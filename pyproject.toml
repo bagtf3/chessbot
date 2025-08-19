@@ -13,8 +13,8 @@ authors = [{name = "Bryan Goggin"}]
 
 dependencies = [
   "numpy>=1.23",
-  "python-chess==1.10",
-  "tensorflow==2.10
+  "chess==1.10",
+  "tensorflow==2.10"
 ]
 
 [project.optional-dependencies]

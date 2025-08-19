@@ -45,21 +45,21 @@ def en_prise(board, color, sq):
     return bool(attackers(board, not color, sq))
 
 
-def is_hanging(board, color, sq):
+def is_undefended(board, color, sq):
     return not defended(board, color, sq)
 
 
-def free_to_take(board, color, sq):
-    return is_hanging(board, color, sq) and en_prise(board, color, sq)
+def is_hanging(board, color, sq):
+    return is_undefended(board, color, sq) and en_prise(board, color, sq)
 
 
 def piece_features(piece, board, color):
     sqs = list(board.pieces(5, color))
     
     features = [
-        len(sqs), sum([1*is_hanging(board, color, sq) for sq in sqs]),
+        len(sqs), sum([1*is_undefended(board, color, sq) for sq in sqs]),
         sum([1*en_prise(board, color, sq) for sq in sqs]),
-        sum([1*free_to_take(board, color, sq) for sq in sqs]),
+        sum([1*is_hanging(board, color, sq) for sq in sqs]),
         sum([1*attacked_by_lower_value(board, color, sq) for sq in sqs])
     ]
     
@@ -72,8 +72,8 @@ def queen_features(board, color):
 
 def all_piece_features(board):
     functions = {
+        "undefended": is_undefended,
         "hanging": is_hanging,
-        "free_to_take": free_to_take,
         "en_prise": en_prise,
         "attacked_by_lower_value": attacked_by_lower_value
     }
@@ -145,24 +145,6 @@ def count_pawn_shield(board, color, ksq):
     return cnt  # 0..6 typical
 
 
-def open_file_near_king(board, color, ksq):
-    # counts open/semi-open among king file and neighbors for opp rooks/queen
-    f = chess.square_file(ksq)
-    files = [x for x in (f - 1, f, f + 1) if 0 <= x <= 7]
-    my_pawns = set(piece_squares(board, color, chess.PAWN))
-    opp_pawns = set(piece_squares(board, not color, chess.PAWN))
-    open_ct, semi_ct = 0, 0
-    for ff in files:
-        col = {chess.square(ff, rr) for rr in range(8)}
-        has_mine = any(s in my_pawns for s in col)
-        has_opp  = any(s in opp_pawns for s in col)
-        if (not has_mine) and (not has_opp):
-            open_ct += 1
-        elif (not has_mine) and has_opp:
-            semi_ct += 1
-    return open_ct, semi_ct
-
-
 def queenization_exposure(board, color, ksq):
     new_board = board.copy()
     king_attacks = new_board.attacks(ksq)
@@ -171,11 +153,10 @@ def queenization_exposure(board, color, ksq):
     return len(queen_attacks) - len(king_attacks)
 
 
-def ring_pressure(board, color, ring):
-    opp = not color
-    att_opp = sum(1 for sq in ring if board.is_attacked_by(opp, sq))
-    att_me  = sum(1 for sq in ring if board.is_attacked_by(color, sq))
-    return att_opp, att_me, att_opp - att_me
+def ring_pressure(board, color, ksq):
+    this_kings_ring = king_ring(sq)
+    pressure = sum(1 for sq in this_kings_ring if board.is_attacked_by(not_color, sq))
+    return pressure
 
 
 def escape_squares(board, color, ksq):
@@ -186,23 +167,13 @@ def escape_squares(board, color, ksq):
     return len(moves)
 
 
-def king_exposure_features(board, color):
-    ksq = king_square(board, color)
-    
-    ray_exposure = queenization_exposure(board, color, ksq)
-    shield = count_pawn_shield(board, color, ksq)
-    ofile, sofile = open_file_near_king(board, color, ksq)
-    esc = escape_squares(board, color, ksq)
-    
-    return [ray_exposure, shield, ofile, sofile, esc]
-
-
 def all_king_exposure_features(board):
     wt_ksq = king_square(board, 1)
     blk_ksq = king_square(board, 0)
     
     functions = {
         "king_ray_exposure": queenization_exposure,
+        "king_ring_pressure": ring_pressure,
         "king_pawn_shield": count_pawn_shield,
         "king_escape_square":escape_squares
     }
@@ -212,12 +183,6 @@ def all_king_exposure_features(board):
         wt = functions[f](board, 1, wt_ksq)
         blk = functions[f](board, 0, blk_ksq)
         feats[f] = [wt, blk]
-        
-    w_ofile, w_sofile = open_file_near_king(board, 1, wt_ksq)
-    b_ofile, b_sofile = open_file_near_king(board, 0, blk_ksq)
-    
-    feats['king_openfile'] = [w_ofile, b_ofile]
-    feats['king_semi_openfile'] = [w_sofile, b_sofile]
     
     return feats
 

@@ -18,6 +18,15 @@ from tensorflow.keras.layers import (
     GlobalAveragePooling2D, Dense, Lambda
 )
 
+
+def load_model(model_loc):
+    model = tf.keras.models.load_model(model_loc)
+    return model
+
+def save_model(model_loc):
+    model.save(model_loc)
+    
+    
 def masked_policy_ce(y_true, y_pred, eps=1e-7):
     """
     y_true: [B,8,8,73] target probs (illegal=0; legal>0; sums to 1 over legal)
@@ -43,6 +52,14 @@ def masked_policy_ce(y_true, y_pred, eps=1e-7):
     # Cross-entropy over legal entries
     loss = -tf.reduce_sum(t_legal * logp, axis=1)   # [B]
     return loss
+
+
+def policy_ce_unmasked(y_true, y_pred):
+    # y_true, y_pred: [B,8,8,73]
+    y_true_f = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
+    y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
+    # From logits = True → applies softmax+log inside
+    return keras.losses.categorical_crossentropy(y_true_f, y_pred_f, from_logits=True)
 
 
 def res_block(x, filters, leak=0.05):

@@ -8,7 +8,6 @@ import pickle, os, math, random, time
 import matplotlib.pyplot as plt
 plt.ion()
 
-import io
 import chess
 import chess.pgn
 import chess.engine
@@ -17,6 +16,61 @@ from chessbot import features as ft
 
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 
+
+def mirror_board(board):
+    return board.mirror()
+
+
+def mirror_move(mv: chess.Move) -> chess.Move:
+    """Mirror a move through the board center (promotion piece is unchanged)."""
+    return chess.Move(
+        chess.square_mirror(mv.from_square),
+        chess.square_mirror(mv.to_square),
+        promotion=mv.promotion
+    )
+
+
+def make_random_move(board):
+    moves = list(board.legal_moves)
+    board.push(np.random.choice(moves))
+    return board
+
+
+def random_init(halfmoves=5):
+    board = chess.Board()
+    for _ in range(halfmoves):
+        moves = list(board.legal_moves)
+        # try again 
+        if not len(moves):
+            return random_init(chess.Board(), halfmoves=halfmoves)
+        
+        board = make_random_move(board)
+        
+        # also try again
+        if board.is_game_over():
+            return random_init(chess.Board(), halfmoves=halfmoves)
+        
+    return board
+
+
+def make_move_with_stockfish(board, engine, depth=1, top_n=0):
+    legal_moves = engine.analyse(
+        board, multipv=5, limit=chess.engine.Limit(depth=depth),
+        info=chess.engine.Info.ALL
+    )
+    
+    if top_n:
+        legal_moves = legal_moves[:top_n]
+        move = np.random.choice(legal_moves)['pv'][0]
+        
+    else:
+        move = legal_moves[0]['pv'][0]
+    
+    board.push(move)
+    return board
+
+
+#%%
 
 def plot_training_progress(all_evals):
     """
@@ -235,44 +289,6 @@ def analyze_board(board, engine):
         
     return position_data
 
-
-def random_init(board, halfmoves=5):
-    for _ in range(halfmoves):
-        moves = list(board.legal_moves)
-        if not len(moves):
-            break
-        
-        move = np.random.choice(moves, 1)[0]
-        board.push(move)
-        
-        if chess.is_game_over():
-            break
-        
-    return board
-
-
-def make_random_move(board):
-    moves = list(board.legal_moves)
-    board.push(np.random.choice(moves))
-    return board
-
-
-def make_move_with_stockfish(board, engine, depth=1, top_n=0):
-    legal_moves = engine.analyse(
-        board, multipv=5, limit=chess.engine.Limit(depth=depth),
-        info=chess.engine.Info.ALL
-    )
-    
-    if top_n:
-        legal_moves = legal_moves[:top_n]
-        move = np.random.choice(legal_moves)['pv'][0]
-        
-    else:
-        move = legal_moves[0]['pv'][0]
-    
-    board.push(move)
-    return board
-    
     
 def make_move_with_model(board, model, color, return_state=True):
     # generate the candidate moves
@@ -329,13 +345,7 @@ def make_move_with_model(board, model, color, return_state=True):
 from IPython.display import display, clear_output, SVG
 import chess.svg, chess.pgn
 
-def random_board():
-    b = chess.Board()
-    for _ in range(5):
-        lms = list(b.legal_moves)
-        random.shuffle(lms)
-        b.push(lms[0])
-    return b
+
 
 
 def sort_candidates(evals, clr):
@@ -685,6 +695,4 @@ def choose_move(board, model, max_sims=1500, max_time=45):
           f"(visits={best_node.visits}, Q={best_node.average_value():.3f})")
     
     return best_move
-
-        
 

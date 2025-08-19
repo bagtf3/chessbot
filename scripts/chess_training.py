@@ -15,14 +15,10 @@ import chess.engine
 
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 
-import tensorflow as tf
-print("Built with CUDA?", tf.test.is_built_with_cuda())
-print("GPUs available:", tf.config.list_physical_devices('GPU'))
 
-
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers as L
+import chessbot.model as cbm
+import chessbot.utils as cbu
+import chessbot.features as cbf
 
 from chessbot.encoding import (
     encode_board, build_training_targets_8x8x73, 
@@ -66,33 +62,9 @@ def build_chess_model(in_planes=23, width=128, n_blocks=12):
     return keras.Model(inp, outputs=[p, v], name="Alpha0ish")
 
 
-def policy_ce_unmasked(y_true, y_pred):
-    # y_true, y_pred: [B,8,8,73]
-    y_true_f = tf.reshape(y_true, [tf.shape(y_true)[0], -1])
-    y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
-    # From logits = True → applies softmax+log inside
-    return keras.losses.categorical_crossentropy(y_true_f, y_pred_f, from_logits=True)
-
-model = build_chess_model(in_planes=23, width=128, n_blocks=12)
-
-model.compile(
-    optimizer = tf.keras.optimizers.Adam(learning_rate=3e-4),
-    loss={
-        "policy_logits": policy_ce_unmasked,
-        "value": keras.losses.BinaryCrossentropy(),
-    },
-    loss_weights={"policy_logits": 1.0, "value": 0.5},
-    metrics={"value": [keras.metrics.MeanAbsoluteError(), keras.metrics.AUC(name="AUC")]}
-)
 
 
-def mirror_move(mv: chess.Move) -> chess.Move:
-    """Mirror a move through the board center (promotion piece is unchanged)."""
-    return chess.Move(
-        chess.square_mirror(mv.from_square),
-        chess.square_mirror(mv.to_square),
-        promotion=mv.promotion
-    )
+
 
 all_X = []
 all_Yp = []

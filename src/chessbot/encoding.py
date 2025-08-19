@@ -194,6 +194,43 @@ def legal_mask_8x8x73(board: chess.Board):
     return mask
 
 
+PIECE_ORDER = [
+    chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
+]
+
+
+def piece_to_move_target(board, Yp, eps=1e-6):
+    """Return a length-6 soft label over [P,N,B,R,Q,K] from Yp."""
+    t = np.zeros(6, dtype=np.float32)
+    flat = Yp.reshape(-1)
+    nz = np.nonzero(flat)[0]
+    if nz.size == 0:
+        # fallback: uniform over piece types that have at least one legal move
+        types_present = set()
+        for mv in board.legal_moves:
+            pt = board.piece_type_at(mv.from_square)
+            if pt: types_present.add(pt)
+        idxs = [PIECE_ORDER.index(pt) for pt in types_present] or [0]
+        t[idxs] = 1.0 / len(idxs)
+        return t
+
+    for ii in nz:
+        fr, ff, pl = np.unravel_index(ii, (8,8,73))
+        mv = idx_to_move_8x8x73(fr, ff, pl, board)
+        pt = board.piece_type_at(mv.from_square)
+        if pt:
+            t[PIECE_ORDER.index(pt)] += flat[ii]
+
+    s = t.sum()
+    if s > 0:
+        t /= s
+    else:
+        t[:] = 1.0 / 6.0
+    # small floor to avoid exact zeros if you like:
+    # t = (t + eps); t /= t.sum()
+    return t
+
+
 def score_to_cp_white(score: chess.engine.PovScore) -> int:
     """Return centipawns from White's POV. Handle mates by mapping to large cp."""
     s = score.white()
@@ -269,7 +306,7 @@ def build_training_targets_8x8x73(board, info_list, k_pawns=250.0, temp=1.0):
     # Position value target from the TOP line
     top_cp = score_to_cp_white(info_list[0]['score'])
     y_value = pawns_to_winprob(top_cp, k_pawns=k_pawns).astype(np.float32)
-    return Y, np.array([y_value], dtype=np.float32)
+    return {'policy_logits': Y, "value": np.array([y_value], dtype=np.float32)}
 
 
 

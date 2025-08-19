@@ -154,8 +154,8 @@ def queenization_exposure(board, color, ksq):
 
 
 def ring_pressure(board, color, ksq):
-    this_kings_ring = king_ring(sq)
-    pressure = sum(1 for sq in this_kings_ring if board.is_attacked_by(not_color, sq))
+    this_kings_ring = king_ring(ksq)
+    pressure = sum(1 for sq in this_kings_ring if board.is_attacked_by(not color, sq))
     return pressure
 
 

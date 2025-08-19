@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
@@ -19,12 +20,19 @@ from tensorflow.keras.layers import (
 )
 
 
+def save_model(model, model_loc):
+    model.save(model_loc, save_format='h5')
+    
+    
 def load_model(model_loc):
-    model = tf.keras.models.load_model(model_loc)
+    custom = {
+        "masked_policy_ce": masked_policy_ce,
+        'weighted_bce_legality': weighted_bce_legality
+    }
+    
+    model = keras.models.load_model(model_loc, custom_objects=custom)
+    
     return model
-
-def save_model(model_loc):
-    model.save(model_loc)
     
     
 def masked_policy_ce(y_true, y_pred, eps=1e-7):
@@ -131,13 +139,14 @@ def probe_head(trunk_vec, name):
     return out, loss, det
 
 
-def weighted_bce_legality(pos_weight=300.0, neg_weight=1.0):
-    """Upweight positives (legal moves) for heavy imbalance."""
+def weighted_bce_legality(pos_weight=300.0, neg_weight=1.0, eps=1e-7):
     def loss(y_true, y_pred):
-        y_true = tf.cast(y_true, y_pred.dtype)
+        y_true = tf.cast(y_true, y_pred.dtype)            # [B,8,8,73]
         w = y_true * pos_weight + (1.0 - y_true) * neg_weight
-        bce = keras.losses.binary_crossentropy(y_true, y_pred)  # from_logits=False
-        return tf.reduce_mean(w * bce)
+        # elementwise BCE on probabilities (sigmoid head)
+        bce = -(y_true * tf.math.log(y_pred + eps) +
+                (1.0 - y_true) * tf.math.log(1.0 - y_pred + eps))  # [B,8,8,73]
+        return tf.reduce_mean(w * bce)                    # scalar
     return loss
 
 
@@ -338,8 +347,10 @@ def _head_name(tensor):
     # e.g. "value/Tanh:0" -> "value"
     return tensor.name.split(':')[0].split('/')[0]
 
+
 def _get_trunk_tensor(model, trunk_layer_name):
     return model.get_layer(trunk_layer_name).output
+
 
 def _collect_losses_and_weights(model, out_names, default_loss="mse"):
     old_losses  = getattr(model, "_head_losses", {}) or {}
@@ -349,12 +360,14 @@ def _collect_losses_and_weights(model, out_names, default_loss="mse"):
     weights = {n: old_weights.get(n, 1.0)        for n in out_names}
     return losses, weights
 
+
 def _recompile(model, losses, weights):
     lr = getattr(model.optimizer, 'learning_rate', 1e-3)
     opt = tf.keras.optimizers.Adam(learning_rate=lr)
     model.compile(optimizer=opt, loss=losses, loss_weights=weights)
     model._head_losses = dict(losses)
     model._head_loss_weights = dict(weights)
+
 
 def add_head(
     model,
@@ -470,3 +483,61 @@ def rename_head(model, old_name, new_name):
 
     _recompile(new_model, losses, weights)
     return new_model
+
+
+def _to_float32(x):
+    a = np.asarray(x)
+    return a.astype(np.float32, copy=False)
+
+def prepare_targets(all_Y):
+    # which targets you expect (must match your model output names)
+    POLICY_KEY = "policy_logits"   # your policy target name
+    VALUE_KEY  = "value"           # scalar [1]
+    LEGAL_KEY  = "legal_moves"     # [8,8,73] 0/1
+    
+    # vector heads that are length-2 (mine, theirs)
+    VEC2_HEADS = [
+        "king_ray_exposure","king_ring_pressure","king_pawn_shield","king_escape_square",
+        "pawn_undefended","pawn_hanging","pawn_en_prise",
+        "knight_undefended","knight_hanging","knight_en_prise",
+        "knight_attacked_by_lower_value", "bishop_undefended","bishop_hanging",
+        "bishop_en_prise","bishop_attacked_by_lower_value", "rook_undefended",
+        "rook_hanging","rook_en_prise","rook_attacked_by_lower_value", "queen_undefended",
+        "queen_hanging","queen_en_prise","queen_attacked_by_lower_value", "material"
+    ]
+    
+    # other heads by shape
+    PIECE_TO_MOVE_KEY = "piece_to_move"   # [6]    
+    
+    N = len(all_Y)
+    # discover which keys are present (require same keys for all samples)
+    keys = set(all_Y[0].keys())
+    for d in all_Y[1:]:
+        keys &= set(d.keys())
+    # minimal required
+    assert POLICY_KEY in keys and VALUE_KEY in keys, "Missing some policy/value"
+
+    # --- stack core heads ---
+    Yp = np.stack([_to_float32(d[POLICY_KEY]) for d in all_Y], axis=0)  # [N,8,8,73]
+    Yv = np.stack([_to_float32(d[VALUE_KEY])  for d in all_Y], axis=0)  # [N,1] or [N]
+    Yv = Yv.reshape(N, 1).astype(np.float32)
+
+    targets = {POLICY_KEY: Yp, VALUE_KEY: Yv}
+
+    # --- legality map if present ---
+    if LEGAL_KEY in keys:
+        Ym = np.stack([_to_float32(d[LEGAL_KEY]) for d in all_Y], axis=0)  # [N,8,8,73]
+        targets[LEGAL_KEY] = Ym
+
+    # --- piece_to_move if present ---
+    if PIECE_TO_MOVE_KEY in keys:
+        Ypiece = np.stack([_to_float32(d[PIECE_TO_MOVE_KEY]) for d in all_Y], axis=0)
+        targets[PIECE_TO_MOVE_KEY] = Ypiece
+
+    # --- all the 2-dim aux heads (convert list/tuple -> [2] float32) ---
+    for name in VEC2_HEADS:
+        if name in keys:
+            Y = np.stack([_to_float32(all_Y[i][name]) for i in range(N)], axis=0)
+            targets[name] = Y
+
+    return targets

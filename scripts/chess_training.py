@@ -81,68 +81,81 @@ import chessbot.encoding as cbe
 #             all_X = []
 #             all_Y = []
 
-from multiprocessing import Process, Queue, Event
-from chessbot.data_gen import data_worker
+import os, pickle, numpy as np, time
+import chessbot.model as cbm
 
-def train_loop(model, n_workers=4, batch_size=128):
-    total_pos = 0
-    n_trains = 0
-    queue = Queue(maxsize=6000)
-    stop_event = Event()
-    procs = [
-        Process(target=data_worker, args=(i, queue, stop_event))
-        for i in range(n_workers)
-    ]
+DATA_DIR =  "C:/Users/Bryan/Data/chessbot_data/training_data/policy_value_data"
+
+model_path = os.path.join(cbm.MODEL_DIR, "value_policy_model_v0.h5")
+
+if os.path.exists(model_path):
+    model = cbm.load_model(model_path)
+else:
+    # model, loss_weights = cbm.new_policy_value_model()
+    # new_weights = loss_weights.copy()
+    # new_weights['king_ray_exposure'] = 0.05
+    # new_weights['king_ring_pressure'] = 0.05
+    # new_weights['king_pawn_shield'] = 0.05
+    # new_weights['king_escape_square'] = 0.05
+
+    # new_weights['material'] = 0.05
+    # new_weights['policy_logits'] = 3.0
+    # new_weights['legal_moves'] = 3.0
+    # not_pawns = [k for k in new_weights.keys() if 'pawn' not in k]
     
-    for p in procs: p.start()
-
-    all_evals = []
-    try:
-        while total_pos < 10000:
-            all_X, all_Y = [], []
-            # accumulate a minibatch
-            while len(all_X) < 1000:
-                X, y = queue.get()
-                all_X.append(X)
-                all_Y.append(y)
-
-            X = np.stack(all_X, axis=0, dtype=np.float32)
-            targets = cbm.prepare_targets(all_Y)
-
-            # metrics
-            if n_trains % 5 == 4:
-                eval_df = cbu.score_game_data(model, X, targets)
-                all_evals.append(eval_df)
-                cbu.plot_training_progress(pd.concat(all_evals))
-
-            # train
-            model.fit(X, targets, batch_size=batch_size, epochs=2, shuffle=True)
-            n_trains += 1
-            total_pos += len(all_X)
-            
-    finally:
+    # for k in [k for k in not_pawns if 'hanging' in k]:
+    #     new_weights[k] = 0.5
         
-        cbm.save_model(model, os.path.join(cbm.MODEL_DIR, "value_policy_model_v1.h5"))
-        stop_event.set()
-        for p in procs: p.join()
-
-
-if __name__ == "__main__":
-    model_path = os.path.join(cbm.MODEL_DIR, "value_policy_model_v1.h5")
-    if os.path.exists(model_path):
-        model = cbm.load_model(model_path)
-    else:
-        model, loss_weights = cbm.new_policy_value_model()
-        new_weights = loss_weights.copy()
-        new_weights['king_ray_exposure'] = 0.05
-        new_weights['king_ring_pressure'] = 0.05
-        new_weights['king_pawn_shield'] = 0.05
-        new_weights['king_escape_square'] = 0.05
-    
-        new_weights['material'] = 0.05
-        new_weights['policy_logits'] = 1.25
-    
-        cbm.set_head_weights(model, new_weights)
+    # for k in [k for k in not_pawns if 'en_prise' in k]:
+    #     new_weights[k] = 0.5
         
-    # train
-    train_loop(model)
+    # for k in [k for k in not_pawns if 'un_defended' in k]:
+    #     new_weights[k] = 0.5
+    #new_weights['value'] = 1.0
+    # for k in [k for k in not_pawns if 'lower' in k]:
+    #     new_weights[k] = 0.5
+    # for k in [k for k in not_pawns if 'queen' in k]:
+    #     new_weights[k] = 0.65
+    # new_weights['legal_moves'] = 2.0
+    # new_weights['policy_logits'] = 4.0
+    # cbm.set_head_weights(model, new_weights)
+
+all_evals = []
+seen_already = []
+n_trains = 0
+
+
+while True:
+    files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".pkl")])
+    files = [f for f in files if f not in seen_already]
+    if not files:
+        print("No new batches yet... waiting")
+        time.sleep(5)
+        continue
+
+    batch_file = files[0]  # grab the oldest
+    path = os.path.join(DATA_DIR, batch_file)
+    with open(path, "rb") as f:
+        all_X, all_Y = pickle.load(f)
+
+    # prep data
+    X = np.stack(all_X, dtype=np.float32)
+    Y = cbm.prepare_targets(all_Y)
+
+    eval_df = cbu.score_game_data(model, X, Y)
+    all_evals.append(eval_df)
+    if n_trains % 5 == 4:
+        cbu.plot_training_progress(pd.concat(all_evals[5:]))
+
+    print(f"Training on {batch_file} -> X {X.shape}")
+    
+    model.fit(X, Y, batch_size=128, epochs=2, shuffle=True)
+    n_trains += 1
+    if n_trains % 50 == 0:
+        model_loc = os.path.join(cbm.MODEL_DIR, f"value_policy_model_v{n_trains}.h5")
+        print(f"Saving to {model_loc}")
+        cbm.save_model(model, model_loc)
+        
+    seen_already.append(batch_file)
+    os.remove(path)  # delete after training
+

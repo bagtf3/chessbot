@@ -187,6 +187,7 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
     names = list(model.output_names)
     important = ['policy_logits', 'value']
     names = [c for c in names if c not in important] + important
+    names = [c for c in names if c != 'legal_moves']
     
     chunk_size = 9
     n_chunks = math.ceil(len(names) / chunk_size)
@@ -232,8 +233,8 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
                         if sp > 0: P[i, mi] = Z[i, mi] / sp
 
                 t_pool = T[M]; p_pool = P[M]
-                if t_pool.size > 50000:
-                    idx = np.random.choice(t_pool.size, size=50000, replace=False)
+                if t_pool.size > 20000:
+                    idx = np.random.choice(t_pool.size, size=20000, replace=False)
                     t_pool = t_pool[idx]; p_pool = p_pool[idx]
 
                 ax.scatter(t_pool, p_pool, s=8, alpha=0.5)
@@ -248,13 +249,15 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
 
             # --- special: legal head diff heatmap (first sample) ---
             if name == "legal_moves":
-                t = y_true[0].reshape(8, 8, 73)
-                p = (y_pred[0].reshape(8, 8, 73) > 0.5).astype(float)
-                diff = p - t
-                im = ax.imshow(diff.sum(axis=-1), cmap="bwr", vmin=-5, vmax=5)
-                ax.set_title("legal diff (pred - true)")
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                ax.set_visible(False)
                 continue
+                # t = y_true[0].reshape(8, 8, 73)
+                # p = (y_pred[0].reshape(8, 8, 73) > 0.5).astype(float)
+                # diff = p - t
+                # im = ax.imshow(diff.sum(axis=-1), cmap="bwr", vmin=-5, vmax=5)
+                # ax.set_title("legal diff (pred - true)")
+                # plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                # continue
 
             # --- default: per-dim scatter for small vector heads ---
             yt = y_true.reshape(len(y_true), -1)
@@ -282,7 +285,7 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
         plt.show()
 
 
-def score_game_data(model, X, Y_batch, policy_from_logits=True, max_points=50000):
+def score_game_data(model, X, Y_batch, policy_from_logits=True):
     outs = model.output_names
     preds = model.predict(X, verbose=0)
 

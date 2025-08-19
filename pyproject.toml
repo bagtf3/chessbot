@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chessbot"
+version = "0.1.0"
+description = "Chess policy/value net with aux heads and SF distillation"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Bryan Goggin"}]
+
+dependencies = [
+  "numpy>=1.23",
+  "python-chess==1.10",
+  "tensorflow==2.10
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

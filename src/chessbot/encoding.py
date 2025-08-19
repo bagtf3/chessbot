@@ -1,6 +1,7 @@
 import chess
 import numpy as np
 
+
 PIECE_TYPES = [
     chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
 ]
@@ -30,7 +31,7 @@ def encode_board(board: chess.Board) -> np.ndarray:
     
     planes = np.zeros((8, 8, 23), dtype=np.float32)
 
-    # --- piece planes & value planes
+    #  piece planes & value planes
     my_value = np.zeros((8,8), dtype=np.float32)
     opp_value = np.zeros((8,8), dtype=np.float32)
 

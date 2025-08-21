@@ -1,4 +1,5 @@
 import chess
+import chess.engine
 import numpy as np
 
 
@@ -229,25 +230,23 @@ def piece_to_move_target(board, Yp, eps=1e-6):
     # small floor to avoid exact zeros if you like:
     # t = (t + eps); t /= t.sum()
     return t
+    
+    
+def score_to_cp_white(board_score):
+    # always look from whites perspective
+    from_white = board_score.white()
+    
+    #check for mates
+    if from_white.score() is None:
+        return np.clip(from_white.score(mate_score=16), -10, 10) / 10
+        
+    else:
+        return np.clip(from_white.score() / 1000, -0.95, 0.95)
 
 
-def score_to_cp_white(score: chess.engine.PovScore) -> int:
-    """Return centipawns from White's POV. Handle mates by mapping to large cp."""
-    s = score.white()
-    if s.is_mate():
-        ply = abs(s.mate())
-        sign = 1 if s.mate() > 0 else -1
-        # map 'mate in ply' to a huge cp with small ply discount
-        return sign * (10000 - 10*ply)
-    return s.cp
-
-
-def pawns_to_winprob(pawns, k_pawns=2.0):
-    # pawns: array of STM-centric pawn evals (positive good for STM)
-    x = np.asarray(pawns, dtype=np.float32) / float(k_pawns)
-    # stable sigmoid
-    pos = np.exp(-np.clip(x, None, 50))
-    return 1.0 / (1.0 + pos)
+def pawns_to_winprob(pawns, k_pawns=4.5):
+    #return 1.0 / (1.0 + np.exp(-k_pawns * pawns))
+    return (pawns + 1.0) / 2.0
 
 
 def winprob_to_policy(winprobs, temperature=1.0, eps=1e-7):
@@ -259,7 +258,7 @@ def winprob_to_policy(winprobs, temperature=1.0, eps=1e-7):
     return w / w.sum()
 
 
-def build_training_targets_8x8x73(board, info_list, k_pawns=250.0, temp=1.0):
+def build_training_targets_8x8x73(board, info_list, k_pawns=150.0, temp=2.0):
     """
     Returns:
       Y_policy: (8,8,73) float32 with a prob dist over the PV-first moves from info_list
@@ -276,7 +275,7 @@ def build_training_targets_8x8x73(board, info_list, k_pawns=250.0, temp=1.0):
             continue
         cp = score_to_cp_white(e['score'])  # White POV
         # Keep the *best* cp per move if duplicated
-        move_to_cp[mv] = max(move_to_cp.get(mv, -1e9), cp)
+        move_to_cp[mv] = max(move_to_cp.get(mv, -1e7), cp)
 
     if not move_to_cp:
         # fallback: uniform over legal moves
@@ -295,19 +294,15 @@ def build_training_targets_8x8x73(board, info_list, k_pawns=250.0, temp=1.0):
     # (STM is White here by assumption)
     moves, cps = zip(*move_to_cp.items())
     winprobs = pawns_to_winprob(np.array(cps, dtype=np.float32), k_pawns=k_pawns)
-    probs = winprob_to_policy(winprobs, temperature=1.0)
+    #probs = winprob_to_policy(winprobs, temperature=1.0)
 
     # Scatter into 8x8x73
     Y = np.zeros((8,8,73), dtype=np.float32)
     idxs = [move_to_8x8x73(m, board) for m in moves]
     frs, ffs, pls = np.array(idxs, dtype=int).T
-    Y[frs, ffs, pls] = probs
+    Y[frs, ffs, pls] = winprobs
 
     # Position value target from the TOP line
     top_cp = score_to_cp_white(info_list[0]['score'])
     y_value = pawns_to_winprob(top_cp, k_pawns=k_pawns).astype(np.float32)
     return {'policy_logits': Y, "value": np.array([y_value], dtype=np.float32)}
-
-
-
-

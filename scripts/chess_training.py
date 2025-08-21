@@ -1,22 +1,16 @@
-import os
+import os, time, pickle
 import numpy as np
 import pandas as pd
 pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
-
-import random            
+      
 import matplotlib.pyplot as plt
 plt.ion()
-
-import chess
-import chess.engine
 
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 
 import chessbot.model as cbm
 import chessbot.utils as cbu
-import chessbot.features as cbf
-import chessbot.encoding as cbe
 
 # model, loss_weights = cbm.new_policy_value_model()
 
@@ -81,9 +75,6 @@ import chessbot.encoding as cbe
 #             all_X = []
 #             all_Y = []
 
-import os, pickle, numpy as np, time
-import chessbot.model as cbm
-
 DATA_DIR =  "C:/Users/Bryan/Data/chessbot_data/training_data/policy_value_data"
 
 model_path = os.path.join(cbm.MODEL_DIR, "value_policy_model_v0.h5")
@@ -91,34 +82,27 @@ model_path = os.path.join(cbm.MODEL_DIR, "value_policy_model_v0.h5")
 if os.path.exists(model_path):
     model = cbm.load_model(model_path)
 else:
-    # model, loss_weights = cbm.new_policy_value_model()
-    # new_weights = loss_weights.copy()
-    # new_weights['king_ray_exposure'] = 0.05
-    # new_weights['king_ring_pressure'] = 0.05
-    # new_weights['king_pawn_shield'] = 0.05
-    # new_weights['king_escape_square'] = 0.05
-
-    # new_weights['material'] = 0.05
-    # new_weights['policy_logits'] = 3.0
-    # new_weights['legal_moves'] = 3.0
-    # not_pawns = [k for k in new_weights.keys() if 'pawn' not in k]
+    model, loss_weights = cbm.new_policy_value_model()
+    new_weights = loss_weights.copy()
     
-    # for k in [k for k in not_pawns if 'hanging' in k]:
-    #     new_weights[k] = 0.5
+    #update some weights
+    new_weights['material'] = 0.05
+    new_weights['piece_to_move'] = 0.25
+    new_weights['policy_logits'] = 2.0
+    
+    for w in [k for k in new_weights.keys() if 'king' in k]:
+        new_weights[w] = 0.05
         
-    # for k in [k for k in not_pawns if 'en_prise' in k]:
-    #     new_weights[k] = 0.5
-        
-    # for k in [k for k in not_pawns if 'un_defended' in k]:
-    #     new_weights[k] = 0.5
-    #new_weights['value'] = 1.0
-    # for k in [k for k in not_pawns if 'lower' in k]:
-    #     new_weights[k] = 0.5
-    # for k in [k for k in not_pawns if 'queen' in k]:
-    #     new_weights[k] = 0.65
-    # new_weights['legal_moves'] = 2.0
-    # new_weights['policy_logits'] = 4.0
-    # cbm.set_head_weights(model, new_weights)
+    for w in [k for k in new_weights.keys() if 'queen' in k]:
+        new_weights[w] = 0.6
+    
+    for qual in ['hanging', 'en_prise', 'undefended', 'lower']:
+        for w in [k for k in new_weights.keys() if qual in k]:
+            if 'pawn' not in w:
+                new_weights[w] = 0.5
+            
+    cbm.set_head_weights(model, new_weights)
+    
 
 all_evals = []
 seen_already = []
@@ -145,7 +129,7 @@ while True:
     eval_df = cbu.score_game_data(model, X, Y)
     all_evals.append(eval_df)
     if n_trains % 5 == 4:
-        cbu.plot_training_progress(pd.concat(all_evals[5:]))
+        cbu.plot_training_progress(pd.concat(all_evals[2:]))
 
     print(f"Training on {batch_file} -> X {X.shape}")
     

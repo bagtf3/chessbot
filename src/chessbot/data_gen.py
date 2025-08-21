@@ -43,7 +43,6 @@ def generate_batch(worker_id, batch_idx):
             y['piece_to_move'] = cbe.piece_to_move_target(to_score, y['policy_logits'])
             y['legal_moves'] = 1 * cbe.legal_mask_8x8x73(to_score).astype("float32")
             all_Y.append(y)
-
             move_to_make = random.choice(info_list[:5])['pv'][0]
             if not board.turn:
                 move_to_make = cbu.mirror_move(move_to_make)

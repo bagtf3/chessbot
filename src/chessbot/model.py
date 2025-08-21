@@ -39,13 +39,14 @@ def masked_policy_ce(y_true, y_pred, eps=1e-7):
     """
     y_true: [B,8,8,73] target probs (illegal=0; legal>0; sums to 1 over legal)
     y_pred: [B,8,8,73] logits
+    DIDNT WORK WORTH A DARN
     """
     B = tf.shape(y_true)[0]
     t = tf.reshape(y_true, [B, -1])        # targets
     z = tf.reshape(y_pred, [B, -1])        # logits
 
     # Build mask from targets
-    m = tf.cast(t > 0.0, z.dtype)          # [B,N]
+    m = tf.cast(t > 1e-6, z.dtype)          # [B,N]
 
     # (Optional but recommended) renormalize only over legal entries
     t_legal = t * m
@@ -68,6 +69,17 @@ def policy_ce_unmasked(y_true, y_pred):
     y_pred_f = tf.reshape(y_pred, [tf.shape(y_pred)[0], -1])
     # From logits = True → applies softmax+log inside
     return keras.losses.categorical_crossentropy(y_true_f, y_pred_f, from_logits=True)
+
+
+def masked_mse(y_true, y_pred):
+    """
+    y_true: [B,8,8,73] with 0 for illegal, winprob [0,1] for legal moves
+    y_pred: [B,8,8,73] sigmoid outputs
+    """
+    mask = tf.cast(y_true > 0, tf.float32)  # 1 where legal, 0 where illegal
+    diff = (y_true - y_pred) ** 2
+    # only average over legal moves
+    return tf.reduce_sum(diff * mask) / (tf.reduce_sum(mask) + 1e-7)
 
 
 def res_block(x, filters, leak=0.05):
@@ -179,7 +191,7 @@ def build_full_with_aux(input_shape, aux_configs, width=128, n_blocks=8, leak=0.
 
     outputs = {'policy_logits': policy_logits, 'value': value}
     losses  = {
-        'policy_logits': masked_policy_ce,
+        'policy_logits': masked_mse,
         'value': 'binary_crossentropy'
     }
     

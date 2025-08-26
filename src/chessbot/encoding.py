@@ -244,16 +244,15 @@ def score_to_cp_white(board_score):
         return np.clip(from_white.score() / 1000, -0.95, 0.95)
 
 
-def pawns_to_winprob(pawns, k_pawns=4.5):
-    #return 1.0 / (1.0 + np.exp(-k_pawns * pawns))
-    return (pawns + 1.0) / 2.0
+def pawns_to_winprob(pawns, k_pawns=4.0):
+    return 1.0 / (1.0 + np.exp(-k_pawns * pawns))
 
 
 def winprob_to_policy(winprobs, temperature=1.0, eps=1e-7):
     p = np.clip(np.asarray(winprobs, dtype=np.float32), eps, 1.0 - eps)
-    logits = np.log(p) - np.log1p(-p)          # log-odds
+    logits = np.log(p) - np.log1p(-p)
     logits /= float(temperature)
-    logits -= logits.max()                     # stabilize
+    logits -= logits.max()
     w = np.exp(logits)
     return w / w.sum()
 
@@ -306,3 +305,67 @@ def build_training_targets_8x8x73(board, info_list, k_pawns=150.0, temp=2.0):
     top_cp = score_to_cp_white(info_list[0]['score'])
     y_value = pawns_to_winprob(top_cp, k_pawns=k_pawns).astype(np.float32)
     return {'policy_logits': Y, "value": np.array([y_value], dtype=np.float32)}
+
+
+def get_rank_file(pieces):
+    ranks = [-1*(1 + p // 8) for p in pieces]
+    files = [p % 8 for p in pieces]
+    return ranks, files
+
+
+def get_board_state(board):
+    board_state = np.zeros((8, 8, 9), dtype=int)
+    attack_map = np.zeros((8, 8), dtype=int)
+    value_map = np.zeros((8, 8), dtype=int)
+    
+    value_lookup = {1:1, 2:3, 3:3, 4:5, 5:9, 6:12}
+    
+    for color in [True, False]:
+        value = 1 if color == True else -1
+        for piece in [1, 2, 3, 4, 5, 6]:
+            pieces = list(board.pieces(piece, color))
+            ranks, files = get_rank_file(pieces)
+            board_state[ranks, files, piece-1] = value
+            value_map[ranks, files] = value * value_lookup[piece]
+                
+            # check the attacks
+            for p in pieces:
+                # ignore pins
+                if board.is_pinned(color, p):
+                    continue
+                squares_attacked = list(board.attacks(p))
+                attack_ranks, attack_files = get_rank_file(squares_attacked)
+                attack_map[attack_ranks, attack_files] += value
+    
+    # game metadata
+    game_data = [
+        1 * board.turn,
+        1 * board.has_castling_rights(chess.WHITE),
+        1 * board.has_castling_rights(chess.BLACK),
+        0,
+        0,
+        board.halfmove_clock / 100,
+        0,
+        1 * board.is_check(),
+        0,
+        attack_map.sum(),
+        value_map.sum(),
+        1 * board.turn,
+        value_map[np.abs(value_map) == 1].sum(),
+        value_map[np.abs(value_map) <= 3].sum(), 
+        value_map[np.abs(value_map) > 3].sum(),
+        len(list(board.legal_moves)) / 10
+    ]
+    
+    meta_plane = np.tile(np.array(game_data).reshape(4, 4), (2, 2))
+    
+    board_state[:, :, -3] = attack_map
+    board_state[:, :, -2] = value_map
+    board_state[:, :, -1] = meta_plane
+    
+    return board_state
+
+
+def encode_worker(fen):
+    board = chess.Board(fen)
+    return fen, get_board_state(board)

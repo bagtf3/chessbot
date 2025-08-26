@@ -5,9 +5,14 @@ import pandas as pd
 
 import chessbot.encoding as cbe
 
+import tensorflow as tf
+print("Built with CUDA?", tf.test.is_built_with_cuda())
+print("GPUs available:", tf.config.list_physical_devices('GPU'))
+
+model = tf.keras.models.load_model("C:/Users/Bryan/Data/chessbot_data/models/chess_model_multihead_v240_3.keras")
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 PRED_CACHE = {}
-
+PRIORS_CACHE = {}
 #%%
 class MCTSNode:
     def __init__(self, board, parent=None, move=None):
@@ -26,7 +31,7 @@ class MCTSNode:
     def average_value(self):
         return self.value_sum / self.visits if self.visits > 0 else 0.5
     
-    def expand(self):
+    def expand(self, engine, set_priors=True):
         legal = list(self.board.legal_moves)
         for move in legal:
             if move not in self.children:
@@ -37,85 +42,48 @@ class MCTSNode:
         # OPTIONAL: if you have a policy head, set node.priors here.
         # Otherwise, selection will uniform-fallback.
         # Example (uniform):
-        n = len(self.children) or 1
-        self.priors = {m: 1.0 / n for m in self.children}
+        if len(self.children):
+            if set_priors:
+                self.priors = self.set_priors(engine)
+            else:
+                self.priors = {m:1/len(self.children) for m in self.children.keys()}
+    
+    def set_priors(self, engine):
+        if self.shredder_fen in PRIORS_CACHE:
+            return PRIORS_CACHE[self.shredder_fen]
+        
+        sf_eval = engine.analyse(
+            self.board, multipv=len(self.children), limit=chess.engine.Limit(depth=2),
+            info=chess.engine.Info.ALL
+        )
+        
+        moves, evals = [], []
+        for e in sf_eval:
+            cp = cbe.score_to_cp_white(e['score'])
+            ve = cbe.pawns_to_winprob(cp if self.board.turn else -1*cp)
+            moves.append(e['pv'][0])
+            evals.append(ve)
+        evals_p = cbe.winprob_to_policy(evals, temperature=0.6)
+        priors = {m:e for m, e in zip(moves, evals_p)}
+        PRIORS_CACHE[self.shredder_fen] = priors
+        return priors
 
     def best_child(self):
         return max(self.children.values(), key=lambda c: c.average_value())
     
 
-def predict_value_cached(node, engine):
+def predict_value_cached(node, model):
     key = node.board.shredder_fen()
     if key in PRED_CACHE:
         return PRED_CACHE[key]
     
-    score = engine.analyse(node.board, limit=chess.engine.Limit(depth=5))
-    v = cbe.pawns_to_winprob(cbe.score_to_cp_white(score['score']))
+    candidates = [get_board_state(node.board)]
+        
+    # predict and take the best based on score
+    preds = model.predict(np.stack(candidates, axis=0), verbose=0)
+    score = preds[model.output_names.index('value')].item()
+    v = cbe.pawns_to_winprob(score)
     PRED_CACHE[key] = v
-    return v
-
-
-def predict_value_cached_priors(node, engine):
-    key = node.shredder_fen
-    need_current_pred = key not in PRED_CACHE.keys()
-    has_children = node.children
-    
-    if has_children:
-        need_priors = hasattr(node, "priors") 
-        need_priors = need_priors and node.children
-        need_priors = need_priors and len(set(node.priors.values())) < 2
-        
-    else:
-        need_priors = False
-    
-    if need_priors:
-        all_priors_cached = True
-        moves, evals = [], []
-        for m, n in node.children.items():
-            n_eval = PRED_CACHE.get(n.shredder_fen, None)
-            if n_eval is None:
-                all_priors_cached = False
-                break
-            else:
-                moves.append(m)
-                evals.append(n_eval)
-     
-    run_sf = need_current_pred or (need_priors and not all_priors_cached)
-    
-    if run_sf:
-        n_moves = len(list(node.board.legal_moves))
-        # might be a checkmate or something
-        if not n_moves:
-            return predict_value_cached(node, engine)
-        
-        sf_eval = engine.analyse(
-            node.board, multipv=n_moves, limit=chess.engine.Limit(depth=5),
-            info=chess.engine.Info.ALL
-        )
-    
-    if need_current_pred:
-        v = cbe.pawns_to_winprob(cbe.score_to_cp_white(sf_eval[0]['score']))
-        PRED_CACHE[node.shredder_fen] = v
-        
-    else:
-        v = PRED_CACHE[node.shredder_fen]
-    
-    if need_priors:
-        if all_priors_cached:
-            evals_p = cbe.winprob_to_policy(temperature=0.6)
-            priors = {m:e for m, e in zip(moves, evals_p)}
-            node.priors = priors
-            
-        else:
-            moves, evals = [], []
-            for e in sf_eval:
-                ve = cbe.pawns_to_winprob(cbe.score_to_cp_white(e['score']))
-                moves.append(e['pv'][0])
-                evals.append(ve)
-            evals_p = cbe.winprob_to_policy(evals, temperature=0.6)
-            priors = {m:e for m, e in zip(moves, evals_p)}
-            node.priors = priors
-            
     return v
 
 
@@ -156,7 +124,7 @@ def select_child_puct(
     return best_child
 
 
-def simulate(engine, root, max_depth=128, c_puct=2.0):
+def simulate(engine, model, root, max_depth=128, c_puct=2.0):
     path = []
     node = root
     depth = 0
@@ -167,7 +135,7 @@ def simulate(engine, root, max_depth=128, c_puct=2.0):
         path.append(node)
 
         if not node.children:
-            node.expand()
+            node.expand(engine, set_priors=depth < 3)
             node = select_child_puct(
                 node, prefer_higher=node.board.turn,
                 c_puct=c_puct, root_noise=root_noise
@@ -186,10 +154,8 @@ def simulate(engine, root, max_depth=128, c_puct=2.0):
             break
         depth += 1
     
-    if depth < 3:
-        value = predict_value_cached_priors(node, engine)
-    else:
-        value = predict_value_cached(node, engine)
+
+    value = predict_value_cached(node, model)
 
     # BACKPROPAGATION
     for i, node in enumerate(reversed(path)):
@@ -210,7 +176,7 @@ def collect_policy_data(root, n_sims):
 def collect_value_data(engine, root):
     n_moves = len(list(root.board.legal_moves))
     info_list = engine.analyse(
-        root.board, multipv=n_moves, limit=chess.engine.Limit(depth=3),
+        root.board, multipv=n_moves, limit=chess.engine.Limit(depth=1),
         info=chess.engine.Info.ALL
     )
     
@@ -224,14 +190,14 @@ def collect_value_data(engine, root):
     return out_df.set_index('move')
     
 
-def choose_move(root, engine, board, max_sims=1000):
+def choose_move(root, engine, model, board, max_sims=1000):
     print("Thinking... ")
     start = time.time()
     df_list = []
     df_list.append(collect_value_data(engine, root))
     
     for s in range(max_sims):
-        simulate(engine, root, max_depth=128)
+        simulate(engine, model, root, max_depth=128)
         
         if s+1 in [100, 200, 500, 1000]:
             df_list.append(collect_policy_data(root, s+1))
@@ -250,7 +216,7 @@ def choose_move(root, engine, board, max_sims=1000):
     print("\nTop candidate moves:")
     for move, node in sorted_children[:5]:
         san = root.board.san(move)
-        v_child = predict_value_cached(node, engine)
+        v_child = predict_value_cached(node, model)
         print(f"{move.uci():<6} ({san})  visits={node.visits:<4} "
               f"Q={node.average_value():.3f}  V(model)={v_child:.3f}")
 
@@ -387,9 +353,11 @@ def make_move_with_model(board, model, color, return_state=True):
 #%%
 from IPython.display import display, clear_output, SVG
 import chess.svg, chess.pgn, random
+import chessbot.utils as cbu
 
 bot_color = np.random.uniform() < 0.5
 board = chess.Board()
+board = cbu.random_init(4)
 root = MCTSNode(board)
 data = []
 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
@@ -404,9 +372,8 @@ with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
         )
         
         if board.turn == bot_color:
-            best_move, df, root = choose_move(root, engine, board, max_sims=500)
+            best_move, df, root = choose_move(root, engine, model, board, max_sims=100)
             data.append(df)
-            root = MCTSNode(board)
             root = advance_root(root, best_move)
             print("\nStockfish top 3 moves: ")
             moves = sf_eval[:3]
@@ -420,123 +387,15 @@ with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
             board.push(best_move)
             
         else:
+            time.sleep(0.5)
             sf_move = sf_eval[0]['pv'][0]
             san = board.san(sf_move)
             print(f"\nStockfish plays {san}\n")
+            #board.push(random.choice(list(board.legal_moves)))
             board.push(sf_move)
-            time.sleep(0.5)
             root = advance_root(root, sf_move)
-            root = MCTSNode(board)
 
 
 
-#%%
-# import time
-# from IPython.display import display, clear_output, SVG
-# import chess.svg, chess.pgn
-# board = cbu.random_init(3)
-# clear_output(wait=True)
-# display(SVG(chess.svg.board(board=board, flipped=not root.board.turn)))
-
-# with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-#     best_move, df = choose_move(engine, board)
-# #PRED_CACHE = {}
-# def predict_value_cached(model, board):
-#     key = board.shredder_fen()
-#     if key in PRED_CACHE:
-#         return PRED_CACHE[key]
-#     x = get_board_state(board).reshape(1, 8, 8, 9)
-#     out = model.predict(x, verbose=0)
-#     v = out[model.output_names.index('value')].item()
-#     PRED_CACHE[key] = v
-#     return v
-
-# def choose_move(board, max_sims=1500, max_time=45):
-#     root = MCTSNode(board.copy())
-    
-#     print("Thinking... ")
-#     start = time.time()
-#     n_sims = 0
-#     while time.time() - start < max_time:
-#         simulate(engine, root, max_depth=64)
-#         n_sims+=1
-        
-#         # check to see if there is a clear winner that will not likely be beaten
-#         if n_sims % 100 == 0:
-#             if n_sims > 399:
-#                 children = [v for k, v in root.children.items()]
-#                 visits = sorted([c.visits for c in children])
-                
-#                 if visits[-1] >= 0.5* n_sims:
-#                     break
-#                 if (visits[-1] >= 0.4*n_sims) and (visits[-1] > 1.5*visits[-2]):
-#                     break
-#                 if visits[-1]-visits[-2] > 0.8 * (max_sims-n_sims):
-#                     break
-        
-#         if n_sims >= max_sims:
-#             break
-            
-#     stop = time.time()
-#     print(f"Completed {n_sims} simulations in {round(stop-start, 2)} seconds")
-    
-#     if not root.children:
-#         print("No legal moves.")
-#         return None
-    
-#     # Sort children by visit count (descending)
-#     sorted_children = sorted(root.children.items(),
-#         key=lambda x: x[1].visits,
-#         reverse=True
-#     )
-
-#     # Print top 5 candidates with SAN and model value of the child position
-#     print("\nTop candidate moves:")
-#     for move, node in sorted_children[:5]:
-#         san = root.board.san(move)
-#         v_child = predict_value_cached(model, node.board)*10
-#         print(f"{move.uci():<6} ({san})  visits={node.visits:<4} "
-#               f"Q={node.average_value():.3f}  V(model)={v_child:.3f}")
-
-#     # Pick the best move (highest visits)
-#     best_move, best_node = sorted_children[0]
-#     best_san = root.board.san(best_move)
-#     print(f"\nChosen move: {best_move.uci()} ({best_san})  "
-#           f"(visits={best_node.visits}, Q={best_node.average_value():.3f})")
-    
-#     return best_move
-
-def sort_candidates(evals, clr):
-    if clr: 
-        ranked = sorted(evals, key=lambda x: x[1], reverse=True)
-    else:
-        ranked = sorted(evals, key=lambda x: x[1], reverse5e=False)
-        
-    return ranked
-    
-def eval_current_state(board, model):
-    current_state = np.zeros((1, 8, 8, 9))
-    current_state[0] = get_board_state(board)
-    current_pred = model.predict(current_state, verbose=0)
-    
-    if isinstance(current_pred, list):
-        outs = model.output_names
-        current_eval = current_pred[outs.index('value')]
-        current_cmr = current_pred[outs.index('checkmate_radar')]
-        current_queen_en_prise = current_pred[outs.index('queen_en_prise')]
-        current_material = current_pred[outs.index('material')]
-        
-    print(f"Current Evaluation: {np.round(current_eval.item()*10, 4)}")
-    print(f"Current CMR: {np.round(current_cmr.item(), 4)}")
-    print(f"Current Materal: {np.round(current_material[0]*10, 4)}")
-    print(f"Current QEP: {np.round(current_queen_en_prise[0], 4)}")
-    
-    
-
-    
-    
 
 
-
-#%%
-#model = tf.keras.models.load_model("C:/Users/Bryan/repos/chessbot/chess_model_multihead_v240_3.keras")

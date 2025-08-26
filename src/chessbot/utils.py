@@ -42,13 +42,13 @@ def random_init(halfmoves=5):
         moves = list(board.legal_moves)
         # try again 
         if not len(moves):
-            return random_init(chess.Board(), halfmoves=halfmoves)
+            return random_init(halfmoves=halfmoves)
         
         board = make_random_move(board)
         
         # also try again
         if board.is_game_over():
-            return random_init(chess.Board(), halfmoves=halfmoves)
+            return random_init(halfmoves=halfmoves)
         
     return board
 

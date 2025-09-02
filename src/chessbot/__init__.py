@@ -12,3 +12,6 @@ BLACK_WINS_IN_2_WHITE_MOVE = chess.Board("r3k2r/ppp2ppp/5n2/4p1bP/1P1nK1b1/P2P4/
 BLACK_WINS_IN_3_BLACK_MOVE = chess.Board("rn2k2r/ppp2pp1/8/2b2K1p/2B5/1P1P1PP1/P1P5/2q5 b kq - 3 22")
 WHITE_HAS_LOST = chess.Board("5rk1/2pn1ppp/8/p1QNp3/4P3/3PKBP1/1r6/6q1 w - - 6 33")
 BLACK_HAS_LOST = chess.Board("r4knr/3n1Qpp/1pp3B1/p2p4/1b1P4/2N4P/PPP2PP1/R1B2RK1 b - - 0 13")
+
+START_POS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+START_POS_KEY = "8F8F01D4562F59FB"

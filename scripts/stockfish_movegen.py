@@ -56,89 +56,6 @@ def board_to_tokens(board: chess.Board):
     tokens.append(ep % 64)  # encode en passant square (0 if none)
     return np.array(tokens, dtype=np.int32)
 
-
-import bulletchess
-from bulletchess import WHITE, BLACK, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING
-from bulletchess import Square, WHITE_KINGSIDE, WHITE_QUEENSIDE, BLACK_KINGSIDE, BLACK_QUEENSIDE
-
-# mapping like python-chess version
-PIECE_TO_ID_BC = {
-    None: 0,
-    PAWN: 1,
-    KNIGHT: 2,
-    BISHOP: 3,
-    ROOK: 4,
-    QUEEN: 5,
-    KING: 6,
-}
-
-FEN_TO_PIECE = {
-    "P": (WHITE, PAWN),
-    "N": (WHITE, KNIGHT),
-    "B": (WHITE, BISHOP),
-    "R": (WHITE, ROOK),
-    "Q": (WHITE, QUEEN),
-    "K": (WHITE, KING),
-    "p": (BLACK, PAWN),
-    "n": (BLACK, KNIGHT),
-    "b": (BLACK, BISHOP),
-    "r": (BLACK, ROOK),
-    "q": (BLACK, QUEEN),
-    "k": (BLACK, KING),
-}
-
-FEN_TO_ID = {
-    "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
-    "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
-}
-
-def square_to_id_bc(piece):
-    if piece is None:
-        return 0
-    base = PIECE_TO_ID_BC[piece.piece_type]
-    return base if piece.color == WHITE else base + 6
-
-def board_to_tokens_bc(board: bulletchess.Board):
-    """
-    Convert a bulletchess.Board into the same token format as python-chess version:
-    - 64 squares encoded with square_to_id_bc
-    - extras: turn, castling rights, en passant square
-    """
-    tokens = []
-
-    # split FEN parts
-    fen_parts = board.fen().split()
-    placement, turn, castling, ep = fen_parts[:4]
-
-    # expand piece placement
-    rows = placement.split('/')
-    for r in rows:
-        for ch in r:
-            if ch.isdigit():
-                # empty squares
-                for _ in range(int(ch)):
-                    tokens.append(0)
-            else:
-                # piece letter → Piece object
-                tokens.append(FEN_TO_ID[ch])
-    
-    # extras
-    tokens.append(int(board.turn == WHITE))
-    tokens.append(int(WHITE_KINGSIDE in board.castling_rights))
-    tokens.append(int(WHITE_QUEENSIDE in board.castling_rights))
-    tokens.append(int(BLACK_KINGSIDE in board.castling_rights))
-    tokens.append(int(BLACK_QUEENSIDE in board.castling_rights))
-
-    if ep == "-":
-        tokens.append(0)
-    else:
-        file = ord(ep[0]) - ord('a')
-        rank = int(ep[1]) - 1
-        ep_idx = rank * 8 + file
-        tokens.append(ep_idx)
-
-    return np.array(tokens, dtype=np.int32)
-
 # -------------------------
 # Core Transformer Stump
 # -------------------------
@@ -648,7 +565,6 @@ n_moves = 4672  # your move-index space
 #     aux_into_heads=False, aux_weight=0.05, value_weight=2.0, policy_weight=2.0
 # )
 
-import tensorflow as tf
 for gpu in tf.config.list_physical_devices("GPU"):
     tf.config.experimental.set_memory_growth(gpu, True)
 
@@ -661,8 +577,6 @@ all_evals = pd.DataFrame()
 #%%
 MCTS_CACHE = {}
 
-import bulletchess
-from bulletchess import Board, CHECKMATE, DRAW, FORCED_DRAW, WHITE, BLACK
 import gc
 
 

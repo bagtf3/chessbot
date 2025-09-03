@@ -1,3 +1,4 @@
+import os
 import chess
 import chess.engine
 import pandas as pd
@@ -5,7 +6,6 @@ import numpy as np
 import random
 import time
 from collections import defaultdict
-import matplotlib.pyplot as plt
 
 from IPython.display import display, clear_output, SVG
 import chess.svg
@@ -19,12 +19,11 @@ from chessbot.utils import random_init
 import chessbot.encoding as cbe
 import chessbot.features as feats
 import chessbot.utils as cbu
-from chessbot.model import masked_policy_ce
 
 from chessbot import SF_LOC, ENDGAME_LOC
-
 import chess.syzygy
 
+MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 
 PIECE_TO_ID = {
     None: 0,                # empty square
@@ -133,253 +132,42 @@ def value_head(trunk_vec, hidden=128, leak=0.05, name="value"):
     return out, "mse"
 
 
-def policy_head(trunk_vec, n_moves, hidden=128, leak=0.05, name="policy", use_mask=True):
+def policy_factor_head(trunk_vec, prefix, hidden=256, leak=0.05):
+    """Return 5 factorized Dense logits for a policy head."""
     x = trunk_vec
     if hidden:
-        x = layers.Dense(hidden, name=f"{name}_dense1")(x)
-        x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    logits = layers.Dense(n_moves, name=f"{name}_logits")(x)
-    if use_mask:
-        mask_in = layers.Input(shape=(n_moves,), dtype="float32", name=f"{name}_mask")
-        masked_logits = layers.Add(name=f"{name}_masked_logits")(
-            [logits, (1.0 - mask_in) * (-1e9)]
-        )
-        
-        probs = layers.Activation("softmax", name=name)(masked_logits)
-        return probs, "categorical_crossentropy", mask_in
-    else:
-        probs = layers.Activation("softmax", name=name)(logits)
-        return probs, "categorical_crossentropy", None
+        x = layers.Dense(hidden, name=f"{prefix}_dense1")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{prefix}_lrelu1")(x)
+
+    from_logits = layers.Dense(64, name=f"{prefix}_from")(x)
+    to_logits = layers.Dense(64, name=f"{prefix}_to")(x)
+    piece_logits = layers.Dense(6,  name=f"{prefix}_piece")(x)
+    cap_logits = layers.Dense(7,  name=f"{prefix}_cap")(x)
+    promo_logits = layers.Dense(5,  name=f"{prefix}_promo")(x)
+
+    return [from_logits, to_logits, piece_logits, cap_logits, promo_logits]
 
 
-def count_vec_head(trunk_vec, name, shape, leak=0.05):
-    x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
-    x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    out = layers.Dense(shape, activation="softplus", name=name)(x)
-    return out, "poisson"
-
-
-def binary_head(trunk_vec, name, shape=1, leak=0.05):
-    x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
-    x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    out = layers.Dense(shape, activation="sigmoid", name=name)(x)
-    return out, "binary_crossentropy"
-
-
-def regression_head(trunk_vec, name, shape=1, leak=0.05):
-    x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
-    x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    out = layers.Dense(shape, activation="linear", name=name)(x)
-    return out, "mse"
-
-
-def probe_head(trunk_vec, name, leak=0.05):
-    x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
-    x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    # mirror your ResNet behavior
-    if name == "hanging_opp_value":
-        out = layers.Dense(1, activation="linear", name=name)(x); loss = "mse"
-    else:
-        out = layers.Dense(1, activation="sigmoid", name=name)(x)
-        loss = "binary_crossentropy"
-    det = layers.Lambda(lambda t: tf.stop_gradient(t), name=f"sg_{name}")(out)
-    return out, loss, det
-
-
-def piece_to_move_head(trunk_vec, leak=0.05, name="piece_to_move"):
-    x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
-    x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
-    out = layers.Dense(6, activation="softmax", name=name)(x)  # P,N,B,R,Q,K
-    return out, tf.keras.losses.CategoricalCrossentropy()
-
-# -------------------------
-# Builder with aux configs
-# -------------------------
-
-def build_transformer_full_with_aux(
-    vocab_size=32, seq_len=70, d_model=128, num_heads=4, num_layers=4, ff_dim=128,
-    n_moves=4672, use_mask=True, aux_configs=None, aux_into_heads=False,
-    aux_weight=0.1, value_weight=1.0, policy_weight=1.0, drop_rate=0.1
+def make_big_model(
+    seq_len=70, vocab_size=64, d_model=128, num_heads=4, num_layers=4, ff_dim=512
 ):
-    
-    if aux_configs is None:
-        aux_configs = []
 
     stump = make_transformer_stump(
-        vocab_size=vocab_size, seq_len=seq_len, d_model=d_model, num_heads=num_heads, 
-        num_layers=num_layers, ff_dim=ff_dim, drop_rate=drop_rate
+        vocab_size, seq_len, d_model, num_heads, num_layers, ff_dim
     )
-
+    
     tokens_in = stump.input
-    trunk_seq, trunk_vec = stump.output  # [B,seq,C], [B,C]
-
-    # Collect probe dets for optional stop-grad concat
-    probe_dets = []
-
-    outputs = {}
-    losses = {}
-    loss_weights = {}
-
-    # Main value & policy heads (heads see stump_vec; optionally augmented with probe_dets)
-    head_base = trunk_vec
-
-    # First pass: build aux heads; collect dets for concat if requested
-    for kind, name, shape in aux_configs:
-        if kind == "count":
-            out, loss = count_vec_head(trunk_vec, name, shape)
-            outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
-
-        elif kind == "binary":
-            out, loss = binary_head(trunk_vec, name, shape)
-            outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
-
-        elif kind == "regression":
-            out, loss = regression_head(trunk_vec, name, shape)
-            outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
-
-        elif kind == "probe":
-            out, loss, det = probe_head(trunk_vec, name)
-            outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
-            probe_dets.append(det)
-
-        elif kind == "piece_to_move":
-            out, loss = piece_to_move_head(trunk_vec, name=name)
-            outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
-
-        else:
-            raise ValueError("unknown aux kind: " + str(kind))
-
-    if aux_into_heads and probe_dets:
-        head_base = layers.Concatenate(name="head_feat_concat")(
-            [trunk_vec] + [layers.Lambda(lambda t: t)(d) for d in probe_dets]
-        )
+    trunk_seq, trunk_vec = stump.output
 
     # Value head
-    value_out, v_loss = value_head(head_base, hidden=128, name="value")
-    outputs["value"] = value_out; losses["value"] = v_loss
-    loss_weights["value"] = value_weight
+    val_out, _ = value_head(trunk_vec, hidden=256)
 
-    # Policy head (masked softmax)
-    policy_out, p_loss, mask_in = policy_head(
-        head_base, n_moves=n_moves, hidden=128, name="policy", use_mask=use_mask
-    )
-    
-    outputs["policy"] = policy_out; losses["policy"] = p_loss
-    loss_weights["policy"] = policy_weight
+    # Best/worst move heads (factorized)
+    best_outputs  = policy_factor_head(trunk_vec, prefix="best")
 
-    inputs = [tokens_in] + ([mask_in] if mask_in is not None else [])
-    model = Model(inputs=inputs, outputs=outputs, name="transformer_with_aux")
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(3e-4), loss=losses, loss_weights=loss_weights
-    )
-    
-    model._head_losses = dict(losses)
-    model._head_loss_weights = dict(loss_weights)
-    model.attn_maps = stump.attn_maps
+    model = Model(tokens_in, [val_out] + best_outputs, name="big_tf")
     return model
 
-
-# 1) choose your aux heads
-aux_configs = [
-    # king exposure bundle (2 = [mine, theirs])
-    ('count',  'king_ray_exposure',          2),
-    ('count',  'king_ring_pressure',         2),
-    ('count',  'king_pawn_shield',           2),
-    ('count',  'king_escape_square',         2),
-
-    # pawns
-    ('count',  'pawn_undefended',            2),
-    ('count',  'pawn_hanging',               2),
-    ('count',  'pawn_en_prise',              2),
-
-    # knights
-    ('count',  'knight_undefended',          2),
-    ('count',  'knight_hanging',             2),
-    ('count',  'knight_en_prise',            2),
-    ('count',  'knight_attacked_by_lower_value', 2),
-
-    # bishops
-    ('count',  'bishop_undefended',          2),
-    ('count',  'bishop_hanging',             2),
-    ('count',  'bishop_en_prise',            2),
-    ('count',  'bishop_attacked_by_lower_value', 2),
-
-    # rooks
-    ('count',  'rook_undefended',            2),
-    ('count',  'rook_hanging',               2),
-    ('count',  'rook_en_prise',              2),
-    ('count',  'rook_attacked_by_lower_value', 2),
-
-    # queens (binary but per-side , shape=2 vector)
-    ('binary', 'queen_undefended',           2),
-    ('binary', 'queen_hanging',              2),
-    ('binary', 'queen_en_prise',             2),
-    ('binary', 'queen_attacked_by_lower_value', 2),
-
-    # material (pair)
-    ('count',  'material',                   2),
-    ('piece_to_move', 'piece_to_move', 6)
-]
-
-
-# -------------------------
-# Utilities: adjust head weights on the fly
-# -------------------------
-
-def set_head_weights(model, new_weights):
-    curr = getattr(model, "_head_loss_weights", None)
-    if curr is None:
-        try:
-            cfg = model.get_compile_config()
-            curr = dict(cfg.get("loss_weights") or {})
-        except Exception:
-            curr = {o.name.split(':')[0].split("/")[0]: 1.0 for o in model.outputs}
-    curr.update(new_weights)
-
-    losses = getattr(model, "_head_losses", None)
-    if losses is None:
-        losses = {}
-        for o in model.outputs:
-            name = o.name.split(':')[0].split("/")[0]
-            losses[name] = "mse" if o.shape[-1] != 1 else "mse"
-
-    model.compile(optimizer=model.optimizer, loss=losses, loss_weights=curr)
-    model._head_loss_weights = dict(curr)
-    
-    
-new_weights = {
-    'king_ray_exposure': 0.05,
-    'king_ring_pressure': 0.1,
-    'king_pawn_shield': 0.1,
-    'king_escape_square': 0.1,
-    'pawn_undefended': 0.1,
-    'pawn_hanging': 0.1,
-    'pawn_en_prise': 0.1,
-    'knight_undefended': 0.1,
-    'knight_hanging': 0.1,
-    'knight_en_prise': 0.1,
-    'knight_attacked_by_lower_value': 0.1,
-    'bishop_undefended': 0.1,
-    'bishop_hanging': 0.1,
-    'bishop_en_prise': 0.1,
-    'bishop_attacked_by_lower_value': 0.1,
-    'rook_undefended': 0.1,
-    'rook_hanging': 0.1,
-    'rook_en_prise': 0.1,
-    'rook_attacked_by_lower_value': 0.1,
-    'queen_undefended': 0.2,
-    'queen_hanging': 0.2,
-    'queen_en_prise': 0.2,
-    'queen_attacked_by_lower_value': 0.2,
-    'material': 0.025,
-    'piece_to_move': 0.05,
-    'value': 3.0,
-    'policy': 5.0
- }
-
-ignore_aux = {k:0.0 for k in new_weights}
-ignore_aux['value'] = 2.0
-ignore_aux['policy'] = 2.0
 
 def evaluate_terminal(board):
     if board.is_checkmate():
@@ -442,7 +230,170 @@ def blend_value_targets(all_Y, outcome, mode="replace", weight=0.5, schedule="li
     return all_Y
 
 
-def collect_stockfish_data(engine, depth=2, n_init=None, n_rand=5):
+def load_model(model_loc):
+    custom = {"TransformerBlock": TransformerBlock}
+    model = keras.models.load_model(model_loc, custom_objects=custom)
+    return model
+#%%
+#model = load_model(os.path.join(MODEL_DIR, "transformer_model_v400.h5"))
+#model = make_big_model()
+#model.summary()
+
+def reload_model_100():
+    losses = {
+        "value": "mse",
+        "best_from": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "best_to": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "best_piece": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "best_cap": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "worst_from": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "worst_to": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "worst_piece": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        "worst_cap": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    }
+    
+    model = load_model(f"C:/Users/Bryan/Data/chessbot_data/models/transformer_model_v2-{100}.h5")
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4, clipnorm=1.0)
+    loss_weights = {
+        "value": 1.0,
+    
+        # Best move heads
+        "best_from": 0.5,
+        "best_to": 0.5,
+        "best_piece": 0.5,
+        "best_cap": 0.2,
+    
+        # Worst move heads
+        "worst_from": 0.5,
+        "worst_to": 0.5,
+        "worst_piece": 0.5,
+        "worst_cap": 0.2
+    }
+    
+    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
+    return model
+
+model = reload_model_100()
+model.summary()
+    
+all_evals = pd.DataFrame()
+#%%
+
+def prepare_data_for_model(X, Y, model, W=None):
+    inputs, outputs, weights = {}, {}, {}
+
+    # Inputs
+    for name, tensor in zip(model.input_names, model.inputs):
+        vals = [x[name] for x in X]
+        arr = np.array(vals, dtype=np.int32)
+        inputs[name] = arr
+
+    # Outputs
+    for name, tensor in zip(model.output_names, model.outputs):
+        vals = [y.get(name, None) for y in Y]
+        # replace None with 0 (dummy class) if needed
+        vals = [0 if v is None else v for v in vals]
+
+        if name == "value":
+            arr = np.array(vals, dtype=np.float32).reshape(-1, 1)
+        else:
+            arr = np.array(vals, dtype=np.int32)
+        outputs[name] = arr
+
+    # Sample weights (optional)
+    if W is not None:
+        for name, tensor in zip(model.output_names, model.outputs):
+            vals = [w.get(name, 1.0) for w in W]   # default weight = 1.0
+            arr = np.array(vals, dtype=np.float32)
+            weights[name] = arr
+
+    if W is not None:
+        return inputs, outputs, weights
+    else:
+        return inputs, outputs
+
+
+def prepare_X(X, model):
+    if not isinstance(X, list):
+        X = [X]
+        
+    inputs = {}
+
+    # Inputs
+    for name, tensor in zip(model.input_names, model.inputs):
+        vals = [x[name] for x in X]   # grab each sample's tokens
+        arr = np.array(vals, dtype=np.int32)
+        inputs[name] = arr
+    
+    return inputs
+        
+        
+def mirror_move(move):
+    return chess.Move(
+        chess.square_mirror(move.from_square),
+        chess.square_mirror(move.to_square),
+        move.promotion
+    )
+
+
+PIECE_MAP = {
+    None: 0, 
+    chess.PAWN: 1,
+    chess.KNIGHT: 2,
+    chess.BISHOP: 3,
+    chess.ROOK: 4,
+    chess.QUEEN: 5,
+    chess.KING: 6,
+}
+
+
+def move_to_labels(board, move):
+    """
+    Convert a move into factorized labels for training.
+    Returns: (from_idx, to_idx, piece_idx, cap_idx, promo_idx)
+    """
+
+    # From / To squares (0..63)
+    from_idx = move.from_square
+    to_idx   = move.to_square
+
+    # Piece to move (0..5)
+    piece = board.piece_type_at(move.from_square)
+    piece_idx = PIECE_MAP[piece]
+
+    # Capture (0..6)
+    cap_idx = 0
+    if board.is_capture(move):
+        captured = board.piece_at(move.to_square)
+        if captured:
+            cap_idx = PIECE_MAP.get(captured.piece_type, 0)
+    
+    promo_idx = PIECE_MAP[move.promotion]
+
+    return from_idx, to_idx, piece_idx, cap_idx
+
+
+def move_distance(moves, best, worst, 
+                  w_from=1.0, w_to=1.0, w_piece=1.0,
+                  alpha=1.0, beta=0.25):
+    """
+    Weighted distance scoring:
+      alpha * (closeness to best) - beta * (closeness to worst)
+    """
+    moves = np.asarray(moves, dtype=float)
+    best  = np.asarray(best, dtype=float)
+    worst = np.asarray(worst, dtype=float)
+
+    W = np.array([w_from, w_to, w_piece])
+
+    d_best  = np.linalg.norm((moves - best)  * W, axis=1)
+    d_worst = np.linalg.norm((moves - worst) * W, axis=1)
+
+    return -alpha * d_best + beta * d_worst
+
+
+engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+def collect_stockfish_data(engine, depth=np.random.randint(2, 6), n_init=None, n_rand=5):
     if n_init is not None:
         board = random_init(n_init)
     else:
@@ -450,121 +401,62 @@ def collect_stockfish_data(engine, depth=2, n_init=None, n_rand=5):
         
     all_X, all_Y = [], []
     while not board.is_game_over():
-        X_tokens = board_to_tokens(board)
-        legal_mask = cbe.legal_mask_8x8x73(board).reshape(-1)
-        all_X.append({'policy_mask': legal_mask, "tokens": X_tokens})
-        
+        # always STM-POV implemented via always white-POV
+        to_score = board if board.turn else board.mirror()
+        X_tokens = board_to_tokens(to_score)
+        all_X.append({"tokens": X_tokens})
+
+        # Run Stockfish multipv analysis
         info_list = engine.analyse(
-            board, multipv=len(list(board.legal_moves)),
+            to_score, multipv=len(list(to_score.legal_moves)),
             limit=chess.engine.Limit(depth=depth),
             info=chess.engine.Info.ALL
         )
+
+        # TARGETS
+        Y = {}
+
+        # 1. Value head target
+        # Scale Stockfish score to [-1, 1]
+        Y["value"] = cbe.score_to_cp_white(info_list[0]["score"])
+
+        # 2. Best move (from multipv=1)
+        best_move = info_list[0]["pv"][0]
+        from_idx, to_idx, piece_idx, cap_idx = move_to_labels(to_score, best_move)
         
-        Y = cbe.build_training_targets_value_policy(board, info_list)
-        Y.update(feats.all_king_exposure_features(board))
-        Y.update(feats.all_piece_features(board))
-        Y['material'] = feats.get_piece_value_sum(board)
-        Y['piece_to_move'] = cbe.piece_to_move_target(board, Y['policy_logits'])
+        Y["best_from"] = from_idx
+        Y["best_to"] = to_idx
+        Y["best_piece"] = piece_idx
+        Y["best_cap"] = cap_idx
+
+        # 3. Worst move (lowest eval in multipv)
+        worst_move = info_list[-1]["pv"][0]
+        from_idx, to_idx, piece_idx, cap_idx = move_to_labels(to_score, worst_move)
+        
+        Y["worst_from"] = from_idx
+        Y["worst_to"] = to_idx
+        Y["worst_piece"] = piece_idx
+        Y["worst_cap"] = cap_idx
+
         all_Y.append(Y)
-        
-        move_to_make = random.choice(info_list[:n_rand])['pv'][0]
-        
+
+        # Pick a move to play to continue the game (random among top-n_rand)
+        move_to_make = random.choice(info_list[:n_rand])["pv"][0]
+        if not board.turn:
+            move_to_make = mirror_move(move_to_make)
+            
         board.push(move_to_make)
-        
+
     return all_X, all_Y
-
-
-def prepare_data_for_model(X, Y, model):
-    inputs, outputs = {}, {}
-
-    # Inputs
-    for name, tensor in zip(model.input_names, model.inputs):
-        vals = [x[name] for x in X]
-        arr = np.array(vals)
-
-        # Flatten mask to (B,4672)
-        if name == "policy_mask":
-            arr = arr.reshape(len(X), -1)
-        # Ensure sequence length matches
-        exp_len = tensor.shape[1]
-        if arr.shape[1] != exp_len:
-            raise ValueError(f"Input {name} has shape {arr.shape}, expected length {exp_len}")
-
-        inputs[name] = arr
-
-    # Outputs
-    for name, tensor in zip(model.output_names, model.outputs):
-        key = "policy_logits" if name == "policy" else name
-        vals = [y[key] for y in Y]
-        arr = np.array(vals)
-
-        # Flatten policy targets
-        if name == "policy":
-            arr = arr.reshape(len(Y), -1)
-
-        # Ensure trailing dim matches
-        exp_dim = tensor.shape[1]
-        if arr.shape[1] != exp_dim:
-            raise ValueError(f"Output {name} has shape {arr.shape}, expected dim {exp_dim}")
-
-        outputs[name] = arr
-
-    return inputs, outputs
-
-
-def prepare_X(X, model):
-    inputs =  {}
-
-    # Inputs
-    for name, tensor in zip(model.input_names, model.inputs):
-        vals = [x[name] for x in X]
-        arr = np.array(vals)
-
-        # Flatten mask to (B,4672)
-        if name == "policy_mask":
-            arr = arr.reshape(len(X), -1)
-
-        # Ensure sequence length matches
-        exp_len = tensor.shape[1]
-        if arr.shape[1] != exp_len:
-            raise ValueError(f"Input {name} has shape {arr.shape}, expected length {exp_len}")
-
-        inputs[name] = arr
-    
-    return inputs
-
-
-def load_model(model_loc):
-    custom = {
-        "masked_policy_ce": masked_policy_ce,
-        "TransformerBlock": TransformerBlock,
-    }
-    model = keras.models.load_model(model_loc, custom_objects=custom)
-    return model
-
-
 #%%
-# build model
-n_moves = 4672  # your move-index space
-#model = build_transformer_full_with_aux(
-#     vocab_size=16, seq_len=70, d_model=256, num_heads=4, num_layers=4, ff_dim=256,
-#     n_moves=n_moves, use_mask=True, aux_configs=aux_configs,
-#     aux_into_heads=False, aux_weight=0.05, value_weight=2.0, policy_weight=2.0
-# )
 
-import os
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
-model = load_model(os.path.join(MODEL_DIR, "transformer_model_v400.h5"))
-#set_head_weights(model, ignore_aux)
-all_evals = pd.DataFrame()
-#%%
 # phase 1: learn from stockfish evaluations
-for outer in range(301, 401):
+for outer in range(1, 101):
     with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
         all_X, all_Y = [], []
         for game in range(10):
             print(f"Outer {outer} game {game}: {len(all_X)} positions so far")
-            X, Y = collect_stockfish_data(engine, depth=3, n_init=20, n_rand=6+game)
+            X, Y = collect_stockfish_data(engine, n_rand=6+game)
             all_X += X
             all_Y += Y
         
@@ -574,7 +466,7 @@ for outer in range(301, 401):
         all_evals = pd.concat([all_evals, eval_df])
         
         if len(all_evals) and (len(all_evals) % 5 == 0):
-            cbu.plot_training_progress(all_evals)
+           cbu.plot_training_progress(all_evals)
         
         # train (no val)
         model.fit(inputs, outputs, batch_size=512, epochs=2, shuffle=True)
@@ -583,8 +475,516 @@ for outer in range(301, 401):
         
         if outer % 50 == 0:
             model.save(
-                f"C:/Users/Bryan/Data/chessbot_data/models/transformer_model_v{outer}.h5"
+                f"C:/Users/Bryan/Data/chessbot_data/models/transformer_model_v2-{outer}.h5"
             )
+# #%%
+# def score_to_cp_rel(board_score):
+#     rel = board_score.relative
+    
+#     #check for mates
+#     if rel.score() is None:
+#         return np.clip(rel.score(mate_score=16), -10, 10) / 10
+        
+#     else:
+#         return np.clip(rel.score() / 1000, -0.95, 0.95)
+
+
+# def choose_move(model, board, sf_eval, top_n=3):
+#     # mirror board for STM-POV
+#     to_score = board if board.turn else board.mirror()
+#     tokens = {"tokens": board_to_tokens(to_score)}
+#     inputs = prepare_X([tokens], model)
+
+#     # predictions -> dict
+#     raw_preds = model.predict(inputs, verbose=0)
+#     preds = {name: arr for name, arr in zip(model.output_names, raw_preds)}
+    
+#     value = raw_preds[model.output_names.index("value")].item()
+#     if not board.turn:
+#         value = -1*value
+#     print(f"Model estimate of postion: {value: <.3}")
+
+#     # best & worst triples
+#     best = np.array([
+#         preds["best_from"].argmax(axis=1)[0],
+#         preds["best_to"].argmax(axis=1)[0],
+#         preds["best_piece"].argmax(axis=1)[0],
+#     ])
+#     worst = np.array([
+#         preds["worst_from"].argmax(axis=1)[0],
+#         preds["worst_to"].argmax(axis=1)[0],
+#         preds["worst_piece"].argmax(axis=1)[0],
+#     ])
+
+#     # legal moves → triples
+#     legal_moves = []
+#     moves_list = list(to_score.legal_moves)
+    
+#     for mv in moves_list:
+#         piece = to_score.piece_type_at(mv.from_square) - 1
+#         legal_moves.append([mv.from_square, mv.to_square, piece])
+#     legal_moves = np.array(legal_moves)
+
+#     # score moves
+#     scores = move_distance(legal_moves, best, worst, alpha=1.0, beta=0.0)
+
+#     # pick top-N
+#     top_idx = np.argsort(-scores)[:top_n]
+#     moves, scores = [moves_list[i] for i in top_idx], scores[top_idx]
+    
+#     if not board.turn:
+#         moves = [mirror_move(mv) for mv in moves]
+        
+#     out = [[m, s] for m, s in zip(moves, scores)]
+#     sf_moves = [s['pv'][0] for s in sf_eval]
+#     sf_scores = [score_to_cp_rel(s['score']) for s in sf_eval]
+    
+#     print("\n--- Model vs Stockfish ---")
+#     for i in range(min(top_n, len(out))):        
+#         uci_move = out[i][0]
+#         san_move = board.san(uci_move)
+#         sf_index = sf_moves.index(uci_move)
+#         sf_score = sf_scores[sf_index]
+#         sf_rank = sf_index + 1
+#         print(f"{i+1}. {uci_move} ({san_move}) SF: {sf_score: <.3} Rank: {sf_rank}")
+        
+#     print("--------------------------\n")
+#     best_move = out[0][0]
+#     return best_move
+    
+# #%%
+# from IPython.display import display, clear_output, SVG
+# import chess.svg, chess.pgn
+# import chessbot.utils as cbu
+# import chessbot.encoding as cbe
+# import numpy as np
+
+# bot_color = np.random.uniform() < 0.5
+# board = chess.Board()
+# with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
+#     while not board.is_game_over():
+#         clear_output(wait=True)
+#         display(SVG(chess.svg.board(board=board, flipped=not bot_color)))
+        
+#         sf_eval = engine.analyse(
+#             board, multipv=len(list(board.legal_moves)), limit=chess.engine.Limit(depth=3),
+#             info=chess.engine.Info.ALL
+#         )
+        
+#         print(f"Current Eval: {cbe.score_to_cp_white(sf_eval[0]['score']):.<3}")
+#         time.sleep(0.75)
+#         if board.turn == bot_color:
+#             best_move = choose_move(model, board, sf_eval, top_n=5)
+#             print()
+#             board.push(best_move)
+#             time.sleep(2.0)
+            
+#         else:
+#             sf_move = random.choice(sf_eval[:3])['pv'][0]
+#             san = board.san(sf_move)
+#             board.push(sf_move)
+#             time.sleep(2.0)
+#%%
+import json
+from datetime import datetime
+
+LOGFILE = "C:/Users/Bryan/Data/chessbot_data/self_play_stats.jsonl"
+def log_game_stats(games, epoch=None):
+    log_path = LOGFILE
+    
+    # Create/initialize empty file
+    if not os.path.exists(log_path):
+        os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
+        with open(LOGFILE, "w") as f:
+            pass
+    
+    stats = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "epoch": epoch,
+        "n_games": len(games),
+        "white_wins": 0,
+        "black_wins": 0,
+        "draws": 0,
+        "avg_length": 0,
+    }
+    lengths = []
+    for g in games:
+        if g.outcome > 0:
+            stats["white_wins"] += 1
+        elif g.outcome < 0:
+            stats["black_wins"] += 1
+        else:
+            stats["draws"] += 1
+        lengths.append(len(g.board.move_stack))
+
+    if lengths:
+        stats["avg_length"] = float(np.mean(lengths))
+
+    # append to JSONL
+    with open(log_path, "a") as f:
+        f.write(json.dumps(stats) + "\n")
+
+    return stats
+
+
+def get_legal_labels(board, moves):
+    N = len(moves)
+    f, t, pc, cp = np.zeros(N, int), np.zeros(N, int), np.zeros(N, int), np.zeros(N, int)
+    for i, mv in enumerate(moves):
+        f[i], t[i], pc[i], cp[i] = move_to_labels(board, mv)
+    return {"from":f, "to":t, "piece":pc, "cap":cp}
+
+# legal_labels = get_legal_label(to_score, moves_list)
+# priors_best, priots_worst = compute_move_priors( model_outputs, legal_labels)
+def compute_move_priors(model_outputs, legal_labels, weights=None):
+    """
+    model_outputs   : dict of np.arrays (softmax probs) for each head
+                      e.g. {"best_from": (64,), "best_to": (64,), ...}
+    legal_labels    : dict of arrays, each shaped (N_moves,)
+                      e.g. {"from": [12,14,...], "to": [...], "piece": [...], ...}
+    weights         : dict of per-head importance, defaults tuned for chess
+    
+    Returns:
+        priors_best  : np.array (N_moves,) priors from best head
+        priors_worst : np.array (N_moves,) priors from worst head
+    """
+    if weights is None:
+        weights = {"from":1.0, "to":1.0, "piece":0.5, "cap":0.25}
+
+    N = len(legal_labels["from"])
+
+    # Stack indices for advanced indexing
+    # e.g. for "from" head: probs[from_indices]
+    priors_best = np.zeros(N, dtype=np.float32)
+    priors_worst = np.zeros(N, dtype=np.float32)
+
+    for factor in ["from","to","piece","cap"]:
+        # Get indices of legal moves for this factor
+        idxs = legal_labels[factor]
+
+        # Look up probs for each legal move at those indices
+        p_best  = model_outputs[f"best_{factor}"][idxs]
+        p_worst = model_outputs[f"worst_{factor}"][idxs]
+
+        # Avoid log(0)
+        p_best  = np.clip(p_best,  1e-9, 1.0)
+        p_worst = np.clip(p_worst, 1e-9, 1.0)
+
+        # Accumulate weighted log-likelihood
+        priors_best  += weights[factor] * np.log(p_best)
+        priors_worst += weights[factor] * np.log(p_worst)
+
+    # Convert back from log-scores to priors
+    priors_best  = np.exp(priors_best  - np.max(priors_best))
+    priors_worst = np.exp(priors_worst - np.max(priors_worst))
+
+    # Normalize
+    priors_best  /= priors_best.sum()
+    priors_worst /= priors_worst.sum()
+
+    return priors_best, priors_worst
+
+
+class SelfPlayGame:
+    def __init__(self, n_init=0, move_limit=80, prevent_repetition=False, **kwargs):
+        self.game_id = str(uuid.uuid4())
+        self.board = random_init(n_init)
+        self.init_fen = self.board.fen()
+        self.move_limit = move_limit
+        
+        self.prevent_repetition = prevent_repetition
+        self.pos_move_counter = defaultdict(int)
+        self.pos_counter = defaultdict(int)
+        self.move_counter = defaultdict(int)
+
+        self.training_X = []
+        self.training_Y = []
+        self.sample_weights = []
+
+        self.outcome = None
+        self.game_complete = False
+
+        self.mat_adv_counter = 0  # track 7-pt lead persistence
+        self.draw_score = kwargs.get("draw_score", 0.0)
+
+    def short_fen(self, fen=None):
+        f = self.board.fen() if fen is None else fen
+        return " ".join(f.split(" ")[:4])
+
+    def check_termination(self):
+        claim_draw = len(self.board.move_stack) > 60
+        if self.board.is_game_over(claim_draw=claim_draw):
+            print(self.game_id, "Game over detected:", self.board.result(), self.board.fen())
+            self.outcome = evaluate_terminal(self.board)
+            return True
+    
+        white_mat, black_mat = feats.get_piece_value_sum(self.board)
+        mat_diff = 10*white_mat - 10*black_mat
+        if abs(mat_diff) >= 9:
+            self.mat_adv_counter += 1
+        else:
+            self.mat_adv_counter = 0
+    
+        if self.mat_adv_counter >= 7:
+            print(self.game_id, "Material cutoff:", mat_diff)
+            self.outcome = 1.0 if mat_diff > 0 else -1.0
+            return True
+    
+        if self.board.fullmove_number > self.move_limit:
+            print(self.game_id, "Move limit reached:", self.board.fullmove_number)
+            self.outcome = 0.0
+            return True
+    
+        return False
+
+    def record_position(self):
+        # STM-POV: mirror if Black to move
+        to_score = self.board if self.board.turn else self.board.mirror()
+        tokens = board_to_tokens(to_score)
+
+        self.training_X.append({"tokens": tokens})
+        
+        # labels filled in later (after outcome known)
+        self.training_Y.append({
+            'value': None, 'best_from': None, 'best_to': None, 'best_piece': None,
+            'best_cap': None, 'worst_from': None, 'worst_to': None, 'worst_piece': None,
+            'worst_cap': None
+        })
+        
+        self.sample_weights.append({
+            'value': 0.1, 'best_from': 0.0, 'best_to': 0.0, 'best_piece': 0.0,
+            'best_cap': 0.0, 'worst_from': 0.0, 'worst_to': 0.0, 'worst_piece': 0.0,
+            'worst_cap': 0.0
+        })
+
+    def get_premove_data(self):
+        if self.check_termination():
+            self.finalize_outcome()
+            return [], []
+        
+        # always collect
+        self.record_position()
+        
+        meta = [self.game_id]
+        X = self.training_X[-1:]
+        # this gets sent to the batch, move made when preds are returned
+        return X, meta    
+    
+    def make_move(self, preds, top_n=1):
+        """
+        Select and push a move given model predictions for this position.
+        raw_preds: list/array of outputs for ONE sample (from the batch)
+        """
+        
+        short_fen = self.short_fen()
+        self.pos_counter[short_fen] += 1
+        
+        # extract best/worst anchors
+        best = np.array([
+            preds["best_from"].argmax(),
+            preds["best_to"].argmax(),
+            preds["best_piece"].argmax(),
+        ])
+        worst = np.array([
+            preds["worst_from"].argmax(),
+            preds["worst_to"].argmax(),
+            preds["worst_piece"].argmax(),
+        ])
+    
+        # build legal-move triples
+        to_score = self.board if self.board.turn else self.board.mirror()
+        moves_list = list(to_score.legal_moves)
+        
+        # prevent threefold by storing pos + move and if that combo has been encountered
+        if self.prevent_repetition:
+            repeated = []
+            for lm in list(self.board.legal_moves):
+                if self.pos_move_counter[(short_fen, lm)] >= 2:
+                    repeated.append(lm)
+                    
+                # # check the san too
+                if self.move_counter[self.board.san(lm)] >= 2:
+                    repeated.append(lm)
+            
+            # if there are no non-repeating moves, end game in draw
+            if len(repeated) == len(moves_list):
+                self.outcome = self.draw_score
+                self.finalize_outcome()
+                return None, None
+            
+            if repeated:
+                # flip and subset moves_list
+                disallow = [m if self.board.turn else mirror_move(m) for m in repeated]
+                moves_list = [m for m in moves_list if m not in disallow]
+            
+        legal_triples = []
+        for mv in moves_list:
+            piece = to_score.piece_type_at(mv.from_square) - 1
+            legal_triples.append([mv.from_square, mv.to_square, piece])
+        legal_triples = np.array(legal_triples)
+    
+        # score by distance
+        scores = move_distance(
+            legal_triples, best, worst,
+            w_from=1.0, w_to=1.0, w_piece=1.0,  alpha=1.0, beta=0.01
+        )
+    
+        # pick top-N
+        top_idx = np.argsort(-scores)[:top_n]
+        moves, scores = [moves_list[i] for i in top_idx], scores[top_idx]
+    
+        # unmirror back if it was Black’s turn
+        if not self.board.turn:
+            moves = [mirror_move(mv) for mv in moves]
+        
+        chosen = random.choice(moves) if top_n > 1 else moves[0]
+        # push best move
+        self.move_counter[self.board.san(chosen)] += 1
+        self.board.push(chosen)
+        self.pos_move_counter[(short_fen, chosen)] += 1
+        
+        # record move info in the last Y slot
+        from_idx, to_idx, piece_idx, cap_idx = move_to_labels(self.board, chosen)
+    
+        self.training_Y[-1].update({
+            "from": from_idx,
+            "to": to_idx,
+            "piece": piece_idx,
+            "cap": cap_idx,
+            "move": chosen,   # keep the actual move object too
+        })
+    
+        return chosen, scores[moves.index(chosen)]
+    
+    def finalize_outcome(self):
+        good_factors = ["best_from","best_to","best_piece","best_cap"]
+        bad_factors = ["worst_from","worst_to","worst_piece","worst_cap"]
+        stm = True  # White POV
+        for x, y, w in zip(self.training_X, self.training_Y, self.sample_weights):
+            # always set value from White’s perspective
+            y["value"] = self.outcome if stm else -self.outcome
+            
+            if self.outcome == 0:
+                w['value'] = 0.005
+            
+            elif (self.outcome > 0 and stm) or (self.outcome < 0 and not stm):
+                # winning side → good move
+                y["best_from"] = y.pop("from")
+                y["best_to"]   = y.pop("to")
+                y["best_piece"]= y.pop("piece")
+                y["best_cap"]  = y.pop("cap")
+                w.update({k:0.1 for k in good_factors})
+            else:
+                # losing side → bad move
+                y["worst_from"] = y.pop("from")
+                y["worst_to"]   = y.pop("to")
+                y["worst_piece"]= y.pop("piece")
+                y["worst_cap"]  = y.pop("cap")
+                w.update({k:0.01 for k in bad_factors})
+    
+            stm = not stm
+        self.game_complete = True
+        
+    def show_board(self, flipped=False, sleep=0.1):
+        clear_output(wait=True)
+        display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
+        time.sleep(sleep)
+
+
+def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
+    games = []
+    for _ in range(n_games):
+        n_init = kwargs.get("n_init", np.random.randint(3, 15))
+        games.append(SelfPlayGame(n_init=n_init, prevent_repetition=True))
+                 
+    all_finished = []
+    train_X, train_Y, train_W = [], [], []
+    while games:
+        this_X, this_meta = [], []
+    
+        for g in games:
+            if not g.game_complete:
+                X, meta = g.get_premove_data()
+                this_X += X
+                this_meta += meta
+    
+        finished = [g for g in games if g.game_complete]
+        all_finished += finished
+        for g in finished:
+            train_X += g.training_X
+            train_Y += g.training_Y
+            train_W += g.sample_weights
+            
+        games = [g for g in games if not g.game_complete]
+    
+        if not this_X:
+            break
+        
+        # predict and store
+        if this_X:
+            to_predict = prepare_X(this_X, model)
+            raw_preds = model.predict(to_predict, batch_size=256, verbose=0)
+            preds = {name: arr for name, arr in zip(model.output_names, raw_preds)}
+            
+            preds_lookup = {}
+            for i, g_id in enumerate(this_meta):
+                preds_lookup[g_id] = {k:v[i] for k, v in preds.items()}
+        
+        # make the moves
+        for game in games:
+            game.make_move(preds_lookup[game.game_id], kwargs.get("top_n", 1))
+        
+        # show the game
+        if show and games:
+            game = games[0]
+            games[0].show_board(sleep=0.0)
+        
+        # drain the list once more
+        finished = [g for g in games if g.game_complete]
+        all_finished += finished
+        for g in finished:
+            train_X += g.training_X
+            train_Y += g.training_Y
+            train_W += g.sample_weights
+            
+        games = [g for g in games if not g.game_complete]
+    
+    # we get here once its done with every game
+    inputs, outputs, weights = prepare_data_for_model(train_X, train_Y, model, train_W)
+    if return_games:
+        return inputs, outputs, weights, all_finished
+    
+    else:
+        return inputs, outputs, weights
+
+i, o, w, g = self_play_batch(model, n_games=1, show=True, return_games=True)
+#%%
+#model = reload_model_100()
+#%%
+for outer in range(1, 50):
+    inputs, outputs, weights, games = self_play_batch(
+        model, n_games=128, show=True, return_games=True, top_n=2
+    )
+    
+    stats = log_game_stats(games, epoch=outer)
+    print(stats)
+
+    eval_df = cbu.score_game_data(model, inputs, outputs)
+    all_evals = pd.concat([all_evals, eval_df])
+    
+    if len(all_evals) and (len(all_evals) % 5 == 0):
+        cbu.plot_training_progress(all_evals)
+    
+    # train (no val)
+    model.fit(
+        inputs, outputs, sample_weight=weights,
+        batch_size=512, epochs=1, shuffle=True
+    )
+
+    if outer % 50 == 0:
+        model.save(
+            f"C:/Users/Bryan/Data/chessbot_data/models/transformer_model_selfplay_v{outer}.h5"
+        )
 
 #%%
 # phase 2: stockfish eval on self play games
@@ -813,434 +1213,7 @@ for outer in range(401, 501):
                 f"C:/Users/Bryan/Data/chessbot_data/models/transformer_model_v{outer}.h5"
             )
 
-#%%
-#model.save("C:/Users/Bryan/Data/chessbot_data/models/transformer_model_initial.h5")
 
-#%%  
-    
-def choose_move(model, board, sf_info, top_n=3):
-    moves, all_X = [], []
-    checkmate_found = False
-    checkmate_move = None
-
-    for move in list(board.legal_moves):
-        board.push(move)
-        if board.is_game_over():
-            board.pop()
-            checkmate_found = True
-            checkmate_move = move
-            break
-
-        X_tokens = board_to_tokens(board)
-        legal_mask = cbe.legal_mask_8x8x73(board).reshape(-1)
-        all_X.append({'policy_mask': legal_mask, "tokens": X_tokens})
-        moves.append(move)
-        board.pop()
-    
-    if checkmate_found:
-        print(f"Checkmate found , playing {board.san(checkmate_move)}")
-        return checkmate_move
-
-    # Model predictions
-    X = prepare_X(all_X, model)
-    preds = model.predict(X, verbose=0)['value'].reshape(-1)
-
-    # Decide ranking direction
-    if board.turn:  # White , higher is better
-        top_idx = np.argsort(-preds)[:top_n]
-    else:           # Black , lower is better
-        top_idx = np.argsort(preds)[:top_n]
-
-    # Pre-compute SF move ranking (dict: move , rank)
-    sf_ranking = {}
-    for i, entry in enumerate(sf_info, start=1):
-        if "pv" in entry and entry["pv"]:
-            mv = entry["pv"][0]
-            sf_ranking[mv] = i
-
-    print("\n--- Model vs Stockfish ---")
-    chosen_move = None
-    for rank, idx in enumerate(top_idx, start=1):
-        mv = moves[idx]
-        san = board.san(mv)
-        val = preds[idx]
-
-        # Stockfish CP and rank if available
-        sf_rank = sf_ranking.get(mv, None)
-        sf_score = None
-        for entry in sf_info:
-            if "pv" in entry and entry["pv"] and entry["pv"][0] == mv:
-                sf_score = cbe.score_to_cp_white(entry["score"])
-                break
-
-        if sf_rank is not None:
-            print(f"Model#{rank}: {san:5s} val={val:+.3f} | SF={sf_score:+.2f} (rank {sf_rank})")
-        else:
-            print(f"Model#{rank}: {san:5s} val={val:+.3f} | SF=--- (not in top list)")
-
-        if rank == 1:
-            chosen_move = mv
-
-    print("--------------------------\n")
-    return chosen_move
-
-bot_color = np.random.uniform() < 0.5
-board = random_init(2)
-with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-    while not board.is_game_over():
-        clear_output(wait=True)
-        display(SVG(chess.svg.board(board=board, flipped=not bot_color)))
-        time.sleep(0.75)
-        
-        sf_eval = engine.analyse(
-            board, multipv=len(list(board.legal_moves)), limit=chess.engine.Limit(depth=1),
-            info=chess.engine.Info.ALL
-        )
-        
-        if board.turn == bot_color:
-            best_move = choose_move(model, board, sf_eval)
-            moves = sf_eval[:3]
-            board.push(best_move)
-            time.sleep(1.5)
-            
-        else:
-            sf_move = sf_eval[0]['pv'][0]
-            san = board.san(sf_move)
-            board.push(sf_move)
-            time.sleep(0.75)
-#%%
-MCTS_CACHE = {}
-#%%
-class MCTSNode:
-    def __init__(self, board, parent=None, move=None):
-        self.board = board
-        self.parent = parent
-        self.move = move
-
-        # Children bookkeeping
-        self.moves = []        # list of moves in same order as arrays
-        self.children = []     # list of MCTSNode objects
-        self.N = np.zeros(0)   # visits
-        self.W = np.zeros(0)   # total value
-        self.P = np.zeros(0)   # priors
-
-        self.value = None
-        self.short_fen = " ".join(board.fen().split(" ")[:4])
-
-    def average_values(self):
-        return np.divide(self.W, self.N, out=np.zeros_like(self.W), where=self.N>0)
-
-    
-    def get_short_fen(self, board):
-        return " ".join(board.fen().split(" ")[:4])
-    
-    def five_or_less(self, board):
-        return len(board.piece_map()) <= 5
-    
-    def lookup_endgame(self):
-        with chess.syzygy.open_tablebase(self.endgame_loc) as tablebase:
-            # boost endgame scores by 1.5
-            result = 1.5*np.clip(tablebase.probe_wdl(self.board), -1, 1)
-        return result if self.board.turn else -1*result
-        
-    def is_fully_expanded(self):
-        return len(self.children) == len(list(self.board.legal_moves))
-
-    def average_value(self):
-        return self.value_sum / self.visits if self.visits > 0 else 0.0
-    
-    def predict_with_priors(self, model, legal_moves=None):
-        # Cache check
-        if self.short_fen in MCTS_CACHE:
-            self.value, self.P = MCTS_CACHE[self.short_fen]
-            return self.value
-    
-        if legal_moves is None:
-            legal_moves = list(self.board.legal_moves)
-    
-        # Terminal state
-        if self.board.is_game_over():
-            self.value = 2 * evaluate_terminal(self.board)
-            n = len(legal_moves)
-            self.P = np.full(n, 1.0 / n, dtype=np.float32) if n > 0 else np.array([], dtype=np.float32)
-            MCTS_CACHE[self.short_fen] = (self.value, self.P)
-            return self.value
-    
-        # Endgame tablebase
-        if self.five_or_less(self.board):
-            self.value = self.lookup_endgame()
-            n = len(legal_moves)
-            self.P = np.full(n, 1.0 / n, dtype=np.float32)
-            MCTS_CACHE[self.short_fen] = (self.value, self.P)
-            return self.value
-    
-        # NN eval
-        legal_mask = cbe.legal_mask_8x8x73(self.board).reshape(-1)
-        X = {'tokens': board_to_tokens(self.board), 'policy_mask': legal_mask}
-        #preds = model.predict(prepare_X([X], model), verbose=0)
-    
-        #self.value = preds['value'][0][0]
-        self.value = np.random.uniform(-1, 1)
-        #policy = preds['policy'][0].reshape((8, 8, 73))
-        policy = np.random.uniform(0, 1, size=(8, 8, 73))
-    
-        # Align priors with move order
-        self.moves = legal_moves
-        self.P = np.array(
-            [policy[cbe.move_to_8x8x73(m, self.board)] for m in legal_moves],
-            dtype=np.float32
-        )
-    
-        # Cache
-        MCTS_CACHE[self.short_fen] = (self.value, self.P)
-        return self.value
-    
-    def expand(self, model):
-        if self.children:  # already expanded
-            return self.value
-
-        legal_moves = list(self.board.legal_moves)
-        self.moves = legal_moves
-        self.children = []
-
-        # Predict priors + value
-        self.value = self.predict_with_priors(model, legal_moves)
-
-        self.N = np.zeros(len(legal_moves), dtype=np.int32)
-        self.W = np.zeros(len(legal_moves), dtype=np.float32)
-
-        # Pre-create child slots (lazy init possible too)
-        for mv in legal_moves:
-            new_board = self.board.copy()
-            new_board.push(mv)
-            self.children.append(MCTSNode(new_board, parent=self, move=mv))
-
-        return self.value
-
-
-    def best_child(self):
-        return max(self.children.values(), key=lambda c: c.average_value())
-
-
-def add_dirichlet_noise(priors, epsilon=0.25, alpha=0.3):
-    moves = list(priors.keys())
-    n = len(moves)
-    noise = np.random.dirichlet([alpha] * n)
-    return {m: (1 - epsilon) * priors[m] + epsilon * n_
-            for m, n_ in zip(moves, noise)}
-
-
-def select_child_puct(
-    node, c_puct=1.5, prefer_higher=True, root_noise=False, epsilon=0.25, alpha=0.3
-):
-    if not node.children:
-        return None
-
-    N_parent = max(1, np.sum(node.N))
-    Q = node.average_values()
-    if not prefer_higher:
-        Q = -Q
-
-    U = c_puct * node.P * (np.sqrt(N_parent) / (1.0 + node.N))
-    scores = Q + U
-
-    idx = np.argmax(scores)
-    return node.children[idx]
-
-
-def simulate(model, root, max_depth=32, c_puct=1.5):
-    path = []
-    node = root
-    depth = 0
-
-    # selection/expansion
-    while depth < max_depth:
-        root_noise = depth == 0
-        
-        if not node.children:
-            node.expand(model)
-            break
-
-        child = select_child_puct(
-            node, prefer_higher=node.board.turn, c_puct=c_puct, root_noise=root_noise
-        )
-        
-        idx = node.children.index(child)
-        path.append((node, idx))
-        node = child
-
-        if node.board.is_game_over():
-            break
-        
-        depth += 1
-
-    value = node.predict_with_priors(model)
-
-    # BACKPROP
-    for parent, idx in path:
-        parent.N[idx] += 1
-        parent.W[idx] += value
-        
-
-def choose_move(root, engine, model, board, max_sims=500):
-    print("Thinking... ")
-    start = time.time()
-    
-    for s in range(max_sims):
-        simulate(model, root, max_depth=32)
-    
-    stop = time.time()
-    print(f"Completed {s+1} simulations in {round(stop-start, 2)} seconds")
-    
-    # Get stats
-    visits = root.N
-    Q = np.divide(root.W, root.N, out=np.zeros_like(root.W), where=root.N > 0)
-    
-    # Sort children by visit count (descending)
-    order = np.argsort(-visits)  # minus = descending
-    print("\nTop candidate moves:")
-    for idx in order[:5]:
-        move = root.moves[idx]
-        node = root.children[idx]
-        san = root.board.san(move)
-        v_child = node.predict_with_priors(model)
-        print(f"{move.uci():<6} ({san})  visits={visits[idx]:<4} "
-              f"Q={Q[idx]:.3f}  V(model)={v_child:.3f}")
-    
-    # Pick the best move (highest visits)
-    best_idx = order[0]
-    best_move = root.moves[best_idx]
-    best_san = root.board.san(best_move)
-    print(f"\nChosen move: {best_move.uci()} ({best_san})  "
-          f"(visits={visits[best_idx]}, Q={Q[best_idx]:.3f})")
-    
-    return best_move, root
-
-
-def advance_root(root, move):
-    """Advance the MCTS root to the child corresponding to `move`."""
-    if move in root.moves:
-        idx = root.moves.index(move)
-        new_root = root.children[idx]
-        new_root.parent = None  # cut link
-        return new_root
-    else:
-        print("MOVE NOT FOUND")
-        # If move not in current root (e.g. unexpected opp move), rebuild from scratch
-        new_board = root.board.copy()
-        new_board.push(move)
-        return MCTSNode(new_board)
-
-
-from IPython.display import display, clear_output, SVG
-import chess.svg, chess.pgn
-import chessbot.utils as cbu
-
-bot_color = np.random.uniform() < 0.9995
-board = chess.Board()
-board.push(chess.Move.from_uci("e2e4"))
-root = MCTSNode(board)
-data = []
-with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-    while not board.is_game_over():
-        clear_output(wait=True)
-        display(SVG(chess.svg.board(board=board, flipped=not bot_color)))
-        
-        sf_eval = engine.analyse(
-            board, multipv=10, limit=chess.engine.Limit(depth=1),
-            info=chess.engine.Info.ALL
-        )
-        
-        if board.turn == bot_color:
-            best_move, root = choose_move(root, engine, model, board, max_sims=500)
-            root = advance_root(root, best_move)
-            print("\nStockfish top 3 moves: ")
-            moves = sf_eval[:3]
-            for i, mv in enumerate(moves):
-                san = board.san(mv['pv'][0])
-                sc = cbe.pawns_to_winprob(cbe.score_to_cp_white(mv['score']))
-                
-                print(f"{i+1}. {san}: {np.round(sc, 3)}")
-                
-            print()
-            board.push(best_move)
-            
-        else:
-            # best_move, root = choose_move(root, engine, model, board, max_sims=100)
-            # root = advance_root(root, best_move)
-            # print("\nStockfish top 3 moves: ")
-            # moves = sf_eval[:3]
-            # for i, mv in enumerate(moves):
-            #     san = board.san(mv['pv'][0])
-            #     sc = cbe.pawns_to_winprob(cbe.score_to_cp_white(mv['score']))
-                
-            #     print(f"{i+1}. {san}: {np.round(sc, 3)}")
-                
-            # print()
-            # board.push(best_move)
-            sf_move = random.choice(sf_eval[:2])['pv'][0]
-            san = board.san(sf_move)
-            print(f"\nStockfish plays {san}\n")
-            root = advance_root(root, sf_move)
-            board.push(sf_move)
-            time.sleep(0.5)
-
-#%%
-def plot_attention_on_board(board, attn_scores, square, head=0):
-    vec = attn_scores[0, head, square, :64]
-    mat = vec.reshape(8,8)
-    plt.figure(figsize=(5,5))
-    plt.imshow(mat, cmap="hot", origin="upper")
-    plt.colorbar()
-    piece = board.piece_at(square)
-    piece_symbol = piece.symbol() if piece else "·"
-    plt.title(f"Attention from {piece_symbol} at {chess.square_name(square)} (head {head})")
-    plt.xticks(range(8), ["a","b","c","d","e","f","g","h"])
-    plt.yticks(range(8), list(range(8,0,-1)))
-    plt.show()
-
-
-board = random_init(26)
-knight_squares = list(board.pieces(chess.KNIGHT, chess.WHITE)) + \
-                 list(board.pieces(chess.KNIGHT, chess.BLACK))
-                 
-king_squares = list(board.pieces(chess.KING, chess.WHITE)) + \
-                 list(board.pieces(chess.KING, chess.BLACK))
-                 
-queen_squares = list(board.pieces(chess.QUEEN, chess.WHITE)) + \
-                 list(board.pieces(chess.QUEEN, chess.BLACK))
-                 
-print("Knights at:", [chess.square_name(sq) for sq in knight_squares])
-
-probe = tf.keras.Model(
-    inputs=model.input,
-    outputs=model.layers[4].output   # if this is your TransformerBlock
-)
-
-to_score = board if board.turn else board.mirror()
-tokens = board_to_tokens(to_score)
-legal_mask = cbe.legal_mask_8x8x73(to_score).reshape(-1)
-
-this_X = {
-    "policy_mask": legal_mask.reshape(1, -1),
-    "tokens": tokens.reshape(1, -1)             
-}
-
-block_out, attn_scores = probe(this_X)
-attn_scores = attn_scores.numpy()
-    
-# visualize for each knight, head 0
-for sq in [chess.E4, chess.E5, chess.D4, chess.D5]:
-    plot_attention_on_board(board, attn_scores, sq, head=0)
-    
-for sq in knight_squares:
-    plot_attention_on_board(board, attn_scores, sq, head=0)
-    
-for sq in king_squares:
-    plot_attention_on_board(board, attn_scores, sq, head=1)
-    
-for sq in queen_squares:
-    plot_attention_on_board(board, attn_scores, sq, head=0)
 
 
 

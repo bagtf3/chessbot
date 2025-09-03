@@ -553,3 +553,359 @@ def prepare_targets(all_Y):
             targets[name] = Y
 
     return targets
+
+
+# PIECE_TO_ID = {
+#     None: 0,                # empty square
+#     chess.PAWN: 1,
+#     chess.KNIGHT: 2,
+#     chess.BISHOP: 3,
+#     chess.ROOK: 4,
+#     chess.QUEEN: 5,
+#     chess.KING: 6,
+# }
+
+# # black pieces offset by +6
+# def square_to_id(piece):
+#     if piece is None:
+#         return 0
+#     base = PIECE_TO_ID[piece.piece_type]
+#     return base if piece.color == chess.WHITE else base + 6
+
+
+# def board_to_tokens(board: chess.Board):
+#     tokens = []
+#     for sq in chess.SQUARES:
+#         piece = board.piece_at(sq)
+#         tokens.append(square_to_id(piece))
+#     # extra tokens
+#     tokens.append(int(board.turn))
+#     tokens.append(int(board.has_kingside_castling_rights(chess.WHITE)))
+#     tokens.append(int(board.has_queenside_castling_rights(chess.WHITE)))
+#     tokens.append(int(board.has_kingside_castling_rights(chess.BLACK)))
+#     tokens.append(int(board.has_queenside_castling_rights(chess.BLACK)))
+#     ep = board.ep_square if board.ep_square else 0
+#     tokens.append(ep % 64)  # encode en passant square (0 if none)
+#     return np.array(tokens, dtype=np.int32)
+
+# # -------------------------
+# # Core Transformer Stump
+# # -------------------------
+
+# class TransformerBlock(layers.Layer):
+#     def __init__(self, d_model, num_heads, ff_dim, rate=0.1, name=None, **kwargs):
+#         super().__init__(name=name)
+#         self.d_model = d_model
+#         self.num_heads = num_heads
+#         self.ff_dim = ff_dim
+#         self.rate = rate
+
+#         self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)
+#         self.ffn = tf.keras.Sequential([
+#             layers.Dense(ff_dim, activation="gelu"),
+#             layers.Dense(d_model),
+#         ])
+#         self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+#         self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+#         self.drop1 = layers.Dropout(rate)
+#         self.drop2 = layers.Dropout(rate)
+
+#     def call(self, x, training=False):
+#         attn_output, attn_scores = self.att(x, x, return_attention_scores=True)
+#         x = self.norm1(x + self.drop1(attn_output, training=training))
+#         ffn_output = self.ffn(x)
+#         x = self.norm2(x + self.drop2(ffn_output, training=training))
+#         return x, attn_scores
+
+#     def get_config(self):
+#         config = super().get_config()
+#         config.update({
+#             "d_model": self.d_model,
+#             "num_heads": self.num_heads,
+#             "ff_dim": self.ff_dim,
+#             "rate": self.rate,
+#             "name": self.name,
+#         })
+#         return config
+
+
+# def make_transformer_stump(vocab_size=32, seq_len=70, d_model=64, num_heads=4, num_layers=2, ff_dim=128, drop_rate=0.1):
+#     tokens_in = layers.Input(shape=(seq_len,), dtype="int32", name="tokens")
+
+#     tok_emb = layers.Embedding(vocab_size, d_model, name="tok_emb")(tokens_in)
+#     pos_emb = layers.Embedding(seq_len, d_model, name="pos_emb")(tf.range(seq_len))
+#     x = tok_emb + pos_emb
+
+#     attn_maps = []
+#     for i in range(num_layers):
+#         x, scores = TransformerBlock(d_model, num_heads, ff_dim, rate=drop_rate, name=f"block_{i}")(x)
+#         attn_maps.append(scores)
+
+#     # sequence features (per-token), and pooled vector stump
+#     trunk_seq = x   # no Identity
+#     trunk_vec = layers.GlobalAveragePooling1D(name="trunk_vec")(x)
+#     stump = Model(tokens_in, [trunk_seq, trunk_vec], name="tf_stump")
+
+#     stump.attn_maps = attn_maps
+#     return stump
+
+# # -------------------------
+# # Heads (policy/value/aux)
+# # -------------------------
+
+# def value_head(trunk_vec, hidden=128, leak=0.05, name="value"):
+#     x = trunk_vec
+#     if hidden:
+#         x = layers.Dense(hidden, name=f"{name}_dense1")(x)
+#         x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     out = layers.Dense(1, activation="tanh", name=name)(x)  # [-1,1] White POV
+#     return out, "mse"
+
+
+# def policy_head(trunk_vec, n_moves, hidden=128, leak=0.05, name="policy", use_mask=True):
+#     x = trunk_vec
+#     if hidden:
+#         x = layers.Dense(hidden, name=f"{name}_dense1")(x)
+#         x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     logits = layers.Dense(n_moves, name=f"{name}_logits")(x)
+#     if use_mask:
+#         mask_in = layers.Input(shape=(n_moves,), dtype="float32", name=f"{name}_mask")
+#         masked_logits = layers.Add(name=f"{name}_masked_logits")(
+#             [logits, (1.0 - mask_in) * (-1e9)]
+#         )
+        
+#         probs = layers.Activation("softmax", name=name)(masked_logits)
+#         return probs, "categorical_crossentropy", mask_in
+#     else:
+#         probs = layers.Activation("softmax", name=name)(logits)
+#         return probs, "categorical_crossentropy", None
+
+
+# def count_vec_head(trunk_vec, name, shape, leak=0.05):
+#     x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
+#     x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     out = layers.Dense(shape, activation="softplus", name=name)(x)
+#     return out, "poisson"
+
+
+# def binary_head(trunk_vec, name, shape=1, leak=0.05):
+#     x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
+#     x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     out = layers.Dense(shape, activation="sigmoid", name=name)(x)
+#     return out, "binary_crossentropy"
+
+
+# def regression_head(trunk_vec, name, shape=1, leak=0.05):
+#     x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
+#     x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     out = layers.Dense(shape, activation="linear", name=name)(x)
+#     return out, "mse"
+
+
+# def probe_head(trunk_vec, name, leak=0.05):
+#     x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
+#     x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     # mirror your ResNet behavior
+#     if name == "hanging_opp_value":
+#         out = layers.Dense(1, activation="linear", name=name)(x); loss = "mse"
+#     else:
+#         out = layers.Dense(1, activation="sigmoid", name=name)(x)
+#         loss = "binary_crossentropy"
+#     det = layers.Lambda(lambda t: tf.stop_gradient(t), name=f"sg_{name}")(out)
+#     return out, loss, det
+
+
+# def piece_to_move_head(trunk_vec, leak=0.05, name="piece_to_move"):
+#     x = layers.Dense(128, name=f"{name}_dense1")(trunk_vec)
+#     x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+#     out = layers.Dense(6, activation="softmax", name=name)(x)  # P,N,B,R,Q,K
+#     return out, tf.keras.losses.CategoricalCrossentropy()
+
+# # -------------------------
+# # Builder with aux configs
+# # -------------------------
+
+# def build_transformer_full_with_aux(
+#     vocab_size=32, seq_len=70, d_model=128, num_heads=4, num_layers=4, ff_dim=128,
+#     n_moves=4672, use_mask=True, aux_configs=None, aux_into_heads=False,
+#     aux_weight=0.1, value_weight=1.0, policy_weight=1.0, drop_rate=0.1
+# ):
+    
+#     if aux_configs is None:
+#         aux_configs = []
+
+#     stump = make_transformer_stump(
+#         vocab_size=vocab_size, seq_len=seq_len, d_model=d_model, num_heads=num_heads, 
+#         num_layers=num_layers, ff_dim=ff_dim, drop_rate=drop_rate
+#     )
+
+#     tokens_in = stump.input
+#     trunk_seq, trunk_vec = stump.output  # [B,seq,C], [B,C]
+
+#     # Collect probe dets for optional stop-grad concat
+#     probe_dets = []
+
+#     outputs = {}
+#     losses = {}
+#     loss_weights = {}
+
+#     # Main value & policy heads (heads see stump_vec; optionally augmented with probe_dets)
+#     head_base = trunk_vec
+
+#     # First pass: build aux heads; collect dets for concat if requested
+#     for kind, name, shape in aux_configs:
+#         if kind == "count":
+#             out, loss = count_vec_head(trunk_vec, name, shape)
+#             outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
+
+#         elif kind == "binary":
+#             out, loss = binary_head(trunk_vec, name, shape)
+#             outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
+
+#         elif kind == "regression":
+#             out, loss = regression_head(trunk_vec, name, shape)
+#             outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
+
+#         elif kind == "probe":
+#             out, loss, det = probe_head(trunk_vec, name)
+#             outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
+#             probe_dets.append(det)
+
+#         elif kind == "piece_to_move":
+#             out, loss = piece_to_move_head(trunk_vec, name=name)
+#             outputs[name] = out; losses[name] = loss; loss_weights[name] = aux_weight
+
+#         else:
+#             raise ValueError("unknown aux kind: " + str(kind))
+
+#     if aux_into_heads and probe_dets:
+#         head_base = layers.Concatenate(name="head_feat_concat")(
+#             [trunk_vec] + [layers.Lambda(lambda t: t)(d) for d in probe_dets]
+#         )
+
+#     # Value head
+#     value_out, v_loss = value_head(head_base, hidden=128, name="value")
+#     outputs["value"] = value_out; losses["value"] = v_loss
+#     loss_weights["value"] = value_weight
+
+#     # Policy head (masked softmax)
+#     policy_out, p_loss, mask_in = policy_head(
+#         head_base, n_moves=n_moves, hidden=128, name="policy", use_mask=use_mask
+#     )
+    
+#     outputs["policy"] = policy_out; losses["policy"] = p_loss
+#     loss_weights["policy"] = policy_weight
+
+#     inputs = [tokens_in] + ([mask_in] if mask_in is not None else [])
+#     model = Model(inputs=inputs, outputs=outputs, name="transformer_with_aux")
+#     model.compile(
+#         optimizer=tf.keras.optimizers.Adam(3e-4), loss=losses, loss_weights=loss_weights
+#     )
+    
+#     model._head_losses = dict(losses)
+#     model._head_loss_weights = dict(loss_weights)
+#     model.attn_maps = stump.attn_maps
+#     return model
+
+
+# # 1) choose your aux heads
+# aux_configs = [
+#     # king exposure bundle (2 = [mine, theirs])
+#     ('count',  'king_ray_exposure',          2),
+#     ('count',  'king_ring_pressure',         2),
+#     ('count',  'king_pawn_shield',           2),
+#     ('count',  'king_escape_square',         2),
+
+#     # pawns
+#     ('count',  'pawn_undefended',            2),
+#     ('count',  'pawn_hanging',               2),
+#     ('count',  'pawn_en_prise',              2),
+
+#     # knights
+#     ('count',  'knight_undefended',          2),
+#     ('count',  'knight_hanging',             2),
+#     ('count',  'knight_en_prise',            2),
+#     ('count',  'knight_attacked_by_lower_value', 2),
+
+#     # bishops
+#     ('count',  'bishop_undefended',          2),
+#     ('count',  'bishop_hanging',             2),
+#     ('count',  'bishop_en_prise',            2),
+#     ('count',  'bishop_attacked_by_lower_value', 2),
+
+#     # rooks
+#     ('count',  'rook_undefended',            2),
+#     ('count',  'rook_hanging',               2),
+#     ('count',  'rook_en_prise',              2),
+#     ('count',  'rook_attacked_by_lower_value', 2),
+
+#     # queens (binary but per-side , shape=2 vector)
+#     ('binary', 'queen_undefended',           2),
+#     ('binary', 'queen_hanging',              2),
+#     ('binary', 'queen_en_prise',             2),
+#     ('binary', 'queen_attacked_by_lower_value', 2),
+
+#     # material (pair)
+#     ('count',  'material',                   2),
+#     ('piece_to_move', 'piece_to_move', 6)
+# ]
+
+
+# # -------------------------
+# # Utilities: adjust head weights on the fly
+# # -------------------------
+
+# def set_head_weights(model, new_weights):
+#     curr = getattr(model, "_head_loss_weights", None)
+#     if curr is None:
+#         try:
+#             cfg = model.get_compile_config()
+#             curr = dict(cfg.get("loss_weights") or {})
+#         except Exception:
+#             curr = {o.name.split(':')[0].split("/")[0]: 1.0 for o in model.outputs}
+#     curr.update(new_weights)
+
+#     losses = getattr(model, "_head_losses", None)
+#     if losses is None:
+#         losses = {}
+#         for o in model.outputs:
+#             name = o.name.split(':')[0].split("/")[0]
+#             losses[name] = "mse" if o.shape[-1] != 1 else "mse"
+
+#     model.compile(optimizer=model.optimizer, loss=losses, loss_weights=curr)
+#     model._head_loss_weights = dict(curr)
+    
+    
+# new_weights = {
+#     'king_ray_exposure': 0.05,
+#     'king_ring_pressure': 0.1,
+#     'king_pawn_shield': 0.1,
+#     'king_escape_square': 0.1,
+#     'pawn_undefended': 0.1,
+#     'pawn_hanging': 0.1,
+#     'pawn_en_prise': 0.1,
+#     'knight_undefended': 0.1,
+#     'knight_hanging': 0.1,
+#     'knight_en_prise': 0.1,
+#     'knight_attacked_by_lower_value': 0.1,
+#     'bishop_undefended': 0.1,
+#     'bishop_hanging': 0.1,
+#     'bishop_en_prise': 0.1,
+#     'bishop_attacked_by_lower_value': 0.1,
+#     'rook_undefended': 0.1,
+#     'rook_hanging': 0.1,
+#     'rook_en_prise': 0.1,
+#     'rook_attacked_by_lower_value': 0.1,
+#     'queen_undefended': 0.2,
+#     'queen_hanging': 0.2,
+#     'queen_en_prise': 0.2,
+#     'queen_attacked_by_lower_value': 0.2,
+#     'material': 0.025,
+#     'piece_to_move': 0.05,
+#     'value': 3.0,
+#     'policy': 5.0
+#  }
+
+# ignore_aux = {k:0.0 for k in new_weights}
+# ignore_aux['value'] = 2.0
+# ignore_aux['policy'] = 2.0

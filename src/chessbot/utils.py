@@ -5,6 +5,7 @@ pd.set_option('display.max_columns', None)
 
 import math, random, time
             
+import tensorflow as tf
 import matplotlib.pyplot as plt
 plt.ion()
 
@@ -143,12 +144,15 @@ def make_move_with_model(board, model):
 
 def plot_training_progress(all_evals):
     """
-    Plots predicted vs true for each head in 3x3 grids, 9 at a time.
+    Plots training/eval metrics for each model output in 3x3 grids, 9 at a time.
+    Expects all_evals to be a DataFrame where each column is a loss or metric.
     """
     cols = list(all_evals.columns)
-    important = ['policy_logits', 'value']
+
+    # Always keep "value" last for consistency
+    important = ['value']
     cols = [c for c in cols if c not in important] + important
-    
+
     chunk_size = 9
     n_chunks = math.ceil(len(cols) / chunk_size)
 
@@ -163,32 +167,18 @@ def plot_training_progress(all_evals):
         for i, col in enumerate(chunk):
             ax = axes[i]
             ax.plot(all_evals[col].values, label=col)
-            ax.set_title(col)
-            ax.set_xlabel("Step")
-            ax.set_ylabel("Value")
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8)
-
-        # Hide unused axes
-        for i in range(len(chunk), len(axes)):
-            axes[i].set_visible(False)
-
-        plt.tight_layout()
-        plt.show()
 
 
-def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
+
+def plot_pred_vs_true_grid(model, preds, y_true_dict):
     """
     Plots predicted vs true for each head in 3x3 grids.
-    - policy_logits: pooled legal-only scatter across ALL samples 
-    - legal_moves: per-first-sample diff heatmap (false pos/neg counts per from-square)
-    - others: per-dimension scatter (<=20 dims)
+    - For classification heads: scatter of predicted class vs true class
+    - For value head: scatter of predicted vs true values
     """
+
     names = list(model.output_names)
-    important = ['policy_logits', 'value']
-    names = [c for c in names if c not in important] + important
-    names = [c for c in names if c != 'legal_moves']
-    
+
     chunk_size = 9
     n_chunks = math.ceil(len(names) / chunk_size)
 
@@ -208,74 +198,25 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
             y_pred = np.asarray(preds[name])
             y_true = np.asarray(y_true_dict[name])
 
-            # --- special: policy pooled scatter (legal-only) ---
-            if name == "policy_logits":
-                T = y_true.reshape(len(y_true), -1).astype(np.float32)
-                Z = y_pred.reshape(len(y_pred), -1).astype(np.float32)
-                M = T > 0.0
-
-                # masked softmax over legal if logits
-                if policy_from_logits:
-                    P = np.zeros_like(Z, dtype=np.float32)
-                    for i in range(Z.shape[0]):
-                        mi = M[i]
-                        if not np.any(mi): continue
-                        zi = Z[i, mi]
-                        zi = zi - np.max(zi)
-                        ei = np.exp(zi)
-                        s = ei.sum()
-                        if s > 0: P[i, mi] = ei / s
-                else:
-                    P = np.zeros_like(Z, dtype=np.float32)
-                    for i in range(Z.shape[0]):
-                        mi = M[i]
-                        sp = Z[i, mi].sum()
-                        if sp > 0: P[i, mi] = Z[i, mi] / sp
-
-                t_pool = T[M]; p_pool = P[M]
-                if t_pool.size > 20000:
-                    idx = np.random.choice(t_pool.size, size=20000, replace=False)
-                    t_pool = t_pool[idx]; p_pool = p_pool[idx]
-
-                ax.scatter(t_pool, p_pool, s=8, alpha=0.5)
-                lo = float(min(t_pool.min(), p_pool.min()))
-                hi = float(max(t_pool.max(), p_pool.max()))
+            # --- Value head: regression scatter ---
+            if name == "value":
+                ax.scatter(y_true, y_pred, s=8, alpha=0.5)
+                lo = float(min(y_true.min(), y_pred.min()))
+                hi = float(max(y_true.max(), y_pred.max()))
                 ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1)
-                ax.set_title("policy (pooled legal)")
-                ax.set_xlabel("Teacher prob")
-                ax.set_ylabel("Model prob")
+                ax.set_title("value")
+                ax.set_xlabel("True")
+                ax.set_ylabel("Pred")
                 ax.grid(True, alpha=0.3)
                 continue
 
-            # --- special: legal head diff heatmap (first sample) ---
-            if name == "legal_moves":
-                ax.set_visible(False)
-                continue
-                # t = y_true[0].reshape(8, 8, 73)
-                # p = (y_pred[0].reshape(8, 8, 73) > 0.5).astype(float)
-                # diff = p - t
-                # im = ax.imshow(diff.sum(axis=-1), cmap="bwr", vmin=-5, vmax=5)
-                # ax.set_title("legal diff (pred - true)")
-                # plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-                # continue
-
-            # --- default: per-dim scatter for small vector heads ---
-            yt = y_true.reshape(len(y_true), -1)
-            yp = y_pred.reshape(len(y_pred), -1)
-
-            if yt.shape[1] > 20:
-                ax.set_visible(False)
-                continue
-
-            for i in range(yt.shape[1]):
-                ax.scatter(yt[:, i], yp[:, i], s=5, alpha=0.5)
-
-            lo = float(min(yt.min(), yp.min()))
-            hi = float(max(yt.max(), yp.max()))
-            ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1)
+            # --- Classification heads: histogram of preds vs true ---
+            # convert logits -> predicted class
+            pred_classes = y_pred.argmax(axis=1)
+            ax.scatter(y_true, pred_classes, s=5, alpha=0.5)
             ax.set_title(name)
-            ax.set_xlabel("True")
-            ax.set_ylabel("Pred")
+            ax.set_xlabel("True class")
+            ax.set_ylabel("Pred class")
             ax.grid(True, alpha=0.3)
 
         for i in range(len(chunk_names), len(axes)):
@@ -285,59 +226,32 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, policy_from_logits=True):
         plt.show()
 
 
-def score_game_data(model, X, Y_batch, policy_from_logits=True):
-    outs = model.output_names
-    preds = model.predict(X, verbose=0)
+def top_k_accuracy(y_true, y_pred, k=3):
+    """
+    Computes Top-K accuracy for classification heads.
+    y_true : (N,) int labels
+    y_pred : (N, C) logits or probs
+    k      : how many top guesses to consider
+    """
+    # convert logits -> probs
+    probs = tf.nn.softmax(y_pred, axis=-1).numpy()
+    # indices of top-k per sample
+    topk = np.argpartition(-probs, k, axis=1)[:, :k]
+    # check if true label is in top-k
+    correct = [y_true[i] in topk[i] for i in range(len(y_true))]
+    return np.mean(correct)
+
+
+def score_game_data(model, X, Y_batch):
+    raw_preds = model.predict(X, verbose=0)
+    preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
 
     # Plot overview grid
-    plot_pred_vs_true_grid(model, preds, Y_batch, policy_from_logits)
+    plot_pred_vs_true_grid(model, preds, Y_batch)
 
     # Base eval_df (keras evaluate gives [total_loss, loss_per_head...])
-    cols = ['total_loss'] + outs
+    cols = ['total_loss'] + model.output_names
     eval_df = pd.DataFrame(model.evaluate(X, Y_batch, verbose=0), index=cols).T
-
-    # --- Policy metrics ---
-    yt = Y_batch['policy_logits'].reshape(len(X), -1)
-    yp = preds['policy_logits'].reshape(len(X), -1)
-
-    mask = yt > 0
-    # masked softmax over legal if logits
-    if policy_from_logits:
-        yp_probs = np.zeros_like(yp, dtype=np.float32)
-        for i in range(yp.shape[0]):
-            mi = mask[i]
-            if not np.any(mi): 
-                continue
-            zi = yp[i, mi] - yp[i, mi].max()
-            ei = np.exp(zi)
-            yp_probs[i, mi] = ei / ei.sum()
-    else:
-        yp_probs = yp / (yp.sum(axis=1, keepdims=True) + 1e-9)
-
-    # flatten legal entries
-    yt_legal = yt[mask]
-    yp_legal = yp_probs[mask]
-
-    # cross-entropy / KL
-    ce = -np.mean(yt_legal * np.log(yp_legal + 1e-9))
-    kl = np.mean(yt_legal * (np.log(yt_legal + 1e-9) - np.log(yp_legal + 1e-9)))
-
-    # top-k accuracy
-    teacher_best = yt.argmax(axis=1)
-    pred_best = yp_probs.argmax(axis=1)
-    top1_acc = np.mean(teacher_best == pred_best)
-
-    # top-3 accuracy
-    pred_top3 = np.argsort(-yp_probs, axis=1)[:, :3]  # indices of top-3 per sample
-    top3_acc = np.mean([tb in pred_top3[i] for i, tb in enumerate(teacher_best)])
-
-    # --- Legal moves metrics ---
-    y_true_legal = (Y_batch['legal_moves'].reshape(len(X), -1) > 0).astype(int)
-    y_pred_legal = (preds['legal_moves'].reshape(len(X), -1) > 0.5).astype(int)
-
-    f1 = f1_score(y_true_legal.flatten(), y_pred_legal.flatten(), zero_division=0)
-    prec = precision_score(y_true_legal.flatten(), y_pred_legal.flatten(), zero_division=0)
-    rec = recall_score(y_true_legal.flatten(), y_pred_legal.flatten(), zero_division=0)
 
     # --- Value head metrics ---
     yt_val = Y_batch['value'].reshape(-1)
@@ -345,12 +259,28 @@ def score_game_data(model, X, Y_batch, policy_from_logits=True):
     val_mse = np.mean((yt_val - yp_val) ** 2)
     corr = np.corrcoef(yt_val, yp_val)[0, 1] if len(yt_val) > 1 else 0.0
 
+    # --- Classification metrics ---
+    cls_metrics = {}
+    for head in [n for n in model.output_names if n != "value"]:
+        y_true = Y_batch[head]
+        y_pred = preds[head].argmax(axis=1)
+        acc = np.mean(y_true == y_pred)
+        cls_metrics[head] = acc
+
     # Print quick summary
     print("\n=== Extra Metrics ===")
-    print(f"Legal : F1={f1:.3f}, Prec={prec:.3f}, Rec={rec:.3f}")
-    print(f"Policy: CE={ce:.4f}, KL={kl:.4f}, Top1={top1_acc:.3f}, Top3={top3_acc:.3f}")
     print(f"Value : MSE={val_mse:.4f}, Corr={corr:.3f}")
-    print("=====================\n")
+    # for head, acc in cls_metrics.items():
+    #     print(f"{head:12s}: Acc={acc:.3f}")
+    # print("=====================\n")
+    # Factor heads: top-k
+    for head in ["best_from","best_to","best_piece","best_cap",
+             "worst_from","worst_to","worst_piece","worst_cap"]:
+        yt = Y_batch[head].reshape(-1)
+        yp = preds[head]
+        top1 = top_k_accuracy(yt, yp, k=1)
+        top3 = top_k_accuracy(yt, yp, k=3)
+        print(f"{head:11s}: Top1={top1:.3f}, Top3={top3:.3f}")
 
     return eval_df
 

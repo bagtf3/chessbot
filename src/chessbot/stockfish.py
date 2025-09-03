@@ -290,7 +290,7 @@ import chess
 import chess.engine
 
 STOCKFISH_PATH = SF_LOC
-N_GAMES = 150                   # number of self-play games
+N_GAMES = 500                   # number of self-play games
 MAX_MOVES = 80                 # max moves per game
 DEPTH = 8                      # SF depth (tune for speed/quality)
 OUTFILE = "C:/Users/Bryan/Data/chessbot_data/train.txt"
@@ -304,6 +304,7 @@ def board_to_words(board):
     if board.castling_rights & chess.BB_A1: yield "A1-C"
     if board.castling_rights & chess.BB_A8: yield "A8-C"
     yield "WhiteTurn" if board.turn else "BlackTurn"
+
 
 def mirror_move(move):
     return chess.Move(chess.square_mirror(move.from_square),
@@ -319,6 +320,7 @@ def prepare_example(board, move):
         string = " ".join(board_to_words(board.mirror()))
         uci_move = mirror_move(move).uci()
     return f"{string} __label__{uci_move}"
+
 
 def generate_selfplay(n_games=10, depth=8, max_moves=80, outfile="train.txt"):
     with chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH) as engine, open(outfile, "w") as f:
@@ -349,10 +351,6 @@ model = fasttext.train_supervised(OUTFILE, epoch=8, lr=0.1, wordNgrams=2, dim=64
 model_file = "C:/Users/Bryan/Data/chessbot_data/models/chess_model.bin"
 model.save_model(model_file)
 
-
-import chess
-import fasttext
-
 # Load trained model
 model = fasttext.load_model(model_file)
 
@@ -366,7 +364,7 @@ def get_priors(board, model, k=-1):
     # Predict (k=-1 = return all labels)
     labels, probs = model.predict(string, k=k)
 
-    # Convert to dict {uci_move: prob}
+    # # Convert to dict {uci_move: prob}
     priors = {}
     for label, prob in zip(labels, probs):
         move = label.replace("__label__", "")
@@ -374,7 +372,7 @@ def get_priors(board, model, k=-1):
         if uci in list(board.legal_moves):
             priors[uci.uci()] = prob
 
-    # Normalize to sum = 1
+    # # Normalize to sum = 1
     total = sum([v for k, v in priors.items()])
     if total > 0:
         priors = {m: p/total for m, p in priors.items()}
@@ -382,15 +380,220 @@ def get_priors(board, model, k=-1):
     return priors
 
 
-# --- Try it on starting position ---
-board = random_init(7)
+def score_to_cp_rel(board_score):
+    rel = board_score.relative
+    
+    #check for mates
+    if rel.score() is None:
+        return np.clip(rel.score(mate_score=16), -10, 10) / 10
+        
+    else:
+        return np.clip(rel.score() / 1000, -0.95, 0.95)
+    
+    
+def choose_move(model, board, sf_eval, top_n=3):
+    # Encode board as text tokens
+    if board.turn == chess.WHITE:
+        string = " ".join(board_to_words(board))
+    else:
+        string = " ".join(board_to_words(board.mirror()))
+    
+    actual_moves = list(board.legal_moves)
+    if len(actual_moves) == 1:
+        return actual_moves[0]
+    
+    move_strs = set([str(mv) for mv in actual_moves])
+    if not board.turn:
+        move_strs = set([str(mirror_move(chess.Move.from_uci(mv))) for mv in move_strs])
+    
+    # Predict (k=-1 = return all labels)
+    k = 10
+    while True:
+        labels, probs = model.predict(string, k=k)
+        labels = [l.replace("__label__", "") for l in labels]
+        if len(set(labels) & move_strs):
+            break
+        else:
+            k *=2
+    
+    if not board.turn:
+        labels = [str(mirror_move(chess.Move.from_uci(mv))) for mv in labels]
+        move_strs = set([str(mirror_move(chess.Move.from_uci(mv))) for mv in move_strs])
+        
+    out = [[l, p] for l, p in zip(labels, probs) if l in move_strs]
+    best_move = chess.Move.from_uci(out[0][0])
+    sf_moves = [s['pv'][0] for s in sf_eval]
+    sf_scores = [score_to_cp_rel(s['score']) for s in sf_eval]
+    
+    print("\n--- Model vs Stockfish ---")
+    for i in range(min(top_n, len(out))):        
+        uci_move = chess.Move.from_uci(out[i][0])
+        san_move = board.san(uci_move)
+        sf_index = sf_moves.index(uci_move)
+        sf_score = sf_scores[sf_index]
+        sf_rank = sf_index + 1
+        print(f"{i+1}. {uci_move} ({san_move}) SF: {sf_score: <.3} Rank: {sf_rank}")
+        
+    print("--------------------------\n")
+    return best_move
+    
+#%%
+from IPython.display import display, clear_output, SVG
+import chess.svg, chess.pgn
+import chessbot.utils as cbu
+import chessbot.encoding as cbe
+import numpy as np
+
+bot_color = np.random.uniform() < 0.5
 board = chess.Board()
-priors = get_priors(board, model, k=-1)
+with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
+    while not board.is_game_over():
+        clear_output(wait=True)
+        display(SVG(chess.svg.board(board=board, flipped=not bot_color)))
+        
+        sf_eval = engine.analyse(
+            board, multipv=len(list(board.legal_moves)), limit=chess.engine.Limit(depth=3),
+            info=chess.engine.Info.ALL
+        )
+        
+        print(f"Current Eval: {cbe.score_to_cp_white(sf_eval[0]['score']):.<3}")
+        time.sleep(0.75)
+        if board.turn == bot_color:
+            best_move = choose_move(model, board, sf_eval, top_n=5)
+            print()
+            board.push(best_move)
+            time.sleep(0.75)
+            
+        else:
+            sf_move = random.choice(sf_eval[:100])['pv'][0]
+            san = board.san(sf_move)
+            board.push(sf_move)
+            time.sleep(0.75)
 
-print("Top priors from fastText:")
-for mv, prob in sorted(priors.items(), key=lambda x: -x[1])[:5]:
-    print(mv, f"{prob:.3f}")
+
+#%%%
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+
+def build_scout_model(input_shape=(8, 8, 8)):
+    """
+    Tiny scout model for fast CPU inference.
+    Input: (8,8,C) planes
+    Output: 2-way softmax (good vs bad move quality)
+    """
+    inp = layers.Input(input_shape)
+
+    # light conv stem (local structure awareness)
+    x = layers.Conv2D(16, (3,3), padding="same", activation="relu")(inp)
+    x = layers.Conv2D(16, (3,3), padding="same", activation="relu")(x)
+
+    # flatten + small MLP
+    x = layers.Flatten()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dense(32, activation="relu")(x)
+
+    # good/bad output
+    out = layers.Dense(2, activation="softmax", name="move_quality")(x)
+
+    return Model(inp, out)
+
+
+def get_rank_file(pieces):
+    ranks = [-1*(1 + p // 8) for p in pieces]
+    files = [p % 8 for p in pieces]
+    return ranks, files
+
+
+def get_board_state(board):
+    board_state = np.zeros((8, 8, 8), dtype=int)
+    value_map = np.zeros((8, 8), dtype=int)
+    
+    value_lookup = {1:1, 2:3, 3:3, 4:5, 5:9, 6:12}
+    
+    for color in [True, False]:
+        value = 1 if color == True else -1
+        for piece in [1, 2, 3, 4, 5, 6]:
+            pieces = list(board.pieces(piece, color))
+            ranks, files = get_rank_file(pieces)
+            board_state[ranks, files, piece-1] = value
+            value_map[ranks, files] = value * value_lookup[piece]
+    
+    # game metadata
+    game_data = [
+        1 * board.turn,
+        1 * board.has_castling_rights(chess.WHITE),
+        1 * board.has_castling_rights(chess.BLACK),
+        0,
+        0,
+        board.halfmove_clock / 100,
+        0,
+        0,
+        0,
+        value_map.sum(),
+        1 * board.turn,
+        value_map[np.abs(value_map) == 1].sum(),
+        value_map[np.abs(value_map) <= 3].sum(), 
+        value_map[np.abs(value_map) > 3].sum(),
+        len(list(board.legal_moves)) / 10,
+        1
+    ]
+    
+    meta_plane = np.tile(np.array(game_data).reshape(4, 4), (2, 2))
+    
+    board_state[:, :, -2] = value_map
+    board_state[:, :, -1] = meta_plane
+    
+    return np.expand_dims(board_state, axis=0)
+
+
+with tf.device("/CPU:0"):
+    scout = build_scout_model()
+    scout.compile(optimizer="adam", loss="categorical_crossentropy")
+
+scout.summary()
+#run inference on CPU
+with tf.device("/CPU:0"):
+    board_tensor = get_board_state(board)
+    pred = scout(board_tensor, training=False).numpy()
+    print("Predicted [good, bad] probs:", pred[0])
+    
+# # run inference
+# pred = scout(board_tensor, training=False).numpy()
+
+
+# --- Try it on starting position ---
+boards = [random_init((rep+1) % 8) for rep in range(1000)]
+
+k = 5
+start = time.time()
+for b in boards:
+    priors = get_priors(b, model, k=k)
+stop = time.time()
+print(f"fasttext {k}: {stop-start:.3}")
+
+
+start = time.time()
+with tf.device("/CPU:0"):
+    for b in boards:
+        board_tensor = get_board_state(b)
+        scout(board_tensor, training=False).numpy()
+stop = time.time()
+print(f"scout model: {stop-start:.3}")
+
+import fasttext
 
 
 
+# number of tokens and labels
+vocab_size = len(model.get_words())
+label_size = len(model.get_labels())
+dim = model.get_dimension()
+
+n_params = (vocab_size * dim) + (label_size * dim)
+
+print(f"Embedding dim: {dim}")
+print(f"Vocab size: {vocab_size}")
+print(f"Label size: {label_size}")
+print(f"Total params ≈ {n_params:,}")
 

@@ -12,77 +12,49 @@ SOFT_VALUE = {
     chess.ROOK:0.50, chess.QUEEN:0.90, chess.KING:1.00
 }
 
-def encode_board(board: chess.Board) -> np.ndarray:
-    """
-    Returns [8,8,N] float32 planes. Order:
-      0..5: my pieces (P,N,B,R,Q,K)
-      6..11: opp pieces
-      12: my_attacks
-      13: opp_attacks
-      14: my_value (soft piece values summed per square)
-      15: opp_value
-      16: my_castle_k
-      17: my_castle_q
-      18: opp_castle_k
-      19: opp_castle_q
-      20: en_passant (1 at EP square else 0)
-      21: halfmove_clock (scalar plane, normalized /100)
-      22: legal_move_count (scalar plane, normalized /60)
-    """
+# Precompute once
+LOOKUP_RANKS = np.array([-(1 + p // 8) for p in range(64)], dtype=np.int8)
+LOOKUP_FILES = np.array([p % 8 for p in range(64)], dtype=np.int8)
+
+def get_rank_file(pieces):
+    pieces = np.asarray(pieces, dtype=np.int32)
+    return LOOKUP_RANKS[pieces], LOOKUP_FILES[pieces]
+
+
+def get_board_state(board):
+    state = np.zeros((64, 25), dtype=np.int8)
+
+    for color in [chess.WHITE, chess.BLACK]:
+        for piece in range(1, 7):
+            channel = piece-1 if color else piece-1+6
+            attack_channel = channel + 12
+
+            squares = np.fromiter(board.pieces(piece, color), dtype=np.int32)
+            state[squares, channel] = 1
+
+            if squares.size > 0:
+                for sq in squares:
+                    attacked = np.fromiter(board.attacks(sq), dtype=np.int32)
+                    state[attacked, attack_channel] += 1
     
-    planes = np.zeros((8, 8, 23), dtype=np.float32)
+    # some meta data
+    castling = [
+        board.has_kingside_castling_rights(chess.WHITE),
+        board.has_queenside_castling_rights(chess.WHITE),
+        board.has_kingside_castling_rights(chess.BLACK),
+        board.has_queenside_castling_rights(chess.BLACK),
+    ] * 2
+    ep_vec = np.zeros(8, dtype=np.int8)
+    if board.ep_square:
+        ep_vec[:] = -1
+        ep_vec[board.ep_square % 8] = 1
 
-    #  piece planes & value planes
-    my_value = np.zeros((8,8), dtype=np.float32)
-    opp_value = np.zeros((8,8), dtype=np.float32)
+    meta = np.array([castling, ep_vec]).reshape(16)
+    state[:, -1] = np.tile(meta, 4)
 
-    for sq, pc in board.piece_map().items():
-        r, f = divmod(sq, 8)
-        mine = (pc.color == True)
-        base = 0 if mine else 6
-        pt = pc.piece_type
-        planes[r, f, base + (pt - 1)] = 1.0
-        
-        if mine:
-            my_value[r, f]  += SOFT_VALUE[pt]
-        else:
-            opp_value[r, f] += SOFT_VALUE[pt]
-
-    planes[:, :, 14] = my_value
-    planes[:, :, 15] = opp_value
-
-    # attack planes (pseudo-legal attacks; include pinned pieces)
-    my_att = np.zeros((8,8), dtype=np.float32)
-    opp_att = np.zeros((8,8), dtype=np.float32)
-    for sq, pc in board.piece_map().items():
-        r, f = divmod(sq, 8)
-        for tgt in board.attacks(sq):
-            tr, tf = divmod(tgt, 8)
-            if pc.color == True:
-                my_att[tr, tf] = 1.0
-            else:
-                opp_att[tr, tf] = 1.0
-    
-    planes[:,:,12] = my_att
-    planes[:,:,13] = opp_att
-
-    # castling rights
-    planes[:,:,16] = 1.0 if board.has_kingside_castling_rights(True) else 0.0
-    planes[:,:,17] = 1.0 if board.has_queenside_castling_rights(True) else 0.0
-    planes[:,:,18] = 1.0 if board.has_kingside_castling_rights(False) else 0.0
-    planes[:,:,19] = 1.0 if board.has_queenside_castling_rights(False) else 0.0
-
-    # en passant square
-    if board.ep_square is not None:
-        er, ef = divmod(board.ep_square, 8)
-        planes[er, ef, 20] = 1.0
-
-    # scalar planes (normalized)
-    planes[:,:,21] = min(board.halfmove_clock, 100) / 100.0
-    legal_n = len(list(board.legal_moves))
-    planes[:,:,22] = min(legal_n, 60) / 60.0
-
-    return planes
+    state = state.reshape(8, 8, 25)    
+    state =  np.flipud(state)
+    return state
 
 # Directions for sliders (N, NE, E, SE, S, SW, W, NW)
 DIRS = [(+1,0),(+1,+1),(0,+1),(-1,+1),(-1,0),(-1,-1),(0,-1),(+1,-1)]
@@ -307,65 +279,134 @@ def build_training_targets_8x8x73(board, info_list, k_pawns=150.0, temp=2.0):
     return {'policy_logits': Y, "value": np.array([y_value], dtype=np.float32)}
 
 
-def get_rank_file(pieces):
-    ranks = [-1*(1 + p // 8) for p in pieces]
-    files = [p % 8 for p in pieces]
-    return ranks, files
-
-
-def get_board_state(board):
-    board_state = np.zeros((8, 8, 9), dtype=int)
-    attack_map = np.zeros((8, 8), dtype=int)
-    value_map = np.zeros((8, 8), dtype=int)
-    
-    value_lookup = {1:1, 2:3, 3:3, 4:5, 5:9, 6:12}
-    
-    for color in [True, False]:
-        value = 1 if color == True else -1
-        for piece in [1, 2, 3, 4, 5, 6]:
-            pieces = list(board.pieces(piece, color))
-            ranks, files = get_rank_file(pieces)
-            board_state[ranks, files, piece-1] = value
-            value_map[ranks, files] = value * value_lookup[piece]
-                
-            # check the attacks
-            for p in pieces:
-                # ignore pins
-                if board.is_pinned(color, p):
-                    continue
-                squares_attacked = list(board.attacks(p))
-                attack_ranks, attack_files = get_rank_file(squares_attacked)
-                attack_map[attack_ranks, attack_files] += value
-    
-    # game metadata
-    game_data = [
-        1 * board.turn,
-        1 * board.has_castling_rights(chess.WHITE),
-        1 * board.has_castling_rights(chess.BLACK),
-        0,
-        0,
-        board.halfmove_clock / 100,
-        0,
-        1 * board.is_check(),
-        0,
-        attack_map.sum(),
-        value_map.sum(),
-        1 * board.turn,
-        value_map[np.abs(value_map) == 1].sum(),
-        value_map[np.abs(value_map) <= 3].sum(), 
-        value_map[np.abs(value_map) > 3].sum(),
-        len(list(board.legal_moves)) / 10
-    ]
-    
-    meta_plane = np.tile(np.array(game_data).reshape(4, 4), (2, 2))
-    
-    board_state[:, :, -3] = attack_map
-    board_state[:, :, -2] = value_map
-    board_state[:, :, -1] = meta_plane
-    
-    return board_state
-
-
 def encode_worker(fen):
     board = chess.Board(fen)
     return fen, get_board_state(board)
+
+
+
+def move_to_labels(board, move):
+    from_idx = move.from_square         # 0..63
+    to_idx   = move.to_square           # 0..63
+
+    # Piece to move: 0..5 (pawn=0 .. king=5)
+    piece = board.piece_type_at(move.from_square)
+    piece_idx = piece - 1
+
+    # Promotion: 0=None, 1=Knight, 2=Bishop, 3=Rook, 4=Queen
+    promo_idx = 0
+    if move.promotion is not None:
+        promo_map = {
+            chess.KNIGHT: 1,
+            chess.BISHOP: 2,
+            chess.ROOK:   3,
+            chess.QUEEN:  4,
+        }
+        promo_idx = promo_map[move.promotion]
+
+    return from_idx, to_idx, piece_idx, promo_idx
+
+
+def get_legal_labels(board, moves):
+    N = len(moves)
+    f, t, pc, pr = np.zeros(N, int), np.zeros(N, int), np.zeros(N, int), np.zeros(N, int)
+    
+    for i, mv in enumerate(moves):
+        f[i], t[i], pc[i], pr[i] = move_to_labels(board, mv)
+    return {"from":f, "to":t, "piece":pc, "promo": pr}
+
+
+def compute_move_priors(model_outputs, legal_labels, weights=None):
+    """
+    Compute move priors given model outputs and legal move labels.
+    Returns a (N_moves,) array of probabilities.
+    """
+    if weights is None:
+        weights = {"from":1.0, "to":1.0, "piece":0.5, "promo":0.1}
+
+    N = len(legal_labels["from"])
+    
+    # --- Safety guards ---
+    if N == 0:
+        # No legal moves: return empty priors
+        return np.array([], dtype=np.float32)
+    if N == 1:
+        # Only one move: forced
+        return np.array([1.0], dtype=np.float32)
+
+    # Weighted log-likelihood accumulation
+    priors_best = np.zeros(N, dtype=np.float32)
+    for factor in ["from","to","piece","promo"]:
+        idxs = legal_labels[factor]
+        if len(idxs) == 0:
+            continue
+        p_best = model_outputs[f"best_{factor}"][idxs]
+        p_best = np.clip(p_best, 1e-9, 1.0)
+        priors_best += weights[factor] * np.log(p_best)
+
+    # Convert back from log-space to probabilities
+    temperature = 1.0
+    priors_best = np.exp((priors_best - np.max(priors_best)) / temperature)
+    priors_best /= priors_best.sum()
+
+    return priors_best
+
+
+def sf_entry_to_value(entry, cp_cap=1500.0, mate_decay_per_ply=0.02, mate_min=0.90):
+    """
+    Map Stockfish entries to [-1, 1] with linear CP scaling and clipping.
+    - CP: clip at +/- cp_cap, scale linearly.
+    - Mate: sign * score where score is ~1.0 for mate-in-1, then slightly decays by ply.
+    """
+    mate = entry.get("Mate")
+    if mate is None and entry.get("type") == "mate":
+        mate = entry.get("value")
+
+    if mate is not None:
+        sign = 1.0 if mate > 0 else -1.0
+        dist = abs(mate)
+        score = 1.0 - mate_decay_per_ply * max(0, dist - 1)
+        score = max(mate_min, min(1.0, score))
+        return sign * score
+
+    cp = entry.get("Centipawn")
+    if cp is None:
+        cp = entry.get("value", 0)
+    cp = 0 if cp is None else cp
+    cp = max(-cp_cap, min(cp_cap, float(cp)))
+    return cp / cp_cap
+
+
+def sf_top_moves_to_values(entries, cp_cap=1500.0, mate_decay_per_ply=0.02, mate_min=0.90):
+    out = []
+    for e in entries:
+        out.append(sf_entry_to_value(
+            e, cp_cap=cp_cap, mate_decay_per_ply=mate_decay_per_ply, mate_min=mate_min
+        ))
+        
+    return out
+
+
+def values_to_priors(vals, temp=0.15, mix=0.0, floor=1e-12):
+    """
+    Turn value scores in [-1,1] into probabilities via softmax.
+    temp: lower = sharper (e.g., 0.10..0.25). 
+    mix:  blend with uniform to keep some exploration (0..1).
+    """
+    v = np.asarray(vals, dtype=np.float64)
+    z = v / float(temp)
+    z -= z.max()              # numerical stability
+    p = np.exp(z)
+    p /= p.sum()
+
+    if floor:
+        p = np.maximum(p, floor)
+        p /= p.sum()
+
+    if mix:
+        n = p.size
+        p = (1.0 - mix) * p + mix * (1.0 / n)
+        p /= p.sum()
+    return p
+
+

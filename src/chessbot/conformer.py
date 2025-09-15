@@ -16,48 +16,24 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from tensorflow import keras
 
+from chessbot.model import res_block
+HE = "he_normal"
+
 from chessbot.utils import random_init, format_time
 import chessbot.encoding as cbe
+from chessbot.encoding import (
+    get_board_state, compute_move_priors, get_legal_labels, move_to_labels
+)    
+
 import chessbot.features as feats
+
 import chessbot.utils as cbu
+from chessbot.utils import mirror_move
 
 from chessbot import SF_LOC, ENDGAME_LOC
 import chess.syzygy
 
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
-
-PIECE_TO_ID = {
-    None: 0,                # empty square
-    chess.PAWN: 1,
-    chess.KNIGHT: 2,
-    chess.BISHOP: 3,
-    chess.ROOK: 4,
-    chess.QUEEN: 5,
-    chess.KING: 6,
-}
-
-# black pieces offset by +6
-def square_to_id(piece):
-    if piece is None:
-        return 0
-    base = PIECE_TO_ID[piece.piece_type]
-    return base if piece.color == chess.WHITE else base + 6
-
-
-def board_to_tokens(board: chess.Board):
-    tokens = []
-    for sq in chess.SQUARES:
-        piece = board.piece_at(sq)
-        tokens.append(square_to_id(piece))
-    # extra tokens
-    tokens.append(int(board.turn))
-    tokens.append(int(board.has_kingside_castling_rights(chess.WHITE)))
-    tokens.append(int(board.has_queenside_castling_rights(chess.WHITE)))
-    tokens.append(int(board.has_kingside_castling_rights(chess.BLACK)))
-    tokens.append(int(board.has_queenside_castling_rights(chess.BLACK)))
-    ep = board.ep_square if board.ep_square else 0
-    tokens.append(ep % 64)  # encode en passant square (0 if none)
-    return np.array(tokens, dtype=np.int32)
+MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"                 
 
 # -------------------------
 # Core Transformer Stump
@@ -99,74 +75,77 @@ class TransformerBlock(layers.Layer):
         })
         return config
 
-
-def make_transformer_stump(vocab_size=32, seq_len=70, d_model=64, num_heads=4, num_layers=2, ff_dim=128, drop_rate=0.1):
-    tokens_in = layers.Input(shape=(seq_len,), dtype="int32", name="tokens")
-
-    tok_emb = layers.Embedding(vocab_size, d_model, name="tok_emb")(tokens_in)
-    pos_emb = layers.Embedding(seq_len, d_model, name="pos_emb")(tf.range(seq_len))
-    x = tok_emb + pos_emb
-
-    attn_maps = []
-    for i in range(num_layers):
-        x, scores = TransformerBlock(d_model, num_heads, ff_dim, rate=drop_rate, name=f"block_{i}")(x)
-        attn_maps.append(scores)
-
-    # sequence features (per-token), and pooled vector stump
-    trunk_seq = x   # no Identity
-    trunk_vec = layers.GlobalAveragePooling1D(name="trunk_vec")(x)
-    stump = Model(tokens_in, [trunk_seq, trunk_vec], name="tf_stump")
-
-    stump.attn_maps = attn_maps
-    return stump
-
 # -------------------------
 # Heads (policy/value/aux)
 # -------------------------
-
-def value_head(trunk_vec, hidden=128, leak=0.05, name="value"):
+def value_head(trunk_vec, hidden=512, leak=0.05, name="value"):
     x = trunk_vec
     if hidden:
+        # First hidden layer
         x = layers.Dense(hidden, name=f"{name}_dense1")(x)
         x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+
+        # Second hidden layer at half size
+        x = layers.Dense(hidden // 2, name=f"{name}_dense2")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu2")(x)
+
     out = layers.Dense(1, activation="tanh", name=name)(x)  # [-1,1] White POV
     return out, "mse"
 
 
-def policy_factor_head(trunk_vec, prefix, hidden=256, leak=0.05):
-    """Return 5 factorized Dense logits for a policy head."""
+def policy_factor_head(trunk_vec, prefix, hidden=512, leak=0.05):
+    """Factorized move logits (no capture)."""
     x = trunk_vec
     if hidden:
+        # First hidden layer
         x = layers.Dense(hidden, name=f"{prefix}_dense1")(x)
         x = layers.LeakyReLU(alpha=leak, name=f"{prefix}_lrelu1")(x)
 
-    from_logits = layers.Dense(64, name=f"{prefix}_from")(x)
-    to_logits = layers.Dense(64, name=f"{prefix}_to")(x)
-    piece_logits = layers.Dense(6,  name=f"{prefix}_piece")(x)
-    cap_logits = layers.Dense(7,  name=f"{prefix}_cap")(x)
-    promo_logits = layers.Dense(5,  name=f"{prefix}_promo")(x)
+        # Second hidden layer at half size
+        x = layers.Dense(hidden // 2, name=f"{prefix}_dense2")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{prefix}_lrelu2")(x)
 
-    return [from_logits, to_logits, piece_logits, cap_logits, promo_logits]
+    # Raw logits, no activation
+    from_logits   = layers.Dense(64, name=f"{prefix}_from")(x)
+    to_logits     = layers.Dense(64, name=f"{prefix}_to")(x)
+    piece_logits  = layers.Dense(6,  name=f"{prefix}_piece")(x)
+    promo_logits  = layers.Dense(5,  name=f"{prefix}_promo")(x)
+
+    return [from_logits, to_logits, piece_logits, promo_logits]
 
 
-def make_big_model(
-    seq_len=70, vocab_size=64, d_model=128, num_heads=4, num_layers=4, ff_dim=512
-):
+def build_conv_trunk(input_shape=(8, 8, 25), width=128, n_blocks=6, leak=0.05):
+    """Convolutional stump with residual blocks, returns feature map + pooled vector."""
+    inputs = layers.Input(shape=input_shape, name="board")
 
-    stump = make_transformer_stump(
-        vocab_size, seq_len, d_model, num_heads, num_layers, ff_dim
-    )
-    
-    tokens_in = stump.input
-    trunk_seq, trunk_vec = stump.output
+    x = layers.Conv2D(width, 3, padding="same", use_bias=False, kernel_initializer=HE)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(alpha=leak)(x)
 
-    # Value head
-    val_out, _ = value_head(trunk_vec, hidden=256)
+    for _ in range(n_blocks):
+        x = res_block(x, width, leak=leak)
 
-    # Best/worst move heads (factorized)
-    best_outputs  = policy_factor_head(trunk_vec, prefix="best")
+    # final compression
+    x = layers.Conv2D(width // 2, 1, padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(alpha=leak, name="trunk")(x)
 
-    model = Model(tokens_in, [val_out] + best_outputs, name="big_tf")
+    trunk_feat = x
+    trunk_vec = layers.GlobalAveragePooling2D(name="trunk_vec")(trunk_feat)
+
+    return Model(inputs, [trunk_feat, trunk_vec], name="conv_trunk")
+
+
+def make_conv_model(input_shape=(8,8,25), width=128, n_blocks=6):
+    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
+    inputs = trunk.input
+    trunk_feat, trunk_vec = trunk.output
+
+    # Heads
+    val_out, _ = value_head(trunk_vec, hidden=512)
+    best_outputs = policy_factor_head(trunk_vec, prefix="best", hidden=512)
+
+    model = Model(inputs, [val_out] + best_outputs, name="conv_factorized")
     return model
 
 
@@ -181,6 +160,43 @@ def evaluate_terminal(board):
         raise Exception("Non terminal board found!")
 
 
+def make_hybrid_model(input_shape=(8,8,25), width=128, n_blocks=6,
+                      d_model=128, num_heads=4, ff_dim=512, n_transformers=3):
+    # --- Conv trunk ---
+    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
+    inputs = trunk.input
+    trunk_feat, trunk_vec = trunk.output  # (8,8,width//2), (vec,)
+
+    # --- Reshape conv features into sequence ---
+    seq = layers.Reshape((64, width // 2))(trunk_feat)   # (batch, 64, width//2)
+
+    # Project channels to d_model so transformer sees right dimension
+    if width // 2 != d_model:
+        seq = layers.Dense(d_model, name="proj_to_dmodel")(seq)  # (batch, 64, d_model)
+
+    # --- Transformer stack ---
+    x = seq
+    for i in range(n_transformers):
+        x, _ = TransformerBlock(d_model=d_model,
+                                num_heads=num_heads,
+                                ff_dim=ff_dim,
+                                rate=0.1,
+                                name=f"tfblock_{i}")(x)
+
+    tf_vec = layers.GlobalAveragePooling1D(name="tf_vec")(x)
+
+    # --- Fuse conv + transformer vectors ---
+    fused = layers.Concatenate(name="fused")([trunk_vec, tf_vec])
+    fused = layers.Dense(256, activation="gelu")(fused)
+
+    # --- Heads ---
+    val_out, _ = value_head(fused, hidden=512)
+    best_outputs = policy_factor_head(fused, prefix="best", hidden=512)
+
+    model = Model(inputs, [val_out] + best_outputs, name="conv_trans_factorized")
+    return model
+
+
 def load_model(model_loc):
     custom = {"TransformerBlock": TransformerBlock}
     model = keras.models.load_model(model_loc, custom_objects=custom)
@@ -191,24 +207,25 @@ losses = {
     "best_from": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     "best_to": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     "best_piece": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-    "best_cap": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
     "best_promo": tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 }
 
-opt = tf.keras.optimizers.Adam(learning_rate=1e-4, clipnorm=1.0)
+opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
 loss_weights = {
-    "value": 1.0,
+    "value": 0.5,
     "best_from": 0.5,
     "best_to": 0.5,
     "best_piece": 0.5,
-    "best_cap": 0.1,
-    "best_promo": 0.1    
+    "best_promo": 0.1
 }
 
-model = make_big_model(70, vocab_size=64, d_model=256, num_heads=8, num_layers=4, ff_dim=512)
+# model = make_hybrid_model(
+#     input_shape=(8,8,25), width=256, n_blocks=6, d_model=128,
+#     num_heads=4, ff_dim=512, n_transformers=4
+# )
+model = load_model("C:/Users/Bryan/Data/chessbot_data/models/conv_model_medium_v1000.h5")
 model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
 model.summary()
-print(model.compiled_loss._loss_weights)
 #%%
 
 def prepare_data_for_model(X, Y, model, W=None):
@@ -253,100 +270,12 @@ def prepare_X(X, model):
 
     # Inputs
     for name, tensor in zip(model.input_names, model.inputs):
-        vals = [x[name] for x in X]   # grab each sample's tokens
+        vals = [x[name] for x in X]
         arr = np.array(vals, dtype=np.int32)
         inputs[name] = arr
     
     return inputs
-        
-        
-def mirror_move(move):
-    return chess.Move(
-        chess.square_mirror(move.from_square),
-        chess.square_mirror(move.to_square),
-        move.promotion
-    )
 
-
-def move_to_labels(board, move):
-    from_idx = move.from_square         # 0..63
-    to_idx   = move.to_square           # 0..63
-
-    # Piece to move: 0..5 (pawn=0 .. king=5)
-    piece = board.piece_type_at(move.from_square)
-    piece_idx = piece - 1
-
-    # Capture: 0=None, 1..6 = pawn..king
-    cap_idx = 0
-    if board.is_capture(move):
-        captured = board.piece_at(move.to_square)
-        if captured:
-            cap_idx = captured.piece_type   # already 1..6
-
-    # Promotion: 0=None, 1=Knight, 2=Bishop, 3=Rook, 4=Queen
-    promo_idx = 0
-    if move.promotion is not None:
-        promo_map = {
-            chess.KNIGHT: 1,
-            chess.BISHOP: 2,
-            chess.ROOK:   3,
-            chess.QUEEN:  4,
-        }
-        promo_idx = promo_map[move.promotion]
-
-    return from_idx, to_idx, piece_idx, cap_idx, promo_idx
-
-
-def collect_stockfish_data(engine, depth=5, n_init=None, rand_prob=0.2):
-    if n_init is not None:
-        board = random_init(n_init)
-    else:
-        board = random_init(np.random.randint(0, 3))
-        
-    all_X, all_Y = [], []
-    while not board.is_game_over():
-        # always STM-POV implemented via always white-POV
-        to_score = board if board.turn else board.mirror()
-        X_tokens = board_to_tokens(to_score)
-        all_X.append({"tokens": X_tokens})
-
-        # Run Stockfish multipv analysis
-        best_move = engine.analyse(
-            to_score, limit=chess.engine.Limit(depth=depth),
-            info=chess.engine.Info.ALL
-        )
-
-        # TARGETS
-        Y = {}
-
-        # 1. Value head target
-        # Scale Stockfish score to [-1, 1]
-        Y["value"] = cbe.score_to_cp_white(best_move["score"])
-
-        # 2. Best move (from multipv=1)
-        origin, to, piece, cap, promo= move_to_labels(to_score, best_move['pv'][0])
-        
-        Y["best_from"] = origin
-        Y["best_to"] = to
-        Y["best_piece"] = piece
-        Y["best_cap"] = cap
-        Y['best_promo'] = promo
-
-        all_Y.append(Y)
-
-        # Pick a move to play to continue the game (or random sometimes)
-        move_to_make = best_move['pv'][0]
-        if np.random.random() < rand_prob:
-            move_to_make = random.choice(list(to_score.legal_moves))
-        
-        if not board.turn:
-            move_to_make = mirror_move(move_to_make)
-            
-        board.push(move_to_make)
-
-    return all_X, all_Y
-
-#%%
 import json
 from datetime import datetime
 
@@ -372,13 +301,13 @@ def load_eval_positions(path, max_positions=None):
     ranks = []
     n_moves = []
     for d in data:
-        losses.append(mean([m['cp_loss'] for m in d['moves']]))
-        ranks.append(mean([i+1 for i in range(len(d['moves']))]))
+        losses.append(np.mean([m['cp_loss'] for m in d['moves']]))
+        ranks.append(np.mean([i+1 for i in range(len(d['moves']))]))
         n_moves.append(len(d['moves']))
     
     summary = {
-        "expected_mean":mean(losses),
-        "expected_rank":mean(ranks),
+        "expected_mean":np.mean(losses),
+        "expected_rank":np.mean(ranks),
         "avg_moves": sum(n_moves)
     }
     
@@ -386,8 +315,8 @@ def load_eval_positions(path, max_positions=None):
 
 
 def positions_to_inputs(positions):
-    X = np.array([p["tokens"] for p in positions], dtype=np.int32)
-    return X
+    X = [get_board_state(chess.Board(p['fen'])) for p in positions]
+    return np.stack(X, axis=0)
 
 
 def evaluate_model(model, positions, batch_size=512, top_ns=(1, 3, 5)):
@@ -446,56 +375,6 @@ def evaluate_model(model, positions, batch_size=512, top_ns=(1, 3, 5)):
     return results
 
 
-def evaluate_stockfish(positions, depth=1):
-    results = {
-        "avg_cp_loss": 0.0,
-        "avg_rank": 0.0,
-        "top_hits": {1:0, 3:0, 5:0},
-        "count": 0
-    }
-
-    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-        for pos in positions:
-            moves = pos["moves"]
-            if not moves:
-                continue
-
-            uci_to_cp_loss = {m["uci"]: m["cp_loss"] for m in moves}
-            sorted_moves = sorted(moves, key=lambda m: m["cp_loss"])
-
-            # Let SF (depth=1) choose a move
-            result = engine.play(pos["board"], limit=chess.engine.Limit(depth=depth))
-            choice_uci = result.move.uci()
-
-            # Handle if SF picks something not in the precomputed multipv (rare, but possible)
-            if choice_uci not in uci_to_cp_loss:
-                continue
-
-            choice_cp_loss = uci_to_cp_loss[choice_uci]
-
-            # metrics
-            results["avg_cp_loss"] += choice_cp_loss
-
-            # rank (1 = best move)
-            true_rank = [m["uci"] for m in sorted_moves].index(choice_uci) + 1
-            results["avg_rank"] += true_rank
-
-            # top-N hits
-            for k in results["top_hits"]:
-                results["top_hits"][k] += int(true_rank <= k)
-
-            results["count"] += 1
-
-    # averages
-    count = results["count"]
-    results["avg_cp_loss"] /= count
-    results["avg_rank"] /= count
-    for k in results["top_hits"]:
-        results["top_hits"][k] /= count
-
-    return results
-
-
 def run_gauntlet(models_paths, loader, eval_file, max_positions=None):
     positions, summary = load_eval_positions(eval_file, max_positions=max_positions)
     results = {}
@@ -532,12 +411,14 @@ def results_to_df(all_results):
 def plot_all_metrics(df, random_baseline=None):
     if random_baseline is None:
         random_baseline = {"expected_mean": 288, "expected_rank": 15.6}
-    
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # CP loss subplot
     axes[0].plot(df["epoch"], df["avg_cp_loss"], marker="o", label="Model")
-    axes[0].axhline(random_baseline["expected_mean"], color="red", linestyle="--", label="Random baseline")
+    axes[0].axhline(random_baseline["expected_mean"],
+                    color="red", linestyle="--",
+                    label="Random baseline")
     axes[0].set_title("Average Centipawn Loss over Training")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Avg CP Loss")
@@ -545,8 +426,11 @@ def plot_all_metrics(df, random_baseline=None):
     axes[0].grid(True)
 
     # Rank subplot
-    axes[1].plot(df["epoch"], df["avg_rank"], marker="o", color="orange", label="Model")
-    axes[1].axhline(random_baseline["expected_rank"], color="red", linestyle="--", label="Random baseline")
+    axes[1].plot(df["epoch"], df["avg_rank"], marker="o",
+                 color="orange", label="Model")
+    axes[1].axhline(random_baseline["expected_rank"],
+                    color="red", linestyle="--",
+                    label="Random baseline")
     axes[1].set_title("Average Rank of Chosen Move")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Avg Rank (1=Best)")
@@ -562,6 +446,7 @@ def plot_all_metrics(df, random_baseline=None):
 
     plt.tight_layout()
     plt.show()
+
 
 
 def get_score_against_sf(all_finished):
@@ -618,72 +503,18 @@ def log_game_stats(games, epoch=None):
         f.write(json.dumps(stats) + "\n")
 
     return stats
-
-
-def get_legal_labels(board, moves):
-    N = len(moves)
-    f, t, pc = np.zeros(N, int), np.zeros(N, int), np.zeros(N, int)
-    cp, pr = np.zeros(N, int), np.zeros(N, int)
-    
-    for i, mv in enumerate(moves):
-        f[i], t[i], pc[i], cp[i], pr[i] = move_to_labels(board, mv)
-    return {"from":f, "to":t, "piece":pc, "cap":cp, "promo": pr}
-
-
-def compute_move_priors(model_outputs, legal_labels, weights=None):
-    """
-    model_outputs   : dict of np.arrays (softmax probs) for each head
-                      e.g. {"best_from": (64,), "best_to": (64,), ...}
-    legal_labels    : dict of arrays, each shaped (N_moves,)
-                      e.g. {"from": [12,14,...], "to": [...], "piece": [...], ...}
-    weights         : dict of per-head importance, defaults tuned for chess
-    
-    Returns:
-        priors_best  : np.array (N_moves,) priors from best head
-    """
-    if weights is None:
-        weights = {"from":1.0, "to":1.0, "piece":0.5, "cap":0.0, "promo": 0.1}
-    
-    N = len(legal_labels["from"])
-
-    # Stack indices for advanced indexing
-    # e.g. for "from" head: probs[from_indices]
-    priors_best = np.zeros(N, dtype=np.float32)
-    
-    # consider a toggle-able bias?
-    # priors_best += bias
-    
-    for factor in ["from","to", "piece", "cap", "promo"]:
-        # Get indices of legal moves for this factor
-        idxs = legal_labels[factor]
-
-        # Look up probs for each legal move at those indices
-        p_best = model_outputs[f"best_{factor}"][idxs]
-
-        # Avoid log(0)
-        p_best = np.clip(p_best,  1e-9, 1.0)
-
-        # Accumulate weighted log-likelihood
-        priors_best += weights[factor] * np.log(p_best)
-    
-    # Convert back from log-scores to priors
-    temperature = 2.0   # smoothness control
-    priors_best = np.exp(priors_best  / temperature - np.max(priors_best) / temperature)
-
-    # Normalize
-    priors_best /= priors_best.sum()
-
-    return priors_best
-
+#%%
 
 class SelfPlayGame:
-    def __init__(self, n_init=0, move_limit=80, prevent_repetition=False, **kwargs):
+    def __init__(self, board=None, move_limit=90, **kwargs):
         self.game_id = str(uuid.uuid4())
-        self.board = random_init(n_init)
-        self.init_fen = self.board.fen()
         self.move_limit = move_limit
         
-        self.prevent_repetition = prevent_repetition
+        n_init = kwargs.get("n_init", 2)
+        self.board = board if board is not None else random_init(n_init)
+        self.init_fen = self.board.fen()
+        
+        self.prevent_repetition = kwargs.get("prevent_repetition", True)
         self.pos_move_counter = defaultdict(int)
         self.pos_counter = defaultdict(int)
         self.move_counter = defaultdict(int)
@@ -699,7 +530,7 @@ class SelfPlayGame:
         self.draw_score = kwargs.get("draw_score", 0.0)
         
         self.sf_plays = kwargs.get("sf_plays", None)
-        self.sample_scores = kwargs.get("sample_scores", True)
+        self.sample_scores = kwargs.get("sample_scores", False)
 
     def short_fen(self, fen=None):
         f = self.board.fen() if fen is None else fen
@@ -714,26 +545,30 @@ class SelfPlayGame:
     
         white_mat, black_mat = feats.get_piece_value_sum(self.board)
         mat_diff = 10*white_mat - 10*black_mat
-        if abs(mat_diff) >= 10:
+        if abs(mat_diff) >= 12:
             self.mat_adv_counter += 1
         else:
             self.mat_adv_counter = 0
     
-        if self.mat_adv_counter >= 20:
+        if self.mat_adv_counter >= 28:
             print(self.game_id, "Material cutoff:", mat_diff)
             self.outcome = 1.0 if mat_diff > 0 else -1.0
             return True
         
         # Syzygy probe if few pieces
-        if self.board.fullmove_number > 20 and len(self.board.piece_map()) <= 5:
-            outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
-            with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
-                table_res = tablebase.probe_wdl(self.board)
-                
-            table_res = table_res if self.board.turn else -1*table_res
-            self.outcome = outcomes[table_res]
-            print(self.game_id, "Endgame Solution Found:", self.outcome, self.board.fen())
-            return True
+        if len(self.board.piece_map()) <= 5:
+            # may not work so just go as normal
+            try:
+                outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
+                with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
+                    table_res = tablebase.probe_wdl(self.board)
+                    
+                table_res = table_res if self.board.turn else -1*table_res
+                self.outcome = outcomes[table_res]
+                print(self.game_id, "Endgame Solution Found:", self.outcome, self.board.fen())
+                return True
+            except:
+                pass
             
         if self.board.fullmove_number > self.move_limit:
             print(self.game_id, "Move limit reached:", self.board.fullmove_number)
@@ -745,20 +580,20 @@ class SelfPlayGame:
     def record_position(self):
         # STM-POV: mirror if Black to move
         to_score = self.board if self.board.turn else self.board.mirror()
-        tokens = board_to_tokens(to_score)
+        state = get_board_state(to_score)
 
-        self.training_X.append({"tokens": tokens})
+        self.training_X.append({"board": state})
         
-        # labels filled in later (after outcome known)
-        self.training_Y.append({
-            'value': None, 'best_from': None, 'best_to': None, 'best_piece': None,
-            'best_cap': None, 'best_promo': None
-        })
+        # # labels filled in later (after outcome known)
+        # self.training_Y.append({
+        #     'value': None, 'best_from': None, 'best_to': None, 'best_piece': None,
+        #     'best_promo': None
+        # })
         
-        self.sample_weights.append({
-            'value': 0.01, 'best_from': 0.0, 'best_to': 0.0, 'best_piece': 0.0,
-            'best_cap': 0.0, 'best_promo': 0.0
-        })
+        # self.sample_weights.append({
+        #     'value': 0.01, 'best_from': 0.0, 'best_to': 0.0, 'best_piece': 0.0,
+        #     'best_promo': 0.0
+        # })
 
     def get_premove_data(self):
         if self.check_termination():
@@ -819,7 +654,7 @@ class SelfPlayGame:
         scores = compute_move_priors(preds, legal_labels)
         
         # pick the move
-        if not self.sample_scores or (scores.max() > 0.15):
+        if not self.sample_scores or (scores.max() > 0.2):
             top_idx = np.argmax(scores)
         else:
             top_idx = np.random.choice(len(scores), p=scores)
@@ -836,16 +671,15 @@ class SelfPlayGame:
         self.pos_move_counter[(short_fen, move)] += 1
         
         # record move info in the last Y slot
-        from_idx, to_idx, piece_idx, cap_idx, pr_idx = move_to_labels(self.board, move)
+        # from_idx, to_idx, piece_idx, pr_idx = move_to_labels(self.board, move)
     
-        self.training_Y[-1].update({
-            "from": from_idx,
-            "to": to_idx,
-            "piece": piece_idx,
-            "cap": cap_idx,
-            "promo":pr_idx,
-            "move": move   # keep the actual move object too
-        })
+        # self.training_Y[-1].update({
+        #     "from": from_idx,
+        #     "to": to_idx,
+        #     "piece": piece_idx,
+        #     "promo":pr_idx,
+        #     "move": move   # keep the actual move object too
+        # })
         
         self.board.push(move)
         
@@ -857,41 +691,39 @@ class SelfPlayGame:
         return
     
     def finalize_outcome(self):
-        stm = True  # White POV
-        for x, y, w in zip(self.training_X, self.training_Y, self.sample_weights):
-            # always set value from White’s perspective
-            y["value"] = self.outcome if stm else -self.outcome
+        # stm = True  # White POV
+        # for x, y, w in zip(self.training_X, self.training_Y, self.sample_weights):
+        #     # always set value from White’s perspective
+        #     y["value"] = self.outcome if stm else -self.outcome
             
-            if self.outcome == 0:
-                w['value'] = 0.005
-                # make sure everything else is 0
-                w.update(
-                    {'best_from': 0.0, 'best_to': 0.0, 'best_piece': 0.0,
-                     'best_cap': 0.0, 'best_promo': 0.0
-                })
+        #     if self.outcome == 0:
+        #         w['value'] = 0.0
+        #         # make sure everything else is 0
+        #         w.update(
+        #             {'best_from': 0.0, 'best_to': 0.0,
+        #              'best_piece': 0.0,'best_promo': 0.0
+        #         })
             
-            if (self.outcome > 0 and stm) or (self.outcome < 0 and not stm):
-                # winning side → good move
-                y["best_from"] = y.pop("from")
-                y["best_to"]   = y.pop("to")
-                y["best_piece"]= y.pop("piece")
-                y["best_cap"]  = y.pop("cap")
-                y["best_promo"]  = y.pop("promo")
+        #     if (self.outcome > 0 and stm) or (self.outcome < 0 and not stm):
+        #         # winning side → good move
+        #         y["best_from"] = y.pop("from")
+        #         y["best_to"]   = y.pop("to")
+        #         y["best_piece"]= y.pop("piece")
+        #         y["best_promo"]  = y.pop("promo")
                 
-                # update weights and pay extra attention to captures and promos
-                w.update({'best_from': 0.0, 'best_to': 0.0, 'best_piece': 0.0})
-                w['best_cap'] = 0.0
-                w['best_promo'] = 3.0 if y['best_promo'] > 0 else 0.005
+        #         # update weights and pay extra attention to promos
+        #         w.update({'best_from': 0.1, 'best_to': 0.1, 'best_piece': 0.1})
+        #         w['best_promo'] = 3.0 if y['best_promo'] > 0 else 0.005
                 
-            else:
-                # remove the extra stuff
-                for k in ["from", "to", "piece", "cap", "promo"]:
-                    y.pop(k, None)
+        #     else:
+        #         # remove the extra stuff
+        #         for k in ["from", "to", "piece", "promo"]:
+        #             y.pop(k, None)
     
-            stm = not stm
+        #     stm = not stm
         self.game_complete = True
         
-    def show_board(self, flipped=False, sleep=0.1):
+    def show_board(self, flipped=False, sleep=0.0):
         clear_output(wait=True)
         display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
         time.sleep(sleep)
@@ -908,27 +740,31 @@ def get_boosting_data(game, result, weights):
     moreX = game.training_X[-1]
         
     # add targets
-    f, t, pi, c, pr = move_to_labels(to_score, move)
+    f, t, pi, pr = move_to_labels(to_score, move)
     moreY = {
-        'value': score, 'best_to': t,
-        'best_from': f, 'best_piece': pi, 'best_cap': c, 'best_promo': pr
+        'value': score, 'best_to': t, 'best_from': f, 'best_piece': pi, 'best_promo': pr
     }
     
     moreW = deepcopy(weights)
-    moreW['value'] = 1.0
-    moreW['best_cap'] = 0.0
-    moreW['best_from'] = 1.0
-    moreW['best_to'] = 1.0
+    moreW['value'] = 0.75
+    moreW['best_from'] = 1.2
+    moreW['best_to'] = 1.2
     moreW['best_promo'] = 3.0 if moreY['best_promo'] > 0 else 0.01
     
     return moreX, moreY, moreW
+
+
+import pickle
+fen_path = "C:/Users/Bryan/Data/chessbot_data/fens2000.pkl"
+with open(fen_path, "rb") as f:
+    fen_list = pickle.load(f)
 
     
 def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
     play_sf = kwargs.get("play_sf", False)
     engine = kwargs.get("engine", False)
     prevent_repetition = kwargs.get("prevent_repetition", True)
-    sample_scores = kwargs.get("sample_scores", True)
+    sample_scores = kwargs.get("sample_scores", False)
     
     # this adds in the true best move for instant gradient boost
     instant_boosting = kwargs.get("instant_boosting", False)
@@ -940,12 +776,19 @@ def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
     # load games
     games = []
     for i in range(n_games):
-        move_limit = 80
+        move_limit = 90
         n_init = kwargs.get("n_init", np.random.randint(2, 6))
+        
+        # half the games from the structured fens, half random inits
+        if i < n_games/2:
+            b = chess.Board(random.choice(fen_list))
+        else:
+            b = random_init(n_init)
+            
         # optionally play white or black vs stockfish
         sf_plays = i % 2 == 0 if play_sf else None
         g = SelfPlayGame(
-            n_init=n_init, move_limit=move_limit,
+            board=b, move_limit=move_limit,
             sf_plays=sf_plays, prevent_repetition=prevent_repetition,
             sample_scores=sample_scores
         )
@@ -967,10 +810,10 @@ def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
         # check if any games are newly finished
         finished = [g for g in games if g.game_complete]
         all_finished += finished
-        for g in finished:
-            train_X += g.training_X
-            train_Y += g.training_Y
-            train_W += g.sample_weights
+        # for g in finished:
+        #     train_X += g.training_X
+        #     train_Y += g.training_Y
+        #     train_W += g.sample_weights
             
         games = [g for g in games if not g.game_complete]
         
@@ -996,7 +839,7 @@ def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
             # run stockfish if it is needed
             if sf_turn or instant_boosting:
                 result = engine.play(
-                    game.board, limit=chess.engine.Limit(depth=5),
+                    game.board, limit=chess.engine.Limit(depth=3),
                     info=chess.engine.Info.ALL
                 )
         
@@ -1025,10 +868,10 @@ def self_play_batch(model, n_games=32, show=True, return_games=False, **kwargs):
         # drain the list once more
         finished = [g for g in games if g.game_complete]
         all_finished += finished
-        for g in finished:
-            train_X += g.training_X
-            train_Y += g.training_Y
-            train_W += g.sample_weights
+        # for g in finished:
+        #     train_X += g.training_X
+        #     train_Y += g.training_Y
+        #     train_W += g.sample_weights
             
         games = [g for g in games if not g.game_complete]
     
@@ -1051,11 +894,6 @@ i, o, w, g = self_play_batch(
     prevent_repetition=True
 )
 
-i, o, w, g = self_play_batch(
-    model, n_games=1, show=True, return_games=True,
-    prevent_repetition=True, sample_scores=False
-)
-
 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
     i, o, w, g = self_play_batch(
         model, n_games=1, show=True, return_games=True, n_init=0,
@@ -1073,24 +911,23 @@ with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
 all_evals = pd.DataFrame()
 all_results = {}
 loop_times = []
-ol = 1
+ol = 1001
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models/"
-model_files = [f for f in os.listdir(MODEL_DIR) if 'selfplay' in f]
+model_files = [f for f in os.listdir(MODEL_DIR) if 'conv_model_medium' in f]
 model_paths = [os.path.join(MODEL_DIR, f) for f in model_files]
 
 DATA_DIR = "C:/Users/Bryan/Data/chessbot_data/training_data"
 eval_file = os.path.join(DATA_DIR, "tf_model_pos_eval_data.jsonl")
 
 all_results, summary = run_gauntlet(model_paths, load_model, eval_file)
-
 positions, summary = load_eval_positions(eval_file, max_positions=None)
 
 #sf_results = evaluate_stockfish(positions, depth=1)
 df = results_to_df(all_results)
 plot_all_metrics(df, random_baseline=None)
 #%%
-while ol <= 1000:
+while ol <= 2000:
     start_loop = time.time()
     show=ol % 7 == 0
     print(f"Outer Loop {ol}")
@@ -1098,7 +935,7 @@ while ol <= 1000:
         print("------- Playing vs Stockfish -------")
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
             inputs, outputs, weights, games = self_play_batch(
-                model, n_games=128, show=True, return_games=True, n_init=3,
+                model, n_games=192, show=show, return_games=True, n_init=3,
                 play_sf=True, engine=engine, instant_boosting=True,
                 prevent_repetition=False
             )
@@ -1107,14 +944,14 @@ while ol <= 1000:
         print("------- Playing vs Self -------")
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
             inputs, outputs, weights, games = self_play_batch(
-                model, n_games=64, show=show, return_games=True, n_init=1,
+                model, n_games=96, show=show, return_games=True, n_init=3,
                 instant_boosting=True, engine=engine, prevent_repetition=True
             )
         
     stats = log_game_stats(games, epoch=ol)
     print(stats)
     
-    if ol % 5 == 0:    
+    if ol % 5 == 0:
         eval_df = cbu.score_game_data(model, inputs, outputs)
         all_evals = pd.concat([all_evals, eval_df])
     
@@ -1124,22 +961,16 @@ while ol <= 1000:
     # train (no val)
     model.fit(
         inputs, outputs, sample_weight=weights,
-        batch_size=128, epochs=1, shuffle=True
+        batch_size=256, epochs=2, shuffle=True
     )
     
-    if ol % 10 == 0:
-        checkup = evaluate_model(model, positions)
-        file_would_be = f"transformer_model_big_v{ol}.h5"
-        all_results[file_would_be] = checkup
-        df = results_to_df(all_results)
-        plot_all_metrics(df, random_baseline=None)
-        
+    if ol % 25 == 0:
         # more frequent checkpointing
-        model_out = os.path.join(MODEL_DIR, "tf_big_selfplay_latest.h5")
+        model_out = os.path.join(MODEL_DIR, "tf_conv_medium_latest.h5")
         model.save(model_out)
         
-    if ol % 50 == 0:
-        model_out = os.path.join(MODEL_DIR, f"transformer_model_big__v{ol}.h5")
+    if ol % 100 == 0:
+        model_out = os.path.join(MODEL_DIR, f"conv_model_medium_v{ol}.h5")
         model.save(model_out)
         
     stop_loop = time.time()
@@ -1148,3 +979,4 @@ while ol <= 1000:
     print(f"*** Loop {ol} completed in {format_time(loop_time)}")
     print(f"*** Avg loop time: {format_time(np.mean(loop_times))}")
     ol += 1
+#%%

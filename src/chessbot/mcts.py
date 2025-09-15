@@ -1,542 +1,544 @@
+import os, json
 import chess
-import time
-import numpy as np
+import math
+
 import pandas as pd
+import numpy as np
 
-import chessbot.encoding as cbe
+import matplotlib.pyplot as plt
+from datetime import datetime
+import random, time
 
-SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
-PRED_CACHE = {}
+import chessbot.utils as cbu
+from chessbot.utils import get_pre_opened_game, softmax
 
-#%%
-class MCTSNode:
-    def __init__(self, board, parent=None, move=None):
-        self.board = board
-        self.parent = parent
-        self.move = move
-        self.children = {}
-        self.visits = 0
-        self.value_sum = 0.0
-        self.shredder_fen = board.shredder_fen()
-        self.priors = {}
+from tensorflow import keras
 
-    def is_fully_expanded(self):
-        return len(self.children) == len(list(self.board.legal_moves))
+from chessbot import SF_LOC, ENDGAME_LOC
+import chess.syzygy
 
-    def average_value(self):
-        return self.value_sum / self.visits if self.visits > 0 else 0.5
-    
-    def expand(self):
-        legal = list(self.board.legal_moves)
-        for move in legal:
-            if move not in self.children:
-                new_board = self.board.copy()
-                new_board.push(move)
-                self.children[move] = MCTSNode(new_board, parent=self, move=move)
+from pyfastchess import Board as fastboard
+from stockfish import Stockfish
 
-        # OPTIONAL: if you have a policy head, set node.priors here.
-        # Otherwise, selection will uniform-fallback.
-        # Example (uniform):
-        n = len(self.children) or 1
-        self.priors = {m: 1.0 / n for m in self.children}
+MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 
-    def best_child(self):
-        return max(self.children.values(), key=lambda c: c.average_value())
-    
+def load_model(model_loc):
+    model = keras.models.load_model(model_loc)
+    return model
 
-def predict_value_cached(node, engine):
-    key = node.board.shredder_fen()
-    if key in PRED_CACHE:
-        return PRED_CACHE[key]
-    
-    score = engine.analyse(node.board, limit=chess.engine.Limit(depth=5))
-    v = cbe.pawns_to_winprob(cbe.score_to_cp_white(score['score']))
-    PRED_CACHE[key] = v
-    return v
+model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+
+# Simple early-stop params
+ES_MIN_SIMS = 128        # do not check before this many sims
+ES_CHECK_EVERY = 4       # check cadence
+ES_GAP_FRAC = 0.60       # stop if (N1 - N2) > ES_GAP_FRAC * remaining
 
 
-def predict_value_cached_priors(node, engine):
-    key = node.shredder_fen
-    need_current_pred = key not in PRED_CACHE.keys()
-    has_children = node.children
-    
-    if has_children:
-        need_priors = hasattr(node, "priors") 
-        need_priors = need_priors and node.children
-        need_priors = need_priors and len(set(node.priors.values())) < 2
-        
-    else:
-        need_priors = False
-    
-    if need_priors:
-        all_priors_cached = True
-        moves, evals = [], []
-        for m, n in node.children.items():
-            n_eval = PRED_CACHE.get(n.shredder_fen, None)
-            if n_eval is None:
-                all_priors_cached = False
-                break
-            else:
-                moves.append(m)
-                evals.append(n_eval)
-     
-    run_sf = need_current_pred or (need_priors and not all_priors_cached)
-    
-    if run_sf:
-        n_moves = len(list(node.board.legal_moves))
-        # might be a checkmate or something
-        if not n_moves:
-            return predict_value_cached(node, engine)
-        
-        sf_eval = engine.analyse(
-            node.board, multipv=n_moves, limit=chess.engine.Limit(depth=5),
-            info=chess.engine.Info.ALL
-        )
-    
-    if need_current_pred:
-        v = cbe.pawns_to_winprob(cbe.score_to_cp_white(sf_eval[0]['score']))
-        PRED_CACHE[node.shredder_fen] = v
-        
-    else:
-        v = PRED_CACHE[node.shredder_fen]
-    
-    if need_priors:
-        if all_priors_cached:
-            evals_p = cbe.winprob_to_policy(temperature=0.6)
-            priors = {m:e for m, e in zip(moves, evals_p)}
-            node.priors = priors
-            
-        else:
-            moves, evals = [], []
-            for e in sf_eval:
-                ve = cbe.pawns_to_winprob(cbe.score_to_cp_white(e['score']))
-                moves.append(e['pv'][0])
-                evals.append(ve)
-            evals_p = cbe.winprob_to_policy(evals, temperature=0.6)
-            priors = {m:e for m, e in zip(moves, evals_p)}
-            node.priors = priors
-            
-    return v
+def show_top_moves(root, board, top_n=4, c_puct=2.0, show_san=True):
+    """Pretty-print the top candidate root moves by visit count, with Q/U/P.
 
-
-def add_dirichlet_noise(priors, epsilon=0.25, alpha=0.3):
-    moves = list(priors.keys())
-    n = len(moves)
-    noise = np.random.dirichlet([alpha] * n)
-    return {m: (1 - epsilon) * priors[m] + epsilon * n_
-            for m, n_ in zip(moves, noise)}
-
-
-def select_child_puct(
-    node, prefer_higher=True, c_puct=1.0, root_noise=False, epsilon=0.25, alpha=0.3
-):
-    """PUCT selection with optional Dirichlet noise at the root."""
-    kids_items = list(node.children.items())
-    if not kids_items:
+    root: MCTSNode at the current root.
+    board: fastboard positioned at root (used only for SAN pretty names).
+    top_n: how many moves to display.
+    c_puct: exploration constant for the U term display.
+    show_san: if True, attempt to print SAN next to each UCI.
+    """
+    if not root.children:
+        print("\nTop candidate moves:\n  (no children)")
         return None
 
-    # Initialize priors if not set
-    if not hasattr(node, "priors") or node.priors is None:
-        n = len(kids_items)
-        node.priors = {m: 1.0 / n for m, _ in kids_items}
-
-        # Add root noise if requested
-        if root_noise:
-            node.priors = add_dirichlet_noise(node.priors, epsilon=epsilon, alpha=alpha)
-
-    N = max(1, node.visits)  # parent visits
-    best_child, best_score = None, -1e18
-    for move, child in kids_items:
-        Q = child.average_value() if prefer_higher else 1 - child.average_value()
-        P = node.priors.get(move, 1.0 / len(kids_items))
-        U = c_puct * P * (np.sqrt(N) / (1.0 + child.visits))
-        score = Q + U
-        if score > best_score:
-            best_score, best_child = score, child
-    return best_child
-
-
-def simulate(engine, root, max_depth=128, c_puct=2.0):
-    path = []
-    node = root
-    depth = 0
-    
-    # SELECTION + EXPANSION
-    while depth < max_depth:
-        root_noise = depth == 0
-        path.append(node)
-
-        if not node.children:
-            node.expand()
-            node = select_child_puct(
-                node, prefer_higher=node.board.turn,
-                c_puct=c_puct, root_noise=root_noise
-            )
-            
-            break
-        
-        else:
-            node = select_child_puct(
-                node, prefer_higher=node.board.turn,
-                c_puct=c_puct, root_noise=root_noise
-            )
-        
-        # stop here if we reached a terminal state
-        if node.board.is_game_over():
-            break
-        depth += 1
-    
-    if depth < 3:
-        value = predict_value_cached_priors(node, engine)
-    else:
-        value = predict_value_cached(node, engine)
-
-    # BACKPROPAGATION
-    for i, node in enumerate(reversed(path)):
-        node.visits += 1
-        node.value_sum += value
-
-
-def collect_policy_data(root, n_sims):
-    to_df = []
-    for move, child in root.children.items():
-        to_df.append([str(move), child.average_value(), child.visits])
-        
-    cols = ['move', f'Q_{n_sims}', f'visits_{n_sims}']
-    out_df = pd.DataFrame(to_df, columns=cols).set_index('move')
-    return out_df
-
-
-def collect_value_data(engine, root):
-    n_moves = len(list(root.board.legal_moves))
-    info_list = engine.analyse(
-        root.board, multipv=n_moves, limit=chess.engine.Limit(depth=3),
-        info=chess.engine.Info.ALL
-    )
-    
-    to_df = []
-    for mv in info_list:
-        move_name = str(mv['pv'][0])
-        v = cbe.pawns_to_winprob(cbe.score_to_cp_white(mv['score']))
-        to_df.append([move_name, v])
-        
-    out_df = pd.DataFrame(to_df, columns=['move', 'SF_eval'])
-    return out_df.set_index('move')
-    
-
-def choose_move(root, engine, board, max_sims=1000):
-    print("Thinking... ")
-    start = time.time()
-    df_list = []
-    df_list.append(collect_value_data(engine, root))
-    
-    for s in range(max_sims):
-        simulate(engine, root, max_depth=128)
-        
-        if s+1 in [100, 200, 500, 1000]:
-            df_list.append(collect_policy_data(root, s+1))
-    
-    stop = time.time()
-    print(f"Completed {s} simulations in {round(stop-start, 2)} seconds")
-    df = pd.concat(df_list, axis=1).sort_values("SF_eval")
-    
-    # Sort children by visit count (descending)
-    sorted_children = sorted(root.children.items(),
-        key=lambda x: x[1].visits,
+    # Sort by visits descending
+    sorted_children = sorted(
+        root.children.items(),
+        key=lambda kv: kv[1].N,
         reverse=True
     )
-    
-    # Print top 5 candidates with SAN and model value of the child position
+
+    # Compute U scores against current root stats
+    sumN = max(1, root.N + sum([c.vloss for _, c in root.children.items()]))
+
     print("\nTop candidate moves:")
-    for move, node in sorted_children[:5]:
-        san = root.board.san(move)
-        v_child = predict_value_cached(node, engine)
-        print(f"{move.uci():<6} ({san})  visits={node.visits:<4} "
-              f"Q={node.average_value():.3f}  V(model)={v_child:.3f}")
+    for move_uci, node in sorted_children[:top_n]:
+        p = root.P.get(move_uci, 0.0)
+        u = c_puct * p * (sumN ** 0.5) / (1 + node.N + node.vloss)
 
-    # Pick the best move (highest visits)
-    best_move, best_node = sorted_children[0]
-    best_san = root.board.san(best_move)
-    print(f"\nChosen move: {best_move.uci()} ({best_san})  "
-          f"(visits={best_node.visits}, Q={best_node.average_value():.3f})")
-    
-    return best_move, df, root
+        san = "?"
+        if show_san:
+            san = board.san(move_uci)
 
-
-def advance_root(root, move):
-    """Advance the root of the MCTS tree to the child that matches `move`."""
-    if move in root.children:
-        new_root = root.children[move]
-        new_root.parent = None  # cut off old parent
-        return new_root
-    else:
-        # Tree has no record of this move, start fresh
-        return MCTSNode(root.board.copy())
-
-
-def get_rank_file(pieces):
-    ranks = [-1*(1 + p // 8) for p in pieces]
-    files = [p % 8 for p in pieces]
-    return ranks, files
-
-
-def get_board_state(board):
-    board_state = np.zeros((8, 8, 9), dtype=int)
-    attack_map = np.zeros((8, 8), dtype=int)
-    value_map = np.zeros((8, 8), dtype=int)
-    
-    value_lookup = {1:1, 2:3, 3:3, 4:5, 5:9, 6:12}
-    
-    for color in [True, False]:
-        value = 1 if color == True else -1
-        for piece in [1, 2, 3, 4, 5, 6]:
-            pieces = list(board.pieces(piece, color))
-            ranks, files = get_rank_file(pieces)
-            board_state[ranks, files, piece-1] = value
-            value_map[ranks, files] = value * value_lookup[piece]
-                
-            # check the attacks
-            for p in pieces:
-                # ignore pins
-                if board.is_pinned(color, p):
-                    continue
-                squares_attacked = list(board.attacks(p))
-                attack_ranks, attack_files = get_rank_file(squares_attacked)
-                attack_map[attack_ranks, attack_files] += value
-    
-    # game metadata
-    game_data = [
-        1 * board.turn,
-        1 * board.has_castling_rights(chess.WHITE),
-        1 * board.has_castling_rights(chess.BLACK),
-        1 * board.is_insufficient_material(),
-        1 * board.can_claim_draw(),
-        board.halfmove_clock / 100,
-        1 * board.is_repetition(3),
-        1 * board.is_check(),
-        1 * board.is_stalemate(),
-        attack_map.sum(),
-        value_map.sum(),
-        1 * board.turn,
-        value_map[np.abs(value_map) == 1].sum(),
-        value_map[np.abs(value_map) <= 3].sum(), 
-        value_map[np.abs(value_map) > 3].sum(),
-        len(list(board.legal_moves)) / 10
-    ]
-    
-    meta_plane = np.tile(np.array(game_data).reshape(4, 4), (2, 2))
-    
-    board_state[:, :, -3] = attack_map
-    board_state[:, :, -2] = value_map
-    board_state[:, :, -1] = meta_plane
-    
-    return board_state
-
-
-def make_move_with_model(board, model, color, return_state=True):
-    # generate the candidate moves
-    legal_moves = list(board.legal_moves)    
-    candidates = np.zeros((len(legal_moves), 8, 8, 9), dtype=int)
-    data = []
-    checkmates = np.zeros(len(legal_moves))
-    draws = np.zeros(len(legal_moves))
-    for i, lm in enumerate(legal_moves):
-        board.push(lm)
-        if board.is_checkmate():
-            checkmates[i] = 1
-            
-        threefold = board.can_claim_threefold_repetition()
-        if threefold | board.is_stalemate() | board.can_claim_draw():
-            draws[i] = 1
-        fen = board.fen()
-        data.append([lm, fen])
-        
-        candidate_state = get_board_state(board)
-        candidates[i] = candidate_state
-        
-        board.pop()
-        
-    # predict and take the best based on score
-    preds = model.predict(candidates, verbose=0)
-    if isinstance(preds, list):
-        outs = model.output_names
-        preds = preds[outs.index('value')]
-    
-    # update based on hyper obvious checks
-    if draws.sum():
-        preds[draws == 1] = 0.0
-        
-    if checkmates.sum():
-        if color:
-            preds[checkmates == 1] = 1000
-        else:
-            preds[checkmates == 1] = -1000
-            
-    # best for white, worst for black    
-    sel = np.argmax if color else np.argmin
-    move = legal_moves[sel(preds)]
-    board.push(move)
-    
-    #optionally return the state if training
-    out = {"board": board}
-    if return_state:
-        out['board_state'] = candidates[sel(preds)]
-        
-    return out
-
-#%%
-from IPython.display import display, clear_output, SVG
-import chess.svg, chess.pgn, random
-
-bot_color = np.random.uniform() < 0.5
-board = chess.Board()
-root = MCTSNode(board)
-data = []
-with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-    #v = predict_value_cached_priors(root, engine)
-    while not board.is_game_over():
-        clear_output(wait=True)
-        display(SVG(chess.svg.board(board=board, flipped=not bot_color)))
-        
-        sf_eval = engine.analyse(
-            board, multipv=10, limit=chess.engine.Limit(depth=1),
-            info=chess.engine.Info.ALL
+        line = (
+            f"{move_uci:<6} "
+            f"{'('+san+')':<12}  "
+            f"visits={node.N:<5} "
+            f"P={p:>.3f}  "
+            f"Q={node.Q:+.3f}  "
+            f"U={u:+.3f}"
         )
-        
-        if board.turn == bot_color:
-            best_move, df, root = choose_move(root, engine, board, max_sims=500)
-            data.append(df)
-            root = MCTSNode(board)
-            root = advance_root(root, best_move)
-            print("\nStockfish top 3 moves: ")
-            moves = sf_eval[:3]
-            for i, mv in enumerate(moves):
-                san = board.san(mv['pv'][0])
-                sc = cbe.pawns_to_winprob(cbe.score_to_cp_white(mv['score']))
-                
-                print(f"{i+1}. {san}: {np.round(sc, 3)}")
-                
-            print()
-            board.push(best_move)
-            
-        else:
-            sf_move = sf_eval[0]['pv'][0]
-            san = board.san(sf_move)
-            print(f"\nStockfish plays {san}\n")
-            board.push(sf_move)
-            time.sleep(0.5)
-            root = advance_root(root, sf_move)
-            root = MCTSNode(board)
+        print(line)
 
-
-
-#%%
-# import time
-# from IPython.display import display, clear_output, SVG
-# import chess.svg, chess.pgn
-# board = cbu.random_init(3)
-# clear_output(wait=True)
-# display(SVG(chess.svg.board(board=board, flipped=not root.board.turn)))
-
-# with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-#     best_move, df = choose_move(engine, board)
-# #PRED_CACHE = {}
-# def predict_value_cached(model, board):
-#     key = board.shredder_fen()
-#     if key in PRED_CACHE:
-#         return PRED_CACHE[key]
-#     x = get_board_state(board).reshape(1, 8, 8, 9)
-#     out = model.predict(x, verbose=0)
-#     v = out[model.output_names.index('value')].item()
-#     PRED_CACHE[key] = v
-#     return v
-
-# def choose_move(board, max_sims=1500, max_time=45):
-#     root = MCTSNode(board.copy())
+    # Chosen move by max visits
+    best_move_uci, best_node = sorted_children[0]
+    best_san = best_move_uci
     
-#     print("Thinking... ")
-#     start = time.time()
-#     n_sims = 0
-#     while time.time() - start < max_time:
-#         simulate(engine, root, max_depth=64)
-#         n_sims+=1
-        
-#         # check to see if there is a clear winner that will not likely be beaten
-#         if n_sims % 100 == 0:
-#             if n_sims > 399:
-#                 children = [v for k, v in root.children.items()]
-#                 visits = sorted([c.visits for c in children])
-                
-#                 if visits[-1] >= 0.5* n_sims:
-#                     break
-#                 if (visits[-1] >= 0.4*n_sims) and (visits[-1] > 1.5*visits[-2]):
-#                     break
-#                 if visits[-1]-visits[-2] > 0.8 * (max_sims-n_sims):
-#                     break
-        
-#         if n_sims >= max_sims:
-#             break
-            
-#     stop = time.time()
-#     print(f"Completed {n_sims} simulations in {round(stop-start, 2)} seconds")
-    
-#     if not root.children:
-#         print("No legal moves.")
-#         return None
-    
-#     # Sort children by visit count (descending)
-#     sorted_children = sorted(root.children.items(),
-#         key=lambda x: x[1].visits,
-#         reverse=True
-#     )
+    if show_san:
+        best_san = board.san(best_move_uci)
 
-#     # Print top 5 candidates with SAN and model value of the child position
-#     print("\nTop candidate moves:")
-#     for move, node in sorted_children[:5]:
-#         san = root.board.san(move)
-#         v_child = predict_value_cached(model, node.board)*10
-#         print(f"{move.uci():<6} ({san})  visits={node.visits:<4} "
-#               f"Q={node.average_value():.3f}  V(model)={v_child:.3f}")
+    print(
+        f"\nChosen move: {best_move_uci} ({best_san})  "
+        f"(visits={best_node.N}, Q={best_node.Q:+.3f})"
+    )
 
-#     # Pick the best move (highest visits)
-#     best_move, best_node = sorted_children[0]
-#     best_san = root.board.san(best_move)
-#     print(f"\nChosen move: {best_move.uci()} ({best_san})  "
-#           f"(visits={best_node.visits}, Q={best_node.average_value():.3f})")
-    
-#     return best_move
+    return best_move_uci
 
-def sort_candidates(evals, clr):
-    if clr: 
-        ranked = sorted(evals, key=lambda x: x[1], reverse=True)
+
+class MCTSNode:
+    def __init__(self, stm, uci=None, parent=None):
+        self.parent = parent
+        self.uci = uci
+        self.stm = stm
+        self.children = {}
+        self.N = 0
+        self.W = 0.0
+        self.Q = 0.0
+        self.P = {}
+        self.is_expanded = False
+        self.value = None
+        self.legal = None
+        self.vloss = 0
+
+
+def terminal_value_white_pov(board):
+    reason, result = board.is_game_over()
+    if reason == 'none':
+        return None
+    if reason == 'checkmate':
+        winner = 'w' if board.side_to_move() == 'b' else 'b'
+        return 1.0 if winner == 'w' else -1.0
+    return 0.0
+
+
+def priors_from_heads(board, legal, p_from, p_to, p_piece, p_promo, mix=0.5):
+    """
+    Returns dict move -> prior. Mix adds uniform mass:
+      final = (1 - mix) * priors + mix * uniform
+    """
+    if not legal:
+        return {}
+
+    fr, to, piece, promo = board.moves_to_labels(ucis=legal)
+
+    pri = []
+    for i in range(len(legal)):
+        pf = p_from[fr[i]]
+        pt = p_to[to[i]]
+        pp = p_piece[piece[i]]
+        pr = p_promo[promo[i]]  # 0=Q/none, 1=N, 2=B, 3=R
+        pri.append(pf * pt * pp * pr)
+
+    s = float(sum(pri))
+    n = len(legal)
+    if s > 0.0:
+        pri = [p / s for p in pri]
     else:
-        ranked = sorted(evals, key=lambda x: x[1], reverse5e=False)
-        
-    return ranked
-    
-def eval_current_state(board, model):
-    current_state = np.zeros((1, 8, 8, 9))
-    current_state[0] = get_board_state(board)
-    current_pred = model.predict(current_state, verbose=0)
-    
-    if isinstance(current_pred, list):
-        outs = model.output_names
-        current_eval = current_pred[outs.index('value')]
-        current_cmr = current_pred[outs.index('checkmate_radar')]
-        current_queen_en_prise = current_pred[outs.index('queen_en_prise')]
-        current_material = current_pred[outs.index('material')]
-        
-    print(f"Current Evaluation: {np.round(current_eval.item()*10, 4)}")
-    print(f"Current CMR: {np.round(current_cmr.item(), 4)}")
-    print(f"Current Materal: {np.round(current_material[0]*10, 4)}")
-    print(f"Current QEP: {np.round(current_queen_en_prise[0], 4)}")
-    
-    
+        pri = [1.0 / n] * n
 
-    
-    
+    m = max(0.0, min(1.0, float(mix)))
+    if m > 0.0:
+        u = 1.0 / n
+        pri = [(1.0 - m) * p + m * u for p in pri]
+        t = float(sum(pri))
+        if t > 0.0:
+            inv = 1.0 / t
+            pri = [p * inv for p in pri]
+        else:
+            pri = [u] * n
+
+    return {mv: p for mv, p in zip(legal, pri)}
 
 
+def model_eval(board, model):
+    X = np.asarray([board.stacked_planes(5)], dtype=np.float32)
+    out = model.predict(X, batch_size=1, verbose=0)
+    if isinstance(out, list):
+        names = list(getattr(model, 'output_names', []))
+        if names:
+            v = out[names.index('value')]
+            pf = out[names.index('best_from')]
+            pt = out[names.index('best_to')]
+            ppiece = out[names.index('best_piece')]
+            ppromo = out[names.index('best_promo')]
+        else:
+            v, pf, pt, ppiece, ppromo = out
+    elif isinstance(out, dict):
+        v = out['value']; pf = out['best_from']; pt = out['best_to']
+        ppiece = out['best_piece']; ppromo = out['best_promo']
+    else:
+        raise RuntimeError('unexpected model outputs')
+    return (
+        float(np.asarray(v, np.float32).reshape(-1)[0]),
+        softmax(pf.reshape(-1)),
+        softmax(pt.reshape(-1)),
+        softmax(ppiece.reshape(-1)),
+        softmax(ppromo.reshape(-1)),
+    )
 
+
+class MCTSTree:
+    def __init__(self, board, model, c_puct=1.5, eps=0.25, alpha=0.03):
+        self.model = model
+        self.c_puct = c_puct
+        self.dir_eps = eps
+        self.dir_alpha = alpha
+        self.root = MCTSNode(board.side_to_move())
+        self.root_board_fen = board.fen()
+
+        # early-stop rolling state
+        self._es_history = []
+        self._es_last_checked_at = 0
+        self._es_tripped = False
+        self._es_reason = ""
+        self._es_after_sims = 0
+
+    def advance(self, board, move_uci):
+        if move_uci in self.root.children:
+            new_root = self.root.children[move_uci]
+            new_root.parent = None
+            self.root = new_root
+            board.push_uci(move_uci)
+            self.root_board_fen = board.fen()
+        else:
+            board.push_uci(move_uci)
+            self.root = MCTSNode(board.side_to_move())
+            self.root_board_fen = board.fen()
+    
+    def _root_child_visits(self):
+        node = self.root
+        if not node.children:
+            return []
+        rows = []
+        for mv, ch in node.children.items():
+            rows.append((mv, ch.N))
+        rows.sort(key=lambda t: t[1], reverse=True)
+        return rows
+
+    def maybe_early_stop(self, sims_done, sims_target):
+        if self._es_tripped:
+            return True
+
+        if sims_done < ES_MIN_SIMS:
+            return False
+        if sims_done - self._es_last_checked_at < ES_CHECK_EVERY:
+            return False
+        self._es_last_checked_at = sims_done
+
+        rows = self._root_child_visits()
+        if len(rows) < 2:
+            return False
+
+        n1 = rows[0][1]
+        n2 = rows[1][1]
+        gap = n1 - n2
+        remaining = max(0, sims_target - sims_done)
+
+        if gap > ES_GAP_FRAC * float(remaining):
+            self._es_tripped = True
+            self._es_reason = (
+                "gap_vs_remaining "
+                "n1=%d n2=%d gap=%d remaining=%d thresh=%.1f"
+                % (n1, n2, gap, remaining, ES_GAP_FRAC * remaining)
+            )
+            self._es_after_sims = sims_done
+            return True
+
+        return False
+
+
+    def _record_top(self, move):
+        self._es_history.append(move)
+        if len(self._es_history) > self._es_hist_k:
+            self._es_history = self._es_history[-self._es_hist_k:]
+
+    def select_child(self, node):
+        sumN = max(1, node.N + sum([c.vloss for c in node.children.values()]))
+        best = None
+        best_score = -1e9
+        for mv, child in node.children.items():
+            p = node.P.get(mv, 0.0)
+            u = self.c_puct * p * math.sqrt(sumN) / (1 + child.N + child.vloss)
+            score = child.Q + u if node.stm == 'w' else -child.Q + u
+            if score > best_score:
+                best_score = score
+                best = (mv, child)
+        return best
+
+    def expand(self, board, node):
+        tv = terminal_value_white_pov(board)
+        if tv is not None:
+            node.is_expanded = True
+            node.value = tv if node.stm == 'w' else -tv
+            node.legal = []
+            return node.value
+        print("Expansion with model eval")
+        v_w, pf, pt, ppiece, ppromo = model_eval(board, self.model)
+        node.value = v_w if node.stm == 'w' else -v_w
+        legal = board.legal_moves()
+        node.legal = legal
+        if not legal:
+            node.is_expanded = True
+            return node.value
+
+        node.P = priors_from_heads(board, legal, pf, pt, ppiece, ppromo)
+        for m in legal:
+            board.push_uci(m)
+            node.children[m] = MCTSNode(board.side_to_move(), uci=m, parent=node)
+            board.unmake()
+        node.is_expanded = True
+        return node.value
+
+    def backup(self, path, leaf_value):
+        v = leaf_value
+        last_stm = path[-1].stm
+        for n in reversed(path):
+            n.N += 1
+            n.W += v if n.stm == last_stm else -v
+            n.Q = n.W / n.N
+
+    def simulate(self, board, total_sims=144, batch_schedule=(2, 4, 6, 8)):
+        start = time.time()
+        sims_done = 0
+        depth_sum = 0
+        depth_max = 0
+        sched = list(batch_schedule) if batch_schedule else [4]
+        s_idx = 0
+
+        # ensure these are reset at the start of simulate
+        self._es_last_checked_at = 0
+        self._es_tripped = False
+        self._es_reason = ""
+        self._es_after_sims = 0
+
+        while sims_done < total_sims:
+            want = sched[s_idx % len(sched)]
+            s_idx += 1
+            want = min(want, total_sims - sims_done)
+    
+            paths = []
+            leaves = []
+            for _ in range(want):
+                p = [self.root]
+                while p[-1].is_expanded and p[-1].children:
+                    mv, child = self.select_child(p[-1])
+                    p.append(child)
+                for n in p:
+                    n.vloss += 1
+                paths.append(p)
+                leaves.append(p[-1])
+    
+                d = len(p) - 1
+                depth_sum += d
+                if d > depth_max:
+                    depth_max = d
+    
+            X = []
+            for p in paths:
+                for i in range(1, len(p)):
+                    board.push_uci(p[i].uci)
+                X.append(board.stacked_planes(5))
+                for _ in range(len(p) - 1):
+                    board.unmake()
+    
+            if X:
+                X = np.asarray(X, dtype=np.float32)
+                out = self.model.predict(X, batch_size=len(X), verbose=0)
+                import pdb; pdb.set_trace()
+                if isinstance(out, list):
+                    names = list(getattr(self.model, 'output_names', []))
+                    v = out[names.index('value')]
+                    pf = out[names.index('best_from')]
+                    pt = out[names.index('best_to')]
+                    ppiece = out[names.index('best_piece')]
+                    ppromo = out[names.index('best_promo')]
+                else:
+                    v = out['value']; pf = out['best_from']; pt = out['best_to']
+                    ppiece = out['best_piece']; ppromo = out['best_promo']
+    
+                v = np.asarray(v, np.float32).reshape(-1)
+                pf = pf.reshape(len(leaves), -1)
+                pt = pt.reshape(len(leaves), -1)
+                ppiece = ppiece.reshape(len(leaves), -1)
+                ppromo = ppromo.reshape(len(leaves), -1)
+    
+                for i, p in enumerate(paths):
+                    leaf = p[-1]
+                    for j in range(1, len(p)):
+                        board.push_uci(p[j].uci)
+    
+                    tv = terminal_value_white_pov(board)
+                    if tv is not None:
+                        leaf.value = tv if leaf.stm == 'w' else -tv
+                        leaf.legal = []
+                        leaf.is_expanded = True
+                    else:
+                        v_w = float(v[i])
+                        leaf.value = v_w if leaf.stm == 'w' else -v_w
+                        legal = board.legal_moves()
+                        leaf.legal = legal
+                        if legal:
+                            p_from = softmax(pf[i])
+                            p_to = softmax(pt[i])
+                            p_piece = softmax(ppiece[i])
+                            p_promo = softmax(ppromo[i])
+                            P = priors_from_heads(
+                                board, legal, p_from, p_to, p_piece, p_promo
+                            )
+                            leaf.P = P
+                            for mv in legal:
+                                board.push_uci(mv)
+                                leaf.children[mv] = MCTSNode(
+                                    board.side_to_move(), uci=mv, parent=leaf
+                                )
+                                board.unmake()
+                        leaf.is_expanded = True
+    
+                    for _ in range(len(p) - 1):
+                        board.unmake()
+    
+            for p in paths:
+                for n in p:
+                    n.vloss -= 1
+                self.backup(p, p[-1].value)
+    
+            sims_done += want
+
+            # >>> EARLY-STOP HOOK <<<
+            if self.maybe_early_stop(sims_done, total_sims):
+                break
+
+        return dict(
+            time_s=time.time() - start,
+            sims=sims_done,
+            avg_depth=(depth_sum / sims_done if sims_done else 0.0),
+            max_depth=depth_max,
+            early_stop=self._es_tripped,
+            es_reason=self._es_reason,
+            es_after_sims=self._es_after_sims,
+        )
+
+    def best(self):
+        if not self.root.children:
+            return None, self.root.value
+        items = [(m, c.N, c.Q) for m, c in self.root.children.items()]
+        m, _, q = max(items, key=lambda x: x[1])
+        return m, q
+
+
+def choose_move_mcts(board, model, simulations=144, c_puct=1.5,
+                     reuse_tree=None, batch_schedule=(2, 4, 6, 8),
+                     batch_size=None, verbose=True):
+    t0 = time.time()
+    tree = reuse_tree
+    if tree is None or tree.root_board_fen != board.fen():
+        tree = MCTSTree(board.clone(), model, c_puct=c_puct)
+
+    b = board.clone()
+    if batch_size is not None:
+        stats = tree.simulate(b, total_sims=simulations,
+                              batch_schedule=(batch_size,))
+    else:
+        stats = tree.simulate(b, total_sims=simulations,
+                              batch_schedule=batch_schedule)
+
+    mv, val = tree.best()
+    info = dict(
+        sims=stats.get('sims', simulations),
+        time_s=time.time() - t0,
+        root_children=len(tree.root.children),
+        visited_root_children=sum(
+            [1 for _, c in tree.root.children.items() if c.N > 0]
+        ),
+        batch_schedule=(batch_schedule if batch_size is None else (batch_size,)),
+        avg_depth=stats.get('avg_depth', 0.0),
+        max_depth=stats.get('max_depth', 0),
+        early_stop=stats.get('early_stop', False),
+        es_reason=stats.get('es_reason', ""),
+        es_after_sims=stats.get('es_after_sims', 0),
+    )
+
+    if verbose:
+        sched = info['batch_schedule']
+        # in choose_move_mcts(...) when printing
+        print(
+            f"[mcts] stm={tree.root.stm} best={mv} Q={val:+.3f} "
+            f"sims={info['sims']} time={info['time_s']:.3f}s "
+            f"visited_children={info['visited_root_children']}/"
+            f"{info['root_children']} schedule={sched} "
+            f"avg_depth={info['avg_depth']:.2f} max_depth={info['max_depth']}"
+        )
+
+    return mv, val, info, tree
+
+
+def pick_best_move(board, model, simulations=144, **kwargs):
+    """Clone the board and return the chosen move, its value, and info."""
+    b = board.clone()
+    mv, val, info, tree = choose_move_mcts(b, model, simulations=simulations, **kwargs)
+    return mv, val, info, tree
 #%%
-#model = tf.keras.models.load_model("C:/Users/Bryan/repos/chessbot/chess_model_multihead_v240_3.keras")
+stockfish_eval = Stockfish(path=SF_LOC)
+stockfish_eval.set_depth(10)
+
+stockfish_play = Stockfish(path=SF_LOC)
+curr_elo_challenge = 400
+stockfish_play.set_elo_rating(curr_elo_challenge)
+stockfish_play.set_depth(1)
+stockfish_play.update_engine_parameters({"Skill Level": 5})
+
+move_time_min = 0.5
+for game_num in range(5):
+    game1 = get_pre_opened_game()
+    game2 = game1.clone()
+    
+    for i, board in enumerate([game1, game2]):
+        tree = MCTSTree(board.clone(), model, c_puct=2.0, eps=0.05, alpha=0.03)
+        sf_plays = 'w' if i else 'b'
+        cbu.show_board(chess.Board(board.fen()), flipped=sf_plays=='w')
+        reason, result = board.is_game_over()
+        while reason == 'none':
+            if board.history_size() > 100:
+                print("Move limit reached!")
+                break
+            
+            this_fen = board.fen()
+            stockfish_eval.set_fen_position(this_fen)
+            ev = stockfish_eval.get_evaluation()
+            print(f"Current SF Eval: {ev['value']} {ev['type'].upper()}\n")
+            
+            start = time.time()
+            if board.side_to_move() == sf_plays:
+                time.sleep(move_time_min)
+                stockfish_play.set_fen_position(this_fen)
+                move_uci = stockfish_play.get_best_move()
+                san = board.san(move_uci)
+                print(f"{san} played by SF")
+            
+            else:
+                mv, val, info, tree = choose_move_mcts(
+                    board, model, simulations=800, c_puct=2.0,
+                    reuse_tree=tree, batch_schedule=(2, 4, 8), verbose=True
+                )
+
+                move_uci = show_top_moves(tree.root, board, top_n=4)
+            
+            board.push_uci(move_uci)
+            cbu.show_board(chess.Board(board.fen()), flipped=sf_plays=='w')
+            tree.advance(board.clone(), move_uci)
+            
+            print("\n")
+            reason, result = board.is_game_over()
+            
+            stop = time.time()
+            if stop-start < move_time_min:
+                time.sleep(move_time_min - (stop-start))
+
+
+

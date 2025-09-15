@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import uuid
+from time import time as _now
 from collections import defaultdict
 
 import chess
@@ -37,10 +38,6 @@ class Config(object):
     material_diff_cutoff = 9
     material_diff_cutoff_span = 7
     
-    # Logging cadence
-    log_every_sims = 200
-    n_training_games = 1000
-
     # early stop
     es_min_sims = 100
     es_check_every = 4
@@ -52,6 +49,13 @@ class Config(object):
     # TF
     training_queue_min = 2048
 
+    def to_dict(self):
+        return {
+            k: getattr(self, k)
+            for k in dir(self)
+            if not k.startswith("_") and not callable(getattr(self, k))
+        }
+
 
 class ChessGame(object):
     def __init__(self, board=None, cfg=None):
@@ -59,9 +63,11 @@ class ChessGame(object):
         self.config = cfg or Config()
         self.board = board or get_pre_opened_game()
         self.tree = MCTSTree(self.board, self.config)
+
         self.mat_adv_counter = 0
         self.outcome = None
         self.examples = [] 
+        self.plies = 0
 
     def make_move_from_tree(self):
         """
@@ -111,6 +117,7 @@ class ChessGame(object):
         
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
+        self.plies += 1
         return True
 
     
@@ -176,8 +183,47 @@ class ChessGame(object):
     def show_board(self, flipped=False, sleep=0.0):
         sb = chess.Board(self.board.fen())
         show_board(sb, flipped=flipped, sleep=sleep)
-
     
+    def show_top_moves(self, top_n=4, show_san=True):
+        root = self.tree.root
+        c_puct = self.config.c_puct
+        if not root.children:
+            print("\nTop candidate moves:\n  (no children)")
+            return None
+    
+        if c_puct is None:
+            c_puct = getattr(self.config, "c_puct", 2.0)
+    
+        sorted_children = sorted(root.children.items(), key=lambda kv: kv[1].N, reverse=True)
+        sumN = max(1, root.N + sum(c.vloss for _, c in root.children.items()))
+    
+        print("\nTop candidate moves:")
+        for move_uci, node in sorted_children[:top_n]:
+            p = root.P.get(move_uci, 0.0)
+            u = c_puct * p * (sumN ** 0.5) / (1 + node.N + node.vloss)
+            san = "?"
+            if show_san:
+                san = self.board.san(move_uci)
+            line = (
+                f"{move_uci:<6} "
+                f"{'('+san+')':<12}  "
+                f"visits={node.N:<5} "
+                f"P={p:>.3f}  "
+                f"Q={node.Q:+.3f}  "
+                f"U={u:+.3f}"
+            )
+            print(line)
+    
+        best_move_uci, best_node = sorted_children[0]
+        best_san = best_move_uci
+        if show_san:
+            best_san = self.board.san(best_move_uci)
+        print(
+            f"\nChosen move: {best_move_uci} ({best_san})  "
+            f"(visits={best_node.N}, Q={best_node.Q:+.3f})"
+        )
+
+
 class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
@@ -198,7 +244,13 @@ class GameLooper(object):
         self.quick_cache = {}
         self.pos_counter = defaultdict(int)
 
+        self.games_finished = 0
+        self.white_wins = 0
+        self.black_wins = 0
+        self.draws = 0
+        self.total_plies = 0
         self.all_evals = pd.DataFrame()
+        self.game_data = []
     
     def run(self):
         """
@@ -217,12 +269,12 @@ class GameLooper(object):
                     # show the first game to monitor progress
                     if game.game_id == self.active_games[0].game_id:
                         game.show_board()
+                        game.show_top_moves()
 
                     if game.check_for_terminal():
                         completed_games += 1
                         # populate training queue, maybe retrain
                         self.finalize_game_data(game)
-                        self.log_results(game)
                         finished.append(game.game_id)
                         continue
 
@@ -249,7 +301,10 @@ class GameLooper(object):
                 self.quick_cache = {}
 
             # remove finished games and init new ones
-            self.active_games = [g for g in self.active_games if g.game_id not in finished]
+            self.active_games = [
+                g for g in self.active_games if g.game_id not in finished
+            ]
+            
             self.active_games += [ChessGame() for _ in range(len(finished))]
         
         # maybe return some logs or something some day
@@ -286,7 +341,7 @@ class GameLooper(object):
         for i, req in enumerate(preds_batch):
             key = req["cache_key"]
             out_i = {
-                "value": float(v[i]),
+                "value": float(v[i].item()),
                 "from": pf[i],
                 "to": pt[i],
                 "piece": ppc[i],
@@ -308,6 +363,26 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
+        # aggregate stats
+        self.games_finished += 1
+        self.total_plies += game.plies
+        if game.outcome > 0:
+            self.white_wins += 1
+        elif game.outcome < 0:
+            self.black_wins += 1
+        else:
+            self.draws += 1
+
+        res = {
+            "ts": _now(),
+            "game_id": game.game_id,
+            "result": float(game.outcome if game.outcome is not None else 0.0),
+            "plies": int(game.plies),
+        }
+        
+        res.update(self.config.to_dict())
+        self.game_data.append(res)
+
         z = float(game.outcome if game.outcome is not None else 0.0)
         for x, heads in game.examples:
             self.training_queue.append((x, heads, z))
@@ -371,8 +446,21 @@ class GameLooper(object):
         self.training_queue = []
         self.reuse_cache = {}
         self.n_retrains += 1
+    
+    def log_results(self, game):
+        avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
+        print("~"*40)
+        print(
+            f"[stats] finished={self.games_finished}  "
+            f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
+            f"avg_len={avg_moves:.1f} moves"
+        )
+        print("~"*40)
 
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+    looper = GameLooper(games=4, model=model, cfg=Config())
+    looper.run()
+    
     

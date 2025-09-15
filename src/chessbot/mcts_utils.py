@@ -1,3 +1,4 @@
+import math
 from chessbot.utils import softmax
 
 class MCTSNode:
@@ -129,21 +130,6 @@ class MCTSTree:
         enc = board.stacked_planes(5)
         legal = board.legal_moves()
 
-        cached = reuse_cache.get(cache_key)
-        if cached is not None:
-            # pop back
-            for _ in range(len(path) - 1):
-                board.unmake()
-            
-            # cached is a dict with keys: value, from, to, piece, promo
-            self.apply_result(
-                board, req,
-                cached["value"], cached["from"], cached["to"],
-                cached["piece"], cached["promo"]
-            )
-            self.sims_completed_this_move += 1
-            return None  # handled by cache now
-
         # pop back
         for _ in range(len(path) - 1):
             board.unmake()
@@ -154,6 +140,17 @@ class MCTSTree:
             "stm_white": (leaf.stm == 'w'), "cache_key": cache_key,
             "n_plies": n_plies
         }
+
+        cached = reuse_cache.get(cache_key)
+        if cached is not None:
+            # cached is a dict with keys: value, from, to, piece, promo
+            self.apply_result(
+                board, req,
+                cached["value"], cached["from"], cached["to"],
+                cached["piece"], cached["promo"]
+            )
+            self.sims_completed_this_move += 1
+            return None  # handled by cache now
 
         if n_plies < 20:
             req['move_history'] = "|".join(board.history_uci())

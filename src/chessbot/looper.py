@@ -7,10 +7,13 @@ import chess
 import chess.syzygy
 
 from chessbot import ENDGAME_LOC
+from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree
 from chessbot.utils import (
     get_pre_opened_game, show_board, score_game_data, plot_training_progress
 )
+
+MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 
 
 class Config(object):
@@ -105,7 +108,7 @@ class ChessGame(object):
         mv, _ = self.tree.best()
         if mv is None:
             return False
-        self.board.push_uci(mv)
+        
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         return True
@@ -239,7 +242,7 @@ class GameLooper(object):
             # resolve predictions back to the games/trees
             applied = 0
             for game in self.active_games:
-                applied += game.resolve_awaiting(game.board, self.quick_cache)
+                applied += game.tree.resolve_awaiting(game.board, self.quick_cache)
             
             # if all 0, we can clear the quick cache, keep it light
             if applied == 0:
@@ -296,7 +299,7 @@ class GameLooper(object):
                 self.reuse_cache[key] = out_i
             
             # store common positions to warm cache with after training
-            mh = req.get("move_histry", False)
+            mh = req.get("move_history", False)
             if mh:
                 self.pos_counter[mh] += 1
 
@@ -368,4 +371,8 @@ class GameLooper(object):
         self.training_queue = []
         self.reuse_cache = {}
         self.n_retrains += 1
-        
+
+
+if __name__ == '__main__':
+    model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+    

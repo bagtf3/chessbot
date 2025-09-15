@@ -350,7 +350,6 @@ class MCTSTree:
             if X:
                 X = np.asarray(X, dtype=np.float32)
                 out = self.model.predict(X, batch_size=len(X), verbose=0)
-                import pdb; pdb.set_trace()
                 if isinstance(out, list):
                     names = list(getattr(self.model, 'output_names', []))
                     v = out[names.index('value')]

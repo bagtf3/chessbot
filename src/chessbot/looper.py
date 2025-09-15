@@ -28,7 +28,8 @@ class Config(object):
     virtual_loss = 1.0
     dirichlet_alpha = 0.3
     dirichlet_eps = 0.25
-    uniform_mix=0.5
+    uniform_mix_opening = 0.05
+    uniform_mix_later = 0.5
     max_depth = 64
 
     # Simulation schedule
@@ -41,9 +42,9 @@ class Config(object):
     material_diff_cutoff_span = 7
     
     # early stop
-    es_min_sims = 100
+    es_min_sims = 200
     es_check_every = 4
-    es_gap_frac = 0.70
+    es_gap_frac = 0.80
 
     # Cache
     write_ply_max = 20
@@ -267,10 +268,14 @@ class GameLooper(object):
                 game.tree.resolve_awaiting(game.board, self.quick_cache)
 
                 if game.tree.stop_simulating():
-                    game.make_move_from_tree()
                     # show the first game to monitor progress
-                    if game.game_id == self.active_games[0].game_id:
+                    display_game = game.game_id == self.active_games[0].game_id
+                    if display_game:
                         game.show_top_moves()
+                        
+                    game.make_move_from_tree()
+                    
+                    if display_game:
                         game.show_board()
 
                     if game.check_for_terminal():
@@ -463,7 +468,7 @@ class GameLooper(object):
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=16, model=model, cfg=Config())
+    looper = GameLooper(games=8, model=model, cfg=Config())
     looper.run()
-    
+
     

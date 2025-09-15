@@ -1,5 +1,7 @@
 import math
 from chessbot.utils import softmax
+from collections import OrderedDict
+
 
 class MCTSNode:
     def __init__(self, stm, uci=None, parent=None):
@@ -207,11 +209,13 @@ class MCTSTree:
             legal = req["legal"] if req["legal"] else board.legal_moves()
             leaf.legal = legal
             if legal:
+                mix = self.config.uniform_mix_opening
+                if board.history_size() < 20:
+                    mix = self.config.uniform_mix_later
+
                 pri = priors_from_heads(
-                    board, legal,
-                    softmax(p_from), softmax(p_to),
-                    softmax(p_piece), softmax(p_promo),
-                    mix=self.config.uniform_mix
+                    board, legal, softmax(p_from), softmax(p_to),
+                    softmax(p_piece), softmax(p_promo), mix=mix
                 )
                 leaf.P = pri
                 for mv in legal:

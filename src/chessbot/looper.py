@@ -9,7 +9,7 @@ import chess.syzygy
 
 from chessbot import ENDGAME_LOC
 from chessbot.model import load_model
-from chessbot.mcts_utils import MCTSTree
+from chessbot.mcts_utils import MCTSTree, ReuseCache
 from chessbot.utils import (
     get_pre_opened_game, show_board, score_game_data, plot_training_progress
 )
@@ -21,6 +21,8 @@ class Config(object):
     """
     Central knobs. Keep simple; override from a dict or flags as needed.
     """
+    n_training_games = 1000
+    
     # MCTS
     c_puct = 1.5
     virtual_loss = 1.0
@@ -41,7 +43,7 @@ class Config(object):
     # early stop
     es_min_sims = 100
     es_check_every = 4
-    es_gap_frac = 0.60
+    es_gap_frac = 0.70
 
     # Cache
     write_ply_max = 20
@@ -195,7 +197,7 @@ class ChessGame(object):
             c_puct = getattr(self.config, "c_puct", 2.0)
     
         sorted_children = sorted(root.children.items(), key=lambda kv: kv[1].N, reverse=True)
-        sumN = max(1, root.N + sum(c.vloss for _, c in root.children.items()))
+        sumN = max(1, root.N + sum([c.vloss for _, c in root.children.items()]))
     
         print("\nTop candidate moves:")
         for move_uci, node in sorted_children[:top_n]:
@@ -240,7 +242,7 @@ class GameLooper(object):
         self.model = model
         self.n_retrains = 0
         self.training_queue = []
-        self.reuse_cache = {}
+        self.reuse_cache = ReuseCache()
         self.quick_cache = {}
         self.pos_counter = defaultdict(int)
 
@@ -268,13 +270,14 @@ class GameLooper(object):
                     game.make_move_from_tree()
                     # show the first game to monitor progress
                     if game.game_id == self.active_games[0].game_id:
-                        game.show_board()
                         game.show_top_moves()
+                        game.show_board()
 
                     if game.check_for_terminal():
                         completed_games += 1
                         # populate training queue, maybe retrain
                         self.finalize_game_data(game)
+                        self.log_results()
                         finished.append(game.game_id)
                         continue
 
@@ -444,23 +447,23 @@ class GameLooper(object):
 
         # clear queue after training
         self.training_queue = []
-        self.reuse_cache = {}
+        self.reuse_cache = ReuseCache()
         self.n_retrains += 1
     
-    def log_results(self, game):
+    def log_results(self):
         avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
-        print("~"*40)
+        print("~"*50)
         print(
             f"[stats] finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
             f"avg_len={avg_moves:.1f} moves"
         )
-        print("~"*40)
+        print("~"*50)
 
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=4, model=model, cfg=Config())
+    looper = GameLooper(games=16, model=model, cfg=Config())
     looper.run()
     
     

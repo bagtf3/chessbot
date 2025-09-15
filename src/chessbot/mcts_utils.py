@@ -125,6 +125,7 @@ class MCTSTree:
         short_fen = board.fen(include_counters=False)
         n_plies = board.history_size()
         move_str = "|".join(board.history_uci()[-5:])
+        move_history = "|".join(board.history_uci())
         cache_key = short_fen + "|" + move_str
 
         enc = board.stacked_planes(5)
@@ -153,7 +154,7 @@ class MCTSTree:
             return None  # handled by cache now
 
         if n_plies < 20:
-            req['move_history'] = "|".join(board.history_uci())
+            req['move_history'] = move_history
 
         self.awaiting_predictions.append(req)
         return req
@@ -315,3 +316,61 @@ class MCTSTree:
         items = [(m, c.N, c.Q) for m, c in self.root.children.items()]
         m, _, q = max(items, key=lambda x: x[1])
         return m, q
+
+        from collections import OrderedDict
+
+
+class ReuseCache:
+    def __init__(self, capacity=300_000):
+        self.capacity = int(capacity)
+        self._store = OrderedDict()  # key -> value
+        self.checks = 0
+        self.hits = 0
+        self.misses = 0
+        self.puts = 0
+        self.evictions = 0
+
+    def get(self, key):
+        self.checks += 1
+        try:
+            val = self._store[key]
+            self._store.move_to_end(key, last=True)  # LRU touch
+            self.hits += 1
+            return val
+        except KeyError:
+            self.misses += 1
+            return None
+
+    def put(self, key, value):
+        self.puts += 1
+        if key in self._store:
+            self._store.move_to_end(key, last=True)
+        self._store[key] = value
+        if len(self._store) > self.capacity:
+            self._store.popitem(last=False)  # evict LRU
+            self.evictions += 1
+
+    # optional dict-like sugar
+    def __len__(self): return len(self._store)
+    def __getitem__(self, k): 
+        v = self.get(k)
+        if v is None: raise KeyError(k)
+        return v
+    def __setitem__(self, k, v): self.put(k, v)
+
+    def clear(self):
+        self._store.clear()
+        self.checks = self.hits = self.misses = self.puts = self.evictions = 0
+
+    def stats(self):
+        hr = (self.hits / self.checks) if self.checks else 0.0
+        return {
+            "size": len(self._store),
+            "capacity": self.capacity,
+            "checks": self.checks,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": hr,
+            "puts": self.puts,
+            "evictions": self.evictions,
+        }

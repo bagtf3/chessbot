@@ -28,8 +28,8 @@ class Config(object):
     virtual_loss = 1.0
     dirichlet_alpha = 0.3
     dirichlet_eps = 0.25
-    uniform_mix_opening = 0.25
-    uniform_mix_later = 0.5
+    uniform_mix_opening = 0.15
+    uniform_mix_later = 0.25
 
     # Simulation schedule
     sims_target = 400
@@ -391,9 +391,6 @@ class GameLooper(object):
         }
         
         res.update(self.config.to_dict())
-        
-        res['history_uci'] = game.board.history_uci()
-        
         self.game_data.append(res)
 
         z = float(game.outcome if game.outcome is not None else 0.0)
@@ -495,12 +492,12 @@ class GameLooper(object):
         self.config.piece_bins = int(out["best_piece"].shape[-1])
         self.config.promo_bins = int(out["best_promo"].shape[-1])
 
-
+ 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=16, model=model, cfg=Config())
-    looper.config.n_training_games = 16
+    looper = GameLooper(games=32, model=model, cfg=Config())
     looper.run()
-    
 
+
+games_moves_uci = [g['history_uci'] for g in looper.game_data]
     

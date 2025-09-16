@@ -44,8 +44,8 @@ def make_random_move(board):
         moves = list(board.legal_moves)
         board.push(random.choice(moves))
         return board
-    # assume its
     else:
+        board.make_random_move()
 
 
 def random_init(halfmoves=5):
@@ -63,7 +63,6 @@ def random_init(halfmoves=5):
             return random_init(halfmoves=halfmoves)
         
     return board
-
 
 def fb_random_init(plies=5):
     b = fastboard()

@@ -18,6 +18,7 @@ class MCTSNode:
         self.legal = None
         self.vloss = 0
 
+
 def terminal_value_white_pov(board):
     reason, result = board.is_game_over()
     if reason == 'none':
@@ -88,24 +89,26 @@ class MCTSTree:
         self._es_after_sims = 0
 
     def select_child(self, node):
-        sumN = max(1, node.N + sum([c.vloss for c in node.children.values()]))
-        best = None
-        best_score = -1e9
+        sumN = max(1, node.N + sum(c.vloss for c in node.children.values()))
+        best, best_score = None, -1e9
         for mv, child in node.children.items():
             p = node.P.get(mv, 0.0)
             u = self.c_puct * p * math.sqrt(sumN) / (1 + child.N + child.vloss)
-            score = child.Q + u if node.stm == 'w' else -child.Q + u
+            q = child.Q
+            if node.stm == 'b':       # flip only here
+                q = -q
+            score = q + u
             if score > best_score:
                 best_score = score
                 best = (mv, child)
         return best
 
+
     def backup(self, path, leaf_value):
-        v = leaf_value
-        last_stm = path[-1].stm
+        v = float(leaf_value)         # white-POV scalar
         for n in reversed(path):
             n.N += 1
-            n.W += v if n.stm == last_stm else -v
+            n.W += v                  # no sign flip
             n.Q = n.W / n.N
 
     def collect_one_leaf(self, board, reuse_cache):
@@ -200,12 +203,11 @@ class MCTSTree:
 
         tv = terminal_value_white_pov(board)
         if tv is not None:
-            leaf.value = tv if leaf.stm == 'w' else -tv
+            leaf.value = tv
             leaf.legal = []
             leaf.is_expanded = True
         else:
-            v_w = float(value_w)
-            leaf.value = v_w if leaf.stm == 'w' else -v_w
+            leaf.value = float(value_w)
             legal = req["legal"] if req["legal"] else board.legal_moves()
             leaf.legal = legal
             if legal:

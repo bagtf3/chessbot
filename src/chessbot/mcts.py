@@ -31,7 +31,7 @@ model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
 # Simple early-stop params
 ES_MIN_SIMS = 128        # do not check before this many sims
 ES_CHECK_EVERY = 4       # check cadence
-ES_GAP_FRAC = 0.60       # stop if (N1 - N2) > ES_GAP_FRAC * remaining
+ES_GAP_FRAC = 0.80       # stop if (N1 - N2) > ES_GAP_FRAC * remaining
 
 
 def show_top_moves(root, board, top_n=4, c_puct=2.0, show_san=True):
@@ -260,12 +260,14 @@ class MCTSTree:
 
     def select_child(self, node):
         sumN = max(1, node.N + sum([c.vloss for c in node.children.values()]))
-        best = None
-        best_score = -1e9
+        best, best_score = None, -1e9
         for mv, child in node.children.items():
             p = node.P.get(mv, 0.0)
             u = self.c_puct * p * math.sqrt(sumN) / (1 + child.N + child.vloss)
-            score = child.Q + u if node.stm == 'w' else -child.Q + u
+            q = child.Q
+            if node.stm == 'b':       # flip only here
+                q = -q
+            score = q + u
             if score > best_score:
                 best_score = score
                 best = (mv, child)
@@ -296,11 +298,10 @@ class MCTSTree:
         return node.value
 
     def backup(self, path, leaf_value):
-        v = leaf_value
-        last_stm = path[-1].stm
+        v = float(leaf_value)         # white-POV scalar
         for n in reversed(path):
             n.N += 1
-            n.W += v if n.stm == last_stm else -v
+            n.W += v                  # no sign flip
             n.Q = n.W / n.N
 
     def simulate(self, board, total_sims=144, batch_schedule=(2, 4, 6, 8)):
@@ -374,12 +375,11 @@ class MCTSTree:
     
                     tv = terminal_value_white_pov(board)
                     if tv is not None:
-                        leaf.value = tv if leaf.stm == 'w' else -tv
+                        leaf.value = tv
                         leaf.legal = []
                         leaf.is_expanded = True
                     else:
-                        v_w = float(v[i])
-                        leaf.value = v_w if leaf.stm == 'w' else -v_w
+                        leaf.value = float(v[i])
                         legal = board.legal_moves()
                         leaf.legal = legal
                         if legal:
@@ -487,7 +487,7 @@ stockfish_eval = Stockfish(path=SF_LOC)
 stockfish_eval.set_depth(10)
 
 stockfish_play = Stockfish(path=SF_LOC)
-curr_elo_challenge = 400
+curr_elo_challenge = 800
 stockfish_play.set_elo_rating(curr_elo_challenge)
 stockfish_play.set_depth(1)
 stockfish_play.update_engine_parameters({"Skill Level": 5})
@@ -516,14 +516,16 @@ for game_num in range(5):
             if board.side_to_move() == sf_plays:
                 time.sleep(move_time_min)
                 stockfish_play.set_fen_position(this_fen)
+                stockfish_play.set_elo_rating(curr_elo_challenge)
+                stockfish_play.set_depth(1)
                 move_uci = stockfish_play.get_best_move()
                 san = board.san(move_uci)
                 print(f"{san} played by SF")
             
             else:
                 mv, val, info, tree = choose_move_mcts(
-                    board, model, simulations=800, c_puct=2.0,
-                    reuse_tree=tree, batch_schedule=(2, 4, 8), verbose=True
+                    board, model, simulations=1600, c_puct=1.5,
+                    reuse_tree=tree, batch_schedule=(16,), verbose=True
                 )
 
                 move_uci = show_top_moves(tree.root, board, top_n=4)

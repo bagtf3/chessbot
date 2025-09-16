@@ -28,15 +28,14 @@ class Config(object):
     virtual_loss = 1.0
     dirichlet_alpha = 0.3
     dirichlet_eps = 0.25
-    uniform_mix_opening = 0.05
-    uniform_mix_later = 0.5
-    max_depth = 64
+    uniform_mix_opening = 0.15
+    uniform_mix_later = 0.25
 
     # Simulation schedule
     sims_target = 400
     
     # Game stuff
-    micro_batch_size = 2
+    micro_batch_size = 16
     move_limit = 90
     material_diff_cutoff = 9
     material_diff_cutoff_span = 7
@@ -44,7 +43,7 @@ class Config(object):
     # early stop
     es_min_sims = 200
     es_check_every = 4
-    es_gap_frac = 0.80
+    es_gap_frac = 0.7
 
     # Cache
     write_ply_max = 20
@@ -79,49 +78,50 @@ class ChessGame(object):
         root = self.tree.root
         if not root.children:
             return False
-
-        # 1) build visit distribution over legal UCIs at the root
+    
+        # visits -> π over legal UCIs at the root
         ucis = list(root.children.keys())
         visits = np.array([root.children[m].N for m in ucis], dtype=np.float32)
         s = float(visits.sum())
-        if s <= 0.0:
-            # degenerate root; skip policy example
-            pi = None
-        else:
-            pi = visits / s
-
-        # 2) factorize π into marginals for heads (from/to/piece/promo)
+        pi = (visits / s) if s > 0.0 else None
+    
+        # factorize π into fixed-size marginals for heads
         if pi is not None:
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
-            F, T = 64, 64
-            Kp = int(max(piece) + 1) if len(piece) > 0 else 1
-            Kpr = 4  # 0=Q/none, 1=N, 2=B, 3=R
-
-            from_m = np.zeros(F, dtype=np.float32)
-            to_m   = np.zeros(T, dtype=np.float32)
-            pc_m   = np.zeros(Kp, dtype=np.float32)
+    
+            F   = getattr(self.config, "from_bins", 64)
+            T   = getattr(self.config, "to_bins", 64)
+            Kp  = getattr(self.config, "piece_bins", 6)
+            Kpr = getattr(self.config, "promo_bins", 4)
+    
+            from_m = np.zeros(F,   dtype=np.float32)
+            to_m   = np.zeros(T,   dtype=np.float32)
+            pc_m   = np.zeros(Kp,  dtype=np.float32)
             pr_m   = np.zeros(Kpr, dtype=np.float32)
-
+    
             for i, p in enumerate(pi):
-                from_m[fr[i]] += p
-                to_m[to[i]]   += p
-                pc_m[piece[i]] += p
-                pr_m[promo[i]] += p
-
-            x = self.board.stacked_planes(5)
+                fi, ti, pi_idx, pr_idx = fr[i], to[i], piece[i], promo[i]
+                if 0 <= fi < F:      from_m[fi]   += p
+                if 0 <= ti < T:      to_m[ti]     += p
+                if 0 <= pi_idx < Kp: pc_m[pi_idx] += p
+                if 0 <= pr_idx < Kpr: pr_m[pr_idx] += p
+    
+            planes_k = getattr(self.config, "planes_k", 5)
+            x = self.board.stacked_planes(planes_k)
             self.examples.append(
                 (x, {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m})
             )
-        
-        # 3) choose move by visits and advance
+    
+        # choose move by visits and advance
         mv, _ = self.tree.best()
         if mv is None:
             return False
-        
+    
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         self.plies += 1
         return True
+
 
     
     def check_for_terminal(self):
@@ -241,6 +241,8 @@ class GameLooper(object):
             self.active_games = games
         
         self.model = model
+        
+        self._infer_head_dims()
         self.n_retrains = 0
         self.training_queue = []
         self.reuse_cache = ReuseCache()
@@ -464,11 +466,36 @@ class GameLooper(object):
             f"avg_len={avg_moves:.1f} moves"
         )
         print("~"*50)
+    
+    def _normalize_out(self, out):
+        # Ensure dict with expected keys regardless of model return type
+        if isinstance(out, dict):
+            return out
+        names = list(getattr(self.model, "output_names", [])) or \
+                ["value", "best_from", "best_to", "best_piece", "best_promo"]
+        if not isinstance(out, (list, tuple)):
+            out = [out]
+        return {k: v for k, v in zip(names, out)}
+
+    def _infer_head_dims(self):
+        # use first game's encoder to make a sample input
+        sample_enc = self.active_games[0].board.stacked_planes(
+            getattr(self.config, "planes_k", 5)
+        )
+        X = np.asarray([sample_enc], dtype=np.float32)
+        raw = self.model.predict(X, batch_size=1, verbose=0)
+        out = self._normalize_out(raw)
+    
+        # write bins onto config (so collection uses fixed sizes)
+        self.config.from_bins  = int(out["best_from"].shape[-1])
+        self.config.to_bins    = int(out["best_to"].shape[-1])
+        self.config.piece_bins = int(out["best_piece"].shape[-1])
+        self.config.promo_bins = int(out["best_promo"].shape[-1])
 
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=8, model=model, cfg=Config())
+    looper = GameLooper(games=32, model=model, cfg=Config())
     looper.run()
 
     

@@ -28,17 +28,17 @@ class Config(object):
     virtual_loss = 1.0
     dirichlet_alpha = 0.3
     dirichlet_eps = 0.25
-    uniform_mix_opening = 0.15
-    uniform_mix_later = 0.25
+    uniform_mix_opening = 0.25
+    uniform_mix_later = 0.5
 
     # Simulation schedule
     sims_target = 400
     
     # Game stuff
     micro_batch_size = 16
-    move_limit = 90
-    material_diff_cutoff = 9
-    material_diff_cutoff_span = 7
+    move_limit = 150
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 13
     
     # early stop
     es_min_sims = 200
@@ -391,6 +391,9 @@ class GameLooper(object):
         }
         
         res.update(self.config.to_dict())
+        
+        res['history_uci'] = game.board.history_uci()
+        
         self.game_data.append(res)
 
         z = float(game.outcome if game.outcome is not None else 0.0)
@@ -495,7 +498,9 @@ class GameLooper(object):
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=32, model=model, cfg=Config())
+    looper = GameLooper(games=16, model=model, cfg=Config())
+    looper.config.n_training_games = 16
     looper.run()
+    
 
     

@@ -10,9 +10,9 @@ import chess.syzygy
 from chessbot import ENDGAME_LOC
 from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree, ReuseCache
-from chessbot.utils import (
-    get_pre_opened_game, show_board, score_game_data, plot_training_progress
-)
+
+from chessbot.utils import score_game_data, plot_training_progress, log_and_plot_sf
+from chessbot.utils import get_pre_opened_game, evaluate_many_games, show_board
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 
@@ -243,7 +243,6 @@ class GameLooper(object):
         self.model = model
         
         self._infer_head_dims()
-        self.n_retrains = 0
         self.training_queue = []
         self.reuse_cache = ReuseCache()
         self.quick_cache = {}
@@ -255,7 +254,10 @@ class GameLooper(object):
         self.draws = 0
         self.total_plies = 0
         self.all_evals = pd.DataFrame()
+        self.pre_game_data = []
         self.game_data = []
+        self.n_retrains = 0
+        self.intra_training_summaries = {}
     
     def run(self):
         """
@@ -387,11 +389,11 @@ class GameLooper(object):
             "ts": _now(),
             "game_id": game.game_id,
             "result": float(game.outcome if game.outcome is not None else 0.0),
-            "plies": int(game.plies),
+            "plies": int(game.plies), "history_uci": game.board.history_uci()
         }
         
         res.update(self.config.to_dict())
-        self.game_data.append(res)
+        self.pre_game_data.append(res)
 
         z = float(game.outcome if game.outcome is not None else 0.0)
         for x, heads in game.examples:
@@ -402,7 +404,7 @@ class GameLooper(object):
         if len(self.training_queue) >= thresh:
             self.prep_and_retrain()
         
-    def prep_and_retrain(self):
+    def trigger_retrain(self):
         """
         Build training tensors from self.training_queue and do a quick fit.
         Balances wins vs losses on the value head with per-sample weights.
@@ -429,24 +431,45 @@ class GameLooper(object):
             "best_promo": np.asarray(Y_promo, dtype=np.float32),
         }
 
-        # per-sample weights to balance wins vs losses (white-POV)
-        z = Y["value"]
+        # per-sample weights to balance wins vs losses (white-POV) and set a low mean
+        target_mean = 0.3
+        draw_frac = 0.15
+        
+        z = Y["value"].astype(np.float32)
         pos = float(np.sum(z > 0))
         neg = float(np.sum(z < 0))
-        nz = pos + neg
-        # if only one side present, fall back to ones
+        nz  = pos + neg
+        
         if nz > 0 and pos > 0 and neg > 0:
             w_pos = 0.5 * nz / pos
             w_neg = 0.5 * nz / neg
-            w = np.where(z > 0, w_pos, np.where(z < 0, w_neg, 0.25 * (w_pos + w_neg)))
+            w_draw = draw_frac * 0.5 * (w_pos + w_neg)
+            w = np.where(z > 0, w_pos, np.where(z < 0, w_neg, w_draw)).astype(np.float32)
         else:
             w = np.ones_like(z, dtype=np.float32)
+        
+        # scale to target average weight
+        mean_w = float(w.mean()) if w.size else 1.0
+        if mean_w > 0:
+            w *= (target_mean / mean_w)
+        else:
+            w[:] = target_mean  # degenerate case
 
         eval_df = score_game_data(self.model, X, Y)
         self.all_evals = pd.concat([self.all_evals, eval_df])
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plot_training_progress(self.all_evals)
-
+        
+        move_lists = [g['history_uci'] for g in self.pre_game_data]
+        print(f"Analyzing last {len(move_lists)} games with Stockfish(d=8)...")
+        sf_analysis = evaluate_many_games(move_lists, depth=8, workers=10, mate_cp=1500)
+        self.intra_training_summaries[self.n_retrains] = sf_analysis
+        log_and_plot_sf(self.intra_training_summaries)
+        
+        # move these games over and reset the pre
+        self.game_data += self.pre_game_data
+        self.pre_data_data = []
+        
         # train (only the value head gets sample weighting)
         self.model.fit(
             X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
@@ -499,5 +522,3 @@ if __name__ == '__main__':
     looper.run()
 
 
-games_moves_uci = [g['history_uci'] for g in looper.game_data]
-    

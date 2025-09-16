@@ -14,13 +14,20 @@ import chess.engine
 import chess.svg
 from IPython.display import SVG, display, clear_output
 
+from pyfastchess import Board as fastboard
+
 from chessbot import SF_LOC
 from chessbot import features as ft
 
 from collections import deque
-from pyfastchess import Board as fastboard
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"  
+with open(uci_path_path, "rb") as f:
+    paths = pickle.load(f)
+    
+    
 def show_board(board, flipped=False, sleep=0.1):
     clear_output(wait=True)
     display(SVG(chess.svg.board(board=board, flipped=flipped)))
@@ -39,53 +46,82 @@ def mirror_move(mv: chess.Move) -> chess.Move:
         promotion=mv.promotion
     )
 
+
 def make_random_move(board):
     if isinstance(board, chess.Board):
         moves = list(board.legal_moves)
         board.push(random.choice(moves))
         return board
-    else:
-        board.make_random_move()
+    
+    if isinstance(board, fastboard):
+        moves = list(board.legal_moves())
+        board.push_uci(random.choice(moves))
+        return board    
 
 
-def random_init(halfmoves=5):
-    board = chess.Board()
-    for _ in range(halfmoves):
-        moves = list(board.legal_moves)
-        # try again 
-        if not len(moves):
-            return random_init(halfmoves=halfmoves)
-        
-        board = make_random_move(board)
-        
-        # also try again
-        if board.is_game_over():
-            return random_init(halfmoves=halfmoves)
-        
-    return board
+def get_all_board_features(board):
+    all_feats = ft.all_king_exposure_features(board)
+    all_feats.update(ft.all_piece_features(board))
+    
+    wt, blk = ft.get_piece_value_sum(board)
+    all_feats['material'] = [wt, blk]
+    
+    return all_feats
 
-def fb_random_init(plies=5):
-    b = fastboard()
-    p = 0
-    counter = 0
-    limit = int(3*plies)
-    while p < plies:
-        # safety in case it gets caught in some weird corner
-        counter += 1
-        if counter > limit:
-            # really bad luck, just try again
-            return random_init(plies=plies)
-        
-        moves = b.legal_moves()
-        while not len(moves):
-            b.unmake()
-            moves = b.legal_moves()
-            p -= 1
 
-        b.push_uci(random.choice(moves))
-        p += 1
-    return b
+def softmax(x):
+    x = np.asarray(x, dtype=np.float32)
+    x = x - np.max(x)
+    y = np.exp(x)
+    s = float(np.sum(y))
+    return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
 
+
+def ensure_df(df_or_dicts):
+    if isinstance(df_or_dicts, pd.DataFrame):
+        return df_or_dicts.copy()
+    return pd.DataFrame(df_or_dicts).copy()
+
+
+def plot_sf_simple(df):
+    """
+    Line plot over epochs showing:
+      - wins (total)
+      - draws (total)
+      - draws as White
+      - draws as Black
+      - average game length (plies) on a secondary axis
+    """
+    df = ensure_df(df).sort_values("epoch").reset_index(drop=True)
+
+    ep = df["epoch"].astype(int).values
+    wins_total   = df.get("wins",         0).fillna(0).astype(int).values
+    draws_total  = df.get("draws",        0).fillna(0).astype(int).values
+    white_draws  = df.get("white_draws",  0).fillna(0).astype(int).values
+    black_draws  = df.get("black_draws",  0).fillna(0).astype(int).values
+    avg_ply      = df.get("avg_ply",    np.nan).values / 5
+
+    fig, ax1 = plt.subplots(figsize=(10,4))
+
+    # counts (left axis)
+    ax1.plot(ep, wins_total,  lw=1.5, label="Wins (total)")
+    ax1.plot(ep, draws_total, lw=1.5, label="Draws (total)")
+    ax1.plot(ep, white_draws, lw=1.2, alpha=0.9, label="Draws as White")
+    ax1.plot(ep, black_draws, lw=1.2, alpha=0.9, label="Draws as Black")
+    ax1.plot(ep, avg_ply,     lw=1.5, color='gray', label="Avg plies / 5")
+    
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Counts")
+    ax1.grid(True, alpha=0.3)
+
+    # combined legend
+    l1, lab1 = ax1.get_legend_handles_labels()
+    ax1.legend(l1, lab1, loc="upper left")
+
+    plt.title("SF600 exhibitions: wins/draws and avg game length")
+    plt.tight_layout()
+    plt.show()
+    
 
 def plot_training_progress(all_evals, max_cols=4):
     """
@@ -121,6 +157,7 @@ def plot_training_progress(all_evals, max_cols=4):
 
     plt.tight_layout()
     plt.show()
+
 
 def plot_pred_vs_true_grid(model, preds, y_true_dict):
     names = list(model.output_names)
@@ -259,27 +296,100 @@ def score_game_data(model, X, Y_batch):
     print(f"Value : MSE={val_mse:.4f}, Corr={corr:.3f}")
 
     return eval_df
+
+
+def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
+    """
+    Pretty-print the latest Stockfish summary and plot simple trends across retrains.
+
+    Args:
+        intra_training_summaries: {step: {"summary": {...}, "games": [...]}, ...}
+        show: if True, plt.show() the figures (ignored if save_path is given)
+        save_path: if set, save figures as f"{save_path}_cpl.png" and f"{save_path}_bmr.png"
+
+    Prints:
+        Latest step's games, CPL (overall/white/black), and best-move rates.
+    Plots (if >=2 steps exist):
+        1) Overall mean CPL vs step
+        2) Overall best-move rate (%) vs step
+    """
+    its = intra_training_summaries
     
+    if not its:
+        print("No SF analysis yet.")
+        return
 
-def get_all_board_features(board):
-    all_feats = ft.all_king_exposure_features(board)
-    all_feats.update(ft.all_piece_features(board))
+    steps = sorted(its.keys())
+    latest_step = steps[-1]
+    s = its[latest_step]["summary"]
+
+    # Pretty print latest
+    print("\n=== Stockfish Analysis (latest) ===")
+    print(f"Retrain step: {latest_step}")
+    print(f"Games analyzed: {int(s['games'])}")
+    print(f"Overall mean CPL: {float(s['avg_overall_mean_cpl']):.3f}")
+    print(f"  - White mean CPL: {float(s['avg_white_mean_cpl']):.3f}")
+    print(f"  - Black mean CPL: {float(s['avg_black_mean_cpl']):.3f}")
+    print(f"Overall best-move rate: {float(s['avg_overall_best_move_rate'])*100:.1f}%")
+    print(f"  - White best-move rate: {float(s['avg_best_move_rate_white'])*100:.1f}%")
+    print(f"  - Black best-move rate: {float(s['avg_best_move_rate_black'])*100:.1f}%")
+    print("===================================\n")
+
+    # Need >=2 points to plot a trend
+    if len(steps) < 2:
+        return
+
+    # Build series
+    overall_cpl = [its[k]["summary"]["avg_overall_mean_cpl"] for k in steps]
+    overall_bmr_pct = [
+        its[k]["summary"]["avg_overall_best_move_rate"] * 100.0 for k in steps
+    ]
+
+    # 1) Overall mean CPL trend
+    fig1 = plt.figure(figsize=(6.4, 3.6))
+    plt.plot(steps, overall_cpl, marker="o")
+    plt.title("Overall Mean CPL vs Retrain Step")
+    plt.xlabel("Retrain step")
+    plt.ylabel("Mean CPL (lower is better)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    if save_path:
+        fig1.savefig(f"{save_path}_cpl.png", dpi=150)
+    elif show:
+        plt.show()
+    plt.close(fig1)
+
+    # 2) Overall best-move rate (%) trend
+    fig2 = plt.figure(figsize=(6.4, 3.6))
+    plt.plot(steps, overall_bmr_pct, marker="o")
+    plt.title("Overall Best-Move Rate vs Retrain Step")
+    plt.xlabel("Retrain step")
+    plt.ylabel("Best-move rate (%)")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    if save_path:
+        fig2.savefig(f"{save_path}_bmr.png", dpi=150)
+    elif show:
+        plt.show()
+    plt.close(fig2)
+
+
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.3f}s"
+    elif seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m {s:.2f}s"
+    else:
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{int(h)}h {int(m)}m {s:.2f}s"
+
     
-    wt, blk = ft.get_piece_value_sum(board)
-    all_feats['material'] = [wt, blk]
-    
-    return all_feats
-
-
-def softmax(x):
-    x = np.asarray(x, dtype=np.float32)
-    x = x - np.max(x)
-    y = np.exp(x)
-    s = float(np.sum(y))
-    return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
-
-
+##    
 ## board/ position generation
+##
+
 OPENING_BOOK = {
     "Ruy Lopez, Morphy Defense": [
         "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"
@@ -385,51 +495,34 @@ def get_all_openings():
     return names, boards
 
 
-def random_endgame_board(max_tries=1000):
-    """
-    Create a random board with exactly 5 pieces:
-    - 2 kings (one white, one black)
-    - 3 random other pieces (any type, any color, random squares)
+def random_init(plies=5, python_chess=False):
+    b = fastboard()
+    p = 0
+    counter = 0
+    limit = int(3*plies)
+    while p < plies:
+        # safety in case it gets caught in some weird corner
+        counter += 1
+        if counter > limit:
+            # really bad luck, just try again
+            return random_init(plies=plies)
+        
+        moves = b.legal_moves()
+        while not len(moves):
+            b.unmake()
+            moves = b.legal_moves()
+            p -= 1
+            if p == 0:
+                # more bad luck, startover
+                return random_init(plies=plies)
+        
+        b.push_uci(random.choice(moves))
+        p += 1
     
-    Keeps retrying until a legal board is found.
-    """
-    piece_types = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
-
-    for _ in range(max_tries):
-        board = chess.Board.empty()
-        board.turn = random.choice([chess.WHITE, chess.BLACK])
-
-        # Place the two kings first
-        king_squares = random.sample(chess.SQUARES, 2)
-        board.set_piece_at(king_squares[0], chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(king_squares[1], chess.Piece(chess.KING, chess.BLACK))
-        occupied = set(king_squares)
-
-        # Place 3 random other pieces
-        for _ in range(3):
-            sq = random.choice([s for s in chess.SQUARES if s not in occupied])
-            occupied.add(sq)
-            piece_type = random.choice(piece_types)
-            color = random.choice([chess.WHITE, chess.BLACK])
-            board.set_piece_at(sq, chess.Piece(piece_type, color))
-
-        # Validate
-        if board.is_valid():
-            return board
-
-    raise ValueError("Could not generate a valid endgame board in given tries")
-
-
-def format_time(seconds):
-    if seconds < 60:
-        return f"{seconds:.3f}s"
-    elif seconds < 3600:
-        m, s = divmod(seconds, 60)
-        return f"{int(m)}m {s:.2f}s"
-    else:
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return f"{int(h)}h {int(m)}m {s:.2f}s"
+    if python_chess:
+        b = chess.Board(b.fen())
+    
+    return b
 
 
 def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=150):
@@ -472,7 +565,6 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
         b2 = start.copy(); b2.push(mv)
         q.append( (b2, [mv.uci()]) )
 
-    eng_kwargs = {}
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
 
     try:
@@ -515,10 +607,6 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
 
     return paths
 
-
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"  
-with open(uci_path_path, "rb") as f:
-    paths = pickle.load(f)
     
 def get_pre_opened_game():
     b = fastboard()
@@ -528,55 +616,39 @@ def get_pre_opened_game():
     return b
 
 
-def ensure_df(df_or_dicts):
-    if isinstance(df_or_dicts, pd.DataFrame):
-        return df_or_dicts.copy()
-    return pd.DataFrame(df_or_dicts).copy()
-
-
-def plot_sf_simple(df):
+def random_endgame_board(max_tries=1000):
     """
-    Line plot over epochs showing:
-      - wins (total)
-      - draws (total)
-      - draws as White
-      - draws as Black
-      - average game length (plies) on a secondary axis
+    Create a random board with exactly 5 pieces:
+    - 2 kings (one white, one black)
+    - 3 random other pieces (any type, any color, random squares)
+    
+    Keeps retrying until a legal board is found.
     """
-    df = ensure_df(df).sort_values("epoch").reset_index(drop=True)
+    piece_types = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
 
-    ep = df["epoch"].astype(int).values
-    wins_total   = df.get("wins",         0).fillna(0).astype(int).values
-    draws_total  = df.get("draws",        0).fillna(0).astype(int).values
-    white_draws  = df.get("white_draws",  0).fillna(0).astype(int).values
-    black_draws  = df.get("black_draws",  0).fillna(0).astype(int).values
-    avg_ply      = df.get("avg_ply",    np.nan).values / 5
+    for _ in range(max_tries):
+        board = chess.Board.empty()
+        board.turn = random.choice([chess.WHITE, chess.BLACK])
 
-    fig, ax1 = plt.subplots(figsize=(10,4))
+        # Place the two kings first
+        king_squares = random.sample(chess.SQUARES, 2)
+        board.set_piece_at(king_squares[0], chess.Piece(chess.KING, chess.WHITE))
+        board.set_piece_at(king_squares[1], chess.Piece(chess.KING, chess.BLACK))
+        occupied = set(king_squares)
 
-    # counts (left axis)
-    ax1.plot(ep, wins_total,  lw=1.5, label="Wins (total)")
-    ax1.plot(ep, draws_total, lw=1.5, label="Draws (total)")
-    ax1.plot(ep, white_draws, lw=1.2, alpha=0.9, label="Draws as White")
-    ax1.plot(ep, black_draws, lw=1.2, alpha=0.9, label="Draws as Black")
-    ax1.plot(ep, avg_ply,     lw=1.5, color='gray', label="Avg plies / 5")
-    
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Counts")
-    ax1.grid(True, alpha=0.3)
+        # Place 3 random other pieces
+        for _ in range(3):
+            sq = random.choice([s for s in chess.SQUARES if s not in occupied])
+            occupied.add(sq)
+            piece_type = random.choice(piece_types)
+            color = random.choice([chess.WHITE, chess.BLACK])
+            board.set_piece_at(sq, chess.Piece(piece_type, color))
 
-    # combined legend
-    l1, lab1 = ax1.get_legend_handles_labels()
-    ax1.legend(l1, lab1, loc="upper left")
+        # Validate
+        if board.is_valid():
+            return board
 
-    plt.title("SF600 exhibitions: wins/draws and avg game length")
-    plt.tight_layout()
-    plt.show()
-    
-#%%    
-
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+    raise ValueError("Could not generate a valid endgame board in given tries")
 
 
 def score_pov_cp(pov_score, white_to_move, mate_cp):
@@ -584,7 +656,7 @@ def score_pov_cp(pov_score, white_to_move, mate_cp):
     return float(s.score(mate_score=mate_cp))
 
 
-def evaluate_game_vs_sf(moves_uci, depth=12, mate_cp=1500):
+def evaluate_game_sf(moves_uci, depth=12, mate_cp=1500):
     board = chess.Board()
     white_cpl, black_cpl = [], []
     best_moves = [0, 0]
@@ -624,39 +696,52 @@ def evaluate_game_vs_sf(moves_uci, depth=12, mate_cp=1500):
     white = summary(white_cpl)
     black = summary(black_cpl)
     overall = float(np.mean(white_cpl + black_cpl)) if (white_cpl or black_cpl) else 0.0
-
+    bm_rate = [np.round(n/len(moves_uci), 3) for n in best_moves]
+    
     return {
         "plies": len(white_cpl) + len(black_cpl),
         "white": white, "black": black, "overall_mean_cpl": np.round(overall, 3),
-        "best_moves_white": best_moves[1], "best_moves_black": best_moves[0],
-        "overall_best_moves": sum(best_moves)
+        "best_move_rate_white": bm_rate[1], "best_move_rate_black": bm_rate[0],
+        "overall_best_move_rate": np.round(sum(bm_rate), 3)
     }
 
 
 def evaluate_many_games(games_moves_uci, depth=12, workers=4, mate_cp=1500):
     def worker(moves):
-        return evaluate_game_vs_sf(moves, depth=depth, mate_cp=mate_cp)
+        return evaluate_game_sf(moves, depth=depth, mate_cp=mate_cp)
 
-    results = []
+    # Collect results in original order
+    results = [None] * len(games_moves_uci)
     with ThreadPoolExecutor(max_workers=int(workers)) as ex:
         futs = {ex.submit(worker, g): i for i, g in enumerate(games_moves_uci)}
         for fut in as_completed(futs):
-            results.append(fut.result())
+            i = futs[fut]
+            results[i] = fut.result()
+
+    # Filter out any failed/None results
+    results = [r for r in results if r is not None]
 
     if not results:
         return {"games": [], "summary": {}}
 
+    # CPL aggregates
     w_means = [r["white"]["mean_cpl"] for r in results]
     b_means = [r["black"]["mean_cpl"] for r in results]
     o_means = [r["overall_mean_cpl"] for r in results]
 
+    # Best-move rate aggregates (values are 0..1)
+    w_best = [r["best_move_rate_white"] for r in results]
+    b_best = [r["best_move_rate_black"] for r in results]
+    o_best = [r["overall_best_move_rate"] for r in results]
+
     summary = {
         "games": len(results),
-        "avg_white_mean_cpl": float(np.mean(w_means)),
-        "avg_black_mean_cpl": float(np.mean(b_means)),
-        "avg_overall_mean_cpl": float(np.mean(o_means)),
+        "avg_white_mean_cpl": np.round(np.mean(w_means), 3),
+        "avg_black_mean_cpl": np.round(np.mean(b_means), 3),
+        "avg_overall_mean_cpl": np.round(np.mean(o_means), 3),
+        "avg_best_move_rate_white": np.round(np.mean(w_best), 3),
+        "avg_best_move_rate_black": np.round(np.mean(b_best), 3),
+        "avg_overall_best_move_rate": np.round(np.mean(o_best), 3),
     }
+
     return {"games": results, "summary": summary}
-
-
-

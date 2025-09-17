@@ -77,8 +77,6 @@ class MCTSTree:
         self.config = cfg
 
         self.c_puct = cfg.c_puct
-        self.dir_eps = cfg.dirichlet_eps
-        self.dir_alpha = cfg.dirichlet_alpha
         
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -336,8 +334,6 @@ class MCTSTree:
         items = [(m, c.N, c.Q) for m, c in self.root.children.items()]
         m, _, q = max(items, key=lambda x: x[1])
         return m, q
-
-        from collections import OrderedDict
 
 
 class ReuseCache:

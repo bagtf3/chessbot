@@ -23,27 +23,26 @@ class Config(object):
     """
     Central knobs. Keep simple; override from a dict or flags as needed.
     """
+    # MCTS
+    c_puct = 1.5
+    virtual_loss = 1.0
+    dirichlet_alpha = 0.2
+    dirichlet_eps = 0.25
+    uniform_mix_opening = 0.15
+    uniform_mix_later = 0.2
+
+    # Simulation schedule
+    sims_target = 400
+    micro_batch_size = 16
+    
+    # Game stuff
+    move_limit = 150
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 13
     n_training_games = 1000
     restart_after_result = True
     random_init_blend = 0.5
     random_init_plies = 8
-    
-    # MCTS
-    c_puct = 1.5
-    virtual_loss = 1.0
-    dirichlet_alpha = 0.3
-    dirichlet_eps = 0.25
-    uniform_mix_opening = 0.15
-    uniform_mix_later = 0.25
-
-    # Simulation schedule
-    sims_target = 360
-    
-    # Game stuff
-    micro_batch_size = 16
-    move_limit = 150
-    material_diff_cutoff = 12
-    material_diff_cutoff_span = 13
     
     # early stop
     es_min_sims = 120

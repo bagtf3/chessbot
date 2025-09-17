@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import uuid
+import uuid, os
 from time import time as _now
 from collections import defaultdict
 
@@ -17,7 +17,7 @@ from chessbot.utils import (
 )    
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
-
+VIS_DIR = "C:/Users/Bryan/Data/chessbot_data/visuals"
 
 class Config(object):
     """
@@ -26,10 +26,8 @@ class Config(object):
     # MCTS
     c_puct = 1.5
     virtual_loss = 1.0
-    dirichlet_alpha = 0.2
-    dirichlet_eps = 0.25
-    uniform_mix_opening = 0.15
-    uniform_mix_later = 0.2
+    uniform_mix_opening = 0.25
+    uniform_mix_later = 0.25
 
     # Simulation schedule
     sims_target = 400
@@ -38,26 +36,29 @@ class Config(object):
     # Game stuff
     move_limit = 150
     material_diff_cutoff = 12
-    material_diff_cutoff_span = 13
+    material_diff_cutoff_span = 15
     n_training_games = 1000
     restart_after_result = True
-    random_init_blend = 0.5
-    random_init_plies = 8
+    random_init_blend = 0.5 # how many random_init vs pre-opened
+    random_init_plies = 8 # number of random init'd moves
     
     # early stop
     es_min_sims = 120
     es_check_every = 4
-    es_gap_frac = 0.7
+    es_gap_frac = 0.75
 
     # Cache
     write_ply_max = 20
 
     # TF
     training_queue_min = 2048
-    vwq_blend = 0.3
-    target_mean = 0.3 
+    vwq_blend = 0.5
+    target_mean = 0.3
     draw_frac = 0.3
     factorized_bins = (64, 64, 6, 4)
+    model_save_pattern = "conv_super_bootstrapped"
+    sf_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_sf_eval")
+    progress_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_progress.png")
 
     def to_dict(self):
         return {
@@ -537,13 +538,15 @@ class GameLooper(object):
         eval_df = score_game_data(self.model, X, Y)
         self.all_evals = pd.concat([self.all_evals, eval_df])
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
-            plot_training_progress(self.all_evals)
+            plot_training_progress(
+                self.all_evals, save_path=self.config.progress_plot_path
+            )
     
         move_lists = [g['history_uci'] for g in self.pre_game_data]
         print(f"Analyzing last {len(move_lists)} games with Stockfish(d=8)...")
         sf_analysis = evaluate_many_games(move_lists, depth=8, workers=10, mate_cp=1500)
         self.intra_training_summaries[self.n_retrains] = sf_analysis
-        log_and_plot_sf(self.intra_training_summaries)
+        log_and_plot_sf(self.intra_training_summaries, save_path=self.config.sf_plot_path)
     
         # archive pre-game data
         self.game_data += self.pre_game_data
@@ -553,11 +556,20 @@ class GameLooper(object):
         self.model.fit(
             X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
         )
-    
+        
         # clear training queue and bump retrain counter
         self.training_queue = []
         self.reuse_cache = ReuseCache()
         self.n_retrains += 1
+        if self.n_retrains % 10 == 0:
+            outfile = self.config.model_save_pattern + "_latest.h5"
+            model_out = os.path.join(MODEL_DIR, outfile)
+            model.save(model_out)
+            
+        if self.n_retrains % 50 == 0:
+            outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
+            model_out = os.path.join(MODEL_DIR, outfile)
+            model.save(model_out)
 
     def log_results(self):
         avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
@@ -571,6 +583,13 @@ class GameLooper(object):
 
 
 if __name__ == '__main__':
-    model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+    try_latest = os.path.join(MODEL_DIR, "conv_super_bootstrapped_latest.h5")
+    if os.path.exists(try_latest):
+        model = load_model(try_latest)
+    
+    # fallback
+    else:
+        model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+        
     looper = GameLooper(games=48, model=model, cfg=Config())
     looper.run()

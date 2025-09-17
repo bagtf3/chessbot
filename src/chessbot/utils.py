@@ -123,10 +123,19 @@ def plot_sf_simple(df):
     plt.show()
     
 
-def plot_training_progress(all_evals, max_cols=4):
+def plot_training_progress(all_evals, max_cols=4, save_path=None):
     """
     Plots training/eval metrics for each model output in a grid.
     Adapts rows/cols automatically, up to max_cols wide.
+
+    Parameters
+    ----------
+    all_evals : pd.DataFrame
+        DataFrame containing eval metrics with columns as outputs.
+    max_cols : int, optional
+        Max number of columns in the plot grid (default 4).
+    save_path : str or Path, optional
+        If provided, saves the plot image to this file location.
     """
     cols = list(all_evals.columns)
 
@@ -145,18 +154,24 @@ def plot_training_progress(all_evals, max_cols=4):
         ax = axes[i]
         y = all_evals[col].values
         ax.plot(y, label=col)
-        # moving average (MA5)
+        # moving average (MA15)
         ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(ma, lw=2, alpha=0.6, label=f"{col} (MA5)")
+        ax.plot(ma, lw=2, alpha=0.6, label=f"{col} (MA15)")
         ax.set_title(col)
         ax.legend()
 
-    # Hide any unused axes
+    # Hide unused axes
     for j in range(len(cols), len(axes)):
         axes[j].axis("off")
 
     plt.tight_layout()
+
+    # Save if requested
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+
     plt.show()
+
 
 
 def plot_pred_vs_true_grid(model, preds, y_true_dict):

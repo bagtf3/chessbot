@@ -107,7 +107,6 @@ class ChessGame(object):
         if pi is not None:
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
             
-            # these are infereed automatically 
             F, T, Kp, Kpr = self.config.factorized_bins
             from_m = np.zeros(F, dtype=np.float32)
             to_m = np.zeros(T, dtype=np.float32)
@@ -593,3 +592,8 @@ if __name__ == '__main__':
         
     looper = GameLooper(games=48, model=model, cfg=Config())
     looper.run()
+
+
+
+
+

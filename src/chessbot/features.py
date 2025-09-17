@@ -1,6 +1,5 @@
 import chess
 
-
 VAL = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
     chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 10
@@ -8,8 +7,6 @@ VAL = {
 
 NAMES = {1: "pawn", 2: "knight", 3: "bishop", 4: "rook", 5:"queen", 6:"king"}
 COLORS = {1:"white", True: 'white', 0:"black", False: 'black'}
-
-board = chess.Board()
 
 
 def attacked_by_lower_value(board, color, square):

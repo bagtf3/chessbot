@@ -173,7 +173,6 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     plt.show()
 
 
-
 def plot_pred_vs_true_grid(model, preds, y_true_dict):
     names = list(model.output_names)
 

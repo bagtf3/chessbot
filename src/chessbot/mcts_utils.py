@@ -1,6 +1,8 @@
 import math
 from chessbot.utils import softmax
 from collections import OrderedDict
+# at top (with the other imports)
+from time import time as _now
 
 
 class MCTSNode:
@@ -77,7 +79,8 @@ class MCTSTree:
         self.c_puct = cfg.c_puct
         self.dir_eps = cfg.dirichlet_eps
         self.dir_alpha = cfg.dirichlet_alpha
-
+        
+        self._move_started_at = _now()
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
 
@@ -256,6 +259,16 @@ class MCTSTree:
             rows.append((mv, ch.N))
         rows.sort(key=lambda t: t[1], reverse=True)
         return rows
+    
+    def visit_weighted_Q(self):
+        node = self.root
+        if not node.children:
+            return 0.0
+        wts = [ch.N for ch in node.children.values() if ch.N > 0]
+        q_vals  = [ch.Q for ch in node.children.values() if ch.N > 0]
+        total = sum(wts)
+        return sum([w * q for w, q in zip(wts, q_vals)]) / total if total > 0 else 0.0
+
 
     def maybe_early_stop(self):
         sims_done = self.sims_completed_this_move
@@ -300,6 +313,7 @@ class MCTSTree:
     def reset_for_new_move(self):
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
+        self._move_started_at = _now()
 
         # early-stop state
         self._es_history = []

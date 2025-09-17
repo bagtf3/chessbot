@@ -12,7 +12,9 @@ from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree, ReuseCache
 
 from chessbot.utils import score_game_data, plot_training_progress, log_and_plot_sf
-from chessbot.utils import get_pre_opened_game, evaluate_many_games, show_board
+from chessbot.utils import (
+    get_pre_opened_game, evaluate_many_games, show_board, random_init
+)    
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 
@@ -22,6 +24,9 @@ class Config(object):
     Central knobs. Keep simple; override from a dict or flags as needed.
     """
     n_training_games = 1000
+    restart_after_result = True
+    random_init_blend = 0.5
+    random_init_plies = 8
     
     # MCTS
     c_puct = 1.5
@@ -32,7 +37,7 @@ class Config(object):
     uniform_mix_later = 0.25
 
     # Simulation schedule
-    sims_target = 400
+    sims_target = 360
     
     # Game stuff
     micro_batch_size = 16
@@ -41,7 +46,7 @@ class Config(object):
     material_diff_cutoff_span = 13
     
     # early stop
-    es_min_sims = 200
+    es_min_sims = 120
     es_check_every = 4
     es_gap_frac = 0.7
 
@@ -50,6 +55,7 @@ class Config(object):
 
     # TF
     training_queue_min = 2048
+    vwq_blend = 0.3
 
     def to_dict(self):
         return {
@@ -63,13 +69,21 @@ class ChessGame(object):
     def __init__(self, board=None, cfg=None):
         self.game_id = str(uuid.uuid4())
         self.config = cfg or Config()
-        self.board = board or get_pre_opened_game()
+        
+        if board is None:
+            if np.random.uniform() <= self.config.random_init_blend:
+                board = random_init(self.config.random_init_plies)
+            else:
+                board = get_pre_opened_game()
+                
+        self.board = board
         self.tree = MCTSTree(self.board, self.config)
 
         self.mat_adv_counter = 0
         self.outcome = None
         self.examples = [] 
         self.plies = 0
+        self.vwq = None
 
     def make_move_from_tree(self):
         """
@@ -78,52 +92,52 @@ class ChessGame(object):
         root = self.tree.root
         if not root.children:
             return False
-    
-        # visits -> π over legal UCIs at the root
+
         ucis = list(root.children.keys())
         visits = np.array([root.children[m].N for m in ucis], dtype=np.float32)
         s = float(visits.sum())
         pi = (visits / s) if s > 0.0 else None
-    
-        # factorize π into fixed-size marginals for heads
+
+        vwq = self.tree.visit_weighted_Q()  # grab visit-weighted Q
+
         if pi is not None:
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
-    
+
             F   = getattr(self.config, "from_bins", 64)
             T   = getattr(self.config, "to_bins", 64)
             Kp  = getattr(self.config, "piece_bins", 6)
             Kpr = getattr(self.config, "promo_bins", 4)
-    
+
             from_m = np.zeros(F,   dtype=np.float32)
             to_m   = np.zeros(T,   dtype=np.float32)
             pc_m   = np.zeros(Kp,  dtype=np.float32)
             pr_m   = np.zeros(Kpr, dtype=np.float32)
-    
+
             for i, p in enumerate(pi):
                 fi, ti, pi_idx, pr_idx = fr[i], to[i], piece[i], promo[i]
                 if 0 <= fi < F:      from_m[fi]   += p
                 if 0 <= ti < T:      to_m[ti]     += p
                 if 0 <= pi_idx < Kp: pc_m[pi_idx] += p
                 if 0 <= pr_idx < Kpr: pr_m[pr_idx] += p
-    
-            planes_k = getattr(self.config, "planes_k", 5)
-            x = self.board.stacked_planes(planes_k)
+
+            x = self.board.stacked_planes(5)
             self.examples.append(
-                (x, {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m})
+                (x,
+                {
+                    "from": from_m, "to": to_m, "piece": pc_m,
+                    "promo": pr_m, "vwq": float(vwq)
+                })
             )
-    
-        # choose move by visits and advance
+
         mv, _ = self.tree.best()
         if mv is None:
             return False
-    
+
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         self.plies += 1
         return True
 
-
-    
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
         if reason != 'none':
@@ -186,7 +200,7 @@ class ChessGame(object):
     def show_board(self, flipped=False, sleep=0.0):
         sb = chess.Board(self.board.fen())
         show_board(sb, flipped=flipped, sleep=sleep)
-    
+
     def show_top_moves(self, top_n=4, show_san=True):
         root = self.tree.root
         c_puct = self.config.c_puct
@@ -194,19 +208,53 @@ class ChessGame(object):
             print("\nTop candidate moves:\n  (no children)")
             return None
     
-        if c_puct is None:
-            c_puct = getattr(self.config, "c_puct", 2.0)
+        # search summary: sims, time, avg/max depth, children visited
+        start = getattr(self.tree, "_move_started_at", None)
+        if start is None:
+            start = _now()
+            self.tree._move_started_at = start
+        elapsed = _now() - start
     
-        sorted_children = sorted(root.children.items(), key=lambda kv: kv[1].N, reverse=True)
+        def _depth_stats(r):
+            total_v, sum_vd, dmax = 0, 0.0, 0
+            stack = [(r, 0)]
+            while stack:
+                n, d = stack.pop()
+                if n is not r and n.N > 0:
+                    total_v += n.N
+                    sum_vd += d * n.N
+                    if d > dmax:
+                        dmax = d
+                for ch in n.children.values():
+                    stack.append((ch, d + 1))
+            avg_d = (sum_vd / total_v) if total_v > 0 else 0.0
+            return avg_d, dmax
+    
+        avg_depth, max_depth = _depth_stats(root)
+        sims = int(getattr(self.tree, "sims_completed_this_move", 0))
+    
+        total_children = len(root.children)
+        visited_children = sum(
+            [1 for ch in root.children.values() if getattr(ch, "N", 0) > 0]
+        )
+    
+        print(
+            f"\nSearch summary: sims={sims}  time={elapsed:.2f}s  "
+            f"avg_depth={avg_depth:.2f}  max_depth={max_depth}  "
+            f"children_visited={visited_children}/{total_children}"
+        )
+    
+        # top-N printout
+        sorted_children = sorted(
+            root.children.items(), key=lambda kv: kv[1].N, reverse=True
+        )
         sumN = max(1, root.N + sum([c.vloss for _, c in root.children.items()]))
     
-        print("\nTop candidate moves:")
+        print("Top candidate moves:")
         for move_uci, node in sorted_children[:top_n]:
             p = root.P.get(move_uci, 0.0)
             u = c_puct * p * (sumN ** 0.5) / (1 + node.N + node.vloss)
-            san = "?"
-            if show_san:
-                san = self.board.san(move_uci)
+            san = self.board.san(move_uci) if show_san else "?"
             line = (
                 f"{move_uci:<6} "
                 f"{'('+san+')':<12}  "
@@ -217,14 +265,37 @@ class ChessGame(object):
             )
             print(line)
     
+        # chosen move
         best_move_uci, best_node = sorted_children[0]
-        best_san = best_move_uci
-        if show_san:
-            best_san = self.board.san(best_move_uci)
+        best_san = self.board.san(best_move_uci) if show_san else best_move_uci
+    
+        # visit-weighted root Q
+        v_mcts = best_node.Q if self.vwq is None else self.vwq
+    
         print(
             f"\nChosen move: {best_move_uci} ({best_san})  "
-            f"(visits={best_node.N}, Q={best_node.Q:+.3f})"
+            f"(visits={best_node.N}, Q={best_node.Q:+.3f}, visit-weighted Q={v_mcts:+.3f})"
         )
+        
+        #self.print_pv()
+    
+    def print_pv(self, max_len=4):
+        b = self.board.clone()
+        node = self.tree.root
+        moves, qs = [], []
+        for _ in range(max_len):
+            if not node.children:
+                break
+            m, child = max(node.children.items(), key=lambda kv: kv[1].N)
+            moves.append(b.san(m))
+            qs.append(child.Q)
+            b.push_uci(m)
+            node = child
+        pv = " ".join(moves) if moves else "(none)"
+        qtrail = " -> ".join([f"{q:+.3f}" for q in qs])
+        print(f"PV: {pv}")
+        if qs:
+            print(f"Q trail: {qtrail}  (final {qs[-1]:+.3f})")
 
 
 class GameLooper(object):
@@ -265,6 +336,9 @@ class GameLooper(object):
         """
         completed_games = 0
         while completed_games < self.config.n_training_games:
+            if not self.active_games:
+                break
+            
             preds_batch = []
             finished = []
             for game in self.active_games:
@@ -317,7 +391,8 @@ class GameLooper(object):
                 g for g in self.active_games if g.game_id not in finished
             ]
             
-            self.active_games += [ChessGame() for _ in range(len(finished))]
+            if self.config.restart_after_result:
+                self.active_games += [ChessGame() for _ in range(len(finished))]
         
         # maybe return some logs or something some day
         return
@@ -397,34 +472,34 @@ class GameLooper(object):
 
         z = float(game.outcome if game.outcome is not None else 0.0)
         for x, heads in game.examples:
-            self.training_queue.append((x, heads, z))
-        game.examples = []  # free memory
+            vwq = heads.get("vwq", 0.0)
+            self.training_queue.append((x, heads, z, vwq))
+        game.examples = []
 
         thresh = getattr(self.config, "training_queue_min", 2048)
         if len(self.training_queue) >= thresh:
-            self.prep_and_retrain()
+            self.trigger_retrain()
         
     def trigger_retrain(self):
-        """
-        Build training tensors from self.training_queue and do a quick fit.
-        Balances wins vs losses on the value head with per-sample weights.
-        """
         if not self.training_queue:
             return
 
-        # unpack
-        X, Y_from, Y_to, Y_piece, Y_promo, Z = [], [], [], [], [], []
-        for x, heads, z in self.training_queue:
+        X, Y_from, Y_to, Y_piece, Y_promo, Z, Vwq = [], [], [], [], [], [], []
+        for x, heads, z, vwq in self.training_queue:
             X.append(x)
             Y_from.append(heads["from"])
             Y_to.append(heads["to"])
             Y_piece.append(heads["piece"])
             Y_promo.append(heads["promo"])
             Z.append(z)
+            Vwq.append(vwq)
+
+        alpa = getattr(self.config, "vwq_blend", 0.3)
+        Y_value = (1 - alpha) * np.asarray(Z) + alpha * np.asarray(Vwq)
 
         X = np.asarray(X, dtype=np.float32)
         Y = {
-            "value": np.asarray(Z, dtype=np.float32),
+            "value": np.asarray(Y_value, dtype=np.float32),
             "best_from": np.asarray(Y_from, dtype=np.float32),
             "best_to": np.asarray(Y_to, dtype=np.float32),
             "best_piece": np.asarray(Y_piece, dtype=np.float32),
@@ -515,10 +590,13 @@ class GameLooper(object):
         self.config.piece_bins = int(out["best_piece"].shape[-1])
         self.config.promo_bins = int(out["best_promo"].shape[-1])
 
- 
+
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
     looper = GameLooper(games=32, model=model, cfg=Config())
+    looper.config.restart_after_result = False
+    looper.config.n_training_games = 32
+    looper.config.training_queue_min = 512
     looper.run()
 
 

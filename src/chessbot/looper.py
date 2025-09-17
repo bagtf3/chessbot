@@ -7,6 +7,8 @@ from collections import defaultdict
 import chess
 import chess.syzygy
 
+from pyfastchess import Board as fastboard
+
 from chessbot import ENDGAME_LOC
 from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree, ReuseCache
@@ -28,13 +30,15 @@ class Config(object):
     virtual_loss = 1.0
     uniform_mix_opening = 0.25
     uniform_mix_later = 0.25
+    uniform_mix_endgame = 0.5
 
     # Simulation schedule
     sims_target = 400
+    sims_target_endgame = 640
     micro_batch_size = 16
     
     # Game stuff
-    move_limit = 150
+    move_limit = 120
     material_diff_cutoff = 12
     material_diff_cutoff_span = 30
     n_training_games = 1000
@@ -48,7 +52,8 @@ class Config(object):
     es_gap_frac = 0.75
 
     # Cache
-    write_ply_max = 20
+    write_ply_max = 30
+    warm_reuse_cache = True
 
     # TF
     training_queue_min = 2048
@@ -56,6 +61,8 @@ class Config(object):
     target_mean = 0.3
     draw_frac = 0.3
     factorized_bins = (64, 64, 6, 4)
+    
+    # files
     model_save_pattern = "conv_super_bootstrapped"
     sf_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_sf_eval")
     progress_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_progress.png")
@@ -292,6 +299,8 @@ class ChessGame(object):
         print(f"PV: {pv}")
         if qs:
             print(f"Q trail: {qtrail}  (final {qs[-1]:+.3f})")
+        
+    
 
 
 class GameLooper(object):
@@ -356,6 +365,13 @@ class GameLooper(object):
                         self.finalize_game_data(game)
                         self.log_results()
                         finished.append(game.game_id)
+                        ### testing cache with regular fen
+                        print(self.reuse_cache.stats())
+                        
+                        pos_counts = self.pos_counter.values()
+                        for n_times in [1, 2, 3]:
+                            pcv = sum([1 for v in pos_counts if v >= n_times])    
+                            print(f"{pcv} positions have been reached {n_times}+ times")
                         continue
 
                 n_collected, tries = 0, 0
@@ -470,8 +486,7 @@ class GameLooper(object):
             self.training_queue.append((x, heads, z, vwq))
         game.examples = []
 
-        thresh = getattr(self.config, "training_queue_min", 2048)
-        if len(self.training_queue) >= thresh:
+        if len(self.training_queue) >= self.config.training_queue_min:
             self.trigger_retrain()
         
     def trigger_retrain(self):
@@ -545,7 +560,9 @@ class GameLooper(object):
         print(f"Analyzing last {len(move_lists)} games with Stockfish(d=8)...")
         sf_analysis = evaluate_many_games(move_lists, depth=8, workers=10, mate_cp=1500)
         self.intra_training_summaries[self.n_retrains] = sf_analysis
-        log_and_plot_sf(self.intra_training_summaries, save_path=self.config.sf_plot_path)
+        log_and_plot_sf(
+            self.intra_training_summaries, save_path=self.config.sf_plot_path
+        )
     
         # archive pre-game data
         self.game_data += self.pre_game_data
@@ -559,6 +576,10 @@ class GameLooper(object):
         # clear training queue and bump retrain counter
         self.training_queue = []
         self.reuse_cache = ReuseCache()
+        
+        if self.config.warm_reuse_cache:
+            self.warm_reuse_cache()
+        
         self.n_retrains += 1
         if self.n_retrains % 10 == 0:
             outfile = self.config.model_save_pattern + "_latest.h5"
@@ -569,7 +590,34 @@ class GameLooper(object):
             outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
             model_out = os.path.join(MODEL_DIR, outfile)
             model.save(model_out)
+    
+    def warm_reuse_cache(self):
+        """
+        Looks for positions that have occurred 2 or more times and predicts with
+        new model to try and get a jump start.
+        """
+        
+        keys = [k for k, v in self.pos_counter.items() if v >= 2]
+        print(f"Warming ReuseCache after model training with {len(keys)} positions...")
+        batch = []
+        for k in keys:
+            moves = k.split("|")
+            b = fastboard()
+            for m in moves:
+                b.push_uci(m)
+            
+            new_key = b.fen(include_counters=False) + "|" + "|".join(moves[-5:])
+            fake_req = {"cache_key": new_key, "enc": b.stacked_planes(5), "n_plies": -1}
+            batch.append(fake_req)
 
+        self.format_and_predict(batch)
+        
+        # reset pos counter to stay relevant. init with the keys from this
+        # round with value 1. if they hit again we will use them again.
+        self.pos_counter = defaultdict(int)
+        for k in keys:
+            self.pos_counter[k] += 1
+        
     def log_results(self):
         avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
         print("~"*50)
@@ -596,4 +644,6 @@ if __name__ == '__main__':
 
 
 
+
+        
 

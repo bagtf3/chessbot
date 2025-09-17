@@ -40,7 +40,6 @@ def priors_from_heads(board, legal, p_from, p_to, p_piece, p_promo, mix=0.5):
         return {}
 
     fr, to, piece, promo = board.moves_to_labels(ucis=legal)
-
     pri = []
     for i in range(len(legal)):
         pf = p_from[fr[i]]
@@ -74,6 +73,7 @@ class MCTSTree:
     def __init__(self, board, cfg):
         self.root = MCTSNode(board.side_to_move())
         self.root_board_fen = board.fen()
+        self.n_plies = board.history_size()
         self.config = cfg
 
         self.c_puct = cfg.c_puct
@@ -129,7 +129,7 @@ class MCTSTree:
             board.push_uci(path[i].uci)
 
         short_fen = board.fen(include_counters=False)
-        n_plies = board.history_size()
+        n_plies = self.n_plies
         move_str = "|".join(board.history_uci()[-5:])
         move_history = "|".join(board.history_uci())
         cache_key = short_fen + "|" + move_str
@@ -147,19 +147,21 @@ class MCTSTree:
             "stm_white": (leaf.stm == 'w'), "cache_key": cache_key,
             "n_plies": n_plies
         }
+        
+        # only check the cache if were close to the cutoff
+        if n_plies <= self.config.write_ply_max + 5:
+            cached = reuse_cache.get(cache_key)
+            if cached is not None:
+                # cached is a dict with keys: value, from, to, piece, promo
+                self.apply_result(
+                    board, req,
+                    cached["value"], cached["from"], cached["to"],
+                    cached["piece"], cached["promo"]
+                )
+                self.sims_completed_this_move += 1
+                return None  # handled by cache now
 
-        cached = reuse_cache.get(cache_key)
-        if cached is not None:
-            # cached is a dict with keys: value, from, to, piece, promo
-            self.apply_result(
-                board, req,
-                cached["value"], cached["from"], cached["to"],
-                cached["piece"], cached["promo"]
-            )
-            self.sims_completed_this_move += 1
-            return None  # handled by cache now
-
-        if n_plies < 20:
+        if n_plies < 30:
             req['move_history'] = move_history
 
         self.awaiting_predictions.append(req)
@@ -212,9 +214,12 @@ class MCTSTree:
             legal = req["legal"] if req["legal"] else board.legal_moves()
             leaf.legal = legal
             if legal:
-                mix = self.config.uniform_mix_opening
-                if board.history_size() > 20:
+                if self.n_plies < 20:
+                    mix = self.config.uniform_mix_opening
+                elif self.n_plies < 50:
                     mix = self.config.uniform_mix_later
+                else:
+                    mix = self.config.uniform_mix_endgame
 
                 pri = priors_from_heads(
                     board, legal, softmax(p_from), softmax(p_to),
@@ -243,10 +248,12 @@ class MCTSTree:
             self.root = new_root
             board.push_uci(move_uci)
             self.root_board_fen = board.fen()
+            self.n_plies = board.history_size()
         else:
             board.push_uci(move_uci)
             self.root = MCTSNode(board.side_to_move())
             self.root_board_fen = board.fen()
+            self.n_plies = board.history_size()
     
     def root_child_visits(self):
         node = self.root
@@ -267,11 +274,8 @@ class MCTSTree:
         total = sum(wts)
         return sum([w * q for w, q in zip(wts, q_vals)]) / total if total > 0 else 0.0
 
-
-    def maybe_early_stop(self):
+    def maybe_early_stop(self, sims_target):
         sims_done = self.sims_completed_this_move
-        sims_target = self.config.sims_target
-
         if self._es_tripped:
             return True
 
@@ -302,11 +306,16 @@ class MCTSTree:
         return False
 
     def stop_simulating(self):
+        sims_target = self.config.sims_target
+        if self.n_plies > 50:
+            sims_target = self.config.sims_target_endgame
+        
         # hard budget
-        if self.sims_completed_this_move >= self.config.sims_target:
+        if self.sims_completed_this_move >= sims_target:
             return True
+        
         # simple early-stop
-        return self.maybe_early_stop()
+        return self.maybe_early_stop(sims_target)
 
     def reset_for_new_move(self):
         self.sims_completed_this_move = 0

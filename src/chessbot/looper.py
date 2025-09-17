@@ -56,6 +56,8 @@ class Config(object):
     # TF
     training_queue_min = 2048
     vwq_blend = 0.3
+    target_mean = 0.3 
+    draw_frac = 0.3
 
     def to_dict(self):
         return {
@@ -99,26 +101,23 @@ class ChessGame(object):
         pi = (visits / s) if s > 0.0 else None
 
         vwq = self.tree.visit_weighted_Q()  # grab visit-weighted Q
+        self.vwq = vwq
 
         if pi is not None:
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
-
-            F   = getattr(self.config, "from_bins", 64)
-            T   = getattr(self.config, "to_bins", 64)
-            Kp  = getattr(self.config, "piece_bins", 6)
-            Kpr = getattr(self.config, "promo_bins", 4)
-
-            from_m = np.zeros(F,   dtype=np.float32)
-            to_m   = np.zeros(T,   dtype=np.float32)
-            pc_m   = np.zeros(Kp,  dtype=np.float32)
-            pr_m   = np.zeros(Kpr, dtype=np.float32)
+            
+            # these are infereed automatically 
+            from_m = np.zeros(self.config.from_bins, dtype=np.float32)
+            to_m = np.zeros(self.config.to_bins, dtype=np.float32)
+            pc_m = np.zeros(self.config.piece_bins, dtype=np.float32)
+            pr_m = np.zeros(self.config.promo_bins, dtype=np.float32)
 
             for i, p in enumerate(pi):
                 fi, ti, pi_idx, pr_idx = fr[i], to[i], piece[i], promo[i]
-                if 0 <= fi < F:      from_m[fi]   += p
-                if 0 <= ti < T:      to_m[ti]     += p
-                if 0 <= pi_idx < Kp: pc_m[pi_idx] += p
-                if 0 <= pr_idx < Kpr: pr_m[pr_idx] += p
+                from_m[fi]   += p
+                to_m[ti]     += p
+                pc_m[pi_idx] += p
+                pr_m[pr_idx] += p
 
             x = self.board.stacked_planes(5)
             self.examples.append(
@@ -234,9 +233,7 @@ class ChessGame(object):
         sims = int(getattr(self.tree, "sims_completed_this_move", 0))
     
         total_children = len(root.children)
-        visited_children = sum(
-            [1 for ch in root.children.values() if getattr(ch, "N", 0) > 0]
-        )
+        visited_children = sum([1 for ch in root.children.values() if ch.N > 0])
     
         print(
             f"\nSearch summary: sims={sims}  time={elapsed:.2f}s  "
@@ -276,8 +273,6 @@ class ChessGame(object):
             f"\nChosen move: {best_move_uci} ({best_san})  "
             f"(visits={best_node.N}, Q={best_node.Q:+.3f}, visit-weighted Q={v_mcts:+.3f})"
         )
-        
-        #self.print_pv()
     
     def print_pv(self, max_len=4):
         b = self.board.clone()
@@ -481,9 +476,15 @@ class GameLooper(object):
             self.trigger_retrain()
         
     def trigger_retrain(self):
+        """
+        Build training tensors from self.training_queue and do a quick fit.
+        Blends game outcomes with visit-weighted Q for the value head.
+        Balances wins vs losses on the value head with per-sample weights.
+        """
         if not self.training_queue:
             return
-
+    
+        # unpack examples
         X, Y_from, Y_to, Y_piece, Y_promo, Z, Vwq = [], [], [], [], [], [], []
         for x, heads, z, vwq in self.training_queue:
             X.append(x)
@@ -493,68 +494,72 @@ class GameLooper(object):
             Y_promo.append(heads["promo"])
             Z.append(z)
             Vwq.append(vwq)
-
-        alpha = getattr(self.config, "vwq_blend", 0.3)
-        Y_value = (1 - alpha) * np.asarray(Z) + alpha * np.asarray(Vwq)
-
+    
+        # blend outcome with visit-weighted Q
+        alpha = self.config.vwq_blend
+        Z = np.asarray(Z, dtype=np.float32)
+        Vwq = np.asarray(Vwq, dtype=np.float32)
+        Y_value = (1 - alpha) * Z + alpha * Vwq
+    
+        # assemble training dict
         X = np.asarray(X, dtype=np.float32)
         Y = {
-            "value": np.asarray(Y_value, dtype=np.float32),
+            "value": Y_value.astype(np.float32),
             "best_from": np.asarray(Y_from, dtype=np.float32),
             "best_to": np.asarray(Y_to, dtype=np.float32),
             "best_piece": np.asarray(Y_piece, dtype=np.float32),
             "best_promo": np.asarray(Y_promo, dtype=np.float32),
         }
-
-        # per-sample weights to balance wins vs losses (white-POV) and set a low mean
-        target_mean = 0.3
-        draw_frac = 0.15
-        
-        z = Y["value"].astype(np.float32)
-        pos = float(np.sum(z > 0))
-        neg = float(np.sum(z < 0))
+    
+        # per-sample weights (based on raw outcomes)
+        target_mean = self.config.target_mean
+        draw_frac = self.config.draw_frac
+    
+        pos = float(np.sum(Z > 0))
+        neg = float(np.sum(Z < 0))
         nz  = pos + neg
-        
+    
         if nz > 0 and pos > 0 and neg > 0:
             w_pos = 0.5 * nz / pos
             w_neg = 0.5 * nz / neg
             w_draw = draw_frac * 0.5 * (w_pos + w_neg)
-            w = np.where(z > 0, w_pos, np.where(z < 0, w_neg, w_draw)).astype(np.float32)
+            w = np.where(Z > 0, w_pos, np.where(Z < 0, w_neg, w_draw)).astype(np.float32)
         else:
-            w = np.ones_like(z, dtype=np.float32)
-        
-        # scale to target average weight
+            w = np.ones_like(Z, dtype=np.float32)
+    
+        # scale weights to target mean
         mean_w = float(w.mean()) if w.size else 1.0
         if mean_w > 0:
             w *= (target_mean / mean_w)
         else:
-            w[:] = target_mean  # degenerate case
-
+            w[:] = target_mean
+    
+        # evaluation and logging
         eval_df = score_game_data(self.model, X, Y)
         self.all_evals = pd.concat([self.all_evals, eval_df])
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plot_training_progress(self.all_evals)
-        
+    
         move_lists = [g['history_uci'] for g in self.pre_game_data]
         print(f"Analyzing last {len(move_lists)} games with Stockfish(d=8)...")
         sf_analysis = evaluate_many_games(move_lists, depth=8, workers=10, mate_cp=1500)
         self.intra_training_summaries[self.n_retrains] = sf_analysis
         log_and_plot_sf(self.intra_training_summaries)
-        
-        # move these games over and reset the pre
+    
+        # archive pre-game data
         self.game_data += self.pre_game_data
-        self.pre_data_data = []
-        
-        # train (only the value head gets sample weighting)
+        self.pre_game_data = []   # <- small typo fix from pre_data_data
+    
+        # fit (only value head weighted)
         self.model.fit(
             X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
         )
-
-        # clear queue after training
+    
+        # clear training queue and bump retrain counter
         self.training_queue = []
         self.reuse_cache = ReuseCache()
         self.n_retrains += 1
-    
+
     def log_results(self):
         avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
         print("~"*50)

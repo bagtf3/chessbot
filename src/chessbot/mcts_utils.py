@@ -215,7 +215,7 @@ class MCTSTree:
             leaf.legal = legal
             if legal:
                 mix = self.config.uniform_mix_opening
-                if board.history_size() < 20:
+                if board.history_size() > 20:
                     mix = self.config.uniform_mix_later
 
                 pri = priors_from_heads(

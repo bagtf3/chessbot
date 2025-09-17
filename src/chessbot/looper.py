@@ -36,7 +36,7 @@ class Config(object):
     # Game stuff
     move_limit = 150
     material_diff_cutoff = 12
-    material_diff_cutoff_span = 15
+    material_diff_cutoff_span = 30
     n_training_games = 1000
     restart_after_result = True
     random_init_blend = 0.5 # how many random_init vs pre-opened

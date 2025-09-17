@@ -284,7 +284,6 @@ def encode_worker(fen):
     return fen, get_board_state(board)
 
 
-
 def move_to_labels(board, move):
     from_idx = move.from_square         # 0..63
     to_idx   = move.to_square           # 0..63
@@ -408,5 +407,4 @@ def values_to_priors(vals, temp=0.15, mix=0.0, floor=1e-12):
         p = (1.0 - mix) * p + mix * (1.0 / n)
         p /= p.sum()
     return p
-
 

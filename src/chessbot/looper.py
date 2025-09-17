@@ -58,6 +58,7 @@ class Config(object):
     vwq_blend = 0.3
     target_mean = 0.3 
     draw_frac = 0.3
+    factorized_bins = (64, 64, 6, 4)
 
     def to_dict(self):
         return {
@@ -107,10 +108,11 @@ class ChessGame(object):
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
             
             # these are infereed automatically 
-            from_m = np.zeros(self.config.from_bins, dtype=np.float32)
-            to_m = np.zeros(self.config.to_bins, dtype=np.float32)
-            pc_m = np.zeros(self.config.piece_bins, dtype=np.float32)
-            pr_m = np.zeros(self.config.promo_bins, dtype=np.float32)
+            F, T, Kp, Kpr = self.config.factorized_bins
+            from_m = np.zeros(F, dtype=np.float32)
+            to_m = np.zeros(T, dtype=np.float32)
+            pc_m = np.zeros(Kp, dtype=np.float32)
+            pr_m = np.zeros(Kpr, dtype=np.float32)
 
             for i, p in enumerate(pi):
                 fi, ti, pi_idx, pr_idx = fr[i], to[i], piece[i], promo[i]
@@ -307,8 +309,6 @@ class GameLooper(object):
             self.active_games = games
         
         self.model = model
-        
-        self._infer_head_dims()
         self.training_queue = []
         self.reuse_cache = ReuseCache()
         self.quick_cache = {}
@@ -569,39 +569,9 @@ class GameLooper(object):
             f"avg_len={avg_moves:.1f} moves"
         )
         print("~"*50)
-    
-    def _normalize_out(self, out):
-        # Ensure dict with expected keys regardless of model return type
-        if isinstance(out, dict):
-            return out
-        names = list(getattr(self.model, "output_names", [])) or \
-                ["value", "best_from", "best_to", "best_piece", "best_promo"]
-        if not isinstance(out, (list, tuple)):
-            out = [out]
-        return {k: v for k, v in zip(names, out)}
-
-    def _infer_head_dims(self):
-        # use first game's encoder to make a sample input
-        sample_enc = self.active_games[0].board.stacked_planes(
-            getattr(self.config, "planes_k", 5)
-        )
-        X = np.asarray([sample_enc], dtype=np.float32)
-        raw = self.model.predict(X, batch_size=1, verbose=0)
-        out = self._normalize_out(raw)
-    
-        # write bins onto config (so collection uses fixed sizes)
-        self.config.from_bins  = int(out["best_from"].shape[-1])
-        self.config.to_bins    = int(out["best_to"].shape[-1])
-        self.config.piece_bins = int(out["best_piece"].shape[-1])
-        self.config.promo_bins = int(out["best_promo"].shape[-1])
 
 
 if __name__ == '__main__':
     model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
-    looper = GameLooper(games=32, model=model, cfg=Config())
-    looper.config.restart_after_result = False
-    looper.config.n_training_games = 32
-    looper.config.training_queue_min = 512
+    looper = GameLooper(games=48, model=model, cfg=Config())
     looper.run()
-
-

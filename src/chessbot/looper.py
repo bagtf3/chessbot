@@ -494,7 +494,7 @@ class GameLooper(object):
             Z.append(z)
             Vwq.append(vwq)
 
-        alpa = getattr(self.config, "vwq_blend", 0.3)
+        alpha = getattr(self.config, "vwq_blend", 0.3)
         Y_value = (1 - alpha) * np.asarray(Z) + alpha * np.asarray(Vwq)
 
         X = np.asarray(X, dtype=np.float32)

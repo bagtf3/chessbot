@@ -47,7 +47,7 @@ def analyze_position(board, topk=4, temp=0.02):
 
     legal = board.legal_moves()
     K = min(topk, len(legal))
-    sf_moves = stockfish.get_top_moves(K)
+    sf_moves = stockfish.get_top_moves(1)
 
     # raw values for SF-returned moves
     vals_sf = sf_top_moves_to_values(sf_moves)

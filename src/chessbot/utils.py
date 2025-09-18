@@ -4,7 +4,8 @@ pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
 
 import math, random, time, pickle
-            
+from time import time as _now
+
 import tensorflow as tf
 import matplotlib.pyplot as plt
 plt.ion()
@@ -631,48 +632,200 @@ def get_pre_opened_game():
     return b
 
 
-def random_endgame_board(max_tries=1000):
+def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
     """
-    Create a random board with exactly 5 pieces:
-    - 2 kings (one white, one black)
-    - 3 random other pieces (any type, any color, random squares)
+    Make a legal endgame-like position with exactly `pieces` total pieces.
+    Pieces are drawn from a bag proportional to a real starting set:
+      per color: 8P, 2N, 2B, 2R, 1Q (plus the king already placed)
+    Constraints:
+      - pawns never on 1st/8th rank for their color
+      - never exceed real caps per piece type per color
+      - board is valid and not immediately game-over
+      - if ensure_move, side to move has at least one legal move
+    """
+    if pieces < 6:
+        raise ValueError("pieces must be >= 6")
+    if pieces > 32:
+        raise ValueError("pieces must be <= 32")
+
+    # Max counts per color, mirroring real chess
+    cap = {
+        chess.PAWN: 8,
+        chess.KNIGHT: 2,
+        chess.BISHOP: 2,
+        chess.ROOK: 2,
+        chess.QUEEN: 1,
+    }
     
-    Keeps retrying until a legal board is found.
-    """
-    piece_types = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
+    if not queens:
+        cap[chess.QUEEN] = 0
+    
+    pool_piece_types = [
+        chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
+    ]
+    colors = [chess.WHITE, chess.BLACK]
 
-    for _ in range(max_tries):
-        board = chess.Board.empty()
-        board.turn = random.choice([chess.WHITE, chess.BLACK])
+    # Squares where pawns are allowed
+    pawn_ok_squares = set([i for i in range(8, 56)])
 
-        # Place the two kings first
-        king_squares = random.sample(chess.SQUARES, 2)
-        board.set_piece_at(king_squares[0], chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(king_squares[1], chess.Piece(chess.KING, chess.BLACK))
-        occupied = set(king_squares)
+    # Weighted draw from the remaining bag
+    def draw_piece_type_and_color(rem_white, rem_black):
+        bag = []
+        # fill bag with counts so probability ∝ remaining allowed
+        for pt in pool_piece_types:
+            for _ in range(rem_white[pt]):
+                bag.append((pt, chess.WHITE))
+            for _ in range(rem_black[pt]):
+                bag.append((pt, chess.BLACK))
+        if not bag:
+            return None
+        return random.choice(bag)
 
-        # Place 3 random other pieces
-        for _ in range(3):
-            sq = random.choice([s for s in chess.SQUARES if s not in occupied])
-            occupied.add(sq)
-            piece_type = random.choice(piece_types)
-            color = random.choice([chess.WHITE, chess.BLACK])
-            board.set_piece_at(sq, chess.Piece(piece_type, color))
+    # Place a non-pawn on any empty square; pawn on allowed rank squares
+    def place_piece(board, piece_type, color):
+        empties = [sq for sq in chess.SQUARES if board.piece_at(sq) is None]
+        if not empties:
+            return False
 
-        # Validate
-        if board.is_valid():
-            return board
+        if piece_type == chess.PAWN:
+            candidates = [sq for sq in empties if sq in pawn_ok_squares]
+        else:
+            candidates = empties
 
-    raise ValueError("Could not generate a valid endgame board in given tries")
+        if not candidates:
+            return False
 
+        sq = random.choice(candidates)
+        board.set_piece_at(sq, chess.Piece(piece_type, color))
+        return True
+
+    # Try until we get a valid, non-terminal position
+    for _ in range(1000):
+        board = chess.Board(None)
+
+        # Kings first (any distinct squares is fine; validity checked later)
+        
+        wk = random.choice(chess.SQUARES) if wk is None else wk
+        while True:
+            bk = random.choice(chess.SQUARES) if bk is None else bk
+            if bk != wk:
+                break
+            # prevents spinning forever
+            bk= None
+
+        board.set_piece_at(wk, chess.Piece(chess.KING, chess.WHITE))
+        board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
+
+        # Remaining counts per color
+        rem_white = dict(cap)
+        rem_black = dict(cap)
+
+        # How many more to place
+        need = pieces - 2
+        ok_build = True
+
+        while need > 0 and ok_build:
+            choice = draw_piece_type_and_color(rem_white, rem_black)
+            if choice is None:
+                ok_build = False
+                break
+
+            pt, color = choice
+            placed = place_piece(board, pt, color)
+            if not placed:
+                # If we failed to place this kind, remove this option once
+                # by temporarily decrementing and continue; if it hits zero
+                # it won't be drawn again.
+                if color == chess.WHITE:
+                    if rem_white[pt] > 0:
+                        rem_white[pt] -= 1
+                else:
+                    if rem_black[pt] > 0:
+                        rem_black[pt] -= 1
+                continue
+
+            # Successful placement consumes from that color's pool
+            if color == chess.WHITE:
+                rem_white[pt] -= 1
+            else:
+                rem_black[pt] -= 1
+            need -= 1
+
+        if not ok_build or need != 0:
+            continue
+
+        # Randomize side to move
+        board.turn = random.choice(colors)
+
+        # Final validity checks
+        if not board.is_valid():
+            # try to flip the turn
+            board.turn = not board.turn
+            if not board.is_valid():
+                continue
+        
+        if board.is_game_over():
+            continue
+        if board.legal_moves.count() == 0:
+            continue
+        
+        return fastboard(board.fen()) if pyfast else board
+    
+    #if we made it here, it couldnt work
+    print("Unable to find valid board. Loosening requirements...")
+    return random_board_setup(pieces-1, wk=None, bk=None, queens=False, pyfast=pyfast)
+
+
+def make_piece_odds_board():
+    b = chess.Board()
+    meta = {"scenario": "piece_odds", "removed": {"white": [], "black": []}}
+
+    remove_from = random.choice([chess.WHITE, chess.BLACK])
+    removable = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
+    to_remove = random.choice(removable)
+    need_to_remove = np.random.randint(1, 4) if to_remove == chess.PAWN else 1
+
+    color_str = "white" if remove_from == chess.WHITE else "black"
+
+    for _ in range(need_to_remove):
+        # recompute candidates fresh each time (so we never hit an empty square)
+        pool = [sq for sq, pc in b.piece_map().items()
+                if pc.color == remove_from and pc.piece_type == to_remove]
+        if not pool:
+            break  # nothing left of this type/color. bail
+
+        sq = random.choice(pool)
+        pc = b.remove_piece_at(sq)
+        meta["removed"][color_str].append(pc.symbol())
+
+    return fastboard(b.fen()), meta
+
+
+def make_piece_training_board():
+    fens = {
+        "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
+        "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
+        "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
+        "many_pawns": "4k3/pppppppp/pppppppp/8/8/PPPPPPPP/PPPPPPPP/4K3 w - - 0 1",
+        "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
+        "oppo_bishops": "1b1bkb1b/pppppppp/8/8/8/8/PPPPPPPP/1B1BKB1B w - - 0 1",
+        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1'
+    }
+    
+    pick = random.choice(list(fens.keys()))
+    board = chess.Board(fens[pick])
+    if np.random.uniform() < 0.5:
+        board = board.mirror()
+    return fastboard(board.fen()), {"scenario": pick}
+        
 
 def score_pov_cp(pov_score, white_to_move, mate_cp):
     s = pov_score.white() if white_to_move else pov_score.black()
     return float(s.score(mate_score=mate_cp))
 
 
-def evaluate_game_sf(moves_uci, depth=12, mate_cp=1500):
-    board = chess.Board()
+def evaluate_game_sf(moves_uci, start_fen=None, depth=12, mate_cp=1500):
+    board = chess.Board() if start_fen is None else chess.Board(start_fen)
     white_cpl, black_cpl = [], []
     best_moves = [0, 0]
     
@@ -721,91 +874,89 @@ def evaluate_game_sf(moves_uci, depth=12, mate_cp=1500):
     }
 
 
-def evaluate_many_games(games_moves_uci, depth=12, workers=4, mate_cp=1500):
-    def worker(moves):
-        return evaluate_game_sf(moves, depth=depth, mate_cp=mate_cp)
+def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
+    def worker(moves, fen):
+        return evaluate_game_sf(
+            moves_uci=list(moves), start_fen=fen, depth=depth, mate_cp=mate_cp)
 
-    # Collect results in original order
-    results = [None] * len(games_moves_uci)
+    N = len(games)
+    results = [None] * N
+
     with ThreadPoolExecutor(max_workers=int(workers)) as ex:
-        futs = {ex.submit(worker, g): i for i, g in enumerate(games_moves_uci)}
+        futs = {}
+        for i, g in enumerate(games):
+            futs[ex.submit(worker, g["moves"], g["start_fen"])] = i
         for fut in as_completed(futs):
             i = futs[fut]
-            results[i] = fut.result()
+            try:
+                results[i] = fut.result()
+            except Exception:
+                results[i] = None
 
-    # Filter out any failed/None results
+    # keep successful in-order
     results = [r for r in results if r is not None]
 
+    # empty-case still returns the keys log_and_plot_sf expects
     if not results:
-        return {"games": [], "summary": {}}
+        return {
+            "summary": {
+                "games": 0,
+                "avg_white_mean_cpl": 0.0,
+                "avg_black_mean_cpl": 0.0,
+                "avg_overall_mean_cpl": 0.0,
+                "avg_best_move_rate_white": 0.0,
+                "avg_best_move_rate_black": 0.0,
+                "avg_overall_best_move_rate": 0.0,
+            },
+            "games": []
+        }
 
-    # CPL aggregates
+    # list-only math (no generators)
     w_means = [r["white"]["mean_cpl"] for r in results]
     b_means = [r["black"]["mean_cpl"] for r in results]
     o_means = [r["overall_mean_cpl"] for r in results]
 
-    # Best-move rate aggregates (values are 0..1)
     w_best = [r["best_move_rate_white"] for r in results]
     b_best = [r["best_move_rate_black"] for r in results]
     o_best = [r["overall_best_move_rate"] for r in results]
 
     summary = {
         "games": len(results),
-        "avg_white_mean_cpl": np.round(np.mean(w_means), 3),
-        "avg_black_mean_cpl": np.round(np.mean(b_means), 3),
-        "avg_overall_mean_cpl": np.round(np.mean(o_means), 3),
-        "avg_best_move_rate_white": np.round(np.mean(w_best), 3),
-        "avg_best_move_rate_black": np.round(np.mean(b_best), 3),
-        "avg_overall_best_move_rate": np.round(np.mean(o_best), 3),
+        "avg_white_mean_cpl": float(np.round(np.mean(w_means), 3)),
+        "avg_black_mean_cpl": float(np.round(np.mean(b_means), 3)),
+        "avg_overall_mean_cpl": float(np.round(np.mean(o_means), 3)),
+        "avg_best_move_rate_white": float(np.round(np.mean(w_best), 3)),
+        "avg_best_move_rate_black": float(np.round(np.mean(b_best), 3)),
+        "avg_overall_best_move_rate": float(np.round(np.mean(o_best), 3)),
     }
 
-    return {"games": results, "summary": summary}
+    return {"summary": summary, "games": results}
 
 
-# pyfastchess has faster cpp versions of both of these items. storing here just in case.
-def terminal_value_white_pov(board):
-    reason, result = board.is_game_over()
-    if reason == 'none':
-        return None
-    if reason == 'checkmate':
-        winner = 'w' if board.side_to_move() == 'b' else 'b'
-        return 1.0 if winner == 'w' else -1.0
-    return 0.0
+class RateMeter(object):
+    def __init__(self, name, interval_s=120.0):
+        self.name = name
+        self.interval_s = float(interval_s)
+        self.t0 = _now()
+        self.t_last = self.t0
+        self.total = 0
+        self.last_total = 0
 
+    def tick(self, n=1):
+        self.total += int(n)
 
-def priors_from_heads(board, legal, p_from, p_to, p_piece, p_promo, mix=0.5):
-    """
-    Returns dict move -> prior. Mix adds uniform mass:
-      final = (1 - mix) * priors + mix * uniform
-    """
-    if not legal:
-        return {}
+    def maybe_report(self, extra=""):
+        t = _now()
+        dt = t - self.t_last
+        if dt < self.interval_s:
+            return None
+        dcount = self.total - self.last_total
+        rate = dcount / dt if dt > 0 else 0.0
+        self.t_last = t
+        self.last_total = self.total
+        msg = f"{self.name}: {rate:.1f}/s  (total {self.total})"
+        if extra:
+            msg += f"  {extra}"
+        print(msg)
+        return rate
 
-    fr, to, piece, promo = board.moves_to_labels(ucis=legal)
-    pri = []
-    for i in range(len(legal)):
-        pf = p_from[fr[i]]
-        pt = p_to[to[i]]
-        pp = p_piece[piece[i]]
-        pr = p_promo[promo[i]]  # 0=Q/none, 1=N, 2=B, 3=R
-        pri.append(pf * pt * pp * pr)
-
-    s = float(sum(pri))
-    n = len(legal)
-    if s > 0.0:
-        pri = [p / s for p in pri]
-    else:
-        pri = [1.0 / n] * n
-
-    m = max(0.0, min(1.0, float(mix)))
-    if m > 0.0:
-        u = 1.0 / n
-        pri = [(1.0 - m) * p + m * u for p in pri]
-        t = float(sum(pri))
-        if t > 0.0:
-            inv = 1.0 / t
-            pri = [p * inv for p in pri]
-        else:
-            pri = [u] * n
-
-    return {mv: p for mv, p in zip(legal, pri)}

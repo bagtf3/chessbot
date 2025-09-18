@@ -4,23 +4,31 @@ import uuid, os
 from time import time as _now
 from collections import defaultdict
 
+import random
 import chess
 import chess.syzygy
 
 from pyfastchess import Board as fastboard
 from pyfastchess import terminal_value_white_pov
 
-from chessbot import ENDGAME_LOC
+from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree, ReuseCache
 
+import chessbot.utils as cbu
 from chessbot.utils import score_game_data, plot_training_progress, log_and_plot_sf
-from chessbot.utils import (
-    get_pre_opened_game, evaluate_many_games, show_board, random_init
-)    
+from chessbot.utils import evaluate_many_games, show_board, RateMeter
+
+from chessbot.encoding import sf_top_moves_to_values
+from stockfish import Stockfish
+
+stockfish = Stockfish(path=SF_LOC)
+stockfish.update_engine_parameters({"Threads": 4})
+stockfish.set_depth(5)
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 VIS_DIR = "C:/Users/Bryan/Data/chessbot_data/visuals"
+
 
 class Config(object):
     """
@@ -31,21 +39,27 @@ class Config(object):
     virtual_loss = 1.0
     uniform_mix_opening = 0.25
     uniform_mix_later = 0.25
-    uniform_mix_endgame = 0.50
+    uniform_mix_endgame = 0.05
 
     # Simulation schedule
-    sims_target = 400
-    sims_target_endgame = 600
+    sims_target = 360
+    sims_target_endgame = 480
     micro_batch_size = 16
     
     # Game stuff
-    move_limit = 120
-    material_diff_cutoff = 20
-    material_diff_cutoff_span = 30
-    n_training_games = 1000
+    move_limit = 200
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 20 
+    n_training_games = 3000
     restart_after_result = True
-    random_init_blend = 0.5 # how many random_init vs pre-opened
-    random_init_plies = 8 # number of random init'd moves
+    play_vs_sf_prob = 0.5
+    sf_depth = 5
+    
+    game_probs = {
+        "pre_opened": 0.2, "random_init": 0.2,
+        "random_middle_game": 0.2, "random_endgame": 0.2,
+        "piece_odds": 0.1, "piece_training": 0.1 
+    }
     
     # early stop
     es_min_sims = 120
@@ -54,7 +68,7 @@ class Config(object):
 
     # Cache
     write_ply_max = 20
-    warm_reuse_cache = True
+    warm_reuse_cache = False
 
     # TF
     training_queue_min = 2048
@@ -76,18 +90,85 @@ class Config(object):
         }
 
 
+class GameGenerator(object):
+    """
+    Curriculum game generator.
+    Chooses among: pre-opened, random-init, middle-game, endgame slices.
+    """
+    def __init__(self, cfg=None):
+        self.config = cfg or Config()
+        self.game_types = list(self.config.game_probs.keys())
+
+    def new_board(self, game_type=None):
+        # sanity check
+        if game_type is not None and game_type not in self.game_types:
+            raise ValueError(
+                f"Unknown game type {game_type}. "
+                f"Pick one of {self.game_types}")
+
+        # sample if not given
+        if game_type is None:
+            types, probs = zip(*self.config.game_probs.items())
+            game_type = random.choices(types, weights=probs, k=1)[0]
+
+        # dispatch
+        if game_type == "pre_opened":
+            board = cbu.get_pre_opened_game()
+            meta = {"scenario": "pre_opened"}
+            
+        elif game_type == "random_init":
+            plies = np.random.randint(4, 13)
+            board = cbu.random_init(plies)
+            meta = {"scenario": "random_init", "plies": plies}
+            
+        elif game_type == "random_middle_game":
+            # just more plies of random_init to land mid-game
+            plies = np.random.randint(20, 31)
+            board = cbu.random_init(plies)
+            meta = {"scenario": "random_middle_game", "plies": plies}
+            
+        elif game_type == "random_endgame":
+            # you wrote random_board_setup / random_endgame_init
+            pieces = np.random.randint(8, 14)
+            wk = np.random.randint(0, 33)
+            bk = np.random.randint(33, 64)
+            board = cbu.random_board_setup(pieces, wk, bk, queens=False)
+            meta = {"scenario": "random_endgame", "pieces": pieces}
+            
+        elif game_type == "piece_odds":
+            board, meta = cbu.make_piece_odds_board()
+            
+        elif game_type == "piece_training":
+            board, meta = cbu.make_piece_training_board()
+            
+        else:
+            raise ValueError(f"unhandled game_type {game_type}")
+            
+        return board, meta
+
+
 class ChessGame(object):
     def __init__(self, board=None, cfg=None):
         self.game_id = str(uuid.uuid4())
         self.config = cfg or Config()
         
         if board is None:
-            if np.random.uniform() <= self.config.random_init_blend:
-                board = random_init(self.config.random_init_plies)
-            else:
-                board = get_pre_opened_game()
-                
+            gg = GameGenerator(cfg=self.config)
+            board, meta = gg.new_board()
+        else:
+            meta = {"scenario": "user provided board"}
+        
         self.board = board
+        self.starting_fen = self.board.fen()
+        self.meta = meta
+        
+        # determine if vs stockfish or full self-play
+        self.vs_stockfish = False
+        self.stockfish_is_white = None
+        if np.random.uniform() < self.config.play_vs_sf_prob:
+            self.vs_stockfish = True
+            self.stockfish_is_white = np.random.uniform() < 0.5
+        
         self.tree = MCTSTree(self.board, self.config)
 
         self.mat_adv_counter = 0
@@ -95,7 +176,66 @@ class ChessGame(object):
         self.examples = [] 
         self.plies = 0
         self.vwq = None
-
+    
+    def turn(self, return_bool=True):
+        stm = self.board.side_to_move()
+        if return_bool:
+            return stm == 'w'
+        else:
+            return stm
+    
+    def is_stockfish_turn(self):
+        return self.vs_stockfish and self.stockfish_is_white == self.turn()
+    
+    def get_stockfish_move(self):
+        stockfish.set_fen_position(self.board.fen())
+        
+        # raw values for SF-returned moves
+        sf_moves = stockfish.get_top_moves(1)    
+        move = sf_moves[0]['Move']
+        
+        val_sf = sf_top_moves_to_values(sf_moves)[0]
+        signed_val = val_sf if self.turn() else -val_sf
+        
+        return move, signed_val
+    
+    def make_move_with_stockfish(self):
+        """
+        Stockfish plays one move. We record a supervised-style target where
+        95% prob is on SF's chosen move, 5% is spread uniformly over the rest.
+        The value target is SF's signed eval for the side to move (white-POV).
+        """
+        # no legal moves -> let terminal handler decide
+        legal = self.board.legal_moves()
+        if not legal:
+            return self.check_for_terminal()
+    
+        # choose SF move + signed eval (white POV)
+        mv, sf_v = self.get_stockfish_move()
+        self.vwq = sf_v
+        
+        # build policy over ALL legal moves: 95% on mv, 5% over others
+        n = len(legal)
+        probs = np.zeros(n, dtype=np.float32)
+        sel = legal.index(mv)
+        if n == 1:
+            probs[0] = 1.0
+        else:
+            probs[sel] = 0.95
+            spill = 0.05 / float(n - 1)
+            for i in range(n):
+                if i != sel:
+                    probs[i] = spill
+    
+        # create the example just like a MCTS move and send to queue
+        self.append_factorized_example(ucis=legal, pi=probs, vwq=sf_v)
+        
+        # advance tree (pushes move) and reset
+        self.tree.advance(self.board, mv)
+        self.tree.reset_for_new_move()
+        self.plies += 1
+        return self.check_for_terminal()
+    
     def make_move_from_tree(self):
         """
         Snapshot policy targets from root visits, then play best-by-visits.
@@ -117,24 +257,7 @@ class ChessGame(object):
         self.vwq = vwq
     
         if pi is not None:
-            fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
-    
-            F, T, Kp, Kpr = self.config.factorized_bins
-            from_m = np.zeros(F, dtype=np.float32)
-            to_m   = np.zeros(T, dtype=np.float32)
-            pc_m   = np.zeros(Kp, dtype=np.float32)
-            pr_m   = np.zeros(Kpr, dtype=np.float32)
-    
-            for i, p in enumerate(pi):
-                from_m[fr[i]] += p
-                to_m[to[i]]   += p
-                pc_m[piece[i]]+= p
-                pr_m[promo[i]]+= p
-    
-            x = self.board.stacked_planes(5)
-            self.examples.append(
-                (x, {"from":from_m, "to":to_m, "piece":pc_m, "promo":pr_m, "vwq":vwq})
-            )
+            self.append_factorized_example(ucis=ucis, pi=pi, vwq=vwq)
     
         mv, _ = self.tree.best()
         if mv is None:
@@ -143,12 +266,42 @@ class ChessGame(object):
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         self.plies += 1
-        return True
-    
+        return self.check_for_terminal()
+
+    def append_factorized_example(self, ucis, pi, vwq):
+        """
+        Snapshot inputs and factorized policy targets for the given move dist.
+        - ucis: list[str] legal moves (same order as probs)
+        - probs: list/array of probabilities summing ~1
+        - vwq: scalar value target (white-POV)
+        """
+        # labels per-legal
+        fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
+
+        # allocate heads
+        F, T, Kp, Kpr = self.config.factorized_bins
+        from_m = np.zeros(F, dtype=np.float32)
+        to_m   = np.zeros(T, dtype=np.float32)
+        pc_m   = np.zeros(Kp, dtype=np.float32)
+        pr_m   = np.zeros(Kpr, dtype=np.float32)
+
+        # accumulate probs
+        for i, p in enumerate(pi):
+            from_m[fr[i]] += p
+            to_m[to[i]]   += p
+            pc_m[piece[i]]+= p
+            pr_m[promo[i]]+= p
+
+        # snapshot inputs and push example
+        x = self.board.stacked_planes(5)
+        self.examples.append(
+            (x, {"from": from_m, "to": to_m, "piece": pc_m,
+                 "promo": pr_m, "vwq": float(vwq)})
+        )
+
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
         if reason != 'none':
-            print(self.game_id, "Game over detected:", reason, self.board.fen())
             self.outcome = terminal_value_white_pov(self.board)
             return True
     
@@ -159,7 +312,6 @@ class ChessGame(object):
             self.mat_adv_counter = 0
     
         if self.mat_adv_counter >= self.config.material_diff_cutoff_span:
-            print(self.game_id, "Material cutoff:", mat_diff)
             self.outcome = 1.0 if mat_diff > 0 else -1.0
             return True
         
@@ -175,7 +327,6 @@ class ChessGame(object):
                     
                 table_res = table_res if chess_board.turn else -1*table_res
                 self.outcome = outcomes[table_res]
-                print(self.game_id, "Endgame Reached:", self.outcome, self.board.fen())
                 return True
             except:
                 pass
@@ -187,14 +338,7 @@ class ChessGame(object):
             return True
         # if we made it here the game is active
         return False
-        
-    def turn(self, return_bool=True):
-        stm = self.board.side_to_move()
-        if return_bool:
-            return stm == 'w'
-        else:
-            return stm
-        
+    
     def show_board(self, flipped=False, sleep=0.0):
         sb = chess.Board(self.board.fen())
         show_board(sb, flipped=flipped, sleep=sleep)
@@ -290,71 +434,109 @@ class GameLooper(object):
         self.game_data = []
         self.n_retrains = 0
         self.intra_training_summaries = {}
-    
+        
+        # update global stockfish
+        stockfish.set_depth(self.config.sf_depth)
+        
+        self.mps = RateMeter("moves")
+        self.lps = RateMeter("leafs")
+        self._last_stats_log = 0.0
+
     def run(self):
         """
-        Main loop. Each round: collect, predict, route, apply, maybe play.
+        Main loop. Each round: for each game either let SF move (if applicable)
+        or run MCTS step (collect/predict/apply). Keeps central batching.
         """
         completed_games = 0
+        
         while completed_games < self.config.n_training_games:
             if not self.active_games:
                 break
-            
+    
             preds_batch = []
             finished = []
-            for game in self.active_games:
-                # see if its time to make a move
-                game.tree.resolve_awaiting(game.board, self.quick_cache)
-
-                if game.tree.stop_simulating():
-                    # show the first game to monitor progress
-                    display_game = game.game_id == self.active_games[0].game_id
-                    if display_game:
-                        game.show_top_moves()
-                        
-                    game.make_move_from_tree()
+    
+            for game in list(self.active_games):
+                # optional UI on first game for visibility
+                display_game = (game.game_id == self.active_games[0].game_id)
+                
+                # if its stockfish turn, let SF move and skip MCTS this ply
+                if game.is_stockfish_turn():
+                    sf_terminal = game.make_move_with_stockfish()
+                    self.mps.tick(1)
                     
                     if display_game:
                         game.show_board()
-
-                    if game.check_for_terminal():
+                        b = game.board.clone()
+                        last_move = b.history_uci()[-1]
+                        b.unmake()
+                        last_san = b.san(last_move)
+                        print(f"Stockfish plays {last_san} ",
+                              f"Current stockfish eval {game.vwq:<.3}")
+                        
+                    if sf_terminal:
                         completed_games += 1
-                        # populate training queue, maybe retrain
                         self.finalize_game_data(game)
-                        self.log_results()
+                        self.maybe_log_results()
                         finished.append(game.game_id)
-
+                        continue
+    
+                # resolve any pending predictions (from last batch) for this game
+                game.tree.resolve_awaiting(game.board, self.quick_cache)
+    
+                # if this game has reached its local sim budget, make the move
+                if game.tree.stop_simulating():
+                    if display_game:
+                        game.show_top_moves()
+    
+                    # bot plays from tree
+                    mcts_terminal = game.make_move_from_tree()
+                    self.mps.tick(1)
+                    
+                    if display_game:
+                        game.show_board()
+                    
+                    # terminal after bot move?
+                    if mcts_terminal:
+                        completed_games += 1
+                        self.finalize_game_data(game)
+                        self.maybe_log_results()
+                        finished.append(game.game_id)
+                        continue
+    
+                # otherwise, collect up to micro_batch_size leaves for this game
                 n_collected, tries = 0, 0
                 while n_collected < self.config.micro_batch_size:
                     leaf_req = game.tree.collect_one_leaf(game.board, self.reuse_cache)
                     if leaf_req is None:
                         tries += 1
-                        if tries > 4: break
+                        if tries > 4:
+                            break
                     else:
                         n_collected += 1
+                        self.lps.tick(1)
                         preds_batch.append(leaf_req)
-
-            # this will also update cache(s)
-            self.format_and_predict(preds_batch)
-
-            # resolve predictions back to the games/trees
+            
+            # predict on the central batch (also updates caches)
+            if preds_batch:
+                self.format_and_predict(preds_batch)
+    
+            # resolve fresh predictions back into each game tree
             applied = 0
             for game in self.active_games:
                 applied += game.tree.resolve_awaiting(game.board, self.quick_cache)
-            
-            # if all 0, we can clear the quick cache, keep it light
+    
+            # if nothing was applied, clear the quick cache to keep it light
             if applied == 0:
                 self.quick_cache = {}
-
-            # remove finished games and init new ones
-            self.active_games = [
-                g for g in self.active_games if g.game_id not in finished
-            ]
-            
-            if self.config.restart_after_result:
-                self.active_games += [ChessGame() for _ in range(len(finished))]
-        
-        # maybe return some logs or something some day
+    
+            # remove finished games and respawn if configured
+            if finished:
+                self.active_games = [
+                    g for g in self.active_games if g.game_id not in finished]
+                
+                if self.config.restart_after_result:
+                    self.active_games += [ChessGame() for _ in range(len(finished))]
         return
 
     def format_and_predict(self, preds_batch):
@@ -421,13 +603,15 @@ class GameLooper(object):
             self.draws += 1
 
         res = {
-            "ts": _now(),
-            "game_id": game.game_id,
+            "ts": _now(), "game_id": game.game_id, "start_fen": game.starting_fen,
             "result": float(game.outcome if game.outcome is not None else 0.0),
-            "plies": int(game.plies), "history_uci": game.board.history_uci()
+            "plies": int(game.plies), "history_uci": game.board.history_uci(),
+            "vs_stockfish": game.vs_stockfish, "stockfish_color": game.stockfish_is_white
         }
         
         res.update(self.config.to_dict())
+        res.update(game.meta)
+        
         self.pre_game_data.append(res)
 
         z = float(game.outcome if game.outcome is not None else 0.0)
@@ -503,16 +687,22 @@ class GameLooper(object):
         self.all_evals = pd.concat([self.all_evals, eval_df])
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plot_training_progress(
-                self.all_evals, save_path=self.config.progress_plot_path
+                self.all_evals, save_path=self.config.progress_plot_pathFcurr
             )
     
-        move_lists = [g['history_uci'] for g in self.pre_game_data]
-        print(f"Analyzing last {len(move_lists)} games with Stockfish(d=8)...")
-        sf_analysis = evaluate_many_games(move_lists, depth=8, workers=10, mate_cp=1500)
-        self.intra_training_summaries[self.n_retrains] = sf_analysis
-        log_and_plot_sf(
-            self.intra_training_summaries, save_path=self.config.sf_plot_path
-        )
+        d = []
+        for g in self.pre_game_data:
+            if g['vs_stockfish']:
+                continue
+            d.append({'moves': g['history_uci'], "start_fen": g['start_fen']})
+        
+        if d:
+            print(f"Analyzing last {len(d)} games with Stockfish(d=8)...")
+            sf_analysis = evaluate_many_games(d, depth=8, workers=10, mate_cp=1500)
+            self.intra_training_summaries[self.n_retrains] = sf_analysis
+            log_and_plot_sf(
+                self.intra_training_summaries, save_path=self.config.sf_plot_path
+            )
     
         # archive pre-game data
         self.game_data += self.pre_game_data
@@ -531,15 +721,15 @@ class GameLooper(object):
             self.warm_reuse_cache()
         
         self.n_retrains += 1
-        if self.n_retrains % 10 == 0:
-            outfile = self.config.model_save_pattern + "_latest.h5"
-            model_out = os.path.join(MODEL_DIR, outfile)
-            model.save(model_out)
+        # if self.n_retrains % 10 == 0:
+        #     outfile = self.config.model_save_pattern + "_latest.h5"
+        #     model_out = os.path.join(MODEL_DIR, outfile)
+        #     model.save(model_out)
             
-        if self.n_retrains % 50 == 0:
-            outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
-            model_out = os.path.join(MODEL_DIR, outfile)
-            model.save(model_out)
+        # if self.n_retrains % 50 == 0:
+        #     outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
+        #     model_out = os.path.join(MODEL_DIR, outfile)
+        #     model.save(model_out)
     
     def warm_reuse_cache(self):
         """
@@ -568,17 +758,30 @@ class GameLooper(object):
         for k in keys:
             self.pos_counter[k] += 1
         
-    def log_results(self):
-        avg_moves = (self.total_plies / max(1, self.games_finished)) / 2.0
-        print("~"*50)
+    def maybe_log_results(self, force=False, interval_s=150.0):
+        """
+        Print W/L/D and avg length at most once per `interval_s` seconds.
+        Set force=True to print immediately (ignores interval).
+        """
+        t = _now()
+        last = getattr(self, "_last_stats_log", 0.0)
+        if not force and (t - last) < float(interval_s):
+            return
+    
+        self._last_stats_log = t
+        avg_moves = self.total_plies / float(max(1, self.games_finished))
+        
+        print("~" * 50)
         print(
             f"[stats] finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
             f"avg_len={avg_moves:.1f} moves"
         )
-        print("~"*50)
-#%%
+        print("~" * 50)
+        print(f"Current training queue: {len(self.training_queue)}")
+        self.mps.maybe_report(); self.lps.maybe_report()
 
+#%%
 if __name__ == '__main__':
     try_latest = os.path.join(MODEL_DIR, "conv_super_bootstrapped_latest.h5")
     if os.path.exists(try_latest):
@@ -588,5 +791,5 @@ if __name__ == '__main__':
     else:
         model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
         
-    looper = GameLooper(games=64, model=model, cfg=Config())
+    looper = GameLooper(games=96, model=model, cfg=Config())
     looper.run()

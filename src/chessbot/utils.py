@@ -369,7 +369,8 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     plt.tight_layout()
     if save_path:
         fig1.savefig(f"{save_path}_cpl.png", dpi=150)
-    elif show:
+    
+    if show:
         plt.show()
     plt.close(fig1)
 
@@ -383,7 +384,7 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     plt.tight_layout()
     if save_path:
         fig2.savefig(f"{save_path}_bmr.png", dpi=150)
-    elif show:
+    if show:
         plt.show()
     plt.close(fig2)
 
@@ -759,3 +760,52 @@ def evaluate_many_games(games_moves_uci, depth=12, workers=4, mate_cp=1500):
     }
 
     return {"games": results, "summary": summary}
+
+
+# pyfastchess has faster cpp versions of both of these items. storing here just in case.
+def terminal_value_white_pov(board):
+    reason, result = board.is_game_over()
+    if reason == 'none':
+        return None
+    if reason == 'checkmate':
+        winner = 'w' if board.side_to_move() == 'b' else 'b'
+        return 1.0 if winner == 'w' else -1.0
+    return 0.0
+
+
+def priors_from_heads(board, legal, p_from, p_to, p_piece, p_promo, mix=0.5):
+    """
+    Returns dict move -> prior. Mix adds uniform mass:
+      final = (1 - mix) * priors + mix * uniform
+    """
+    if not legal:
+        return {}
+
+    fr, to, piece, promo = board.moves_to_labels(ucis=legal)
+    pri = []
+    for i in range(len(legal)):
+        pf = p_from[fr[i]]
+        pt = p_to[to[i]]
+        pp = p_piece[piece[i]]
+        pr = p_promo[promo[i]]  # 0=Q/none, 1=N, 2=B, 3=R
+        pri.append(pf * pt * pp * pr)
+
+    s = float(sum(pri))
+    n = len(legal)
+    if s > 0.0:
+        pri = [p / s for p in pri]
+    else:
+        pri = [1.0 / n] * n
+
+    m = max(0.0, min(1.0, float(mix)))
+    if m > 0.0:
+        u = 1.0 / n
+        pri = [(1.0 - m) * p + m * u for p in pri]
+        t = float(sum(pri))
+        if t > 0.0:
+            inv = 1.0 / t
+            pri = [p * inv for p in pri]
+        else:
+            pri = [u] * n
+
+    return {mv: p for mv, p in zip(legal, pri)}

@@ -8,6 +8,7 @@ import chess
 import chess.syzygy
 
 from pyfastchess import Board as fastboard
+from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
 from chessbot.model import load_model
@@ -30,16 +31,16 @@ class Config(object):
     virtual_loss = 1.0
     uniform_mix_opening = 0.25
     uniform_mix_later = 0.25
-    uniform_mix_endgame = 0.5
+    uniform_mix_endgame = 0.50
 
     # Simulation schedule
     sims_target = 400
-    sims_target_endgame = 640
+    sims_target_endgame = 600
     micro_batch_size = 16
     
     # Game stuff
     move_limit = 120
-    material_diff_cutoff = 12
+    material_diff_cutoff = 20
     material_diff_cutoff_span = 30
     n_training_games = 1000
     restart_after_result = True
@@ -52,7 +53,7 @@ class Config(object):
     es_gap_frac = 0.75
 
     # Cache
-    write_ply_max = 30
+    write_ply_max = 20
     warm_reuse_cache = True
 
     # TF
@@ -99,57 +100,56 @@ class ChessGame(object):
         """
         Snapshot policy targets from root visits, then play best-by-visits.
         """
-        root = self.tree.root
-        if not root.children:
+        root = self.tree.root()
+        if not root.is_expanded:
             return False
-
-        ucis = list(root.children.keys())
-        visits = np.array([root.children[m].N for m in ucis], dtype=np.float32)
+    
+        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
+        if not rows:
+            return False
+    
+        ucis   = [u for u, _ in rows]
+        visits = np.array([n for _, n in rows], dtype=np.float32)
         s = float(visits.sum())
         pi = (visits / s) if s > 0.0 else None
-
-        vwq = self.tree.visit_weighted_Q()  # grab visit-weighted Q
+    
+        vwq = self.tree.visit_weighted_Q()
         self.vwq = vwq
-
+    
         if pi is not None:
             fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
-            
+    
             F, T, Kp, Kpr = self.config.factorized_bins
             from_m = np.zeros(F, dtype=np.float32)
-            to_m = np.zeros(T, dtype=np.float32)
-            pc_m = np.zeros(Kp, dtype=np.float32)
-            pr_m = np.zeros(Kpr, dtype=np.float32)
-
+            to_m   = np.zeros(T, dtype=np.float32)
+            pc_m   = np.zeros(Kp, dtype=np.float32)
+            pr_m   = np.zeros(Kpr, dtype=np.float32)
+    
             for i, p in enumerate(pi):
-                fi, ti, pi_idx, pr_idx = fr[i], to[i], piece[i], promo[i]
-                from_m[fi]   += p
-                to_m[ti]     += p
-                pc_m[pi_idx] += p
-                pr_m[pr_idx] += p
-
+                from_m[fr[i]] += p
+                to_m[to[i]]   += p
+                pc_m[piece[i]]+= p
+                pr_m[promo[i]]+= p
+    
             x = self.board.stacked_planes(5)
             self.examples.append(
-                (x,
-                {
-                    "from": from_m, "to": to_m, "piece": pc_m,
-                    "promo": pr_m, "vwq": float(vwq)
-                })
+                (x, {"from":from_m, "to":to_m, "piece":pc_m, "promo":pr_m, "vwq":vwq})
             )
-
+    
         mv, _ = self.tree.best()
         if mv is None:
             return False
-
+    
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         self.plies += 1
         return True
-
+    
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
         if reason != 'none':
             print(self.game_id, "Game over detected:", reason, self.board.fen())
-            self.outcome = self.evaluate_terminal(reason, result)
+            self.outcome = terminal_value_white_pov(self.board)
             return True
     
         mat_diff = self.board.material_count()
@@ -187,15 +187,6 @@ class ChessGame(object):
             return True
         # if we made it here the game is active
         return False
-    
-    def evaluate_terminal(self, reason, result):
-        if reason == "none":
-            raise Exception("Non terminal board found!")
-
-        if reason == "checkmate":
-            loser = self.board.side_to_move()
-            return -1 if loser == "w" else 1
-        return 0
         
     def turn(self, return_bool=True):
         stm = self.board.side_to_move()
@@ -209,39 +200,31 @@ class ChessGame(object):
         show_board(sb, flipped=flipped, sleep=sleep)
 
     def show_top_moves(self, top_n=4, show_san=True):
-        root = self.tree.root
+        root = self.tree.root()
         c_puct = self.config.c_puct
-        if not root.children:
+    
+        if not root.is_expanded:
             print("\nTop candidate moves:\n  (no children)")
             return None
     
-        # search summary: sims, time, avg/max depth, children visited
+        # timing
         start = getattr(self.tree, "_move_started_at", None)
         if start is None:
             start = _now()
             self.tree._move_started_at = start
         elapsed = _now() - start
     
-        def _depth_stats(r):
-            total_v, sum_vd, dmax = 0, 0.0, 0
-            stack = [(r, 0)]
-            while stack:
-                n, d = stack.pop()
-                if n is not r and n.N > 0:
-                    total_v += n.N
-                    sum_vd += d * n.N
-                    if d > dmax:
-                        dmax = d
-                for ch in n.children.values():
-                    stack.append((ch, d + 1))
-            avg_d = (sum_vd / total_v) if total_v > 0 else 0.0
-            return avg_d, dmax
+        # C++ summaries
+        avg_depth, max_depth = self.tree.depth_stats()
+        details = self.tree.root_child_details()
     
-        avg_depth, max_depth = _depth_stats(root)
+        if not details:
+            print("\nTop candidate moves:\n  (no children)")
+            return None
+    
         sims = int(getattr(self.tree, "sims_completed_this_move", 0))
-    
-        total_children = len(root.children)
-        visited_children = sum([1 for ch in root.children.values() if ch.N > 0])
+        total_children = len(details)
+        visited_children = sum([1 for cd in details if cd.N > 0])
     
         print(
             f"\nSearch summary: sims={sims}  time={elapsed:.2f}s  "
@@ -249,58 +232,33 @@ class ChessGame(object):
             f"children_visited={visited_children}/{total_children}"
         )
     
-        # top-N printout
-        sorted_children = sorted(
-            root.children.items(), key=lambda kv: kv[1].N, reverse=True
-        )
-        sumN = max(1, root.N + sum([c.vloss for _, c in root.children.items()]))
+        # sumN for U term
+        sum_vloss = sum([cd.vloss for cd in details])
+        sumN = max(1, root.N + sum_vloss)
     
         print("Top candidate moves:")
-        for move_uci, node in sorted_children[:top_n]:
-            p = root.P.get(move_uci, 0.0)
-            u = c_puct * p * (sumN ** 0.5) / (1 + node.N + node.vloss)
-            san = self.board.san(move_uci) if show_san else "?"
-            line = (
-                f"{move_uci:<6} "
-                f"{'('+san+')':<12}  "
-                f"visits={node.N:<5} "
-                f"P={p:>.3f}  "
-                f"Q={node.Q:+.3f}  "
-                f"U={u:+.3f}"
-            )
-            print(line)
+        for cd in details[:top_n]:
+            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N + cd.vloss)
+            san = self.board.san(cd.uci) if show_san else "?"
+            print(f"{cd.uci:<6} {('('+san+')'):<12}  visits={cd.N:<5}  "
+                  f"P={cd.prior:>.3f}  Q={cd.Q:+.3f}  U={U:+.3f}")
     
-        # chosen move
-        best_move_uci, best_node = sorted_children[0]
+        # chosen move + visit-weighted Q
+        best_move_uci, _ = self.tree.best()
+        if best_move_uci is None:
+            return None
+    
         best_san = self.board.san(best_move_uci) if show_san else best_move_uci
-    
-        # visit-weighted root Q
-        v_mcts = best_node.Q if self.vwq is None else self.vwq
+        # If vwq already computed elsewhere, prefer it; otherwise use the Q
+        chosen = next((cd for cd in details if cd.uci == best_move_uci), None)
+        v_mcts = self.vwq if self.vwq is not None else (chosen.Q if chosen else 0.0)
     
         print(
             f"\nChosen move: {best_move_uci} ({best_san})  "
-            f"(visits={best_node.N}, Q={best_node.Q:+.3f}, visit-weighted Q={v_mcts:+.3f})"
+            f"(visits={(chosen.N if chosen else 0)}, "
+            f"Q={(chosen.Q if chosen else 0.0):+.3f}, "
+            f"visit-weighted Q={v_mcts:+.3f})"
         )
-    
-    def print_pv(self, max_len=4):
-        b = self.board.clone()
-        node = self.tree.root
-        moves, qs = [], []
-        for _ in range(max_len):
-            if not node.children:
-                break
-            m, child = max(node.children.items(), key=lambda kv: kv[1].N)
-            moves.append(b.san(m))
-            qs.append(child.Q)
-            b.push_uci(m)
-            node = child
-        pv = " ".join(moves) if moves else "(none)"
-        qtrail = " -> ".join([f"{q:+.3f}" for q in qs])
-        print(f"PV: {pv}")
-        if qs:
-            print(f"Q trail: {qtrail}  (final {qs[-1]:+.3f})")
-        
-    
 
 
 class GameLooper(object):
@@ -365,14 +323,6 @@ class GameLooper(object):
                         self.finalize_game_data(game)
                         self.log_results()
                         finished.append(game.game_id)
-                        ### testing cache with regular fen
-                        print(self.reuse_cache.stats())
-                        
-                        pos_counts = self.pos_counter.values()
-                        for n_times in [1, 2, 3]:
-                            pcv = sum([1 for v in pos_counts if v >= n_times])    
-                            print(f"{pcv} positions have been reached {n_times}+ times")
-                        continue
 
                 n_collected, tries = 0, 0
                 while n_collected < self.config.micro_batch_size:
@@ -418,7 +368,7 @@ class GameLooper(object):
 
         X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
 
-        out = self.model.predict(X, batch_size=768, verbose=0)
+        out = self.model.predict(X, batch_size=1024, verbose=0)
 
         if isinstance(out, list):
             names = list(getattr(self.model, 'output_names', []))
@@ -627,7 +577,7 @@ class GameLooper(object):
             f"avg_len={avg_moves:.1f} moves"
         )
         print("~"*50)
-
+#%%
 
 if __name__ == '__main__':
     try_latest = os.path.join(MODEL_DIR, "conv_super_bootstrapped_latest.h5")
@@ -638,12 +588,5 @@ if __name__ == '__main__':
     else:
         model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
         
-    looper = GameLooper(games=48, model=model, cfg=Config())
+    looper = GameLooper(games=64, model=model, cfg=Config())
     looper.run()
-
-
-
-
-
-        
-

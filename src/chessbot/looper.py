@@ -23,7 +23,7 @@ from chessbot.encoding import sf_top_moves_to_values
 from stockfish import Stockfish
 
 stockfish = Stockfish(path=SF_LOC)
-stockfish.update_engine_parameters({"Threads": 4})
+stockfish.update_engine_parameters({"Threads": 4, "Contempt": 30})
 stockfish.set_depth(5)
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
@@ -37,13 +37,13 @@ class Config(object):
     # MCTS
     c_puct = 1.5
     virtual_loss = 1.0
-    uniform_mix_opening = 0.25
+    uniform_mix_opening = 0.15
     uniform_mix_later = 0.25
-    uniform_mix_endgame = 0.05
+    uniform_mix_endgame = 0.15
 
     # Simulation schedule
-    sims_target = 360
-    sims_target_endgame = 480
+    sims_target = 400
+    sims_target_endgame = 400
     micro_batch_size = 16
     
     # Game stuff
@@ -62,13 +62,13 @@ class Config(object):
     }
     
     # early stop
-    es_min_sims = 120
+    es_min_sims = 128
     es_check_every = 4
-    es_gap_frac = 0.75
+    es_gap_frac = 0.80
 
     # Cache
     write_ply_max = 20
-    warm_reuse_cache = False
+    warm_reuse_cache = True
 
     # TF
     training_queue_min = 2048
@@ -160,6 +160,7 @@ class ChessGame(object):
         
         self.board = board
         self.starting_fen = self.board.fen()
+        self.moves_played = []
         self.meta = meta
         
         # determine if vs stockfish or full self-play
@@ -176,6 +177,7 @@ class ChessGame(object):
         self.examples = [] 
         self.plies = 0
         self.vwq = None
+        self.sf_eval = None
     
     def turn(self, return_bool=True):
         stm = self.board.side_to_move()
@@ -195,9 +197,8 @@ class ChessGame(object):
         move = sf_moves[0]['Move']
         
         val_sf = sf_top_moves_to_values(sf_moves)[0]
-        signed_val = val_sf if self.turn() else -val_sf
         
-        return move, signed_val
+        return move, val_sf
     
     def make_move_with_stockfish(self):
         """
@@ -212,7 +213,7 @@ class ChessGame(object):
     
         # choose SF move + signed eval (white POV)
         mv, sf_v = self.get_stockfish_move()
-        self.vwq = sf_v
+        self.sf_eval = sf_v
         
         # build policy over ALL legal moves: 95% on mv, 5% over others
         n = len(legal)
@@ -233,6 +234,7 @@ class ChessGame(object):
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
+        self.moves_played.append(mv)
         self.plies += 1
         return self.check_for_terminal()
     
@@ -265,6 +267,7 @@ class ChessGame(object):
     
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
+        self.moves_played.append(mv)
         self.plies += 1
         return self.check_for_terminal()
 
@@ -333,7 +336,6 @@ class ChessGame(object):
            
         hs = self.board.history_size()
         if hs > self.config.move_limit:
-            print(self.game_id, "Move limit reached:", hs)
             self.outcome = 0.0
             return True
         # if we made it here the game is active
@@ -395,8 +397,8 @@ class ChessGame(object):
         best_san = self.board.san(best_move_uci) if show_san else best_move_uci
         # If vwq already computed elsewhere, prefer it; otherwise use the Q
         chosen = next((cd for cd in details if cd.uci == best_move_uci), None)
-        v_mcts = self.vwq if self.vwq is not None else (chosen.Q if chosen else 0.0)
-    
+        v_mcts = self.vwq if self.vwq is not None else chosen.Q
+        
         print(
             f"\nChosen move: {best_move_uci} ({best_san})  "
             f"(visits={(chosen.N if chosen else 0)}, "
@@ -472,14 +474,15 @@ class GameLooper(object):
                         b.unmake()
                         last_san = b.san(last_move)
                         print(f"Stockfish plays {last_san} ",
-                              f"Current stockfish eval {game.vwq:<.3}")
+                              f"Current stockfish eval {np.round(game.sf_eval, 3)}")
                         
                     if sf_terminal:
                         completed_games += 1
                         self.finalize_game_data(game)
                         self.maybe_log_results()
                         finished.append(game.game_id)
-                        continue
+                    # just pass until the next turn
+                    continue
     
                 # resolve any pending predictions (from last batch) for this game
                 game.tree.resolve_awaiting(game.board, self.quick_cache)
@@ -604,10 +607,10 @@ class GameLooper(object):
 
         res = {
             "ts": _now(), "game_id": game.game_id, "start_fen": game.starting_fen,
-            "result": float(game.outcome if game.outcome is not None else 0.0),
+            "result": game.outcome if game.outcome is not None else 0.0,
             "plies": int(game.plies), "history_uci": game.board.history_uci(),
-            "vs_stockfish": game.vs_stockfish, "stockfish_color": game.stockfish_is_white
-        }
+            "moves_played": game.moves_played, "vs_stockfish": game.vs_stockfish,
+            "stockfish_color": game.stockfish_is_white}
         
         res.update(self.config.to_dict())
         res.update(game.meta)
@@ -656,8 +659,7 @@ class GameLooper(object):
             "best_from": np.asarray(Y_from, dtype=np.float32),
             "best_to": np.asarray(Y_to, dtype=np.float32),
             "best_piece": np.asarray(Y_piece, dtype=np.float32),
-            "best_promo": np.asarray(Y_promo, dtype=np.float32),
-        }
+            "best_promo": np.asarray(Y_promo, dtype=np.float32)}
     
         # per-sample weights (based on raw outcomes)
         target_mean = self.config.target_mean
@@ -687,14 +689,16 @@ class GameLooper(object):
         self.all_evals = pd.concat([self.all_evals, eval_df])
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plot_training_progress(
-                self.all_evals, save_path=self.config.progress_plot_pathFcurr
+                self.all_evals, save_path=self.config.progress_plot_path
             )
     
         d = []
         for g in self.pre_game_data:
+            # dont eval on sf moves
             if g['vs_stockfish']:
                 continue
-            d.append({'moves': g['history_uci'], "start_fen": g['start_fen']})
+            
+            d.append({'moves': g['moves_played'], "start_fen": g['start_fen']})
         
         if d:
             print(f"Analyzing last {len(d)} games with Stockfish(d=8)...")
@@ -721,15 +725,15 @@ class GameLooper(object):
             self.warm_reuse_cache()
         
         self.n_retrains += 1
-        # if self.n_retrains % 10 == 0:
-        #     outfile = self.config.model_save_pattern + "_latest.h5"
-        #     model_out = os.path.join(MODEL_DIR, outfile)
-        #     model.save(model_out)
+        if self.n_retrains % 5 == 0:
+            outfile = self.config.model_save_pattern + "_latest.h5"
+            model_out = os.path.join(MODEL_DIR, outfile)
+            model.save(model_out)
             
-        # if self.n_retrains % 50 == 0:
-        #     outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
-        #     model_out = os.path.join(MODEL_DIR, outfile)
-        #     model.save(model_out)
+        if self.n_retrains % 25 == 0:
+            outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
+            model_out = os.path.join(MODEL_DIR, outfile)
+            model.save(model_out)
     
     def warm_reuse_cache(self):
         """
@@ -756,40 +760,55 @@ class GameLooper(object):
         # round with value 1. if they hit again we will use them again.
         self.pos_counter = defaultdict(int)
         for k in keys:
-            self.pos_counter[k] += 1
-        
-    def maybe_log_results(self, force=False, interval_s=150.0):
-        """
-        Print W/L/D and avg length at most once per `interval_s` seconds.
-        Set force=True to print immediately (ignores interval).
-        """
-        t = _now()
-        last = getattr(self, "_last_stats_log", 0.0)
-        if not force and (t - last) < float(interval_s):
-            return
+            self.pos_counter[k] += 1    
     
-        self._last_stats_log = t
-        avg_moves = self.total_plies / float(max(1, self.games_finished))
-        
-        print("~" * 50)
+    def maybe_log_results(self, every_sec=120.0, window=500):
+        """
+        Periodically print overall stats PLUS a breakdown by (scenario, sf_color).
+        - window: only aggregate last N finished games to keep it cheap.
+        """
+        def sf_bucket(vs_sf, sf_is_white):
+            if not vs_sf:
+                return "none"
+            return "white" if sf_is_white else "black"
+    
+        now = _now()
+        if now - self._last_stats_log < every_sec:
+            return
+        self._last_stats_log = now
+    
+        # overall
+        avg_moves = (self.total_plies / max(1, self.games_finished))
+        print("~" * 60)
         print(
             f"[stats] finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
-            f"avg_len={avg_moves:.1f} moves"
-        )
-        print("~" * 50)
-        print(f"Current training queue: {len(self.training_queue)}")
-        self.mps.maybe_report(); self.lps.maybe_report()
+            f"avg_len={avg_moves:.1f} moves  |  "
+            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}")
+        print("-" * 60)
+        
+        # recent finished games (use archived + pending pre_game_data)
+        recent = (self.game_data + self.pre_game_data)[-window:]
+        if not recent:
+            print("(no recent games to break down)")
+            print("~" * 60)
+            return
+    
+        # nice printout
+        cbu.print_recent_summary(recent, window=window)
+        print(
+            f"Length of training queue: {len(self.training_queue)} ",
+            f"Number of retrains: {self.n_retrains}")
 
 #%%
 if __name__ == '__main__':
     try_latest = os.path.join(MODEL_DIR, "conv_super_bootstrapped_latest.h5")
-    if os.path.exists(try_latest):
-        model = load_model(try_latest)
+    fallback = os.path.join(MODEL_DIR + "/conv_model_big_v1000.h5")
+    model_file = try_latest if os.path.exists(try_latest) else fallback
     
-    # fallback
-    else:
-        model = load_model(MODEL_DIR + "/conv_model_big_v1000.h5")
+    print(f"Loading model from {model_file}")
+    model = load_model(model_file)
         
-    looper = GameLooper(games=96, model=model, cfg=Config())
+    looper = GameLooper(games=64, model=model, cfg=Config())
     looper.run()
+    

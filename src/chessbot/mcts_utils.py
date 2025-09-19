@@ -4,6 +4,7 @@ from chessbot.utils import softmax
 from pyfastchess import priors_from_heads
 from pyfastchess import MCTSTree as fasttree
 
+
 class MCTSTree(fasttree):
     """
     Python ergonomics around the fast C++ tree.
@@ -115,13 +116,12 @@ class MCTSTree(fasttree):
 
         pri = priors_from_heads(
             leaf.board, legal,
-            softmax(cached["from"]), softmax(cached["to"]),
-            softmax(cached["piece"]), softmax(cached["promo"]),
-            mix=mix
-        )
-        
+            softmax(cached["from"]).tolist(), softmax(cached["to"]).tolist(),
+            softmax(cached["piece"]).tolist(), softmax(cached["promo"]).tolist(),
+            mix=mix)
+                
         # C++ expansion + backup (also pops vloss along the last selected path)
-        self.apply_result(leaf, pri, float(cached["value"]))
+        self.apply_result(leaf, pri, cached["value"])
     
     def advance(self, board, move_uci):
         """

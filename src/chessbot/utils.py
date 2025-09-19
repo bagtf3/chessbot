@@ -20,7 +20,7 @@ from pyfastchess import Board as fastboard
 from chessbot import SF_LOC
 from chessbot import features as ft
 
-from collections import deque
+from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -806,7 +806,7 @@ def make_piece_training_board():
         "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
         "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
         "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "many_pawns": "4k3/pppppppp/pppppppp/8/8/PPPPPPPP/PPPPPPPP/4K3 w - - 0 1",
+        "only_pawns": "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
         "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
         "oppo_bishops": "1b1bkb1b/pppppppp/8/8/8/8/PPPPPPPP/1B1BKB1B w - - 0 1",
         "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1'
@@ -824,54 +824,115 @@ def score_pov_cp(pov_score, white_to_move, mate_cp):
     return float(s.score(mate_score=mate_cp))
 
 
-def evaluate_game_sf(moves_uci, start_fen=None, depth=12, mate_cp=1500):
+def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
     board = chess.Board() if start_fen is None else chess.Board(start_fen)
     white_cpl, black_cpl = [], []
     best_moves = [0, 0]
-    
-    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-        limit = chess.engine.Limit(depth=int(depth))
 
-        for u in moves_uci:
+    # diag counters
+    drops = {
+        "no_best_score": 0,
+        "mv_illegal": 0,
+        "no_played_score": 0,
+        "engine_err": 0,
+    }
+
+    limit = chess.engine.Limit(depth=int(depth))
+    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+        for idx, u in enumerate(moves_uci):
             if board.is_game_over():
                 break
-            
-            mv = chess.Move.from_uci(u)
-            white_to_move = board.turn
 
-            best = eng.analyse(board, limit=limit)
-            best_cp = score_pov_cp(best["score"], white_to_move, mate_cp)
-            best_uci = str(best['pv'][0])
-            
-            if best_uci == u:
-                best_moves[white_to_move] += 1
-                
-            played = eng.analyse(board, limit=limit, root_moves=[mv])
-            played_cp = score_pov_cp(played["score"], white_to_move, mate_cp)
+            mv = None
+            try:
+                mv = chess.Move.from_uci(u)
+            except Exception:
+                mv = None
 
-            cpl = max(0.0, best_cp - played_cp)
-            (white_cpl if white_to_move else black_cpl).append(cpl)
-            board.push(mv)
+            try:
+                root_for_best = board.copy(stack=False)
+                root_for_play = board.copy(stack=False)
+                white_to_move = root_for_best.turn
 
+                bm = eng.play(root_for_best, limit=limit)
+                best_uci = bm.move.uci() if (bm and bm.move) else None
+
+                best_info = eng.analyse(
+                    root_for_best, limit=limit,
+                    info=chess.engine.INFO_SCORE
+                )
+                best_sc = best_info.get("score")
+                best_cp = score_pov_cp(best_sc, white_to_move, mate_cp)
+
+                played_cp = None
+                if mv is not None and mv in root_for_play.legal_moves:
+                    played_info = eng.analyse(
+                        root_for_play, limit=limit,
+                        root_moves=[mv], info=chess.engine.INFO_SCORE
+                    )
+                    played_sc = played_info.get("score")
+                    played_cp = score_pov_cp(played_sc, white_to_move, mate_cp)
+                else:
+                    drops["mv_illegal"] += 1
+
+                if best_uci is not None and best_uci == u:
+                    best_moves[1 if white_to_move else 0] += 1
+
+                if best_cp is None:
+                    drops["no_best_score"] += 1
+                if played_cp is None:
+                    drops["no_played_score"] += 1
+
+                if (best_cp is not None) and (played_cp is not None):
+                    cpl = max(0.0, float(best_cp) - float(played_cp))
+                    (white_cpl if white_to_move else black_cpl).append(cpl)
+
+            except (chess.engine.EngineError, ValueError):
+                drops["engine_err"] += 1
+
+            # only push legal parsed moves
+            if mv is not None and mv in board.legal_moves:
+                board.push(mv)
+            else:
+                # stop if input game is desynced
+                break
+
+    # summaries (unchanged)
     def summary(arr):
         if not arr:
             return {"mean_cpl": 0.0, "max_cpl": 0.0, "n": 0}
-        a = np.asarray(arr, dtype=np.float32)
+        n = len(arr)
         return {
-            "mean_cpl": a.mean().round(3), "max_cpl": a.max().round(3), "n": int(a.size)
+            "mean_cpl": round(sum(arr) / n, 3),
+            "max_cpl": round(max(arr), 3),
+            "n": n,
         }
 
     white = summary(white_cpl)
     black = summary(black_cpl)
-    overall = float(np.mean(white_cpl + black_cpl)) if (white_cpl or black_cpl) else 0.0
-    bm_rate = [np.round(n/len(moves_uci), 3) for n in best_moves]
-    
-    return {
-        "plies": len(white_cpl) + len(black_cpl),
-        "white": white, "black": black, "overall_mean_cpl": np.round(overall, 3),
-        "best_move_rate_white": bm_rate[1], "best_move_rate_black": bm_rate[0],
-        "overall_best_move_rate": np.round(sum(bm_rate), 3)
+    all_cpl = white_cpl + black_cpl
+    overall = round(sum(all_cpl) / len(all_cpl), 3) if all_cpl else 0.0
+
+    total_white_plies = max(1, white["n"])
+    total_black_plies = max(1, black["n"])
+    bm_rate_white = round(best_moves[1] / total_white_plies, 3)
+    bm_rate_black = round(best_moves[0] / total_black_plies, 3)
+    bm_overall = round(
+        (best_moves[1] + best_moves[0]) /
+        (total_white_plies + total_black_plies), 3
+    )
+
+    out = {
+        "plies": white["n"] + black["n"],
+        "white": white,
+        "black": black,
+        "overall_mean_cpl": overall,
+        "best_move_rate_white": bm_rate_white,
+        "best_move_rate_black": bm_rate_black,
+        "overall_best_move_rate": bm_overall,
+        "drops": drops,  # <-- diagnostics
     }
+    return out
 
 
 def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
@@ -896,40 +957,39 @@ def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
     # keep successful in-order
     results = [r for r in results if r is not None]
 
-    # empty-case still returns the keys log_and_plot_sf expects
+    # results is a list of per-game dicts from evaluate_game_sf
     if not results:
-        return {
-            "summary": {
-                "games": 0,
-                "avg_white_mean_cpl": 0.0,
-                "avg_black_mean_cpl": 0.0,
-                "avg_overall_mean_cpl": 0.0,
-                "avg_best_move_rate_white": 0.0,
-                "avg_best_move_rate_black": 0.0,
-                "avg_overall_best_move_rate": 0.0,
-            },
-            "games": []
-        }
-
-    # list-only math (no generators)
+        return {"summary": {
+            "games": 0,
+            "avg_white_mean_cpl": 0.0,
+            "avg_black_mean_cpl": 0.0,
+            "avg_overall_mean_cpl": 0.0,
+            "avg_best_move_rate_white": 0.0,
+            "avg_best_move_rate_black": 0.0,
+            "avg_overall_best_move_rate": 0.0,
+        }, "games": []}
+    
     w_means = [r["white"]["mean_cpl"] for r in results]
     b_means = [r["black"]["mean_cpl"] for r in results]
     o_means = [r["overall_mean_cpl"] for r in results]
-
+    
     w_best = [r["best_move_rate_white"] for r in results]
     b_best = [r["best_move_rate_black"] for r in results]
     o_best = [r["overall_best_move_rate"] for r in results]
-
+    
+    def avg(xs): 
+        return round(sum(xs) / len(xs), 3) if xs else 0.0
+    
     summary = {
         "games": len(results),
-        "avg_white_mean_cpl": float(np.round(np.mean(w_means), 3)),
-        "avg_black_mean_cpl": float(np.round(np.mean(b_means), 3)),
-        "avg_overall_mean_cpl": float(np.round(np.mean(o_means), 3)),
-        "avg_best_move_rate_white": float(np.round(np.mean(w_best), 3)),
-        "avg_best_move_rate_black": float(np.round(np.mean(b_best), 3)),
-        "avg_overall_best_move_rate": float(np.round(np.mean(o_best), 3)),
+        "avg_white_mean_cpl": avg(w_means),
+        "avg_black_mean_cpl": avg(b_means),
+        "avg_overall_mean_cpl": avg(o_means),
+        "avg_best_move_rate_white": avg(w_best),
+        "avg_best_move_rate_black": avg(b_best),
+        "avg_overall_best_move_rate": avg(o_best),
     }
-
+    
     return {"summary": summary, "games": results}
 
 
@@ -944,6 +1004,14 @@ class RateMeter(object):
 
     def tick(self, n=1):
         self.total += int(n)
+
+    def rate(self):
+        # instantaneous rate since last maybe_report (or since start if never called)
+        t = _now()
+        dt = t - self.t_last
+        if dt <= 0:
+            return 0.0
+        return (self.total - self.last_total) / dt
 
     def maybe_report(self, extra=""):
         t = _now()
@@ -960,3 +1028,102 @@ class RateMeter(object):
         print(msg)
         return rate
 
+
+def summarize_recent_games(recent, result_is_bot_pov=True):
+    """
+    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/L/D totals.
+    For the SF totals we assume `result` is WHITE-POV:
+      r > 0 => white won, r < 0 => black won, r == 0 => draw
+    This matches your own description for detecting bot wins vs SF.
+    """
+    def sf_bucket(vs_sf, sf_flag):
+        if not vs_sf:
+            return "none"
+        return "white" if sf_flag else "black"
+
+    stats = defaultdict(lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
+
+    # bot vs Stockfish totals only (what you care about)
+    sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
+
+    for g in recent:
+        scenario = g.get("scenario", "unknown")
+        bucket = sf_bucket(g.get("vs_stockfish", False), g.get("stockfish_color"))
+        key = (scenario, bucket)
+
+        r = g.get("result", 0.0)
+
+        # scenario table: keep your existing semantics (bot-POV by default)
+        r_for_table = r
+        if not result_is_bot_pov:
+            sf_is_white = bool(g.get("stockfish_color"))
+            bot_is_white = not sf_is_white
+            r_for_table = r if bot_is_white else -r
+
+        s = stats[key]
+        s["N"] += 1
+        plies = int(g.get("plies", 0))
+        s["plies_sum"] += plies
+        if r_for_table > 0:
+            s["W"] += 1
+        elif r_for_table < 0:
+            s["L"] += 1
+        else:
+            s["D"] += 1
+
+        # bot vs SF: count bot wins by checking if SF lost (WHITE-POV logic)
+        if g.get("vs_stockfish", False):
+            sf_overall["N"] += 1
+            sf_overall["plies_sum"] += plies
+
+            sf_is_white = bool(g.get("stockfish_color"))
+            if r == 0:
+                sf_overall["D"] += 1
+            else:
+                bot_won = (r < 0) if sf_is_white else (r > 0)
+                if bot_won:
+                    sf_overall["W"] += 1
+                else:
+                    sf_overall["L"] += 1
+
+    bucket_order = {"white": 0, "black": 1, "none": 2}
+    rows = sorted(stats.items(),
+                  key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99)))
+
+    return stats, rows, sf_overall
+
+
+def print_recent_summary(recent, window=500, result_is_bot_pov=True):
+    """
+    Pretty-print the scenario table and the bot-vs-Stockfish W/L/D line.
+    """
+    recent = recent[-window:]
+    stats, rows, sf_overall = summarize_recent_games(
+        recent, result_is_bot_pov=result_is_bot_pov
+    )
+
+    # scenario table (unchanged formatting)
+    print(
+        f"{'scenario':<20} {'sf':<6} {'N':>4} "
+        f"{'W':>4} {'L':>4} {'D':>4}   {'avg_plies':>10}"
+    )
+    print("-" * 60)
+    for (scenario, bucket), s in rows:
+        avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
+        print(
+            f"{scenario:<20} {bucket:<6} {s['N']:>4} "
+            f"{s['W']:>4} {s['L']:>4} {s['D']:>4}  "
+            f"{avg:>10.1f}"
+        )
+    print("-" * 60)
+
+    # bot vs Stockfish summary (90-char lines)
+    def pct(n, d): return (n / d) if d else 0.0
+    total = sf_overall["N"]
+    w, l, d = sf_overall["W"], sf_overall["L"], sf_overall["D"]
+    win = pct(w, total)
+    avg = (sf_overall["plies_sum"] / total) if total else 0.0
+    print(
+        f"Total SF games: {total:>4}  W/L/D={w}/{l}/{d}  ",
+        f"win_rate={win:.1%}  avg_plies={avg:.1f}")
+    print("~" * 60)

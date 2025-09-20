@@ -37,29 +37,33 @@ class Config(object):
     # MCTS
     c_puct = 1.5
     virtual_loss = 1.0
-    uniform_mix_opening = 0.15
-    uniform_mix_later = 0.25
-    uniform_mix_endgame = 0.15
+    anytime_uniform_mix = 0.15
+    endgame_uniform_mix = 0.15
 
     # Simulation schedule
     sims_target = 400
-    sims_target_endgame = 400
-    micro_batch_size = 16
+    sims_target_endgame = 600
+    micro_batch_size = 8
     
     # Game stuff
     move_limit = 200
-    material_diff_cutoff = 12
-    material_diff_cutoff_span = 20 
+    material_diff_cutoff = 50
+    material_diff_cutoff_span = 1000
     n_training_games = 3000
     restart_after_result = True
-    play_vs_sf_prob = 0.5
+    play_vs_sf_prob = 2.0
     sf_depth = 5
     
     game_probs = {
         "pre_opened": 0.2, "random_init": 0.2,
         "random_middle_game": 0.2, "random_endgame": 0.2,
-        "piece_odds": 0.1, "piece_training": 0.1 
-    }
+        "piece_odds": 0.1, "piece_training": 0.1}
+    
+    # boosts/penalize
+    use_prior_boosts = True
+    endgame_prior_adjustments = {
+        "pawn_push":0.15, "capture":0.15,
+        "repetition_penalty": 0.75, "gives_check": 0.1}
     
     # early stop
     es_min_sims = 128
@@ -117,15 +121,15 @@ class GameGenerator(object):
             meta = {"scenario": "pre_opened"}
             
         elif game_type == "random_init":
-            plies = np.random.randint(4, 13)
+            plies = np.random.randint(0, 4)
             board = cbu.random_init(plies)
-            meta = {"scenario": "random_init", "plies": plies}
+            meta = {"scenario": "random_init", "start_plies": plies}
             
         elif game_type == "random_middle_game":
             # just more plies of random_init to land mid-game
             plies = np.random.randint(20, 31)
             board = cbu.random_init(plies)
-            meta = {"scenario": "random_middle_game", "plies": plies}
+            meta = {"scenario": "random_middle_game", "start_plies": plies}
             
         elif game_type == "random_endgame":
             # you wrote random_board_setup / random_endgame_init
@@ -154,7 +158,7 @@ class ChessGame(object):
         
         if board is None:
             gg = GameGenerator(cfg=self.config)
-            board, meta = gg.new_board()
+            board, meta = gg.new_board("piece_odds")
         else:
             meta = {"scenario": "user provided board"}
         
@@ -168,7 +172,10 @@ class ChessGame(object):
         self.stockfish_is_white = None
         if np.random.uniform() < self.config.play_vs_sf_prob:
             self.vs_stockfish = True
-            self.stockfish_is_white = np.random.uniform() < 0.5
+            #self.stockfish_is_white = np.random.uniform() < 0.5
+            self.stockfish_is_white = True
+            if self.board.material_count() > 0:
+                self.stockfish_is_white = False
         
         self.tree = MCTSTree(self.board, self.config)
 
@@ -190,7 +197,14 @@ class ChessGame(object):
         return self.vs_stockfish and self.stockfish_is_white == self.turn()
     
     def get_stockfish_move(self):
-        stockfish.set_fen_position(self.board.fen())
+        try:
+            stockfish.set_fen_position(self.starting_fen)
+            if self.moves_played:
+                stockfish.make_moves_from_current_position(self.moves_played)
+        except Exception as e:
+            print(e)
+            print("Setting stockfish from current position")
+            stockfish.set_position(self.board.fen())
         
         # raw values for SF-returned moves
         sf_moves = stockfish.get_top_moves(1)    
@@ -728,12 +742,12 @@ class GameLooper(object):
         if self.n_retrains % 5 == 0:
             outfile = self.config.model_save_pattern + "_latest.h5"
             model_out = os.path.join(MODEL_DIR, outfile)
-            model.save(model_out)
+            self.model.save(model_out)
             
         if self.n_retrains % 25 == 0:
             outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
             model_out = os.path.join(MODEL_DIR, outfile)
-            model.save(model_out)
+            self.model.save(model_out)
     
     def warm_reuse_cache(self):
         """
@@ -808,7 +822,6 @@ if __name__ == '__main__':
     
     print(f"Loading model from {model_file}")
     model = load_model(model_file)
-        
-    looper = GameLooper(games=64, model=model, cfg=Config())
-    looper.run()
     
+    looper = GameLooper(games=32, model=model, cfg=Config())
+    looper.run()

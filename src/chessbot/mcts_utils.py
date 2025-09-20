@@ -107,19 +107,39 @@ class MCTSTree(fasttree):
         legal = req["legal"] or leaf.board.legal_moves()
 
         # Pick uniform mix by game phase
-        if self.n_plies < 20:
-            mix = self.config.uniform_mix_opening
-        elif self.n_plies < 50:
-            mix = self.config.uniform_mix_later
-        else:
-            mix = self.config.uniform_mix_endgame
+        mix = self.config.anytime_uniform_mix
+        is_endgame = leaf.board.piece_count() <= 14 or self.n_plies >= 70
+        mix = self.config.endgame_uniform_mix if is_endgame else mix
 
         pri = priors_from_heads(
             leaf.board, legal,
             softmax(cached["from"]).tolist(), softmax(cached["to"]).tolist(),
             softmax(cached["piece"]).tolist(), softmax(cached["promo"]).tolist(),
             mix=mix)
+        
+        # check for bumps        
+        if is_endgame and self.config.use_prior_boosts:
+            eg_adj = self.config.endgame_prior_adjustments
+            repp = eg_adj.get("repetition_penalty", 0.0)
+            egc = eg_adj.get("capture", 0.0)
+            egpp = eg_adj.get("pawn_push", 0.0)
+            egchk = eg_adj.get("gives_check", 0.0)
+
+            adjusted_pri = []        
+            for m, p in pri:
+                if repp:
+                    # down scale to prevent going negative
+                    if leaf.board.would_be_repetition(m, 1): p *= repp
+                if egpp:
+                    if leaf.board.is_pawn_move(m): p += egpp
+                if egc:
+                    if leaf.board.is_capture(m): p += egc
+                if egchk:
+                    if leaf.board.gives_check(m): p += egchk
                 
+                adjusted_pri.append((m, p))
+            pri = adjusted_pri
+        
         # C++ expansion + backup (also pops vloss along the last selected path)
         self.apply_result(leaf, pri, cached["value"])
     

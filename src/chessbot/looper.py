@@ -1,6 +1,5 @@
 import uuid, os, copy
 import pathlib, json
-from pathlib import Path
 from time import time as _now
 
 import numpy as np
@@ -20,7 +19,6 @@ import chessbot.utils as cbu
 from chessbot.utils import (
     rnd, score_game_data, plot_training_progress, show_board, RateMeter
 )
-
 
 from chessbot.encoding import sf_top_moves_to_values
 from stockfish import Stockfish
@@ -47,8 +45,8 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 100
-    sims_target_endgame = 100
+    sims_target = 600
+    sims_target_endgame = 800
     micro_batch_size = 8
     
     # Game stuff
@@ -725,7 +723,8 @@ class GameLooper(object):
             w[:] = target_mean
     
         # evaluation and logging
-        eval_df = score_game_data(self.model, X, Y)
+        plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
+        eval_df = score_game_data(self.model, X, Y, save_path=plt_file)
         eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)

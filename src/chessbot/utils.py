@@ -7,8 +7,6 @@ import math, random, time, pickle
 from time import time as _now
 
 import tensorflow as tf
-import matplotlib
-matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 plt.ion()
 
@@ -174,12 +172,10 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path, dpi=150)
-
-    # non-blocking window + let GUI process events
+    
     plt.show(block=False)
-    plt.pause(0.1)
 
-def plot_pred_vs_true_grid(model, preds, y_true_dict):
+def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     names = list(model.output_names)
 
     chunk_size = 9
@@ -250,8 +246,9 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict):
             fig.canvas.manager.set_window_title(f"Pred vs True [{start}:{end}]")
         except Exception:
             pass
-        plt.show(block=False)
-        plt.pause(0.1)
+        if save_path is not None:
+            plt.savefig(save_path, dpi=150)
+        plt.show()
 
 
 def top_k_accuracy(y_true, y_pred, k=3):
@@ -285,12 +282,12 @@ def _topk_from_logits(y_true_sparse, y_pred_logits, k=1):
     return float(hits.mean())
 
 
-def score_game_data(model, X, Y_batch):
+def score_game_data(model, X, Y_batch, save_path=None):
     raw_preds = model.predict(X, batch_size=256, verbose=0)
     preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
 
     # Plot overview grid
-    plot_pred_vs_true_grid(model, preds, Y_batch)
+    plot_pred_vs_true_grid(model, preds, Y_batch, save_path=save_path)
 
     # Keras evaluate -> dataframe row
     cols = ['total_loss'] + model.output_names

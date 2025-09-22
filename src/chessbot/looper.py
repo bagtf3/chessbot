@@ -181,10 +181,7 @@ class ChessGame(object):
         self.stockfish_is_white = None
         if np.random.uniform() < self.config.play_vs_sf_prob:
             self.vs_stockfish = True
-            #self.stockfish_is_white = np.random.uniform() < 0.5
-            self.stockfish_is_white = True
-            if self.board.material_count() > 0:
-                self.stockfish_is_white = False
+            self.stockfish_is_white = np.random.uniform() < 0.5
         
         self.tree = MCTSTree(self.board, self.config)
 

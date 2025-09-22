@@ -7,6 +7,8 @@ import math, random, time, pickle
 from time import time as _now
 
 import tensorflow as tf
+import matplotlib
+matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 plt.ion()
 

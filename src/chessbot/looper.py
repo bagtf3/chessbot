@@ -60,7 +60,7 @@ class Config(object):
     sf_finish = True
     vwq_diff_cutoff = 0.7
     vwq_diff_cutoff_span = 15
-    n_training_games = 3000
+    n_training_games = 1000
     restart_after_result = True
     play_vs_sf_prob = 0.5
     sf_depth = 5
@@ -68,13 +68,15 @@ class Config(object):
     game_probs = {
         "pre_opened": 0.2, "random_init": 0.2,
         "random_middle_game": 0.2, "random_endgame": 0.2,
-        "piece_odds": 0.1, "piece_training": 0.1}
+        "piece_odds": 0.1, "piece_training": 0.1
+    }
     
     # boosts/penalize
     use_prior_boosts = True
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15,
-        "repetition_penalty": 0.75, "gives_check": 0.15}
+        "repetition_penalty": 0.7, "gives_check": 0.15
+    }
     
     # early stop
     es_min_sims = 128
@@ -725,10 +727,11 @@ class GameLooper(object):
         # evaluation and logging
         eval_df = score_game_data(self.model, X, Y)
         self.all_evals = pd.concat([self.all_evals, eval_df])
+        self.all_evals.to_csv(self.config.progress_csv_path)
+        
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
-            plot_training_progress(
-                self.all_evals, save_path=self.config.progress_plot_path
-            )
+            plt_file = self.config.progress_plot_path
+            plot_training_progress(self.all_evals, save_path=plt_file)
     
         # fit (only value head weighted)
         self.model.fit(
@@ -738,9 +741,6 @@ class GameLooper(object):
 
         # save new model
         self.model.save(self.config.model_path)
-        
-        # TODO
-        #sync data to selfplay index
         
         # clear training queue and bump retrain counter
         self.training_queue = []
@@ -795,7 +795,8 @@ def init_selfplay():
     Config.game_dir = game_dir
     
     Config.game_index_file = os.path.join(run_dir, "game_index.json")
-    Config.progress_csv = os.path.join(run_dir, "eval_progress.csv")
+    Config.progress_csv_path = os.path.join(run_dir, "eval_progress.csv")
+    Config.progress_plot_path = os.path.join(run_dir, "eval_progress.png")
     
     for d in [run_dir, game_dir]:
         os.makedirs(d, exist_ok=True)
@@ -813,15 +814,24 @@ def init_selfplay():
         print(f"Loading {config.init_model}")
         model = load_model(config.init_model)
         model.save(model_path)
-    config = Config() 
+    config = Config()
+    
     return model, config
 
 
 def main():
     model, config = init_selfplay()
-    # TODO
-    # need console input here for 30 seconds, prompting user if it looks good, ready to proceed or not
     looper = GameLooper(games=config.games_at_once, model=model, cfg=Config())
+    
+    # infer the number of trainins already done from existing files
+    if os.path.exists(config.progress_csv_path):
+        try:
+            progress_df = pd.read_csv(config.progress_csv_path)
+            n_retrains = len(progress_df)
+            looper.n_retrains = n_retrains
+        except Exception as e:
+            print(e)
+    
     looper.run()
     
 

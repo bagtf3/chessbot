@@ -25,7 +25,7 @@ from stockfish import Stockfish
 
 stockfish = Stockfish(path=SF_LOC)
 stockfish.update_engine_parameters({"Threads": 4})
-stockfish.set_depth(5)
+stockfish.set_depth(8)
 
 
 class Config(object):
@@ -45,8 +45,8 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 600
-    sims_target_endgame = 800
+    sims_target = 400
+    sims_target_endgame = 400
     micro_batch_size = 8
     
     # Game stuff
@@ -194,6 +194,7 @@ class ChessGame(object):
         
         # might cutover to stockfish later
         self.meta['started_vs_stockfish'] = self.vs_stockfish
+        self.meta['stockfish_is_white'] = self.stockfish_is_white
         
         self.tree = MCTSTree(self.board, self.config)
 
@@ -213,7 +214,7 @@ class ChessGame(object):
             return stm
     
     def is_stockfish_turn(self):
-        return self.vs_stockfish and self.stockfish_is_white == self.turn()
+        return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self):
         try:
@@ -237,7 +238,7 @@ class ChessGame(object):
         # collect search data then push and update
         
         try:
-            self.collect_tree_search_data()
+            self.collect_tree_search_data(mv)
         except Exception as e:
             print(e)
         
@@ -248,7 +249,7 @@ class ChessGame(object):
         self.plies += 1
         return self.check_for_terminal()
     
-    def collect_tree_search_data(self):
+    def collect_tree_search_data(self, mv):
         root = self.tree.root()
         if not root.is_expanded:
             return
@@ -275,7 +276,8 @@ class ChessGame(object):
         data = {
             "sims": sims, "time": rnd(elapsed, 3),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
-            "children_visite": rnd(visited_children/total_children, 2),
+            "children_visited": visited_children,
+            "total_children": total_children,
             "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
         }
     
@@ -292,7 +294,7 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data['candidate_moves'] = candidate_moves
         
-        self.tree_data[self.plies] = data
+        self.tree_data[mv] = data
         
     def make_move_with_stockfish(self):
         """
@@ -640,6 +642,7 @@ class GameLooper(object):
         new_idx = {k: v for k, v in res.items() if k in keep}
         new_idx['json_file'] = out_file
         
+        new_idx['beat_sf'] = False
         if new_idx['started_vs_stockfish']:
             game_result = new_idx['result']
             if game_result > 0 and not game.stockfish_is_white:

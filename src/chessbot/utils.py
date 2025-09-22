@@ -7,8 +7,11 @@ import math, random, time, pickle
 from time import time as _now
 
 import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")  # write-to-file backend (no windows)
 import matplotlib.pyplot as plt
-plt.ion()
+plt.ioff()
+
 
 import chess
 import chess.engine
@@ -172,8 +175,10 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path, dpi=150)
+        plt.close(fig)
+    else:
+        plt.show()
     
-    plt.show(block=False)
 
 def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     names = list(model.output_names)
@@ -248,7 +253,9 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
             pass
         if save_path is not None:
             plt.savefig(save_path, dpi=150)
-        plt.show()
+            plt.close(fig)
+        else:
+            plt.show(block=False)
 
 
 def top_k_accuracy(y_true, y_pred, k=3):

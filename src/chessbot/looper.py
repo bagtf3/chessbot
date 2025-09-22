@@ -21,7 +21,7 @@ from chessbot.encoding import sf_top_moves_to_values
 from stockfish import Stockfish
 
 stockfish = Stockfish(path=SF_LOC)
-stockfish.update_engine_parameters({"Threads": 4, "Contempt": 30})
+stockfish.update_engine_parameters({"Threads": 4})
 stockfish.set_depth(5)
 
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
@@ -49,7 +49,7 @@ class Config(object):
     material_diff_cutoff_span = 1000
     n_training_games = 3000
     restart_after_result = True
-    play_vs_sf_prob = 2.0
+    play_vs_sf_prob = 0.5
     sf_depth = 5
     
     game_probs = {
@@ -86,6 +86,21 @@ class Config(object):
             for k in dir(self)
             if not k.startswith("_") and not callable(getattr(self, k))
         }
+    
+    def update(self, mapping=None, **kwargs):
+        if mapping is not None:
+            try:
+                items = mapping.items()
+            except AttributeError:
+                items = mapping
+            for k, v in items:
+                if not hasattr(self, k):
+                    raise AttributeError(f"Unknown config key: {k}")
+                setattr(self, k, v)
+        for k, v in kwargs.items():
+            if not hasattr(self, k):
+                raise AttributeError(f"Unknown config key: {k}")
+            setattr(self, k, v)
 
 
 class GameGenerator(object):
@@ -152,7 +167,7 @@ class ChessGame(object):
         
         if board is None:
             gg = GameGenerator(cfg=self.config)
-            board, meta = gg.new_board("piece_odds")
+            board, meta = gg.new_board()
         else:
             meta = {"scenario": "user provided board"}
         
@@ -208,6 +223,14 @@ class ChessGame(object):
         
         return move, val_sf
     
+    def push_move(self, mv):
+        # advance tree (pushes move) and reset
+        self.tree.advance(self.board, mv)
+        self.tree.reset_for_new_move()
+        self.moves_played.append(mv)
+        self.plies += 1
+        return self.check_for_terminal()
+        
     def make_move_with_stockfish(self):
         """
         Stockfish plays one move. We record a supervised-style target where
@@ -239,12 +262,7 @@ class ChessGame(object):
         # create the example just like a MCTS move and send to queue
         self.append_factorized_example(ucis=legal, pi=probs, vwq=sf_v)
         
-        # advance tree (pushes move) and reset
-        self.tree.advance(self.board, mv)
-        self.tree.reset_for_new_move()
-        self.moves_played.append(mv)
-        self.plies += 1
-        return self.check_for_terminal()
+        return self.push_move(mv)
     
     def make_move_from_tree(self):
         """
@@ -272,13 +290,9 @@ class ChessGame(object):
         mv, _ = self.tree.best()
         if mv is None:
             return False
-    
-        self.tree.advance(self.board, mv)
-        self.tree.reset_for_new_move()
-        self.moves_played.append(mv)
-        self.plies += 1
-        return self.check_for_terminal()
-
+        
+        return self.push_move(mv)
+        
     def append_factorized_example(self, ucis, pi, vwq):
         """
         Snapshot inputs and factorized policy targets for the given move dist.
@@ -607,7 +621,8 @@ class GameLooper(object):
             "result": game.outcome if game.outcome is not None else 0.0,
             "plies": int(game.plies), "history_uci": game.board.history_uci(),
             "moves_played": game.moves_played, "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white}
+            "stockfish_color": game.stockfish_is_white
+        }
         
         res.update(self.config.to_dict())
         res.update(game.meta)
@@ -723,10 +738,10 @@ class GameLooper(object):
         self.training_queue = []
         
         self.n_retrains += 1
-        if self.n_retrains % 10 == 0:
-            outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
-            model_out = os.path.join(MODEL_DIR, outfile)
-            self.model.save(model_out)  
+        # if self.n_retrains % 10 == 0:
+        #     outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
+        #     model_out = os.path.join(MODEL_DIR, outfile)
+        #     self.model.save(model_out)  
     
     def maybe_log_results(self, every_sec=120.0, window=500):
         """
@@ -775,5 +790,5 @@ if __name__ == '__main__':
     print(f"Loading model from {model_file}")
     model = load_model(model_file)
     
-    looper = GameLooper(games=32, model=model, cfg=Config())
+    looper = GameLooper(games=128, model=model, cfg=Config())
     looper.run()

@@ -2,18 +2,16 @@ import numpy as np
 import pandas as pd
 import uuid, os
 from time import time as _now
-from collections import defaultdict
 
 import random
 import chess
 import chess.syzygy
 
-from pyfastchess import Board as fastboard
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model
-from chessbot.mcts_utils import MCTSTree, ReuseCache
+from chessbot.mcts_utils import MCTSTree
 
 import chessbot.utils as cbu
 from chessbot.utils import score_game_data, plot_training_progress, log_and_plot_sf
@@ -69,10 +67,6 @@ class Config(object):
     es_min_sims = 128
     es_check_every = 4
     es_gap_frac = 0.80
-
-    # Cache
-    write_ply_max = 20
-    warm_reuse_cache = True
 
     # TF
     training_queue_min = 2048
@@ -436,9 +430,7 @@ class GameLooper(object):
         
         self.model = model
         self.training_queue = []
-        self.reuse_cache = ReuseCache()
         self.quick_cache = {}
-        self.pos_counter = defaultdict(int)
 
         self.games_finished = 0
         self.white_wins = 0
@@ -524,7 +516,7 @@ class GameLooper(object):
                 # otherwise, collect up to micro_batch_size leaves for this game
                 n_collected, tries = 0, 0
                 while n_collected < self.config.micro_batch_size:
-                    leaf_req = game.tree.collect_one_leaf(game.board, self.reuse_cache)
+                    leaf_req = game.tree.collect_one_leaf(game.board)
                     if leaf_req is None:
                         tries += 1
                         if tries > 4:
@@ -559,7 +551,7 @@ class GameLooper(object):
     def format_and_predict(self, preds_batch):
         """
         Take leaf requests from all games, run one model call, and write
-        results into quick_cache (and reuse_cache).
+        results into quick_cache
         Each req must have: 'enc', 'cache_key'.
         """
         if not preds_batch:
@@ -594,15 +586,6 @@ class GameLooper(object):
                 "promo": ppr[i],
             }
             self.quick_cache[key] = out_i
-
-            # optional long-lived reuse
-            if req.get("n_plies", 999) <= self.config.write_ply_max:
-                self.reuse_cache[key] = out_i
-            
-            # store common positions to warm cache with after training
-            mh = req.get("move_history", False)
-            if mh:
-                self.pos_counter[mh] += 1
 
     def finalize_game_data(self, game):
         """
@@ -721,7 +704,7 @@ class GameLooper(object):
             log_and_plot_sf(
                 self.intra_training_summaries, save_path=self.config.sf_plot_path
             )
-    
+        
         # archive pre-game data
         self.game_data += self.pre_game_data
         self.pre_game_data = []   # <- small typo fix from pre_data_data
@@ -731,50 +714,19 @@ class GameLooper(object):
             X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
         )
         
+        # save new model
+        outfile = self.config.model_save_pattern + "_latest.h5"
+        model_out = os.path.join(MODEL_DIR, outfile)
+        self.model.save(model_out)
+        
         # clear training queue and bump retrain counter
         self.training_queue = []
-        self.reuse_cache = ReuseCache()
-        
-        if self.config.warm_reuse_cache:
-            self.warm_reuse_cache()
         
         self.n_retrains += 1
-        if self.n_retrains % 5 == 0:
-            outfile = self.config.model_save_pattern + "_latest.h5"
-            model_out = os.path.join(MODEL_DIR, outfile)
-            self.model.save(model_out)
-            
-        if self.n_retrains % 25 == 0:
+        if self.n_retrains % 10 == 0:
             outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
             model_out = os.path.join(MODEL_DIR, outfile)
-            self.model.save(model_out)
-    
-    def warm_reuse_cache(self):
-        """
-        Looks for positions that have occurred 2 or more times and predicts with
-        new model to try and get a jump start.
-        """
-        
-        keys = [k for k, v in self.pos_counter.items() if v >= 2]
-        print(f"Warming ReuseCache after model training with {len(keys)} positions...")
-        batch = []
-        for k in keys:
-            moves = k.split("|")
-            b = fastboard()
-            for m in moves:
-                b.push_uci(m)
-            
-            new_key = b.fen(include_counters=False) + "|" + "|".join(moves[-5:])
-            fake_req = {"cache_key": new_key, "enc": b.stacked_planes(5), "n_plies": -1}
-            batch.append(fake_req)
-
-        self.format_and_predict(batch)
-        
-        # reset pos counter to stay relevant. init with the keys from this
-        # round with value 1. if they hit again we will use them again.
-        self.pos_counter = defaultdict(int)
-        for k in keys:
-            self.pos_counter[k] += 1    
+            self.model.save(model_out)  
     
     def maybe_log_results(self, every_sec=120.0, window=500):
         """

@@ -1,4 +1,3 @@
-from collections import OrderedDict
 from time import time as _now
 from chessbot.utils import softmax
 from pyfastchess import priors_from_heads
@@ -35,7 +34,7 @@ class MCTSTree(fasttree):
         self._es_reason = ""
         self._es_after_sims = 0
     
-    def collect_one_leaf(self, board, reuse_cache):
+    def collect_one_leaf(self, board):
         """
         Walk PUCT+virtual to a leaf (in C++) and return an inference request dict,
         or None if a cache hit allowed us to apply immediately.
@@ -48,7 +47,6 @@ class MCTSTree(fasttree):
 
         # Build a cache key off the leaf's board state/history (no pushes needed).
         short_fen = leaf.board.fen(include_counters=False)
-        move_hist = "|".join(leaf.board.history_uci())
         move_tail = "|".join(leaf.board.history_uci()[-5:])
         cache_key = f"{short_fen}|{move_tail}"
 
@@ -59,17 +57,8 @@ class MCTSTree(fasttree):
             "stm_white": (leaf.board.side_to_move() == 'w'),
             "cache_key": cache_key,
             "n_plies": self.n_plies,
-            "move_history": move_hist if self.n_plies < 30 else None,
             "epoch": self.epoch
         }
-
-        # Opportunistic cache hit
-        if self.n_plies <= self.config.write_ply_max + 5:
-            cached = reuse_cache.get(cache_key)
-            if cached is not None and req["epoch"] == self.epoch:
-                self._apply_cached(req, cached)
-                self.sims_completed_this_move += 1
-                return None
 
         self.awaiting_predictions.append(req)
         return req
@@ -206,59 +195,3 @@ class MCTSTree(fasttree):
         self._es_tripped = False
         self._es_reason = ""
         self._es_after_sims = 0
-
-
-class ReuseCache:
-    def __init__(self, capacity=300_000):
-        self.capacity = int(capacity)
-        self._store = OrderedDict()  # key -> value
-        self.checks = 0
-        self.hits = 0
-        self.misses = 0
-        self.puts = 0
-        self.evictions = 0
-
-    def get(self, key):
-        self.checks += 1
-        try:
-            val = self._store[key]
-            self._store.move_to_end(key, last=True)  # LRU touch
-            self.hits += 1
-            return val
-        except KeyError:
-            self.misses += 1
-            return None
-
-    def put(self, key, value):
-        self.puts += 1
-        if key in self._store:
-            self._store.move_to_end(key, last=True)
-        self._store[key] = value
-        if len(self._store) > self.capacity:
-            self._store.popitem(last=False)  # evict LRU
-            self.evictions += 1
-
-    # optional dict-like sugar
-    def __len__(self): return len(self._store)
-    def __getitem__(self, k): 
-        v = self.get(k)
-        if v is None: raise KeyError(k)
-        return v
-    def __setitem__(self, k, v): self.put(k, v)
-
-    def clear(self):
-        self._store.clear()
-        self.checks = self.hits = self.misses = self.puts = self.evictions = 0
-
-    def stats(self):
-        hr = (self.hits / self.checks) if self.checks else 0.0
-        return {
-            "size": len(self._store),
-            "capacity": self.capacity,
-            "checks": self.checks,
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate": hr,
-            "puts": self.puts,
-            "evictions": self.evictions,
-        }

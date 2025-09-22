@@ -28,7 +28,11 @@ uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"
 with open(uci_path_path, "rb") as f:
     paths = pickle.load(f)
     
-    
+
+def rnd(x, n):
+    return np.round(x, n)
+
+
 def show_board(board, flipped=False, sleep=0.1):
     clear_output(wait=True)
     display(SVG(chess.svg.board(board=board, flipped=flipped)))

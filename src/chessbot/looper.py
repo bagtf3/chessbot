@@ -1,7 +1,10 @@
+import uuid, os, copy
+import pathlib, json
+from pathlib import Path
+from time import time as _now
+
 import numpy as np
 import pandas as pd
-import uuid, os
-from time import time as _now
 
 import random
 import chess
@@ -14,8 +17,10 @@ from chessbot.model import load_model
 from chessbot.mcts_utils import MCTSTree
 
 import chessbot.utils as cbu
-from chessbot.utils import score_game_data, plot_training_progress, log_and_plot_sf
-from chessbot.utils import evaluate_many_games, show_board, RateMeter
+from chessbot.utils import (
+    rnd, score_game_data, plot_training_progress, show_board, RateMeter
+)
+
 
 from chessbot.encoding import sf_top_moves_to_values
 from stockfish import Stockfish
@@ -42,11 +47,12 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 400
-    sims_target_endgame = 400
+    sims_target = 16
+    sims_target_endgame = 16
     micro_batch_size = 8
     
     # Game stuff
+    games_at_once = 128
     move_limit = 200
     material_diff_cutoff = 50
     material_diff_cutoff_span = 1000
@@ -229,6 +235,7 @@ class ChessGame(object):
     
     def push_move(self, mv):
         # collect search data then push and update
+        
         try:
             self.collect_tree_search_data()
         except Exception as e:
@@ -243,6 +250,9 @@ class ChessGame(object):
     
     def collect_tree_search_data(self):
         root = self.tree.root()
+        if not root.is_expanded:
+            return
+        
         c_puct = self.config.c_puct
         
         # timing
@@ -255,16 +265,18 @@ class ChessGame(object):
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
         details = self.tree.root_child_details()
+        if details is None:
+            return
     
         sims = int(getattr(self.tree, "sims_completed_this_move", 0))
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
     
         data = {
-            "sims": sims, "time": np.round(elapsed, 3),
-            "avg_depth": np.round(avg_depth, 2), "max_depth": max_depth,
-            "children_visite": np.round(visited_children/total_children, 2),
-            "visit_weighted_Q": root.visit_weighted_Q()
+            "sims": sims, "time": rnd(elapsed, 3),
+            "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
+            "children_visite": rnd(visited_children/total_children, 2),
+            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
         }
     
         # sumN for U term
@@ -276,7 +288,7 @@ class ChessGame(object):
             U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N + cd.vloss)
             cm = {
                 "uci": cd.uci, "san": self.board.san(cd.uci), "visits": cd.N,
-                "P": cd.prior, "Q": cd.Q, "U": U}
+                "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4)}
             candidate_moves.append(cm)
         data['candidate_moves'] = candidate_moves
         
@@ -446,6 +458,7 @@ class GameLooper(object):
         
         self.model = model
         self.training_queue = []
+        self.game_data = []
         self.quick_cache = {}
 
         self.games_finished = 0
@@ -607,11 +620,41 @@ class GameLooper(object):
         
         res.update(self.config.to_dict())
         res.update(game.meta)
+        self.game_data.append(copy.deepcopy(res))
+        
         res['tree_search_data'] = game.tree_data
-
-        # write this out to selfplay folder
-        # TODO
-
+        
+        # save game_file
+        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.json")
+        out_path = pathlib.Path(out_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(res, f, indent=2)
+        
+        # update game_file_log
+        keep = [
+            'game_id', 'ts', 'n_retrains', 'scenario', 'plies',
+            'started_vs_stockfish', 'stockfish_color', 'result'
+        ]
+        new_idx = {k: v for k, v in res.items() if k in keep}
+        new_idx['json_file'] = out_file
+        
+        if new_idx['started_vs_stockfish']:
+            game_result = new_idx['result']
+            if game_result > 0 and not game.stockfish_is_white:
+                new_idx['beat_sf'] = True
+            elif game_result < 0 and game.stockfish_is_white:
+                new_idx['beat_sf'] = True
+            else:
+                new_idx['beat_sf'] = False
+        
+        # append to JSONL index (create parent dirs if needed)
+        idx_file = self.config.game_index_file
+        os.makedirs(os.path.dirname(idx_file), exist_ok=True)
+        with open(idx_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
+        
         z = game.outcome if game.outcome is not None else 0.0
         for x, heads in game.examples:
             vwq = heads.get("vwq", 0.0)
@@ -696,12 +739,13 @@ class GameLooper(object):
         # save new model
         self.model.save(self.config.model_path)
         
+        # TODO
         #sync data to selfplay index
         
         # clear training queue and bump retrain counter
         self.training_queue = []
     
-    def maybe_log_results(self, every_sec=120.0, window=500):
+    def maybe_log_results(self, every_sec=30.0, window=500):
         """
         Periodically print overall stats PLUS a breakdown by (scenario, sf_color).
         - window: only aggregate last N finished games to keep it cheap.
@@ -727,7 +771,7 @@ class GameLooper(object):
         print("-" * 60)
         
         # recent finished games (use archived + pending pre_game_data)
-        recent = (self.game_data + self.pre_game_data)[-window:]
+        recent = self.game_data[-window:]
         if not recent:
             print("(no recent games to break down)")
             print("~" * 60)
@@ -749,7 +793,9 @@ def init_selfplay():
     
     game_dir = os.path.join(run_dir, "game_logs")
     Config.game_dir = game_dir
-
+    
+    Config.game_index_file = os.path.join(run_dir, "game_index.json")
+    Config.progress_csv = os.path.join(run_dir, "eval_progress.csv")
     
     for d in [run_dir, game_dir]:
         os.makedirs(d, exist_ok=True)
@@ -767,16 +813,17 @@ def init_selfplay():
         print(f"Loading {config.init_model}")
         model = load_model(config.init_model)
         model.save(model_path)
-    config = Config()    
-    return model
+    config = Config() 
+    return model, config
 
 
 def main():
     model, config = init_selfplay()
+    # TODO
     # need console input here for 30 seconds, prompting user if it looks good, ready to proceed or not
-    looper = GameLooper(games=128, model=model, cfg=Config())
+    looper = GameLooper(games=config.games_at_once, model=model, cfg=Config())
     looper.run()
     
-    
+
 if __name__ == '__main__':
     main()

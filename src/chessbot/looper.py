@@ -47,8 +47,8 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 16
-    sims_target_endgame = 16
+    sims_target = 100
+    sims_target_endgame = 100
     micro_batch_size = 8
     
     # Game stuff
@@ -726,8 +726,9 @@ class GameLooper(object):
     
         # evaluation and logging
         eval_df = score_game_data(self.model, X, Y)
+        eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
-        self.all_evals.to_csv(self.config.progress_csv_path)
+        self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)
         
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plt_file = self.config.progress_plot_path
@@ -781,7 +782,7 @@ class GameLooper(object):
         cbu.print_recent_summary(recent, window=window)
         print(
             f"Length of training queue: {len(self.training_queue)} ",
-            f"Number of retrains: {self.n_retrains}")
+            f"Number of retrains: {self.n_retrains}\n")
 
 
 def init_selfplay():

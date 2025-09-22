@@ -8,7 +8,7 @@ from time import time as _now
 
 import tensorflow as tf
 import matplotlib
-matplotlib.use("Qt5Agg")
+matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 plt.ion()
 
@@ -172,13 +172,12 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
         axes[j].axis("off")
 
     plt.tight_layout()
-
-    # Save if requested
     if save_path is not None:
         plt.savefig(save_path, dpi=150)
 
-    plt.show()
-
+    # non-blocking window + let GUI process events
+    plt.show(block=False)
+    plt.pause(0.1)
 
 def plot_pred_vs_true_grid(model, preds, y_true_dict):
     names = list(model.output_names)
@@ -246,7 +245,13 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict):
             axes[i].set_visible(False)
 
         plt.tight_layout()
-        plt.show()
+        # optional: name the window per chunk
+        try:
+            fig.canvas.manager.set_window_title(f"Pred vs True [{start}:{end}]")
+        except Exception:
+            pass
+        plt.show(block=False)
+        plt.pause(0.1)
 
 
 def top_k_accuracy(y_true, y_pred, k=3):

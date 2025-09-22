@@ -24,29 +24,36 @@ stockfish = Stockfish(path=SF_LOC)
 stockfish.update_engine_parameters({"Threads": 4})
 stockfish.set_depth(5)
 
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
-VIS_DIR = "C:/Users/Bryan/Data/chessbot_data/visuals"
-
 
 class Config(object):
     """
     Central knobs. Keep simple; override from a dict or flags as needed.
     """
+
+    # files
+    run_tag = "conv_1000_selfplay"
+    selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
+
     # MCTS
-    c_puct = 1.5
+    c_puct = 2.0
     virtual_loss = 1.0
     anytime_uniform_mix = 0.15
-    endgame_uniform_mix = 0.15
+    endgame_uniform_mix = 0.25
 
     # Simulation schedule
     sims_target = 400
-    sims_target_endgame = 600
+    sims_target_endgame = 400
     micro_batch_size = 8
     
     # Game stuff
     move_limit = 200
     material_diff_cutoff = 50
     material_diff_cutoff_span = 1000
+
+    sf_finish = True
+    vwq_diff_cutoff = 0.7
+    vwq_diff_cutoff_span = 15
     n_training_games = 3000
     restart_after_result = True
     play_vs_sf_prob = 0.5
@@ -61,7 +68,7 @@ class Config(object):
     use_prior_boosts = True
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15,
-        "repetition_penalty": 0.75, "gives_check": 0.1}
+        "repetition_penalty": 0.75, "gives_check": 0.15}
     
     # early stop
     es_min_sims = 128
@@ -74,11 +81,6 @@ class Config(object):
     target_mean = 0.3
     draw_frac = 0.3
     factorized_bins = (64, 64, 6, 4)
-    
-    # files
-    model_save_pattern = "conv_super_bootstrapped"
-    sf_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_sf_eval")
-    progress_plot_path = os.path.join(VIS_DIR, "conv_super_bootstrapped_progress.png")
 
     def to_dict(self):
         return {
@@ -174,6 +176,7 @@ class ChessGame(object):
         self.board = board
         self.starting_fen = self.board.fen()
         self.moves_played = []
+        self.tree_data = {}
         self.meta = meta
         
         # determine if vs stockfish or full self-play
@@ -183,11 +186,15 @@ class ChessGame(object):
             self.vs_stockfish = True
             self.stockfish_is_white = np.random.uniform() < 0.5
         
+        # might cutover to stockfish later
+        self.meta['started_vs_stockfish'] = self.vs_stockfish
+        
         self.tree = MCTSTree(self.board, self.config)
 
         self.mat_adv_counter = 0
+        self.vwq_adv_counter = 0
         self.outcome = None
-        self.examples = [] 
+        self.examples = []
         self.plies = 0
         self.vwq = None
         self.sf_eval = None
@@ -221,12 +228,59 @@ class ChessGame(object):
         return move, val_sf
     
     def push_move(self, mv):
+        # collect search data then push and update
+        try:
+            self.collect_tree_search_data()
+        except Exception as e:
+            print(e)
+        
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
         self.moves_played.append(mv)
         self.plies += 1
         return self.check_for_terminal()
+    
+    def collect_tree_search_data(self):
+        root = self.tree.root()
+        c_puct = self.config.c_puct
+        
+        # timing
+        start = getattr(self.tree, "_move_started_at", None)
+        if start is None:
+            start = _now()
+            self.tree._move_started_at = start
+        elapsed = _now() - start
+    
+        # C++ summaries
+        avg_depth, max_depth = self.tree.depth_stats()
+        details = self.tree.root_child_details()
+    
+        sims = int(getattr(self.tree, "sims_completed_this_move", 0))
+        total_children = len(details)
+        visited_children = sum([1 for cd in details if cd.N > 0])
+    
+        data = {
+            "sims": sims, "time": np.round(elapsed, 3),
+            "avg_depth": np.round(avg_depth, 2), "max_depth": max_depth,
+            "children_visite": np.round(visited_children/total_children, 2),
+            "visit_weighted_Q": root.visit_weighted_Q()
+        }
+    
+        # sumN for U term
+        sum_vloss = sum([cd.vloss for cd in details])
+        sumN = max(1, root.N + sum_vloss)
+        
+        candidate_moves = []
+        for cd in details:
+            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N + cd.vloss)
+            cm = {
+                "uci": cd.uci, "san": self.board.san(cd.uci), "visits": cd.N,
+                "P": cd.prior, "Q": cd.Q, "U": U}
+            candidate_moves.append(cm)
+        data['candidate_moves'] = candidate_moves
+        
+        self.tree_data[self.plies] = data
         
     def make_move_with_stockfish(self):
         """
@@ -280,6 +334,19 @@ class ChessGame(object):
     
         vwq = self.tree.visit_weighted_Q()
         self.vwq = vwq
+        
+        # if winning but cant convert, finish with stockfish
+        if self.config.sf_finish and not self.vs_stockfish:
+            if np.abs(vwq >= self.config.vwq_diff_cutoff):
+                self.vwq_adv_counter += 1
+            else:
+                self.vwq_adv_counter = 0
+            
+            if self.vwq_adv_counter >= self.config.vwq_diff_cutoff:
+                self.vs_stock_fish = True
+                self.meta['cutover_to_sf_on'] = self.plies
+                # stockfish plays the winning side
+                self.stockfish_is_white = vwq > 0
     
         if pi is not None:
             self.append_factorized_example(ucis=ucis, pi=pi, vwq=vwq)
@@ -318,8 +385,7 @@ class ChessGame(object):
         x = self.board.stacked_planes(5)
         self.examples.append(
             (x, {"from": from_m, "to": to_m, "piece": pc_m,
-                 "promo": pr_m, "vwq": float(vwq)})
-        )
+                 "promo": pr_m, "vwq": vwq}))
 
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
@@ -364,67 +430,6 @@ class ChessGame(object):
         sb = chess.Board(self.board.fen())
         show_board(sb, flipped=flipped, sleep=sleep)
 
-    def show_top_moves(self, top_n=4, show_san=True):
-        root = self.tree.root()
-        c_puct = self.config.c_puct
-    
-        if not root.is_expanded:
-            print("\nTop candidate moves:\n  (no children)")
-            return None
-    
-        # timing
-        start = getattr(self.tree, "_move_started_at", None)
-        if start is None:
-            start = _now()
-            self.tree._move_started_at = start
-        elapsed = _now() - start
-    
-        # C++ summaries
-        avg_depth, max_depth = self.tree.depth_stats()
-        details = self.tree.root_child_details()
-    
-        if not details:
-            print("\nTop candidate moves:\n  (no children)")
-            return None
-    
-        sims = int(getattr(self.tree, "sims_completed_this_move", 0))
-        total_children = len(details)
-        visited_children = sum([1 for cd in details if cd.N > 0])
-    
-        print(
-            f"\nSearch summary: sims={sims}  time={elapsed:.2f}s  "
-            f"avg_depth={avg_depth:.2f}  max_depth={max_depth}  "
-            f"children_visited={visited_children}/{total_children}"
-        )
-    
-        # sumN for U term
-        sum_vloss = sum([cd.vloss for cd in details])
-        sumN = max(1, root.N + sum_vloss)
-    
-        print("Top candidate moves:")
-        for cd in details[:top_n]:
-            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N + cd.vloss)
-            san = self.board.san(cd.uci) if show_san else "?"
-            print(f"{cd.uci:<6} {('('+san+')'):<12}  visits={cd.N:<5}  "
-                  f"P={cd.prior:>.3f}  Q={cd.Q:+.3f}  U={U:+.3f}")
-    
-        # chosen move + visit-weighted Q
-        best_move_uci, _ = self.tree.best()
-        if best_move_uci is None:
-            return None
-    
-        best_san = self.board.san(best_move_uci) if show_san else best_move_uci
-        # If vwq already computed elsewhere, prefer it; otherwise use the Q
-        chosen = next((cd for cd in details if cd.uci == best_move_uci), None)
-        v_mcts = self.vwq if self.vwq is not None else chosen.Q
-        
-        print(
-            f"\nChosen move: {best_move_uci} ({best_san})  "
-            f"(visits={(chosen.N if chosen else 0)}, "
-            f"Q={(chosen.Q if chosen else 0.0):+.3f}, "
-            f"visit-weighted Q={v_mcts:+.3f})"
-        )
-
 
 class GameLooper(object):
     """
@@ -448,11 +453,8 @@ class GameLooper(object):
         self.black_wins = 0
         self.draws = 0
         self.total_plies = 0
-        self.all_evals = pd.DataFrame()
-        self.pre_game_data = []
-        self.game_data = []
         self.n_retrains = 0
-        self.intra_training_summaries = {}
+        self.all_evals = pd.DataFrame()
         
         # update global stockfish
         stockfish.set_depth(self.config.sf_depth)
@@ -476,22 +478,10 @@ class GameLooper(object):
             finished = []
     
             for game in list(self.active_games):
-                # optional UI on first game for visibility
-                display_game = (game.game_id == self.active_games[0].game_id)
-                
                 # if its stockfish turn, let SF move and skip MCTS this ply
                 if game.is_stockfish_turn():
                     sf_terminal = game.make_move_with_stockfish()
                     self.mps.tick(1)
-                    
-                    if display_game:
-                        game.show_board()
-                        b = game.board.clone()
-                        last_move = b.history_uci()[-1]
-                        b.unmake()
-                        last_san = b.san(last_move)
-                        print(f"Stockfish plays {last_san} ",
-                              f"Current stockfish eval {np.round(game.sf_eval, 3)}")
                         
                     if sf_terminal:
                         completed_games += 1
@@ -506,15 +496,9 @@ class GameLooper(object):
     
                 # if this game has reached its local sim budget, make the move
                 if game.tree.stop_simulating():
-                    if display_game:
-                        game.show_top_moves()
-    
                     # bot plays from tree
                     mcts_terminal = game.make_move_from_tree()
                     self.mps.tick(1)
-                    
-                    if display_game:
-                        game.show_board()
                     
                     # terminal after bot move?
                     if mcts_terminal:
@@ -530,7 +514,7 @@ class GameLooper(object):
                     leaf_req = game.tree.collect_one_leaf(game.board)
                     if leaf_req is None:
                         tries += 1
-                        if tries > 4:
+                        if tries > 2:
                             break
                     else:
                         n_collected += 1
@@ -623,10 +607,12 @@ class GameLooper(object):
         
         res.update(self.config.to_dict())
         res.update(game.meta)
-        
-        self.pre_game_data.append(res)
+        res['tree_search_data'] = game.tree_data
 
-        z = float(game.outcome if game.outcome is not None else 0.0)
+        # write this out to selfplay folder
+        # TODO
+
+        z = game.outcome if game.outcome is not None else 0.0
         for x, heads in game.examples:
             vwq = heads.get("vwq", 0.0)
             self.training_queue.append((x, heads, z, vwq))
@@ -659,7 +645,7 @@ class GameLooper(object):
         alpha = self.config.vwq_blend
         Z = np.asarray(Z, dtype=np.float32)
         Vwq = np.asarray(Vwq, dtype=np.float32)
-        Y_value = (1 - alpha) * Z + alpha * Vwq
+        Y_value = (1-alpha)*Z + alpha*Vwq
     
         # assemble training dict
         X = np.asarray(X, dtype=np.float32)
@@ -701,44 +687,19 @@ class GameLooper(object):
                 self.all_evals, save_path=self.config.progress_plot_path
             )
     
-        d = []
-        for g in self.pre_game_data:
-            # dont eval on sf moves
-            if g['vs_stockfish']:
-                continue
-            
-            d.append({'moves': g['moves_played'], "start_fen": g['start_fen']})
-        
-        if d:
-            print(f"Analyzing last {len(d)} games with Stockfish(d=8)...")
-            sf_analysis = evaluate_many_games(d, depth=8, workers=10, mate_cp=1500)
-            self.intra_training_summaries[self.n_retrains] = sf_analysis
-            log_and_plot_sf(
-                self.intra_training_summaries, save_path=self.config.sf_plot_path
-            )
-        
-        # archive pre-game data
-        self.game_data += self.pre_game_data
-        self.pre_game_data = []   # <- small typo fix from pre_data_data
-    
         # fit (only value head weighted)
         self.model.fit(
             X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
         )
-        
+        self.n_retrains += 1
+
         # save new model
-        outfile = self.config.model_save_pattern + "_latest.h5"
-        model_out = os.path.join(MODEL_DIR, outfile)
-        self.model.save(model_out)
+        self.model.save(self.config.model_path)
+        
+        #sync data to selfplay index
         
         # clear training queue and bump retrain counter
         self.training_queue = []
-        
-        self.n_retrains += 1
-        # if self.n_retrains % 10 == 0:
-        #     outfile = self.config.model_save_pattern + f"_v{self.n_retrains}.h5"
-        #     model_out = os.path.join(MODEL_DIR, outfile)
-        #     self.model.save(model_out)  
     
     def maybe_log_results(self, every_sec=120.0, window=500):
         """
@@ -778,14 +739,44 @@ class GameLooper(object):
             f"Length of training queue: {len(self.training_queue)} ",
             f"Number of retrains: {self.n_retrains}")
 
-#%%
-if __name__ == '__main__':
-    try_latest = os.path.join(MODEL_DIR, "conv_super_bootstrapped_latest.h5")
-    fallback = os.path.join(MODEL_DIR + "/conv_model_big_v1000.h5")
-    model_file = try_latest if os.path.exists(try_latest) else fallback
+
+def init_selfplay():
+    # file structure first
+    config = Config()
+    config.selfplay_dir
+    run_dir = os.path.join(config.selfplay_dir, config.run_tag)
+    Config.run_dir = run_dir
     
-    print(f"Loading model from {model_file}")
-    model = load_model(model_file)
+    game_dir = os.path.join(run_dir, "game_logs")
+    Config.game_dir = game_dir
+
     
+    for d in [run_dir, game_dir]:
+        os.makedirs(d, exist_ok=True)
+    config = Config()
+    
+    # deal with model file structure first
+    model_name = config.run_tag + "_model.h5"
+    model_path = os.path.join(run_dir, model_name)
+    Config.model_path = model_path
+    
+    if os.path.exists(model_path):
+        print(f"Loading {model_name}")
+        model = load_model(model_path)
+    else:
+        print(f"Loading {config.init_model}")
+        model = load_model(config.init_model)
+        model.save(model_path)
+    config = Config()    
+    return model
+
+
+def main():
+    model, config = init_selfplay()
+    # need console input here for 30 seconds, prompting user if it looks good, ready to proceed or not
     looper = GameLooper(games=128, model=model, cfg=Config())
     looper.run()
+    
+    
+if __name__ == '__main__':
+    main()

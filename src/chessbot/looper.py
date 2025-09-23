@@ -34,9 +34,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay"
+    run_tag = "conv_200_selfplay"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v200.h5"
 
     # MCTS
     c_puct = 2.0
@@ -45,15 +45,15 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 400
-    sims_target_endgame = 400
-    micro_batch_size = 8
+    sims_target = 300
+    sims_target_endgame = 300
+    micro_batch_size = 12
     
     # Game stuff
-    games_at_once = 128
-    move_limit = 200
-    material_diff_cutoff = 50
-    material_diff_cutoff_span = 1000
+    games_at_once = 96
+    move_limit = 180
+    material_diff_cutoff = 20
+    material_diff_cutoff_span = 25
 
     sf_finish = True
     vwq_diff_cutoff = 0.7
@@ -61,12 +61,12 @@ class Config(object):
     n_training_games = 1000
     restart_after_result = True
     play_vs_sf_prob = 0.5
-    sf_depth = 5
+    sf_depth = 8
     
     game_probs = {
         "pre_opened": 0.2, "random_init": 0.2,
-        "random_middle_game": 0.2, "random_endgame": 0.2,
-        "piece_odds": 0.1, "piece_training": 0.1
+        "random_middle_game": 0.2, "random_endgame": 0.1,
+        "piece_odds": 0.2, "piece_training": 0.1
     }
     
     # boosts/penalize
@@ -77,12 +77,12 @@ class Config(object):
     }
     
     # early stop
-    es_min_sims = 128
+    es_min_sims = 150
     es_check_every = 4
     es_gap_frac = 0.80
 
     # TF
-    training_queue_min = 2048
+    training_queue_min = 3072
     vwq_blend = 0.5
     target_mean = 0.3
     draw_frac = 0.3
@@ -149,7 +149,6 @@ class GameGenerator(object):
             meta = {"scenario": "random_middle_game", "start_plies": plies}
             
         elif game_type == "random_endgame":
-            # you wrote random_board_setup / random_endgame_init
             pieces = np.random.randint(8, 14)
             wk = np.random.randint(0, 33)
             bk = np.random.randint(33, 64)
@@ -617,7 +616,7 @@ class GameLooper(object):
             "result": game.outcome if game.outcome is not None else 0.0,
             "plies": int(game.plies), "history_uci": game.board.history_uci(),
             "moves_played": game.moves_played, "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white
+            "stockfish_color": game.stockfish_is_white, "model_epoch": self.n_retrains
         }
         
         res.update(self.config.to_dict())
@@ -832,6 +831,7 @@ def main():
             progress_df = pd.read_csv(config.progress_csv_path)
             n_retrains = len(progress_df)
             looper.n_retrains = n_retrains
+            looper.all_evals = progress_df
         except Exception as e:
             print(e)
     

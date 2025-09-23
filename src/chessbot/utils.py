@@ -788,7 +788,8 @@ def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
     
     #if we made it here, it couldnt work
     print("Unable to find valid board. Loosening requirements...")
-    return random_board_setup(pieces-1, wk=None, bk=None, queens=False, pyfast=pyfast)
+    next_pieces = max(6, pieces-1)
+    return random_board_setup(next_pieces, wk=None, bk=None, queens=False, pyfast=pyfast)
 
 
 def make_piece_odds_board():

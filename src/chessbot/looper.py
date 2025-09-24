@@ -25,7 +25,6 @@ from stockfish import Stockfish
 
 stockfish = Stockfish(path=SF_LOC)
 stockfish.update_engine_parameters({"Threads": 4})
-stockfish.set_depth(8)
 
 
 class Config(object):
@@ -39,14 +38,14 @@ class Config(object):
     init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v200.h5"
 
     # MCTS
-    c_puct = 2.0
+    c_puct = 1.5
     virtual_loss = 1.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 300
-    sims_target_endgame = 300
+    sims_target = 600
+    sims_target_endgame = 720
     micro_batch_size = 12
     
     # Game stuff
@@ -57,8 +56,8 @@ class Config(object):
 
     sf_finish = True
     vwq_diff_cutoff = 0.7
-    vwq_diff_cutoff_span = 15
-    n_training_games = 1000
+    vwq_diff_cutoff_span = 25
+    n_training_games = 1500
     restart_after_result = True
     play_vs_sf_prob = 0.5
     sf_depth = 8
@@ -73,13 +72,13 @@ class Config(object):
     use_prior_boosts = True
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15,
-        "repetition_penalty": 0.7, "gives_check": 0.15
+        "repetition_penalty": 0.6, "gives_check": 0.15
     }
     
     # early stop
-    es_min_sims = 150
+    es_min_sims = 200
     es_check_every = 4
-    es_gap_frac = 0.80
+    es_gap_frac = 0.75
 
     # TF
     training_queue_min = 3072
@@ -505,9 +504,6 @@ class GameLooper(object):
                     # just pass until the next turn
                     continue
     
-                # resolve any pending predictions (from last batch) for this game
-                game.tree.resolve_awaiting(game.board, self.quick_cache)
-    
                 # if this game has reached its local sim budget, make the move
                 if game.tree.stop_simulating():
                     # bot plays from tree
@@ -540,12 +536,12 @@ class GameLooper(object):
                 self.format_and_predict(preds_batch)
     
             # resolve fresh predictions back into each game tree
-            applied = 0
+            still_waiting = 0
             for game in self.active_games:
-                applied += game.tree.resolve_awaiting(game.board, self.quick_cache)
+                still_waiting += game.tree.resolve_awaiting(game.board, self.quick_cache)
     
             # if nothing was applied, clear the quick cache to keep it light
-            if applied == 0:
+            if still_waiting == 0:
                 self.quick_cache = {}
     
             # remove finished games and respawn if configured
@@ -568,7 +564,7 @@ class GameLooper(object):
 
         X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
 
-        out = self.model.predict(X, batch_size=1024, verbose=0)
+        out = self.model.predict(X, batch_size=1200, verbose=0)
 
         if isinstance(out, list):
             names = list(getattr(self.model, 'output_names', []))

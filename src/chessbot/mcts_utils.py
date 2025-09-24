@@ -85,7 +85,7 @@ class MCTSTree(fasttree):
             applied += 1
 
         self.awaiting_predictions = keep
-        return applied
+        return len(self.awaiting_predictions)
 
     def _apply_cached(self, req, cached):
         """

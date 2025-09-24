@@ -2,9 +2,10 @@ import json, sys, os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+plt.ion()
 import math
 from scipy.stats import spearmanr
-
+import pickle
 import chess
 import chess.engine
 from chessbot import SF_LOC
@@ -490,22 +491,73 @@ def tail_vs_prev(df, window=200):
 
     return pd.DataFrame(rows).T.round(6)
 
-games = load_game_index()
+
+def combine_summaries(*summaries):
+    out = {"games": 0}
+    # collect weights per summary
+    weights = []
+    for s in summaries:
+        g = int(s.get("games", 0))
+        weights.append({"games": g})
+        out["games"] += g
+
+    # gather all avg_* keys
+    avg_keys = set()
+    for s in summaries:
+        avg_keys |= {k for k in s.keys() if k.startswith("avg_")}
+
+    # weighted average for each metric
+    for k in avg_keys:
+        num, den = 0.0, 0
+        for s, w in zip(summaries, weights):
+            if k in s and s[k] is not None:
+                wt = w['games']
+                num += float(s[k]) * wt
+                den += wt
+        out[k] = rnd((num / den), 3)  if den else None
+
+    return out
+
+
+def combine_run_stats(previous, summary, results, df_all, df_means):
+    new_summary = combine_summaries(previous['summary'], summary)
+    new_results = previous['results'] + results
+    new_df_all = pd.concat([previous['df_all'], df_all])
+    new_df_means = pd.concat([previous['df_means'], df_means])
+    
+    return {
+        "summary": new_summary, "results": new_results,
+        "df_all": new_df_all, "df_means": new_df_means
+    }
+
+#%%
+#%matplotlib inline
+all_games = load_game_index()
+
+pkl_file = [f for f in os.listdir(RUN_DIR) if "analyze_results" in f][0]
+outfile = os.path.join(RUN_DIR, pkl_file)
+
+with open(outfile, "rb") as fp:
+    run200 = pickle.load(fp)
+
+# rerun just those not in the current df
+old_df_means = run200['df_means']
+games = [g for g in all_games if g['game_id'] not in set(old_df_means.game_id)]
 summary, results, df_all, df_means = analyze_many_games(games, workers=4)
 
-# f = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/analyze_results_2470_games.pkl"
-# import pickle
-# with open(f, "rb") as fp:
-#     run1000 = pickle.load(fp)
-# df_means = run1000['df_means']
-    
-df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
-plot_cpl_and_bmr(df_trim, window=50)
-trend_check(df_trim, window=50)
+new_pkl = combine_run_stats(run200, summary, results, df_all, df_means)
+with open(outfile, "wb") as f:
+    pickle.dump(new_pkl, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-df_games = pd.DataFrame.from_records(games)
+df_means = new_pkl['df_means']
+df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
+plot_cpl_and_bmr(df_trim, window=100)
+trend_check(df_trim, window=100)
+
+df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=30)
-tail_vs_prev(df_games, window=30)
+plot_rolling_rates_with_ci(df_games, window=200)
+tail_vs_prev(df_games, window=200)
+

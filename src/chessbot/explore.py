@@ -13,7 +13,7 @@ from chessbot.utils import show_board, rnd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_200_selfplay"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -37,117 +37,6 @@ def load_game_index(path=None):
         path = os.path.join(RUN_DIR, "game_index.json")
         
     return load_json(path)
-
-
-def summarize_games(games):
-    rows = []
-    for g in games:
-        vs_sf = bool(g.get("started_vs_stockfish"))
-        sf_col = g.get("stockfish_color")
-        sf_color = "white" if sf_col is True else ("black" if sf_col is False else None)
-
-        rows.append({
-            "scenario": g.get("scenario"),
-            "result": g.get("result"),
-            "plies": g.get("plies"),
-            "vs_sf": vs_sf,
-            "beat_sf": g.get("beat_sf") if vs_sf else None,
-            "sf_color": sf_color,
-        })
-
-    df = pd.DataFrame(rows)
-
-    grp = df.groupby(["scenario", "sf_color"], dropna=False)
-
-    out = grp.agg(
-        n_games=("result", "size"),
-        avg_result=("result", "mean"),
-        avg_plies=("plies", "mean"),
-        n_vs_sf=("vs_sf", "sum"),
-        n_selfplay=("vs_sf", lambda s: int((~s).sum())),
-        n_beat_sf=("beat_sf", lambda s: int((s == True).sum())),
-    ).reset_index()
-
-    out["beat_sf_rate"] = out.apply(
-        lambda r: (r["n_beat_sf"] / r["n_vs_sf"]) if r["n_vs_sf"] else None, axis=1
-    )
-
-    return out
-
-
-def step_game(board, moves_uci, eng, flipped=False, depth=15, mate_cp=1500):
-    """
-    Controls:
-      <enter>  next move
-      b        back one move
-      s        eval (always White POV)
-      g <n>    jump to ply n (0-based)
-      q        quit
-    """
-    def who_moved(ply_idx, sf_color):
-        if sf_color is None:
-            return "Move"
-        is_white = (ply_idx % 2 == 0)
-        sf_turn = (sf_color and is_white) or ((not sf_color) and (not is_white))
-        return "SF" if sf_turn else "Bot"
-
-    def eval_white_pov():
-        eng_lim = chess.engine.Limit(depth=depth)
-        eng_inf = info=chess.engine.INFO_SCORE
-        info = eng.analyse(board, eng_lim, eng_inf)
-        sc = info["score"].pov(chess.WHITE)
-        if sc.is_mate():
-            return f"mate {sc.mate()}"
-        return f"{sc.score() if sc.score() is not None else 0} cp"
-
-    def redraw():
-        show_board(board, flipped=flipped)
-        print(f"ply={len(board.move_stack)} | eval(White POV)={eval_white_pov()}")
-
-    ply = 0
-    redraw()
-
-    while True:
-        cmd = input("[enter]=next, b=back, s=eval, g <n>=goto, q=quit > ").strip()
-        if cmd == "":
-            if ply >= len(moves_uci):
-                print("end of game")
-                continue
-            u = moves_uci[ply]
-            mv = chess.Move.from_uci(u)
-            label = who_moved(ply, flipped)  # flipped == stockfish_color
-            print(f"{label} plays {board.san(mv)}")
-            board.push(mv)
-            ply += 1
-            redraw()
-            continue
-
-        if cmd == "b":
-            if board.move_stack:
-                board.pop()
-                ply -= 1
-            redraw()
-            continue
-
-        if cmd == "s":
-            print(f"eval(White POV)={eval_white_pov()}")
-            continue
-
-        if cmd.startswith("g "):
-            n = int(cmd.split()[1])
-            n = max(0, min(n, len(moves_uci)))
-            while board.move_stack:
-                board.pop()
-            for i in range(n):
-                board.push_uci(moves_uci[i])
-            ply = n
-            redraw()
-            continue
-
-        if cmd == "q":
-            break
-
-        print("unknown command")
 
 
 def score_cp(pov_score, white_to_move, mate_cp):    
@@ -530,6 +419,80 @@ def combine_run_stats(previous, summary, results, df_all, df_means):
         "df_all": new_df_all, "df_means": new_df_means
     }
 
+
+def step_game(board, moves_uci, eng, flipped=False, depth=15, mate_cp=1500):
+    """
+    Controls:
+      <enter>  next move
+      b        back one move
+      s        eval (always White POV)
+      g <n>    jump to ply n (0-based)
+      q        quit
+    """
+    def who_moved(ply_idx, sf_color):
+        if sf_color is None:
+            return "Move"
+        is_white = (ply_idx % 2 == 0)
+        sf_turn = (sf_color and is_white) or ((not sf_color) and (not is_white))
+        return "SF" if sf_turn else "Bot"
+
+    def eval_white_pov():
+        eng_lim = chess.engine.Limit(depth=depth)
+        eng_inf = info=chess.engine.INFO_SCORE
+        info = eng.analyse(board, eng_lim, eng_inf)
+        sc = info["score"].pov(chess.WHITE)
+        if sc.is_mate():
+            return f"mate {sc.mate()}"
+        return f"{sc.score() if sc.score() is not None else 0} cp"
+
+    def redraw():
+        show_board(board, flipped=flipped)
+        print(f"ply={len(board.move_stack)} | eval(White POV)={eval_white_pov()}")
+
+    ply = 0
+    redraw()
+
+    while True:
+        cmd = input("[enter]=next, b=back, s=eval, g <n>=goto, q=quit > ").strip()
+        if cmd == "":
+            if ply >= len(moves_uci):
+                print("end of game")
+                continue
+            u = moves_uci[ply]
+            mv = chess.Move.from_uci(u)
+            label = who_moved(ply, flipped)  # flipped == stockfish_color
+            print(f"{label} plays {board.san(mv)}")
+            board.push(mv)
+            ply += 1
+            redraw()
+            continue
+
+        if cmd == "b":
+            if board.move_stack:
+                board.pop()
+                ply -= 1
+            redraw()
+            continue
+
+        if cmd == "s":
+            print(f"eval(White POV)={eval_white_pov()}")
+            continue
+
+        if cmd.startswith("g "):
+            n = int(cmd.split()[1])
+            n = max(0, min(n, len(moves_uci)))
+            while board.move_stack:
+                board.pop()
+            for i in range(n):
+                board.push_uci(moves_uci[i])
+            ply = n
+            redraw()
+            continue
+
+        if cmd == "q":
+            break
+
+        print("unknown command")
 #%%
 #%matplotlib inline
 all_games = load_game_index()
@@ -538,26 +501,27 @@ pkl_file = [f for f in os.listdir(RUN_DIR) if "analyze_results" in f][0]
 outfile = os.path.join(RUN_DIR, pkl_file)
 
 with open(outfile, "rb") as fp:
-    run200 = pickle.load(fp)
+    prev_run = pickle.load(fp)
 
 # rerun just those not in the current df
-old_df_means = run200['df_means']
+old_df_means = prev_run['df_means']
 games = [g for g in all_games if g['game_id'] not in set(old_df_means.game_id)]
+print(f"Found {len(games)} new games")
 summary, results, df_all, df_means = analyze_many_games(games, workers=4)
 
-new_pkl = combine_run_stats(run200, summary, results, df_all, df_means)
+new_pkl = combine_run_stats(prev_run, summary, results, df_all, df_means)
 with open(outfile, "wb") as f:
     pickle.dump(new_pkl, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 df_means = new_pkl['df_means']
 df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
-plot_cpl_and_bmr(df_trim, window=100)
-trend_check(df_trim, window=100)
+plot_cpl_and_bmr(df_trim, window=500)
+trend_check(df_trim, window=500)
 
 df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=200)
-tail_vs_prev(df_games, window=200)
+plot_rolling_rates_with_ci(df_games, window=250)
+tail_vs_prev(df_games, window=250)
 

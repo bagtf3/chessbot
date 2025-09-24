@@ -33,9 +33,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_200_selfplay"
+    run_tag = "conv_1000_selfplay"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v200.h5"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
 
     # MCTS
     c_puct = 1.5
@@ -57,7 +57,7 @@ class Config(object):
     sf_finish = True
     vwq_diff_cutoff = 0.7
     vwq_diff_cutoff_span = 25
-    n_training_games = 1500
+    n_training_games = 1000
     restart_after_result = True
     play_vs_sf_prob = 0.5
     sf_depth = 8

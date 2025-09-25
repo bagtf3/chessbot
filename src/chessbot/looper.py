@@ -5,6 +5,9 @@ from time import time as _now
 import numpy as np
 import pandas as pd
 
+import matplotlib
+matplotlib.use("Agg")
+
 import random
 import chess
 import chess.syzygy
@@ -33,9 +36,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay"
+    run_tag = "conv_less_blend_selfplay"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
 
     # MCTS
     c_puct = 1.5
@@ -44,23 +47,23 @@ class Config(object):
     endgame_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 600
-    sims_target_endgame = 720
+    sims_target = 400
+    sims_target_endgame = 600
     micro_batch_size = 12
     
     # Game stuff
-    games_at_once = 96
+    games_at_once = 100
     move_limit = 180
-    material_diff_cutoff = 20
-    material_diff_cutoff_span = 25
+    material_diff_cutoff = 99
+    material_diff_cutoff_span = 99
 
-    sf_finish = True
-    vwq_diff_cutoff = 0.7
+    sf_finish = False
+    vwq_diff_cutoff = 0.85
     vwq_diff_cutoff_span = 25
-    n_training_games = 1000
+    n_training_games = 750
     restart_after_result = True
     play_vs_sf_prob = 0.5
-    sf_depth = 8
+    sf_depth = 2
     
     game_probs = {
         "pre_opened": 0.2, "random_init": 0.2,
@@ -76,13 +79,13 @@ class Config(object):
     }
     
     # early stop
-    es_min_sims = 200
-    es_check_every = 4
+    es_min_sims = 280
+    es_check_every = 1
     es_gap_frac = 0.75
 
     # TF
-    training_queue_min = 3072
-    vwq_blend = 0.5
+    training_queue_min = 2048
+    vwq_blend = 0.2
     target_mean = 0.3
     draw_frac = 0.3
     factorized_bins = (64, 64, 6, 4)
@@ -501,8 +504,8 @@ class GameLooper(object):
                         self.finalize_game_data(game)
                         self.maybe_log_results()
                         finished.append(game.game_id)
-                    # just pass until the next turn
-                    continue
+                        # pass until the next turn
+                        continue
     
                 # if this game has reached its local sim budget, make the move
                 if game.tree.stop_simulating():
@@ -516,6 +519,10 @@ class GameLooper(object):
                         self.finalize_game_data(game)
                         self.maybe_log_results()
                         finished.append(game.game_id)
+                        continue
+                    
+                    # if its stockfish turn, dont do any sims
+                    if game.is_stockfish_turn():
                         continue
     
                 # otherwise, collect up to micro_batch_size leaves for this game
@@ -733,7 +740,7 @@ class GameLooper(object):
     
         # fit (only value head weighted)
         self.model.fit(
-            X, Y, epochs=1, batch_size=512, verbose=0, sample_weight={"value": w}
+            X, Y, epochs=2, batch_size=512, verbose=0, sample_weight={"value": w}
         )
         self.n_retrains += 1
 
@@ -835,4 +842,6 @@ def main():
     
 
 if __name__ == '__main__':
+    main()
+    main()
     main()

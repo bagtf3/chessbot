@@ -7,11 +7,7 @@ import math, random, time, pickle
 from time import time as _now
 
 import tensorflow as tf
-import matplotlib
-matplotlib.use("Agg")  # write-to-file backend (no windows)
 import matplotlib.pyplot as plt
-plt.ioff()
-
 
 import chess
 import chess.engine
@@ -824,7 +820,6 @@ def make_piece_training_board():
         "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
         "only_pawns": "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
         "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "oppo_bishops": "1b1bkb1b/pppppppp/8/8/8/8/PPPPPPPP/1B1BKB1B w - - 0 1",
         "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1'
     }
     

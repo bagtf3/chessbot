@@ -43,7 +43,6 @@ class MCTSTree(fasttree):
         its own board per node.
         """
         leaf = super().collect_one_leaf()
-        legal = leaf.board.legal_moves()
 
         # Build a cache key off the leaf's board state/history (no pushes needed).
         short_fen = leaf.board.fen(include_counters=False)
@@ -52,7 +51,6 @@ class MCTSTree(fasttree):
 
         req = {
             "leaf": leaf,
-            "legal": legal,
             "enc": leaf.board.stacked_planes(5),
             "stm_white": (leaf.board.side_to_move() == 'w'),
             "cache_key": cache_key,
@@ -93,11 +91,11 @@ class MCTSTree(fasttree):
         'cached' must have keys: value, from, to, piece, promo (factorized heads).
         """
         leaf = req["leaf"]
-        legal = req["legal"] or leaf.board.legal_moves()
+        legal = leaf.board.legal_moves()
 
         # Pick uniform mix by game phase
         mix = self.config.anytime_uniform_mix
-        is_endgame = leaf.board.piece_count() <= 14 or self.n_plies >= 70
+        is_endgame = leaf.board.piece_count() <= 14 or self.n_plies >= 75
         mix = self.config.endgame_uniform_mix if is_endgame else mix
 
         pri = priors_from_heads(

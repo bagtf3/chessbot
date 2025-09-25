@@ -1,19 +1,16 @@
-import json, sys, os
+import json, os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 plt.ion()
+
 import math
 from scipy.stats import spearmanr
 import pickle
-import chess
-import chess.engine
-from chessbot import SF_LOC
-from chessbot.utils import show_board, rnd
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from chessbot.utils import rnd
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_less_blend_selfplay"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -37,126 +34,6 @@ def load_game_index(path=None):
         path = os.path.join(RUN_DIR, "game_index.json")
         
     return load_json(path)
-
-
-def score_cp(pov_score, white_to_move, mate_cp):    
-    return pov_score.white().score(mate_score=mate_cp)
-
-
-def analyze_with_sf(file_loc):
-    game_data = load_json(file_loc)
-    limit = chess.engine.Limit(depth=10)
-    board = chess.Board(game_data['start_fen'])
-    sf_color = game_data['stockfish_is_white']
-        
-    cpl_s, cpl_w, cpl_b =  0, 0, 0
-    nw, nb = 0, 0
-    out = []
-    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-        for i, mv in enumerate(game_data['moves_played']):
-            move = chess.Move.from_uci(mv)
-            # dont care about stockfish moves
-            if board.turn == sf_color:
-                board.push(move)
-                continue
-            else:
-                sf_best = eng.play(board, limit=limit, info=chess.engine.INFO_ALL)
-                best_move = sf_best.move
-                best_cp = score_cp(sf_best.info['score'], board.turn, mate_cp=1500)
-                best_relative = sf_best.info['score'].relative.score(mate_score=1500)
-                
-                played_info = eng.analyse(
-                    board, limit=limit, root_moves=[move], info=chess.engine.INFO_SCORE
-                )
-                played_sc = played_info.get("score")
-                played_cp = score_cp(played_sc, board.turn, mate_cp=1500)
-                delta = best_cp - played_cp
-                
-                if board.turn:
-                    cpl_s += delta
-                    cpl_w += delta
-                    nw +=1
-                else:
-                    cpl_s += -delta
-                    cpl_b += -delta
-                    nb+=1
-                    
-                l = [
-                    i, mv, str(best_move), best_cp, played_cp,
-                    np.abs(delta), best_relative, board.turn
-                ]
-                out.append(l)
-                board.push(move)
-    
-    cols = [
-        'move_num', "played_move", "best_move", "best_cp",
-        "delta", "played_cp", "relative_score", "stm"
-    ]
-    out_df = pd.DataFrame(out, columns=cols)
-    out_df['played_best_move'] = out_df['played_move'] == out_df["best_move"]
-    
-    out = {
-        "plies": nw+nb,
-        "overall_cpl": rnd(cpl_s/(nw+nb), 3) if nw+nb else np.nan,
-        "white_cpl": rnd(cpl_w/(nw), 3) if nw else np.nan,
-        "black_cpl": rnd(cpl_b/(nb), 3) if nb else np.nan,
-        "overall_best_move_rate": out_df['played_best_move'].mean(),
-        "best_move_rate_white": out_df.query("stm")['played_best_move'].mean(),
-        "best_move_rate_black": out_df.query("not stm")['played_best_move'].mean()
-    }
-    
-    for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
-        out[key] = game_data[key]
-        out_df[key] = game_data[key]
-    
-    out['df'] = out_df
-    return out
-
-
-def analyze_many_games(games, workers=8):
-    def worker(file_loc):
-        return analyze_with_sf(file_loc)
-
-    N = len(games)
-    results = [None] * N
-
-    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
-        futs = {}
-        for i, g in enumerate(games):
-            futs[ex.submit(worker, g['json_file'])] = i
-        for fut in as_completed(futs):
-            i = futs[fut]
-            try:
-                results[i] = fut.result()
-            except Exception as e:
-                print(e)
-                results[i] = None
-    
-    results = [r for r in results if r is not None]
-    
-    w_means = [r["white_cpl"] for r in results]
-    b_means = [r["black_cpl"] for r in results]
-    o_means = [r["overall_cpl"] for r in results]
-    
-    w_best = [r["best_move_rate_white"] for r in results]
-    b_best = [r["best_move_rate_black"] for r in results]
-    o_best = [r["overall_best_move_rate"] for r in results]
-    
-    summary = {
-        "games": len(results),
-        "avg_white_mean_cpl": rnd(np.nanmean(w_means), 3),
-        "avg_black_mean_cpl": rnd(np.nanmean(b_means), 3),
-        "avg_overall_mean_cpl": rnd(np.nanmean(o_means), 3),
-        "avg_best_move_rate_white": rnd(np.nanmean(w_best), 3),
-        "avg_best_move_rate_black": rnd(np.nanmean(b_best), 3),
-        "avg_overall_best_move_rate": rnd(np.nanmean(o_best), 3),
-    }
-    
-    df_all = pd.concat([r.pop("df") for r in results])
-    df_means = pd.DataFrame.from_records(results)
-    df_means["ts"] = df_means["ts"].round().astype("int64")
-    
-    return summary, results, df_all, df_means
 
 
 def plot_cpl_and_bmr(df, window=30, title=None):
@@ -379,149 +256,34 @@ def tail_vs_prev(df, window=200):
         }
 
     return pd.DataFrame(rows).T.round(6)
-
-
-def combine_summaries(*summaries):
-    out = {"games": 0}
-    # collect weights per summary
-    weights = []
-    for s in summaries:
-        g = int(s.get("games", 0))
-        weights.append({"games": g})
-        out["games"] += g
-
-    # gather all avg_* keys
-    avg_keys = set()
-    for s in summaries:
-        avg_keys |= {k for k in s.keys() if k.startswith("avg_")}
-
-    # weighted average for each metric
-    for k in avg_keys:
-        num, den = 0.0, 0
-        for s, w in zip(summaries, weights):
-            if k in s and s[k] is not None:
-                wt = w['games']
-                num += float(s[k]) * wt
-                den += wt
-        out[k] = rnd((num / den), 3)  if den else None
-
-    return out
-
-
-def combine_run_stats(previous, summary, results, df_all, df_means):
-    new_summary = combine_summaries(previous['summary'], summary)
-    new_results = previous['results'] + results
-    new_df_all = pd.concat([previous['df_all'], df_all])
-    new_df_means = pd.concat([previous['df_means'], df_means])
-    
-    return {
-        "summary": new_summary, "results": new_results,
-        "df_all": new_df_all, "df_means": new_df_means
-    }
-
-
-def step_game(board, moves_uci, eng, flipped=False, depth=15, mate_cp=1500):
-    """
-    Controls:
-      <enter>  next move
-      b        back one move
-      s        eval (always White POV)
-      g <n>    jump to ply n (0-based)
-      q        quit
-    """
-    def who_moved(ply_idx, sf_color):
-        if sf_color is None:
-            return "Move"
-        is_white = (ply_idx % 2 == 0)
-        sf_turn = (sf_color and is_white) or ((not sf_color) and (not is_white))
-        return "SF" if sf_turn else "Bot"
-
-    def eval_white_pov():
-        eng_lim = chess.engine.Limit(depth=depth)
-        eng_inf = info=chess.engine.INFO_SCORE
-        info = eng.analyse(board, eng_lim, eng_inf)
-        sc = info["score"].pov(chess.WHITE)
-        if sc.is_mate():
-            return f"mate {sc.mate()}"
-        return f"{sc.score() if sc.score() is not None else 0} cp"
-
-    def redraw():
-        show_board(board, flipped=flipped)
-        print(f"ply={len(board.move_stack)} | eval(White POV)={eval_white_pov()}")
-
-    ply = 0
-    redraw()
-
-    while True:
-        cmd = input("[enter]=next, b=back, s=eval, g <n>=goto, q=quit > ").strip()
-        if cmd == "":
-            if ply >= len(moves_uci):
-                print("end of game")
-                continue
-            u = moves_uci[ply]
-            mv = chess.Move.from_uci(u)
-            label = who_moved(ply, flipped)  # flipped == stockfish_color
-            print(f"{label} plays {board.san(mv)}")
-            board.push(mv)
-            ply += 1
-            redraw()
-            continue
-
-        if cmd == "b":
-            if board.move_stack:
-                board.pop()
-                ply -= 1
-            redraw()
-            continue
-
-        if cmd == "s":
-            print(f"eval(White POV)={eval_white_pov()}")
-            continue
-
-        if cmd.startswith("g "):
-            n = int(cmd.split()[1])
-            n = max(0, min(n, len(moves_uci)))
-            while board.move_stack:
-                board.pop()
-            for i in range(n):
-                board.push_uci(moves_uci[i])
-            ply = n
-            redraw()
-            continue
-
-        if cmd == "q":
-            break
-
-        print("unknown command")
 #%%
 #%matplotlib inline
 all_games = load_game_index()
 
-pkl_file = [f for f in os.listdir(RUN_DIR) if "analyze_results" in f][0]
-outfile = os.path.join(RUN_DIR, pkl_file)
+pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
+if pkl_files:
+    outfile = os.path.join(RUN_DIR, pkl_files[0])
+    with open(outfile, "rb") as fp:
+        prev_run = pickle.load(fp)
+        df_means = prev_run['df_means']
 
-with open(outfile, "rb") as fp:
-    prev_run = pickle.load(fp)
+df_all = prev_run['df_all']
+df_all['played_best_move'] = df_all.loss <= 10
+bmr = df_all.groupby("game_id")['played_best_move'].mean()
+df_all['clipped_loss'] = np.clip(df_all['loss'], 0, 600)
+clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
-# rerun just those not in the current df
-old_df_means = prev_run['df_means']
-games = [g for g in all_games if g['game_id'] not in set(old_df_means.game_id)]
-print(f"Found {len(games)} new games")
-summary, results, df_all, df_means = analyze_many_games(games, workers=4)
-
-new_pkl = combine_run_stats(prev_run, summary, results, df_all, df_means)
-with open(outfile, "wb") as f:
-    pickle.dump(new_pkl, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-df_means = new_pkl['df_means']
 df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
-plot_cpl_and_bmr(df_trim, window=500)
-trend_check(df_trim, window=500)
+df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
+df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+
+plot_cpl_and_bmr(df_trim, window=200)
+print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
+trend_check(df_trim, window=200)
 
 df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=250)
-tail_vs_prev(df_games, window=250)
-
+plot_rolling_rates_with_ci(df_games, window=50)
+tail_vs_prev(df_games, window=50)

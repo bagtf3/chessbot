@@ -52,10 +52,8 @@ class MCTSTree(fasttree):
         req = {
             "leaf": leaf,
             "enc": leaf.board.stacked_planes(5),
-            "stm_white": (leaf.board.side_to_move() == 'w'),
-            "cache_key": cache_key,
-            "n_plies": self.n_plies,
-            "epoch": self.epoch
+            "stm_leaf": leaf.board.side_to_move(),
+            "cache_key": cache_key
         }
 
         self.awaiting_predictions.append(req)
@@ -64,7 +62,7 @@ class MCTSTree(fasttree):
     def resolve_awaiting(self, board, quick_cache):
         """
         Apply any results now available in quick_cache; drop stale by epoch.
-        Returns how many were applied.
+        Returns how many were not applied (left over).
         """
         if not self.awaiting_predictions:
             return 0
@@ -72,20 +70,18 @@ class MCTSTree(fasttree):
         applied, keep = 0, []
         for req in self.awaiting_predictions:
             cached = quick_cache.get(req["cache_key"])
-            if cached is None or req["epoch"] != self.epoch:
-                # keep if no cache yet and still current epoch
-                if cached is None and req["epoch"] == self.epoch:
-                    keep.append(req)
+            if cached is None:
+                keep.append(req)
                 continue
 
-            self._apply_cached(req, cached)
+            self.apply_cached(req, cached)
             self.sims_completed_this_move += 1
             applied += 1
 
         self.awaiting_predictions = keep
         return len(self.awaiting_predictions)
 
-    def _apply_cached(self, req, cached):
+    def apply_cached(self, req, cached):
         """
         Compute priors (with ply-based mix) and delegate to C++ apply_result.
         'cached' must have keys: value, from, to, piece, promo (factorized heads).
@@ -93,10 +89,14 @@ class MCTSTree(fasttree):
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
 
-        # Pick uniform mix by game phase
-        mix = self.config.anytime_uniform_mix
+        # Pick uniform mix by game phase and turn
         is_endgame = leaf.board.piece_count() <= 14 or self.n_plies >= 75
-        mix = self.config.endgame_uniform_mix if is_endgame else mix
+        if self.root_stm != req['stm_leaf']:
+            mix = self.config.opponent_uniform_mix
+        elif is_endgame:
+            mix = self.config.endgame_uniform_mix
+        else:
+            mix = self.config.anytime_uniform_mix
 
         pri = priors_from_heads(
             leaf.board, legal,
@@ -104,26 +104,29 @@ class MCTSTree(fasttree):
             softmax(cached["piece"]).tolist(), softmax(cached["promo"]).tolist(),
             mix=mix)
         
-        # check for bumps        
-        if is_endgame and self.config.use_prior_boosts:
-            eg_adj = self.config.endgame_prior_adjustments
-            repp = eg_adj.get("repetition_penalty", 0.0)
-            egc = eg_adj.get("capture", 0.0)
-            egpp = eg_adj.get("pawn_push", 0.0)
-            egchk = eg_adj.get("gives_check", 0.0)
+        # check for bumps     
+        if self.config.use_prior_boosts:
+            adjusted_pri = []
+            g_chk = self.config.anytime_prior_adjustments.get("gives_check", 0.0)
 
-            adjusted_pri = []        
+            repp, egc, egpp = 0, 0, 0
+            if is_endgame:
+                eg_adj = self.config.endgame_prior_adjustments
+                repp = eg_adj.get("repetition_penalty", 0.0)
+                egc = eg_adj.get("capture", 0.0)
+                egpp = eg_adj.get("pawn_push", 0.0)
+
             for m, p in pri:
-                if repp:
-                    # down scale to prevent going negative
-                    if leaf.board.would_be_repetition(m, 1): p *= repp
-                if egpp:
-                    if leaf.board.is_pawn_move(m): p += egpp
-                if egc:
-                    if leaf.board.is_capture(m): p += egc
-                if egchk:
-                    if leaf.board.gives_check(m): p += egchk
-                
+                if g_chk:
+                    if leaf.board.gives_check(m): p += g_chk
+                if is_endgame:
+                    if repp:
+                        # down scale to prevent going negative
+                        if leaf.board.would_be_repetition(m, 1): p *= repp
+                    if egpp:
+                        if leaf.board.is_pawn_move(m): p += egpp
+                    if egc:
+                        if leaf.board.is_capture(m): p += egc
                 adjusted_pri.append((m, p))
             pri = adjusted_pri
         

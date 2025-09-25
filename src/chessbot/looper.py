@@ -41,18 +41,22 @@ class Config(object):
     init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
 
     # MCTS
-    c_puct = 1.5
+    c_puct = 2.25
     virtual_loss = 1.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.25
+    opponent_uniform_mix = 0.65
 
     # Simulation schedule
     sims_target = 400
     sims_target_endgame = 600
-    micro_batch_size = 12
+    micro_batch_size = 8
     
     # Game stuff
-    games_at_once = 100
+    games_at_once = 150
+    n_training_games = 750
+    restart_after_result = True
+    
     move_limit = 180
     material_diff_cutoff = 99
     material_diff_cutoff_span = 99
@@ -60,8 +64,6 @@ class Config(object):
     sf_finish = False
     vwq_diff_cutoff = 0.85
     vwq_diff_cutoff_span = 25
-    n_training_games = 750
-    restart_after_result = True
     play_vs_sf_prob = 0.5
     sf_depth = 2
     
@@ -74,13 +76,14 @@ class Config(object):
     # boosts/penalize
     use_prior_boosts = True
     endgame_prior_adjustments = {
-        "pawn_push":0.15, "capture":0.15,
-        "repetition_penalty": 0.6, "gives_check": 0.15
+        "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.6
     }
+    
+    anytime_prior_adjustments = {"gives_check": 0.15}
     
     # early stop
     es_min_sims = 280
-    es_check_every = 1
+    es_check_every = 4
     es_gap_frac = 0.75
 
     # TF

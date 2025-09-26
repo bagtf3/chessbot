@@ -5,15 +5,6 @@ from pyfastchess import MCTSTree as fasttree
 
 
 class MCTSTree(fasttree):
-    """
-    Python ergonomics around the fast C++ tree.
-
-    Key changes vs the old pure-Python class:
-      - Never reassign self.root in Python; we call advance_root() in C++.
-      - We keep at most one outstanding leaf (collect → apply) to avoid
-        multi-path vloss bookkeeping. If you queue, we epoch-guard & clear on advance.
-      - apply_result() computes priors (mix by ply) then delegates to C++ apply_result.
-    """
     def __init__(self, board, cfg):
         self.config = cfg
         self.c_puct = float(cfg.c_puct)
@@ -26,6 +17,10 @@ class MCTSTree(fasttree):
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
+
+        # unique-sims tracking (per move)
+        self._uniq_keys = set()
+        self.unique_sims_this_move = 0
 
         # early-stop rolling state
         self._es_history = []
@@ -60,14 +55,10 @@ class MCTSTree(fasttree):
         return req
 
     def resolve_awaiting(self, board, quick_cache):
-        """
-        Apply any results now available in quick_cache; drop stale by epoch.
-        Returns how many were not applied (left over).
-        """
         if not self.awaiting_predictions:
             return 0
 
-        applied, keep = 0, []
+        keep = []
         for req in self.awaiting_predictions:
             cached = quick_cache.get(req["cache_key"])
             if cached is None:
@@ -76,7 +67,12 @@ class MCTSTree(fasttree):
 
             self.apply_cached(req, cached)
             self.sims_completed_this_move += 1
-            applied += 1
+
+            # bump uniques on first application of this key
+            key = req["cache_key"]
+            if key not in self._uniq_keys:
+                self._uniq_keys.add(key)
+                self.unique_sims_this_move += 1
 
         self.awaiting_predictions = keep
         return len(self.awaiting_predictions)
@@ -90,7 +86,7 @@ class MCTSTree(fasttree):
         legal = leaf.board.legal_moves()
 
         # Pick uniform mix by game phase and turn
-        is_endgame = leaf.board.piece_count() <= 14 or self.n_plies >= 75
+        is_endgame = leaf.board.piece_count() <= 14
         if self.root_stm != req['stm_leaf']:
             mix = self.config.opponent_uniform_mix
         elif is_endgame:
@@ -104,25 +100,26 @@ class MCTSTree(fasttree):
             softmax(cached["piece"]).tolist(), softmax(cached["promo"]).tolist(),
             mix=mix)
         
-        # check for bumps     
-        if self.config.use_prior_boosts:
+        # check for prior boosts after the opening
+        if self.config.use_prior_boosts and leaf.board.history_size() > 10:
             adjusted_pri = []
             g_chk = self.config.anytime_prior_adjustments.get("gives_check", 0.0)
+            repp = self.config.anytime_prior_adjustments.get("repetition_penalty", 1.0)
 
-            repp, egc, egpp = 0, 0, 0
+            egc, egpp = 0, 0
             if is_endgame:
                 eg_adj = self.config.endgame_prior_adjustments
-                repp = eg_adj.get("repetition_penalty", 0.0)
+                repp = eg_adj.get("repetition_penalty", 1.0)
                 egc = eg_adj.get("capture", 0.0)
                 egpp = eg_adj.get("pawn_push", 0.0)
 
             for m, p in pri:
                 if g_chk:
                     if leaf.board.gives_check(m): p += g_chk
+                if repp:
+                    # down scale to prevent going negative
+                    if leaf.board.would_be_repetition(m, 1): p *= repp
                 if is_endgame:
-                    if repp:
-                        # down scale to prevent going negative
-                        if leaf.board.would_be_repetition(m, 1): p *= repp
                     if egpp:
                         if leaf.board.is_pawn_move(m): p += egpp
                     if egc:
@@ -196,3 +193,7 @@ class MCTSTree(fasttree):
         self._es_tripped = False
         self._es_reason = ""
         self._es_after_sims = 0
+
+        # reset uniques
+        self._uniq_keys.clear()
+        self.unique_sims_this_move = 0

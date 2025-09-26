@@ -36,21 +36,25 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_less_blend_selfplay"
+    run_tag = "conv_1000_selfplay"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
 
     # MCTS
-    c_puct = 2.25
-    virtual_loss = 1.0
+    c_puct = 1.25
     anytime_uniform_mix = 0.15
-    endgame_uniform_mix = 0.25
-    opponent_uniform_mix = 0.65
+    endgame_uniform_mix = 0.15
+    opponent_uniform_mix = 0.4
 
     # Simulation schedule
-    sims_target = 400
-    sims_target_endgame = 600
+    sims_target = 560
+    sims_target_endgame = 720
     micro_batch_size = 8
+
+    # early stop
+    es_min_sims = 360
+    es_check_every = 4
+    es_gap_frac = 0.75
     
     # Game stuff
     games_at_once = 150
@@ -64,8 +68,8 @@ class Config(object):
     sf_finish = False
     vwq_diff_cutoff = 0.85
     vwq_diff_cutoff_span = 25
-    play_vs_sf_prob = 0.5
-    sf_depth = 2
+    play_vs_sf_prob = 0.75
+    sf_depth = 6
     
     game_probs = {
         "pre_opened": 0.2, "random_init": 0.2,
@@ -79,17 +83,12 @@ class Config(object):
         "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.6
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.15}
-    
-    # early stop
-    es_min_sims = 280
-    es_check_every = 4
-    es_gap_frac = 0.75
+    anytime_prior_adjustments = {"gives_check": 0.15, "repetition_penalty": 0.75}
 
     # TF
-    training_queue_min = 2048
-    vwq_blend = 0.2
-    target_mean = 0.3
+    training_queue_min = 1024
+    vwq_blend = 0.5
+    target_mean = 1.0
     draw_frac = 0.3
     factorized_bins = (64, 64, 6, 4)
 
@@ -274,6 +273,10 @@ class ChessGame(object):
             return
     
         sims = int(getattr(self.tree, "sims_completed_this_move", 0))
+        # new
+        uniq = int(getattr(self.tree, "unique_sims_this_move", 0))
+        dup = max(0, sims - uniq)
+
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
     
@@ -282,7 +285,9 @@ class ChessGame(object):
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
             "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
+            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
+            "unique_sims": uniq,
+            "duplicate_sims": dup,
         }
     
         # sumN for U term
@@ -298,7 +303,7 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data['candidate_moves'] = candidate_moves
         
-        self.tree_data[mv] = data
+        self.tree_data[self.plies] = data
         
     def make_move_with_stockfish(self):
         """
@@ -740,11 +745,15 @@ class GameLooper(object):
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plt_file = self.config.progress_plot_path
             plot_training_progress(self.all_evals, save_path=plt_file)
-    
-        # fit (only value head weighted)
-        self.model.fit(
-            X, Y, epochs=2, batch_size=512, verbose=0, sample_weight={"value": w}
-        )
+
+        # build sample weights for each head
+        even_weights = np.ones_like(w)
+        s_wts = {
+            'value': w, "best_from": even_weights, "best_to": even_weights,
+            "best_piece": even_weights, 'best_promo': even_weights}
+
+        # fit
+        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)
         self.n_retrains += 1
 
         # save new model

@@ -149,6 +149,47 @@ class MCTSTree(fasttree):
         # expansion + backup (C++ apply_result expects pri as (move, prob) pairs)
         self.apply_result(leaf, pri, cached["value"])
 
+    def best(self):
+        # If not configured, delegate straight to the C++/base implementation.
+        if not self.config.use_q_override:
+            return super().best()
+    
+        # Gather child details (fail-fast if API changed)
+        details = self.root_child_details()
+    
+        # Build candidate list (fail-fast on missing attrs)
+        cands = [{"uci": d.uci, "visits": int(d.N), "Q": float(d.Q), "P": float(d.prior)}
+                 for d in details]
+    
+        # Sort by visits descending
+        c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
+        top = c_sorted[0]
+        top_vis = top["visits"]
+        top_q = top["Q"]
+    
+        # Read thresholds from Config (fail-fast if missing)
+        vis_ratio = float(self.config.q_override_vis_ratio)
+        q_margin = float(self.config.q_override_q_margin)
+        min_vis_cfg = int(self.config.q_override_min_vis)
+        top_k = int(self.config.q_override_top_k)
+    
+        # Compute absolute minimum visits required
+        vis_min = max(min_vis_cfg, int(top_vis * vis_ratio))
+    
+        # Eligible among top_k
+        eligible = [c for c in c_sorted[:top_k] if c["visits"] >= vis_min]
+    
+        if not eligible:
+            return top["uci"], None
+    
+        # Pick the eligible one with highest Q
+        best_q_c = max(eligible, key=lambda x: x["Q"])
+    
+        if best_q_c["Q"] >= top_q + q_margin and best_q_c["uci"] != top["uci"]:
+            return best_q_c["uci"], None
+        else:
+            return top["uci"], None
+
     def advance(self, board, move_uci):
         """
         Safe root advance: mutate the C++ tree, then sync Python-side bookeeping.

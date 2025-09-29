@@ -41,24 +41,32 @@ class Config(object):
     init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
 
     # MCTS
-    c_puct = 1.25
-    anytime_uniform_mix = 0.5
-    endgame_uniform_mix = 0.5
-    opponent_uniform_mix = 0.5
+    c_puct = 1.5
+    anytime_uniform_mix = 0.25
+    endgame_uniform_mix = 0.25
+    opponent_uniform_mix = 0.25
 
     # Simulation schedule
-    sims_target = 560
-    sims_target_endgame = 720
+    sims_target = 1600
+    sims_target_endgame = 1600
     micro_batch_size = 8
 
     # early stop
-    es_min_sims = 360
+    es_min_sims = 800
     es_check_every = 4
-    es_gap_frac = 0.75
+    es_gap_frac = 0.7
+    
+    # Q-override selection
+    use_q_override = False
+    q_override_vis_ratio = 0.85
+    q_override_q_margin = 0.15
+    q_override_min_vis = 100
+    q_override_top_k = 3
+
     
     # Game stuff
     games_at_once = 150
-    n_training_games = 750
+    n_training_games = 500
     
     move_limit = 180
     material_diff_cutoff = 99
@@ -78,8 +86,8 @@ class Config(object):
     
     # boosts/penalize
     use_prior_boosts = True
-    prior_clip_max = 0.6
-    prior_clip_min = 1e-4
+    prior_clip_max = 0.3
+    prior_clip_min = 0.01
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
     }
@@ -559,6 +567,7 @@ class GameLooper(object):
                         break
             
             # predict on the central batch (also updates caches)
+            self.maybe_log_results()
             if preds_batch:
                 self.format_and_predict(preds_batch)
     

@@ -42,9 +42,9 @@ class Config(object):
 
     # MCTS
     c_puct = 1.25
-    anytime_uniform_mix = 0.15
-    endgame_uniform_mix = 0.15
-    opponent_uniform_mix = 0.4
+    anytime_uniform_mix = 0.5
+    endgame_uniform_mix = 0.5
+    opponent_uniform_mix = 0.5
 
     # Simulation schedule
     sims_target = 560
@@ -59,7 +59,6 @@ class Config(object):
     # Game stuff
     games_at_once = 150
     n_training_games = 750
-    restart_after_result = True
     
     move_limit = 180
     material_diff_cutoff = 99
@@ -493,7 +492,8 @@ class GameLooper(object):
         or run MCTS step (collect/predict/apply). Keeps central batching.
         """
         completed_games = 0
-        
+        mbs = self.config.micro_batch_size
+        mps, lps = self.mps, self.lps
         while completed_games < self.config.n_training_games:
             if not self.active_games:
                 break
@@ -505,7 +505,7 @@ class GameLooper(object):
                 # if its stockfish turn, let SF move and skip MCTS this ply
                 if game.is_stockfish_turn():
                     sf_terminal = game.make_move_with_stockfish()
-                    self.mps.tick(1)
+                    mps.tick(1)
                         
                     if sf_terminal:
                         completed_games += 1
@@ -519,7 +519,7 @@ class GameLooper(object):
                 if game.tree.stop_simulating():
                     # bot plays from tree
                     mcts_terminal = game.make_move_from_tree()
-                    self.mps.tick(1)
+                    mps.tick(1)
                     
                     # terminal after bot move?
                     if mcts_terminal:
@@ -535,16 +535,22 @@ class GameLooper(object):
     
                 # otherwise, collect up to micro_batch_size leaves for this game
                 n_collected, tries = 0, 0
-                while n_collected < self.config.micro_batch_size:
+                while n_collected < mbs:
                     leaf_req = game.tree.collect_one_leaf(game.board)
                     if leaf_req is None:
+                        # this shouldnt really happen
                         tries += 1
-                        if tries > 2:
-                            break
+                        
+                    elif leaf_req.get("already_applied", False):
+                        lps.tick(1)
+                        tries += 1
                     else:
-                        n_collected += 1
-                        self.lps.tick(1)
+                        n_collected += 1 
+                        lps.tick(1)
                         preds_batch.append(leaf_req)
+                    
+                    if tries >= 8:
+                        break
             
             # predict on the central batch (also updates caches)
             if preds_batch:
@@ -564,8 +570,9 @@ class GameLooper(object):
                 self.active_games = [
                     g for g in self.active_games if g.game_id not in finished]
                 
-                if self.config.restart_after_result:
-                    self.active_games += [ChessGame() for _ in range(len(finished))]
+            if completed_games + len(self.active_games) < self.config.n_training_games:
+                while len(self.active_games) < self.config.games_at_once:
+                    self.active_games.append(ChessGame())
         return
 
     def format_and_predict(self, preds_batch):

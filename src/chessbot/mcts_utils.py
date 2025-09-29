@@ -31,28 +31,38 @@ class MCTSTree(fasttree):
     
     def collect_one_leaf(self, board):
         """
-        Walk PUCT+virtual to a leaf (in C++) and return an inference request dict,
-        or None if a cache hit allowed us to apply immediately.
-
-        NOTE: We *do not* mutate the Python 'board' here; the C++ tree holds
-        its own board per node.
+        Walk PUCT to a leaf (in C++) and return an inference request dict,
+        or a terminal-hit dict that should NOT be batched.
         """
         leaf = super().collect_one_leaf()
-
-        # Build a cache key off the leaf's board state/history (no pushes needed).
-        short_fen = leaf.board.fen(include_counters=False)
-        move_tail = "|".join(leaf.board.history_uci()[-5:])
-        cache_key = f"{short_fen}|{move_tail}"
-
+    
+        # cheap key: (zobrist, last1 UCI)
+        tail = leaf.board.history_uci()
+        last1 = tail[-1] if tail else ""
+        cache_key = (leaf.board.hash(), last1)
+    
+        # terminal handled in C++: count it here if you track stats, don't batch
+        if leaf.is_terminal:
+            self.sims_completed_this_move += 1
+            return {
+                "leaf": leaf,
+                "cache_key": cache_key,
+                "terminal": True,
+                "already_applied": True,
+                "terminal_value": leaf.value,
+            }
+    
         req = {
             "leaf": leaf,
-            "enc": leaf.board.stacked_planes(5),
+            "cache_key": cache_key,
+            "terminal": False,
+            "already_applied": False,
             "stm_leaf": leaf.board.side_to_move(),
-            "cache_key": cache_key
+            "enc": leaf.board.stacked_planes(5),
         }
-
         self.awaiting_predictions.append(req)
         return req
+
 
     def resolve_awaiting(self, board, quick_cache):
         if not self.awaiting_predictions:

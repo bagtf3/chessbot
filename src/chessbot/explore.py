@@ -294,6 +294,6 @@ tail_vs_prev(df_games, window=150)
 from chessbot.review import GameViewer
 all_games = load_game_index()
 view = [g for g in all_games if (g['stockfish_color']) is not None]
-gv = GameViewer(view[-2]['json_file']); gv.replay()
+gv = GameViewer(view[-1]['json_file']); gv.replay()
 
 

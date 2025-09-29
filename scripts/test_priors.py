@@ -125,8 +125,8 @@ def make_prior_config_from_cfg(cfg):
 # metrics
 def l1_distance(dict_a, dict_b):
     all_keys = set(dict_a) | set(dict_b)
-    return sum(abs(dict_a.get(k, 0.0) - dict_b.get(k, 0.0))
-               for k in all_keys)
+    return sum([abs(dict_a.get(k, 0.0) - dict_b.get(k, 0.0))
+               for k in all_keys])
 
 def kl_divergence(p_dict, q_dict, eps=1e-12):
     # KL(p||q)
@@ -222,7 +222,8 @@ def test_against_positions(num_positions=200, seed=1234):
         stats['old_time'] += (t1 - t0)
         stats['new_time'] += (t3 - t2)
         # convert to dicts (move -> prob). Old pri may not be normalized; normalize for fair metric
-        sum_old = sum(max(0.0, p) for (_m, p) in pri_old)
+
+        sum_old = sum([max(0.0, p) for (_m, p) in pri_old])
         if sum_old > 0:
             old_dict = {m: max(0.0, p) / sum_old for (m, p) in pri_old}
         else:
@@ -231,9 +232,14 @@ def test_against_positions(num_positions=200, seed=1234):
         # new pri is already normalized by engine (but still coerce dict)
         new_dict = {m: float(p) for (m, p) in pri_new}
         # ensure sums
-        s_new = sum(new_dict.values()) or 1.0
-        for k in new_dict:
-            new_dict[k] /= s_new
+        # fixed
+        s_new = 0.0
+        for v in new_dict.values():
+            s_new += float(v)
+        if s_new == 0.0:
+            s_new = 1.0
+        for k, v in list(new_dict.items()):
+            new_dict[k] = float(v) / s_new
 
         l1 = l1_distance(old_dict, new_dict)
         kl = kl_divergence(old_dict, new_dict)
@@ -250,6 +256,9 @@ def test_against_positions(num_positions=200, seed=1234):
     print("Total new  C++  time: {:.6f}s".format(stats['new_time']))
     print("Avg time / pos: old = {:.6f} ms, new = {:.6f} ms".format(
         (stats['old_time']/n)*1000.0, (stats['new_time']/n)*1000.0))
+    ratio = stats['old_time'] / stats['new_time'] if stats['new_time'] > 0 else float("inf")
+    print("Speedup (old / new): {:.2f}x".format(ratio))
+
     print("Avg L1 between priors: {:.6f}".format(
         sum(stats['l1'])/n if n else 0.0))
     print("Avg KL(p_old||p_new): {:.6f}".format(
@@ -259,4 +268,4 @@ def test_against_positions(num_positions=200, seed=1234):
 
 if __name__ == "__main__":
     # tweak num_positions down if you want a fast smoke-test
-    stats = test_against_positions(num_positions=200)
+    stats = test_against_positions(num_positions=5000)

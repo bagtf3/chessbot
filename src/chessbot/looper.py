@@ -78,11 +78,13 @@ class Config(object):
     
     # boosts/penalize
     use_prior_boosts = True
+    prior_clip_max = 0.6
+    prior_clip_min = 1e-4
     endgame_prior_adjustments = {
-        "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.6
+        "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.15, "repetition_penalty": 0.75}
+    anytime_prior_adjustments = {"gives_check": 0.15, "repetition_penalty": 0.02}
 
     # TF
     training_queue_min = 1024

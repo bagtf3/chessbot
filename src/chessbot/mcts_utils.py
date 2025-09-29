@@ -1,7 +1,7 @@
 from time import time as _now
 from chessbot.utils import softmax
-from pyfastchess import priors_from_heads
 from pyfastchess import MCTSTree as fasttree
+from pyfastchess import PriorConfig, PriorEngine
 
 
 class MCTSTree(fasttree):
@@ -9,6 +9,7 @@ class MCTSTree(fasttree):
         self.config = cfg
         self.c_puct = float(cfg.c_puct)
         super().__init__(board, self.c_puct)
+        self.configure_prior_engine()
 
         # bookkeeping mirroring old interface
         self.root_board_fen = board.fen()
@@ -29,6 +30,43 @@ class MCTSTree(fasttree):
         self._es_reason = ""
         self._es_after_sims = 0
     
+    def configure_prior_engine(self):
+        cfg = self.config
+    
+        def _get(name, default=None):
+            if hasattr(cfg, name):
+                return getattr(cfg, name)
+            return default
+    
+        # top-level mixes / flags
+        pcfg = PriorConfig()
+        pcfg.anytime_uniform_mix = float(_get("anytime_uniform_mix", 0.15))
+        pcfg.endgame_uniform_mix = float(_get("endgame_uniform_mix", 0.25))
+        pcfg.opponent_uniform_mix = float(_get("opponent_uniform_mix", 0.5))
+        pcfg.use_prior_boosts = bool(_get("use_prior_boosts", True))
+    
+        # prior adjustments (these are expected to be dict-like)
+        anytime_adj = _get("anytime_prior_adjustments", {}) or {}
+        eg_adj = _get("endgame_prior_adjustments", {}) or {}
+    
+        pcfg.anytime_gives_check = float(anytime_adj.get("gives_check", 0.0))
+        pcfg.anytime_repetition_sub = float(anytime_adj.get("repetition_penalty", 0.0))
+        pcfg.endgame_pawn_push = float(eg_adj.get("pawn_push", 0.0))
+        pcfg.endgame_capture = float(eg_adj.get("capture", 0.0))
+        pcfg.endgame_repetition_sub = float(eg_adj.get("repetition_penalty", 0.0))
+    
+        # optional clipping overrides (if present on cfg)
+        if _get("prior_clip_min", None) is not None:
+            pcfg.clip_min = float(_get("prior_clip_min"))
+        if _get("prior_clip_max", None) is not None:
+            pcfg.clip_max = float(_get("prior_clip_max"))
+    
+        # attach both the config and engine to the instance for later inspection
+        self._prior_cfg = pcfg
+        pcfg.clip_enabled = True 
+        self._prior_engine = PriorEngine(pcfg)
+        return pcfg
+
     def collect_one_leaf(self, board):
         """
         Walk PUCT to a leaf (in C++) and return an inference request dict,
@@ -89,57 +127,28 @@ class MCTSTree(fasttree):
 
     def apply_cached(self, req, cached):
         """
-        Compute priors (with ply-based mix) and delegate to C++ apply_result.
+        Compute priors (softmax in Python) and delegate to C++ apply_result.
         'cached' must have keys: value, from, to, piece, promo (factorized heads).
         """
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
-
-        # Pick uniform mix by game phase and turn
-        is_endgame = leaf.board.piece_count() <= 14
-        if self.root_stm != req['stm_leaf']:
-            mix = self.config.opponent_uniform_mix
-        elif is_endgame:
-            mix = self.config.endgame_uniform_mix
-        else:
-            mix = self.config.anytime_uniform_mix
-
-        pri = priors_from_heads(
-            leaf.board, legal,
-            softmax(cached["from"]).tolist(), softmax(cached["to"]).tolist(),
-            softmax(cached["piece"]).tolist(), softmax(cached["promo"]).tolist(),
-            mix=mix)
-        
-        # check for prior boosts after the opening
-        if self.config.use_prior_boosts and leaf.board.history_size() > 10:
-            adjusted_pri = []
-            g_chk = self.config.anytime_prior_adjustments.get("gives_check", 0.0)
-            repp = self.config.anytime_prior_adjustments.get("repetition_penalty", 1.0)
-
-            egc, egpp = 0, 0
-            if is_endgame:
-                eg_adj = self.config.endgame_prior_adjustments
-                repp = eg_adj.get("repetition_penalty", 1.0)
-                egc = eg_adj.get("capture", 0.0)
-                egpp = eg_adj.get("pawn_push", 0.0)
-
-            for m, p in pri:
-                if g_chk:
-                    if leaf.board.gives_check(m): p += g_chk
-                if repp:
-                    # down scale to prevent going negative
-                    if leaf.board.would_be_repetition(m, 1): p *= repp
-                if is_endgame:
-                    if egpp:
-                        if leaf.board.is_pawn_move(m): p += egpp
-                    if egc:
-                        if leaf.board.is_capture(m): p += egc
-                adjusted_pri.append((m, p))
-            pri = adjusted_pri
-        
-        # C++ expansion + backup (also pops vloss along the last selected path)
-        self.apply_result(leaf, pri, cached["value"])
     
+        # compute factorized softmaxes in python (numpy)
+        sf_from  = softmax(cached["from"])
+        sf_to    = softmax(cached["to"])
+        sf_piece = softmax(cached["piece"])
+        sf_promo = softmax(cached["promo"])
+    
+        # let the C++ PriorEngine handle mixing, boosts, clipping and renorm
+        pri = self._prior_engine.build(
+            leaf.board, legal,
+            sf_from, sf_to, sf_piece, sf_promo,
+            self.root_stm, req["stm_leaf"]
+        )
+    
+        # expansion + backup (C++ apply_result expects pri as (move, prob) pairs)
+        self.apply_result(leaf, pri, cached["value"])
+
     def advance(self, board, move_uci):
         """
         Safe root advance: mutate the C++ tree, then sync Python-side bookeeping.

@@ -67,7 +67,7 @@ class Config(object):
     sf_finish = False
     vwq_diff_cutoff = 0.85
     vwq_diff_cutoff_span = 25
-    play_vs_sf_prob = 0.75
+    play_vs_sf_prob = 0.5
     sf_depth = 6
     
     game_probs = {
@@ -289,20 +289,24 @@ class ChessGame(object):
             "duplicate_sims": dup,
         }
     
-        # sumN for U term
-        sum_vloss = sum([cd.vloss for cd in details])
-        sumN = max(1, root.N + sum_vloss)
-        
+        # sumN for U term (no vloss in the new flow)
+        sumN = max(1, root.N)
+
         candidate_moves = []
         for cd in details:
-            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N + cd.vloss)
+            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N)
             cm = {
-                "uci": cd.uci, "san": self.board.san(cd.uci), "visits": cd.N,
-                "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4)}
+                "uci": cd.uci, "san": self.board.san(cd.uci),
+                "visits": cd.N, "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4),
+                "U": rnd(U, 4), "is_terminal": cd.is_terminal,
+                "vprime_visits": cd.vprime_visits
+            }
+            
             candidate_moves.append(cm)
-        data['candidate_moves'] = candidate_moves
-        
+        data["candidate_moves"] = candidate_moves
+
         self.tree_data[self.plies] = data
+
         
     def make_move_with_stockfish(self):
         """

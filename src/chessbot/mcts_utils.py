@@ -207,23 +207,46 @@ class MCTSTree(fasttree):
         self.n_plies = board.history_size()
 
     def maybe_early_stop(self, sims_target):
-        sims_done = self.sims_completed_this_move
         if self._es_tripped:
             return True
-        if sims_done < self.config.es_min_sims:
-            return False
+        
+        sims_done = self.sims_completed_this_move
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
             return False
-
+    
+        # immediate checks that apply regardless of es_min_sims
+        rows = self.root_child_visits()
+        if rows:
+            # if the top node already has >= es_top_node_frac * sims_target, stop
+            top_vis = rows[0][1]
+            if top_vis >= self.config.es_top_node_frac * sims_target:
+                self._es_tripped = True
+                self._es_after_sims = sims_done
+                thresh = self.config.es_top_node_frac * sims_target
+                self._es_reason = f"top_node_frac top_vis={top_vis} thresh={thresh:.1f}"
+                return True
+    
+            # if the top 4 visited nodes already sum to >= sims_target, stop now
+            top4_sum = sum([n for (_u, n) in rows[:4]])
+            if top4_sum >= int(sims_target):
+                self._es_tripped = True
+                self._es_after_sims = sims_done
+                self._es_reason = f"top4_sum={top4_sum} >= sims_target={sims_target}"
+                return True
+    
+        # from here on enforce min sims and periodic checking as before
+        if sims_done < self.config.es_min_sims:
+            return False
+        
         self._es_last_checked_at = sims_done
         rows = self.root_child_visits()
         if len(rows) < 2:
             return False
-
+    
         n1, n2 = rows[0][1], rows[1][1]
         gap = n1 - n2
         remaining = max(0, sims_target - sims_done)
-
+    
         if gap > self.config.es_gap_frac * float(remaining):
             self._es_tripped = True
             self._es_reason = (

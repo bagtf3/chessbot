@@ -286,16 +286,15 @@ df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=150)
-tail_vs_prev(df_games, window=150)
+plot_rolling_rates_with_ci(df_games, window=500)
+tail_vs_prev(df_games, window=500)
 
 
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['stockfish_color']) is not None]
-#view = [g for g in all_games if (g['scenario']) == 'piece_odds']
+
 view = [g for g in all_games if (g['beat_sf'])]
-gv = GameViewer(view[-2]['json_file']); gv.replay()
+gv = GameViewer(view[-1]['json_file']); gv.replay()
 
 

@@ -44,7 +44,7 @@ class Config(object):
     c_puct = 1.5
     anytime_uniform_mix = 0.25
     endgame_uniform_mix = 0.25
-    opponent_uniform_mix = 0.25
+    opponent_uniform_mix = 0.35
 
     # Simulation schedule
     sims_target = 1600
@@ -53,24 +53,24 @@ class Config(object):
 
     # early stop
     es_min_sims = 800
-    es_check_every = 4
+    es_check_every = 7
     es_gap_frac = 0.7
+    es_top_node_frac = 0.5
     
     # Q-override selection
-    use_q_override = False
+    use_q_override = True
     q_override_vis_ratio = 0.85
     q_override_q_margin = 0.15
     q_override_min_vis = 100
     q_override_top_k = 3
-
     
     # Game stuff
     games_at_once = 150
     n_training_games = 500
     
-    move_limit = 180
-    material_diff_cutoff = 99
-    material_diff_cutoff_span = 99
+    move_limit = 160
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 20
 
     sf_finish = False
     vwq_diff_cutoff = 0.85
@@ -95,7 +95,7 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.15, "repetition_penalty": 0.02}
 
     # TF
-    training_queue_min = 1024
+    training_queue_min = 2048
     vwq_blend = 0.5
     target_mean = 1.0
     draw_frac = 0.3
@@ -784,7 +784,7 @@ class GameLooper(object):
         # clear training queue and bump retrain counter
         self.training_queue = []
     
-    def maybe_log_results(self, every_sec=30.0, window=500):
+    def maybe_log_results(self, every_sec=60.0, window=500):
         """
         Periodically print overall stats PLUS a breakdown by (scenario, sf_color).
         - window: only aggregate last N finished games to keep it cheap.

@@ -274,20 +274,20 @@ df_all['clipped_loss'] = np.clip(df_all['loss'], 0, 600)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
-df_trim = df_trim.query("plies > 5")
+df_trim = df_trim.query("plies > 10")
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
-df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+#df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
-plot_cpl_and_bmr(df_trim, window=500)
+plot_cpl_and_bmr(df_trim, window=1000)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-trend_check(df_trim, window=500)
+trend_check(df_trim, window=1000)
 
 df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=500)
-tail_vs_prev(df_games, window=500)
+plot_rolling_rates_with_ci(df_games, window=1000)
+tail_vs_prev(df_games, window=1000)
 
 
 #%%
@@ -295,6 +295,5 @@ from chessbot.review import GameViewer
 all_games = load_game_index()
 
 view = [g for g in all_games if (g['beat_sf'])]
-gv = GameViewer(view[-1]['json_file']); gv.replay()
-
-
+gv = GameViewer(view[-7]['json_file']); gv.replay()
+#%%

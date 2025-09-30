@@ -16,7 +16,7 @@ from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model
-from chessbot.mcts_utils import MCTSTree
+from chessbot.mcts_utils import MCTSTree, LRUCache
 
 import chessbot.utils as cbu
 from chessbot.utils import (
@@ -67,6 +67,7 @@ class Config(object):
     # Game stuff
     games_at_once = 150
     n_training_games = 500
+    lru_cache_size = 500_000
     
     move_limit = 160
     material_diff_cutoff = 12
@@ -209,7 +210,6 @@ class ChessGame(object):
         self.meta['stockfish_is_white'] = self.stockfish_is_white
         
         self.tree = MCTSTree(self.board, self.config)
-
         self.mat_adv_counter = 0
         self.vwq_adv_counter = 0
         self.outcome = None
@@ -473,9 +473,18 @@ class GameLooper(object):
     """
     def __init__(self, games, model, cfg):
         self.config = cfg or Config()
-        
+        self.active_games = []
+
         if isinstance(games, int):
-            self.active_games = [ChessGame() for _ in range(games)]
+            # generate unique starting games    
+            starting_fens = set()
+            while len(self.active_games) < games:
+                cg = ChessGame()
+                if cg.starting_fen in starting_fens:
+                    continue
+
+                starting_fens.add(cg.starting_fen)
+                self.active_games.append(cg)
         else:
             # assumes these are pre-loaded Game objects in a list
             self.active_games = games
@@ -483,7 +492,6 @@ class GameLooper(object):
         self.model = model
         self.training_queue = []
         self.game_data = []
-        self.quick_cache = {}
 
         self.games_finished = 0
         self.white_wins = 0
@@ -492,6 +500,7 @@ class GameLooper(object):
         self.total_plies = 0
         self.n_retrains = 0
         self.all_evals = pd.DataFrame()
+        self.clear_lru_cache = False
         
         # update global stockfish
         stockfish.set_depth(self.config.sf_depth)
@@ -507,14 +516,17 @@ class GameLooper(object):
         """
         completed_games = 0
         mbs = self.config.micro_batch_size
+        try_break = int(2.5 * mbs)
+        lpb = []
         mps, lps = self.mps, self.lps
+        lru = LRUCache(self.config.lru_cache_size)
+        counts = []
         while completed_games < self.config.n_training_games:
             if not self.active_games:
                 break
     
             preds_batch = []
             finished = []
-    
             for game in list(self.active_games):
                 # if its stockfish turn, let SF move and skip MCTS this ply
                 if game.is_stockfish_turn():
@@ -549,36 +561,89 @@ class GameLooper(object):
     
                 # otherwise, collect up to micro_batch_size leaves for this game
                 n_collected, tries = 0, 0
-                while n_collected < mbs:
-                    leaf_req = game.tree.collect_one_leaf(game.board)
+                bonus_hit, terminal, nones = 0, 0, 0
+                try_stop, collect_stop = 0, 0
+                while True: #n_collected < mbs:
+                    leaf_req = game.tree.collect_one_leaf(lru)
                     if leaf_req is None:
                         # this shouldnt really happen
+                        print("none was found !!")
                         tries += 1
-                        
+                        nones += 1
                     elif leaf_req.get("already_applied", False):
                         lps.tick(1)
                         tries += 1
-                    else:
+                        if leaf_req['terminal']:
+                            terminal += 1
+                        else:
+                            bonus_hit += 1
+                    else:    
                         n_collected += 1 
                         lps.tick(1)
                         preds_batch.append(leaf_req)
-                    
-                    if tries >= 8:
+                    # so we dont spin forever
+                    if tries >= try_break:
+                        try_stop += 1
                         break
-            
+                    if n_collected >= mbs:
+                        collect_stop += 1
+                        break
+
+                counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop])
             # predict on the central batch (also updates caches)
-            self.maybe_log_results()
+            logged = self.maybe_log_results()
+            if logged:
+                lru.stats()
+                # --- quick loop stats (temporary) ---
+                if counts:
+                    n_groups = len(counts)
+                    s_collected   = sum(r[0] for r in counts)
+                    s_tries       = sum(r[1] for r in counts)
+                    s_nones       = sum(r[2] for r in counts)
+                    s_terminals   = sum(r[3] for r in counts)
+                    s_bonus_hits  = sum(r[4] for r in counts)
+                    s_try_stops   = sum(r[5] for r in counts)
+                    s_collect_stops = sum(r[6] for r in counts)
+
+                    avg_collected = s_collected / float(n_groups)
+                    avg_tries     = s_tries / float(n_groups)
+                    fill_ratio    = s_collected / float(max(1, n_groups * mbs))
+
+                    hit_ratio       = s_bonus_hits / float(max(1, s_tries))
+                    terminal_ratio  = s_terminals  / float(max(1, s_tries))
+                    none_ratio      = s_nones      / float(max(1, s_tries))
+                    print("------------------------------------------------------------")
+                    print("Loop stats"
+                        f" | groups={n_groups}  mbs={mbs}"
+                        f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
+                        f" | fill_ratio={fill_ratio:.3f}")
+                    print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
+                        f" | terminals={s_terminals} ({terminal_ratio:.3%})"
+                        f" | nones={s_nones} ({none_ratio:.3%})")
+                    print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
+                    if lpb:
+                        print(f"Avg len of preds_batch {np.mean(lpb):<.3f}")
+                    print(f"Avg ply of active_games {np.mean([g.plies for g in self.active_games]):<.3f}")
+                    print("------------------------------------------------------------")
+                counts = []
+                lpb = []
             if preds_batch:
-                self.format_and_predict(preds_batch)
+                self.format_and_predict(preds_batch, lru)
+                lpb.append(len(preds_batch))
     
             # resolve fresh predictions back into each game tree
             still_waiting = 0
             for game in self.active_games:
-                still_waiting += game.tree.resolve_awaiting(game.board, self.quick_cache)
-    
-            # if nothing was applied, clear the quick cache to keep it light
-            if still_waiting == 0:
-                self.quick_cache = {}
+                still_waiting += game.tree.resolve_awaiting(game.board, lru)
+
+            if still_waiting > 0:
+                print(f"missed {still_waiting} preds somehow !!!!")
+            
+            if (still_waiting == 0) and self.clear_lru_cache:
+                if not logged:
+                    lru.stats()
+                lru.clear()
+                self.clear_lru_cache = False
     
             # remove finished games and respawn if configured
             if finished:
@@ -588,19 +653,19 @@ class GameLooper(object):
             if completed_games + len(self.active_games) < self.config.n_training_games:
                 while len(self.active_games) < self.config.games_at_once:
                     self.active_games.append(ChessGame())
+        
         return
 
-    def format_and_predict(self, preds_batch):
+    def format_and_predict(self, preds_batch, lru):
         """
         Take leaf requests from all games, run one model call, and write
-        results into quick_cache
+        results into cache
         Each req must have: 'enc', 'cache_key'.
         """
         if not preds_batch:
             return
 
         X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
-
         out = self.model.predict(X, batch_size=1200, verbose=0)
 
         if isinstance(out, list):
@@ -627,7 +692,7 @@ class GameLooper(object):
                 "piece": ppc[i],
                 "promo": ppr[i],
             }
-            self.quick_cache[key] = out_i
+            lru[key] = out_i
 
     def finalize_game_data(self, game):
         """
@@ -774,15 +839,14 @@ class GameLooper(object):
             'value': w, "best_from": even_weights, "best_to": even_weights,
             "best_piece": even_weights, 'best_promo': even_weights}
 
-        # fit
-        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)
-        self.n_retrains += 1
-
-        # save new model
+        # fit and  save new model
+        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)        
         self.model.save(self.config.model_path)
         
-        # clear training queue and bump retrain counter
+        # clear training queue, clear LRU and bump retrain counter
         self.training_queue = []
+        self.n_retrains += 1
+        self.clear_lru_cache = True
     
     def maybe_log_results(self, every_sec=60.0, window=500):
         """
@@ -796,7 +860,7 @@ class GameLooper(object):
     
         now = _now()
         if now - self._last_stats_log < every_sec:
-            return
+            return False
         self._last_stats_log = now
     
         # overall
@@ -814,13 +878,14 @@ class GameLooper(object):
         if not recent:
             print("(no recent games to break down)")
             print("~" * 60)
-            return
+            return True
     
         # nice printout
         cbu.print_recent_summary(recent, window=window)
         print(
             f"Length of training queue: {len(self.training_queue)} ",
             f"Number of retrains: {self.n_retrains}\n")
+        return True
 
 
 def init_selfplay():

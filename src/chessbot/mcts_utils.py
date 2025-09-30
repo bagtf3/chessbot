@@ -2,6 +2,7 @@ from time import time as _now
 from chessbot.utils import softmax
 from pyfastchess import MCTSTree as fasttree
 from pyfastchess import PriorConfig, PriorEngine
+from collections import OrderedDict
 
 
 class MCTSTree(fasttree):
@@ -14,6 +15,7 @@ class MCTSTree(fasttree):
         # bookkeeping mirroring old interface
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
+        self.single_move_flag = None
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -67,7 +69,7 @@ class MCTSTree(fasttree):
         self._prior_engine = PriorEngine(pcfg)
         return pcfg
 
-    def collect_one_leaf(self, board):
+    def collect_one_leaf(self, lru=None):
         """
         Walk PUCT to a leaf (in C++) and return an inference request dict,
         or a terminal-hit dict that should NOT be batched.
@@ -75,52 +77,54 @@ class MCTSTree(fasttree):
         leaf = super().collect_one_leaf()
     
         # cheap key: (zobrist, last1 UCI)
-        tail = leaf.board.history_uci()
-        last1 = tail[-1] if tail else ""
-        cache_key = (leaf.board.hash(), last1)
+        # tail = leaf.board.history_uci()
+        # last1 = tail[-1] if tail else ""
+        # cache_key = (leaf.board.hash(), last1)
+        cache_key = leaf.board.hash()
+
+        req = {
+            "leaf": leaf, "cache_key": cache_key,
+            "terminal": False, "already_applied": False
+        }
     
-        # terminal handled in C++: count it here if you track stats, don't batch
+        # terminal handled in C++: count it here
         if leaf.is_terminal:
             self.sims_completed_this_move += 1
-            return {
-                "leaf": leaf,
-                "cache_key": cache_key,
-                "terminal": True,
-                "already_applied": True,
-                "terminal_value": leaf.value,
-            }
-    
-        req = {
-            "leaf": leaf,
-            "cache_key": cache_key,
-            "terminal": False,
-            "already_applied": False,
-            "stm_leaf": leaf.board.side_to_move(),
-            "enc": leaf.board.stacked_planes(5),
-        }
+            req['terminal'] = True
+            req['already_applied'] = True
+            return req
+
+        # check the LRU cache
+        if lru is not None:
+            cached = lru.get(cache_key, None, touch=True)
+            lru.bonus_queries += 1
+            if cached is not None:
+                lru.bonus_hits += 1
+                self.sims_completed_this_move += 1
+                req['already_applied'] = True
+                req["stm_leaf"] = leaf.board.side_to_move()
+                self.apply_cached(req, cached)
+                return req
+
+        req["stm_leaf"] = leaf.board.side_to_move()
+        req['enc'] = leaf.board.stacked_planes(5)
         self.awaiting_predictions.append(req)
         return req
 
-
-    def resolve_awaiting(self, board, quick_cache):
+    def resolve_awaiting(self, board, cache):
         if not self.awaiting_predictions:
             return 0
 
         keep = []
         for req in self.awaiting_predictions:
-            cached = quick_cache.get(req["cache_key"])
+            cached = cache[req["cache_key"]]
             if cached is None:
+                print("req key wasnt in cache !!!!!")
                 keep.append(req)
                 continue
 
             self.apply_cached(req, cached)
             self.sims_completed_this_move += 1
-
-            # bump uniques on first application of this key
-            key = req["cache_key"]
-            if key not in self._uniq_keys:
-                self._uniq_keys.add(key)
-                self.unique_sims_this_move += 1
 
         self.awaiting_predictions = keep
         return len(self.awaiting_predictions)
@@ -132,6 +136,12 @@ class MCTSTree(fasttree):
         """
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
+
+        # bump uniques on first application of this key
+        key = req["cache_key"]
+        if key not in self._uniq_keys:
+            self._uniq_keys.add(key)
+            self.unique_sims_this_move += 1
     
         # compute factorized softmaxes in python (numpy)
         sf_from  = softmax(cached["from"])
@@ -258,6 +268,15 @@ class MCTSTree(fasttree):
         return False
 
     def stop_simulating(self):
+        # if there is only 1 move, make it
+        if self.single_move_flag is not False:
+            mvs = self.root().board.legal_moves()
+            if len(mvs) == 1:
+                self.single_move_flag = True
+                return True
+            else:
+                self.single_move_flag = False
+        
         sims_target = self.config.sims_target
         if self.n_plies > 60:
             sims_target = self.config.sims_target_endgame
@@ -269,6 +288,7 @@ class MCTSTree(fasttree):
         self.sims_completed_this_move = 0
         self.awaiting_predictions.clear()
         self._move_started_at = _now()
+        self.single_move_flag = None
 
         # early-stop state
         self._es_history.clear()
@@ -280,3 +300,93 @@ class MCTSTree(fasttree):
         # reset uniques
         self._uniq_keys.clear()
         self.unique_sims_this_move = 0
+
+
+class LRUCache:
+    """
+    Minimal LRU cache backed by collections.OrderedDict.
+    """
+
+    def __init__(self, maxsize=100_00):
+        self.maxsize = int(maxsize)
+        self._od = OrderedDict()
+        self.bonus_queries = 0
+        self.bonus_hits = 0
+        self.evictions = 0
+
+    def __len__(self):
+        return len(self._od)
+
+    def __contains__(self, key):
+        return key in self._od
+
+    def put(self, key, value, touch=False):
+        """Insert or update value and mark key as most-recent. Evict if needed."""
+        self._od[key] = value
+        # eviction if over capacity
+        if touch:
+            self._od.move_to_end(key, last=True)
+        
+        if len(self._od) > self.maxsize:
+            # pop least-recent (first item)
+            self._od.popitem(last=False)
+            self.evictions += 1
+
+    def get(self, key, default=None, touch=False):
+        if key not in self._od:
+            return default
+        if touch:
+            self._od.move_to_end(key, last=True)
+        return self._od[key]
+
+    def pop(self, key, default=None):
+        return self._od.pop(key, default)
+
+    def touch(self, key):
+        """Move entry to the most recent side"""
+        if key in self._od:
+            # replace value and mark as most-recent
+            self._od.move_to_end(key, last=True)
+
+    def clear(self):
+        """Empty the cache."""
+        self._od.clear()
+        self.bonus_hits = 0
+        self.bonus_queries = 0
+        self.evictions = 0
+
+    def keys(self):
+        """Return keys from least-recent to most-recent."""
+        return self._od.keys()
+
+    def items(self):
+        """Return (key, value) pairs from least-recent to most-recent."""
+        return self._od.items()
+
+    def most_recent_items(self, n):
+        """Iterate up to `n` most-recent items (most-recent first)."""
+        if n <= 0:
+            return iter([])
+        # OrderedDict is from least->most; take last n and reverse
+        it = list(self._od.items())[-n:][::-1]
+        return iter(it)
+
+    def stats(self):
+        print("LRUCache Stats")
+        print(f"size={len(self._od)}/{self.maxsize}, evictions={self.evictions}")
+        bh = self.bonus_hits
+        bq = self.bonus_queries
+        bhr = (bh / float(bq)) if (bq != 0) else 0.0
+        print(f"bonus_hits={bh}, bonus_queries={bq}, bonus_hit_rate={bhr:.3f}")
+        print("="*60)
+
+    # dict-style conveniences
+    def __setitem__(self, key, value):
+        self.put(key, value)
+
+    def __getitem__(self, key):
+        return self._od[key]
+
+    def __repr__(self):
+        return "LRUCache(maxsize={}, len={}, evictions={})".format(
+            self.maxsize, len(self), self.evictions)

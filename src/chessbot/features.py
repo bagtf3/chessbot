@@ -51,7 +51,7 @@ def is_hanging(board, color, sq):
 
 
 def piece_features(piece, board, color):
-    sqs = list(board.pieces(5, color))
+    sqs = list(board.pieces(piece, color))
     
     features = [
         len(sqs), sum([1*is_undefended(board, color, sq) for sq in sqs]),

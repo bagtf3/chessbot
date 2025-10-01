@@ -8,6 +8,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 
+from collections import deque 
 import random
 import chess
 import chess.syzygy
@@ -41,18 +42,17 @@ class Config(object):
     init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
 
     # MCTS
-    c_puct = 1.5
-    anytime_uniform_mix = 0.25
-    endgame_uniform_mix = 0.25
-    opponent_uniform_mix = 0.35
+    c_puct = 1.25
+    anytime_uniform_mix = 0.35
+    endgame_uniform_mix = 0.35
+    opponent_uniform_mix = 0.45
 
     # Simulation schedule
-    sims_target = 1600
-    sims_target_endgame = 1600
-    micro_batch_size = 8
+    sims_target = 1200
+    micro_batch_size = 12
 
     # early stop
-    es_min_sims = 800
+    es_min_sims = 600
     es_check_every = 7
     es_gap_frac = 0.7
     es_top_node_frac = 0.5
@@ -60,17 +60,17 @@ class Config(object):
     # Q-override selection
     use_q_override = True
     q_override_vis_ratio = 0.85
-    q_override_q_margin = 0.15
+    q_override_q_margin = 0.1
     q_override_min_vis = 100
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 150
+    games_at_once = 100
     n_training_games = 500
     lru_cache_size = 500_000
     
     move_limit = 160
-    material_diff_cutoff = 12
+    material_diff_cutoff = 15
     material_diff_cutoff_span = 20
 
     sf_finish = False
@@ -87,13 +87,13 @@ class Config(object):
     
     # boosts/penalize
     use_prior_boosts = True
-    prior_clip_max = 0.3
+    prior_clip_max = 0.5
     prior_clip_min = 0.01
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.15, "repetition_penalty": 0.02}
+    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.02}
 
     # TF
     training_queue_min = 2048
@@ -296,7 +296,7 @@ class ChessGame(object):
             "total_children": total_children,
             "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
             "unique_sims": uniq,
-            "duplicate_sims": dup,
+            "duplicate_sims": dup
         }
     
         # sumN for U term (no vloss in the new flow)
@@ -491,7 +491,8 @@ class GameLooper(object):
         
         self.model = model
         self.training_queue = []
-        self.game_data = []
+        self.stats_window = self.config.n_training_games
+        self.recent_games = deque(maxlen=self.stats_window)
 
         self.games_finished = 0
         self.white_wins = 0
@@ -560,7 +561,7 @@ class GameLooper(object):
                         continue
     
                 # otherwise, collect up to micro_batch_size leaves for this game
-                n_collected, tries = 0, 0
+                n_collected, tries, de_dupes = 0, 0, 0
                 bonus_hit, terminal, nones = 0, 0, 0
                 try_stop, collect_stop = 0, 0
                 while True: #n_collected < mbs:
@@ -570,7 +571,7 @@ class GameLooper(object):
                         print("none was found !!")
                         tries += 1
                         nones += 1
-                    elif leaf_req.get("already_applied", False):
+                    elif leaf_req["already_applied"]:
                         lps.tick(1)
                         tries += 1
                         if leaf_req['terminal']:
@@ -580,7 +581,11 @@ class GameLooper(object):
                     else:    
                         n_collected += 1 
                         lps.tick(1)
-                        preds_batch.append(leaf_req)
+                        if leaf_req['already_pending']:
+                            de_dupes += 1
+                        else:
+                            lru.pending.add(leaf_req['cache_key'])
+                            preds_batch.append(leaf_req)
                     # so we dont spin forever
                     if tries >= try_break:
                         try_stop += 1
@@ -589,7 +594,7 @@ class GameLooper(object):
                         collect_stop += 1
                         break
 
-                counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop])
+                counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop, de_dupes])
             # predict on the central batch (also updates caches)
             logged = self.maybe_log_results()
             if logged:
@@ -597,18 +602,19 @@ class GameLooper(object):
                 # --- quick loop stats (temporary) ---
                 if counts:
                     n_groups = len(counts)
-                    s_collected   = sum(r[0] for r in counts)
-                    s_tries       = sum(r[1] for r in counts)
-                    s_nones       = sum(r[2] for r in counts)
-                    s_terminals   = sum(r[3] for r in counts)
-                    s_bonus_hits  = sum(r[4] for r in counts)
-                    s_try_stops   = sum(r[5] for r in counts)
-                    s_collect_stops = sum(r[6] for r in counts)
+                    s_collected   = sum([r[0] for r in counts])
+                    s_tries       = sum([r[1] for r in counts])
+                    s_nones       = sum([r[2] for r in counts])
+                    s_terminals   = sum([r[3] for r in counts])
+                    s_bonus_hits  = sum([r[4] for r in counts])
+                    s_try_stops   = sum([r[5] for r in counts])
+                    s_collect_stops = sum([r[6] for r in counts])
+                    s_de_dupes = sum([r[7] for r in counts])
 
                     avg_collected = s_collected / float(n_groups)
                     avg_tries     = s_tries / float(n_groups)
+                    avg_de_dupes = s_de_dupes / float(n_groups)
                     fill_ratio    = s_collected / float(max(1, n_groups * mbs))
-
                     hit_ratio       = s_bonus_hits / float(max(1, s_tries))
                     terminal_ratio  = s_terminals  / float(max(1, s_tries))
                     none_ratio      = s_nones      / float(max(1, s_tries))
@@ -616,13 +622,13 @@ class GameLooper(object):
                     print("Loop stats"
                         f" | groups={n_groups}  mbs={mbs}"
                         f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
-                        f" | fill_ratio={fill_ratio:.3f}")
+                        f" | fill_ratio={fill_ratio:.3f}  avg_de_dupes={avg_de_dupes:.2f}")
                     print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
                         f" | terminals={s_terminals} ({terminal_ratio:.3%})"
                         f" | nones={s_nones} ({none_ratio:.3%})")
                     print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
                     if lpb:
-                        print(f"Avg len of preds_batch {np.mean(lpb):<.3f}")
+                        print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
                     print(f"Avg ply of active_games {np.mean([g.plies for g in self.active_games]):<.3f}")
                     print("------------------------------------------------------------")
                 counts = []
@@ -634,7 +640,7 @@ class GameLooper(object):
             # resolve fresh predictions back into each game tree
             still_waiting = 0
             for game in self.active_games:
-                still_waiting += game.tree.resolve_awaiting(game.board, lru)
+                still_waiting += game.tree.resolve_awaiting(lru)
 
             if still_waiting > 0:
                 print(f"missed {still_waiting} preds somehow !!!!")
@@ -644,16 +650,18 @@ class GameLooper(object):
                     lru.stats()
                 lru.clear()
                 self.clear_lru_cache = False
-    
-            # remove finished games and respawn if configured
-            if finished:
-                self.active_games = [
-                    g for g in self.active_games if g.game_id not in finished]
+
+            # remove any finished games
+            self.active_games = [
+                g for g in self.active_games if g.game_id not in finished
+            ]
                 
             if completed_games + len(self.active_games) < self.config.n_training_games:
                 while len(self.active_games) < self.config.games_at_once:
                     self.active_games.append(ChessGame())
         
+        # final report
+        self.maybe_log_results(force=True)
         return
 
     def format_and_predict(self, preds_batch, lru):
@@ -693,6 +701,9 @@ class GameLooper(object):
                 "promo": ppr[i],
             }
             lru[key] = out_i
+        
+        # clear out the pending. theyre all in lru_cache now
+        lru.pending.clear()
 
     def finalize_game_data(self, game):
         """
@@ -708,36 +719,48 @@ class GameLooper(object):
             self.black_wins += 1
         else:
             self.draws += 1
-
-        res = {
-            "ts": _now(), "game_id": game.game_id, "start_fen": game.starting_fen,
-            "result": game.outcome if game.outcome is not None else 0.0,
-            "plies": int(game.plies), "history_uci": game.board.history_uci(),
-            "moves_played": game.moves_played, "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white, "model_epoch": self.n_retrains
-        }
         
+        mem_summary = {
+            "ts": _now(),
+            "game_id": game.game_id,
+            "scenario": game.meta.get("scenario", ""),
+            "plies": int(game.plies),
+            "result": game.outcome or 0.0,
+            "vs_stockfish": bool(game.vs_stockfish),
+            "stockfish_color": bool(game.stockfish_is_white)
+        }
+        # small in-memory record for recent prints only
+        self.recent_games.append(mem_summary)
+
+        # on-disk record (full)
+        res = {
+            "start_fen": game.starting_fen,
+            "history_uci": game.board.history_uci(),
+            "moves_played": game.moves_played,
+            "model_epoch": self.n_retrains,
+            "n_retrains": self.n_retrains
+        }
+        res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
-        self.game_data.append(copy.deepcopy(res))
-        
-        res['tree_search_data'] = game.tree_data
-        
-        # save game_file
+
+        # attach tree search data to disk record
+        res["tree_search_data"] = game.tree_data
+
+        # save per-game JSON
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.json")
         out_path = pathlib.Path(out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(res, f, indent=2)
-        
-        # update game_file_log
+
+        # update JSONL index (small)
         keep = [
-            'game_id', 'ts', 'n_retrains', 'scenario', 'plies',
-            'started_vs_stockfish', 'stockfish_color', 'result'
+            "game_id", "ts", "n_retrains", "scenario", "plies",
+            "started_vs_stockfish", "stockfish_color", "result"
         ]
-        new_idx = {k: v for k, v in res.items() if k in keep}
-        new_idx['json_file'] = out_file
+        new_idx = {k: res[k] for k in keep}
+        new_idx["json_file"] = out_file
         
         new_idx['beat_sf'] = False
         if new_idx['started_vs_stockfish']:
@@ -811,7 +834,7 @@ class GameLooper(object):
             w_pos = 0.5 * nz / pos
             w_neg = 0.5 * nz / neg
             w_draw = draw_frac * 0.5 * (w_pos + w_neg)
-            w = np.where(Z > 0, w_pos, np.where(Z < 0, w_neg, w_draw)).astype(np.float32)
+            w = np.where(Z>0, w_pos, np.where(Z<0, w_neg, w_draw)).astype(np.float32)
         else:
             w = np.ones_like(Z, dtype=np.float32)
     
@@ -848,44 +871,41 @@ class GameLooper(object):
         self.n_retrains += 1
         self.clear_lru_cache = True
     
-    def maybe_log_results(self, every_sec=60.0, window=500):
-        """
-        Periodically print overall stats PLUS a breakdown by (scenario, sf_color).
-        - window: only aggregate last N finished games to keep it cheap.
-        """
+    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"
             return "white" if sf_is_white else "black"
-    
+
         now = _now()
-        if now - self._last_stats_log < every_sec:
+        if not force and (now - self._last_stats_log < every_sec):
             return False
         self._last_stats_log = now
-    
-        # overall
+
         avg_moves = (self.total_plies / max(1, self.games_finished))
         print("~" * 60)
         print(
             f"[stats] finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
             f"avg_len={avg_moves:.1f} moves  |  "
-            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}")
+            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}"
+        )
         print("-" * 60)
-        
-        # recent finished games (use archived + pending pre_game_data)
-        recent = self.game_data[-window:]
+
+        recent = list(self.recent_games)[-min(window, len(self.recent_games)):]
         if not recent:
             print("(no recent games to break down)")
             print("~" * 60)
             return True
-    
-        # nice printout
+
+        # re-use your existing pretty printer
         cbu.print_recent_summary(recent, window=window)
         print(
             f"Length of training queue: {len(self.training_queue)} ",
-            f"Number of retrains: {self.n_retrains}\n")
+            f"Number of retrains: {self.n_retrains}\n"
+        )
         return True
+
 
 
 def init_selfplay():

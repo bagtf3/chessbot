@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 
 import pickle
+from pprint import pprint
 import chess
 import chess.engine
 from chessbot import SF_LOC
@@ -225,6 +226,8 @@ if __name__ == '__main__':
         print(f"No pkl found. Running all {len(games)} games")
 
     summary, results, df_all, df_means = analyze_many_games(games, workers=6)
+    print("=== New Game Summary ===")
+    pprint(summary)
     
     if prev_run is not None:
         new_pkl = combine_run_stats(prev_run, summary, results, df_all, df_means)
@@ -233,6 +236,10 @@ if __name__ == '__main__':
             "summary": summary, "results": results,
             "df_all":df_all, "df_means":df_means
         }
-    
+
+    print()
+    print("=== Overall Summary ===")
+    pprint(new_pkl['summary'])
+
     with open(pkl_file, "wb") as f:
         pickle.dump(new_pkl, f, protocol=pickle.HIGHEST_PROTOCOL)

@@ -15,7 +15,7 @@ class MCTSTree(fasttree):
         # bookkeeping mirroring old interface
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        self.single_move_flag = None
+        self.sims_target = None
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -75,16 +75,12 @@ class MCTSTree(fasttree):
         or a terminal-hit dict that should NOT be batched.
         """
         leaf = super().collect_one_leaf()
-    
-        # cheap key: (zobrist, last1 UCI)
-        # tail = leaf.board.history_uci()
-        # last1 = tail[-1] if tail else ""
-        # cache_key = (leaf.board.hash(), last1)
         cache_key = leaf.board.hash()
 
         req = {
             "leaf": leaf, "cache_key": cache_key,
-            "terminal": False, "already_applied": False
+            "terminal": False, "already_applied": False,
+            "already_pending": False
         }
     
         # terminal handled in C++: count it here
@@ -94,6 +90,9 @@ class MCTSTree(fasttree):
             req['already_applied'] = True
             return req
 
+        # if not terminal, will need this
+        req["stm_leaf"] = leaf.board.side_to_move()
+
         # check the LRU cache
         if lru is not None:
             cached = lru.get(cache_key, None, touch=True)
@@ -102,24 +101,29 @@ class MCTSTree(fasttree):
                 lru.bonus_hits += 1
                 self.sims_completed_this_move += 1
                 req['already_applied'] = True
-                req["stm_leaf"] = leaf.board.side_to_move()
                 self.apply_cached(req, cached)
                 return req
 
-        req["stm_leaf"] = leaf.board.side_to_move()
+            # may be a duplicate request but not cached
+            if cache_key in lru.pending:
+                req['already_pending'] = True
+                self.awaiting_predictions.append(req)
+                return req
+        
+        # if not terminal, cached or pending, send standard request
         req['enc'] = leaf.board.stacked_planes(5)
         self.awaiting_predictions.append(req)
         return req
 
-    def resolve_awaiting(self, board, cache):
+    def resolve_awaiting(self, cache):
         if not self.awaiting_predictions:
             return 0
 
         keep = []
         for req in self.awaiting_predictions:
             cached = cache[req["cache_key"]]
+            # this shouldnt be possible
             if cached is None:
-                print("req key wasnt in cache !!!!!")
                 keep.append(req)
                 continue
 
@@ -137,12 +141,6 @@ class MCTSTree(fasttree):
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
 
-        # bump uniques on first application of this key
-        key = req["cache_key"]
-        if key not in self._uniq_keys:
-            self._uniq_keys.add(key)
-            self.unique_sims_this_move += 1
-    
         # compute factorized softmaxes in python (numpy)
         sf_from  = softmax(cached["from"])
         sf_to    = softmax(cached["to"])
@@ -151,8 +149,7 @@ class MCTSTree(fasttree):
     
         # let the C++ PriorEngine handle mixing, boosts, clipping and renorm
         pri = self._prior_engine.build(
-            leaf.board, legal,
-            sf_from, sf_to, sf_piece, sf_promo,
+            leaf.board, legal, sf_from, sf_to, sf_piece, sf_promo,
             self.root_stm, req["stm_leaf"]
         )
     
@@ -164,24 +161,24 @@ class MCTSTree(fasttree):
         if not self.config.use_q_override:
             return super().best()
     
-        # Gather child details (fail-fast if API changed)
         details = self.root_child_details()
     
-        # Build candidate list (fail-fast on missing attrs)
-        cands = [{"uci": d.uci, "visits": int(d.N), "Q": float(d.Q), "P": float(d.prior)}
-                 for d in details]
+        # build candidate list
+        cands = []
+        for d in details:
+            cands.append({"uci": d.uci, "visits": d.N, "Q": d.Q, "P": d.prior})
     
-        # Sort by visits descending
+        # sort by visits descending
         c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
         top = c_sorted[0]
         top_vis = top["visits"]
         top_q = top["Q"]
     
-        # Read thresholds from Config (fail-fast if missing)
-        vis_ratio = float(self.config.q_override_vis_ratio)
-        q_margin = float(self.config.q_override_q_margin)
-        min_vis_cfg = int(self.config.q_override_min_vis)
-        top_k = int(self.config.q_override_top_k)
+        # read thresholds from Config
+        vis_ratio = self.config.q_override_vis_ratio
+        q_margin = self.config.q_override_q_margin
+        min_vis_cfg = self.config.q_override_min_vis
+        top_k = self.config.q_override_top_k
     
         # Compute absolute minimum visits required
         vis_min = max(min_vis_cfg, int(top_vis * vis_ratio))
@@ -216,15 +213,16 @@ class MCTSTree(fasttree):
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
-    def maybe_early_stop(self, sims_target):
+    def maybe_early_stop(self):
         if self._es_tripped:
             return True
         
         sims_done = self.sims_completed_this_move
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
             return False
-    
+
         # immediate checks that apply regardless of es_min_sims
+        sims_target = self.sims_target
         rows = self.root_child_visits()
         if rows:
             # if the top node already has >= es_top_node_frac * sims_target, stop
@@ -257,7 +255,7 @@ class MCTSTree(fasttree):
         gap = n1 - n2
         remaining = max(0, sims_target - sims_done)
     
-        if gap > self.config.es_gap_frac * float(remaining):
+        if gap > self.config.es_gap_frac * remaining:
             self._es_tripped = True
             self._es_reason = (
                 f"gap_vs_remaining n1={n1} n2={n2} gap={gap} "
@@ -268,27 +266,27 @@ class MCTSTree(fasttree):
         return False
 
     def stop_simulating(self):
-        # if there is only 1 move, make it
-        if self.single_move_flag is not False:
-            mvs = self.root().board.legal_moves()
+        if self.sims_target is None:
+            b = self.root().board
+            mvs = b.legal_moves()
+            # if there is only 1 move, make it
             if len(mvs) == 1:
-                self.single_move_flag = True
+                # set this ultra low just incase
+                self.sims_target = 1
                 return True
-            else:
-                self.single_move_flag = False
+            
+            # use the sims target, or 300*num_moves to speed up forced positions
+            self.sims_target = min(self.config.sims_target, 300*len(mvs))
         
-        sims_target = self.config.sims_target
-        if self.n_plies > 60:
-            sims_target = self.config.sims_target_endgame
-        if self.sims_completed_this_move >= sims_target:
+        if self.sims_completed_this_move >= self.sims_target:
             return True
-        return self.maybe_early_stop(sims_target)
+        return self.maybe_early_stop()
 
     def reset_for_new_move(self):
         self.sims_completed_this_move = 0
         self.awaiting_predictions.clear()
         self._move_started_at = _now()
-        self.single_move_flag = None
+        self.sims_target = None
 
         # early-stop state
         self._es_history.clear()
@@ -307,12 +305,13 @@ class LRUCache:
     Minimal LRU cache backed by collections.OrderedDict.
     """
 
-    def __init__(self, maxsize=100_00):
+    def __init__(self, maxsize=100_000):
         self.maxsize = int(maxsize)
         self._od = OrderedDict()
         self.bonus_queries = 0
         self.bonus_hits = 0
         self.evictions = 0
+        self.pending = set()
 
     def __len__(self):
         return len(self._od)
@@ -347,7 +346,7 @@ class LRUCache:
         if key in self._od:
             # replace value and mark as most-recent
             self._od.move_to_end(key, last=True)
-
+    
     def clear(self):
         """Empty the cache."""
         self._od.clear()

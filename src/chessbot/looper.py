@@ -43,11 +43,11 @@ class Config(object):
     opponent_uniform_mix = 0.45
 
     # Simulation schedule
-    sims_target = 1200
+    sims_target = 500
     micro_batch_size = 12
 
     # early stop
-    es_min_sims = 800
+    es_min_sims = 600
     es_check_every = 7
     es_gap_frac = 0.7
     es_top_node_frac = 0.75
@@ -523,7 +523,7 @@ class GameLooper(object):
                             continue
         
                     # otherwise, collect up to micro_batch_size leaves for this game
-                    n_collected, tries, de_dupes = 0, 0, 0
+                    n_collected, tries = 0, 0
                     bonus_hit, terminal, nones = 0, 0, 0
                     try_stop, collect_stop = 0, 0
                     while True: #n_collected < mbs:
@@ -543,11 +543,7 @@ class GameLooper(object):
                         else:    
                             n_collected += 1 
                             lps.tick(1)
-                            if leaf_req['already_pending']:
-                                de_dupes += 1
-                            else:
-                                lru.pending.add(leaf_req['cache_key'])
-                                preds_batch.append(leaf_req)
+                            preds_batch.append(leaf_req)
                         # so we dont spin forever
                         if tries >= try_break:
                             try_stop += 1
@@ -556,7 +552,7 @@ class GameLooper(object):
                             collect_stop += 1
                             break
     
-                    counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop, de_dupes])
+                    counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop])
                 # predict on the central batch (also updates caches)
                 logged = self.maybe_log_results()
                 if logged:
@@ -571,11 +567,9 @@ class GameLooper(object):
                         s_bonus_hits  = sum([r[4] for r in counts])
                         s_try_stops   = sum([r[5] for r in counts])
                         s_collect_stops = sum([r[6] for r in counts])
-                        s_de_dupes = sum([r[7] for r in counts])
     
                         avg_collected = s_collected / float(n_groups)
                         avg_tries     = s_tries / float(n_groups)
-                        avg_de_dupes = s_de_dupes / float(n_groups)
                         fill_ratio    = s_collected / float(max(1, n_groups * mbs))
                         hit_ratio       = s_bonus_hits / float(max(1, s_tries))
                         terminal_ratio  = s_terminals  / float(max(1, s_tries))
@@ -584,7 +578,7 @@ class GameLooper(object):
                         print("Loop stats"
                             f" | groups={n_groups}  mbs={mbs}"
                             f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
-                            f" | fill_ratio={fill_ratio:.3f}  avg_de_dupes={avg_de_dupes:.2f}")
+                            f" | fill_ratio={fill_ratio:.3f} ")
                         print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
                             f" | terminals={s_terminals} ({terminal_ratio:.3%})"
                             f" | nones={s_nones} ({none_ratio:.3%})")
@@ -663,9 +657,6 @@ class GameLooper(object):
                 "promo": ppr[i],
             }
             lru[key] = out_i
-        
-        # clear out the pending. theyre all in lru_cache now
-        lru.pending.clear()
 
     def finalize_game_data(self, game):
         """
@@ -909,7 +900,7 @@ def main():
     model, config = init_selfplay()
     looper = GameLooper(games=config.games_at_once, model=model, cfg=Config())
     
-    # infer the number of trainins already done from existing files
+    # infer the number of trainings already done from existing files
     if os.path.exists(config.progress_csv_path):
         try:
             progress_df = pd.read_csv(config.progress_csv_path)
@@ -926,8 +917,10 @@ if __name__ == '__main__':
     main()
     
     Config.sims_target = 1000
+    Config.es_min_sims = 600
     main()
     
     Config.sims_target = 1200
+    Config.es_min_sims = 800
     main()
     main()

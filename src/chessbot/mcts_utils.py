@@ -79,8 +79,7 @@ class MCTSTree(fasttree):
 
         req = {
             "leaf": leaf, "cache_key": cache_key,
-            "terminal": False, "already_applied": False,
-            "already_pending": False
+            "terminal": False, "already_applied": False
         }
     
         # terminal handled in C++: count it here
@@ -103,14 +102,8 @@ class MCTSTree(fasttree):
                 req['already_applied'] = True
                 self.apply_cached(req, cached)
                 return req
-
-            # may be a duplicate request but not cached
-            if cache_key in lru.pending:
-                req['already_pending'] = True
-                self.awaiting_predictions.append(req)
-                return req
         
-        # if not terminal, cached or pending, send standard request
+        # if not terminal or cached, send standard request
         req['enc'] = leaf.board.stacked_planes(5)
         self.awaiting_predictions.append(req)
         return req
@@ -311,7 +304,6 @@ class LRUCache:
         self.bonus_queries = 0
         self.bonus_hits = 0
         self.evictions = 0
-        self.pending = set()
 
     def __len__(self):
         return len(self._od)

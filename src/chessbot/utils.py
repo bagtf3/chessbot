@@ -412,7 +412,6 @@ def format_time(seconds):
         m, s = divmod(rem, 60)
         return f"{int(h)}h {int(m)}m {s:.2f}s"
 
-    
 ##    
 ## board/ position generation
 ##
@@ -1106,7 +1105,8 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
 
 def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     """
-    Pretty-print the scenario table and the bot-vs-Stockfish W/L/D line.
+    Pretty-print the scenario table and the bot-vs-Stockfish W/L/D line,
+    plus a wins-by-scenario breakdown (SF games only).
     """
     recent = recent[-window:]
     stats, rows, sf_overall = summarize_recent_games(
@@ -1136,5 +1136,26 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     avg = (sf_overall["plies_sum"] / total) if total else 0.0
     print(
         f"Total SF games: {total:>4}  W/L/D={w}/{l}/{d}  ",
-        f"win_rate={win:.1%}  avg_plies={avg:.1f}")
+        f"win_rate={win:.1%}  avg_plies={avg:.1f}"
+    )
+
+    # compute counts: scenario -> wins (combine colors)
+    wins_by_scenario = defaultdict(int)
+    for g in recent:
+        if not g.get("vs_stockfish", False):
+            continue
+        r = g.get("result", 0.0)
+        if r == 0:
+            continue
+        sf_is_white = g.get("stockfish_color")
+        bot_won = (r < 0) if sf_is_white else (r > 0)
+        if bot_won:
+            scenario = g.get("scenario", "unknown")
+            wins_by_scenario[scenario] += 1
+
+    if wins_by_scenario:
+        print("\nWins by scenario (SF games only):")
+        # sort by descending wins, then alphabetically
+        for s, c in sorted(wins_by_scenario.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  {s:<30} {c}")
     print("~" * 60)

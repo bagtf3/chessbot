@@ -1,4 +1,4 @@
-import uuid, os, copy
+import uuid, os
 import pathlib, json
 from time import time as _now
 
@@ -24,11 +24,7 @@ from chessbot.utils import (
     rnd, score_game_data, plot_training_progress, show_board, RateMeter
 )
 
-from chessbot.encoding import sf_top_moves_to_values
-from stockfish import Stockfish
-
-stockfish = Stockfish(path=SF_LOC)
-stockfish.update_engine_parameters({"Threads": 4})
+from chessbot.encoding import score_to_cp_white
 
 
 class Config(object):
@@ -37,10 +33,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay"
+    run_tag = "conv_1000_selfplay_v2"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
-
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
     # MCTS
     c_puct = 1.25
     anytime_uniform_mix = 0.35
@@ -52,10 +47,10 @@ class Config(object):
     micro_batch_size = 12
 
     # early stop
-    es_min_sims = 600
+    es_min_sims = 800
     es_check_every = 7
     es_gap_frac = 0.7
-    es_top_node_frac = 0.5
+    es_top_node_frac = 0.75
     
     # Q-override selection
     use_q_override = True
@@ -73,9 +68,6 @@ class Config(object):
     material_diff_cutoff = 15
     material_diff_cutoff_span = 20
 
-    sf_finish = False
-    vwq_diff_cutoff = 0.85
-    vwq_diff_cutoff_span = 25
     play_vs_sf_prob = 0.5
     sf_depth = 6
     
@@ -96,7 +88,7 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.02}
 
     # TF
-    training_queue_min = 2048
+    training_queue_min = 3072
     vwq_blend = 0.5
     target_mean = 1.0
     draw_frac = 0.3
@@ -205,8 +197,6 @@ class ChessGame(object):
             self.vs_stockfish = True
             self.stockfish_is_white = np.random.uniform() < 0.5
         
-        # might cutover to stockfish later
-        self.meta['started_vs_stockfish'] = self.vs_stockfish
         self.meta['stockfish_is_white'] = self.stockfish_is_white
         
         self.tree = MCTSTree(self.board, self.config)
@@ -228,21 +218,11 @@ class ChessGame(object):
     def is_stockfish_turn(self):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
-    def get_stockfish_move(self):
-        try:
-            stockfish.set_fen_position(self.starting_fen)
-            if self.moves_played:
-                stockfish.make_moves_from_current_position(self.moves_played)
-        except Exception as e:
-            print(e)
-            print("Setting stockfish from current position")
-            stockfish.set_position(self.board.fen())
-        
-        # raw values for SF-returned moves
-        sf_moves = stockfish.get_top_moves(1)    
-        move = sf_moves[0]['Move']
-        
-        val_sf = sf_top_moves_to_values(sf_moves)[0]
+    def get_stockfish_move(self, eng):
+        b = chess.Board(self.board.fen())
+        info = eng.analyse(b, chess.engine.Limit(depth=6), info=chess.engine.INFO_ALL)
+        val_sf = score_to_cp_white(info['score'])
+        move = str(info['pv'][0])
         
         return move, val_sf
     
@@ -282,10 +262,6 @@ class ChessGame(object):
             return
     
         sims = int(getattr(self.tree, "sims_completed_this_move", 0))
-        # new
-        uniq = int(getattr(self.tree, "unique_sims_this_move", 0))
-        dup = max(0, sims - uniq)
-
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
     
@@ -294,9 +270,7 @@ class ChessGame(object):
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
             "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
-            "unique_sims": uniq,
-            "duplicate_sims": dup
+            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
         }
     
         # sumN for U term (no vloss in the new flow)
@@ -318,10 +292,10 @@ class ChessGame(object):
         self.tree_data[self.plies] = data
 
         
-    def make_move_with_stockfish(self):
+    def make_move_with_stockfish(self, eng):
         """
         Stockfish plays one move. We record a supervised-style target where
-        95% prob is on SF's chosen move, 5% is spread uniformly over the rest.
+        60% prob is on SF's chosen move, 50% is spread uniformly over the rest.
         The value target is SF's signed eval for the side to move (white-POV).
         """
         # no legal moves -> let terminal handler decide
@@ -330,25 +304,24 @@ class ChessGame(object):
             return self.check_for_terminal()
     
         # choose SF move + signed eval (white POV)
-        mv, sf_v = self.get_stockfish_move()
+        mv, sf_v = self.get_stockfish_move(eng)
         self.sf_eval = sf_v
         
-        # build policy over ALL legal moves: 95% on mv, 5% over others
+        # build policy over ALL legal moves: 60% on mv, 40% over others
         n = len(legal)
         probs = np.zeros(n, dtype=np.float32)
         sel = legal.index(mv)
         if n == 1:
             probs[0] = 1.0
         else:
-            probs[sel] = 0.95
-            spill = 0.05 / float(n - 1)
+            probs[sel] = 0.60
+            spill = 0.40 / float(n - 1)
             for i in range(n):
                 if i != sel:
                     probs[i] = spill
     
         # create the example just like a MCTS move and send to queue
         self.append_factorized_example(ucis=legal, pi=probs, vwq=sf_v)
-        
         return self.push_move(mv)
     
     def make_move_from_tree(self):
@@ -370,19 +343,6 @@ class ChessGame(object):
     
         vwq = self.tree.visit_weighted_Q()
         self.vwq = vwq
-        
-        # if winning but cant convert, finish with stockfish
-        if self.config.sf_finish and not self.vs_stockfish:
-            if np.abs(vwq >= self.config.vwq_diff_cutoff):
-                self.vwq_adv_counter += 1
-            else:
-                self.vwq_adv_counter = 0
-            
-            if self.vwq_adv_counter >= self.config.vwq_diff_cutoff:
-                self.vs_stock_fish = True
-                self.meta['cutover_to_sf_on'] = self.plies
-                # stockfish plays the winning side
-                self.stockfish_is_white = vwq > 0
     
         if pi is not None:
             self.append_factorized_example(ucis=ucis, pi=pi, vwq=vwq)
@@ -504,7 +464,8 @@ class GameLooper(object):
         self.clear_lru_cache = False
         
         # update global stockfish
-        stockfish.set_depth(self.config.sf_depth)
+        if self.config.play_vs_sf_prob:
+            self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
         
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
@@ -522,143 +483,144 @@ class GameLooper(object):
         mps, lps = self.mps, self.lps
         lru = LRUCache(self.config.lru_cache_size)
         counts = []
-        while completed_games < self.config.n_training_games:
-            if not self.active_games:
-                break
-    
-            preds_batch = []
-            finished = []
-            for game in list(self.active_games):
-                # if its stockfish turn, let SF move and skip MCTS this ply
-                if game.is_stockfish_turn():
-                    sf_terminal = game.make_move_with_stockfish()
-                    mps.tick(1)
-                        
-                    if sf_terminal:
-                        completed_games += 1
-                        self.finalize_game_data(game)
-                        self.maybe_log_results()
-                        finished.append(game.game_id)
-                        # pass until the next turn
-                        continue
-    
-                # if this game has reached its local sim budget, make the move
-                if game.tree.stop_simulating():
-                    # bot plays from tree
-                    mcts_terminal = game.make_move_from_tree()
-                    mps.tick(1)
-                    
-                    # terminal after bot move?
-                    if mcts_terminal:
-                        completed_games += 1
-                        self.finalize_game_data(game)
-                        self.maybe_log_results()
-                        finished.append(game.game_id)
-                        continue
-                    
-                    # if its stockfish turn, dont do any sims
+        with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+            while completed_games < self.config.n_training_games:
+                if not self.active_games:
+                    break
+        
+                preds_batch = []
+                finished = []
+                for game in list(self.active_games):
+                    # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
-                        continue
+                        sf_terminal = game.make_move_with_stockfish(eng)
+                        mps.tick(1)
+                            
+                        if sf_terminal:
+                            completed_games += 1
+                            self.finalize_game_data(game)
+                            self.maybe_log_results()
+                            finished.append(game.game_id)
+                            # pass until the next turn
+                            continue
+        
+                    # if this game has reached its local sim budget, make the move
+                    if game.tree.stop_simulating():
+                        # bot plays from tree
+                        mcts_terminal = game.make_move_from_tree()
+                        mps.tick(1)
+                        
+                        # terminal after bot move?
+                        if mcts_terminal:
+                            completed_games += 1
+                            self.finalize_game_data(game)
+                            self.maybe_log_results()
+                            finished.append(game.game_id)
+                            continue
+                        
+                        # if its stockfish turn, dont do any sims
+                        if game.is_stockfish_turn():
+                            continue
+        
+                    # otherwise, collect up to micro_batch_size leaves for this game
+                    n_collected, tries, de_dupes = 0, 0, 0
+                    bonus_hit, terminal, nones = 0, 0, 0
+                    try_stop, collect_stop = 0, 0
+                    while True: #n_collected < mbs:
+                        leaf_req = game.tree.collect_one_leaf(lru)
+                        if leaf_req is None:
+                            # this shouldnt really happen
+                            print("none was found !!")
+                            tries += 1
+                            nones += 1
+                        elif leaf_req["already_applied"]:
+                            lps.tick(1)
+                            tries += 1
+                            if leaf_req['terminal']:
+                                terminal += 1
+                            else:
+                                bonus_hit += 1
+                        else:    
+                            n_collected += 1 
+                            lps.tick(1)
+                            if leaf_req['already_pending']:
+                                de_dupes += 1
+                            else:
+                                lru.pending.add(leaf_req['cache_key'])
+                                preds_batch.append(leaf_req)
+                        # so we dont spin forever
+                        if tries >= try_break:
+                            try_stop += 1
+                            break
+                        if n_collected >= mbs:
+                            collect_stop += 1
+                            break
     
-                # otherwise, collect up to micro_batch_size leaves for this game
-                n_collected, tries, de_dupes = 0, 0, 0
-                bonus_hit, terminal, nones = 0, 0, 0
-                try_stop, collect_stop = 0, 0
-                while True: #n_collected < mbs:
-                    leaf_req = game.tree.collect_one_leaf(lru)
-                    if leaf_req is None:
-                        # this shouldnt really happen
-                        print("none was found !!")
-                        tries += 1
-                        nones += 1
-                    elif leaf_req["already_applied"]:
-                        lps.tick(1)
-                        tries += 1
-                        if leaf_req['terminal']:
-                            terminal += 1
-                        else:
-                            bonus_hit += 1
-                    else:    
-                        n_collected += 1 
-                        lps.tick(1)
-                        if leaf_req['already_pending']:
-                            de_dupes += 1
-                        else:
-                            lru.pending.add(leaf_req['cache_key'])
-                            preds_batch.append(leaf_req)
-                    # so we dont spin forever
-                    if tries >= try_break:
-                        try_stop += 1
-                        break
-                    if n_collected >= mbs:
-                        collect_stop += 1
-                        break
-
-                counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop, de_dupes])
-            # predict on the central batch (also updates caches)
-            logged = self.maybe_log_results()
-            if logged:
-                lru.stats()
-                # --- quick loop stats (temporary) ---
-                if counts:
-                    n_groups = len(counts)
-                    s_collected   = sum([r[0] for r in counts])
-                    s_tries       = sum([r[1] for r in counts])
-                    s_nones       = sum([r[2] for r in counts])
-                    s_terminals   = sum([r[3] for r in counts])
-                    s_bonus_hits  = sum([r[4] for r in counts])
-                    s_try_stops   = sum([r[5] for r in counts])
-                    s_collect_stops = sum([r[6] for r in counts])
-                    s_de_dupes = sum([r[7] for r in counts])
-
-                    avg_collected = s_collected / float(n_groups)
-                    avg_tries     = s_tries / float(n_groups)
-                    avg_de_dupes = s_de_dupes / float(n_groups)
-                    fill_ratio    = s_collected / float(max(1, n_groups * mbs))
-                    hit_ratio       = s_bonus_hits / float(max(1, s_tries))
-                    terminal_ratio  = s_terminals  / float(max(1, s_tries))
-                    none_ratio      = s_nones      / float(max(1, s_tries))
-                    print("------------------------------------------------------------")
-                    print("Loop stats"
-                        f" | groups={n_groups}  mbs={mbs}"
-                        f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
-                        f" | fill_ratio={fill_ratio:.3f}  avg_de_dupes={avg_de_dupes:.2f}")
-                    print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
-                        f" | terminals={s_terminals} ({terminal_ratio:.3%})"
-                        f" | nones={s_nones} ({none_ratio:.3%})")
-                    print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
-                    if lpb:
-                        print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-                    print(f"Avg ply of active_games {np.mean([g.plies for g in self.active_games]):<.3f}")
-                    print("------------------------------------------------------------")
-                counts = []
-                lpb = []
-            if preds_batch:
-                self.format_and_predict(preds_batch, lru)
-                lpb.append(len(preds_batch))
-    
-            # resolve fresh predictions back into each game tree
-            still_waiting = 0
-            for game in self.active_games:
-                still_waiting += game.tree.resolve_awaiting(lru)
-
-            if still_waiting > 0:
-                print(f"missed {still_waiting} preds somehow !!!!")
-            
-            if (still_waiting == 0) and self.clear_lru_cache:
-                if not logged:
+                    counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop, de_dupes])
+                # predict on the central batch (also updates caches)
+                logged = self.maybe_log_results()
+                if logged:
                     lru.stats()
-                lru.clear()
-                self.clear_lru_cache = False
-
-            # remove any finished games
-            self.active_games = [
-                g for g in self.active_games if g.game_id not in finished
-            ]
+                    # --- quick loop stats (temporary) ---
+                    if counts:
+                        n_groups = len(counts)
+                        s_collected   = sum([r[0] for r in counts])
+                        s_tries       = sum([r[1] for r in counts])
+                        s_nones       = sum([r[2] for r in counts])
+                        s_terminals   = sum([r[3] for r in counts])
+                        s_bonus_hits  = sum([r[4] for r in counts])
+                        s_try_stops   = sum([r[5] for r in counts])
+                        s_collect_stops = sum([r[6] for r in counts])
+                        s_de_dupes = sum([r[7] for r in counts])
+    
+                        avg_collected = s_collected / float(n_groups)
+                        avg_tries     = s_tries / float(n_groups)
+                        avg_de_dupes = s_de_dupes / float(n_groups)
+                        fill_ratio    = s_collected / float(max(1, n_groups * mbs))
+                        hit_ratio       = s_bonus_hits / float(max(1, s_tries))
+                        terminal_ratio  = s_terminals  / float(max(1, s_tries))
+                        none_ratio      = s_nones      / float(max(1, s_tries))
+                        print("------------------------------------------------------------")
+                        print("Loop stats"
+                            f" | groups={n_groups}  mbs={mbs}"
+                            f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
+                            f" | fill_ratio={fill_ratio:.3f}  avg_de_dupes={avg_de_dupes:.2f}")
+                        print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
+                            f" | terminals={s_terminals} ({terminal_ratio:.3%})"
+                            f" | nones={s_nones} ({none_ratio:.3%})")
+                        print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
+                        if lpb:
+                            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
+                        print(f"Avg ply of active_games {np.mean([g.plies for g in self.active_games]):<.3f}")
+                        print("------------------------------------------------------------")
+                    counts = []
+                    lpb = []
+                if preds_batch:
+                    self.format_and_predict(preds_batch, lru)
+                    lpb.append(len(preds_batch))
+        
+                # resolve fresh predictions back into each game tree
+                still_waiting = 0
+                for game in self.active_games:
+                    still_waiting += game.tree.resolve_awaiting(lru)
+    
+                if still_waiting > 0:
+                    print(f"missed {still_waiting} preds somehow !!!!")
                 
-            if completed_games + len(self.active_games) < self.config.n_training_games:
-                while len(self.active_games) < self.config.games_at_once:
-                    self.active_games.append(ChessGame())
+                if (still_waiting == 0) and self.clear_lru_cache:
+                    if not logged:
+                        lru.stats()
+                    lru.clear()
+                    self.clear_lru_cache = False
+    
+                # remove any finished games
+                self.active_games = [
+                    g for g in self.active_games if g.game_id not in finished
+                ]
+                    
+                if completed_games + len(self.active_games) < self.config.n_training_games:
+                    while len(self.active_games) < self.config.games_at_once:
+                        self.active_games.append(ChessGame())
         
         # final report
         self.maybe_log_results(force=True)
@@ -726,8 +688,8 @@ class GameLooper(object):
             "scenario": game.meta.get("scenario", ""),
             "plies": int(game.plies),
             "result": game.outcome or 0.0,
-            "vs_stockfish": bool(game.vs_stockfish),
-            "stockfish_color": bool(game.stockfish_is_white)
+            "vs_stockfish": game.vs_stockfish,
+            "stockfish_color": game.stockfish_is_white
         }
         # small in-memory record for recent prints only
         self.recent_games.append(mem_summary)
@@ -757,13 +719,13 @@ class GameLooper(object):
         # update JSONL index (small)
         keep = [
             "game_id", "ts", "n_retrains", "scenario", "plies",
-            "started_vs_stockfish", "stockfish_color", "result"
+            "vs_stockfish", "stockfish_color", "result"
         ]
         new_idx = {k: res[k] for k in keep}
         new_idx["json_file"] = out_file
         
         new_idx['beat_sf'] = False
-        if new_idx['started_vs_stockfish']:
+        if new_idx['vs_stockfish']:
             game_result = new_idx['result']
             if game_result > 0 and not game.stockfish_is_white:
                 new_idx['beat_sf'] = True
@@ -962,5 +924,10 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
+    Config.sims_target = 1000
+    main()
+    
+    Config.sims_target = 1200
     main()
     main()

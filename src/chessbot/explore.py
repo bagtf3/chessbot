@@ -127,9 +127,9 @@ def add_points_vs_sf(df):
     'result' is white-POV: -1 loss, 0 draw, +1 win.
     """
     d = df.copy()
-    vs_sf = d["started_vs_stockfish"] == True
+    vs_sf = d["vs_stockfish"] == True
 
-    # bot POV: if SF is white, flip sign; if SF is black, keep sign
+
     sign = np.where(d["stockfish_color"] == True, -1.0, 1.0)
     bot_res = np.where(vs_sf, sign * d["result"].astype(float), np.nan)
 
@@ -282,6 +282,7 @@ print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
 trend_check(df_trim, window=1000)
 
 df_games = pd.DataFrame.from_records(all_games)
+
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
@@ -292,7 +293,5 @@ tail_vs_prev(df_games, window=500)
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
-
-view = [g for g in all_games if (g['beat_sf'])]
+view = [g for g in all_games if (not g['beat_sf'])]
 gv = GameViewer(view[-2]['json_file']); gv.replay()
-#%%

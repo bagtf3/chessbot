@@ -294,3 +294,49 @@ from chessbot.review import GameViewer
 all_games = load_game_index()
 view = [g for g in all_games if (not g['beat_sf'])]
 gv = GameViewer(view[-1]['json_file']); gv.replay()
+
+#%%
+import numpy as np
+
+alpha = 0.8          # final weight on Z at game end
+gl = 5               # total plies
+plys = np.arange(gl) # [0,1,2,3,4]
+
+Z = np.full(gl, 1.0, dtype=np.float32)     # outcome = 1 for all examples
+Vwq = np.full(gl, 0.69, dtype=np.float32)  # Vwq = 0.69 for all examples
+
+# position fraction t = p / (gl - 1)  (guard gl>1)
+t = plys.astype(np.float32) / float(gl - 1)
+
+# ramp factor w = alpha * t  (0 -> alpha across the game)
+w = alpha * t
+
+# additive pieces (your requested style)
+Vwq_pure = (1.0 - w) * Vwq   # retained portion of Vwq
+tapered  = w * Z             # contribution coming from Z
+
+# final blended value
+Y = Vwq_pure + tapered
+
+print("plys:", plys)
+print("t (pos frac):", np.round(t, 3))
+print("w (ramp):", np.round(w, 3))
+print("Vwq_pure:", np.round(Vwq_pure, 3))
+print("tapered (Z part):", np.round(tapered, 3))
+print("Y (final):", np.round(Y, 3))
+
+import numpy as np
+Z = np.ones(20)
+Vwq = 0.6*np.ones(20)
+Vwq = np.random.uniform(0, 1, 20)
+taper_arr = np.array([x/20 for x in range(20)])
+alpha = 0.5
+
+use_taper = True
+if use_taper:
+    w = alpha * taper_arr
+    Y_value = (1.0 - w) * Vwq + w * Z
+else:
+    Y_value = (1.0 - alpha) * Vwq + alpha * Z
+
+

@@ -61,8 +61,8 @@ class Config(object):
     
     # Game stuff
     games_at_once = 100
-    n_training_games = 500
-    lru_cache_size = 500_000
+    n_training_games = 2000
+    lru_cache_size = 600_000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -722,11 +722,15 @@ class GameLooper(object):
             f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
         
         z = game.outcome if game.outcome is not None else 0.0
-        gl = game.plies # game length
+        g = game.plies or 0  # game length
+
+        # use g-1 as denominator only when there are >= 2 plies; otherwise taper=0
+        denom = g - 1 if g > 1 else None
+
         for x, heads in game.examples:
             vwq = heads.get("vwq", 0.0)
             ply = heads.get("ply", 0.0)
-            taper = ply / gl if gl else 0.0
+            taper = ply / denom if denom is not None else 0.0
             self.training_queue.append((x, heads, z, vwq, taper))
         game.examples = []
 
@@ -744,15 +748,15 @@ class GameLooper(object):
     
         # unpack examples
         X, Y_from, Y_to, Y_piece, Y_promo = [], [], [], [], []
-        Z, Vwq, taper_list = [], [], []
+        Z_list, Vwq_list, taper_list = [], [], []
         for x, heads, z, vwq, taper in self.training_queue:
             X.append(x)
             Y_from.append(heads["from"])
             Y_to.append(heads["to"])
             Y_piece.append(heads["piece"])
             Y_promo.append(heads["promo"])
-            Z.append(z)
-            Vwq.append(vwq)
+            Z_list.append(z)
+            Vwq_list.append(vwq)
             taper_list.append(taper)
 
         Z = np.asarray(Z_list, dtype=np.float32)
@@ -762,8 +766,12 @@ class GameLooper(object):
         # blend outcome with visit-weighted Q
         alpha = getattr(self.config, "vwq_blend", 0.0)
         use_taper = getattr(self.config, "use_vwq_alpha_taper", False)
-        alpha_eff = alpha * taper_arr if use_taper else alpha
-        Y_value = (1.0 - alpha_eff) * Z + alpha_eff * Vwq
+
+        if use_taper:
+            w = np.clip(alpha * taper_arr, 0.0, 1.0)
+            Y_value = (1.0 - w) * Vwq + w * Z
+        else:
+            Y_value = (1.0 - alpha) * Vwq + alpha * Z
         
         # assemble training dict
         X = np.asarray(X, dtype=np.float32)
@@ -913,7 +921,5 @@ def main():
     looper.run()
 
 if __name__ == '__main__':
-    main()
-    main()
     main()
     main()

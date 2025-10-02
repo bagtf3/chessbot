@@ -10,7 +10,7 @@ from chessbot import SF_LOC
 from chessbot.utils import rnd, format_time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:

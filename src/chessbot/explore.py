@@ -10,7 +10,7 @@ import pickle
 from chessbot.utils import rnd
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -123,7 +123,7 @@ def add_points_vs_sf(df):
     Adds two columns:
       - bot_result_vs_sf: {-1,0,1} from the BOT'S pov (NaN if not vs SF)
       - points_vs_sf: {0,0.5,1} from the BOT'S pov (NaN if not vs SF)
-    Assumes df has: ['result', 'started_vs_stockfish', 'stockfish_color'].
+    Assumes df has: ['result', 'vs_stockfish', 'stockfish_color'].
     'result' is white-POV: -1 loss, 0 draw, +1 win.
     """
     d = df.copy()
@@ -157,7 +157,7 @@ def wilson(p, n, z=1.96):
 
 
 def plot_rolling_rates_with_ci(df, window=200):
-    d = df[df.started_vs_stockfish].sort_values("ts").reset_index(drop=True).copy()
+    d = df[df.vs_stockfish].sort_values("ts").reset_index(drop=True).copy()
     sign = np.where(d.stockfish_color == True, -1.0, 1.0)
     res = sign * d.result.astype(float)
     win = (res == 1).astype(float)
@@ -212,7 +212,7 @@ def tail_vs_prev(df, window=200):
         se = math.sqrt((s1 * s1) / n1 + (s2 * s2) / n2)
         return (m2 - m1) / se if se else float("nan")
     
-    d = df[df.started_vs_stockfish].sort_values("ts").reset_index(drop=True)
+    d = df[df.vs_stockfish].sort_values("ts").reset_index(drop=True)
     d = d.copy()
     sign = np.where(d.stockfish_color == True, -1.0, 1.0)
     res = sign * d.result.astype(float)
@@ -277,21 +277,20 @@ df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
-plot_cpl_and_bmr(df_trim, window=1000)
+plot_cpl_and_bmr(df_trim, window=200)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-trend_check(df_trim, window=1000)
+trend_check(df_trim, window=200)
 
 df_games = pd.DataFrame.from_records(all_games)
-
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=500)
-tail_vs_prev(df_games, window=500)
+plot_rolling_rates_with_ci(df_games, window=100)
+tail_vs_prev(df_games, window=100)
 
 
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
 view = [g for g in all_games if (not g['beat_sf'])]
-gv = GameViewer(view[-2]['json_file']); gv.replay()
+gv = GameViewer(view[-1]['json_file']); gv.replay()

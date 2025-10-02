@@ -33,28 +33,28 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_v2"
+    run_tag = "conv_1000_selfplay_phase2"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_model_big_v1000.h5"
+    init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
     c_puct = 1.25
     anytime_uniform_mix = 0.35
     endgame_uniform_mix = 0.35
-    opponent_uniform_mix = 0.45
+    opponent_uniform_mix = 0.5
 
     # Simulation schedule
-    sims_target = 500
+    sims_target = 1200
     micro_batch_size = 12
 
     # early stop
     es_min_sims = 600
-    es_check_every = 7
+    es_check_every = 24
     es_gap_frac = 0.7
     es_top_node_frac = 0.75
     
     # Q-override selection
     use_q_override = True
-    q_override_vis_ratio = 0.85
+    q_override_vis_ratio = 0.80
     q_override_q_margin = 0.1
     q_override_min_vis = 100
     q_override_top_k = 3
@@ -79,19 +79,20 @@ class Config(object):
     
     # boosts/penalize
     use_prior_boosts = True
-    prior_clip_max = 0.5
-    prior_clip_min = 0.01
+    prior_clip_max = 0.35
+    prior_clip_min = 0.05
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.02}
+    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
-    training_queue_min = 3072
+    training_queue_min = 4096
     vwq_blend = 0.5
-    target_mean = 1.0
-    draw_frac = 0.3
+    use_vwq_alpha_taper = True
+    target_mean = 0.5
+    draw_frac = 0.5
     factorized_bins = (64, 64, 6, 4)
 
     def to_dict(self):
@@ -381,7 +382,7 @@ class ChessGame(object):
         x = self.board.stacked_planes(5)
         self.examples.append(
             (x, {"from": from_m, "to": to_m, "piece": pc_m,
-                 "promo": pr_m, "vwq": vwq}))
+                 "promo": pr_m, "vwq": vwq, "ply": self.plies}))
 
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
@@ -463,10 +464,6 @@ class GameLooper(object):
         self.all_evals = pd.DataFrame()
         self.clear_lru_cache = False
         
-        # update global stockfish
-        if self.config.play_vs_sf_prob:
-            self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
         self._last_stats_log = 0.0
@@ -524,15 +521,13 @@ class GameLooper(object):
         
                     # otherwise, collect up to micro_batch_size leaves for this game
                     n_collected, tries = 0, 0
-                    bonus_hit, terminal, nones = 0, 0, 0
+                    bonus_hit, terminal = 0, 0
                     try_stop, collect_stop = 0, 0
                     while True: #n_collected < mbs:
                         leaf_req = game.tree.collect_one_leaf(lru)
                         if leaf_req is None:
                             # this shouldnt really happen
-                            print("none was found !!")
                             tries += 1
-                            nones += 1
                         elif leaf_req["already_applied"]:
                             lps.tick(1)
                             tries += 1
@@ -552,7 +547,7 @@ class GameLooper(object):
                             collect_stop += 1
                             break
     
-                    counts.append([n_collected, tries, nones, terminal, bonus_hit, try_stop, collect_stop])
+                    counts.append([n_collected, tries, terminal, bonus_hit, try_stop, collect_stop])
                 # predict on the central batch (also updates caches)
                 logged = self.maybe_log_results()
                 if logged:
@@ -562,30 +557,28 @@ class GameLooper(object):
                         n_groups = len(counts)
                         s_collected   = sum([r[0] for r in counts])
                         s_tries       = sum([r[1] for r in counts])
-                        s_nones       = sum([r[2] for r in counts])
-                        s_terminals   = sum([r[3] for r in counts])
-                        s_bonus_hits  = sum([r[4] for r in counts])
-                        s_try_stops   = sum([r[5] for r in counts])
-                        s_collect_stops = sum([r[6] for r in counts])
+                        s_terminals   = sum([r[2] for r in counts])
+                        s_bonus_hits  = sum([r[3] for r in counts])
+                        s_try_stops   = sum([r[4] for r in counts])
+                        s_collect_stops = sum([r[5] for r in counts])
     
-                        avg_collected = s_collected / float(n_groups)
-                        avg_tries     = s_tries / float(n_groups)
-                        fill_ratio    = s_collected / float(max(1, n_groups * mbs))
-                        hit_ratio       = s_bonus_hits / float(max(1, s_tries))
-                        terminal_ratio  = s_terminals  / float(max(1, s_tries))
-                        none_ratio      = s_nones      / float(max(1, s_tries))
+                        avg_collected = s_collected / n_groups
+                        avg_tries     = s_tries / n_groups
+                        fill_ratio    = s_collected / max(1, n_groups * mbs)
+                        hit_ratio       = s_bonus_hits / max(1, s_tries)
+                        terminal_ratio  = s_terminals  / max(1, s_tries)
                         print("------------------------------------------------------------")
                         print("Loop stats"
                             f" | groups={n_groups}  mbs={mbs}"
                             f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
                             f" | fill_ratio={fill_ratio:.3f} ")
                         print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
-                            f" | terminals={s_terminals} ({terminal_ratio:.3%})"
-                            f" | nones={s_nones} ({none_ratio:.3%})")
+                            f" | terminals={s_terminals} ({terminal_ratio:.3%})")
                         print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
                         if lpb:
                             print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-                        print(f"Avg ply of active_games {np.mean([g.plies for g in self.active_games]):<.3f}")
+                        avgply = np.mean([g.plies for g in self.active_games])
+                        print(f"Avg ply of active_games {avgply:<.3f}")
                         print("------------------------------------------------------------")
                     counts = []
                     lpb = []
@@ -597,11 +590,8 @@ class GameLooper(object):
                 still_waiting = 0
                 for game in self.active_games:
                     still_waiting += game.tree.resolve_awaiting(lru)
-    
-                if still_waiting > 0:
-                    print(f"missed {still_waiting} preds somehow !!!!")
                 
-                if (still_waiting == 0) and self.clear_lru_cache:
+                if self.clear_lru_cache:
                     if not logged:
                         lru.stats()
                     lru.clear()
@@ -732,9 +722,12 @@ class GameLooper(object):
             f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
         
         z = game.outcome if game.outcome is not None else 0.0
+        gl = game.plies # game length
         for x, heads in game.examples:
             vwq = heads.get("vwq", 0.0)
-            self.training_queue.append((x, heads, z, vwq))
+            ply = heads.get("ply", 0.0)
+            taper = ply / gl if gl else 0.0
+            self.training_queue.append((x, heads, z, vwq, taper))
         game.examples = []
 
         if len(self.training_queue) >= self.config.training_queue_min:
@@ -750,8 +743,9 @@ class GameLooper(object):
             return
     
         # unpack examples
-        X, Y_from, Y_to, Y_piece, Y_promo, Z, Vwq = [], [], [], [], [], [], []
-        for x, heads, z, vwq in self.training_queue:
+        X, Y_from, Y_to, Y_piece, Y_promo = [], [], [], [], []
+        Z, Vwq, taper_list = [], [], []
+        for x, heads, z, vwq, taper in self.training_queue:
             X.append(x)
             Y_from.append(heads["from"])
             Y_to.append(heads["to"])
@@ -759,13 +753,18 @@ class GameLooper(object):
             Y_promo.append(heads["promo"])
             Z.append(z)
             Vwq.append(vwq)
-    
+            taper_list.append(taper)
+
+        Z = np.asarray(Z_list, dtype=np.float32)
+        Vwq = np.asarray(Vwq_list, dtype=np.float32)
+        taper_arr = np.asarray(taper_list, dtype=np.float32)
+
         # blend outcome with visit-weighted Q
-        alpha = self.config.vwq_blend
-        Z = np.asarray(Z, dtype=np.float32)
-        Vwq = np.asarray(Vwq, dtype=np.float32)
-        Y_value = (1-alpha)*Z + alpha*Vwq
-    
+        alpha = getattr(self.config, "vwq_blend", 0.0)
+        use_taper = getattr(self.config, "use_vwq_alpha_taper", False)
+        alpha_eff = alpha * taper_arr if use_taper else alpha
+        Y_value = (1.0 - alpha_eff) * Z + alpha_eff * Vwq
+        
         # assemble training dict
         X = np.asarray(X, dtype=np.float32)
         Y = {
@@ -773,7 +772,8 @@ class GameLooper(object):
             "best_from": np.asarray(Y_from, dtype=np.float32),
             "best_to": np.asarray(Y_to, dtype=np.float32),
             "best_piece": np.asarray(Y_piece, dtype=np.float32),
-            "best_promo": np.asarray(Y_promo, dtype=np.float32)}
+            "best_promo": np.asarray(Y_promo, dtype=np.float32)
+        }
     
         # per-sample weights (based on raw outcomes)
         target_mean = self.config.target_mean
@@ -813,7 +813,8 @@ class GameLooper(object):
         even_weights = np.ones_like(w)
         s_wts = {
             'value': w, "best_from": even_weights, "best_to": even_weights,
-            "best_piece": even_weights, 'best_promo': even_weights}
+            "best_piece": even_weights, 'best_promo': even_weights
+        }
 
         # fit and  save new model
         self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)        
@@ -858,7 +859,6 @@ class GameLooper(object):
             f"Number of retrains: {self.n_retrains}\n"
         )
         return True
-
 
 
 def init_selfplay():
@@ -912,15 +912,8 @@ def main():
     
     looper.run()
 
-
 if __name__ == '__main__':
     main()
-    
-    Config.sims_target = 1000
-    Config.es_min_sims = 600
     main()
-    
-    Config.sims_target = 1200
-    Config.es_min_sims = 800
     main()
     main()

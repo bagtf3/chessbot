@@ -38,8 +38,8 @@ class Config(object):
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
     c_puct = 1.25
-    anytime_uniform_mix = 0.35
-    endgame_uniform_mix = 0.35
+    anytime_uniform_mix = 0.3
+    endgame_uniform_mix = 0.4
     opponent_uniform_mix = 0.5
 
     # Simulation schedule
@@ -56,13 +56,13 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.1
-    q_override_min_vis = 100
+    q_override_min_vis = 256
     q_override_top_k = 3
     
     # Game stuff
     games_at_once = 100
-    n_training_games = 2000
-    lru_cache_size = 600_000
+    n_training_games = 500
+    lru_cache_size = 500_000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -80,7 +80,7 @@ class Config(object):
     # boosts/penalize
     use_prior_boosts = True
     prior_clip_max = 0.35
-    prior_clip_min = 0.05
+    prior_clip_min = 0.01
     endgame_prior_adjustments = {
         "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
     }
@@ -606,7 +606,8 @@ class GameLooper(object):
                     while len(self.active_games) < self.config.games_at_once:
                         self.active_games.append(ChessGame())
         
-        # final report
+        # train with whatever we got and final report
+        self.trigger_retrain()
         self.maybe_log_results(force=True)
         return
 
@@ -921,5 +922,7 @@ def main():
     looper.run()
 
 if __name__ == '__main__':
+    main()
+    main()
     main()
     main()

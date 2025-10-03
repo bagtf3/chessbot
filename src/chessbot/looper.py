@@ -43,7 +43,7 @@ class Config(object):
     opponent_uniform_mix = 0.5
 
     # Simulation schedule
-    sims_target = 1200
+    sims_target = 1600
     micro_batch_size = 12
 
     # early stop
@@ -56,13 +56,13 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.1
-    q_override_min_vis = 256
+    q_override_min_vis = 396
     q_override_top_k = 3
     
     # Game stuff
     games_at_once = 100
     n_training_games = 500
-    lru_cache_size = 500_000
+    lru_cache_size = 650_000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -922,7 +922,4 @@ def main():
     looper.run()
 
 if __name__ == '__main__':
-    main()
-    main()
-    main()
     main()

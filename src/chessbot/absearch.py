@@ -13,18 +13,26 @@ class GAUnit:
     def __init__(self, evaluator=None, **limits):
         self.evaluator = evaluator
         self.tt = TranspositionTable()
-        
+
         # limits
         self.dl = limits.get("depth", 5)
         self.tl = limits.get("time", None)
         self.nl = limits.get("node", None)
-
+        # qsearch spefic
+        self.max_qply = limits.get("max_qply", 6)
+        self.max_qcaptures = limits.get("max_qcaptures", 12)
+        self.qdelta = limits.get("qdelta", None)
+        
+        # some stats
         self.nodes = 0
         self.qnodes = 0
         
-        # qsearch depth tracking
+        # qsearch specific stats
+        self.use_fast_q = False
         self.max_qply_seen = 0
         self.qdepth_hist = {}
+        self.qcaptures_considered = 0
+        self.qtime_ms = 0
 
     def evaluate_board(self, board):
         if self.evaluator:
@@ -62,63 +70,8 @@ class GAUnit:
         if board.gives_check(mv):
             return 500
         return 0
-
-    def qsearch(self, board, alpha, beta, ply, start_time=None):
-        # record ply stats
-        if ply > self.max_qply_seen:
-            self.max_qply_seen = ply
-        self.qdepth_hist[ply] = self.qdepth_hist.get(ply, 0) + 1
-
-        """Quiescence: captures only. low-allocation, hot-loop friendly."""
-        # time/node cutoff -> return static evaluation
-        if self.tl and start_time and (time.time() - start_time) > self.tl:
-            return self.evaluate_board(board)
-        if self.nl and self.nodes >= self.nl:
-            return self.evaluate_board(board)
-
-        self.qnodes += 1
-
-        # local refs for speed
-        eval_fn = self.evaluate_board
-        is_capture = board.is_capture
-        mvvlva = board.mvvlva
-        legal_moves = board.legal_moves()
-
-        stand = eval_fn(board)
-        if stand >= beta:
-            return stand
-        if alpha < stand:
-            alpha = stand
-
-        # collect captures with precomputed mvvlva scores
-        scored = []
-        append = scored.append
-        for m in legal_moves:
-            if is_capture(m):
-                append((mvvlva(m), m))
-
-        if not scored:
-            return stand
-
-        scored.sort(reverse=True)  # sort by mvvlva score (first tuple item)
-
-        best = stand
-        for _, mv in scored:
-            if not board.push_uci(mv):
-                continue
-            sc = -self.qsearch(board, -beta, -alpha, ply + 1, start_time)
-            board.unmake()
-            if sc >= beta:
-                return sc
-            if sc > best:
-                best = sc
-                if sc > alpha:
-                    alpha = sc
-
-        # **BUG FIX**: return the best found quiescent score (was a bare `return`)
-        return best
     
-    def qsearch_fast(self, board, alpha, beta, ply, start_time=None):
+    def qsearch(self, board, alpha, beta, ply, start_time=None):
         """
         Fast quiescence that delegates to the C++ board.qsearch(...) wrapper.
     
@@ -132,8 +85,7 @@ class GAUnit:
         if ply > self.max_qply_seen:
             self.max_qply_seen = ply
         self.qdepth_hist[ply] = self.qdepth_hist.get(ply, 0) + 1
-    
-        # same cutoff logic as python qsearch (preserve behavior)
+        
         if self.tl and start_time and (time.time() - start_time) > self.tl:
             return self.evaluate_board(board)
         if self.nl and self.nodes >= self.nl:
@@ -144,8 +96,8 @@ class GAUnit:
             "max_qply": getattr(self, "max_qply", None),
             "max_qcaptures": getattr(self, "max_qcaptures", None),
             "qdelta": getattr(self, "qdelta", None),
-            "time_limit_ms": None if not getattr(self, "tl", None) else int(self.tl * 1000),
-            "node_limit": getattr(self, "nl", None),
+            "time_limit_ms": None if not self.tl else int(self.tl * 1000),
+            "node_limit": self.nl
         }
         # remove keys with None because the wrapper expects only provided fields
         qopts = {k: v for k, v in qopts.items() if v is not None}
@@ -155,20 +107,15 @@ class GAUnit:
     
         # update counters from returned qstats
         # qstats keys: "qnodes", "max_qply_seen", "captures_considered", "time_used_ms"
-        qnodes_local = int(qstats.get("qnodes", 0))
-        self.qnodes += qnodes_local
+        self.qnodes += qstats.get("qnodes", 0)
     
-        max_qply_local = int(qstats.get("max_qply_seen", 0))
+        max_qply_local = qstats.get("max_qply_seen", 0)
         if max_qply_local > self.max_qply_seen:
             self.max_qply_seen = max_qply_local
     
-        # keep captures_considered/time_used if you track them; example:
-        if hasattr(self, "captures_considered"):
-            self.captures_considered = getattr(self, "captures_considered", 0)
-            self.captures_considered += int(qstats.get("captures_considered", 0))
-        if hasattr(self, "qtime_ms"):
-            self.qtime_ms = getattr(self, "qtime_ms", 0)
-            self.qtime_ms += int(qstats.get("time_used_ms", 0))
+        # keep captures_considered/time_used
+        self.qcaptures_considered = qstats.get("captures_considered", 0)
+        self.qtime_ms = qstats.get("time_used_ms", 0)
     
         return score
 
@@ -210,8 +157,9 @@ class GAUnit:
                 return -VALUE_MATE + ply
             return 0
 
-        moves = sorted(legal, key=lambda m: self.move_order_key(board, m, tt_best),
-                       reverse=True)
+        moves = sorted(
+            legal, key=lambda m: self.move_order_key(board, m, tt_best), reverse=True
+        )
 
         best_score = -VALUE_MATE
         best_move = None
@@ -271,8 +219,10 @@ class GAUnit:
                 break
 
         if best_move:
-            self.tt.store_entry(key, depth, bound_flag.EXACTBOUND,
-                                best_score, best_move, 0)
+            self.tt.store_entry(
+                key, depth, bound_flag.EXACTBOUND, best_score, best_move, 0
+            )
+        
         return best_score, best_pv
 
     def search(self, board, max_depth=None, verbose=False):
@@ -280,6 +230,7 @@ class GAUnit:
         self.qnodes = 0
         self.max_qply_seen = 0
         self.qdepth_hist = {}
+        
         max_depth = max_depth or self.dl
         start = time.time()
         best_move = None
@@ -342,7 +293,6 @@ class GAUnit:
             print(f"  {ply:2d}: {cnt}")
         if len(items) > 8:
             print(f"  ... ({len(items)} ply levels total)")
-
 
 
 if __name__ == '__main__':
@@ -459,18 +409,24 @@ if __name__ == '__main__':
     print("itemized:", ev.evaluate_itemized(b))
 
     # plug into GAUnit (replace your import/module path as needed)
-    u = GAUnit(evaluator=ev, depth=5, time=10, node=None, verbose=True)
-    u.max_qply = 5
-    u.max_qcaptures = 8
+    u = GAUnit(evaluator=ev, depth=5, time=3, node=None, verbose=True)
+    u.max_qply = 10
+    u.max_qcaptures = 16
     u.qdelta = 0
 
     # now search as before:
     best, score, info = u.search(random_init(1), max_depth=5, verbose=True)
     u.print_qstats()
-    
-    
-    # quick smoke test
-b = random_init(1)
-u = GAUnit(evaluator=ev, depth=3, time=1)
-res = u.qsearch(b, -10000, 10000, 0)
-print("qsearch returned:", res, type(res))
+
+
+u = GAUnit(evaluator=ev, depth=5, time=10, verbose=True)
+u.max_qply = None
+u.max_qcaptures = None
+u.qdelta = 0
+
+rb = random_init(1)
+best, score, info = u.search(b, max_depth=5, verbose=True)
+
+# profile
+%prun -s cumulative -l 50 u.search(random_init(1), max_depth=5, verbose=True)
+

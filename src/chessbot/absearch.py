@@ -231,7 +231,7 @@ class GAUnit:
         for mv in moves:
             board.push_uci(mv)
             child_score = self.absearch(
-                board, depth - 1, alpha, beta, 1, maximizing, start_time
+                board, depth - 1, alpha, beta, 1, not maximizing, start_time
             )
             child_pv = self.extract_pv(board, max_len=depth-1)
             board.unmake()
@@ -302,7 +302,7 @@ class GAUnit:
                 (depth, best_move, best_score, self.nodes, self.qnodes, elapsed, pv))
 
             info["best_pv"] = pv
-            
+
             if verbose:
                 print(
                     f"depth {depth}: best={best_move} score={best_score} "

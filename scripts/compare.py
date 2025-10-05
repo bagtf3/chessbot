@@ -5,23 +5,8 @@ from chessbot.psqt import build_weights
 from chessbot.absearch import GAUnit
 from chessbot.utils import show_board, random_init
 
-board = chess.Board()
-search = DSearch(board)
-search.limit.limited["depth"] = 5
-search.iterativeDeepening()
 
-board = chess.Board()
-board.turn = False
-search = DSearch(board.mirror())
-search.limit.limited["depth"] = 5
-search.iterativeDeepening()
-
-board = chess.Board()
-search = DSearch(board.mirror())
-search.limit.limited["depth"] = 5
-search.iterativeDeepening()
-
-def make_gaunit(depth=1, time=20):
+def make_gaunit(depth=5, time=20):
     ev = Evaluator()
     ev.configure(build_weights(zeros=False))
     g = GAUnit(ev, depth=depth, time=time)
@@ -30,18 +15,18 @@ def make_gaunit(depth=1, time=20):
     return g
 
 
-rb = random_init(41)
+rb = random_init(15)
 
 board = chess.Board(rb.fen())
 show_board(board, flipped=True)
 search = DSearch(board)
 
-search.limit.limited["depth"] = 1
+search.limit.limited["depth"] = 3
 search.iterativeDeepening()
 
 my_search = make_gaunit()
 fb = FastBoard(board.fen())
-best, score, info = my_search.search(fb, verbose=True)
+best, score, info = my_search.search(fb, max_depth=7, verbose=True)
 print(fb.san(best), score)
 
 

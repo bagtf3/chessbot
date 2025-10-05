@@ -257,6 +257,7 @@ def tail_vs_prev(df, window=200):
 
     return pd.DataFrame(rows).T.round(6)
 #%%
+from pprint import pprint
 #%matplotlib inline
 all_games = load_game_index()
 
@@ -277,9 +278,9 @@ df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
-plot_cpl_and_bmr(df_trim, window=300)
+plot_cpl_and_bmr(df_trim, window=500)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-trend_check(df_trim, window=300)
+pprint(trend_check(df_trim, window=500))
 
 df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
@@ -292,6 +293,6 @@ tail_vs_prev(df_games, window=200)
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf'])]
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
 gv = GameViewer(view[-1]['json_file']); gv.replay()
 

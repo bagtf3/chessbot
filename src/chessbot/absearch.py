@@ -18,7 +18,7 @@ class GAUnit:
         self.dl = limits.get("depth", 5)
         self.tl = limits.get("time", None)
         self.nl = limits.get("node", None)
-        # qsearch spefic
+        # qsearch specific
         self.max_qply = limits.get("max_qply", 6)
         self.max_qcaptures = limits.get("max_qcaptures", 12)
         self.qdelta = limits.get("qdelta", None)
@@ -42,10 +42,10 @@ class GAUnit:
     def terminal_value(self, board, ply):
         """Use pyfastchess helper and map to mate-distance values."""
         res = terminal_value_white_pov(board)
-        # None => ongoing, 0 => draw
+        # None -> ongoing, 0 -> draw
         if not res:
             return res
-        return VALUE_MATE - ply if res > 0 else -VALUE_MATE + ply
+        return VALUE_MATE - ply if res == 1 else -VALUE_MATE + ply
 
     def extract_pv(self, board, max_len=32):
         pv = []
@@ -61,15 +61,6 @@ class GAUnit:
                 break
             pv.append(mv)
         return pv
-
-    def move_order_key(self, board, mv, tt_best):
-        if tt_best and mv == tt_best:
-            return 100000
-        if board.is_capture(mv):
-            return 1000 + board.mvvlva(mv)
-        if board.gives_check(mv):
-            return 500
-        return 0
     
     def qsearch(self, board, alpha, beta, ply, start_time=None):
         """
@@ -145,65 +136,73 @@ class GAUnit:
         if depth <= 0:
             return self.qsearch(board, alpha, beta, ply, start_time)
 
-        tv = self.terminal_value(board, ply)
-        if tv is not None:
-            return tv
-
         tt_best = tt_ent["move_uci"] if tt_ent else None
 
-        legal = board.legal_moves()
-        if not legal:
+        scores_moves = board.ordered_moves(tt_best)
+        if not scores_moves:
             if board.in_check():
                 return -VALUE_MATE + ply
             return 0
 
-        moves = sorted(
-            legal, key=lambda m: self.move_order_key(board, m, tt_best), reverse=True
-        )
+        moves = [m for (s, m) in scores_moves]
 
+        # canonical setup: remember old alpha
+        old_alpha = alpha
         best_score = -VALUE_MATE
         best_move = None
-        flag = bound_flag.UPPERBOUND
 
+        # main negamax loop
+        moves_made = 0
         for mv in moves:
-            if not board.push_uci(mv):
-                continue
+            moves_made += 1
+            board.push_uci(mv)
             score = -self.absearch(board, depth - 1, -beta, -alpha, ply + 1, start_time)
             board.unmake()
 
             if score > best_score:
                 best_score = score
                 best_move = mv
+
             if score > alpha:
                 alpha = score
-                flag = bound_flag.EXACTBOUND
+
             if alpha >= beta:
-                flag = bound_flag.LOWERBOUND
                 break
+
+        # baked in terminal check for free
+        if moves_made == 0:
+            return -VALUE_MATE + ply if board.in_check() else 0
+
+        # canonical bound classification AFTER the loop (matches Disservin)
+        if best_score >= beta:
+            flag = bound_flag.LOWERBOUND
+        elif alpha != old_alpha:
+            flag = bound_flag.EXACTBOUND
+        else:
+            flag = bound_flag.UPPERBOUND
 
         self.tt.store_entry(key, depth, flag, best_score, best_move or "0000", ply)
         return best_score
 
     def absearch_root(self, board, depth, alpha, beta, start_time=None):
-        legal = board.legal_moves()
-        if not legal:
-            return self.qsearch(board, alpha, beta, 0, start_time), []
-
         key = board.hash()
         tt_entry = self.tt.probe_entry(key)
         tt_best = tt_entry["move_uci"] if tt_entry else None
-
-        moves = sorted(
-            legal, key=lambda m: self.move_order_key(board, m, tt_best),
-            reverse=True)
-
+        
+        scores, moves = [], []
+        for s, m in board.ordered_moves(tt_best):
+            scores.append(s)
+            moves.append(m)
+        
+        if not moves:
+            return self.qsearch(board, alpha, beta, 0, start_time), []
+        
         best_score = -VALUE_MATE
         best_move = None
         best_pv = []
 
         for mv in moves:
-            if not board.push_uci(mv):
-                continue
+            board.push_uci(mv)
             score = -self.absearch(board, depth - 1, -beta, -alpha, 1, start_time)
             child_pv = self.extract_pv(board, max_len=depth-1)
             board.unmake()
@@ -217,7 +216,7 @@ class GAUnit:
                 alpha = score
             if alpha >= beta:
                 break
-
+        
         if best_move:
             self.tt.store_entry(
                 key, depth, bound_flag.EXACTBOUND, best_score, best_move, 0
@@ -293,140 +292,3 @@ class GAUnit:
             print(f"  {ply:2d}: {cnt}")
         if len(items) > 8:
             print(f"  ... ({len(items)} ply levels total)")
-
-
-if __name__ == '__main__':
-    from pyfastchess import Board as fastboard
-    from chessbot.utils import random_init
-
-    # assume these imports are available in your project
-    import numpy as np
-    import chess                      # used by the psqt tables
-    from pyfastchess import Evaluator # C++ evaluator binding
-
-    from chessbot.psqt import psqt_values
-
-    # helper: convert the psqt_values dict to a (4,6,64) int32 array
-    def build_psqt_buckets(psqt_values):
-        # piece order expected by Evaluator: P,N,B,R,Q,K -> indices 0..5
-        piece_order = [chess.PAWN, chess.KNIGHT, chess.BISHOP,
-                       chess.ROOK, chess.QUEEN, chess.KING]
-    
-        # base 6x64 from psqt_values
-        base = np.zeros((6, 64), dtype=np.int32)
-        for pi, piece in enumerate(piece_order):
-            tbl = psqt_values[piece]  # list of 64 ints
-            base[pi, :] = np.array(tbl, dtype=np.int32)
-    
-        # bucket0..bucket2: reuse base (you can tweak later via GA)
-        buckets = np.zeros((4, 6, 64), dtype=np.int32)
-        buckets[0] = base.copy()   # 0..19 plies
-        buckets[1] = base.copy()   # 20..39 plies
-        buckets[2] = base.copy()   # 40..59 plies
-    
-        # bucket3 = endgame tweak: reward advanced pawns and king centrality
-        eg = base.copy()
-    
-        # increase pawn rewards on advanced ranks (white-pov):
-        # indices are 0..63 with 0==a1, 8==a2, ... 56==a8
-        # we add modest positive bonuses to ranks 5-7 (indices 32..55), bigger on 7th rank
-        pawn_idx = 0  # pawn is piece index 0
-        for sq in range(64):
-            rank = (sq // 8) + 1  # rank 1..8
-            # reward advanced pawns (white-perspective)
-            if rank >= 6:
-                eg[pawn_idx, sq] += 30   # strongly encourage passed/advanced pawns
-            elif rank == 5:
-                eg[pawn_idx, sq] += 12
-            elif rank == 4:
-                eg[pawn_idx, sq] += 6
-    
-        # king: encourage centralization in endgame (reduce "safety" penalty)
-        king_idx = 5
-        # add +40 to central squares (d4,e4,d5,e5 indices)
-        central_squares = []
-        files = [3, 4]   # d,e (0=a)
-        ranks = [3, 4]   # 4th,5th rank (0-based rank indices 3,4)
-        for r in ranks:
-            for f in files:
-                central_squares.append(r*8 + f)
-        for sq in central_squares:
-            eg[king_idx, sq] += 40
-    
-        # Slightly reduce piece-square values for heavy pieces in endgame (encourage activity)
-        for pidx in (3, 4):  # rook and queen
-            eg[pidx, :] += 6
-    
-        buckets[3] = eg
-    
-        # Flatten to shape (4, 384) or (1536,) — evaluator accepts multiple shapes
-        return buckets.reshape((4, 6*64)).astype(np.int32)
-    
-    psqt_arr = build_psqt_buckets(psqt_values)
-
-
-    # mobility weights (pawn..king) in centipawns per reachable empty square
-    mobility_weights = [0, 4, 6, 2, 1, 0]  # ints, length 6
-    
-    # tactical weights: 3 features per piece (attacked_by_lower, defended, hanging)
-    # ordering: [pawn_att_low, pawn_def, pawn_hang, knight_att_low, ...]
-    tactical_weights = [
-        # pawn
-        -10,  4,  -40,
-        # knight
-        -35, 10, -120,
-        # bishop
-        -30, 10, -110,
-        # rook
-        -45, 10, -150,
-        # queen
-        -90, 20, -350,
-        # king
-        0,   20, 0
-    ]
-
-    king_weights = [0, 0, 0]   # placeholder (unused for now)
-    stm_bias = 30               # no side-to-move bias by default
-    global_scale = 100         # 100 == 1.00
-    
-    # Assemble config dict for Evaluator.configure()
-    weights_dict = {
-        "psqt": psqt_arr,                    # shape (4,384) int32
-        "mobility_weights": mobility_weights,
-        "tactical_weights": tactical_weights,
-        "king_weights": king_weights,
-        "stm_bias": stm_bias,
-        "global_scale": global_scale
-    }
-
-    # instantiate and configure the C++ evaluator
-    ev = Evaluator()
-    ev.configure(weights_dict)
-
-    # quick test
-    b = fastboard()   # startpos
-    print("eval:", ev.evaluate(b))
-    print("itemized:", ev.evaluate_itemized(b))
-
-    # plug into GAUnit (replace your import/module path as needed)
-    u = GAUnit(evaluator=ev, depth=5, time=3, node=None, verbose=True)
-    u.max_qply = 10
-    u.max_qcaptures = 16
-    u.qdelta = 0
-
-    # now search as before:
-    best, score, info = u.search(random_init(1), max_depth=5, verbose=True)
-    u.print_qstats()
-
-
-u = GAUnit(evaluator=ev, depth=5, time=10, verbose=True)
-u.max_qply = None
-u.max_qcaptures = None
-u.qdelta = 0
-
-rb = random_init(1)
-best, score, info = u.search(b, max_depth=5, verbose=True)
-
-# profile
-%prun -s cumulative -l 50 u.search(random_init(1), max_depth=5, verbose=True)
-

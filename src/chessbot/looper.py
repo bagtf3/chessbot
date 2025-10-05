@@ -38,19 +38,19 @@ class Config(object):
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
     c_puct = 1.25
-    anytime_uniform_mix = 0.3
-    endgame_uniform_mix = 0.4
-    opponent_uniform_mix = 0.5
+    anytime_uniform_mix = 0.25
+    endgame_uniform_mix = 0.35
+    opponent_uniform_mix = 0.4
 
     # Simulation schedule
-    sims_target = 1600
+    sims_target = 2400
     micro_batch_size = 12
 
     # early stop
-    es_min_sims = 600
+    es_min_sims = 900
     es_check_every = 24
     es_gap_frac = 0.7
-    es_top_node_frac = 0.75
+    es_top_node_frac = 0.6
     
     # Q-override selection
     use_q_override = True
@@ -62,7 +62,7 @@ class Config(object):
     # Game stuff
     games_at_once = 100
     n_training_games = 500
-    lru_cache_size = 650_000
+    lru_cache_size = 750_000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -82,10 +82,10 @@ class Config(object):
     prior_clip_max = 0.35
     prior_clip_min = 0.01
     endgame_prior_adjustments = {
-        "pawn_push":0.15, "capture":0.15, "repetition_penalty": 0.05
+        "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.05
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
+    anytime_prior_adjustments = {"gives_check": 0.05, "repetition_penalty": 0.05}
 
     # TF
     training_queue_min = 4096

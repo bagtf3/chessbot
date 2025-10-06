@@ -39,8 +39,8 @@ class Config(object):
     # MCTS
     c_puct = 1.25
     anytime_uniform_mix = 0.25
-    endgame_uniform_mix = 0.35
-    opponent_uniform_mix = 0.4
+    endgame_uniform_mix = 0.3
+    opponent_uniform_mix = 0.3
 
     # Simulation schedule
     sims_target = 2400
@@ -80,7 +80,7 @@ class Config(object):
     # boosts/penalize
     use_prior_boosts = True
     prior_clip_max = 0.35
-    prior_clip_min = 0.01
+    prior_clip_min = 0.001
     endgame_prior_adjustments = {
         "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.05
     }

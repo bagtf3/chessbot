@@ -252,7 +252,6 @@ def tail_vs_prev(df, window=200):
             "prev_mean": p1, "prev_n": n1,
             "tail_mean": p2, "tail_n": n2,
             "delta_mean": p2 - p1,
-            "z": z, "p_two_sided": z_to_p(z),
         }
 
     return pd.DataFrame(rows).T.round(6)
@@ -260,6 +259,13 @@ def tail_vs_prev(df, window=200):
 from pprint import pprint
 #%matplotlib inline
 all_games = load_game_index()
+
+df_games = pd.DataFrame.from_records(all_games)
+df_games["ts"] = df_games["ts"].round().astype("int64")
+df_games = rolling_points_vs_sf(df_games)
+
+plot_rolling_rates_with_ci(df_games, window=200)
+tail_vs_prev(df_games, window=200)
 
 pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
 if pkl_files:
@@ -282,17 +288,13 @@ plot_cpl_and_bmr(df_trim, window=500)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
 pprint(trend_check(df_trim, window=500))
 
-df_games = pd.DataFrame.from_records(all_games)
-df_games["ts"] = df_games["ts"].round().astype("int64")
-df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=200)
-tail_vs_prev(df_games, window=200)
 
 
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'piece_odds')]
+#view = [g for g in all_games if not g['vs_stockfish']]
 gv = GameViewer(view[-1]['json_file']); gv.replay()
 

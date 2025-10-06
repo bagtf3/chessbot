@@ -149,17 +149,16 @@ def mirror_index(sq):
     return rank * 8 + mirror_file
 
 
-def jostle_weights(weights=None, delta=5, seed=None):
+def jostle_weights(weights=None, delta=5):
     """
     Return a new weights dict with each integer jostled by randint(-delta, delta).
     Enforces left-right symmetry for PSQT by only jostling half of each 64-square
     table and mirroring the changes.
     - weights: existing weights dict (if None, build_weights() will be used)
     - delta: integer jitter amplitude (applies to all integer fields uniformly)
-    - seed: optional RNG seed for reproducibility
     """
     
-    rng = np.random.RandomState(seed)
+    rng = np.random.default_rng()
     if weights is None:
         weights = build_weights()
 
@@ -176,7 +175,7 @@ def jostle_weights(weights=None, delta=5, seed=None):
                 # operate only on left half (files 0..3)
                 if f <= 3:
                     msq = mirror_index(sq)
-                    delta_val = int(rng.randint(-delta, delta + 1))
+                    delta_val = int(rng.integers(-delta, delta + 1))
                     # add same delta to both mirror squares to preserve symmetry
                     ps[b, p, sq] = int(ps[b, p, sq]) + delta_val
                     ps[b, p, msq] = int(ps[b, p, msq]) + delta_val
@@ -186,13 +185,13 @@ def jostle_weights(weights=None, delta=5, seed=None):
     # other arrays: add uniform jitter elementwise
     for key in ("mobility_weights", "tactical_weights", "king_weights"):
         arr = np.array(w[key], dtype=np.int32, copy=True)
-        jitter = rng.randint(-delta, delta + 1, size=arr.shape)
+        jitter = rng.integers(-delta, delta + 1, size=arr.shape)
         arr = (arr + jitter).astype(np.int32)
         w[key] = arr
 
     # scalars
-    w["stm_bias"] = int(w.get("stm_bias", 0) + rng.randint(-delta, delta + 1))
-    w["global_scale"] = int(w.get("global_scale", 100) + rng.randint(-delta, delta + 1))
+    w["stm_bias"] = int(w.get("stm_bias", 0) + rng.integers(-delta, delta + 1))
+    w["global_scale"] = int(w.get("global_scale", 100) + rng.integers(-delta, delta + 1))
 
     return w
 

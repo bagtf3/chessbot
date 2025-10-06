@@ -10,7 +10,7 @@ import pickle
 from chessbot.utils import rnd
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_depth_test"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -289,12 +289,10 @@ print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
 pprint(trend_check(df_trim, window=500))
 
 
-
-
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
 view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'piece_odds')]
-#view = [g for g in all_games if not g['vs_stockfish']]
+#view = [g for g in all_games if (g['scenario']) == 'random_init']
 gv = GameViewer(view[-1]['json_file']); gv.replay()
 

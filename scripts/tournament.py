@@ -12,11 +12,11 @@ from chessbot.absearch import GAUnit
 from chessbot.utils import show_board
 
 # ========== CONFIG ========== #
-POP_SIZE = 32
+POP_SIZE = 16
 DEPTH = 1
 QPLY = 3
 QCAPTURES = 5
-N_EPOCHS = 100
+N_EPOCHS = 10
 MAX_MOVES_PER_GAME = 200
 MAT_CUTOFF = 7
 MAT_PLYS = 7
@@ -27,7 +27,7 @@ SAVE_DIR = "C:/Users/Bryan/Data/chessbot_data/GA_results"
 
 def save_pickle(res):
     os.makedirs(SAVE_DIR, exist_ok=True)
-    fname = "GA_p32_e100_res_history.pkl"
+    fname = "GA_p16_e50_res_history.pkl"
     path = os.path.join(SAVE_DIR, fname)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:

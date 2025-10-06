@@ -43,7 +43,7 @@ class GAUnit:
         res = terminal_value_white_pov(board)
         # None -> ongoing, 0 -> draw
         if not res:
-            return res
+            return int(res) if res is not None else res
         return VALUE_MATE - ply if res == 1 else -VALUE_MATE + ply
 
     def extract_pv(self, board, max_len=32):
@@ -123,16 +123,16 @@ class GAUnit:
                 return val
             if flag == bound_flag.UPPERBOUND and val <= alpha:
                 return val
-
-        # leaf: use qsearch
-        if depth <= 0:
-            return self.qsearch(board, alpha, beta, ply, start_time)
-
+        
         # terminal check
         tv = self.terminal_value(board, ply)
         if tv is not None:
             return tv
-
+        
+        # leaf: use qsearch
+        if depth <= 0:
+            return self.qsearch(board, alpha, beta, ply, start_time)
+        
         # ordering: recommend TT best first
         tt_best = tt_ent["move_uci"] if tt_ent else None
         scores_moves = board.ordered_moves(tt_best)

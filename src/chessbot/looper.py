@@ -33,22 +33,22 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_phase2"
+    run_tag = "conv_1000_selfplay_depth_test"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
-    c_puct = 1.25
+    c_puct = 0.5
     anytime_uniform_mix = 0.25
     endgame_uniform_mix = 0.3
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 2400
-    micro_batch_size = 12
+    sims_target = 3200
+    micro_batch_size = 30
 
     # early stop
-    es_min_sims = 900
-    es_check_every = 24
+    es_min_sims = 1200
+    es_check_every = 45
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
     
@@ -60,7 +60,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 100
+    games_at_once = 40
     n_training_games = 500
     lru_cache_size = 750_000
     
@@ -605,9 +605,12 @@ class GameLooper(object):
                 if completed_games + len(self.active_games) < self.config.n_training_games:
                     while len(self.active_games) < self.config.games_at_once:
                         self.active_games.append(ChessGame())
-        
+                    
         # train with whatever we got and final report
-        self.trigger_retrain()
+        half_full = self.config.training_queue_min / 2
+        if len(self.training_queue) >= half_full:
+            self.trigger_retrain()
+
         self.maybe_log_results(force=True)
         return
 

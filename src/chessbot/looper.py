@@ -33,7 +33,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_depth_test"
+    run_tag = "conv_1000_selfplay_phase2"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
@@ -43,8 +43,8 @@ class Config(object):
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 3200
-    micro_batch_size = 30
+    sims_target = 2400
+    micro_batch_size = 16
 
     # early stop
     es_min_sims = 1200
@@ -60,7 +60,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 40
+    games_at_once = 75
     n_training_games = 500
     lru_cache_size = 750_000
     

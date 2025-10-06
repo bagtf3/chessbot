@@ -3,20 +3,18 @@ import time, os, random
 from uuid import uuid4
 from copy import deepcopy
 import numpy as np
-import chess
 import pickle
 
 from pyfastchess import Board as FastBoard, Evaluator, terminal_value_white_pov
 from chessbot.psqt import build_weights, jostle_weights
 from chessbot.absearch import GAUnit
-from chessbot.utils import show_board
 
 # ========== CONFIG ========== #
-POP_SIZE = 16
+POP_SIZE = 24
 DEPTH = 1
 QPLY = 3
 QCAPTURES = 5
-N_EPOCHS = 10
+N_EPOCHS = 20
 MAX_MOVES_PER_GAME = 200
 MAT_CUTOFF = 7
 MAT_PLYS = 7
@@ -27,7 +25,7 @@ SAVE_DIR = "C:/Users/Bryan/Data/chessbot_data/GA_results"
 
 def save_pickle(res):
     os.makedirs(SAVE_DIR, exist_ok=True)
-    fname = "GA_p16_e50_res_history.pkl"
+    fname = f"GA_{POP_SIZE}_{N_EPOCHS}_res_history.pkl"
     path = os.path.join(SAVE_DIR, fname)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
@@ -380,7 +378,6 @@ def run_epoch_pseudoparallel(population, epoch_index, verbose=True):
     while True:
         loop_iter += 1
         any_active = False
-        shown = False
         for g in games:
             if g["finished"]:
                 continue
@@ -400,9 +397,6 @@ def run_epoch_pseudoparallel(population, epoch_index, verbose=True):
 
             # push move onto this game's board
             b.push_uci(best)
-            if not shown:
-                show_board(chess.Board(b.fen()))
-                shown = True
 
             g["moves"].append(best)
             g["move_count"] += 1
@@ -438,7 +432,7 @@ def run_epoch_pseudoparallel(population, epoch_index, verbose=True):
     
     standings = sorted(
         population,
-        key=lambda c: (-c["points"], -c["wins"], -c["wins_with_black"])
+        key=lambda c: (-c["points"], -c["wins"], -c["wins_with_black"], -c['rating'])
     )
     
     if verbose:

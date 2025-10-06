@@ -10,7 +10,7 @@ import pickle
 from chessbot.utils import rnd
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_depth_test"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -292,7 +292,7 @@ pprint(trend_check(df_trim, window=500))
 #%%
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'piece_odds')]
-#view = [g for g in all_games if (g['scenario']) == 'random_init']
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_middle_game')]
+view = [g for g in all_games if (g['scenario']) == 'pre_opened']
 gv = GameViewer(view[-1]['json_file']); gv.replay()
 

@@ -1,17 +1,39 @@
-import json, pathlib, sys
+import json, pathlib
 import chess, chess.svg
+import numpy as np
 from IPython.display import SVG, display, clear_output
 
 class GameViewer:
-    def __init__(self, log_path):
+    # in GameViewer.__init__
+    def __init__(self, log_path, sf_df=None):
         self.path = pathlib.Path(log_path)
         with open(self.path, "r", encoding="utf-8") as f:
             self.log = json.load(f)
-                    
-        self.start_fen = self.log["start_fen"]
-        self.moves_uci = self.log["moves_played"]
+    
+        self.start_fen = self.log.get("start_fen")
+        self.moves_uci = self.log.get("moves_played", [])
         self.tree_data = self.log.get("tree_search_data", {})
-        self.result = self.log.get("result", None)
+        self.result = self.log.get("result")
+        self.game_id = self.log.get("game_id")
+    
+        self.sf_rows = None
+        self._sf_by_ply = {}  # maps ply index -> row index into self.sf_rows
+    
+        if sf_df is not None and self.game_id is not None:
+            try:
+                g = sf_df[sf_df["game_id"] == self.game_id].copy()
+                if not g.empty:
+                    # deterministic order: prefer timestamp, else move_num if present
+                    order = [c for c in ["ts", "move_num"] if c in g.columns]
+                    if order:
+                        g = g.sort_values(order, kind="stable")
+                    g = g.reset_index(drop=True)
+                    self.sf_rows = g
+                    self._align_sf_rows_to_json()
+            except Exception:
+                self.sf_rows = None
+                self._sf_by_ply = {}
+    
         self.reset()
 
     def reset(self):
@@ -25,6 +47,44 @@ class GameViewer:
             self.board.push_uci(u)
         self.ply = ply
         return self
+    
+    def _sf_row_for_ply(self, ply):
+        # uses the alignment map built in _align_sf_rows_to_json()
+        if not self._sf_by_ply or self.sf_rows is None:
+            return None
+        ridx = self._sf_by_ply.get(ply)
+        if ridx is None:
+            return None
+        try:
+            return self.sf_rows.iloc[ridx]  # or .loc[ridx] if you prefer
+        except Exception:
+            return None
+
+
+    # add inside GameViewer
+    def _align_sf_rows_to_json(self):
+        self._sf_by_ply = {}
+        if self.sf_rows is None:
+            return
+    
+        seq = list(self.moves_uci or [])
+        j = 0  # cursor in JSON move list
+    
+        for ridx, r in self.sf_rows.iterrows():
+            uci = str(r.get("played_move", "") or "")
+            if not uci:
+                continue
+    
+            found = -1
+            for k in range(j, len(seq)):
+                if seq[k] == uci:
+                    found = k
+                    break
+    
+            if found >= 0:
+                self._sf_by_ply[found] = ridx
+                j = found + 1  # advance so next DF row maps to a later ply
+            # else: no match; leave it unmapped (overlay will skip)
 
     def next(self):
         if self.ply < len(self.moves_uci):
@@ -129,10 +189,59 @@ class GameViewer:
                     show_rank=True,
                     rank_val=sf_idx + 1,
                 )
-    
+        
         vwq = node.get("visit_weighted_Q")
         if vwq is not None:
             print(f"\nvisit-weighted Q={vwq}")
+        
+        # SF overlay (optional)
+        r = self._sf_row_for_ply(self.ply)
+        if r is not None:
+            stm_white = (self.board.turn == chess.WHITE)
+        
+            best_uci   = str(r.get("best_move", "") or "")
+            played_uci = str(r.get("played_move", "") or "")
+        
+            best_cp_raw   = r.get("best_cp", None)
+            played_cp_raw = r.get("played_cp", None)
+        
+            def _pov(cp):
+                if cp is None or (isinstance(cp, float) and np.isnan(cp)):
+                    return None
+                return int(cp if stm_white else -cp)
+        
+            best_cp_pov   = _pov(best_cp_raw)
+            played_cp_pov = _pov(played_cp_raw)
+        
+            loss = r.get("clipped_loss", r.get("loss", None))
+            if loss is None and best_cp_pov is not None and played_cp_pov is not None:
+                loss = max(0, best_cp_pov - played_cp_pov)
+        
+            # recompute match flag from UCIs to avoid DF drift
+            matched = (best_uci == played_uci) if best_uci and played_uci else False
+        
+            def _to_san(uci):
+                try:
+                    return self.board.san(chess.Move.from_uci(uci))
+                except Exception:
+                    return "?"
+        
+            best_san   = _to_san(best_uci) if best_uci else "?"
+            played_san = _to_san(played_uci) if played_uci else "?"
+        
+            parts = []
+            if loss is not None:
+                parts.append(f"CPL={int(loss)}")
+            if best_san != "?":
+                parts.append(f"SF best={best_san}")
+            if played_san != "?":
+                parts.append(f"played={played_san} ({'✓' if matched else '×'})")
+            if (best_cp_pov is not None) and (played_cp_pov is not None):
+                parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
+        
+            if parts:
+                print("SF:", "  ".join(parts))
+        
         print("=" * 60)
 
     def replay(self):

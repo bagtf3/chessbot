@@ -264,8 +264,8 @@ df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=200)
-tail_vs_prev(df_games, window=200)
+plot_rolling_rates_with_ci(df_games, window=250)
+tail_vs_prev(df_games, window=250)
 
 pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
 if pkl_files:
@@ -290,9 +290,12 @@ pprint(trend_check(df_trim, window=500))
 
 
 #%%
+d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_middle_game')]
-view = [g for g in all_games if (g['scenario']) == 'pre_opened']
-gv = GameViewer(view[-1]['json_file']); gv.replay()
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'b_vs_k')]
+gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
+
+
+#%%
 

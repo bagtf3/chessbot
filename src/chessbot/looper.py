@@ -37,18 +37,18 @@ class Config(object):
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
-    c_puct = 0.5
+    c_puct = 1.25
     anytime_uniform_mix = 0.25
     endgame_uniform_mix = 0.3
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 2400
+    sims_target = 2000
     micro_batch_size = 16
 
     # early stop
-    es_min_sims = 1200
-    es_check_every = 45
+    es_min_sims = 1400
+    es_check_every = 32
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
     
@@ -62,7 +62,7 @@ class Config(object):
     # Game stuff
     games_at_once = 75
     n_training_games = 500
-    lru_cache_size = 750_000
+    lru_cache_size = 500_000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -170,8 +170,13 @@ class GameGenerator(object):
             
         else:
             raise ValueError(f"unhandled game_type {game_type}")
-            
-        return board, meta
+        
+        # quick check to make sure there are legal moves
+        if board.legal_moves():
+            return board, meta
+        # otherwise look for a new board
+        else:
+            return self.new_board(game_type=game_type)
 
 
 class ChessGame(object):

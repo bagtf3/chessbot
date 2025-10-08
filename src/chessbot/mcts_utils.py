@@ -1,15 +1,19 @@
 from time import time as _now
 from chessbot.utils import softmax
+from chessbot.psqt import build_weights
 from pyfastchess import MCTSTree as fasttree
-from pyfastchess import PriorConfig, PriorEngine
+from pyfastchess import PriorConfig, PriorEngine, Evaluator
 from collections import OrderedDict
 
 
 class MCTSTree(fasttree):
+    ev = Evaluator()
+    ev.configure(build_weights(zeros=False))
+
     def __init__(self, board, cfg):
         self.config = cfg
         self.c_puct = float(cfg.c_puct)
-        super().__init__(board, self.c_puct)
+        super().__init__(board, self.c_puct, MCTSTree.ev)
         self.configure_prior_engine()
 
         # bookkeeping mirroring old interface

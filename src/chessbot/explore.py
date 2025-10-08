@@ -277,7 +277,11 @@ if pkl_files:
 df_all = prev_run['df_all']
 df_all['played_best_move'] = df_all.loss <= 10
 bmr = df_all.groupby("game_id")['played_best_move'].mean()
-df_all['clipped_loss'] = np.clip(df_all['loss'], 0, 600)
+
+df_all['loss'] = np.where(
+    df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
+
+df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
@@ -293,9 +297,11 @@ pprint(trend_check(df_trim, window=500))
 d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'b_vs_k')]
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
 gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
 
 
 #%%
+
+
 

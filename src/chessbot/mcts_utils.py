@@ -1,5 +1,4 @@
 from time import time as _now
-from chessbot.utils import softmax
 from chessbot.psqt import build_weights
 from pyfastchess import MCTSTree as fasttree
 from pyfastchess import PriorConfig, PriorEngine, Evaluator
@@ -132,17 +131,17 @@ class MCTSTree(fasttree):
 
     def apply_cached(self, req, cached):
         """
-        Compute priors (softmax in Python) and delegate to C++ apply_result.
+        Compute priors and delegate to C++ apply_result.
         'cached' must have keys: value, from, to, piece, promo (factorized heads).
         """
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
 
         # compute factorized softmaxes in python (numpy)
-        sf_from  = softmax(cached["from"])
-        sf_to    = softmax(cached["to"])
-        sf_piece = softmax(cached["piece"])
-        sf_promo = softmax(cached["promo"])
+        sf_from  = cached["from"]
+        sf_to    = cached["to"]
+        sf_piece = cached["piece"]
+        sf_promo = cached["promo"]
     
         # let the C++ PriorEngine handle mixing, boosts, clipping and renorm
         pri = self._prior_engine.build(

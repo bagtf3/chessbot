@@ -21,7 +21,7 @@ from chessbot.mcts_utils import MCTSTree, LRUCache
 
 import chessbot.utils as cbu
 from chessbot.utils import (
-    rnd, score_game_data, plot_training_progress, show_board, RateMeter
+    rnd, score_game_data, plot_training_progress, show_board, RateMeter, softmax
 )
 
 from chessbot.encoding import score_to_cp_white
@@ -37,17 +37,17 @@ class Config(object):
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
-    c_puct = 1.25
+    c_puct = 1.0
     anytime_uniform_mix = 0.25
     endgame_uniform_mix = 0.3
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 2000
-    micro_batch_size = 16
+    sims_target = 2800
+    micro_batch_size = 30
 
     # early stop
-    es_min_sims = 1400
+    es_min_sims = 1600
     es_check_every = 32
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
@@ -60,7 +60,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 75
+    games_at_once = 40
     n_training_games = 500
     lru_cache_size = 500_000
     
@@ -72,8 +72,8 @@ class Config(object):
     sf_depth = 6
     
     game_probs = {
-        "pre_opened": 0.2, "random_init": 0.2,
-        "random_middle_game": 0.2, "random_endgame": 0.1,
+        "pre_opened": 0.25, "random_init": 0.25,
+        "random_middle_game": 0.15, "random_endgame": 0.05,
         "piece_odds": 0.2, "piece_training": 0.1
     }
     
@@ -650,10 +650,11 @@ class GameLooper(object):
             key = req["cache_key"]
             out_i = {
                 "value": float(v[i].item()),
-                "from": pf[i],
-                "to": pt[i],
-                "piece": ppc[i],
-                "promo": ppr[i],
+                # softmax here to skip re-softmax for cache hits
+                "from": softmax(pf[i]),
+                "to": softmax(pt[i]),
+                "piece": softmax(ppc[i]),
+                "promo": softmax(ppr[i]),
             }
             lru[key] = out_i
 

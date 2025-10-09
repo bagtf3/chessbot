@@ -284,24 +284,22 @@ df_all['loss'] = np.where(
 df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
-df_trim = df_means.query("overall_cpl > 0").query("overall_cpl < 500")
+
+df_trim = df_means.copy()
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+df_trim = df_trim.query("overall_cpl > 0").query("overall_cpl < 500")
 
-plot_cpl_and_bmr(df_trim, window=500)
+plot_cpl_and_bmr(df_trim, window=1000)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-pprint(trend_check(df_trim, window=500))
+pprint(trend_check(df_trim, window=1000))
 
 
 #%%
 d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
-gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
-
-
-#%%
-
-
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'knights')]
+view = [g for g in all_games if (not g['vs_stockfish']) and (g['scenario'] == 'pre_opened')]
+gv = GameViewer(view[-3]['json_file'], sf_df=d); gv.replay()
 

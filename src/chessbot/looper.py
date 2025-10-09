@@ -43,12 +43,12 @@ class Config(object):
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 2800
+    sims_target = 3200
     micro_batch_size = 30
 
     # early stop
-    es_min_sims = 1600
-    es_check_every = 32
+    es_min_sims = 1200
+    es_check_every = 100
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
     
@@ -62,7 +62,7 @@ class Config(object):
     # Game stuff
     games_at_once = 40
     n_training_games = 500
-    lru_cache_size = 500_000
+    lru_cache_size = 750_000
     
     move_limit = 160
     material_diff_cutoff = 15

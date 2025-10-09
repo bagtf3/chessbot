@@ -24,10 +24,6 @@ class MCTSTree(fasttree):
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
 
-        # unique-sims tracking (per move)
-        self._uniq_keys = set()
-        self.unique_sims_this_move = 0
-
         # early-stop rolling state
         self._es_history = []
         self._es_last_checked_at = 0
@@ -272,7 +268,7 @@ class MCTSTree(fasttree):
                 return True
             
             # use the sims target, or 300*num_moves to speed up forced positions
-            self.sims_target = min(self.config.sims_target, 300*len(mvs))
+            self.sims_target = min(self.config.sims_target, 500*len(mvs))
         
         if self.sims_completed_this_move >= self.sims_target:
             return True
@@ -290,10 +286,6 @@ class MCTSTree(fasttree):
         self._es_tripped = False
         self._es_reason = ""
         self._es_after_sims = 0
-
-        # reset uniques
-        self._uniq_keys.clear()
-        self.unique_sims_this_move = 0
 
 
 class LRUCache:

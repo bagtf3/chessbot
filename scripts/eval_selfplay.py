@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -100,7 +100,7 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             continue
 
         res = analyze_with_deeper_look(
-            move, board, limit, eng, max_depth=16, cpl_trigger=120
+            move, board, limit, eng, max_depth=16, cpl_trigger=250
         )
 
         delta_signed = res['delta_signed']
@@ -148,59 +148,59 @@ def analyze_with_sf_core(game_data, eng, depth=10):
     return out
 
 
-def worker_shard(shard, depth, sem):
-    # one engine for the whole shard
+def worker_shard(games, depth, progress_q, result_q):
+    """Each worker runs its own engine, sends results + heartbeats."""
+    eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+    eng.configure({"Threads": 1, "Hash": 64})
+
     out = []
-    try:
-        eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        eng.configure({"Threads": 1})
-        eng.configure({"Hash": 64})
-        for g in shard:
-            try:
-                jd = load_json(g['json_file'])
-                out.append(analyze_with_sf_core(jd, eng, depth=depth))
-                sem.release()
-            except Exception as e:
-                print(f"error encountered {e}")
-                pass
-    finally:
-        try: eng.close()
-        except Exception: pass
+    for g in games:
+        try:
+            jd = load_json(g["json_file"])
+            out.append(analyze_with_sf_core(jd, eng, depth=depth))
+            progress_q.put(1)
+        except Exception as e:
+            print(f"error in worker: {e}")
+    eng.close()
+    result_q.put(out)
 
-    return out
 
-    
 def analyze_many_games(games, workers=6, depth=10):
     start = time.time()
-    shards = [games[i::workers] for i in range(max(1, int(workers)))]
-    total = sum([len(sh) for sh in shards])
+    shards = [games[i::workers] for i in range(workers)]
+    total = len(games)
 
-    sem = mp.Semaphore(0)
-    results, done = [], set()
+    progress_q = mp.Queue()
+    result_q   = mp.Queue()
 
-    with ProcessPoolExecutor(max_workers=len(shards)) as ex:
-        futs = []
-        for sh in shards:
-            if sh:
-                futs.append(ex.submit(worker_shard, sh, depth, sem))
+    procs = [
+        mp.Process(target=worker_shard, args=(shards[i], depth, progress_q, result_q))
+        for i in range(workers)
+    ]
+    for p in procs: p.start()
 
-        with tqdm(total=total, unit='game', desc='Analyzing games') as pbar:
-            while len(done) < len(futs):
-                ticked = 0
-                # drain available permits without blocking or exceptions
-                while sem.acquire(block=False):
-                    ticked += 1
-                if ticked:
-                    pbar.update(ticked)
+    results = []
+    done = 0
+    start = time.perf_counter()
 
-                d, _ = wait([f for f in futs if f not in done],
-                            timeout=0.2, return_when=FIRST_COMPLETED)
-                for f in d:
-                    results.extend(f.result())
-                    done.add(f)
+    with tqdm(total=total, unit="game", desc="Analyzing games") as pbar:
+        active = len(procs)
+        while active > 0:
+            # drain any progress heartbeats
+            while not progress_q.empty():
+                progress_q.get_nowait()
+                done += 1
+                pbar.update(1)
 
-                # dont need to spin too fast
-                time.sleep(1)
+            # collect finished result batches (non-blocking)
+            while not result_q.empty():
+                part = result_q.get_nowait()
+                results.extend(part)
+                active -= 1
+
+            time.sleep(0.5)
+
+    for p in procs: p.join()
 
     # same aggregation as your original
     w_means = [r["white_cpl"] for r in results]
@@ -261,8 +261,8 @@ def combine_run_stats(previous, summary, results, df_all, df_means):
 
 
 if __name__ == '__main__':
-    CHUNK_THRESHOLD = 1800
-    CHUNK_SIZE = 900
+    CHUNK_THRESHOLD = 2400
+    CHUNK_SIZE = 1200
 
     all_games = load_game_index()
     pkl_file = os.path.join(RUN_DIR, "analyze_results_combined.pkl")

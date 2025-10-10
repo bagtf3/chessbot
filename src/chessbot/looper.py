@@ -486,6 +486,8 @@ class GameLooper(object):
         lru = LRUCache(self.config.lru_cache_size)
         counts = []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+            eng.configure({"Threads": 2})
+            eng.configure({"Hash": 64})
             while completed_games < self.config.n_training_games:
                 if not self.active_games:
                     break

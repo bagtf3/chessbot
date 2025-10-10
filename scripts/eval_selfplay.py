@@ -120,6 +120,7 @@ def analyze_with_sf(file_loc, depth=10):
         try:
             # optional: avoid CPU oversubscription
             eng.configure({"Threads": 1})
+            eng.configure({"Hash": 128})
         except Exception:
             pass
         return analyze_with_sf_core(game_data, eng, depth=depth)

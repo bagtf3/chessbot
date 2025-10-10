@@ -299,7 +299,5 @@ pprint(trend_check(df_trim, window=1000))
 d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'knights')]
-view = [g for g in all_games if (not g['vs_stockfish']) and (g['scenario'] == 'pre_opened')]
-gv = GameViewer(view[-3]['json_file'], sf_df=d); gv.replay()
-
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'pre_opened')]
+gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()

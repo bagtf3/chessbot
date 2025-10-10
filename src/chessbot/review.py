@@ -1,7 +1,10 @@
 import json, pathlib
 import chess, chess.svg
+import chess.engine
+from chessbot import SF_LOC
 import numpy as np
 from IPython.display import SVG, display, clear_output
+
 
 class GameViewer:
     # in GameViewer.__init__
@@ -48,20 +51,138 @@ class GameViewer:
         self.ply = ply
         return self
     
-    def _sf_row_for_ply(self, ply):
-        # uses the alignment map built in _align_sf_rows_to_json()
-        if not self._sf_by_ply or self.sf_rows is None:
+    def get_pv(self, min_vis=1, max_len=40):
+        """
+        Build a SAN PV from the logged tree_search_data starting at current ply.
+        Choose the candidate with the most visits at each node: visits >= min_vis.
+        Returns list of SAN moves (strings). Stops when no node / candidate is found.
+        """
+        b = self.board.copy()
+        pv = []
+        p = self.ply
+    
+        for _ in range(max_len):
+            # prefer node keyed by ply index (string), fallback to other keys if present
+            node = self.tree_data.get(str(p)) or self.tree_data.get(b.fen())
+            if not node:
+                break
+            cands = node.get("candidate_moves") or []
+            # filter by min_vis
+            valid = [c for c in cands if (c.get("visits", 0) >= min_vis)]
+            if not valid:
+                break
+            # pick highest visits
+            best = max(valid, key=lambda x: x.get("visits", 0))
+            mv_uci = best.get("uci")
+            if not mv_uci:
+                break
+            try:
+                san = b.san(chess.Move.from_uci(mv_uci))
+            except Exception:
+                san = mv_uci
+            pv.append(san)
+            # advance board and ply index
+            try:
+                b.push_uci(mv_uci)
+            except Exception:
+                break
+            p += 1
+        return pv
+    
+    def sf_row_for_ply(self, ply):
+        if (not self._sf_by_ply) or (self.sf_rows is None):
             return None
-        ridx = self._sf_by_ply.get(ply)
-        if ridx is None:
+        idx = self._sf_by_ply.get(ply)
+        if idx is None:
             return None
-        try:
-            return self.sf_rows.iloc[ridx]  # or .loc[ridx] if you prefer
-        except Exception:
-            return None
+        return self.sf_rows.iloc[idx]
+    
+    def show_pv(self, min_vis=1):
+        pv = self.get_pv(min_vis=min_vis)
+        if not pv:
+            print("PV: (none found with visits >=", min_vis, ")")
+        else:
+            print("PV (min_vis={}): {}".format(min_vis, "  ".join(pv)))
 
-
-    # add inside GameViewer
+    def run_stockfish_topk(self, depth=16, k=3):
+        """
+        Return list[(uci, san, cp_white_pov, pv)] for top-k moves.
+        Let exceptions propagate so we see stack traces if SF fails.
+        """
+        out = []
+        limit = chess.engine.Limit(depth=depth, time=10.0)
+        with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+            infos = eng.analyse(self.board, limit=limit, multipv=k)
+            if not isinstance(infos, list):
+                infos = [infos]
+            for info in infos:
+                pv = info.get("pv", [])
+                move_uci = pv[0].uci() if pv else None
+                san = None
+                if move_uci:
+                    san = self.board.san(chess.Move.from_uci(move_uci))
+                score_obj = info.get("score")
+                cp = None
+                if score_obj is not None:
+                    cp = score_obj.white().score(mate_score=1500)
+                out.append((move_uci, san, cp, pv))
+        return out
+    
+    def show_sf_overlay(self, token="sf"):
+        """
+        Parse token like 'sf' or 'sf20' to run stockfish.
+          - 'sf' -> depth 16
+          - 'sfNN' -> depth NN (e.g. sf20 -> depth 20)
+        Prints SF top-3 moves (white-pov cp at depth) and if the chosen move
+        isn't in top-3, prints its cp as well (forced evaluation).
+        """
+        # parse token
+        if token == "sf":
+            depth = 16
+        else:
+            try:
+                depth = int(token[2:]) if token.startswith("sf") else 16
+            except Exception:
+                depth = 16
+    
+        print(f"Running Stockfish (depth={depth}, time cap=10s, multipv=3)...")
+        topk = self.run_stockfish_topk(depth=depth, k=3)
+        if not topk:
+            print("No SF info (maybe engine failed).")
+            return
+    
+        # print top-3
+        print("SF top moves (white-POV cp):")
+        top_ucis = set()
+        for i, (uci, san, cp, pv) in enumerate(topk, start=1):
+            cp_str = ("mate" if cp is None else str(int(cp)))
+            print(f"  #{i}. {san:<6}  cp={cp_str}")
+            if uci:
+                top_ucis.add(uci)
+    
+        # check the move about to be played (selected from moves_uci[self.ply])
+        if self.ply < len(self.moves_uci):
+            upcoming_uci = self.moves_uci[self.ply]
+            upcoming_san = self.board.san(chess.Move.from_uci(upcoming_uci))
+            if upcoming_uci not in top_ucis:
+                # get forced eval for the played move
+                print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
+                limit = chess.engine.Limit(depth=depth, time=10.0)
+                with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+                    info = eng.analyse(
+                        self.board, limit=limit,
+                        root_moves=[chess.Move.from_uci(upcoming_uci)]
+                    )
+                    
+                    score_obj = info.get("score")
+                    if score_obj is not None:
+                        cp = score_obj.white().score(mate_score=1500)
+                        print(f"  cp(played) = {int(cp)} (white-POV)")
+                    else:
+                        print("  played move eval not available")
+            else:
+                print(f"\nPlayed move {upcoming_san} is in SF top-3.")
+    
     def _align_sf_rows_to_json(self):
         self._sf_by_ply = {}
         if self.sf_rows is None:
@@ -160,11 +281,8 @@ class GameViewer:
                 sf_idx = i
                 break
     
-        def _print_row(c, mark=False, show_rank=False, rank_val=None):
-            try:
-                san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
-            except Exception:
-                san = "?"
+        def print_row(c, mark=False, show_rank=False, rank_val=None):
+            san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
             marker = "  <- SF" if mark else ""
             rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
             print(
@@ -176,18 +294,16 @@ class GameViewer:
         shown_ucis = set()
         # top-N: never show ranks; just mark if SF move happens to be in top-N
         for i, c in enumerate(cands_sorted[:top_n]):
-            _print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
+            print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
             shown_ucis.add(c.get("uci"))
     
         # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
         if is_sf_turn and sf_idx is not None:
             if cands_sorted[sf_idx].get("uci") not in shown_ucis:
                 print("   ...")
-                _print_row(
-                    cands_sorted[sf_idx],
-                    mark=True,
-                    show_rank=True,
-                    rank_val=sf_idx + 1,
+                print_row(
+                    cands_sorted[sf_idx], mark=True,
+                    show_rank=True, rank_val=sf_idx + 1,
                 )
         
         vwq = node.get("visit_weighted_Q")
@@ -195,7 +311,7 @@ class GameViewer:
             print(f"\nvisit-weighted Q={vwq}")
         
         # SF overlay (optional)
-        r = self._sf_row_for_ply(self.ply)
+        r = self.sf_row_for_ply(self.ply)
         if r is not None:
             stm_white = (self.board.turn == chess.WHITE)
         
@@ -205,13 +321,13 @@ class GameViewer:
             best_cp_raw   = r.get("best_cp", None)
             played_cp_raw = r.get("played_cp", None)
         
-            def _pov(cp):
+            def pov(cp):
                 if cp is None or (isinstance(cp, float) and np.isnan(cp)):
                     return None
                 return int(cp if stm_white else -cp)
         
-            best_cp_pov   = _pov(best_cp_raw)
-            played_cp_pov = _pov(played_cp_raw)
+            best_cp_pov   = pov(best_cp_raw)
+            played_cp_pov = pov(played_cp_raw)
         
             loss = r.get("clipped_loss", r.get("loss", None))
             if loss is None and best_cp_pov is not None and played_cp_pov is not None:
@@ -220,14 +336,11 @@ class GameViewer:
             # recompute match flag from UCIs to avoid DF drift
             matched = (best_uci == played_uci) if best_uci and played_uci else False
         
-            def _to_san(uci):
-                try:
-                    return self.board.san(chess.Move.from_uci(uci))
-                except Exception:
-                    return "?"
+            def to_san(uci):
+                return self.board.san(chess.Move.from_uci(uci))
         
-            best_san   = _to_san(best_uci) if best_uci else "?"
-            played_san = _to_san(played_uci) if played_uci else "?"
+            best_san   = to_san(best_uci) if best_uci else "?"
+            played_san = to_san(played_uci) if played_uci else "?"
         
             parts = []
             if loss is not None:
@@ -241,7 +354,6 @@ class GameViewer:
         
             if parts:
                 print("SF:", "  ".join(parts))
-        
         print("=" * 60)
 
     def replay(self):
@@ -250,13 +362,33 @@ class GameViewer:
         sf_color = self.log.get("stockfish_color", None)
         flipped = sf_color if sf_color else False
         print("Controls: Enter/Space=forward, b=back, q=quit")
+        shown = False
         while True:
-            self.show_board(flipped=flipped)
-            self.show_moves()
-            cmd = input("[Enter]=fwd, b=back, q=quit > ").strip().lower()
+            if not shown:
+                self.show_board(flipped=flipped)
+                self.show_moves()
+                shown = True
+            cmd = input("[Enter]=fwd, b=back, q=quit, pv, sf > ")
+            cmd = cmd.strip().lower()
             if cmd in ("q", "quit", "exit"):
                 break
             elif cmd in ("b", "back"):
+                shown = False
                 self.prev()
+                
+            elif cmd.startswith("pv"):
+                # pv or pv8
+                if cmd == "pv":
+                    self.show_pv(min_vis=1)
+                else:
+                    try:
+                        n = int(cmd[2:])  # e.g. pv8
+                        self.show_pv(min_vis=n)
+                    except Exception:
+                        self.show_pv(min_vis=1)
+            elif cmd.startswith("sf"):
+                self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
             else:
+                # default: forward one move
+                shown = False
                 self.next()

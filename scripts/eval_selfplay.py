@@ -36,8 +36,47 @@ def load_game_index(path=None):
     return load_json(path)
 
 
-def score_cp(pov_score, white_to_move, mate_cp):
+def score_cp(pov_score, mate_cp):
     return pov_score.white().score(mate_score=mate_cp)
+
+
+def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=100):
+    # best line (white-POV cp)
+    sf_best = eng.play(board, limit=limit, info=chess.engine.INFO_ALL)
+    best_move = sf_best.move
+    res = {'best_move': best_move}
+    if move == best_move:
+        res['best_cp'] = score_cp(sf_best.info['score'], mate_cp=1500)
+        res['played_cp'] = res['best_cp']
+        res['best_relative'] = sf_best.info['score'].relative.score(mate_score=1500)
+        res['delta_signed'] = 0
+        return res
+
+    # analyze the 2 moves together
+    root_moves = [move, best_move]
+    info = eng.analyse(
+        board, limit=limit, root_moves=root_moves,
+        info=chess.engine.INFO_ALL, multipv=2
+    )
+
+    played_info = [i for i in info if i['pv'][0] == move][0]
+    played_cp = score_cp(played_info["score"], mate_cp=1500)
+
+    best_info = [i for i in info if i['pv'][0] == best_move][0]
+    best_cp = score_cp(best_info["score"], mate_cp=1500)
+
+    delta_signed = best_cp - played_cp
+    if delta_signed >= cpl_trigger:
+        new_limit = chess.engine.Limit(depth=max_depth)
+        # recurse with infinite cpl_trigger to make sure it returns
+        return analyze_with_deeper_look(move, board, new_limit, eng, max_depth, np.inf)
+    
+    else:
+        res['best_cp'] = best_cp
+        res['played_cp'] = played_cp
+        res['best_relative'] = best_info['score'].relative.score(mate_score=1500)
+        res['delta_signed'] = delta_signed
+        return res
 
 
 def analyze_with_sf_core(game_data, eng, depth=10):
@@ -57,28 +96,20 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             board.push(move)
             continue
 
-        # best line (white-POV cp)
-        sf_best = eng.play(board, limit=limit, info=chess.engine.INFO_ALL)
-        best_move = sf_best.move
-        best_cp = score_cp(sf_best.info['score'], board.turn, mate_cp=1500)
-        best_relative = sf_best.info['score'].relative.score(mate_score=1500)
-
-        # played move cp
-        played_info = eng.analyse(
-            board, limit=limit, root_moves=[move], info=chess.engine.INFO_SCORE
+        res = analyze_with_deeper_look(
+            move, board, limit, eng, max_depth=16, cpl_trigger=120
         )
-        played_cp = score_cp(played_info["score"], board.turn, mate_cp=1500)
 
-        delta_signed = best_cp - played_cp
-        if board.turn:  # White to move
+        delta_signed = res['delta_signed']
+        if board.turn:
             loss_this = max(0, delta_signed); cpl_w += loss_this; nw += 1
-        else:          # Black to move
+        else:
             loss_this = max(0, -delta_signed); cpl_b += loss_this; nb += 1
         cpl_s += loss_this
 
         rows.append([
-            i, mv, str(best_move), best_cp,
-            delta_signed, played_cp, best_relative, board.turn, loss_this
+            i, mv, str(res['best_move']), res['best_cp'], delta_signed,
+            res['played_cp'], res['best_relative'], board.turn, loss_this
         ])
         board.push(move)
 
@@ -114,18 +145,6 @@ def analyze_with_sf_core(game_data, eng, depth=10):
     return out
 
 
-def analyze_with_sf(file_loc, depth=10):
-    game_data = load_json(file_loc)
-    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-        try:
-            # optional: avoid CPU oversubscription
-            eng.configure({"Threads": 1})
-            eng.configure({"Hash": 128})
-        except Exception:
-            pass
-        return analyze_with_sf_core(game_data, eng, depth=depth)
-
-
 def worker_shard(shard, depth):
     # one engine for the whole shard
     out = []
@@ -133,6 +152,7 @@ def worker_shard(shard, depth):
     try:
         try:
             eng.configure({"Threads": 1})
+            eng.configure({"Hash": 64})
         except Exception:
             pass
         for g in shard:
@@ -226,7 +246,7 @@ if __name__ == '__main__':
         games = all_games
         print(f"No pkl found. Running all {len(games)} games")
 
-    summary, results, df_all, df_means = analyze_many_games(games, workers=6)
+    summary, results, df_all, df_means = analyze_many_games(games[:100], workers=6)
     print("=== New Game Summary ===")
     pprint(summary)
     

@@ -300,4 +300,34 @@ d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
 view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'pre_opened')]
-gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(view[-2]['json_file'], sf_df=d); gv.replay()
+
+#%%
+import chess, chess.engine
+from chessbot import SF_LOC
+
+board = chess.Board()
+limit = chess.engine.Limit(depth=12)
+info=chess.engine.INFO_ALL
+root_moves = [chess.Move.from_uci(x) for x in ['e2e4', 'a2a3']]
+
+with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
+    info = engine.analyse(board, limit=limit, root_moves=root_moves, info=info, multipv=2)
+
+
+def score_cp(pov_score, mate_cp):
+    return pov_score.white().score(mate_score=mate_cp)
+
+move = chess.Move.from_uci("e2e4")
+played_info = [i for i in info if i['pv'][0] == move][0]
+played_cp = score_cp(played_info["score"], mate_cp=1500)
+
+        delta_signed = best_cp - played_cp
+        if board.turn:  # White to move
+            loss_this = max(0, delta_signed); cpl_w += loss_this; nw += 1
+        else:          # Black to move
+            loss_this = max(0, -delta_signed); cpl_b += loss_this; nb += 1
+        cpl_s += loss_this
+        
+move2 = chess.Move.from_uci('e2e4')
+

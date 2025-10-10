@@ -51,44 +51,6 @@ class GameViewer:
         self.ply = ply
         return self
     
-    def get_pv(self, min_vis=1, max_len=40):
-        """
-        Build a SAN PV from the logged tree_search_data starting at current ply.
-        Choose the candidate with the most visits at each node: visits >= min_vis.
-        Returns list of SAN moves (strings). Stops when no node / candidate is found.
-        """
-        b = self.board.copy()
-        pv = []
-        p = self.ply
-    
-        for _ in range(max_len):
-            # prefer node keyed by ply index (string), fallback to other keys if present
-            node = self.tree_data.get(str(p)) or self.tree_data.get(b.fen())
-            if not node:
-                break
-            cands = node.get("candidate_moves") or []
-            # filter by min_vis
-            valid = [c for c in cands if (c.get("visits", 0) >= min_vis)]
-            if not valid:
-                break
-            # pick highest visits
-            best = max(valid, key=lambda x: x.get("visits", 0))
-            mv_uci = best.get("uci")
-            if not mv_uci:
-                break
-            try:
-                san = b.san(chess.Move.from_uci(mv_uci))
-            except Exception:
-                san = mv_uci
-            pv.append(san)
-            # advance board and ply index
-            try:
-                b.push_uci(mv_uci)
-            except Exception:
-                break
-            p += 1
-        return pv
-    
     def sf_row_for_ply(self, ply):
         if (not self._sf_by_ply) or (self.sf_rows is None):
             return None
@@ -96,13 +58,6 @@ class GameViewer:
         if idx is None:
             return None
         return self.sf_rows.iloc[idx]
-    
-    def show_pv(self, min_vis=1):
-        pv = self.get_pv(min_vis=min_vis)
-        if not pv:
-            print("PV: (none found with visits >=", min_vis, ")")
-        else:
-            print("PV (min_vis={}): {}".format(min_vis, "  ".join(pv)))
 
     def run_stockfish_topk(self, depth=16, k=3):
         """
@@ -368,7 +323,7 @@ class GameViewer:
                 self.show_board(flipped=flipped)
                 self.show_moves()
                 shown = True
-            cmd = input("[Enter]=fwd, b=back, q=quit, pv, sf > ")
+            cmd = input("[Enter]=fwd, b=back, q=quit, sf=stockfish eval > ")
             cmd = cmd.strip().lower()
             if cmd in ("q", "quit", "exit"):
                 break
@@ -376,16 +331,16 @@ class GameViewer:
                 shown = False
                 self.prev()
                 
-            elif cmd.startswith("pv"):
-                # pv or pv8
-                if cmd == "pv":
-                    self.show_pv(min_vis=1)
-                else:
-                    try:
-                        n = int(cmd[2:])  # e.g. pv8
-                        self.show_pv(min_vis=n)
-                    except Exception:
-                        self.show_pv(min_vis=1)
+            # elif cmd.startswith("pv"):
+            #     # pv or pv8
+            #     if cmd == "pv":
+            #         self.show_pv(min_vis=1)
+            #     else:
+            #         try:
+            #             n = int(cmd[2:])  # e.g. pv8
+            #             self.show_pv(min_vis=n)
+            #         except Exception:
+            #             self.show_pv(min_vis=1)
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
             else:

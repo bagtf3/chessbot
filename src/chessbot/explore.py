@@ -303,31 +303,99 @@ view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'pre_opened
 gv = GameViewer(view[-2]['json_file'], sf_df=d); gv.replay()
 
 #%%
-import chess, chess.engine
-from chessbot import SF_LOC
+import psutil
+print("total cpu %:", psutil.cpu_percent(interval=5))
+print("per-cpu:", psutil.cpu_percent(interval=5, percpu=True))
 
-board = chess.Board()
-limit = chess.engine.Limit(depth=12)
-info=chess.engine.INFO_ALL
-root_moves = [chess.Move.from_uci(x) for x in ['e2e4', 'a2a3']]
+#%%
+# Requires: pip install psutil
+import sys
+import time
+import datetime as dt
 
-with chess.engine.SimpleEngine.popen_uci(SF_LOC) as engine:
-    info = engine.analyse(board, limit=limit, root_moves=root_moves, info=info, multipv=2)
+try:
+    import psutil
+except ImportError:
+    print("Please install psutil: pip install psutil")
+    sys.exit(1)
 
 
-def score_cp(pov_score, mate_cp):
-    return pov_score.white().score(mate_score=mate_cp)
+NAMES = {"stockfish", "stockfish.exe"}
 
-move = chess.Move.from_uci("e2e4")
-played_info = [i for i in info if i['pv'][0] == move][0]
-played_cp = score_cp(played_info["score"], mate_cp=1500)
 
-        delta_signed = best_cp - played_cp
-        if board.turn:  # White to move
-            loss_this = max(0, delta_signed); cpl_w += loss_this; nw += 1
-        else:          # Black to move
-            loss_this = max(0, -delta_signed); cpl_b += loss_this; nb += 1
-        cpl_s += loss_this
-        
-move2 = chess.Move.from_uci('e2e4')
+def proc_matches(p):
+    try:
+        n = p.name().lower()
+        if n in NAMES:
+            return True
+        # fallback: sometimes name is generic, check cmdline
+        cmd = [str(x).lower() for x in p.cmdline()]
+        return any([("stockfish" in x) for x in cmd])
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
 
+
+def fmt_td(seconds):
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def collect_stockfish():
+    out = []
+    now = time.time()
+    for p in psutil.process_iter(["pid", "name", "create_time", "exe",
+                                  "cmdline", "cpu_percent", "memory_info"]):
+        if not proc_matches(p):
+            continue
+        try:
+            with p.oneshot():
+                pid = p.pid
+                name = p.name()
+                started = p.create_time()
+                elapsed = now - started
+                cpu = p.cpu_percent(interval=1.0)
+                mem = p.memory_info().rss if p.memory_info() else 0
+                exe = p.exe() if p.exe() else ""
+                cmd = " ".join(p.info.get("cmdline") or [])
+                start_str = dt.datetime.fromtimestamp(
+                    started
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                out.append({
+                    "pid": pid,
+                    "name": name,
+                    "start": start_str,
+                    "elapsed": fmt_td(elapsed),
+                    "cpu_percent": cpu,
+                    "rss_mb": round(mem / (1024.0 * 1024.0), 1),
+                    "exe": exe,
+                    "cmdline": cmd,
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return out
+
+
+def print_table(rows):
+    if not rows:
+        print("No Stockfish processes found.")
+        return
+    hdr = ("PID", "Name", "Start", "Elapsed", "CPU%", "RSS(MB)", "Executable")
+    print(f"{hdr[0]:>6s}  {hdr[1]:12s}  {hdr[2]:19s}  {hdr[3]:>8s}  "
+          f"{hdr[4]:>5s}  {hdr[5]:>7s}  {hdr[6]}")
+    print("-" * 100)
+    for r in rows:
+        print(f"{r['pid']:6d}  {r['name'][:12]:12s}  {r['start']:19s}  "
+              f"{r['elapsed']:>8s}  {r['cpu_percent']:5.1f}  "
+              f"{r['rss_mb']:7.1f}  {r['exe']}")
+    print()
+    print(f"Total Stockfish processes: {len(rows)}")
+
+
+def main():
+    rows = collect_stockfish()
+    print_table(rows)
+
+main()

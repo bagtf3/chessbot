@@ -8,7 +8,10 @@ import chess
 import chess.engine
 from chessbot import SF_LOC
 from chessbot.utils import rnd, format_time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from tqdm import tqdm
+
 
 RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
 
@@ -145,34 +148,59 @@ def analyze_with_sf_core(game_data, eng, depth=10):
     return out
 
 
-def worker_shard(shard, depth):
+def worker_shard(shard, depth, sem):
     # one engine for the whole shard
     out = []
-    eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
     try:
-        try:
-            eng.configure({"Threads": 1})
-            eng.configure({"Hash": 64})
-        except Exception:
-            pass
+        eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        eng.configure({"Threads": 1})
+        eng.configure({"Hash": 64})
         for g in shard:
-            jd = load_json(g['json_file'])
-            out.append(analyze_with_sf_core(jd, eng, depth=depth))
+            try:
+                jd = load_json(g['json_file'])
+                out.append(analyze_with_sf_core(jd, eng, depth=depth))
+                sem.release()
+            except Exception as e:
+                print(f"error encountered {e}")
+                pass
     finally:
         try: eng.close()
         except Exception: pass
+
     return out
 
     
-def analyze_many_games(games, workers=4, depth=10):
+def analyze_many_games(games, workers=6, depth=10):
     start = time.time()
-    # shard games evenly across workers
-    shards = [games[i::workers] for i in range(max(1,int(workers)))]
-    results = []
+    shards = [games[i::workers] for i in range(max(1, int(workers)))]
+    total = sum([len(sh) for sh in shards])
+
+    sem = mp.Semaphore(0)
+    results, done = [], set()
+
     with ProcessPoolExecutor(max_workers=len(shards)) as ex:
-        futs = [ex.submit(worker_shard, sh, depth) for sh in shards if sh]
-        for fut in as_completed(futs):
-            results.extend(fut.result())
+        futs = []
+        for sh in shards:
+            if sh:
+                futs.append(ex.submit(worker_shard, sh, depth, sem))
+
+        with tqdm(total=total, unit='game', desc='Analyzing games') as pbar:
+            while len(done) < len(futs):
+                ticked = 0
+                # drain available permits without blocking or exceptions
+                while sem.acquire(block=False):
+                    ticked += 1
+                if ticked:
+                    pbar.update(ticked)
+
+                d, _ = wait([f for f in futs if f not in done],
+                            timeout=0.2, return_when=FIRST_COMPLETED)
+                for f in d:
+                    results.extend(f.result())
+                    done.add(f)
+
+                # dont need to spin too fast
+                time.sleep(1)
 
     # same aggregation as your original
     w_means = [r["white_cpl"] for r in results]
@@ -194,7 +222,7 @@ def analyze_many_games(games, workers=4, depth=10):
     
     df_all  = pd.concat([r.pop("df") for r in results], ignore_index=True)
     df_means = pd.DataFrame.from_records(results)
-    if "ts" in df_means:
+    if "ts" in df_means.columns:
         df_means["ts"] = df_means["ts"].round().astype("Int64")
         
     stop = time.time()
@@ -233,34 +261,80 @@ def combine_run_stats(previous, summary, results, df_all, df_means):
 
 
 if __name__ == '__main__':
+    CHUNK_THRESHOLD = 1800
+    CHUNK_SIZE = 900
+
     all_games = load_game_index()
     pkl_file = os.path.join(RUN_DIR, "analyze_results_combined.pkl")
+
+    # Load prior combined run and filter out already-processed games
     if os.path.exists(pkl_file):
         with open(pkl_file, "rb") as fp:
             prev_run = pickle.load(fp)
             old_df_means = prev_run['df_means']
-            games = [g for g in all_games if g['game_id'] not in set(old_df_means.game_id)]
+            done_ids = set(old_df_means.game_id)
+            games = [g for g in all_games if g['game_id'] not in done_ids]
             print(f"Found {len(games)} new games")
     else:
         prev_run = None
         games = all_games
         print(f"No pkl found. Running all {len(games)} games")
 
-    summary, results, df_all, df_means = analyze_many_games(games[:100], workers=6)
-    print("=== New Game Summary ===")
-    pprint(summary)
-    
-    if prev_run is not None:
-        new_pkl = combine_run_stats(prev_run, summary, results, df_all, df_means)
+    total_games = len(games)
+    if total_games == 0:
+        print("Nothing to do.")
+        # still print the overall summary if a prev_run exists
+        if prev_run is not None:
+            print("\n=== Overall Summary ===")
+            pprint(prev_run['summary'])
+        raise SystemExit(0)
+
+    # Decide chunking
+    if total_games > CHUNK_THRESHOLD:
+        chunks = [games[i:i + CHUNK_SIZE] for i in range(0, total_games, CHUNK_SIZE)]
     else:
-        new_pkl = {
-            "summary": summary, "results": results,
-            "df_all":df_all, "df_means":df_means
-        }
+        chunks = [games]
+
+    total_chunks = len(chunks)
+    combined = prev_run if prev_run is not None else None
+
+    t0 = time.time()
+    for ci, chunk in enumerate(chunks, 1):
+        print()
+        print(f"=== Chunk {ci}/{total_chunks} : {len(chunk)} games ===")
+
+        summary, results, df_all, df_means = analyze_many_games(chunk, workers=6)
+
+        print("=== New Game Summary ===")
+        pprint(summary)
+
+        # combine with prior results and/or earlier chunks
+        if combined is not None:
+            combined = combine_run_stats(combined, summary, results, df_all, df_means)
+        else:
+            combined = {
+                "summary": summary,
+                "results": results,
+                "df_all": df_all,
+                "df_means": df_means,
+            }
+
+        # persist after each chunk so progress is saved
+        with open(pkl_file, "wb") as f:
+            pickle.dump(combined, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        elapsed = time.time() - t0
+        done_chunks = ci
+        remain_chunks = total_chunks - ci
+        print(f"Chunks completed: {done_chunks}/{total_chunks}  "
+              f"Remaining: {remain_chunks}  "
+              f"Elapsed: {format_time(elapsed)}")
+
+        if remain_chunks > 0:
+            avg_chunk_s = elapsed / float(done_chunks)
+            eta = avg_chunk_s * remain_chunks
+            print(f"Estimated remaining: {format_time(eta)}")
 
     print()
     print("=== Overall Summary ===")
-    pprint(new_pkl['summary'])
-
-    with open(pkl_file, "wb") as f:
-        pickle.dump(new_pkl, f, protocol=pickle.HIGHEST_PROTOCOL)
+    pprint(combined['summary'])

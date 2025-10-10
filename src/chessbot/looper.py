@@ -33,22 +33,22 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_phase2"
+    run_tag = "conv_1000_selfplay_pv_collect_test"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
-    c_puct = 1.0
+    c_puct = 1.25
     anytime_uniform_mix = 0.25
     endgame_uniform_mix = 0.3
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 3200
-    micro_batch_size = 30
+    sims_target = 1600
+    micro_batch_size = 12
 
     # early stop
-    es_min_sims = 1200
-    es_check_every = 100
+    es_min_sims = 800
+    es_check_every = 32
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
     
@@ -60,13 +60,13 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 40
-    n_training_games = 500
+    games_at_once = 100
+    n_training_games = 100
     lru_cache_size = 750_000
     
     move_limit = 160
     material_diff_cutoff = 15
-    material_diff_cutoff_span = 20
+    material_diff_cutoff_span = 24
 
     play_vs_sf_prob = 0.5
     sf_depth = 6
@@ -295,8 +295,48 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        self.tree_data[self.plies] = data
+        # build PV from live tree by following the highest-visit child downwards
+        pv = []
+        node = self.tree.root()
+        max_pv_len = 24
+        for _ in range(max_pv_len):
+            # guard: node may be None or have no children
+            if node is None:
+                break
+            # node.children expected to be a mapping {uci: child_node}
+            children = getattr(node, "children", None)
+            if not children:
+                break
 
+            # pick child with max visits
+            best_uci = None
+            best_child = None
+            best_N = -1
+            for uci, ch in children.items():
+                # ch.N is the visit count stored in the C++ node wrapper
+                N = getattr(ch, "N", 0)
+                if N > best_N:
+                    best_N = N
+                    best_uci = uci
+                    best_child = ch
+
+            # stop if no child has positive visits (we only want real visited PV)
+            if best_uci is None or best_N <= 0:
+                break
+            try:
+                pv.append({
+                    "uci": best_uci, "visits": int(best_N),
+                    "P": getattr(best_child, "P", None) or 0.0,
+                    "Q": float(getattr(best_child, "Q", 0.0))
+                })
+                node = best_child
+            except Exception as e:
+                print(f'error encountered parsing PV: \n {e}')
+                break
+
+        # attach PV snapshot (may be empty if no deeper visited chain exists)
+        data["pv"] = pv
+        self.tree_data[self.plies] = data
         
     def make_move_with_stockfish(self, eng):
         """

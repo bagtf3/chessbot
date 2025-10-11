@@ -33,9 +33,10 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_phase2"
+    run_tag = "conv_1000_selfplay_visit_count_test"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
+    
     # MCTS
     c_puct = 1.25
     anytime_uniform_mix = 0.25
@@ -43,7 +44,7 @@ class Config(object):
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 3200
+    sims_target = 4800
     micro_batch_size = 30
 
     # early stop
@@ -56,7 +57,7 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.1
-    q_override_min_vis = 796
+    q_override_min_vis = 1200
     q_override_top_k = 3
     
     # Game stuff
@@ -229,15 +230,11 @@ class ChessGame(object):
         info = eng.analyse(b, chess.engine.Limit(depth=6), info=chess.engine.INFO_ALL)
         val_sf = score_to_cp_white(info['score'])
         move = str(info['pv'][0])
-        
         return move, val_sf
     
     def push_move(self, mv):
         # collect search data then push and update
-        try:
-            self.collect_tree_search_data(mv)
-        except Exception as e:
-            print(e)
+        self.collect_tree_search_data(mv)
         
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
@@ -266,7 +263,7 @@ class ChessGame(object):
         if details is None:
             return
     
-        sims = int(getattr(self.tree, "sims_completed_this_move", 0))
+        sims = int(self.tree.sims_completed_this_move)
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
     
@@ -322,16 +319,13 @@ class ChessGame(object):
             # stop if no child has positive visits (we only want real visited PV)
             if best_uci is None or best_N <= 0:
                 break
-            try:
-                pv.append({
-                    "uci": best_uci, "visits": int(best_N),
-                    "P": getattr(best_child, "P", None) or 0.0,
-                    "Q": float(getattr(best_child, "Q", 0.0))
-                })
-                node = best_child
-            except Exception as e:
-                print(f'error encountered parsing PV: \n {e}')
-                break
+            
+            pv.append({
+                "uci": best_uci, "visits": int(best_N),
+                "P": getattr(best_child, "P", None) or 0.0,
+                "Q": float(getattr(best_child, "Q", 0.0))
+            })
+            node = best_child
 
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv

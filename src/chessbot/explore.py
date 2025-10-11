@@ -302,14 +302,16 @@ pprint(trend_check(df_trim, window=1000))
 
 
 #%%
-d = prev_run['df_all']
 from chessbot.review import GameViewer
+d = prev_run['df_all']
+
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
+wins = [g for g in all_games if (g['beat_sf'])]
+pd.Series([w['scenario'] for w in wins]).value_counts()
+
+scns = ['random_init', 'pre_opened', 'piece_odds']
 gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
 
-
-cl = d.groupby("game_id")['clipped_loss'].max().sort_values()
 
 
 

@@ -267,15 +267,35 @@ class MCTSTree(fasttree):
                 self.sims_target = 1
                 return True
             
-            # use the sims target, or 300*num_moves to speed up forced positions
-            self.sims_target = min(self.config.sims_target, 500*len(mvs))
+            # use the sims target, or 600*num_moves to speed up forced positions
+            self.sims_target = min(self.config.sims_target, 600*len(mvs))
         
         if self.sims_completed_this_move >= self.sims_target:
             return True
         return self.maybe_early_stop()
 
     def reset_for_new_move(self):
-        self.sims_completed_this_move = 0
+        """
+        Resets everything, counts visits from previous trees.
+        """
+        existing = 0
+        try:
+            r = self.root()
+            # Prefer the root's own N if available
+            n_root = int(r.N)
+            if n_root > 0:
+                existing = n_root
+            else:
+                # sum child visits if root.N isnt populated
+                rows = self.root_child_visits() or []
+                existing = int(sum([n for (_u, n) in rows]))
+        except Exception as e:
+            print(f"error encountered calculating sims: {e}")
+            existing = 0
+        # carry the existing visit count forward
+        self.sims_completed_this_move = existing
+
+        # standard housekeeping
         self.awaiting_predictions.clear()
         self._move_started_at = _now()
         self.sims_target = None

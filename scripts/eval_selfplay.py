@@ -100,7 +100,7 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             continue
 
         res = analyze_with_deeper_look(
-            move, board, limit, eng, max_depth=16, cpl_trigger=250
+            move, board, limit, eng, max_depth=18, cpl_trigger=80
         )
 
         delta_signed = res['delta_signed']

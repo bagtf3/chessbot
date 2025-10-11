@@ -60,7 +60,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 30
+    games_at_once = 40
     n_training_games = 500
     lru_cache_size = 750_000
     

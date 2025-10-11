@@ -262,6 +262,9 @@ all_games = load_game_index()
 
 df_games = pd.DataFrame.from_records(all_games)
 df_games["ts"] = df_games["ts"].round().astype("int64")
+if 'vs_stockfish' not in df_games.columns:
+    df_games['vs_stockfish'] = df_games['beat_sf'] | df_games['started_vs_stockfish']
+    
 df_games = rolling_points_vs_sf(df_games)
 
 plot_rolling_rates_with_ci(df_games, window=250)
@@ -286,9 +289,12 @@ clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 
 df_trim = df_means.copy()
+df_trim = df_trim.query("plies >= 3")
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
-df_trim = df_trim.query("overall_cpl > 0").query("overall_cpl < 500")
+
+df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
+df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
 
 plot_cpl_and_bmr(df_trim, window=1000)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
@@ -299,103 +305,11 @@ pprint(trend_check(df_trim, window=1000))
 d = prev_run['df_all']
 from chessbot.review import GameViewer
 all_games = load_game_index()
-view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'pre_opened')]
-gv = GameViewer(view[-2]['json_file'], sf_df=d); gv.replay()
-
-#%%
-import psutil
-print("total cpu %:", psutil.cpu_percent(interval=5))
-print("per-cpu:", psutil.cpu_percent(interval=5, percpu=True))
-
-#%%
-# Requires: pip install psutil
-import sys
-import time
-import datetime as dt
-
-try:
-    import psutil
-except ImportError:
-    print("Please install psutil: pip install psutil")
-    sys.exit(1)
+view = [g for g in all_games if (g['beat_sf']) and (g['scenario'] == 'random_init')]
+gv = GameViewer(view[-1]['json_file'], sf_df=d); gv.replay()
 
 
-NAMES = {"stockfish", "stockfish.exe"}
+cl = d.groupby("game_id")['clipped_loss'].max().sort_values()
 
 
-def proc_matches(p):
-    try:
-        n = p.name().lower()
-        if n in NAMES:
-            return True
-        # fallback: sometimes name is generic, check cmdline
-        cmd = [str(x).lower() for x in p.cmdline()]
-        return any([("stockfish" in x) for x in cmd])
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return False
 
-
-def fmt_td(seconds):
-    seconds = int(seconds)
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def collect_stockfish():
-    out = []
-    now = time.time()
-    for p in psutil.process_iter(["pid", "name", "create_time", "exe",
-                                  "cmdline", "cpu_percent", "memory_info"]):
-        if not proc_matches(p):
-            continue
-        try:
-            with p.oneshot():
-                pid = p.pid
-                name = p.name()
-                started = p.create_time()
-                elapsed = now - started
-                cpu = p.cpu_percent(interval=1.0)
-                mem = p.memory_info().rss if p.memory_info() else 0
-                exe = p.exe() if p.exe() else ""
-                cmd = " ".join(p.info.get("cmdline") or [])
-                start_str = dt.datetime.fromtimestamp(
-                    started
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                out.append({
-                    "pid": pid,
-                    "name": name,
-                    "start": start_str,
-                    "elapsed": fmt_td(elapsed),
-                    "cpu_percent": cpu,
-                    "rss_mb": round(mem / (1024.0 * 1024.0), 1),
-                    "exe": exe,
-                    "cmdline": cmd,
-                })
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    return out
-
-
-def print_table(rows):
-    if not rows:
-        print("No Stockfish processes found.")
-        return
-    hdr = ("PID", "Name", "Start", "Elapsed", "CPU%", "RSS(MB)", "Executable")
-    print(f"{hdr[0]:>6s}  {hdr[1]:12s}  {hdr[2]:19s}  {hdr[3]:>8s}  "
-          f"{hdr[4]:>5s}  {hdr[5]:>7s}  {hdr[6]}")
-    print("-" * 100)
-    for r in rows:
-        print(f"{r['pid']:6d}  {r['name'][:12]:12s}  {r['start']:19s}  "
-              f"{r['elapsed']:>8s}  {r['cpu_percent']:5.1f}  "
-              f"{r['rss_mb']:7.1f}  {r['exe']}")
-    print()
-    print(f"Total Stockfish processes: {len(rows)}")
-
-
-def main():
-    rows = collect_stockfish()
-    print_table(rows)
-
-main()

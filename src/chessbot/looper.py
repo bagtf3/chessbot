@@ -33,7 +33,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_pv_collect_test"
+    run_tag = "conv_1000_selfplay_phase2"
     selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
     init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
     # MCTS
@@ -43,12 +43,12 @@ class Config(object):
     opponent_uniform_mix = 0.3
 
     # Simulation schedule
-    sims_target = 1600
-    micro_batch_size = 12
+    sims_target = 3200
+    micro_batch_size = 30
 
     # early stop
-    es_min_sims = 800
-    es_check_every = 32
+    es_min_sims = 1600
+    es_check_every = 128
     es_gap_frac = 0.7
     es_top_node_frac = 0.6
     
@@ -56,12 +56,12 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.1
-    q_override_min_vis = 396
+    q_override_min_vis = 796
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 100
-    n_training_games = 100
+    games_at_once = 30
+    n_training_games = 500
     lru_cache_size = 750_000
     
     move_limit = 160
@@ -69,7 +69,7 @@ class Config(object):
     material_diff_cutoff_span = 24
 
     play_vs_sf_prob = 0.5
-    sf_depth = 6
+    sf_depth = 9
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.25,
@@ -234,7 +234,6 @@ class ChessGame(object):
     
     def push_move(self, mv):
         # collect search data then push and update
-        
         try:
             self.collect_tree_search_data(mv)
         except Exception as e:
@@ -295,7 +294,7 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # build PV from live tree by following the highest-visit child downwards
+        # # build PV from live tree by following the highest-visit child downwards
         pv = []
         node = self.tree.root()
         max_pv_len = 24
@@ -516,7 +515,7 @@ class GameLooper(object):
     def run(self):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
-        or run MCTS step (collect/predict/apply). Keeps central batching.
+        or run MCTS step (collect/predict/apply).
         """
         completed_games = 0
         mbs = self.config.micro_batch_size

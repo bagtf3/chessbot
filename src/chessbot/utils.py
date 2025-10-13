@@ -1019,6 +1019,12 @@ class RateMeter(object):
         # instantaneous rate since last maybe_report (or since start if never called)
         t = _now()
         dt = t - self.t_last
+        total = self.total
+
+        # update for next time
+        self.t_last = t
+        self.last_total = total
+
         if dt <= 0:
             return 0.0
         return (self.total - self.last_total) / dt
@@ -1028,10 +1034,8 @@ class RateMeter(object):
         dt = t - self.t_last
         if dt < self.interval_s:
             return None
-        dcount = self.total - self.last_total
-        rate = dcount / dt if dt > 0 else 0.0
-        self.t_last = t
-        self.last_total = self.total
+        
+        rate = self.rate()
         msg = f"{self.name}: {rate:.1f}/s  (total {self.total})"
         if extra:
             msg += f"  {extra}"

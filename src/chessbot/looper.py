@@ -26,6 +26,7 @@ from chessbot.utils import (
 
 from chessbot.encoding import score_to_cp_white
 
+SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
 
 class Config(object):
     """
@@ -33,41 +34,41 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_phase2"
-    selfplay_dir =  "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-    init_model = "C:/Users/Bryan\Data/chessbot_data/selfplay_runs/conv_1000_selfplay/conv_1000_selfplay_model.h5"
+    run_tag = "conv_1000_selfplay_deep_priors"
+    selfplay_dir =  SP_DIR
+    init_model = SP_DIR + "conv_1000_selfplay_phase2/conv_1000_selfplay_phase2_model.h5"
     
     # MCTS
-    c_puct = 1.5
-    anytime_uniform_mix = 0.25
-    endgame_uniform_mix = 0.3
-    opponent_uniform_mix = 0.3
+    c_puct = 2.0
+    anytime_uniform_mix = 0.15
+    endgame_uniform_mix = 0.2
+    opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 10000
-    micro_batch_size = 40
+    sims_target = 8000
+    micro_batch_size = 200
 
     # early stop
-    es_min_sims = 8000
-    es_check_every = 512
-    es_gap_frac = 0.85
+    es_min_sims = 4000
+    es_check_every = 400
+    es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
     # Q-override selection
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 2800
+    q_override_min_vis = 2500
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 30
+    games_at_once = 24
     n_training_games = 500
     lru_cache_size = 750_000
     
     move_limit = 160
-    material_diff_cutoff = 15
-    material_diff_cutoff_span = 24
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 15
 
     play_vs_sf_prob = 0.5
     sf_depth = 9
@@ -79,14 +80,14 @@ class Config(object):
     }
     
     # boosts/penalize
-    use_prior_boosts = True
+    use_prior_boosts = False
     prior_clip_max = 0.35
     prior_clip_min = 0.001
     endgame_prior_adjustments = {
         "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.05
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.0, "repetition_penalty": 0.0}
+    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
     training_queue_min = 4096
@@ -225,7 +226,7 @@ class ChessGame(object):
         info = eng.analyse(
             b, chess.engine.Limit(depth=depth), info=chess.engine.INFO_ALL
         )
-        
+
         val_sf = score_to_cp_white(info['score'])
         move = str(info['pv'][0])
         return move, val_sf
@@ -533,7 +534,7 @@ class GameLooper(object):
                     n_collected, tries = 0, 0
                     bonus_hit, terminal = 0, 0
                     try_stop, collect_stop = 0, 0
-                    while True: #n_collected < mbs:
+                    while True:
                         leaf_req = game.tree.collect_one_leaf(lru)
                         if leaf_req is None:
                             # this shouldnt really happen
@@ -599,7 +600,7 @@ class GameLooper(object):
                 # resolve fresh predictions back into each game tree
                 still_waiting = 0
                 for game in self.active_games:
-                    still_waiting += game.tree.resolve_awaiting(lru)
+                   still_waiting += game.tree.resolve_awaiting(lru)
                 
                 if self.clear_lru_cache:
                     if not logged:

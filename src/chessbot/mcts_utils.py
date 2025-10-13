@@ -106,6 +106,13 @@ class MCTSTree(fasttree):
         req['enc'] = leaf.board.stacked_planes(5)
         self.awaiting_predictions.append(req)
         return req
+        
+        ## TEMP
+        # self.sims_completed_this_move += 1
+        # req['enc'] = 1
+        # self.apply_cached(req, None)
+        # return req
+        # END TEMP
 
     def resolve_awaiting(self, cache):
         if not self.awaiting_predictions:
@@ -132,16 +139,40 @@ class MCTSTree(fasttree):
         """
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
+        
+        ## TEMP add some priors
+        # b = leaf.board
+        # pri = []
+        # v = 1/len(legal) if len(legal) else 1.0
+        # d = v/4
+        # s_total = 0
+        # for l in legal:
+        #     s = v
+        #     if b.gives_check(l):
+        #         s += v/5
+        #         if b.gives_checkmate(l):
+        #             s += v*2
+        #     if b.would_be_repetition(l):
+        #         s -= v/5
+        #     else:
+        #         if b.is_capture(l): s += v/3
+        #         if len(l) > 4: s += v/5
+            
+        #     s_total += s
+        #     pri.append((l, s))
+        # pri = [(l, float(s/s_total)) for l, s in pri]
+        # self.apply_result(leaf, pri, leaf.v_prime)
+        # END TEMP
 
-        # compute factorized softmaxes in python (numpy)
-        sf_from  = cached["from"]
-        sf_to    = cached["to"]
-        sf_piece = cached["piece"]
-        sf_promo = cached["promo"]
+        # retrieve factorized softmaxes
+        p_from  = cached["from"]
+        p_to    = cached["to"]
+        p_piece = cached["piece"]
+        p_promo = cached["promo"]
     
         # let the C++ PriorEngine handle mixing, boosts, clipping and renorm
         pri = self._prior_engine.build(
-            leaf.board, legal, sf_from, sf_to, sf_piece, sf_promo,
+            leaf.board, legal, p_from, p_to, p_piece, p_promo,
             self.root_stm, req["stm_leaf"]
         )
     
@@ -224,14 +255,6 @@ class MCTSTree(fasttree):
                 self._es_after_sims = sims_done
                 thresh = self.config.es_top_node_frac * sims_target
                 self._es_reason = f"top_node_frac top_vis={top_vis} thresh={thresh:.1f}"
-                return True
-    
-            # if the top 4 visited nodes already sum to >= sims_target, stop now
-            top4_sum = sum([n for (_u, n) in rows[:4]])
-            if top4_sum >= int(sims_target):
-                self._es_tripped = True
-                self._es_after_sims = sims_done
-                self._es_reason = f"top4_sum={top4_sum} >= sims_target={sims_target}"
                 return True
     
         # from here on enforce min sims and periodic checking as before

@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -35,7 +35,6 @@ def load_json(path):
 def load_game_index(path=None):
     if path is None:
         path = os.path.join(RUN_DIR, "game_index.json")
-        
     return load_json(path)
 
 
@@ -100,7 +99,7 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             continue
 
         res = analyze_with_deeper_look(
-            move, board, limit, eng, max_depth=18, cpl_trigger=80
+            move, board, limit, eng, max_depth=18, cpl_trigger=50
         )
 
         delta_signed = res['delta_signed']

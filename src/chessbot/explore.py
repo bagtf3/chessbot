@@ -11,7 +11,7 @@ from chessbot.utils import rnd
 
 
 #RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_visit_count_test"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -268,8 +268,8 @@ if 'vs_stockfish' not in df_games.columns:
     
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=250)
-tail_vs_prev(df_games, window=250)
+plot_rolling_rates_with_ci(df_games, window=25)
+tail_vs_prev(df_games, window=25)
 
 pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
 if pkl_files:
@@ -297,9 +297,9 @@ df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
 df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
 
-plot_cpl_and_bmr(df_trim, window=1000)
+plot_cpl_and_bmr(df_trim, window=20)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-pprint(trend_check(df_trim, window=1000))
+pprint(trend_check(df_trim, window=20))
 
 
 #%%
@@ -308,8 +308,10 @@ d = prev_run['df_all']
 
 all_games = load_game_index()
 wins = [g for g in all_games if (g['beat_sf'])]
-wins = [g for g in all_games if (g['scenario'] == 'user provided board')]
-gv = GameViewer(wins[-1]['json_file'], sf_df=d); gv.replay()
+#wins = [g for g in all_games if (g['scenario'] == 'user provided board')]
+
+gv = GameViewer(wins[-6]['json_file'], sf_df=d); gv.replay()
+
 
 
 

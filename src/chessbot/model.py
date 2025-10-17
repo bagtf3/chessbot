@@ -7,6 +7,7 @@ MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 HE = "he_normal"
 
 import tensorflow as tf
+from tensorflow.keras import layers, Model
 from tensorflow import keras
 
 print("Built with CUDA?", tf.test.is_built_with_cuda())
@@ -404,3 +405,92 @@ def rename_head(model, old_name, new_name):
     _recompile(new_model, losses, weights)
     return new_model
 
+
+#### Current Model ###
+def value_head(trunk_vec, hidden=512, leak=0.05, name="value"):
+    x = trunk_vec
+    if hidden:
+        # First hidden layer
+        x = layers.Dense(hidden, name=f"{name}_dense1")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu1")(x)
+
+        # Second hidden layer at half size
+        x = layers.Dense(hidden // 2, name=f"{name}_dense2")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{name}_lrelu2")(x)
+
+    out = layers.Dense(1, activation="tanh", name=name)(x)  # [-1,1] White POV
+    return out, "mse"
+
+
+def policy_factor_head(trunk_vec, prefix, hidden=512, leak=0.05):
+    """Factorized move logits (no capture)."""
+    x = trunk_vec
+    if hidden:
+        # First hidden layer
+        x = layers.Dense(hidden, name=f"{prefix}_dense1")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{prefix}_lrelu1")(x)
+
+        # Second hidden layer at half size
+        x = layers.Dense(hidden // 2, name=f"{prefix}_dense2")(x)
+        x = layers.LeakyReLU(alpha=leak, name=f"{prefix}_lrelu2")(x)
+
+    # Raw logits, no activation
+    from_logits   = layers.Dense(64, name=f"{prefix}_from")(x)
+    to_logits     = layers.Dense(64, name=f"{prefix}_to")(x)
+    piece_logits  = layers.Dense(6,  name=f"{prefix}_piece")(x)
+    promo_logits  = layers.Dense(4,  name=f"{prefix}_promo")(x)
+
+    return [from_logits, to_logits, piece_logits, promo_logits]
+
+
+def build_conv_trunk(input_shape=(8, 8, 90), width=256, n_blocks=8, leak=0.05):
+    """Convolutional trunk with residual blocks, returns feature map + pooled vector."""
+    inputs = layers.Input(shape=input_shape, name="board")
+
+    # fat first conv
+    x = layers.Conv2D(width, 3, padding="same", use_bias=False, kernel_initializer=HE)(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.LeakyReLU(alpha=leak)(x)
+
+    # residual tower
+    for _ in range(n_blocks):
+        x = res_block(x, width, leak=leak)
+    
+    trunk_feat = layers.LeakyReLU(alpha=leak, name="trunk")(x)
+
+    # global pooling: (8,8,width) -> (width,)
+    trunk_vec = layers.GlobalAveragePooling2D(name="trunk_vec")(trunk_feat)
+
+    return Model(inputs, [trunk_feat, trunk_vec], name="conv_trunk")
+
+
+def make_conv_model(name, input_shape=(8, 8, 70), width=256, n_blocks=8):
+    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
+    inputs = trunk.input
+    trunk_feat, trunk_vec = trunk.output
+
+    # Heads
+    val_out, _ = value_head(trunk_vec, hidden=512)
+    best_outputs = policy_factor_head(trunk_vec, prefix="best", hidden=512)
+
+    model = Model(inputs, [val_out] + best_outputs, name=name)
+
+    losses = {
+        "value": tf.keras.losses.MeanSquaredError(),
+        "best_from": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_to":   tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_piece":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_promo":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+    }
+
+    loss_weights = {
+        "value": 0.5,
+        "best_from": 0.5,
+        "best_to": 0.5,
+        "best_piece": 0.5,
+        "best_promo": 0.1,
+    }
+
+    opt = tf.keras.optimizers.Adam(1e-4)
+    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
+    return model

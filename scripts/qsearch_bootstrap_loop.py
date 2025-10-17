@@ -16,7 +16,8 @@ import chess.syzygy
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC, SF_LOC
-load_model
+
+from chessbot.model import load_model, make_conv_model
 from chessbot.mcts_utils import MCTSTree, LRUCache
 
 import chessbot.utils as cbu
@@ -34,9 +35,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_small_conv"
+    run_tag = "qsearch_bootstrap"
     selfplay_dir =  SP_DIR
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_test.h5"
+    init_model = SP_DIR + "conv_1000_selfplay_small_conv/conv_1000_selfplay_small_conv_model.h5"
     
     # MCTS
     c_puct = 1.0
@@ -45,12 +46,12 @@ class Config(object):
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 600
-    micro_batch_size = 100
+    sims_target = 1000
+    micro_batch_size = 200
 
     # early stop
-    es_min_sims = 300
-    es_check_every = 32
+    es_min_sims = 400
+    es_check_every = 50
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -62,20 +63,20 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 40
-    n_training_games = 1000
+    games_at_once = 50
+    n_training_games = 1500
     lru_cache_size = 750_000
     
     move_limit = 160
     material_diff_cutoff = 12
     material_diff_cutoff_span = 15
 
-    play_vs_sf_prob = 0.5
+    play_vs_sf_prob = -1 # no stockfish, selfplay only
     sf_depth = 6
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
-        "random_middle_game": 0.15, "random_endgame": 0.05,
+        "pre_opened": 0.2, "random_init": 0.25,
+        "random_middle_game": 0.15, "random_endgame": 0.10,
         "piece_odds": 0.2, "piece_training": 0.1
     }
     
@@ -489,133 +490,132 @@ class GameLooper(object):
         mps, lps = self.mps, self.lps
         lru = LRUCache(self.config.lru_cache_size)
         counts = []
-        with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            eng.configure({"Threads": 2})
-            eng.configure({"Hash": 64})
-            while completed_games < self.config.n_training_games:
-                if not self.active_games:
-                    break
-        
-                preds_batch = []
-                finished = []
-                for game in list(self.active_games):
-                    # if its stockfish turn, let SF move and skip MCTS this ply
-                    if game.is_stockfish_turn():
-                        sf_terminal = game.make_move_with_stockfish(eng)
-                        mps.tick(1)
-                            
-                        if sf_terminal:
-                            completed_games += 1
-                            self.finalize_game_data(game)
-                            self.maybe_log_results()
-                            finished.append(game.game_id)
-                            # pass until the next turn
-                            continue
-        
-                    # if this game has reached its local sim budget, make the move
-                    if game.tree.stop_simulating():
-                        # bot plays from tree
-                        mcts_terminal = game.make_move_from_tree()
-                        mps.tick(1)
+        while completed_games < self.config.n_training_games:
+            if not self.active_games:
+                break
+    
+            preds_batch = []
+            finished = []
+            for game in list(self.active_games):
+                # for bootstrap only, since no preds, empty the tree's queue
+                game.tree.awaiting_predictions.clear()
+
+                # # No stockfish for this one
+                # # if its stockfish turn, let SF move and skip MCTS this ply
+                # if game.is_stockfish_turn():
+                #     sf_terminal = game.make_move_with_stockfish(eng)
+                #     mps.tick(1)
                         
-                        # terminal after bot move?
-                        if mcts_terminal:
-                            completed_games += 1
-                            self.finalize_game_data(game)
-                            self.maybe_log_results()
-                            finished.append(game.game_id)
-                            continue
-                        
-                        # if its stockfish turn, dont do any sims
-                        if game.is_stockfish_turn():
-                            continue
-        
-                    # otherwise, collect up to micro_batch_size leaves for this game
-                    n_collected, tries = 0, 0
-                    bonus_hit, terminal = 0, 0
-                    try_stop, collect_stop = 0, 0
-                    while True:
-                        leaf_req = game.tree.collect_one_leaf(lru)
-                        if leaf_req is None:
-                            # this shouldnt really happen
-                            tries += 1
-                        elif leaf_req["already_applied"]:
-                            lps.tick(1)
-                            tries += 1
-                            if leaf_req['terminal']:
-                                terminal += 1
-                            else:
-                                bonus_hit += 1
-                        else:    
-                            n_collected += 1 
-                            lps.tick(1)
-                            preds_batch.append(leaf_req)
-                        # so we dont spin forever
-                        if tries >= try_break:
-                            try_stop += 1
-                            break
-                        if n_collected >= mbs:
-                            collect_stop += 1
-                            break
+                #     if sf_terminal:
+                #         completed_games += 1
+                #         self.finalize_game_data(game)
+                #         self.maybe_log_results()
+                #         finished.append(game.game_id)
+                #         # pass until the next turn
+                #         continue
     
-                    counts.append([n_collected, tries, terminal, bonus_hit, try_stop, collect_stop])
-                # predict on the central batch (also updates caches)
-                logged = self.maybe_log_results()
-                if logged:
-                    lru.stats()
-                    # quick loop stats (temporary)
-                    if counts:
-                        n_groups = len(counts)
-                        s_collected   = sum([r[0] for r in counts])
-                        s_tries       = sum([r[1] for r in counts])
-                        s_terminals   = sum([r[2] for r in counts])
-                        s_bonus_hits  = sum([r[3] for r in counts])
-                        s_try_stops   = sum([r[4] for r in counts])
-                        s_collect_stops = sum([r[5] for r in counts])
-    
-                        avg_collected = s_collected / n_groups
-                        avg_tries     = s_tries / n_groups
-                        fill_ratio    = s_collected / max(1, n_groups * mbs)
-                        hit_ratio       = s_bonus_hits / max(1, s_tries)
-                        terminal_ratio  = s_terminals  / max(1, s_tries)
-                        print("------------------------------------------------------------")
-                        print("Loop stats"
-                            f" | groups={n_groups}  mbs={mbs}"
-                            f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
-                            f" | fill_ratio={fill_ratio:.3f} ")
-                        print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
-                            f" | terminals={s_terminals} ({terminal_ratio:.3%})")
-                        print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
-                        if lpb:
-                            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-                        avgply = np.mean([g.plies for g in self.active_games])
-                        print(f"Avg ply of active_games {avgply:<.3f}")
-                        print("------------------------------------------------------------")
-                    counts = []
-                    lpb = []
-                if preds_batch:
-                    self.format_and_predict(preds_batch, lru)
-                    lpb.append(len(preds_batch))
-        
-                # resolve fresh predictions back into each game tree
-                still_waiting = 0
-                for game in self.active_games:
-                   still_waiting += game.tree.resolve_awaiting(lru)
-                
-                if self.clear_lru_cache:
-                    if not logged:
-                        lru.stats()
-                    lru.clear()
-                    self.clear_lru_cache = False
-    
-                # remove any finished games
-                self.active_games = [
-                    g for g in self.active_games if g.game_id not in finished
-                ]
+                # if this game has reached its local sim budget, make the move
+                if game.tree.stop_simulating():
+                    # bot plays from tree
+                    mcts_terminal = game.make_move_from_tree()
+                    mps.tick(1)
                     
-                if completed_games + len(self.active_games) < self.config.n_training_games:
-                    while len(self.active_games) < self.config.games_at_once:
-                        self.active_games.append(ChessGame())
+                    # terminal after bot move?
+                    if mcts_terminal:
+                        completed_games += 1
+                        self.finalize_game_data(game)
+                        self.maybe_log_results()
+                        finished.append(game.game_id)
+                        continue
+                    
+                    # # if its stockfish turn, dont do any sims
+                    # if game.is_stockfish_turn():
+                    #     continue
+    
+                # otherwise, collect up to micro_batch_size leaves for this game
+                n_collected, tries = 0, 0
+                bonus_hit, terminal = 0, 0
+                try_stop, collect_stop = 0, 0
+                while True:
+                    leaf_req = game.tree.collect_one_leaf(lru)
+                    if leaf_req is None:
+                        # this shouldnt really happen
+                        tries += 1
+                    elif leaf_req["already_applied"]:
+                        lps.tick(1)
+                        tries += 1
+                        if leaf_req['terminal']:
+                            terminal += 1
+                        else:
+                            bonus_hit += 1
+                    else:    
+                        n_collected += 1 
+                        lps.tick(1)
+                        preds_batch.append(leaf_req)
+                    # so we dont spin forever
+                    if tries >= try_break:
+                        try_stop += 1
+                        break
+                    if n_collected >= mbs:
+                        collect_stop += 1
+                        break
+
+                counts.append([n_collected, tries, terminal, bonus_hit, try_stop, collect_stop])
+            # predict on the central batch (also updates caches)
+            logged = self.maybe_log_results()
+            if logged:
+                lru.stats()
+                # quick loop stats (temporary)
+                if counts:
+                    n_groups = len(counts)
+                    s_collected   = sum([r[0] for r in counts])
+                    s_tries       = sum([r[1] for r in counts])
+                    s_terminals   = sum([r[2] for r in counts])
+                    s_bonus_hits  = sum([r[3] for r in counts])
+                    s_try_stops   = sum([r[4] for r in counts])
+                    s_collect_stops = sum([r[5] for r in counts])
+
+                    avg_collected = s_collected / n_groups
+                    avg_tries     = s_tries / n_groups
+                    fill_ratio    = s_collected / max(1, n_groups * mbs)
+                    hit_ratio       = s_bonus_hits / max(1, s_tries)
+                    terminal_ratio  = s_terminals  / max(1, s_tries)
+                    print("------------------------------------------------------------")
+                    print("Loop stats"
+                        f" | groups={n_groups}  mbs={mbs}"
+                        f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
+                        f" | fill_ratio={fill_ratio:.3f} ")
+                    print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
+                        f" | terminals={s_terminals} ({terminal_ratio:.3%})")
+                    print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
+                    if lpb:
+                        print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
+                    avgply = np.mean([g.plies for g in self.active_games])
+                    print(f"Avg ply of active_games {avgply:<.3f}")
+                    print("------------------------------------------------------------")
+                counts = []
+                lpb = []
+
+            ## NOTHING TO RESOLVE IN THIS MODE    
+            # resolve fresh predictions back into each game tree
+            # still_waiting = 0
+            # for game in self.active_games:
+            #     still_waiting += game.tree.resolve_awaiting(lru)
+            
+            if self.clear_lru_cache:
+                if not logged:
+                    lru.stats()
+                lru.clear()
+                self.clear_lru_cache = False
+
+            # remove any finished games
+            self.active_games = [
+                g for g in self.active_games if g.game_id not in finished
+            ]
+                
+            if completed_games + len(self.active_games) < self.config.n_training_games:
+                while len(self.active_games) < self.config.games_at_once:
+                    self.active_games.append(ChessGame())
                     
         # train with whatever we got and final report
         half_full = self.config.training_queue_min / 2
@@ -626,6 +626,7 @@ class GameLooper(object):
         return
 
     def format_and_predict(self, preds_batch, lru):
+        ## not used for this mode ##
         """
         Take leaf requests from all games, run one model call, and write
         results into cache
@@ -885,6 +886,17 @@ class GameLooper(object):
         return True
 
 
+def init_model():
+    # roughyl 1.1M parameters. should be trainable on CPU
+    model = make_conv_model(
+        name="conv_factorized_small", input_shape=(8, 8, 70),
+        width=128, n_blocks=2
+    )
+
+    model.summary()
+    return model
+
+
 def init_selfplay():
     # file structure first
     config = Config()
@@ -911,10 +923,15 @@ def init_selfplay():
     if os.path.exists(model_path):
         print(f"Loading {model_name}")
         model = load_model(model_path)
-    else:
+    elif os.path.exists(config.init_model):
         print(f"Loading {config.init_model}")
         model = load_model(config.init_model)
         model.save(model_path)
+    else:
+        print("Initializing new model...")
+        model = init_model()
+        model.save(model_path)
+    
     config = Config()
     
     return model, config

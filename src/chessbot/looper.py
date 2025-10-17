@@ -461,7 +461,7 @@ class GameLooper(object):
             self.active_games = games
         
         self.model = model
-        self.fwd = make_fwd_batched(self.model, max_bs=config.fwd_batch)
+        self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
         self.training_queue = []
         self.stats_window = self.config.n_training_games
         self.recent_games = deque(maxlen=self.stats_window)
@@ -837,7 +837,7 @@ class GameLooper(object):
         self.model.save(self.config.model_path)
         
         #update the fwd
-        self.fwd = make_fwd_batched(self.model, max_bs=config.fwd_batch)
+        self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
 
         # clear training queue, clear LRU and bump retrain counter
         self.training_queue = []

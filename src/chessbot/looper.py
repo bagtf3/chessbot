@@ -34,23 +34,23 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_deep_priors"
+    run_tag = "conv_1000_selfplay_small_conv"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "conv_1000_selfplay_phase2/conv_1000_selfplay_phase2_model.h5"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_test.h5"
     
     # MCTS
-    c_puct = 2.0
+    c_puct = 1.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 8000
-    micro_batch_size = 200
+    sims_target = 600
+    micro_batch_size = 100
 
     # early stop
-    es_min_sims = 4000
-    es_check_every = 400
+    es_min_sims = 300
+    es_check_every = 32
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -58,12 +58,12 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 2500
+    q_override_min_vis = 200
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 12
-    n_training_games = 500
+    games_at_once = 40
+    n_training_games = 1000
     lru_cache_size = 750_000
     
     move_limit = 160
@@ -71,7 +71,7 @@ class Config(object):
     material_diff_cutoff_span = 15
 
     play_vs_sf_prob = 0.5
-    sf_depth = 9
+    sf_depth = 6
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.25,
@@ -80,7 +80,7 @@ class Config(object):
     }
     
     # boosts/penalize
-    use_prior_boosts = False
+    use_prior_boosts = True
     prior_clip_max = 0.35
     prior_clip_min = 0.001
     endgame_prior_adjustments = {
@@ -635,7 +635,7 @@ class GameLooper(object):
             return
 
         X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
-        out = self.model.predict(X, batch_size=1200, verbose=0)
+        out = self.model.predict(X, batch_size=4096, verbose=0)
 
         if isinstance(out, list):
             names = self.model.output_names

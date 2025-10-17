@@ -106,13 +106,6 @@ class MCTSTree(fasttree):
         req['enc'] = leaf.board.stacked_planes(5)
         self.awaiting_predictions.append(req)
         return req
-        
-        ## TEMP
-        # self.sims_completed_this_move += 1
-        # req['enc'] = 1
-        # self.apply_cached(req, None)
-        # return req
-        # END TEMP
 
     def resolve_awaiting(self, cache):
         if not self.awaiting_predictions:
@@ -121,11 +114,6 @@ class MCTSTree(fasttree):
         keep = []
         for req in self.awaiting_predictions:
             cached = cache[req["cache_key"]]
-            # this shouldnt be possible
-            if cached is None:
-                keep.append(req)
-                continue
-
             self.apply_cached(req, cached)
             self.sims_completed_this_move += 1
 
@@ -139,30 +127,6 @@ class MCTSTree(fasttree):
         """
         leaf = req["leaf"]
         legal = leaf.board.legal_moves()
-        
-        ## TEMP add some priors
-        # b = leaf.board
-        # pri = []
-        # v = 1/len(legal) if len(legal) else 1.0
-        # d = v/4
-        # s_total = 0
-        # for l in legal:
-        #     s = v
-        #     if b.gives_check(l):
-        #         s += v/5
-        #         if b.gives_checkmate(l):
-        #             s += v*2
-        #     if b.would_be_repetition(l):
-        #         s -= v/5
-        #     else:
-        #         if b.is_capture(l): s += v/3
-        #         if len(l) > 4: s += v/5
-            
-        #     s_total += s
-        #     pri.append((l, s))
-        # pri = [(l, float(s/s_total)) for l, s in pri]
-        # self.apply_result(leaf, pri, leaf.v_prime)
-        # END TEMP
 
         # retrieve factorized softmaxes
         p_from  = cached["from"]

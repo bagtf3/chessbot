@@ -16,7 +16,7 @@ import chess.syzygy
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC, SF_LOC
-from chessbot.model import load_model
+from chessbot.model import load_model, make_fwd_batched
 from chessbot.mcts_utils import MCTSTree, LRUCache
 
 import chessbot.utils as cbu
@@ -34,9 +34,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_small_conv"
+    run_tag = "conv_small_bootstrap"
     selfplay_dir =  SP_DIR
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_test.h5"
+    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_init.h5"
     
     # MCTS
     c_puct = 1.0
@@ -46,7 +46,7 @@ class Config(object):
 
     # Simulation schedule
     sims_target = 600
-    micro_batch_size = 100
+    micro_batch_size = 200
 
     # early stop
     es_min_sims = 300
@@ -62,7 +62,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 40
+    games_at_once = 20
     n_training_games = 1000
     lru_cache_size = 750_000
     
@@ -91,6 +91,7 @@ class Config(object):
 
     # TF
     training_queue_min = 4096
+    fwd_batch = 2048
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
     target_mean = 0.5
@@ -460,6 +461,7 @@ class GameLooper(object):
             self.active_games = games
         
         self.model = model
+        self.fwd = make_fwd_batched(self.model, max_bs=config.fwd_batch)
         self.training_queue = []
         self.stats_window = self.config.n_training_games
         self.recent_games = deque(maxlen=self.stats_window)
@@ -536,10 +538,7 @@ class GameLooper(object):
                     try_stop, collect_stop = 0, 0
                     while True:
                         leaf_req = game.tree.collect_one_leaf(lru)
-                        if leaf_req is None:
-                            # this shouldnt really happen
-                            tries += 1
-                        elif leaf_req["already_applied"]:
+                        if leaf_req["already_applied"]:
                             lps.tick(1)
                             tries += 1
                             if leaf_req['terminal']:
@@ -635,21 +634,14 @@ class GameLooper(object):
             return
 
         X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
-        out = self.model.predict(X, batch_size=4096, verbose=0)
+        out_list = self.fwd(X)
 
-        if isinstance(out, list):
-            names = self.model.output_names
-            v = out[names.index('value')]
-            pf = out[names.index('best_from')]
-            pt = out[names.index('best_to')]
-            ppc = out[names.index('best_piece')]
-            ppr = out[names.index('best_promo')]
-        else:
-            v   = out['value']
-            pf  = out['best_from']
-            pt  = out['best_to']
-            ppc = out['best_piece']
-            ppr = out['best_promo']
+        names = self.model.output_names
+        v   = out_list[names.index('value')]
+        pf  = out_list[names.index('best_from')]
+        pt  = out_list[names.index('best_to')]
+        ppc = out_list[names.index('best_piece')]
+        ppr = out_list[names.index('best_promo')]
 
         # write to caches keyed by the req cache_key
         for i, req in enumerate(preds_batch):
@@ -841,15 +833,18 @@ class GameLooper(object):
         }
 
         # fit and  save new model
-        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)        
+        self.model.fit(X, Y, epochs=1, batch_size=1024, verbose=0, sample_weight=s_wts)
         self.model.save(self.config.model_path)
         
+        #update the fwd
+        self.fwd = make_fwd_batched(self.model, max_bs=config.fwd_batch)
+
         # clear training queue, clear LRU and bump retrain counter
         self.training_queue = []
         self.n_retrains += 1
         self.clear_lru_cache = True
     
-    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=45.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"

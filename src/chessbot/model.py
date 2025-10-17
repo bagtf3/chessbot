@@ -32,11 +32,20 @@ def save_model(model, model_loc):
 
 def res_block(x, filters, leak=0.05):
     skip = x
+
+    # project skip if channel count doesnt match
+    if x.shape[-1] != filters:
+        skip = Conv2D(
+            filters, 1, padding="same", use_bias=False, kernel_initializer=HE
+        )(skip)
+        skip = BatchNormalization()(skip)
+
     y = Conv2D(filters, 3, padding="same", use_bias=False, kernel_initializer=HE)(x)
     y = BatchNormalization()(y)
     y = LeakyReLU(alpha=leak)(y)
     y = Conv2D(filters, 3, padding="same", use_bias=False, kernel_initializer=HE)(y)
     y = BatchNormalization()(y)
+
     y = Add()([skip, y])
     return LeakyReLU(alpha=leak)(y)
 
@@ -443,15 +452,18 @@ def policy_factor_head(trunk_vec, prefix, hidden=512, leak=0.05):
     return [from_logits, to_logits, piece_logits, promo_logits]
 
 
-def build_conv_trunk(input_shape=(8, 8, 90), width=256, n_blocks=8, leak=0.05):
+def build_conv_trunk(input_shape=(8, 8, 70), width=256, n_blocks=8, leak=0.05):
     """Convolutional trunk with residual blocks, returns feature map + pooled vector."""
     inputs = layers.Input(shape=input_shape, name="board")
 
     # fat first conv
-    x = layers.Conv2D(width, 3, padding="same", use_bias=False, kernel_initializer=HE)(inputs)
+    x = layers.Conv2D(
+        2*width, 3, padding="same", use_bias=False, kernel_initializer=HE
+    )(inputs)
+
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(alpha=leak)(x)
-
+    
     # residual tower
     for _ in range(n_blocks):
         x = res_block(x, width, leak=leak)
@@ -494,3 +506,57 @@ def make_conv_model(name, input_shape=(8, 8, 70), width=256, n_blocks=8):
     opt = tf.keras.optimizers.Adam(1e-4)
     model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
     return model
+
+
+def make_fwd(model, warm_shapes=(64, 256)):
+    """
+    Returns a callable fwd(X_np) that:
+      1) uses a compiled @tf.function on the given model with training=False
+      2) accepts a NumPy batch [B,8,8,70] and returns a list of NumPy arrays
+         in the same order as model.outputs
+      3) warms up the common batch shapes once to stabilize autotune
+    """
+    @tf.function(input_signature=[tf.TensorSpec([None, 8, 8, 70], tf.float32)])
+    def graph(x):
+        return model(x, training=False)
+
+    for B in warm_shapes:
+        _ = graph(tf.zeros([B, 8, 8, 70], tf.float32))
+
+    def fwd(x_np):
+        x = tf.convert_to_tensor(x_np, dtype=tf.float32)
+        outs = graph(x)
+        if isinstance(outs, (list, tuple)):
+            return [t.numpy() for t in outs]
+        if isinstance(outs, dict):
+            ordered = []
+            for t in model.outputs:
+                key = t.name.split(':')[0].split('/')[0]
+                ordered.append(outs[key].numpy())
+            return ordered
+        return [outs.numpy()]
+    return fwd
+    
+
+def make_fwd_batched(model, max_bs=1024, warm_shapes=(256, 512, 1024)):
+    base = make_fwd(model, warm_shapes=warm_shapes)
+
+    def fwd(X_np):
+        B = X_np.shape[0]
+        if B <= max_bs:
+            return base(X_np)
+
+        acc = None
+        i = 0
+        while i < B:
+            j = min(i + max_bs, B)
+            part = base(X_np[i:j])
+            if acc is None:
+                acc = [p for p in part]
+            else:
+                for k in range(len(acc)):
+                    acc[k] = np.concatenate([acc[k], part[k]], axis=0)
+            i = j
+        return acc
+
+    return fwd

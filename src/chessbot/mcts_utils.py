@@ -141,7 +141,8 @@ class MCTSTree(fasttree):
         )
     
         # expansion + backup (C++ apply_result expects pri as (move, prob) pairs)
-        self.apply_result(leaf, pri, cached["value"])
+        # testing bootstrapping with v_prime per se
+        self.apply_result(leaf, pri, leaf.v_prime) 
 
     def best(self):
         # If not configured, delegate straight to the C++/base implementation.

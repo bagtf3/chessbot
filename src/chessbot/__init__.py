@@ -1,3 +1,16 @@
+# try to get ahead of TF GPU mem management
+import os
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+
+try:
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for g in gpus:
+            tf.config.experimental.set_memory_growth(g, True)
+except Exception as e:
+    print(f"Error setting TF GPU mem: {e}")
+    
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 ENDGAME_LOC = "C:/Users/Bryan/Data/chessbot_data/endgame_tables"
 

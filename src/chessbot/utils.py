@@ -5,6 +5,7 @@ pd.set_option('display.max_columns', None)
 
 import math, random, time, pickle
 from time import time as _now
+from pathlib import Path
 
 import tensorflow as tf
 import matplotlib.pyplot as plt
@@ -22,8 +23,7 @@ from chessbot import features as ft
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"  
+uci_path_path =  Path(__file__).resolve().parents[2] / "data" / "uci_paths3000.pkl"
 with open(uci_path_path, "rb") as f:
     paths = pickle.load(f)
     

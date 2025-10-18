@@ -11,7 +11,7 @@ from chessbot.utils import rnd
 
 
 #RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_small_bootstrap"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -268,8 +268,8 @@ if 'vs_stockfish' not in df_games.columns:
     
 df_games = rolling_points_vs_sf(df_games)
 
-plot_rolling_rates_with_ci(df_games, window=25)
-tail_vs_prev(df_games, window=25)
+plot_rolling_rates_with_ci(df_games, window=100)
+tail_vs_prev(df_games, window=100)
 
 pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
 if pkl_files:
@@ -285,7 +285,7 @@ bmr = df_all.groupby("game_id")['played_best_move'].mean()
 df_all['loss'] = np.where(
     df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
 
-df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
+df_all['clipped_loss'] = np.clip(df_all['loss'], -1200, 1200)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 
@@ -295,11 +295,11 @@ df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
 df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
-df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
+#df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
 
-plot_cpl_and_bmr(df_trim, window=20)
+plot_cpl_and_bmr(df_trim, window=200)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-pprint(trend_check(df_trim, window=20))
+pprint(trend_check(df_trim, window=200))
 
 
 #%%
@@ -308,9 +308,9 @@ d = prev_run['df_all']
 
 all_games = load_game_index()
 wins = [g for g in all_games if (g['beat_sf'])]
-#wins = [g for g in all_games if (g['scenario'] == 'user provided board')]
+wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 
-gv = GameViewer(wins[-6]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(wins[-5]['json_file'], sf_df=d); gv.replay()
 
 
 

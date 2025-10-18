@@ -43,7 +43,6 @@ class MCTSTree(fasttree):
         pcfg = PriorConfig()
         pcfg.anytime_uniform_mix = float(_get("anytime_uniform_mix", 0.15))
         pcfg.endgame_uniform_mix = float(_get("endgame_uniform_mix", 0.25))
-        pcfg.opponent_uniform_mix = float(_get("opponent_uniform_mix", 0.5))
         pcfg.use_prior_boosts = bool(_get("use_prior_boosts", True))
     
         # prior adjustments (these are expected to be dict-like)
@@ -141,8 +140,7 @@ class MCTSTree(fasttree):
         )
     
         # expansion + backup (C++ apply_result expects pri as (move, prob) pairs)
-        # testing bootstrapping with v_prime per se
-        self.apply_result(leaf, pri, leaf.v_prime) 
+        self.apply_result(leaf, pri, cached['value'])
 
     def best(self):
         # If not configured, delegate straight to the C++/base implementation.

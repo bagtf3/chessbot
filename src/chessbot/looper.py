@@ -45,8 +45,8 @@ class Config(object):
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 800
-    micro_batch_size = 200
+    sims_target = 1000
+    micro_batch_size = 100
 
     # early stop
     es_min_sims = 400
@@ -62,8 +62,8 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 10
-    n_training_games = 1000
+    games_at_once = 20
+    n_training_games = 1500
     lru_cache_size = 750_000
     
     move_limit = 160

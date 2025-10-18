@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_deep_priors"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_small_bootstrap"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -42,7 +42,7 @@ def score_cp(pov_score, mate_cp):
     return pov_score.white().score(mate_score=mate_cp)
 
 
-def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=50):
+def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=200):
     # best line (white-POV cp)
     sf_best = eng.play(board, limit=limit, info=chess.engine.INFO_ALL)
     best_move = sf_best.move
@@ -99,7 +99,7 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             continue
 
         res = analyze_with_deeper_look(
-            move, board, limit, eng, max_depth=18, cpl_trigger=50
+            move, board, limit, eng, max_depth=18, cpl_trigger=200
         )
 
         delta_signed = res['delta_signed']

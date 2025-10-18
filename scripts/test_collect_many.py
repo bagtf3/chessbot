@@ -100,3 +100,93 @@ for i in range(5):
                   np.random.randn(5).astype(np.float32)))
 pf.raw_cache_bulk_insert(batch)
 print(pf.raw_cache_stats())
+
+
+import numpy as np, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+key = 55555
+arr1 = np.zeros(64, dtype=np.float32)     # all zeros
+arr2 = np.ones(64, dtype=np.float32)      # all ones
+p_piece = np.arange(6, dtype=np.float32)
+p_promo = np.arange(5, dtype=np.float32)
+
+pf.raw_cache_bulk_insert([(key, arr1, arr1, p_piece, p_promo)])   # insert first
+print("after 1st insert:", pf.raw_cache_stats())
+
+pf.raw_cache_bulk_insert([(key, arr2, arr2, p_piece, p_promo)])   # overwrite same key
+print("after overwrite:", pf.raw_cache_stats())
+
+# Expect size unchanged (should be 1)
+
+#####
+
+
+import numpy as np, time, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+N = 1000
+batch = []
+for i in range(N):
+    k = 200000 + i
+    pf_from = np.random.randn(64).astype(np.float32)
+    pf_to   = np.random.randn(64).astype(np.float32)
+    pf_piece= np.random.randn(6).astype(np.float32)
+    pf_promo= np.random.randn(5).astype(np.float32)
+    batch.append((k, pf_from, pf_to, pf_piece, pf_promo))
+
+t0 = time.perf_counter()
+pf.raw_cache_bulk_insert(batch)
+t1 = time.perf_counter()
+print(f"Inserted {N} entries in {t1-t0:.3f}s -> {N/(t1-t0):.0f} inserts/sec")
+print("stats:", pf.raw_cache_stats())
+
+
+####
+import numpy as np, time, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+M = 17000
+batch = []
+for i in range(M):
+    k = 300000 + i
+    pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+    pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+    pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+    pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+    batch.append((k, pf_from, pf_to, pf_piece, pf_promo))
+
+pf.raw_cache_bulk_insert(batch)
+s = pf.raw_cache_stats()
+print("after heavy insert:", s)
+# Expect s['evictions'] > 0 and s['size'] <= s['capacity']
+assert s["evictions"] > 0
+assert s["size"] <= s["capacity"]
+print("eviction test passed.")
+######
+import numpy as np, pyfastchess as pf
+
+pf.ensure_prior_engine()
+
+for round in range(5):
+    pf.raw_cache_clear()
+    batch = []
+    for i in range(200):
+        k = 400000 + round*1000 + i
+        batch.append((k,
+                      np.random.randn(64).astype(np.float32),
+                      np.random.randn(64).astype(np.float32),
+                      np.random.randn(6).astype(np.float32),
+                      np.random.randn(5).astype(np.float32)))
+    pf.raw_cache_bulk_insert(batch)
+    print(f"round {round}: ", pf.raw_cache_stats())
+
+
+
+

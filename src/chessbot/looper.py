@@ -486,7 +486,7 @@ class GameLooper(object):
         """
         completed_games = 0
         mbs = self.config.micro_batch_size
-        try_break = int(2.5 * mbs)
+        max_fastpath = int(2.5 * mbs)
         lpb = []
         mps, lps = self.mps, self.lps
         lru = LRUCache(self.config.lru_cache_size)
@@ -531,37 +531,27 @@ class GameLooper(object):
                         # if its stockfish turn, dont do any sims
                         if game.is_stockfish_turn():
                             continue
-        
+
                     # otherwise, collect up to micro_batch_size leaves for this game
-                    n_collected, tries = 0, 0
-                    bonus_hit, terminal = 0, 0
-                    try_stop, collect_stop = 0, 0
-                    while True:
-                        leaf_req = game.tree.collect_one_leaf(lru)
-                        if leaf_req["already_applied"]:
-                            lps.tick(1)
-                            tries += 1
-                            if leaf_req['terminal']:
-                                terminal += 1
-                            else:
-                                bonus_hit += 1
-                        else:    
-                            n_collected += 1 
-                            lps.tick(1)
-                            preds_batch.append(leaf_req)
-                        # so we dont spin forever
-                        if tries >= try_break:
-                            try_stop += 1
-                            break
-                        if n_collected >= mbs:
-                            collect_stop += 1
-                            break
+                    # new, terminal, cached
+                    nn, nt, nc = game.tree.collect_many_leaves(mbs, max_fastpath)
+                    lps.tick(nn + nc)
+
+                    # update sim count here
+                    game.tree.sims_completed_this_move += nn + nt + nc
+
+                    if nn:
+                        preds_batch.append(game.tree.pending_encoded(5))
+
+                    tries = nt + nc
+                    try_stop, collect_stop = 0, 1
+                    if nn < mbs:
+                        try_stop, collect_stop = 1, 0
     
-                    counts.append([n_collected, tries, terminal, bonus_hit, try_stop, collect_stop])
+                    counts.append([nc, tries, nt, nc, try_stop, collect_stop])
                 # predict on the central batch (also updates caches)
                 logged = self.maybe_log_results()
                 if logged:
-                    lru.stats()
                     # quick loop stats (temporary)
                     if counts:
                         n_groups = len(counts)
@@ -572,19 +562,21 @@ class GameLooper(object):
                         s_try_stops   = sum([r[4] for r in counts])
                         s_collect_stops = sum([r[5] for r in counts])
     
-                        avg_collected = s_collected / n_groups
-                        avg_tries     = s_tries / n_groups
-                        fill_ratio    = s_collected / max(1, n_groups * mbs)
-                        hit_ratio       = s_bonus_hits / max(1, s_tries)
-                        terminal_ratio  = s_terminals  / max(1, s_tries)
-                        print("------------------------------------------------------------")
+                        avg_new = s_collected / n_groups
+                        avg_tries = s_tries / n_groups
+                        fill_ratio = s_collected / max(1, n_groups * mbs)
+                        hit_ratio = s_bonus_hits / max(1, s_tries)
+                        terminal_ratio = s_terminals  / max(1, s_tries)
+                        print("----------------------------------------------------------")
                         print("Loop stats"
                             f" | groups={n_groups}  mbs={mbs}"
-                            f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
+                            f" | avg_collected={avg_new:.2f}  avg_tries={avg_tries:.2f}"
                             f" | fill_ratio={fill_ratio:.3f} ")
                         print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
                             f" | terminals={s_terminals} ({terminal_ratio:.3%})")
-                        print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
+                        print(f"Stops: try_breaks={s_try_stops}",
+                            f"collect_breaks={s_collect_stops}")
+
                         if lpb:
                             print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
                         avgply = np.mean([g.plies for g in self.active_games])
@@ -593,13 +585,13 @@ class GameLooper(object):
                     counts = []
                     lpb = []
                 if preds_batch:
-                    self.format_and_predict(preds_batch, lru)
+                    self.format_and_predict(preds_batch)
                     lpb.append(len(preds_batch))
         
                 # resolve fresh predictions back into each game tree
                 still_waiting = 0
                 for game in self.active_games:
-                   still_waiting += game.tree.resolve_awaiting(lru)
+                   still_waiting += game.tree.resolve_pending()
                 
                 if self.clear_lru_cache:
                     if not logged:

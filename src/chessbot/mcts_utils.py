@@ -222,7 +222,6 @@ class MCTSTree(fasttree):
             
             # use the sims target, or 600*num_moves to speed up forced positions
             self.sims_target = min(self.config.sims_target, 600*len(mvs))
-        
         if self.sims_completed_this_move >= self.sims_target:
             return True
         return self.maybe_early_stop()

@@ -11,7 +11,7 @@ from chessbot.utils import rnd
 
 
 #RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_small_bootstrap"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/collect_many_test"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -285,7 +285,7 @@ bmr = df_all.groupby("game_id")['played_best_move'].mean()
 df_all['loss'] = np.where(
     df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
 
-df_all['clipped_loss'] = np.clip(df_all['loss'], -1200, 1200)
+df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 
@@ -310,8 +310,8 @@ all_games = load_game_index()
 wins = [g for g in all_games if (g['beat_sf'])]
 wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 
-gv = GameViewer(wins[-5]['json_file'], sf_df=d); gv.replay()
-
+gv = GameViewer(all_games[-2]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(all_games[-2]['json_file']); gv.replay()
 
 
 

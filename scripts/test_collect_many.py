@@ -243,7 +243,7 @@ if __name__ == '__main__':
     time.sleep(1.0)
     
     start = time.time()
-    nn, nt, nc = tree.collect_many_leaves(10000, 500)
+    nn, nt, nc = tree.collect_many_leaves(5000, 500)
     stop = time.time()
     print(f"collected 10000 pending in {stop-start:<.3}")
     pn = tree.pending_nodes_
@@ -258,13 +258,26 @@ if __name__ == '__main__':
         pf_promo= np.full(5, float(i % 5), dtype=np.float32)
         batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
     
+    raw_cache_clear()
+    priors_cache_clear()
+    from pyfastchess import raw_cache_stats
+    uniq = set([z for z, b in tree.pending_encoded()])
+    rcs = raw_cache_stats()
+    n = len(uniq)
+    start = time.time()
     pf.raw_cache_bulk_insert(batch)
+    while rcs['size'] < n:
+        rcs = raw_cache_stats()
+    stop = time.time()
+    print(f"batch appened {n} raw pending in {stop-start:<.5}")
+    
+
     
     start = time.time()
     tree.resolve_pending()
     while len(tree.pending_nodes_):
         pass
     stop = time.time()
-    print(f"applied 10000 pending in {stop-start:<.3}")
+    print(f"applied {n} pending in {stop-start:<.3}")
 
 

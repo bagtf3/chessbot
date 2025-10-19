@@ -1,16 +1,16 @@
 from chessbot.utils import random_init
 from chessbot.looper import ChessGame
 
-from pyfastchess import cache_clear, Board
+from pyfastchess import Board, prior_engine_details
 
-cache_clear()
 
 game = ChessGame(board=Board())
 tree = game.tree
 
+
 import time
 start = time.time()
-nn, nt, nc = tree.collect_many_leaves(200, 200)
+nn, nt, nc = tree.collect_many_leaves(12000, 5200)
 stop = time.time()
 
 print(f"{stop-start:<.3}")
@@ -30,11 +30,10 @@ tree.root_child_visits()
 batch = tree.pending_encoded(5)
 len(batch)
 
-a, b, c, d = batch[0]
+z, p = batch[0]
 
 
 import pyfastchess as pf
-pf.ensure_prior_engine()                  # creates singleton with defaults (safe to call)
 print(pf.prior_engine_details())          # shows current prior config (dict)
 
 
@@ -94,9 +93,191 @@ batch = []
 for i in range(5):
     k = 100000 + i
     batch.append((k,
+                  np.random.uniform(),
                   np.random.randn(64).astype(np.float32),
                   np.random.randn(64).astype(np.float32),
                   np.random.randn(6).astype(np.float32),
                   np.random.randn(5).astype(np.float32)))
 pf.raw_cache_bulk_insert(batch)
 print(pf.raw_cache_stats())
+
+
+import numpy as np, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+key = 55555
+v = 0.0
+arr1 = np.zeros(64, dtype=np.float32)     # all zeros
+arr2 = np.ones(64, dtype=np.float32)      # all ones
+p_piece = np.arange(6, dtype=np.float32)
+p_promo = np.arange(5, dtype=np.float32)
+
+pf.raw_cache_bulk_insert([(key, v, arr1, arr1, p_piece, p_promo)])   # insert first
+print("after 1st insert:", pf.raw_cache_stats())
+
+pf.raw_cache_bulk_insert([(key, v, arr2, arr2, p_piece, p_promo)])   # overwrite same key
+print("after overwrite:", pf.raw_cache_stats())
+
+# Expect size unchanged (should be 1)
+
+#####
+
+
+import numpy as np, time, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+N = 25000
+batch = []
+for i in range(N):
+    k = 200000 + i
+    v = np.random.uniform()
+    pf_from = np.random.randn(64).astype(np.float32)
+    pf_to   = np.random.randn(64).astype(np.float32)
+    pf_piece= np.random.randn(6).astype(np.float32)
+    pf_promo= np.random.randn(5).astype(np.float32)
+    batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+
+t0 = time.perf_counter()
+pf.raw_cache_bulk_insert(batch)
+t1 = time.perf_counter()
+print(f"Inserted {N} entries in {t1-t0:.3f}s -> {N/(t1-t0):.0f} inserts/sec")
+print("stats:", pf.raw_cache_stats())
+
+
+####
+import numpy as np, time, pyfastchess as pf
+
+pf.ensure_prior_engine()
+pf.raw_cache_clear()
+
+M = 17000
+batch = []
+for i in range(M):
+    k = 300000 + i
+    v = 0.0
+    pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+    pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+    pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+    pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+    batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+
+pf.raw_cache_bulk_insert(batch)
+s = pf.raw_cache_stats()
+print("after heavy insert:", s)
+# Expect s['evictions'] > 0 and s['size'] <= s['capacity']
+assert s["evictions"] > 0
+assert s["size"] <= s["capacity"]
+print("eviction test passed.")
+######
+import numpy as np, pyfastchess as pf
+
+pf.ensure_prior_engine()
+
+for round in range(5):
+    pf.raw_cache_clear()
+    batch = []
+    for i in range(200):
+        k = 400000 + round*1000 + i
+        batch.append((k,
+                      0.25, 
+                      np.random.randn(64).astype(np.float32),
+                      np.random.randn(64).astype(np.float32),
+                      np.random.randn(6).astype(np.float32),
+                      np.random.randn(5).astype(np.float32)))
+    pf.raw_cache_bulk_insert(batch)
+    print(f"round {round}: ", pf.raw_cache_stats())
+    
+    
+#%%
+
+if __name__ == '__main__':
+    from chessbot.utils import random_init
+    from chessbot.looper import ChessGame
+    
+    from pyfastchess import Board, prior_engine_details, raw_cache_clear, priors_cache_clear
+    
+    
+    game = ChessGame(board=Board())
+    tree = game.tree
+    
+    
+    import time
+    raw_cache_clear()
+    priors_cache_clear()
+    time.sleep(1.0)
+    start = time.time()
+    nn, nt, nc = tree.collect_many_leaves(200, 500)
+    stop = time.time()
+    print(f"collected 200 pending in {stop-start:<.3}")
+    pn = tree.pending_nodes_
+        
+    batch = []
+    for p in pn:
+        k = p.zobrist
+        v = 0.0
+        pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+        pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+        pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+        pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+        batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+    
+    pf.raw_cache_bulk_insert(batch)
+    print(len(tree.pending_nodes_))
+    start = time.time()
+    tree.resolve_pending()
+    while len(tree.pending_nodes_):
+        pass
+    stop = time.time()
+    print(f"applied 200 pending in {stop-start:<.3}")
+    
+    
+    game = ChessGame(board=Board())
+    tree = game.tree
+    
+    raw_cache_clear()
+    priors_cache_clear()
+    time.sleep(1.0)
+    
+    start = time.time()
+    nn, nt, nc = tree.collect_many_leaves(5000, 500)
+    stop = time.time()
+    print(f"collected 10000 pending in {stop-start:<.3}")
+    pn = tree.pending_nodes_
+        
+    batch = []
+    for p in pn:
+        k = p.zobrist
+        v = 0.0
+        pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+        pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+        pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+        pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+        batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+    
+    raw_cache_clear()
+    priors_cache_clear()
+    from pyfastchess import raw_cache_stats
+    uniq = set([z for z, b in tree.pending_encoded()])
+    rcs = raw_cache_stats()
+    n = len(uniq)
+    start = time.time()
+    pf.raw_cache_bulk_insert(batch)
+    while rcs['size'] < n:
+        rcs = raw_cache_stats()
+    stop = time.time()
+    print(f"batch appened {n} raw pending in {stop-start:<.5}")
+    
+
+    
+    start = time.time()
+    tree.resolve_pending()
+    while len(tree.pending_nodes_):
+        pass
+    stop = time.time()
+    print(f"applied {n} pending in {stop-start:<.3}")
+
+

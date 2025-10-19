@@ -1,6 +1,7 @@
 import uuid, os
 import pathlib, json
-from time import time as _now
+import time
+_now = time.time
 
 import numpy as np
 import pandas as pd
@@ -8,16 +9,16 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 
-from collections import deque 
 import random
 import chess
 import chess.syzygy
 
-from pyfastchess import terminal_value_white_pov
+from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
+from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
 from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model, make_fwd_batched
-from chessbot.mcts_utils import MCTSTree, LRUCache
+from chessbot.mcts_utils import MCTSTree
 
 import chessbot.utils as cbu
 from chessbot.utils import (
@@ -34,7 +35,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_small_bootstrap"
+    run_tag = "collect_many_test"
     selfplay_dir =  SP_DIR
     init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_init.h5"
     
@@ -45,8 +46,8 @@ class Config(object):
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 1000
-    micro_batch_size = 100
+    sims_target = 2000
+    micro_batch_size = 400
 
     # early stop
     es_min_sims = 400
@@ -62,9 +63,8 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 20
+    games_at_once = 5
     n_training_games = 1500
-    lru_cache_size = 750_000
     
     move_limit = 160
     material_diff_cutoff = 12
@@ -74,9 +74,9 @@ class Config(object):
     sf_depth = 6
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
-        "random_middle_game": 0.15, "random_endgame": 0.05,
-        "piece_odds": 0.2, "piece_training": 0.1
+        "pre_opened": 0.25, "random_init": 0.2,
+        "random_middle_game": 0.1, "random_endgame": 0.1,
+        "piece_odds": 0.25, "piece_training": 0.1
     }
     
     # boosts/penalize
@@ -90,7 +90,7 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
-    training_queue_min = 4096
+    training_queue_min = 1024
     fwd_batch = 2048
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
@@ -183,6 +183,7 @@ class ChessGame(object):
     def __init__(self, board=None, cfg=None):
         self.game_id = str(uuid.uuid4())
         self.config = cfg or Config()
+        self.started_at = _now()
 
         if board is None:
             gg = GameGenerator(cfg=self.config)
@@ -235,7 +236,7 @@ class ChessGame(object):
     def push_move(self, mv):
         # collect search data then push and update
         self.collect_tree_search_data(mv)
-        
+
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
         self.tree.reset_for_new_move()
@@ -262,11 +263,11 @@ class ChessGame(object):
         details = self.tree.root_child_details()
         if details is None:
             return
-    
+        
         sims = int(self.tree.sims_completed_this_move)
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
-    
+
         data = {
             "sims": sims, "time": rnd(elapsed, 3),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
@@ -274,8 +275,7 @@ class ChessGame(object):
             "total_children": total_children,
             "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
         }
-    
-        # sumN for U term (no vloss in the new flow)
+        # sumN for U term
         sumN = max(1, root.N)
 
         candidate_moves = []
@@ -342,26 +342,23 @@ class ChessGame(object):
         root = self.tree.root()
         if not root.is_expanded:
             return False
-    
         rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
         if not rows:
             return False
-    
+
         ucis   = [u for u, _ in rows]
         visits = np.array([n for _, n in rows], dtype=np.float32)
         s = float(visits.sum())
         pi = (visits / s) if s > 0.0 else None
-    
         vwq = self.tree.visit_weighted_Q()
         self.vwq = vwq
     
         if pi is not None:
             self.append_factorized_example(ucis=ucis, pi=pi, vwq=vwq)
-    
+
         mv, _ = self.tree.best()
         if mv is None:
             return False
-        
         return self.push_move(mv)
         
     def append_factorized_example(self, ucis, pi, vwq):
@@ -463,8 +460,7 @@ class GameLooper(object):
         self.model = model
         self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
         self.training_queue = []
-        self.stats_window = self.config.n_training_games
-        self.recent_games = deque(maxlen=self.stats_window)
+        self.recent_games = []
 
         self.games_finished = 0
         self.white_wins = 0
@@ -473,7 +469,7 @@ class GameLooper(object):
         self.total_plies = 0
         self.n_retrains = 0
         self.all_evals = pd.DataFrame()
-        self.clear_lru_cache = False
+        self.clear_cache = False
         
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
@@ -486,10 +482,9 @@ class GameLooper(object):
         """
         completed_games = 0
         mbs = self.config.micro_batch_size
-        try_break = int(2.5 * mbs)
+        max_fastpath = int(2.5 * mbs)
         lpb = []
         mps, lps = self.mps, self.lps
-        lru = LRUCache(self.config.lru_cache_size)
         counts = []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2})
@@ -531,82 +526,62 @@ class GameLooper(object):
                         # if its stockfish turn, dont do any sims
                         if game.is_stockfish_turn():
                             continue
-        
+
                     # otherwise, collect up to micro_batch_size leaves for this game
-                    n_collected, tries = 0, 0
-                    bonus_hit, terminal = 0, 0
-                    try_stop, collect_stop = 0, 0
-                    while True:
-                        leaf_req = game.tree.collect_one_leaf(lru)
-                        if leaf_req["already_applied"]:
-                            lps.tick(1)
-                            tries += 1
-                            if leaf_req['terminal']:
-                                terminal += 1
-                            else:
-                                bonus_hit += 1
-                        else:    
-                            n_collected += 1 
-                            lps.tick(1)
-                            preds_batch.append(leaf_req)
-                        # so we dont spin forever
-                        if tries >= try_break:
-                            try_stop += 1
-                            break
-                        if n_collected >= mbs:
-                            collect_stop += 1
-                            break
+                    # new, terminal, cached
+                    nn, nt, nc = game.tree.collect_many_leaves(mbs, max_fastpath)
+                    lps.tick(nn + nc)
+
+                    # update sim count here
+                    game.tree.sims_completed_this_move += nn + nt + nc
+
+                    if nn:
+                        preds_batch += game.tree.pending_encoded(5)
+
+                    fastpaths = nt + nc
+                    fast_stop, collect_stop = 0, 1
+                    if nn < mbs:
+                        fast_stop, collect_stop = 1, 0
     
-                    counts.append([n_collected, tries, terminal, bonus_hit, try_stop, collect_stop])
-                # predict on the central batch (also updates caches)
-                logged = self.maybe_log_results()
-                if logged:
-                    lru.stats()
-                    # quick loop stats (temporary)
-                    if counts:
-                        n_groups = len(counts)
-                        s_collected   = sum([r[0] for r in counts])
-                        s_tries       = sum([r[1] for r in counts])
-                        s_terminals   = sum([r[2] for r in counts])
-                        s_bonus_hits  = sum([r[3] for r in counts])
-                        s_try_stops   = sum([r[4] for r in counts])
-                        s_collect_stops = sum([r[5] for r in counts])
-    
-                        avg_collected = s_collected / n_groups
-                        avg_tries     = s_tries / n_groups
-                        fill_ratio    = s_collected / max(1, n_groups * mbs)
-                        hit_ratio       = s_bonus_hits / max(1, s_tries)
-                        terminal_ratio  = s_terminals  / max(1, s_tries)
-                        print("------------------------------------------------------------")
-                        print("Loop stats"
-                            f" | groups={n_groups}  mbs={mbs}"
-                            f" | avg_collected={avg_collected:.2f}  avg_tries={avg_tries:.2f}"
-                            f" | fill_ratio={fill_ratio:.3f} ")
-                        print(f"Hits: bonus={s_bonus_hits} ({hit_ratio:.3%})"
-                            f" | terminals={s_terminals} ({terminal_ratio:.3%})")
-                        print(f"Stops: try_breaks={s_try_stops}  collect_breaks={s_collect_stops}")
-                        if lpb:
-                            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-                        avgply = np.mean([g.plies for g in self.active_games])
-                        print(f"Avg ply of active_games {avgply:<.3f}")
-                        print("------------------------------------------------------------")
+                    counts.append([nn, fastpaths, nt, nc, fast_stop, collect_stop])
+                
+                # run predictions if we have any. sends results to c++ raw cache
+                if preds_batch:
+                    self.format_and_predict(preds_batch)
+                    lpb.append(len(preds_batch))
+
+                if self.maybe_log_results():
+                    self.log_loop_stats(counts, mbs, lpb)
                     counts = []
                     lpb = []
-                if preds_batch:
-                    self.format_and_predict(preds_batch, lru)
-                    lpb.append(len(preds_batch))
-        
-                # resolve fresh predictions back into each game tree
-                still_waiting = 0
-                for game in self.active_games:
-                   still_waiting += game.tree.resolve_awaiting(lru)
                 
-                if self.clear_lru_cache:
-                    if not logged:
-                        lru.stats()
-                    lru.clear()
-                    self.clear_lru_cache = False
-    
+                # resolve fresh predictions back into each game tree
+                for game in self.active_games:
+                   game.tree.resolve_pending()
+                
+                # clear caches after model training and the last round of moves
+                if self.clear_cache:
+                    pc = priors_cache_stats()
+                    p_size = pc.get("size", 0)
+                    p_cap  = pc.get("capacity", 1)
+                    p_ev   = pc.get("evictions", 0)
+                    p_q    = pc.get("queries", 0)
+                    p_h    = pc.get("hits", 0)
+                    p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
+                    p_ev_r = (100.0 * p_ev / p_cap) if p_cap else 0.0
+
+                    print("Clearing caches after training:")
+                    print(
+                        f"Priors cache:\n \tsize={p_size}/{p_cap}  evictions={p_ev}  "
+                        f"queries={p_q}  hits={p_h}\n"
+                        f"\thit_rate={p_hit:.2f}% evict_rate={p_ev_r:.2f}%"
+                    )
+
+                    # finally clear them
+                    raw_cache_clear()
+                    priors_cache_clear()
+                    self.clear_cache = False
+
                 # remove any finished games
                 self.active_games = [
                     g for g in self.active_games if g.game_id not in finished
@@ -624,7 +599,7 @@ class GameLooper(object):
         self.maybe_log_results(force=True)
         return
 
-    def format_and_predict(self, preds_batch, lru):
+    def format_and_predict(self, preds_batch):
         """
         Take leaf requests from all games, run one model call, and write
         results into cache
@@ -633,7 +608,8 @@ class GameLooper(object):
         if not preds_batch:
             return
 
-        X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
+        # preds batch = list of tups: (zobrist, board encodings)
+        X = np.asarray([r[1] for r in preds_batch], dtype=np.float32)
         out_list = self.fwd(X)
 
         names = self.model.output_names
@@ -643,18 +619,20 @@ class GameLooper(object):
         ppc = out_list[names.index('best_piece')]
         ppr = out_list[names.index('best_promo')]
 
-        # write to caches keyed by the req cache_key
-        for i, req in enumerate(preds_batch):
-            key = req["cache_key"]
-            out_i = {
-                "value": float(v[i].item()),
-                # softmax here to skip re-softmax for cache hits
-                "from": softmax(pf[i]),
-                "to": softmax(pt[i]),
-                "piece": softmax(ppc[i]),
-                "promo": softmax(ppr[i]),
-            }
-            lru[key] = out_i
+        # write to raw policy caches keyed by zobrist
+        to_raw_cache = []
+        for i, pb in enumerate(preds_batch):
+            to_raw_cache.append((
+                pb[0],
+                v[i].item(),
+                softmax(pf[i]),
+                softmax(pt[i]),
+                softmax(ppc[i]),
+                softmax(ppr[i])
+            ))
+
+        # send to the c++ cache. the trees will pick up from there
+        raw_cache_bulk_insert(to_raw_cache)
 
     def finalize_game_data(self, game):
         """
@@ -678,7 +656,8 @@ class GameLooper(object):
             "plies": int(game.plies),
             "result": game.outcome or 0.0,
             "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white
+            "stockfish_color": game.stockfish_is_white,
+            "duration": _now() - game.started_at
         }
         # small in-memory record for recent prints only
         self.recent_games.append(mem_summary)
@@ -839,12 +818,12 @@ class GameLooper(object):
         #update the fwd
         self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
 
-        # clear training queue, clear LRU and bump retrain counter
+        # clear training queue, clear caches and bump retrain counter
         self.training_queue = []
         self.n_retrains += 1
-        self.clear_lru_cache = True
+        self.clear_cache = True
     
-    def maybe_log_results(self, every_sec=45.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"
@@ -878,6 +857,63 @@ class GameLooper(object):
             f"Number of retrains: {self.n_retrains}\n"
         )
         return True
+
+    def log_loop_stats(self, counts, mbs, lpb):
+        """Pretty-print the loop statistics and clear counts/lpb lists in-place."""
+        if not counts:
+            return
+
+        # aggregate
+        n_groups = len(counts)
+        s_collected  = sum(r[0] for r in counts)
+        s_fast       = sum(r[1] for r in counts)
+        s_terminals  = sum(r[2] for r in counts)
+        s_cached     = sum(r[3] for r in counts)
+        s_fast_stops = sum(r[4] for r in counts)
+        s_collect_stops = sum(r[5] for r in counts)
+
+        avg_new = s_collected / n_groups
+        fill_ratio = s_collected / max(1, n_groups * mbs)
+
+        total_overall = s_collected + s_terminals + s_cached
+        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
+        pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
+        pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
+
+        fast_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
+        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
+
+        print("----------------------------------------------------------")
+        print("Loop stats"
+            f" | groups={n_groups}  mbs={mbs}"
+            f" | new: collected={s_collected}, avg={avg_new:.2f}"
+            f" | fill_ratio={fill_ratio:.3f}")
+        print(f"Stops: fastpath_breaks={s_fast_stops} "
+            f"({fast_stops_pct:.2f}%) "
+            f"collect_breaks={s_collect_stops} "
+            f"({collect_stops_pct:.2f}%)")
+
+        print(
+            "Hits: "
+            f"cached={s_cached} ({pct_cached_overall:.3f}%) | "
+            f"terminals={s_terminals} ({pct_term_overall:.3f}%) | ",
+            f"terminals/cached={term_to_cached:.3f}"
+        )
+
+        if lpb:
+            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
+
+        avg_ply = np.mean([g.plies for g in self.active_games])
+        print(f"Avg ply of active_games {avg_ply:.3f}")
+        print(f"Number of active_games {len(self.active_games)}")
+
+        # avg duration of last 50 completed games
+        last50 = self.recent_games[-50:]
+        durations = [g.get("duration", 0.0) for g in last50]
+        if sum(durations) > 0:
+            avg_len_str = cbu.format_time(np.mean(durations))
+            print(f"Avg game runtime (last {len(last50)}) {avg_len_str}")
+        print("------------------------------------------------------------")
 
 
 def init_selfplay():
@@ -933,3 +969,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    

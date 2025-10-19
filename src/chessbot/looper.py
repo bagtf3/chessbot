@@ -639,15 +639,14 @@ class GameLooper(object):
         # write to raw policy caches keyed by zobrist
         to_raw_cache = []
         for i, pb in enumerate(preds_batch):
-            tup = (
+            to_raw_cache.append((
                 pb[0],
                 v[i].item(),
                 softmax(pf[i]),
                 softmax(pt[i]),
                 softmax(ppc[i]),
                 softmax(ppr[i])
-            )
-            to_raw_cache.append(tup)
+            ))
 
         # send to the c++ cache. the trees will pick up from there
         raw_cache_bulk_insert(to_raw_cache)

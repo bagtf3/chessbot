@@ -192,10 +192,79 @@ for round in range(5):
     print(f"round {round}: ", pf.raw_cache_stats())
     
     
+#%%
+
+if __name__ == '__main__':
+    from chessbot.utils import random_init
+    from chessbot.looper import ChessGame
+    
+    from pyfastchess import Board, prior_engine_details, raw_cache_clear, priors_cache_clear
     
     
-
-
-
+    game = ChessGame(board=Board())
+    tree = game.tree
+    
+    
+    import time
+    raw_cache_clear()
+    priors_cache_clear()
+    time.sleep(1.0)
+    start = time.time()
+    nn, nt, nc = tree.collect_many_leaves(200, 500)
+    stop = time.time()
+    print(f"collected 200 pending in {stop-start:<.3}")
+    pn = tree.pending_nodes_
+        
+    batch = []
+    for p in pn:
+        k = p.zobrist
+        v = 0.0
+        pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+        pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+        pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+        pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+        batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+    
+    pf.raw_cache_bulk_insert(batch)
+    print(len(tree.pending_nodes_))
+    start = time.time()
+    tree.resolve_pending()
+    while len(tree.pending_nodes_):
+        pass
+    stop = time.time()
+    print(f"applied 200 pending in {stop-start:<.3}")
+    
+    
+    game = ChessGame(board=Board())
+    tree = game.tree
+    
+    raw_cache_clear()
+    priors_cache_clear()
+    time.sleep(1.0)
+    
+    start = time.time()
+    nn, nt, nc = tree.collect_many_leaves(10000, 500)
+    stop = time.time()
+    print(f"collected 10000 pending in {stop-start:<.3}")
+    pn = tree.pending_nodes_
+        
+    batch = []
+    for p in pn:
+        k = p.zobrist
+        v = 0.0
+        pf_from = np.full(64, float(i % 256), dtype=np.float32)  # deterministic-ish
+        pf_to   = np.full(64, float((i+7) % 256), dtype=np.float32)
+        pf_piece= np.full(6, float(i % 6), dtype=np.float32)
+        pf_promo= np.full(5, float(i % 5), dtype=np.float32)
+        batch.append((k, v, pf_from, pf_to, pf_piece, pf_promo))
+    
+    pf.raw_cache_bulk_insert(batch)
+    
+    start = time.time()
+    tree.resolve_pending()
+    while len(tree.pending_nodes_):
+        pass
+    stop = time.time()
+    print(f"applied 10000 pending in {stop-start:<.3}")
 
 

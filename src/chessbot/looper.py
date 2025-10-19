@@ -9,7 +9,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 
-from collections import deque 
 import random
 import chess
 import chess.syzygy
@@ -48,7 +47,7 @@ class Config(object):
 
     # Simulation schedule
     sims_target = 1000
-    micro_batch_size = 100
+    micro_batch_size = 200
 
     # early stop
     es_min_sims = 400
@@ -184,6 +183,7 @@ class ChessGame(object):
     def __init__(self, board=None, cfg=None):
         self.game_id = str(uuid.uuid4())
         self.config = cfg or Config()
+        self.started_at = _now()
 
         if board is None:
             gg = GameGenerator(cfg=self.config)
@@ -460,8 +460,7 @@ class GameLooper(object):
         self.model = model
         self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
         self.training_queue = []
-        self.stats_window = self.config.n_training_games
-        self.recent_games = deque(maxlen=self.stats_window)
+        self.recent_games = []
 
         self.games_finished = 0
         self.white_wins = 0
@@ -546,55 +545,13 @@ class GameLooper(object):
     
                     counts.append([nn, fastpaths, nt, nc, fast_stop, collect_stop])
                 
-                # run predictions if we have any. send results to c++ raw cache
+                # run predictions if we have any. sends results to c++ raw cache
                 if preds_batch:
                     self.format_and_predict(preds_batch)
                     lpb.append(len(preds_batch))
 
-                logged = self.maybe_log_results()
-                if logged:
-                    # quick loop stats (temporary)
-                    if counts:
-                        n_groups = len(counts)
-                        s_collected  = sum(r[0] for r in counts)
-                        s_fast       = sum(r[1] for r in counts)
-                        s_terminals  = sum(r[2] for r in counts)
-                        s_cached     = sum(r[3] for r in counts)
-                        s_fast_stops = sum(r[4] for r in counts)
-                        s_collect_stops = sum(r[5] for r in counts)
-
-                        avg_new = s_collected / n_groups
-                        fill_ratio = s_collected / max(1, n_groups * mbs)
-
-                        total_overall = s_collected + s_terminals + s_cached
-                        cached_overall_pct = 100.0 * s_cached / max(1, total_overall)
-                        terminal_overall_pct = 100.0 * s_terminals / max(1, total_overall)
-
-                        # Stops percentages (of groups)
-                        fast_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
-                        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
-
-                        # terminals per cached as percentage
-                        terminals_per_cached_pct = 100.0 * s_terminals / max(1, s_cached)
-
-                        print("----------------------------------------------------------")
-                        print("Loop stats"
-                              f" | groups={n_groups}  mbs={mbs}"
-                              f" | new: collected={s_collected}, avg={avg_new:.2f}"
-                              f" | fill_ratio={fill_ratio:.3f}")
-                        print(f"Stops: fastpath_breaks={s_fast_stops} "
-                              f"({fast_stops_pct:.2f}%) "
-                              f"collect_breaks={s_collect_stops} "
-                              f"({collect_stops_pct:.2f}%)")
-                        print(f"Hits:  cached={s_cached} ({cached_overall_pct:.3f}%) "
-                              f"| terminals={s_terminals} ({terminal_overall_pct:.3f}%) "
-                              f"| terminals/cached={terminals_per_cached_pct:.2f}")
-                        if lpb:
-                            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-                        avg_ply = np.mean([g.plies for g in self.active_games])
-                        print(f"Avg ply of active_games {avg_ply:.3f}")
-                        print(f"Number of active_games {len(self.active_games)}")
-                        print("------------------------------------------------------------")
+                if self.maybe_log_results():
+                    self.log_loop_stats(counts, mbs, lpb)
                     counts = []
                     lpb = []
                 
@@ -615,14 +572,14 @@ class GameLooper(object):
 
                     print("Clearing caches after training:")
                     print(
-                        f"  Priors cache: size={p_size}/{p_cap}  evictions={p_ev}  "
-                        f"queries={p_q}  hits={p_h}  hit_rate={p_hit:.2f}%  "
-                        f"evict_rate={p_ev_r:.2f}%"
+                        f"Priors cache:\n \tsize={p_size}/{p_cap}  evictions={p_ev}  "
+                        f"queries={p_q}  hits={p_h}\n"
+                        f"\thit_rate={p_hit:.2f}% evict_rate={p_ev_r:.2f}%"
                     )
 
                     # finally clear them
                     raw_cache_clear()
-                    clear_prior_cache()
+                    priors_cache_clear()
                     self.clear_cache = False
 
                 # remove any finished games
@@ -699,7 +656,8 @@ class GameLooper(object):
             "plies": int(game.plies),
             "result": game.outcome or 0.0,
             "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white
+            "stockfish_color": game.stockfish_is_white,
+            "duration": _now() - game.started_at
         }
         # small in-memory record for recent prints only
         self.recent_games.append(mem_summary)
@@ -899,6 +857,63 @@ class GameLooper(object):
             f"Number of retrains: {self.n_retrains}\n"
         )
         return True
+
+    def log_loop_stats(self, counts, mbs, lpb):
+        """Pretty-print the loop statistics and clear counts/lpb lists in-place."""
+        if not counts:
+            return
+
+        # aggregate
+        n_groups = len(counts)
+        s_collected  = sum(r[0] for r in counts)
+        s_fast       = sum(r[1] for r in counts)
+        s_terminals  = sum(r[2] for r in counts)
+        s_cached     = sum(r[3] for r in counts)
+        s_fast_stops = sum(r[4] for r in counts)
+        s_collect_stops = sum(r[5] for r in counts)
+
+        avg_new = s_collected / n_groups
+        fill_ratio = s_collected / max(1, n_groups * mbs)
+
+        total_overall = s_collected + s_terminals + s_cached
+        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
+        pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
+        pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
+
+        fast_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
+        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
+
+        print("----------------------------------------------------------")
+        print("Loop stats"
+            f" | groups={n_groups}  mbs={mbs}"
+            f" | new: collected={s_collected}, avg={avg_new:.2f}"
+            f" | fill_ratio={fill_ratio:.3f}")
+        print(f"Stops: fastpath_breaks={s_fast_stops} "
+            f"({fast_stops_pct:.2f}%) "
+            f"collect_breaks={s_collect_stops} "
+            f"({collect_stops_pct:.2f}%)")
+
+        print(
+            "Hits: "
+            f"cached={s_cached} ({pct_cached_overall:.3f}%) | "
+            f"terminals={s_terminals} ({pct_term_overall:.3f}%) | ",
+            f"terminals/cached={term_to_cached:.3f}"
+        )
+
+        if lpb:
+            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
+
+        avg_ply = np.mean([g.plies for g in self.active_games])
+        print(f"Avg ply of active_games {avg_ply:.3f}")
+        print(f"Number of active_games {len(self.active_games)}")
+
+        # avg duration of last 50 completed games
+        last50 = self.recent_games[-50:]
+        durations = [g.get("duration", 0.0) for g in last50]
+        if sum(durations) > 0:
+            avg_len_str = cbu.format_time(np.mean(durations))
+            print(f"Avg game runtime (last {len(last50)}) {avg_len_str}")
+        print("------------------------------------------------------------")
 
 
 def init_selfplay():

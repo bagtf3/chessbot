@@ -13,7 +13,7 @@ import random
 import chess
 import chess.syzygy
 
-from pyfastchess import terminal_value_white_pov
+from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 
 from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model, make_fwd_batched
@@ -616,7 +616,7 @@ class GameLooper(object):
         self.maybe_log_results(force=True)
         return
 
-    def format_and_predict(self, preds_batch, lru):
+    def format_and_predict(self, preds_batch):
         """
         Take leaf requests from all games, run one model call, and write
         results into cache
@@ -625,7 +625,8 @@ class GameLooper(object):
         if not preds_batch:
             return
 
-        X = np.asarray([r["enc"] for r in preds_batch], dtype=np.float32)
+        # preds batch = list of tups: (zobrist, board encodings)
+        X = np.asarray([r[1] for r in preds_batch], dtype=np.float32)
         out_list = self.fwd(X)
 
         names = self.model.output_names
@@ -635,18 +636,21 @@ class GameLooper(object):
         ppc = out_list[names.index('best_piece')]
         ppr = out_list[names.index('best_promo')]
 
-        # write to caches keyed by the req cache_key
-        for i, req in enumerate(preds_batch):
-            key = req["cache_key"]
-            out_i = {
-                "value": float(v[i].item()),
-                # softmax here to skip re-softmax for cache hits
-                "from": softmax(pf[i]),
-                "to": softmax(pt[i]),
-                "piece": softmax(ppc[i]),
-                "promo": softmax(ppr[i]),
-            }
-            lru[key] = out_i
+        # write to raw policy caches keyed by zobrist
+        to_raw_cache = []
+        for i, pb in enumerate(preds_batch):
+            tup = (
+                pb[0],
+                v[i].item(),
+                softmax(pf[i]),
+                softmax(pt[i]),
+                softmax(ppc[i]),
+                softmax(ppr[i])
+            )
+            to_raw_cache.append(tup)
+
+        # send to the c++ cache. the trees will pick up from there
+        raw_cache_bulk_insert(to_raw_cache)
 
     def finalize_game_data(self, game):
         """

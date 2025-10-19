@@ -1,7 +1,7 @@
 from time import time as _now
 from chessbot.psqt import build_weights
-from pyfastchess import MCTSTree as fasttree
-from pyfastchess import PriorConfig, PriorEngine, Evaluator
+from pyfastchess import Evaluator, MCTSTree as fasttree
+from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
 from collections import OrderedDict
 
 
@@ -30,42 +30,12 @@ class MCTSTree(fasttree):
         self._es_tripped = False
         self._es_reason = ""
         self._es_after_sims = 0
-    
+
     def configure_prior_engine(self):
-        cfg = self.config
-    
-        def _get(name, default=None):
-            if hasattr(cfg, name):
-                return getattr(cfg, name)
-            return default
-    
-        # top-level mixes / flags
-        pcfg = PriorConfig()
-        pcfg.anytime_uniform_mix = float(_get("anytime_uniform_mix", 0.15))
-        pcfg.endgame_uniform_mix = float(_get("endgame_uniform_mix", 0.25))
-        pcfg.use_prior_boosts = bool(_get("use_prior_boosts", True))
-    
-        # prior adjustments (these are expected to be dict-like)
-        anytime_adj = _get("anytime_prior_adjustments", {}) or {}
-        eg_adj = _get("endgame_prior_adjustments", {}) or {}
-    
-        pcfg.anytime_gives_check = float(anytime_adj.get("gives_check", 0.0))
-        pcfg.anytime_repetition_sub = float(anytime_adj.get("repetition_penalty", 0.0))
-        pcfg.endgame_pawn_push = float(eg_adj.get("pawn_push", 0.0))
-        pcfg.endgame_capture = float(eg_adj.get("capture", 0.0))
-        pcfg.endgame_repetition_sub = float(eg_adj.get("repetition_penalty", 0.0))
-    
-        # optional clipping overrides (if present on cfg)
-        if _get("prior_clip_min", None) is not None:
-            pcfg.clip_min = float(_get("prior_clip_min"))
-        if _get("prior_clip_max", None) is not None:
-            pcfg.clip_max = float(_get("prior_clip_max"))
-    
-        # attach both the config and engine to the instance for later inspection
-        self._prior_cfg = pcfg
-        pcfg.clip_enabled = True 
-        self._prior_engine = PriorEngine(pcfg)
-        return pcfg
+        """Creates and configures singleton prior engine in c++ """
+        create_prior_engine()
+        conf_dict = self.config.to_dict()
+        configure_prior_engine(conf_dict)
 
     def collect_one_leaf(self, lru=None):
         """
@@ -124,8 +94,6 @@ class MCTSTree(fasttree):
         Compute priors and delegate to C++ apply_result.
         'cached' must have keys: value, from, to, piece, promo (factorized heads).
         """
-        leaf = req["leaf"]
-        legal = leaf.board.legal_moves()
 
         # retrieve factorized softmaxes
         p_from  = cached["from"]
@@ -134,9 +102,8 @@ class MCTSTree(fasttree):
         p_promo = cached["promo"]
     
         # let the C++ PriorEngine handle mixing, boosts, clipping and renorm
-        pri = self._prior_engine.build(
-            leaf.board, legal, p_from, p_to, p_piece, p_promo,
-            self.root_stm, req["stm_leaf"]
+        pri = prior_engine_build(
+            leaf.board, leaf.legal_moves, p_from, p_to, p_piece, p_promo
         )
     
         # expansion + backup (C++ apply_result expects pri as (move, prob) pairs)

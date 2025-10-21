@@ -35,23 +35,23 @@ class Config(object):
     """
 
     # files
-    run_tag = "collect_many_test"
+    run_tag = "conv_1000_selfplay_phase3"
     selfplay_dir =  SP_DIR
-    init_model = "C:/Users/Bryan/Data/chessbot_data/models/conv_small_init.h5"
+    init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 1.0
+    c_puct = 1.25
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 2000
-    micro_batch_size = 400
+    sims_target = 3200
+    micro_batch_size = 20
 
     # early stop
-    es_min_sims = 400
-    es_check_every = 32
+    es_min_sims = 1600
+    es_check_every = 150
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -59,11 +59,11 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 200
+    q_override_min_vis = 800
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 5
+    games_at_once = 100
     n_training_games = 1500
     
     move_limit = 160
@@ -71,12 +71,12 @@ class Config(object):
     material_diff_cutoff_span = 15
 
     play_vs_sf_prob = 0.5
-    sf_depth = 6
+    sf_depth = 10
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.2,
-        "random_middle_game": 0.1, "random_endgame": 0.1,
-        "piece_odds": 0.25, "piece_training": 0.1
+        "random_middle_game": 0.15, "random_endgame": 0.1,
+        "piece_odds": 0.2, "piece_training": 0.1
     }
     
     # boosts/penalize
@@ -90,7 +90,7 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
-    training_queue_min = 1024
+    training_queue_min = 4096
     fwd_batch = 2048
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
@@ -482,10 +482,9 @@ class GameLooper(object):
         """
         completed_games = 0
         mbs = self.config.micro_batch_size
-        max_fastpath = int(2.5 * mbs)
-        lpb = []
+        max_fastpath = max(200, int(2.5 * mbs))
+        lpb, counts = [], []
         mps, lps = self.mps, self.lps
-        counts = []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2})
             eng.configure({"Hash": 64})

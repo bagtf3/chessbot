@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"  
 with open(uci_path_path, "rb") as f:
-    paths = pickle.load(f)
+    PATHS = pickle.load(f)
     
 
 def rnd(x, n):
@@ -634,9 +634,22 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
     return paths
 
     
-def get_pre_opened_game():
+def get_pre_opened_game(index=None):
     b = fastboard()
-    moves_to_play = random.choice(paths)
+
+    if index is None:
+        moves_to_play = random.choice(PATHS)
+    else:
+        try:
+            moves_to_play = PATHS[index]
+        except:
+            print(
+                f"No premove path found for {index}!",
+                f"please choose 0 - {len(PATHS)-1}.",
+                "Selecting random premove path"
+            )
+            moves_to_play = random.choice(PATHS)
+
     for mtp in moves_to_play:
         b.push_uci(mtp)
     return b

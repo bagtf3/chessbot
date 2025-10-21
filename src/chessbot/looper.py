@@ -47,7 +47,7 @@ class Config(object):
 
     # Simulation schedule
     sims_target = 3200
-    micro_batch_size = 20
+    micro_batch_size = 12
 
     # early stop
     es_min_sims = 1600
@@ -91,7 +91,7 @@ class Config(object):
 
     # TF
     training_queue_min = 4096
-    fwd_batch = 2048
+    fwd_batch = 1200
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
     target_mean = 0.5
@@ -145,7 +145,7 @@ class GameGenerator(object):
             meta = {"scenario": "pre_opened"}
             
         elif game_type == "random_init":
-            plies = np.random.randint(0, 5)
+            plies = 2*np.random.randint(0, 4)
             board = cbu.random_init(plies)
             meta = {"scenario": "random_init", "start_plies": plies}
             

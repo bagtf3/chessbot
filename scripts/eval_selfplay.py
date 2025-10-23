@@ -42,15 +42,15 @@ def score_cp(pov_score, mate_cp):
     return pov_score.white().score(mate_score=mate_cp)
 
 
-def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=200):
+def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=70):
     # best line (white-POV cp)
     sf_best = eng.play(board, limit=limit, info=chess.engine.INFO_ALL)
     best_move = sf_best.move
     res = {'best_move': best_move}
     if move == best_move:
-        res['best_cp'] = score_cp(sf_best.info['score'], mate_cp=1500)
+        res['best_cp'] = score_cp(sf_best.info['score'], mate_cp=2200)
         res['played_cp'] = res['best_cp']
-        res['best_relative'] = sf_best.info['score'].relative.score(mate_score=1500)
+        res['best_relative'] = sf_best.info['score'].relative.score(mate_score=2200)
         res['delta_signed'] = 0
         return res
 
@@ -62,10 +62,10 @@ def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=
     )
 
     played_info = [i for i in info if i['pv'][0] == move][0]
-    played_cp = score_cp(played_info["score"], mate_cp=1500)
+    played_cp = score_cp(played_info["score"], mate_cp=2200)
 
     best_info = [i for i in info if i['pv'][0] == best_move][0]
-    best_cp = score_cp(best_info["score"], mate_cp=1500)
+    best_cp = score_cp(best_info["score"], mate_cp=2200)
 
     delta_signed = best_cp - played_cp
     if delta_signed >= cpl_trigger:
@@ -76,7 +76,7 @@ def analyze_with_deeper_look(move, board, limit, eng, max_depth=16, cpl_trigger=
     else:
         res['best_cp'] = best_cp
         res['played_cp'] = played_cp
-        res['best_relative'] = best_info['score'].relative.score(mate_score=1500)
+        res['best_relative'] = best_info['score'].relative.score(mate_score=2200)
         res['delta_signed'] = delta_signed
         return res
 
@@ -99,7 +99,7 @@ def analyze_with_sf_core(game_data, eng, depth=10):
             continue
 
         res = analyze_with_deeper_look(
-            move, board, limit, eng, max_depth=18, cpl_trigger=200
+            move, board, limit, eng, max_depth=18, cpl_trigger=70
         )
 
         delta_signed = res['delta_signed']

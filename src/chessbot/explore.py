@@ -9,9 +9,8 @@ from scipy.stats import spearmanr
 import pickle
 from chessbot.utils import rnd
 
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 
-#RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/collect_many_test"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -279,7 +278,11 @@ if pkl_files:
         df_means = prev_run['df_means']
 
 df_all = prev_run['df_all']
+df_all = df_all.loc[df_all.relative_score.abs() < 2000]
+df_all = df_all.loc[df_all.loss.abs() < 1500]
+
 df_all['played_best_move'] = df_all.loss <= 10
+
 bmr = df_all.groupby("game_id")['played_best_move'].mean()
 
 df_all['loss'] = np.where(
@@ -295,7 +298,7 @@ df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
 df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
-#df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
+df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
 
 plot_cpl_and_bmr(df_trim, window=200)
 print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
@@ -313,6 +316,16 @@ wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 gv = GameViewer(all_games[-2]['json_file'], sf_df=d); gv.replay()
 gv = GameViewer(all_games[-2]['json_file']); gv.replay()
 
+#%%
 
+df_all.loc[df_all.played_best_move | (df_all.loss <= 12), "played_best_move"] = True
+df_all.loc[df_all.played_best_move & (df_all.loss > 0), 'loss'] = 0
+df_all.loc[((df_all.loss > 0) & (df_all.loss < 12)), 'loss'] = 0
+df_all['lost'] = df_all['best_cp'].abs() >= 900
+
+df_all.groupby('lost', observed=False)['loss'].mean()
+
+
+df_all.query("lost==True").groupby(['scenario'], observed=False)[['loss', 'played_best_move']].mean().round(3).sort_values('loss')
 
 

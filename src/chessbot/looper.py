@@ -40,18 +40,18 @@ class Config(object):
     init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 1.25
+    c_puct = 1.75
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 3200
-    micro_batch_size = 12
+    sims_target = 6400
+    micro_batch_size = 50
 
     # early stop
-    es_min_sims = 1600
-    es_check_every = 150
+    es_min_sims = 3200
+    es_check_every = 256
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -59,24 +59,24 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 800
+    q_override_min_vis = 2000
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 100
+    games_at_once = 24
     n_training_games = 1500
     
     move_limit = 160
-    material_diff_cutoff = 12
-    material_diff_cutoff_span = 15
+    material_diff_cutoff = 15
+    material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
     sf_depth = 10
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.2,
-        "random_middle_game": 0.15, "random_endgame": 0.1,
-        "piece_odds": 0.2, "piece_training": 0.1
+        "random_middle_game": 0.2, "random_endgame": 0.1,
+        "piece_odds": 0.1, "piece_training": 0.15
     }
     
     # boosts/penalize
@@ -90,7 +90,7 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
-    training_queue_min = 4096
+    training_queue_min = 8192
     fwd_batch = 1200
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
@@ -590,9 +590,8 @@ class GameLooper(object):
                     while len(self.active_games) < self.config.games_at_once:
                         self.active_games.append(ChessGame())
                     
-        # train with whatever we got and final report
-        half_full = self.config.training_queue_min / 2
-        if len(self.training_queue) >= half_full:
+        # train with whatever we got and final report (> 2000)
+        if len(self.training_queue) >= 2000:
             self.trigger_retrain()
 
         self.maybe_log_results(force=True)
@@ -858,7 +857,6 @@ class GameLooper(object):
         return True
 
     def log_loop_stats(self, counts, mbs, lpb):
-        """Pretty-print the loop statistics and clear counts/lpb lists in-place."""
         if not counts:
             return
 
@@ -918,7 +916,6 @@ class GameLooper(object):
 def init_selfplay():
     # file structure first
     config = Config()
-    config.selfplay_dir
     run_dir = os.path.join(config.selfplay_dir, config.run_tag)
     Config.run_dir = run_dir
     
@@ -968,4 +965,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    

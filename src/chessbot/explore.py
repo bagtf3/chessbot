@@ -9,7 +9,7 @@ from scipy.stats import spearmanr
 import pickle
 from chessbot.utils import rnd
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
 
 
 def load_json(path):
@@ -33,6 +33,11 @@ def load_game_index(path=None):
     if path is None:
         path = os.path.join(RUN_DIR, "game_index.json")
         
+    elif not path.endswith("game_index.json"):
+        path = os.path.join(path, "game_index.json")
+    else:
+        pass
+    print(f"loading {path}")
     return load_json(path)
 
 
@@ -258,53 +263,51 @@ def tail_vs_prev(df, window=200):
 #%%
 from pprint import pprint
 #%matplotlib inline
-all_games = load_game_index()
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
+all_games = load_game_index(run_dir)
 
-df_games = pd.DataFrame.from_records(all_games)
-df_games["ts"] = df_games["ts"].round().astype("int64")
-if 'vs_stockfish' not in df_games.columns:
-    df_games['vs_stockfish'] = df_games['beat_sf'] | df_games['started_vs_stockfish']
+# df_games = pd.DataFrame.from_records(all_games)
+# df_games["ts"] = df_games["ts"].round().astype("int64")
+# if 'vs_stockfish' not in df_games.columns:
+#     df_games['vs_stockfish'] = df_games['beat_sf'] | df_games['started_vs_stockfish']
     
-df_games = rolling_points_vs_sf(df_games)
+# df_games = rolling_points_vs_sf(df_games)
+# plot_rolling_rates_with_ci(df_games, window=100)
+# tail_vs_prev(df_games, window=100)
 
-plot_rolling_rates_with_ci(df_games, window=100)
-tail_vs_prev(df_games, window=100)
-
-pkl_files = [f for f in os.listdir(RUN_DIR) if "analyze_results_combined.pkl" in f]
+pkl_files = [f for f in os.listdir(run_dir) if "analyze_results_combined.pkl" in f]
 if pkl_files:
-    outfile = os.path.join(RUN_DIR, pkl_files[0])
+    outfile = os.path.join(run_dir, pkl_files[0])
     with open(outfile, "rb") as fp:
         prev_run = pickle.load(fp)
         df_means = prev_run['df_means']
 
 df_all = prev_run['df_all']
-df_all = df_all.loc[df_all.relative_score.abs() < 2000]
-df_all = df_all.loc[df_all.loss.abs() < 1500]
-
-df_all['played_best_move'] = df_all.loss <= 10
 
 bmr = df_all.groupby("game_id")['played_best_move'].mean()
 
-df_all['loss'] = np.where(
-    df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
+# df_all['loss'] = np.where(
+#     df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
 
 df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
-
 df_trim = df_means.copy()
-df_trim = df_trim.query("plies >= 3")
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
 
 df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
-df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
+#df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
+df_trim = df_trim.query("overall_cpl <= 200")
 
-plot_cpl_and_bmr(df_trim, window=200)
-print("Overall CPL", prev_run['summary']['avg_overall_mean_cpl'])
-pprint(trend_check(df_trim, window=200))
+plot_cpl_and_bmr(df_trim, window=1000)
+print("Overall CPL", df_trim['overall_cpl'].mean().round(4))
+pprint(trend_check(df_trim, window=1000))
 
-
+#%%
+df_list = []
+df_list.append(df_trim)
+df_trim = pd.concat(df_list).sort_values("ts")
 #%%
 from chessbot.review import GameViewer
 d = prev_run['df_all']
@@ -313,19 +316,6 @@ all_games = load_game_index()
 wins = [g for g in all_games if (g['beat_sf'])]
 wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 
-gv = GameViewer(all_games[-2]['json_file'], sf_df=d); gv.replay()
-gv = GameViewer(all_games[-2]['json_file']); gv.replay()
-
-#%%
-
-df_all.loc[df_all.played_best_move | (df_all.loss <= 12), "played_best_move"] = True
-df_all.loc[df_all.played_best_move & (df_all.loss > 0), 'loss'] = 0
-df_all.loc[((df_all.loss > 0) & (df_all.loss < 12)), 'loss'] = 0
-df_all['lost'] = df_all['best_cp'].abs() >= 900
-
-df_all.groupby('lost', observed=False)['loss'].mean()
-
-
-df_all.query("lost==True").groupby(['scenario'], observed=False)[['loss', 'played_best_move']].mean().round(3).sort_values('loss')
+gv = GameViewer(wins[-3]['json_file'], sf_df=d); gv.replay()
 
 

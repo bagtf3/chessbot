@@ -40,7 +40,7 @@ class Config(object):
     init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 1.75
+    c_puct = 1.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
     opponent_uniform_mix = 0.2
@@ -71,7 +71,7 @@ class Config(object):
     material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
-    sf_depth = 10
+    sf_depth = 16
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.2,

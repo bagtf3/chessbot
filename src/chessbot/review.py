@@ -176,12 +176,12 @@ class GameViewer:
         mover = "White" if self.board.turn == chess.WHITE else "Black"
         sf_color = self.log.get("stockfish_color", None)
         if sf_color is None:
-            return f"{mover} (bot)"
+            return f"{mover} (MCTS)"
         
         if (self.board.turn and sf_color) or \
            (not self.board.turn and not sf_color):
             return f"{mover} (stockfish)"
-        return f"{mover} (bot)"
+        return f"{mover} (MCTS)"
 
     def show_board(self, flipped=False):
         clear_output(wait=True)
@@ -198,7 +198,8 @@ class GameViewer:
             chosen_san = self.board.san(chess.Move.from_uci(chosen))
         except Exception:
             chosen_san = "?"
-    
+        
+        print()
         print(f"Ply {self.ply+1}: {who} about to play {chosen_san}")
         print("=" * 60)
     
@@ -242,7 +243,7 @@ class GameViewer:
             rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
             print(
                 f"   {san:<6} visits={c.get('visits',0):<5} "
-                f"P={c.get('P',0):.3f} U={c.get('U',0):+.3f} Q={c.get('Q',0):+.3f}"
+                f"Q={c.get('Q',0):+.3f} P={c.get('P',0):.3f} U={c.get('U',0):+.3f}"
                 f"{marker}{rank_str}"
             )
     
@@ -300,10 +301,10 @@ class GameViewer:
             parts = []
             if loss is not None:
                 parts.append(f"CPL={int(loss)}")
-            if best_san != "?":
-                parts.append(f"SF best={best_san}")
             if played_san != "?":
                 parts.append(f"played={played_san} ({'✓' if matched else '×'})")
+            if best_san != "?":
+                parts.append(f"SF best={best_san}")
             if (best_cp_pov is not None) and (played_cp_pov is not None):
                 parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
         

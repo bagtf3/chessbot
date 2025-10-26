@@ -13,9 +13,9 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 MATE_CP = 2500
-DEPTH = 12
+DEPTH = 13
 CLIP_MAX = 1200
 N_WORKERS = 6
 EQUIV_RANGE = 10
@@ -78,6 +78,7 @@ def analyze_with_rank(move, board, limit, eng):
         res['played_absolute'] = best_abs
         res['delta_signed'] = 0
         res['sf_rank'] = 1
+        res['in_top3'] = True
         return res
     
     played = [t for t in top3 if t['pv'][0] == move]
@@ -206,7 +207,7 @@ def analyze_with_sf_core(game_data, eng):
 def worker_shard(games, progress_q, result_q):
     """Each worker runs its own engine, sends results + heartbeats."""
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 1, "Hash": 64})
+    eng.configure({"Threads": 1, "Hash": 128})
 
     out = []
     for g in games:

@@ -9,7 +9,7 @@ from scipy.stats import spearmanr
 import pickle
 from chessbot.utils import rnd
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase2"
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 
 
 def load_json(path):
@@ -90,8 +90,7 @@ def plot_cpl_and_bmr(df, window=30, title=None):
 def trend_check(df, window=100):
     """
     Sort by ts, smooth (centered rolling mean), then report:
-    - linear slope per 100 games
-    - start→end change (first/last decile means)
+    - linear slope per 100 games (with permutation p-value)
     - Spearman rank correlation (monotonic trend)
     """
     d = df.sort_values("ts").reset_index(drop=True).copy()
@@ -102,178 +101,50 @@ def trend_check(df, window=100):
         window, center=True, min_periods=1).mean().values
 
     def lin_slope_per100(y):
-        # simple least-squares slope scaled per 100 games
         x0 = x - x.mean()
         b = (x0 @ (y - y.mean())) / (x0 @ x0)
-        return rnd(100 * b, 5)
+        return float(100 * b)
 
-    def start_end_change(y, frac=0.1):
-        k = max(1, int(len(y) * frac))
-        return rnd(np.nanmean(y[-k:]) - np.nanmean(y[:k]), 5)
+    # slopes
+    cpl_s = lin_slope_per100(cpl)
+    bmr_s = lin_slope_per100(bmr)
 
-    # metrics
+    # permutation p-values for slope (3000 perms, no seed)
+    nperm = 3000
+    abs_cpl = abs(cpl_s)
+    abs_bmr = abs(bmr_s)
+    cnt_c = 0
+    cnt_b = 0
+    x0 = x - x.mean()
+    for _ in range(nperm):
+        yp = np.random.permutation(cpl)
+        bp = (x0 @ (yp - yp.mean())) / (x0 @ x0) * 100
+        if abs(bp) >= abs_cpl: cnt_c += 1
+        yp2 = np.random.permutation(bmr)
+        bp2 = (x0 @ (yp2 - yp2.mean())) / (x0 @ x0) * 100
+        if abs(bp2) >= abs_bmr: cnt_b += 1
+    p_cpl = (cnt_c + 1) / (nperm + 1)
+    p_bmr = (cnt_b + 1) / (nperm + 1)
+
     out = {
-        f"cpl_slope_per_{window}": lin_slope_per100(cpl),
-        "cpl_start_to_end": start_end_change(cpl),
+        "cpl_slope_per_100": rnd(cpl_s, 5),
+        "cpl_slope_p": rnd(p_cpl, 5),
         "cpl_spearman": rnd(spearmanr(x, cpl, nan_policy="omit").statistic, 5),
-        f"bmr_slope_per_{window}": lin_slope_per100(bmr),
-        "bmr_start_to_end": start_end_change(bmr),
-        "bmr_spearman": rnd(spearmanr(x, bmr, nan_policy="omit").statistic, 5)
+        "bmr_slope_per_100": rnd(bmr_s, 5),
+        "bmr_slope_p": rnd(p_bmr, 5),
+        "bmr_spearman": rnd(spearmanr(x, bmr, nan_policy="omit").statistic, 5),
     }
     return out
 
-
-def add_points_vs_sf(df):
-    """
-    Adds two columns:
-      - bot_result_vs_sf: {-1,0,1} from the BOT'S pov (NaN if not vs SF)
-      - points_vs_sf: {0,0.5,1} from the BOT'S pov (NaN if not vs SF)
-    Assumes df has: ['result', 'vs_stockfish', 'stockfish_color'].
-    'result' is white-POV: -1 loss, 0 draw, +1 win.
-    """
-    d = df.copy()
-    vs_sf = d["vs_stockfish"] == True
-
-
-    sign = np.where(d["stockfish_color"] == True, -1.0, 1.0)
-    bot_res = np.where(vs_sf, sign * d["result"].astype(float), np.nan)
-
-    d["bot_result_vs_sf"] = bot_res
-    d["points_vs_sf"] = (bot_res + 1.0) / 2.0  # -1/0/+1 -> 0/0.5/1
-    return d
-
-
-def rolling_points_vs_sf(df, window=200):
-    """
-    Returns a new DataFrame sorted by time with a rolling mean of points_vs_sf.
-    NaNs (non-SF games) are ignored inside the window.
-    """
-    d = add_points_vs_sf(df).sort_values("ts").reset_index(drop=True)
-    d["rolling_points_vs_sf"] = (d["points_vs_sf"].rolling(window, min_periods=1).mean())
-    return d
-
-
-def wilson(p, n, z=1.96):
-    if n == 0: return (np.nan, np.nan)
-    denom = 1 + z*z/n
-    center = (p + z*z/(2*n)) / denom
-    halfw  = z * ((p*(1-p)/n + z*z/(4*n*n)) ** 0.5) / denom
-    return center - halfw, center + halfw
-
-
-def plot_rolling_rates_with_ci(df, window=200):
-    d = df[df.vs_stockfish].sort_values("ts").reset_index(drop=True).copy()
-    sign = np.where(d.stockfish_color == True, -1.0, 1.0)
-    res = sign * d.result.astype(float)
-    win = (res == 1).astype(float)
-    draw = (res == 0).astype(float)
-    pts = (res + 1.0) / 2.0
-
-    # trailing rolling stats
-    p_win = win.rolling(window, center=True, min_periods=1).mean()
-    p_draw = draw.rolling(window, center=True, min_periods=1).mean()
-    m_pts = pts.rolling(window, center=True, min_periods=1).mean()
-    s_pts = pts.rolling(window, center=True, min_periods=2).std()
-    n_pts = pts.rolling(window, center=True, min_periods=1).count()
-
-    # 95% normal CI for mean of points (bounded but fine as a quick approx)
-    z = 1.96
-    se = s_pts / np.sqrt(n_pts.replace(0, np.nan))
-    lo = m_pts - z * se
-    hi = m_pts + z * se
-
-    x = range(len(d))
-    plt.figure(figsize=(11, 5))
-    plt.plot(x, p_win, label="win rate", color="tab:orange", lw=2)
-    plt.plot(x, p_draw, label="draw rate", color="tab:blue", lw=2)
-    plt.plot(x, m_pts, label="points (mean)", color="tab:green", lw=2)
-    plt.fill_between(x, lo, hi, color="tab:green", alpha=0.15, linewidth=0)
-    
-    # auto-fit y with padding, clipped to [0,1]
-    y_min = np.nanmin([p_win.min(), p_draw.min(), m_pts.min()])
-    y_max = np.nanmax([p_win.max(), p_draw.max(), m_pts.max()])
-    pad = 0.05 * (y_max - y_min if np.isfinite(y_max - y_min) and y_max > y_min else 1.0)
-    plt.ylim(max(0.0, y_min - pad), min(1.0, y_max + pad))
-    
-    plt.xlabel(f"Game # vs SF (trailing window={window})")
-    plt.ylabel("Rate / Points")
-    plt.title("Trailing win/draw; points with 95% CI")
-    plt.grid(True, alpha=0.2)
-    plt.legend()
-    plt.show()
-
-
-def tail_vs_prev(df, window=200):
-    def z_two_prop(p1, p2, n1, n2):
-        p = (p1 * n1 + p2 * n2) / (n1 + n2)
-        se = math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
-        return (p2 - p1) / se if se else float("nan")
-
-    def z_to_p(z):
-        return math.erfc(abs(z) / math.sqrt(2.0))
-
-    def z_two_mean(m1, m2, s1, s2, n1, n2):
-        # Welch z (normal approx)
-        se = math.sqrt((s1 * s1) / n1 + (s2 * s2) / n2)
-        return (m2 - m1) / se if se else float("nan")
-    
-    d = df[df.vs_stockfish].sort_values("ts").reset_index(drop=True)
-    d = d.copy()
-    sign = np.where(d.stockfish_color == True, -1.0, 1.0)
-    res = sign * d.result.astype(float)
-    pts = (res + 1.0) / 2.0
-    wins = (res == 1).astype(float)
-    draws = (res == 0).astype(float)
-
-    tail = slice(-window, None)
-    prev = slice(-2 * window, -window)
-
-    def mean_n(x):
-        arr = np.asarray(x, dtype=float)
-        return float(np.nanmean(arr)), int(np.sum(~np.isnan(arr)))
-
-    def var_n(x):
-        arr = np.asarray(x, dtype=float)
-        return float(np.nanvar(arr, ddof=1)), int(np.sum(~np.isnan(arr)))
-
-    rows = {}
-
-    # points: use Welch z on 0/0.5/1
-    m1, n1 = mean_n(pts[prev]); m2, n2 = mean_n(pts[tail])
-    s1, _ = var_n(pts[prev]);   s2, _ = var_n(pts[tail])
-    z = z_two_mean(m1, m2, math.sqrt(s1), math.sqrt(s2), n1, n2)
-    rows["points"] = {
-        "prev_mean": m1, "prev_n": n1,
-        "tail_mean": m2, "tail_n": n2,
-        "delta_mean": m2 - m1,
-        "z": z, "p_two_sided": z_to_p(z),
-    }
-
-    # wins/draws: two-proportion z-tests
-    for name, arr in (("win_rate", wins), ("draw_rate", draws)):
-        p1, n1 = mean_n(arr[prev]); p2, n2 = mean_n(arr[tail])
-        z = z_two_prop(p1, p2, n1, n2)
-        rows[name] = {
-            "prev_mean": p1, "prev_n": n1,
-            "tail_mean": p2, "tail_n": n2,
-            "delta_mean": p2 - p1,
-        }
-
-    return pd.DataFrame(rows).T.round(6)
+df_list = []
 #%%
 from pprint import pprint
 #%matplotlib inline
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 all_games = load_game_index(run_dir)
 
-# df_games = pd.DataFrame.from_records(all_games)
-# df_games["ts"] = df_games["ts"].round().astype("int64")
-# if 'vs_stockfish' not in df_games.columns:
-#     df_games['vs_stockfish'] = df_games['beat_sf'] | df_games['started_vs_stockfish']
-    
-# df_games = rolling_points_vs_sf(df_games)
-# plot_rolling_rates_with_ci(df_games, window=100)
-# tail_vs_prev(df_games, window=100)
+CLIP_UB = 500
+WINDOW = 2000
 
 pkl_files = [f for f in os.listdir(run_dir) if "analyze_results_combined.pkl" in f]
 if pkl_files:
@@ -284,38 +155,89 @@ if pkl_files:
 
 df_all = prev_run['df_all']
 
+# tidy up CPL
+df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
+
+# BMR
 bmr = df_all.groupby("game_id")['played_best_move'].mean()
 
-# df_all['loss'] = np.where(
-#     df_all.stm, df_all.best_cp - df_all.played_cp, df_all.played_cp - df_all.best_cp)
-
-df_all['clipped_loss'] = np.clip(df_all['loss'], -600, 600)
-clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
+#Top3
+if 'in_top3' not in df_all.columns:
+    df_all['in_top3'] = False
+    
+df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
+t3r = df_all.groupby("game_id")["in_top3"].mean()
 
 df_trim = df_means.copy()
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
 df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
 
-df_trim.loc[df_trim.overall_cpl < 0, 'overall_cpl'] = 0
-#df_trim.loc[df_trim.overall_cpl > 400, 'overall_cpl'] = 400
-df_trim = df_trim.query("overall_cpl <= 200")
+df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
+df_trim = df_trim.sort_values('ts')
 
-plot_cpl_and_bmr(df_trim, window=1000)
-print("Overall CPL", df_trim['overall_cpl'].mean().round(4))
-pprint(trend_check(df_trim, window=1000))
-
-#%%
-df_list = []
 df_list.append(df_trim)
-df_trim = pd.concat(df_list).sort_values("ts")
+
+#df_trim = pd.concat(df_list).drop_duplicates().sort_values("ts")
+plot_cpl_and_bmr(df_trim, window=WINDOW)
+
+# compute aggregates
+overall_cpl = df_trim['overall_cpl'].mean()
+overall_bmr = df_trim['overall_best_move_rate'].mean()
+overall_top3 = df_trim['overall_top3_rate'].mean()
+
+first = df_trim.head(WINDOW)
+last = df_trim.tail(WINDOW)
+
+first_cpl = first['overall_cpl'].mean()
+first_bmr = first['overall_best_move_rate'].mean()
+first_top3 = first['overall_top3_rate'].mean()
+
+last_cpl = last['overall_cpl'].mean()
+last_bmr = last['overall_best_move_rate'].mean()
+last_top3 = last['overall_top3_rate'].mean()
+
+# pretty print
+label_w = 18
+val_w = 10
+
+print("#" * 60)
+print(f"{'':<{label_w}}{'CPL':>{val_w}}{'BMR':>{val_w}}{'Top3':>{val_w}}")
+print(f"{'-'*label_w}{'-'*val_w}{'-'*val_w}{'-'*val_w}")
+print(f"{'First ' + str(WINDOW):<{label_w}}{first_cpl:>{val_w}.3f}"
+      f"{first_bmr:>{val_w}.3f}{first_top3:>{val_w}.3f}")
+print(f"{'Last ' + str(WINDOW):<{label_w}}{last_cpl:>{val_w}.3f}"
+      f"{last_bmr:>{val_w}.3f}{last_top3:>{val_w}.3f}")
+print(f"{'Overall':<{label_w}}{overall_cpl:>{val_w}.3f}"
+      f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
+print()
+
+pprint(trend_check(df_trim, window=WINDOW))
+
 #%%
 from chessbot.review import GameViewer
 d = prev_run['df_all']
+worst = '7d6eaf91-e370-4d97-9ee3-8aa5fd08bd8e'
+worst  = [g for g in all_games if g['game_id'] == worst]
 
-all_games = load_game_index()
 wins = [g for g in all_games if (g['beat_sf'])]
 wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 
-gv = GameViewer(wins[-3]['json_file'], sf_df=d); gv.replay()
+scored_games = set(d.game_id.unique())
+scored = [g for g in all_games if g['game_id'] in scored_games]
+pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
+
+gv = GameViewer(worst[-1]['json_file'], sf_df=d); gv.replay()
+
+
+
+#%%
+# blunder mining
+df_all = prev_run['df_all'].sort_values("ts")
+df_all['blunder150'] = df_all.loss >= 150
+df_all.blunder150.sum()
+bcount = df_all.groupby("game_id")['blunder150'].sum()
+bcount = bcount[bcount > 0]
 
 

@@ -46,12 +46,12 @@ class Config(object):
     opponent_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 6400
+    sims_target = 10000
     micro_batch_size = 50
 
     # early stop
-    es_min_sims = 3200
-    es_check_every = 256
+    es_min_sims = 5000
+    es_check_every = 500
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -64,13 +64,13 @@ class Config(object):
     
     # Game stuff
     games_at_once = 24
-    n_training_games = 1500
+    n_training_games = 500
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 0.5
+    play_vs_sf_prob = 2.0
     sf_depth = 16
     
     game_probs = {
@@ -80,7 +80,7 @@ class Config(object):
     }
     
     # boosts/penalize
-    use_prior_boosts = True
+    use_prior_boosts = False
     prior_clip_max = 0.35
     prior_clip_min = 0.001
     endgame_prior_adjustments = {
@@ -487,7 +487,7 @@ class GameLooper(object):
         mps, lps = self.mps, self.lps
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2})
-            eng.configure({"Hash": 64})
+            eng.configure({"Hash": 256})
             while completed_games < self.config.n_training_games:
                 if not self.active_games:
                     break

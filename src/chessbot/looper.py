@@ -40,7 +40,7 @@ class Config(object):
     init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 1.0
+    c_puct = 1.5
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
     opponent_uniform_mix = 0.2
@@ -51,7 +51,7 @@ class Config(object):
 
     # early stop
     es_min_sims = 5000
-    es_check_every = 500
+    es_check_every = 300
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -59,18 +59,18 @@ class Config(object):
     use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 2000
+    q_override_min_vis = 1200
     q_override_top_k = 3
     
     # Game stuff
     games_at_once = 24
-    n_training_games = 500
+    n_training_games = 750
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 2.0
+    play_vs_sf_prob = 2
     sf_depth = 16
     
     game_probs = {
@@ -94,7 +94,7 @@ class Config(object):
     fwd_batch = 1200
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
-    target_mean = 0.5
+    target_mean = 0.1
     draw_frac = 0.5
     factorized_bins = (64, 64, 6, 4)
 
@@ -772,8 +772,8 @@ class GameLooper(object):
         target_mean = self.config.target_mean
         draw_frac = self.config.draw_frac
     
-        pos = float(np.sum(Z > 0))
-        neg = float(np.sum(Z < 0))
+        pos = np.sum(Z > 0)
+        neg = np.sum(Z < 0)
         nz  = pos + neg
     
         if nz > 0 and pos > 0 and neg > 0:
@@ -785,7 +785,7 @@ class GameLooper(object):
             w = np.ones_like(Z, dtype=np.float32)
     
         # scale weights to target mean
-        mean_w = float(w.mean()) if w.size else 1.0
+        mean_w = w.mean() if w.size else 1.0
         if mean_w > 0:
             w *= (target_mean / mean_w)
         else:
@@ -962,6 +962,6 @@ def main():
             print(e)
     
     looper.run()
-
+#%%
 if __name__ == '__main__':
     main()

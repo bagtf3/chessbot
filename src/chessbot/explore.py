@@ -179,7 +179,7 @@ df_trim = df_trim.sort_values('ts')
 
 df_list.append(df_trim)
 
-#df_trim = pd.concat(df_list).drop_duplicates().sort_values("ts")
+df_trim = pd.concat(df_list).drop_duplicates().sort_values("ts")
 plot_cpl_and_bmr(df_trim, window=WINDOW)
 
 # compute aggregates
@@ -228,7 +228,7 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
-gv = GameViewer(worst[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
 
 
 

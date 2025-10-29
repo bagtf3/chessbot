@@ -8,200 +8,15 @@ import chess
 import chess.engine
 from chessbot import SF_LOC
 from chessbot.utils import rnd, format_time
+from chessbot.review import load_json, load_game_index, analyze_with_sf_core
+
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
-MATE_CP = 2500
-DEPTH = 13
-CLIP_MAX = 1200
+RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_test"
 N_WORKERS = 6
-EQUIV_RANGE = 10
-
-
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-
-    # First, try regular JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: parse line-by-line (JSONL / concatenated objects)
-        items = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
-        return items
-    
-
-def load_game_index(path=None):
-    if path is None:
-        path = os.path.join(RUN_DIR, "game_index.json")
-    return load_json(path)
-
-
-def score_clipped(x):
-    return np.clip(x.score(mate_score=MATE_CP), -CLIP_MAX, CLIP_MAX)
-
-
-def score_cp_white_pov(pov_score, clipped=True):
-    scr = pov_score.white()
-    return score_clipped(scr) if clipped else scr.score(mate_score=MATE_CP)
-
-
-def score_cp_relative(pov_score, clipped=True):
-    scr = pov_score.relative
-    return score_clipped(scr) if clipped else scr.score(mate_score=MATE_CP)
-
-
-def analyze_with_rank(move, board, limit, eng):
-    # Get Stockfish root best at this depth (white-POV score included in info)
-    top3 = eng.analyse(board, limit=limit, info=chess.engine.INFO_ALL, multipv=3)
-    best = [t for t in top3 if t['multipv'] == 1][0]
-    
-    best_move = best['pv'][0]
-    best_cp   = score_cp_relative(best["score"])
-    best_abs  = score_cp_white_pov(best["score"], clipped=False)
-    
-    # default
-    res = {}
-    res['best_move'] = best_move
-    res['best_cp'] = best_cp
-    res['best_absolute'] = best_abs
-    
-    if move == best_move:
-        res['played_cp'] = best_cp
-        res['played_absolute'] = best_abs
-        res['delta_signed'] = 0
-        res['sf_rank'] = 1
-        res['in_top3'] = True
-        return res
-    
-    played = [t for t in top3 if t['pv'][0] == move]
-    # if played move not in top3, need to check again
-    if not played:
-        in_top3 = False
-        played = eng.analyse(
-            board, limit=limit, root_moves=[move], info=chess.engine.INFO_ALL
-        )
-        
-    else:
-        played = played[0]
-        in_top3 = True
-    
-    played_cp = score_cp_relative(played['score'])
-    played_abs = score_cp_white_pov(played["score"], clipped=False)
-    delta = best_cp - played_cp
-
-    # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
-    if abs(delta) <= EQUIV_RANGE:
-        res['best_move'] = move # our move is also best
-        res['played_cp'] = best_cp
-        res['played_absolute'] = best_abs
-        res['delta_signed'] = 0
-        res['in_top3'] = True
-        return res
-
-    # If the played move appears better (delta negative beyond EQUIV_RANGE),
-    # treat the played move as the best move (but keep delta_signed negative).
-    if delta <= -EQUIV_RANGE:
-        res['best_move'] = move
-        res['best_cp'] = played_cp
-        res['played_cp'] = played_cp
-        res['best_absolute'] = played_abs
-        res['played_absolute'] = played_abs
-        res['delta_signed'] = delta
-        res['in_top3'] = True
-        return res
-    
-    # otherwise, our move is worse
-    res['played_cp'] = played_cp
-    res['played_absolute'] = played_abs
-    res['delta_signed'] = delta
-    res['in_top3'] = in_top3
-    return res
-
-
-def analyze_with_sf_core(game_data, eng):
-    limit = chess.engine.Limit(depth=DEPTH)
-    board = chess.Board(game_data['start_fen'])
-    sf_color = game_data['stockfish_is_white']
-
-    cpl_s = cpl_w = cpl_b = 0.0
-    nw = nb = 0
-    rows = []
-
-    for i, mv in enumerate(game_data['moves_played']):
-        move = chess.Move.from_uci(mv)
-
-        # skip SF plies
-        if board.turn == sf_color:
-            board.push(move)
-            continue
-
-        res = analyze_with_rank(move, board, limit, eng)
-
-        loss_this = res['delta_signed']
-        cpl_s += loss_this
-        if board.turn:
-            cpl_w += loss_this; nw += 1
-        else:
-            cpl_b += loss_this; nb += 1
-
-        # append in_top3 flag into the row so it propagates into df
-        rows.append([
-            i, mv, str(res['best_move']), res['best_cp'], loss_this,
-            res['played_cp'],
-            res.get('in_top3', False),
-            res['best_absolute'], res['played_absolute'],
-            board.turn, loss_this
-        ])
-        board.push(move)
-
-    cols = [
-        'move_num','played_move','best_move','best_cp',
-        'delta','played_cp','in_top3',
-        'best_absolute','played_absolute','stm','loss'
-    ]
-    out_df = pd.DataFrame(rows, columns=cols)
-    out_df["played_best_move"] = out_df["played_move"] == out_df["best_move"]
-    
-    # replace the three rate lines with this robust version
-    mask_w = out_df["stm"] == True
-    mask_b = out_df["stm"] == False
-    
-    overall_bmr = out_df["played_best_move"].mean() if len(out_df) else np.nan
-    white_bmr = out_df.loc[mask_w, "played_best_move"].mean() if mask_w.any() else np.nan
-    black_bmr = out_df.loc[mask_b, "played_best_move"].mean() if mask_b.any() else np.nan
-
-    # compute in_top3 aggregate counts and rate for this game
-    top3_cnt = int(out_df["in_top3"].sum())
-    total_plies = len(out_df)
-    not_in_top3_cnt = int(total_plies - top3_cnt)
-    top3_rate = out_df["in_top3"].mean() if total_plies else np.nan
-    
-    out = {
-        "plies": nw + nb,
-        "overall_cpl": rnd(cpl_s/(nw+nb), 3) if (nw+nb) else np.nan,
-        "white_cpl":   rnd(cpl_w/nw, 3)      if nw else np.nan,
-        "black_cpl":   rnd(cpl_b/nb, 3)      if nb else np.nan,
-        "overall_best_move_rate": overall_bmr,
-        "best_move_rate_white":    white_bmr,
-        "best_move_rate_black":    black_bmr,
-        "plays_in_top3_cnt": top3_cnt,
-        "not_in_top3_cnt": not_in_top3_cnt,
-        "plays_in_top3_rate": top3_rate,
-    }
-    
-    for key in ['game_id','scenario','stockfish_color','ts']:
-        out[key] = game_data.get(key)
-        out_df[key] = game_data.get(key)
-    out['df'] = out_df
-    return out
 
 
 def worker_shard(games, progress_q, result_q):
@@ -317,7 +132,6 @@ def combine_run_stats(previous, summary, results, df_all, df_means):
         "avg_played_in_top3_rate": rnd(np.nanmean(top3_rates), 3)
     }
 
-    
     return {
         "summary": new_summary, "results": new_results,
         "df_all": new_df_all, "df_means": new_df_means
@@ -328,7 +142,7 @@ if __name__ == '__main__':
     CHUNK_THRESHOLD = 1200
     CHUNK_SIZE = 600
 
-    all_games = load_game_index()
+    all_games = load_game_index(RUN_DIR)
     pkl_file = os.path.join(RUN_DIR, "analyze_results_combined.pkl")
 
     # Load prior combined run and filter out already-processed games

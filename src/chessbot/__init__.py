@@ -13,6 +13,7 @@ except Exception as e:
     
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 ENDGAME_LOC = "C:/Users/Bryan/Data/chessbot_data/endgame_tables"
+SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
 
 import chess
 WHITE_WINNING_WHITE_MOVE = chess.Board("rn5N/p2p3p/b2k3n/5p2/1p2P3/8/PPPP1PPP/RNBQKB1R w KQ - 1 12")

@@ -9,9 +9,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 
-import random
-import chess
-import chess.syzygy
+import chess, chess.syzygy
 
 from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
@@ -20,193 +18,30 @@ from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model, make_fwd_batched
 from chessbot.mcts_utils import MCTSTree
 
+from chessbot.config import Config
+
 import chessbot.utils as cbu
-from chessbot.utils import (
-    rnd, score_game_data, plot_training_progress, show_board, RateMeter, softmax
-)
-
+from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
+from chessbot.review import start_post_hoc_server, stop_post_hoc_server
 from chessbot.encoding import score_to_cp_white
-
-SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-
-class Config(object):
-    """
-    Central knobs. Keep simple; override from a dict or flags as needed.
-    """
-
-    # files
-    run_tag = "conv_1000_selfplay_phase3"
-    selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
-    
-    # MCTS
-    c_puct = 1.5
-    anytime_uniform_mix = 0.15
-    endgame_uniform_mix = 0.2
-    opponent_uniform_mix = 0.2
-
-    # Simulation schedule
-    sims_target = 10000
-    micro_batch_size = 50
-
-    # early stop
-    es_min_sims = 5000
-    es_check_every = 300
-    es_gap_frac = 0.8
-    es_top_node_frac = 0.7
-    
-    # Q-override selection
-    use_q_override = True
-    q_override_vis_ratio = 0.80
-    q_override_q_margin = 0.08
-    q_override_min_vis = 1200
-    q_override_top_k = 3
-    
-    # Game stuff
-    games_at_once = 24
-    n_training_games = 750
-    
-    move_limit = 160
-    material_diff_cutoff = 15
-    material_diff_cutoff_span = 30
-
-    play_vs_sf_prob = 2
-    sf_depth = 16
-    
-    game_probs = {
-        "pre_opened": 0.25, "random_init": 0.2,
-        "random_middle_game": 0.2, "random_endgame": 0.1,
-        "piece_odds": 0.1, "piece_training": 0.15
-    }
-    
-    # boosts/penalize
-    use_prior_boosts = False
-    prior_clip_max = 0.35
-    prior_clip_min = 0.001
-    endgame_prior_adjustments = {
-        "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.05
-    }
-    
-    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
-
-    # TF
-    training_queue_min = 8192
-    fwd_batch = 1200
-    vwq_blend = 0.5
-    use_vwq_alpha_taper = True
-    target_mean = 0.1
-    draw_frac = 0.5
-    factorized_bins = (64, 64, 6, 4)
-
-    def to_dict(self):
-        return {
-            k: getattr(self, k)
-            for k in dir(self)
-            if not k.startswith("_") and not callable(getattr(self, k))
-        }
-    
-    def update(self, mapping=None, **kwargs):
-        if mapping is not None:
-            try:
-                items = mapping.items()
-            except AttributeError:
-                items = mapping
-            for k, v in items:
-                if not hasattr(self, k):
-                    raise AttributeError(f"Unknown config key: {k}")
-                setattr(self, k, v)
-        for k, v in kwargs.items():
-            if not hasattr(self, k):
-                raise AttributeError(f"Unknown config key: {k}")
-            setattr(self, k, v)
-
-
-class GameGenerator(object):
-    """ Curriculum game generator """
-    def __init__(self, cfg=None):
-        self.config = cfg or Config()
-        self.game_types = list(self.config.game_probs.keys())
-
-    def new_board(self, game_type=None):
-        # sanity check
-        if game_type is not None and game_type not in self.game_types:
-            raise ValueError(
-                f"Unknown game type {game_type}. "
-                f"Pick one of {self.game_types}")
-
-        # sample if not given
-        if game_type is None:
-            types, probs = zip(*self.config.game_probs.items())
-            game_type = random.choices(types, weights=probs, k=1)[0]
-
-        # dispatch
-        if game_type == "pre_opened":
-            board = cbu.get_pre_opened_game()
-            meta = {"scenario": "pre_opened"}
-            
-        elif game_type == "random_init":
-            plies = 2*np.random.randint(0, 4)
-            board = cbu.random_init(plies)
-            meta = {"scenario": "random_init", "start_plies": plies}
-            
-        elif game_type == "random_middle_game":
-            # just more plies of random_init to land mid-game
-            plies = np.random.randint(20, 31)
-            board = cbu.random_init(plies)
-            meta = {"scenario": "random_middle_game", "start_plies": plies}
-            
-        elif game_type == "random_endgame":
-            pieces = np.random.randint(8, 14)
-            wk = np.random.randint(0, 33)
-            bk = np.random.randint(33, 64)
-            board = cbu.random_board_setup(pieces, wk, bk, queens=False)
-            meta = {"scenario": "random_endgame", "pieces": pieces}
-            
-        elif game_type == "piece_odds":
-            board, meta = cbu.make_piece_odds_board()
-            
-        elif game_type == "piece_training":
-            board, meta = cbu.make_piece_training_board()
-            
-        else:
-            raise ValueError(f"unhandled game_type {game_type}")
-        
-        # quick check to make sure there are legal moves
-        if board.legal_moves():
-            return board, meta
-        # otherwise look for a new board
-        else:
-            return self.new_board(game_type=game_type)
 
 
 class ChessGame(object):
-    def __init__(self, board=None, cfg=None):
+    def __init__(self, board, meta, cfg):
         self.game_id = str(uuid.uuid4())
-        self.config = cfg or Config()
+        self.config = cfg
         self.started_at = _now()
 
-        if board is None:
-            gg = GameGenerator(cfg=self.config)
-            board, meta = gg.new_board()
-        else:
-            meta = {"scenario": "user provided board"}
-        
         self.board = board
         self.starting_fen = self.board.fen()
-        self.moves_played = []
-        self.tree_data = {}
         self.meta = meta
         
-        # determine if vs stockfish or full self-play
-        self.vs_stockfish = False
-        self.stockfish_is_white = None
-        if np.random.uniform() < self.config.play_vs_sf_prob:
-            self.vs_stockfish = True
-            self.stockfish_is_white = np.random.uniform() < 0.5
-        
-        self.meta['stockfish_is_white'] = self.stockfish_is_white
-        
+        self.vs_stockfish = meta['vs_stockfish']
+        self.stockfish_is_white = meta['stockfish_is_white']
         self.tree = MCTSTree(self.board, self.config)
+        self.tree_data = {}
+        self.moves_played = []
+        
         self.mat_adv_counter = 0
         self.vwq_adv_counter = 0
         self.outcome = None
@@ -348,7 +183,7 @@ class ChessGame(object):
 
         ucis   = [u for u, _ in rows]
         visits = np.array([n for _, n in rows], dtype=np.float32)
-        s = float(visits.sum())
+        s = visits.sum()
         pi = (visits / s) if s > 0.0 else None
         vwq = self.tree.visit_weighted_Q()
         self.vwq = vwq
@@ -429,40 +264,25 @@ class ChessGame(object):
             return True
         # if we made it here the game is active
         return False
-    
-    def show_board(self, flipped=False, sleep=0.0):
-        sb = chess.Board(self.board.fen())
-        show_board(sb, flipped=flipped, sleep=sleep)
 
 
 class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, games, model, cfg):
+    def __init__(self, model, cfg):
         self.config = cfg or Config()
+        self.game_gen = GameGenerator(self.config)
+        self.games_finished = 0
         self.active_games = []
+        self.sf_count = 0
+        self.fill_active_games()
 
-        if isinstance(games, int):
-            # generate unique starting games    
-            starting_fens = set()
-            while len(self.active_games) < games:
-                cg = ChessGame()
-                if cg.starting_fen in starting_fens:
-                    continue
-
-                starting_fens.add(cg.starting_fen)
-                self.active_games.append(cg)
-        else:
-            # assumes these are pre-loaded Game objects in a list
-            self.active_games = games
-        
         self.model = model
         self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
         self.training_queue = []
         self.recent_games = []
 
-        self.games_finished = 0
         self.white_wins = 0
         self.black_wins = 0
         self.draws = 0
@@ -475,20 +295,49 @@ class GameLooper(object):
         self.lps = RateMeter("leafs")
         self._last_stats_log = 0.0
 
+    def fill_active_games(self):
+        cfg = self.config
+        needed = cfg.n_training_games - self.games_finished - len(self.active_games)
+        if needed <= 0:
+            return
+
+        # add games w.r.t. num needed and games_at_once
+        for _ in range(needed):
+            if len(self.active_games) >= cfg.games_at_once:
+                return
+
+            # this has game probs from the config
+            board, meta = self.game_gen.new_board()
+
+            meta['vs_stockfish'] = False
+            meta['stockfish_is_white'] = False
+            if np.random.uniform() <= cfg.play_vs_sf_prob:
+                self.sf_count += 1
+                meta['vs_stockfish'] = True
+            
+                # alternate sf color to balance white and black
+                meta['stockfish_is_white'] = bool(self.sf_count % 2)
+            
+            cg = ChessGame(board=board, meta=meta, cfg=self.config)
+            self.active_games.append(cg)
+    
     def run(self):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
         or run MCTS step (collect/predict/apply).
         """
-        completed_games = 0
-        mbs = self.config.micro_batch_size
+        # reset
+        self.games_finished = 0
+
+        cfg = self.config
+        mbs = cfg.micro_batch_size
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2})
             eng.configure({"Hash": 256})
-            while completed_games < self.config.n_training_games:
+            while self.games_finished < cfg.n_training_games:
                 if not self.active_games:
                     break
         
@@ -501,7 +350,6 @@ class GameLooper(object):
                         mps.tick(1)
                             
                         if sf_terminal:
-                            completed_games += 1
                             self.finalize_game_data(game)
                             self.maybe_log_results()
                             finished.append(game.game_id)
@@ -516,7 +364,6 @@ class GameLooper(object):
                         
                         # terminal after bot move?
                         if mcts_terminal:
-                            completed_games += 1
                             self.finalize_game_data(game)
                             self.maybe_log_results()
                             finished.append(game.game_id)
@@ -585,10 +432,9 @@ class GameLooper(object):
                 self.active_games = [
                     g for g in self.active_games if g.game_id not in finished
                 ]
-                    
-                if completed_games + len(self.active_games) < self.config.n_training_games:
-                    while len(self.active_games) < self.config.games_at_once:
-                        self.active_games.append(ChessGame())
+                
+                # add in more games if needed
+                self.fill_active_games()
                     
         # train with whatever we got and final report (> 2000)
         if len(self.training_queue) >= 2000:
@@ -637,6 +483,7 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
+        
         # aggregate stats
         self.games_finished += 1
         self.total_plies += game.plies
@@ -793,14 +640,14 @@ class GameLooper(object):
     
         # evaluation and logging
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
-        eval_df = score_game_data(self.model, X, Y, save_path=plt_file)
+        eval_df = cbu.score_game_data(self.model, X, Y, save_path=plt_file)
         eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)
         
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plt_file = self.config.progress_plot_path
-            plot_training_progress(self.all_evals, save_path=plt_file)
+            cbu.plot_training_progress(self.all_evals, save_path=plt_file)
 
         # build sample weights for each head
         even_weights = np.ones_like(w)
@@ -949,7 +796,7 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
-    looper = GameLooper(games=config.games_at_once, model=model, cfg=Config())
+    looper = GameLooper(model=model, cfg=Config())
     
     # infer the number of trainings already done from existing files
     if os.path.exists(config.progress_csv_path):
@@ -961,7 +808,18 @@ def main():
         except Exception as e:
             print(e)
     
-    looper.run()
-#%%
+    # start the analysis server
+    phs = start_post_hoc_server(looper.config.run_dir)
+    
+    try:
+        looper.run()
+        
+    except Exception as e:
+        print("Error encountered", e)
+        
+    finally:
+        stop_post_hoc_server(phs, timeout=10)
+        
+
 if __name__ == '__main__':
     main()

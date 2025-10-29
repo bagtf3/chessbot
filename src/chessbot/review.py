@@ -1,9 +1,39 @@
-import json, pathlib
+import os, json, pathlib, time
+import pickle
+import math
+
 import chess, chess.svg
-import chess.engine
-from chessbot import SF_LOC
-import numpy as np
 from IPython.display import SVG, display, clear_output
+import chess.engine
+
+import signal
+from multiprocessing import Process
+
+import pandas as pd
+import numpy as np
+
+from pyfastchess import Board
+
+from chessbot import SF_LOC
+from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd
+
+
+BLUNDER_CP = 60
+WATCH_INTERVAL = 8
+TRAINING_PKL = "additional_training_data.pkl"
+ANALYZE_PKL = "analyze_results_combined.pkl"
+
+# default analysis params
+DEPTH = 13
+EQUIV_RANGE = 10
+
+# stops the post hoc server
+POST_HOC_STOP = False
+
+
+def post_hoc_signal_handler(signum, frame):
+    global POST_HOC_STOP
+    POST_HOC_STOP = True
 
 
 class GameViewer:
@@ -348,3 +378,630 @@ class GameViewer:
                 # default: forward one move
                 shown = False
                 self.next()
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+
+    # First, try regular JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: parse line-by-line (JSONL / concatenated objects)
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                items.append(json.loads(line))
+        return items
+    
+
+def load_game_index(path=None):
+    if not path.endswith("game_index.json"):
+        path = os.path.join(path, "game_index.json")
+    return load_json(path)
+
+
+def analyze_with_rank(move, board, limit, eng):
+    # Get Stockfish root best at this depth (white-POV score included in info)
+    top3 = eng.analyse(board, limit=limit, info=chess.engine.INFO_ALL, multipv=3)
+    best = [t for t in top3 if t['multipv'] == 1][0]
+    
+    best_move = best['pv'][0]
+    best_cp   = score_cp_relative(best["score"])
+    best_abs  = score_cp_white_pov(best["score"], clipped=False)
+    
+    # default
+    res = {}
+    res['best_move'] = best_move
+    res['best_cp'] = best_cp
+    res['best_absolute'] = best_abs
+    
+    if move == best_move:
+        res['played_cp'] = best_cp
+        res['played_absolute'] = best_abs
+        res['delta_signed'] = 0
+        res['sf_rank'] = 1
+        res['in_top3'] = True
+        return res
+    
+    played = [t for t in top3 if t['pv'][0] == move]
+    # if played move not in top3, need to check again
+    if not played:
+        in_top3 = False
+        played = eng.analyse(
+            board, limit=limit, root_moves=[move], info=chess.engine.INFO_ALL
+        )
+        
+    else:
+        played = played[0]
+        in_top3 = True
+    
+    played_cp = score_cp_relative(played['score'])
+    played_abs = score_cp_white_pov(played["score"], clipped=False)
+    delta = best_cp - played_cp
+
+    # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
+    if abs(delta) <= EQUIV_RANGE:
+        res['best_move'] = move # our move is also best
+        res['played_cp'] = best_cp
+        res['played_absolute'] = best_abs
+        res['delta_signed'] = 0
+        res['in_top3'] = True
+        return res
+
+    # If the played move appears better (delta negative beyond EQUIV_RANGE),
+    # treat the played move as the best move (but keep delta_signed negative).
+    if delta <= -EQUIV_RANGE:
+        res['best_move'] = move
+        res['best_cp'] = played_cp
+        res['played_cp'] = played_cp
+        res['best_absolute'] = played_abs
+        res['played_absolute'] = played_abs
+        res['delta_signed'] = delta
+        res['in_top3'] = True
+        return res
+    
+    # otherwise, our move is worse
+    res['played_cp'] = played_cp
+    res['played_absolute'] = played_abs
+    res['delta_signed'] = delta
+    res['in_top3'] = in_top3
+    return res
+
+
+def analyze_with_sf_core(game_data, eng, depth=DEPTH):
+    limit = chess.engine.Limit(depth=depth)
+    board = chess.Board(game_data['start_fen'])
+
+    vs_stockfish = game_data['vs_stockfish']
+    sf_color = game_data['stockfish_is_white']
+
+    cpl_s = cpl_w = cpl_b = 0.0
+    nw = nb = 0
+    rows = []
+
+    for i, mv in enumerate(game_data['moves_played']):
+        move = chess.Move.from_uci(mv)
+
+        # skip SF plies
+        if vs_stockfish and (board.turn == sf_color):
+            board.push(move)
+            continue
+
+        res = analyze_with_rank(move, board, limit, eng)
+
+        loss_this = res['delta_signed']
+        cpl_s += loss_this
+        if board.turn:
+            cpl_w += loss_this; nw += 1
+        else:
+            cpl_b += loss_this; nb += 1
+
+        # append in_top3 flag into the row so it propagates into df
+        rows.append([
+            i, mv, str(res['best_move']), res['best_cp'], loss_this,
+            res['played_cp'],
+            res.get('in_top3', False),
+            res['best_absolute'], res['played_absolute'],
+            board.turn, loss_this
+        ])
+        board.push(move)
+
+    cols = [
+        'move_num','played_move','best_move','best_cp',
+        'delta','played_cp','in_top3',
+        'best_absolute','played_absolute','stm','loss'
+    ]
+    out_df = pd.DataFrame(rows, columns=cols)
+    out_df["played_best_move"] = out_df["played_move"] == out_df["best_move"]
+    
+    # replace the three rate lines with this robust version
+    mask_w = out_df["stm"] == True
+    mask_b = out_df["stm"] == False
+    
+    overall_bmr = out_df["played_best_move"].mean() if len(out_df) else np.nan
+    white_bmr = out_df.loc[mask_w, "played_best_move"].mean() if mask_w.any() else np.nan
+    black_bmr = out_df.loc[mask_b, "played_best_move"].mean() if mask_b.any() else np.nan
+
+    # compute in_top3 aggregate counts and rate for this game
+    top3_cnt = int(out_df["in_top3"].sum())
+    total_plies = len(out_df)
+    not_in_top3_cnt = int(total_plies - top3_cnt)
+    top3_rate = out_df["in_top3"].mean() if total_plies else np.nan
+    
+    out = {
+        "plies": nw + nb,
+        "overall_cpl": rnd(cpl_s/(nw+nb), 3) if (nw+nb) else np.nan,
+        "white_cpl":   rnd(cpl_w/nw, 3)      if nw else np.nan,
+        "black_cpl":   rnd(cpl_b/nb, 3)      if nb else np.nan,
+        "overall_best_move_rate": overall_bmr,
+        "best_move_rate_white":    white_bmr,
+        "best_move_rate_black":    black_bmr,
+        "plays_in_top3_cnt": top3_cnt,
+        "not_in_top3_cnt": not_in_top3_cnt,
+        "plays_in_top3_rate": top3_rate,
+    }
+    
+    for key in ['game_id','scenario','stockfish_color','ts']:
+        out[key] = game_data.get(key)
+        out_df[key] = game_data.get(key)
+    out['df'] = out_df
+    return out
+
+## post hoc server
+def save_pickle_atomic(obj, path):
+    tmp = str(path) + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, str(path))
+
+
+def append_analysis_to_pkl(run_dir, analysis_out):
+    """
+    Append a single game's analysis_out (dict with 'df' DataFrame) to a
+    combined pkl at run_dir/ANALYZE_PKL and return the combined dict.
+    """
+    pkl_path = os.path.join(run_dir, ANALYZE_PKL)
+
+    # load existing combined if present
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            combined = pickle.load(f)
+            prev_results = combined.get("results", [])
+            prev_df_all = combined.get("df_all", None)
+            prev_df_means = combined.get("df_means", None)
+    else:
+        prev_results = []
+        prev_df_all = None
+        prev_df_means = None
+
+    # build a compact mean-row for this game (same fields analyze_many uses)
+    mean_row = {
+        "game_id": analysis_out.get("game_id"),
+        "ts": analysis_out.get("ts"),
+        "white_cpl": analysis_out.get("white_cpl"),
+        "black_cpl": analysis_out.get("black_cpl"),
+        "overall_cpl": analysis_out.get("overall_cpl"),
+        "best_move_rate_white": analysis_out.get("best_move_rate_white"),
+        "best_move_rate_black": analysis_out.get("best_move_rate_black"),
+        "overall_best_move_rate": analysis_out.get("overall_best_move_rate"),
+        "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate"),
+        # keep raw analysis metadata (omit df)
+        "raw": {k: v for k, v in analysis_out.items() if k != "df"}
+    }
+
+    prev_results.append(mean_row)
+
+    # concat df_all and df_means
+    df_new = analysis_out.get("df")
+    if prev_df_all is None:
+        df_all = df_new.copy() if df_new is not None else None
+    else:
+        if df_new is not None:
+            df_all = pd.concat([prev_df_all, df_new], ignore_index=True)
+        else:
+            df_all = prev_df_all
+
+    mean_df = pd.DataFrame.from_records([mean_row])
+    if prev_df_means is None:
+        df_means = mean_df
+    else:
+        df_means = pd.concat([prev_df_means, mean_df], ignore_index=True)
+
+    # recompute a lightweight summary (same style as analyze_many)
+    def safe_mean(arr):
+        a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
+        return float(np.nanmean(a)) if a.size else float("nan")
+
+    wm = [r.get("white_cpl", np.nan) for r in prev_results]
+    bm = [r.get("black_cpl", np.nan) for r in prev_results]
+    om = [r.get("overall_cpl", np.nan) for r in prev_results]
+    wb = [r.get("best_move_rate_white", np.nan) for r in prev_results]
+    bb = [r.get("best_move_rate_black", np.nan) for r in prev_results]
+    ob = [r.get("overall_best_move_rate", np.nan) for r in prev_results]
+    t3 = [r.get("plays_in_top3_rate", np.nan) for r in prev_results]
+
+    summary = {
+        "games": len(prev_results),
+        "avg_white_mean_cpl": round(safe_mean(wm), 3),
+        "avg_black_mean_cpl": round(safe_mean(bm), 3),
+        "avg_overall_mean_cpl": round(safe_mean(om), 3),
+        "avg_best_move_rate_white": round(safe_mean(wb), 3),
+        "avg_best_move_rate_black": round(safe_mean(bb), 3),
+        "avg_overall_best_move_rate": round(safe_mean(ob), 3),
+        "avg_played_in_top3_rate": round(safe_mean(t3), 3),
+    }
+
+    combined_new = {
+        "summary": summary,
+        "results": prev_results,
+        "df_all": df_all,
+        "df_means": df_means
+    }
+
+    save_pickle_atomic(combined_new, pkl_path)
+    return combined_new
+
+
+def cp_to_value(cp, mid_cp=400.0):
+    # scale so tanh(k * mid_cp) == 0.5  =>  k = atanh(0.5) / mid_cp
+    k = math.atanh(0.5) / mid_cp
+    return math.tanh(k * cp)
+
+
+def make_fake_visits(b, mv, lms, ratio_best=50):
+    visits = [[mv, int(ratio_best)]]
+    
+    # may only be 1 legal move
+    if len(lms) == 1:
+        return visits
+    
+    ratio_not_best = 100-ratio_best
+    sup_optimal = min(1, int(ratio_not_best / (len(lms) - 1)))
+    visits += [[m, int(sup_optimal)] for m in lms if m != mv]
+    return visits
+
+
+def make_training_sample(b, v, visits):
+    # turn counts into move probabilites
+    ucis   = [x[0] for x in visits]
+    counts = np.array([x[1] for x in visits], dtype=np.float32)
+    s = counts.sum()
+    pi = (counts / s) if s > 0.0 else None
+    
+    # labels per-legal
+    fr, to, piece, promo = b.moves_to_labels(ucis=ucis)
+
+    # allocate heads
+    from_m = np.zeros(64, dtype=np.float32)
+    to_m   = np.zeros(64, dtype=np.float32)
+    pc_m   = np.zeros(6, dtype=np.float32)
+    pr_m   = np.zeros(4, dtype=np.float32)
+
+    # accumulate probs
+    for i, p in enumerate(pi):
+        from_m[fr[i]] += p
+        to_m[to[i]]   += p
+        pc_m[piece[i]]+= p
+        pr_m[promo[i]]+= p
+
+    # snapshot inputs and push example
+    x = b.stacked_planes(5)
+    
+    return (x, {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m, "v": v})
+    
+
+def sf_eval(b, engine=None):
+    if not isinstance(b, chess.Board):
+        b = chess.Board(b.fen())
+        
+    if engine is None:
+        new_eng = True
+        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        engine.configure({"Threads": 1, "Hash": 128})
+
+    else:
+        new_eng = False
+
+    try:
+        info = engine.analyse(
+            b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
+        )
+        
+        score = score_cp_white_pov(info['score'])
+        val = cp_to_value(score)
+        best_move = info['pv'][0]
+
+    finally:
+        if new_eng:
+            engine.quit()
+    
+    return val, str(best_move)
+
+
+def process_game_and_update_pkl(game_json_path, run_dir, engine=None, depth=DEPTH):
+    """
+    Load game JSON, run analyze_with_sf_core using a Stockfish engine (or
+    a provided engine instance), append the analysis to the pkl in run_dir,
+    and return (game_data, analysis_out, combined_dict).
+
+    If engine is None, this function will open and close a local engine.
+    If depth is provided, it touches the global DEPTH if your analyze uses it.
+    """
+    with open(game_json_path, "r", encoding="utf-8") as gf:
+        game_data = json.load(gf)
+
+    if engine is None:
+        new_eng = True
+        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        engine.configure({"Threads": 1, "Hash": 128})
+
+    else:
+        new_eng = False
+
+    try:
+        # run analysis.
+        analysis_out = analyze_with_sf_core(game_data, engine)
+
+        # ensure keys exist for pkl row
+        analysis_out["game_id"] = game_data.get("game_id")
+        analysis_out["ts"] = game_data.get("ts")
+
+        # append to combined pkl and persist
+        combined = append_analysis_to_pkl(run_dir, analysis_out)
+
+    finally:
+        if new_eng:
+            engine.quit()
+
+    # return objects so caller has them in memory for training creation
+    return game_data, analysis_out
+
+
+def mine_additional_training_data(analysis_out, game_data, engine=None):
+    def stm(b):
+        return b.side_to_move() == 'w'
+
+    df = analysis_out['df']
+
+    tree_data = game_data['tree_search_data']
+    vs_stockfish = game_data['vs_stockfish']
+    sf_color = game_data['stockfish_is_white']
+
+    b = Board(game_data['start_fen'])
+    training_data = []
+    for i, mv in enumerate(game_data['moves_played']):
+        if vs_stockfish and (sf_color == stm(b)):
+            # we already have these, dont duplicate
+            b.push_uci(mv)
+            continue
+        
+        lms = b.legal_moves()
+        # terminals are handled elsewhere
+        if not lms:
+            break
+        
+        tr = tree_data.get(i, tree_data.get(str(i), {}))
+        cm = tr.get('candidate_moves', [])
+        
+        if cm:
+            visits = [[c['uci'], c['visits']] for c in cm]
+            visits = sorted(visits, key=lambda x: x[1], reverse=True)
+        
+        else:
+            # make up fake visits if we dont have any
+            visits = make_fake_visits(b, mv, lms, ratio_best=50)
+        
+        # find the df row associated to this move
+        row = df.query("played_move == @mv")
+        if len(row) > 1:
+            row = df.query("played_move == @mv").query("move_num == @i")
+        if len(row) == 0:
+            stri = str(i)
+            row = df.query("played_move == @mv").query("move_num == @stri")
+        if len(row) == 0:
+            print(f"no row found for {i}, {mv}")
+            continue
+        
+        # happy path, not a blunder
+        if row['delta'].item() < BLUNDER_CP:
+            v = cp_to_value(row['played_cp'].item())
+            ts = make_training_sample(b, v, visits)
+            training_data.append(ts)
+            b.push_uci(mv)
+        
+        # if a blunder, dont use actual visits (theyre wrong)
+        else:
+            best_v = cp_to_value(row['best_cp'].item())
+            best_mv = row['best_move'].item()
+            best_visits = make_fake_visits(b, best_mv, lms)
+            ts_best = make_training_sample(b, best_v, best_visits)
+            training_data.append(ts_best)
+            
+            # furthermore, show the best continuation
+            b2 = b.clone()
+            b2.push_uci(best_mv)
+            cont_moves = 1
+            while cont_moves < 3 :
+                lms2 = b2.legal_moves()
+                if not lms2:
+                    break
+                cont_val, cont_best = sf_eval(b2, engine=engine)
+                cont_visits = make_fake_visits(b2, cont_best, lms2)
+                cont_ts = make_training_sample(b2, cont_val, cont_visits)
+                training_data.append(cont_ts)
+                b2.push_uci(cont_best)        
+                cont_moves += 1
+            
+            # and the values of its PV to learn those positions are bad
+            pv = tr.get('pv', [])
+            # if no PV, just move on
+            if not pv:
+                b.push_uci(mv)
+                continue
+            
+            # run the 3 PV moves
+            b2 = b.clone()
+            for m in pv[:3]:
+                b2.push_uci(m['uci'])
+                lms2 = b2.legal_moves()
+                if not lms2:
+                    break
+                
+                pv_val, pv_best = sf_eval(b2, engine=engine)
+                pv_visits = make_fake_visits(b2, pv_best, lms2)
+                pv_ts = make_training_sample(b2, pv_val, pv_visits)
+                training_data.append(pv_ts)
+            
+            # push to move and let the loop roll over
+            b.push_uci(mv)
+
+    return training_data
+
+
+def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
+    idx_path = os.path.join(run_dir, "game_index.json")
+    pkl_path = os.path.join(run_dir, TRAINING_PKL)
+
+    # seen games from existing analyze pkl
+    seen_games = set()
+    analyze_pkl_path = os.path.join(run_dir, ANALYZE_PKL)
+    if os.path.exists(analyze_pkl_path):
+        with open(analyze_pkl_path, "rb") as f:
+            combined = pickle.load(f)
+        if "df_means" in combined and combined["df_means"] is not None:
+            seen_games = set(
+                combined["df_means"]["game_id"].astype(str).tolist()
+            )
+
+    # load existing accumulated training data
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            master_list = pickle.load(f)
+    else:
+        print(f"No exising games found at {pkl_path}")
+        master_list = []
+
+    batch_samples = []
+    games_since_flush = 0
+    last_flush = time.time()
+
+    # install signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, post_hoc_signal_handler)
+    signal.signal(signal.SIGTERM, post_hoc_signal_handler)
+
+    # single engine reused across loop
+    eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+    eng.configure({"Threads": 1, "Hash": 128})
+
+    try:
+        total_training_samples = 0
+        next_threshold = 1000
+        while not POST_HOC_STOP:
+            if not os.path.exists(idx_path):
+                # check shutdown every poll_interval
+                time.sleep(poll_interval)
+                continue
+
+            idx = load_game_index(idx_path)
+            entries = [idx] if isinstance(idx, dict) else idx
+
+            for rec in entries:
+                if POST_HOC_STOP:
+                    break
+
+                gid = str(rec.get("game_id"))
+                json_path = rec.get("json_file")
+                if not json_path or not os.path.exists(json_path):
+                    continue
+                if gid in seen_games:
+                    continue
+
+                # run analysis and update combined pkl
+                game_data, analysis_out = process_game_and_update_pkl(
+                    json_path, run_dir, engine=eng
+                )
+
+                # create training tuples for this game
+                samples = mine_additional_training_data(
+                    analysis_out, game_data, engine=eng
+                )
+
+                if samples:
+                    batch_samples.extend(samples)
+
+                seen_games.add(gid)
+                games_since_flush += 1
+
+                now = time.time()
+                if games_since_flush >= batch_games or (now - last_flush) >= batch_secs:
+                    if batch_samples:
+                        master_list.extend(batch_samples)
+                        save_pickle_atomic(master_list, pkl_path)
+                        total_training_samples += len(batch_samples)
+                        if total_training_samples >= next_threshold:
+                            next_threshold += 1000
+                            print(
+                                f"pushed {len(total_training_samples)}",
+                                f"training samples -> {pkl_path}"
+                            )
+
+                    batch_samples = []
+                    games_since_flush = 0
+                    last_flush = now
+
+            # sleep but wake quickly if shutdown requested
+            for _ in range(max(1, int(poll_interval))):
+                if POST_HOC_STOP:
+                    break
+                time.sleep(1)
+
+    finally:
+        # final flush of any pending samples before exit
+        if batch_samples:
+            master_list.extend(batch_samples)
+            save_pickle_atomic(master_list, pkl_path)
+            total_training_samples += len(batch_samples)
+            if total_training_samples >= next_threshold:
+                next_threshold += 1000
+                print(
+                    f"pushed {len(total_training_samples)}",
+                    f"training samples -> {pkl_path}"
+                )
+
+        # ensure engine is cleanly quit
+        eng.quit()
+        print("post_hoc_worker exiting cleanly")
+
+
+def start_post_hoc_server(run_dir):
+    p = Process(target=post_hoc_worker, args=(run_dir,), daemon=False)
+    p.start()
+    print("started post_hoc_server pid=", p.pid, "watching", run_dir)
+    return p
+
+
+def stop_post_hoc_server(p, timeout=10):
+    if p is None:
+        return
+
+    # prefer polite SIGINT on POSIX so worker can flush and quitEngine
+    if os.name == "posix":
+        os.kill(p.pid, signal.SIGINT)
+    else:
+        p.terminate()
+
+    start = time.time()
+    p.join(timeout)
+    if p.is_alive():
+        # escalate to terminate/kill
+        p.terminate()
+        p.join(3)
+
+    if p.is_alive():
+        print("post_hoc_server did not exit cleanly; process still alive")
+    else:
+        print("post_hoc_server stopped")
+        del p

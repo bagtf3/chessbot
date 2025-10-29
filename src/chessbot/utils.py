@@ -23,7 +23,25 @@ from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"  
+MATE_CP = 2500
+CLIP_MAX = 1200
+
+
+def score_clipped(x, clip_max=CLIP_MAX):
+    return np.clip(x.score(mate_score=MATE_CP), -clip_max, clip_max)
+
+
+def score_cp_white_pov(pov_score, clipped=True, mate_cp=MATE_CP):
+    scr = pov_score.white()
+    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+
+
+def score_cp_relative(pov_score, clipped=True):
+    scr = pov_score.relative
+    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+
+
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"
 with open(uci_path_path, "rb") as f:
     PATHS = pickle.load(f)
     
@@ -842,12 +860,69 @@ def make_piece_training_board():
     return fastboard(board.fen()), {"scenario": pick}
         
 
-def score_pov_cp(pov_score, white_to_move, mate_cp):
-    s = pov_score.white() if white_to_move else pov_score.black()
-    return float(s.score(mate_score=mate_cp))
+class GameGenerator(object):
+    """ Curriculum game generator """
+    def __init__(self, cfg):
+        self.config = cfg
+        self.game_types = list(self.config.game_probs.keys())
+
+    def new_board(self, game_type=None):
+        # sanity check
+        if game_type is not None and game_type not in self.game_types:
+            raise ValueError(
+                f"Unknown game type {game_type}. "
+                f"Pick one of {self.game_types}")
+
+        # sample if not given
+        if game_type is None:
+            types, probs = zip(*self.config.game_probs.items())
+            game_type = random.choices(types, weights=probs, k=1)[0]
+
+        # dispatch
+        if game_type == "pre_opened":
+            board = get_pre_opened_game()
+            meta = {"scenario": "pre_opened"}
+            
+        elif game_type == "random_init":
+            plies = 2*np.random.randint(0, 4)
+            board = random_init(plies)
+            meta = {"scenario": "random_init", "start_plies": plies}
+            
+        elif game_type == "random_middle_game":
+            # just more plies of random_init to land mid-game
+            plies = np.random.randint(20, 31)
+            board = random_init(plies)
+            meta = {"scenario": "random_middle_game", "start_plies": plies}
+            
+        elif game_type == "random_endgame":
+            pieces = np.random.randint(8, 14)
+            wk = np.random.randint(0, 33)
+            bk = np.random.randint(33, 64)
+            board = random_board_setup(pieces, wk, bk, queens=False)
+            meta = {"scenario": "random_endgame", "pieces": pieces}
+            
+        elif game_type == "piece_odds":
+            board, meta = make_piece_odds_board()
+            
+        elif game_type == "piece_training":
+            board, meta = make_piece_training_board()
+            
+        else:
+            raise ValueError(f"unhandled game_type {game_type}")
+        
+        # quick check to make sure there are legal moves
+        if board.legal_moves():
+            return board, meta
+        # otherwise look for a new board
+        else:
+            return self.new_board(game_type=game_type)
 
 
 def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
+    def _score_pov_cp(pov_score, white_to_move, mate_cp):
+        s = pov_score.white() if white_to_move else pov_score.black()
+        return float(s.score(mate_score=mate_cp))
+
     board = chess.Board() if start_fen is None else chess.Board(start_fen)
     white_cpl, black_cpl = [], []
     best_moves = [0, 0]
@@ -885,7 +960,7 @@ def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
                     info=chess.engine.INFO_SCORE
                 )
                 best_sc = best_info.get("score")
-                best_cp = score_pov_cp(best_sc, white_to_move, mate_cp)
+                best_cp = _score_pov_cp(best_sc, white_to_move, mate_cp)
 
                 played_cp = None
                 if mv is not None and mv in root_for_play.legal_moves:
@@ -894,7 +969,7 @@ def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
                         root_moves=[mv], info=chess.engine.INFO_SCORE
                     )
                     played_sc = played_info.get("score")
-                    played_cp = score_pov_cp(played_sc, white_to_move, mate_cp)
+                    played_cp = _score_pov_cp(played_sc, white_to_move, mate_cp)
                 else:
                     drops["mv_illegal"] += 1
 

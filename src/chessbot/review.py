@@ -1,4 +1,6 @@
 import os, json, pathlib, time
+import psutil
+
 import pickle
 import math
 
@@ -689,9 +691,11 @@ def make_training_sample(b, v, visits):
 
     # snapshot inputs and push example
     x = b.stacked_planes(5)
-    
-    return (x, {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m, "v": v})
-    
+    policy_heads = {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m}
+
+    # needs to match looper's training_queue: x, heads, Z (outcome), value, taper
+    tup = (x, policy_heads, 0, v, None)
+    return tup
 
 def sf_eval(b, engine=None):
     if not isinstance(b, chess.Board):
@@ -794,6 +798,11 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             # make up fake visits if we dont have any
             visits = make_fake_visits(b, mv, lms, ratio_best=50)
         
+        # if visits dont look right, skip
+        if sum([v[1] for v in visits]) <= 0:
+            b.push_uci(mv)
+            continue
+            
         # find the df row associated to this move
         row = df.query("played_move == @mv")
         if len(row) > 1:
@@ -807,14 +816,14 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         
         # happy path, not a blunder
         if row['delta'].item() < BLUNDER_CP:
-            v = cp_to_value(row['played_cp'].item())
+            v = cp_to_value(row['played_absolute'].item())
             ts = make_training_sample(b, v, visits)
             training_data.append(ts)
             b.push_uci(mv)
         
         # if a blunder, dont use actual visits (theyre wrong)
         else:
-            best_v = cp_to_value(row['best_cp'].item())
+            best_v = cp_to_value(row['best_absolute'].item())
             best_mv = row['best_move'].item()
             best_visits = make_fake_visits(b, best_mv, lms)
             ts_best = make_training_sample(b, best_v, best_visits)
@@ -824,7 +833,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             b2 = b.clone()
             b2.push_uci(best_mv)
             cont_moves = 1
-            while cont_moves < 3 :
+            while cont_moves < 2 :
                 lms2 = b2.legal_moves()
                 if not lms2:
                     break
@@ -842,7 +851,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 b.push_uci(mv)
                 continue
             
-            # run the 3 PV moves
+            # run the 2 next PV moves
             b2 = b.clone()
             for m in pv[:3]:
                 b2.push_uci(m['uci'])
@@ -861,10 +870,35 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
     return training_data
 
 
-def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
+def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
+    ## trying to deprioritize the server so it doesnt slow down main training looper
+    p = psutil.Process()
+
+    if os.name == "posix":
+        # lower CPU priority (nice). 10 is a polite background value.
+        p.nice(10)
+        # set IO priority to idle if available (Linux)
+        if hasattr(p, "ionice"):
+            p.ionice(psutil.IOPRIO_CLASS_IDLE)
+
+    elif os.name == "nt":
+        # Windows: lower process priority class
+        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+
+    # pin worker to a small set of cores (use last 1-2 physical cores as example)
+    # adjust the slice to pick different cores if you want
+    phy = psutil.cpu_count(logical=False) or psutil.cpu_count()
+    if phy is not None:
+        use_count = 1 if phy <= 2 else 2
+        start = max(0, phy - use_count)
+        cores = list(range(start, start + use_count))
+        # cpu_affinity expects a list of logical/core ids; ok on Linux & Windows
+        p.cpu_affinity(cores)
+
     idx_path = os.path.join(run_dir, "game_index.json")
     pkl_path = os.path.join(run_dir, TRAINING_PKL)
 
+    # post hoc logic starts here
     # seen games from existing analyze pkl
     seen_games = set()
     analyze_pkl_path = os.path.join(run_dir, ANALYZE_PKL)
@@ -894,11 +928,13 @@ def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
 
     # single engine reused across loop
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 1, "Hash": 128})
+    eng.configure({"Threads": 1, "Hash": 64})
 
     try:
-        total_training_samples = 0
-        next_threshold = 1000
+        total_training_samples = len(master_list)
+        last_seen_pkl = os.path.exists(pkl_path)
+        next_threshold = ((total_training_samples // 1000) + 1) * 1000
+
         while not POST_HOC_STOP:
             if not os.path.exists(idx_path):
                 # check shutdown every poll_interval
@@ -909,6 +945,13 @@ def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
             entries = [idx] if isinstance(idx, dict) else idx
 
             for rec in entries:
+                # check if the pkl has been cleared
+                curr_exists = os.path.exists(pkl_path)
+                if last_seen_pkl and not curr_exists:
+                    master_list = []
+                    total_training_samples = 0
+                    next_threshold = 1000
+                last_seen_pkl = curr_exists
                 if POST_HOC_STOP:
                     break
 
@@ -940,14 +983,16 @@ def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
                     if batch_samples:
                         master_list.extend(batch_samples)
                         save_pickle_atomic(master_list, pkl_path)
-                        total_training_samples += len(batch_samples)
+                        # reflect exact on-disk state
+                        total_training_samples = len(master_list)
+                        last_seen_pkl = True
                         if total_training_samples >= next_threshold:
                             next_threshold += 1000
                             print(
-                                f"pushed {len(total_training_samples)}",
+                                f"pushed {total_training_samples}",
                                 f"training samples -> {pkl_path}"
                             )
-
+                    
                     batch_samples = []
                     games_since_flush = 0
                     last_flush = now
@@ -963,11 +1008,13 @@ def post_hoc_worker(run_dir, poll_interval=10, batch_games=5, batch_secs=120):
         if batch_samples:
             master_list.extend(batch_samples)
             save_pickle_atomic(master_list, pkl_path)
-            total_training_samples += len(batch_samples)
+            # reflect exact on-disk state
+            total_training_samples = len(master_list)
+            last_seen_pkl = True
             if total_training_samples >= next_threshold:
                 next_threshold += 1000
                 print(
-                    f"pushed {len(total_training_samples)}",
+                    f"pushed {total_training_samples}",
                     f"training samples -> {pkl_path}"
                 )
 

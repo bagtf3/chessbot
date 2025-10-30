@@ -9,7 +9,7 @@ class Config(object):
     # files
     run_tag = "conv_1000_test"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
+    init_model = "c:\\Users\\Bryan\\Data\\chessbot_data\\models\\conv_small_init.h5"
     
     # MCTS
     c_puct = 1.5
@@ -17,12 +17,12 @@ class Config(object):
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 500
+    sims_target = 100
     micro_batch_size = 10
 
     # early stop
-    es_min_sims = 5000
-    es_check_every = 300
+    es_min_sims = 100
+    es_check_every = 200
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -34,15 +34,15 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 100
-    n_training_games = 750
+    games_at_once = 80
+    n_training_games = 5000
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 2
-    sf_depth = 16
+    play_vs_sf_prob = 0.5
+    sf_depth = 10
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.2,
@@ -61,12 +61,12 @@ class Config(object):
     anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
 
     # TF
-    training_queue_min = 8192
+    training_queue_min = 4096
     fwd_batch = 1200
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
     target_mean = 0.1
-    draw_frac = 0.5
+    additional_data_ratio = 1.0
     factorized_bins = (64, 64, 6, 4)
 
     def to_dict(self):

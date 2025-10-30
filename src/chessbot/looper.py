@@ -1,4 +1,4 @@
-import uuid, os
+import uuid, os, pickle
 import pathlib, json
 import time
 _now = time.time
@@ -571,103 +571,151 @@ class GameLooper(object):
         
     def trigger_retrain(self):
         """
-        Build training tensors from self.training_queue and do a quick fit.
-        Blends game outcomes with visit-weighted Q for the value head.
-        Balances wins vs losses on the value head with per-sample weights.
+        Build training tensors from self.training_queue and fit.
+        If an 'additional_training_data.pkl' exists in run_dir, load it,
+        remove the file, and blend those samples with the in-memory queue.
+        Equalize total weight between existing and additional groups by
+        downscaling the larger group (never upweight).
         """
         if not self.training_queue:
             return
-    
-        # unpack examples
-        X, Y_from, Y_to, Y_piece, Y_promo = [], [], [], [], []
-        Z_list, Vwq_list, taper_list = [], [], []
-        for x, heads, z, vwq, taper in self.training_queue:
-            X.append(x)
+
+        # check for additional data pkl and load+remove if present
+        add_pkl = os.path.join(self.config.run_dir, "additional_training_data.pkl")
+        if os.path.exists(add_pkl):
+            with open(add_pkl, "rb") as f:
+                additional = pickle.load(f)
+                print(f"Found {len(additional)} additional training samples")
+            # remove immediately so nothing is re-read later
+            os.remove(add_pkl)
+        else:
+            print("No additional data found at", add_pkl)
+            additional = []
+
+        # combined list: existing queue first, additional appended
+        combined = list(self.training_queue) + list(additional)
+        n_main = len(self.training_queue)
+        n_add  = len(additional)
+        total = len(combined)
+
+        # unpack examples into arrays
+        X_list = []
+        Y_from = []
+        Y_to   = []
+        Y_piece= []
+        Y_promo= []
+        Z_list = []
+        Vwq_list = []
+        taper_list = []
+        is_add_flag = []
+
+        for i, (x, heads, z, vwq, taper) in enumerate(combined):
+            X_list.append(x)
             Y_from.append(heads["from"])
             Y_to.append(heads["to"])
             Y_piece.append(heads["piece"])
             Y_promo.append(heads["promo"])
             Z_list.append(z)
             Vwq_list.append(vwq)
-            taper_list.append(taper)
+            taper_list.append(taper if taper is not None else 0.0)
+            is_add_flag.append(i >= n_main)  # True for additional samples
 
+        X = np.asarray(X_list, dtype=np.float32)
         Z = np.asarray(Z_list, dtype=np.float32)
         Vwq = np.asarray(Vwq_list, dtype=np.float32)
         taper_arr = np.asarray(taper_list, dtype=np.float32)
+        is_add = np.asarray(is_add_flag, dtype=np.bool_)
 
         # blend outcome with visit-weighted Q
         alpha = getattr(self.config, "vwq_blend", 0.0)
         use_taper = getattr(self.config, "use_vwq_alpha_taper", False)
-
         if use_taper:
-            w = np.clip(alpha * taper_arr, 0.0, 1.0)
-            Y_value = (1.0 - w) * Vwq + w * Z
+            w_alpha = np.clip(alpha * taper_arr, 0.0, 1.0)
+            Y_value = (1.0 - w_alpha) * Vwq + w_alpha * Z
         else:
             Y_value = (1.0 - alpha) * Vwq + alpha * Z
-        
-        # assemble training dict
-        X = np.asarray(X, dtype=np.float32)
+
+        # initial per-sample weights (ones)
+        weights = np.ones_like(Y_value, dtype=np.float32)
+
+        # balance selfplay and additional (boosting) data
+        adr = getattr(self.config, "additional_data_ratio", 1.0)
+        M = weights[~is_add].sum() if n_main > 0 else 0.0
+        A = weights[is_add].sum() if n_add  > 0 else 0.0
+
+        # default scale factors (no downscaling)
+        s_main = 1.0
+        s_add  = 1.0
+
+        if M > 0.0 and A > 0.0:
+            R = adr
+            # keep additional fixed (s_add=1), find required s_main
+            required_s_main = A / (R * M)
+            if required_s_main <= 1.0:
+                s_main = required_s_main
+                s_add = 1.0
+            else:
+                # downscale additional to meet ratio if possible
+                required_s_add = (R * M) / A
+                if required_s_add <= 1.0:
+                    s_add = required_s_add
+                    s_main = 1.0
+
+            # apply downscaling factors (never upweight here)
+            if s_main < 1.0:
+                weights[~is_add] *= s_main
+            if s_add < 1.0:
+                weights[is_add]  *= s_add
+        # If one group is empty, we leave the other group as-is (no balancing)
+
+        # respect target_mean
+        target_mean = getattr(self.config, "target_mean", 1.0)
+        mean_w = weights.mean() if weights.size else 1.0
+        if mean_w > 0.0:
+            scale_to_target = target_mean / mean_w
+            weights *= scale_to_target
+
+        # assemble final Y dict and sample_weight mapping for Keras fit
         Y = {
             "value": Y_value.astype(np.float32),
-            "best_from": np.asarray(Y_from, dtype=np.float32),
-            "best_to": np.asarray(Y_to, dtype=np.float32),
-            "best_piece": np.asarray(Y_piece, dtype=np.float32),
-            "best_promo": np.asarray(Y_promo, dtype=np.float32)
+            "best_from":   np.asarray(Y_from, dtype=np.float32),
+            "best_to":     np.asarray(Y_to, dtype=np.float32),
+            "best_piece":  np.asarray(Y_piece, dtype=np.float32),
+            "best_promo":  np.asarray(Y_promo, dtype=np.float32)
         }
-    
-        # per-sample weights (based on raw outcomes)
-        target_mean = self.config.target_mean
-        draw_frac = self.config.draw_frac
-    
-        pos = np.sum(Z > 0)
-        neg = np.sum(Z < 0)
-        nz  = pos + neg
-    
-        if nz > 0 and pos > 0 and neg > 0:
-            w_pos = 0.5 * nz / pos
-            w_neg = 0.5 * nz / neg
-            w_draw = draw_frac * 0.5 * (w_pos + w_neg)
-            w = np.where(Z>0, w_pos, np.where(Z<0, w_neg, w_draw)).astype(np.float32)
-        else:
-            w = np.ones_like(Z, dtype=np.float32)
-    
-        # scale weights to target mean
-        mean_w = w.mean() if w.size else 1.0
-        if mean_w > 0:
-            w *= (target_mean / mean_w)
-        else:
-            w[:] = target_mean
-    
-        # evaluation and logging
+
+        even_weights = np.ones_like(weights, dtype=np.float32)
+        s_wts = {
+            "value": weights,
+            "best_from": even_weights,
+            "best_to": even_weights,
+            "best_piece": even_weights,
+            "best_promo": even_weights
+        }
+
+        # evaluation and logging (reuse existing helpers)
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
         eval_df = cbu.score_game_data(self.model, X, Y, save_path=plt_file)
         eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)
-        
+
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plt_file = self.config.progress_plot_path
             cbu.plot_training_progress(self.all_evals, save_path=plt_file)
 
-        # build sample weights for each head
-        even_weights = np.ones_like(w)
-        s_wts = {
-            'value': w, "best_from": even_weights, "best_to": even_weights,
-            "best_piece": even_weights, 'best_promo': even_weights
-        }
-
-        # fit and  save new model
-        self.model.fit(X, Y, epochs=1, batch_size=1024, verbose=0, sample_weight=s_wts)
+        # fit and save new model
+        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)
         self.model.save(self.config.model_path)
-        
-        #update the fwd
+
+        # update the fwd helper and clear queues/caches
         self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
 
-        # clear training queue, clear caches and bump retrain counter
+        # clear training queue (we consumed the in-memory queue)
         self.training_queue = []
         self.n_retrains += 1
         self.clear_cache = True
-    
+
     def maybe_log_results(self, every_sec=60.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:

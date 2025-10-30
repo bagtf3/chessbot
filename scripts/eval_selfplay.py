@@ -139,8 +139,8 @@ def combine_run_stats(previous, summary, results, df_all, df_means):
 
 
 if __name__ == '__main__':
-    CHUNK_THRESHOLD = 1200
-    CHUNK_SIZE = 600
+    CHUNK_THRESHOLD = 599
+    CHUNK_SIZE = 300
 
     all_games = load_game_index(RUN_DIR)
     pkl_file = os.path.join(RUN_DIR, "analyze_results_combined.pkl")

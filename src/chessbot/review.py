@@ -1,5 +1,6 @@
 import os, json, pathlib, time
 import psutil
+import uuid
 
 import pickle
 import math
@@ -21,12 +22,12 @@ from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd
 
 
 BLUNDER_CP = 60
-WATCH_INTERVAL = 8
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
+ANALYZE_BATCH = 150
 
 # default analysis params
-DEPTH = 13
+DEPTH = 12
 EQUIV_RANGE = 10
 
 # stops the post hoc server
@@ -39,7 +40,6 @@ def post_hoc_signal_handler(signum, frame):
 
 
 class GameViewer:
-    # in GameViewer.__init__
     def __init__(self, log_path, sf_df=None):
         self.path = pathlib.Path(log_path)
         with open(self.path, "r", encoding="utf-8") as f:
@@ -560,73 +560,26 @@ def save_pickle_atomic(obj, path):
     os.replace(tmp, str(path))
 
 
-def append_analysis_to_pkl(run_dir, analysis_out):
+def safe_mean(arr):
+    a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
+    return float(np.nanmean(a)) if a.size else float("nan")
+
+
+def lightweight_summary(results):
     """
-    Append a single game's analysis_out (dict with 'df' DataFrame) to a
-    combined pkl at run_dir/ANALYZE_PKL and return the combined dict.
+    Build the small summary dict you use in combined chunk files.
+    'results' is a list of per-game dicts (the merged_results or results).
     """
-    pkl_path = os.path.join(run_dir, ANALYZE_PKL)
+    wm = [r.get("white_cpl", np.nan) for r in results]
+    bm = [r.get("black_cpl", np.nan) for r in results]
+    om = [r.get("overall_cpl", np.nan) for r in results]
+    wb = [r.get("best_move_rate_white", np.nan) for r in results]
+    bb = [r.get("best_move_rate_black", np.nan) for r in results]
+    ob = [r.get("overall_best_move_rate", np.nan) for r in results]
+    t3 = [r.get("plays_in_top3_rate", np.nan) for r in results]
 
-    # load existing combined if present
-    if os.path.exists(pkl_path):
-        with open(pkl_path, "rb") as f:
-            combined = pickle.load(f)
-            prev_results = combined.get("results", [])
-            prev_df_all = combined.get("df_all", None)
-            prev_df_means = combined.get("df_means", None)
-    else:
-        prev_results = []
-        prev_df_all = None
-        prev_df_means = None
-
-    # build a compact mean-row for this game (same fields analyze_many uses)
-    mean_row = {
-        "game_id": analysis_out.get("game_id"),
-        "ts": analysis_out.get("ts"),
-        "white_cpl": analysis_out.get("white_cpl"),
-        "black_cpl": analysis_out.get("black_cpl"),
-        "overall_cpl": analysis_out.get("overall_cpl"),
-        "best_move_rate_white": analysis_out.get("best_move_rate_white"),
-        "best_move_rate_black": analysis_out.get("best_move_rate_black"),
-        "overall_best_move_rate": analysis_out.get("overall_best_move_rate"),
-        "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate"),
-        # keep raw analysis metadata (omit df)
-        "raw": {k: v for k, v in analysis_out.items() if k != "df"}
-    }
-
-    prev_results.append(mean_row)
-
-    # concat df_all and df_means
-    df_new = analysis_out.get("df")
-    if prev_df_all is None:
-        df_all = df_new.copy() if df_new is not None else None
-    else:
-        if df_new is not None:
-            df_all = pd.concat([prev_df_all, df_new], ignore_index=True)
-        else:
-            df_all = prev_df_all
-
-    mean_df = pd.DataFrame.from_records([mean_row])
-    if prev_df_means is None:
-        df_means = mean_df
-    else:
-        df_means = pd.concat([prev_df_means, mean_df], ignore_index=True)
-
-    # recompute a lightweight summary (same style as analyze_many)
-    def safe_mean(arr):
-        a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
-        return float(np.nanmean(a)) if a.size else float("nan")
-
-    wm = [r.get("white_cpl", np.nan) for r in prev_results]
-    bm = [r.get("black_cpl", np.nan) for r in prev_results]
-    om = [r.get("overall_cpl", np.nan) for r in prev_results]
-    wb = [r.get("best_move_rate_white", np.nan) for r in prev_results]
-    bb = [r.get("best_move_rate_black", np.nan) for r in prev_results]
-    ob = [r.get("overall_best_move_rate", np.nan) for r in prev_results]
-    t3 = [r.get("plays_in_top3_rate", np.nan) for r in prev_results]
-
-    summary = {
-        "games": len(prev_results),
+    return {
+        "games": len(results),
         "avg_white_mean_cpl": round(safe_mean(wm), 3),
         "avg_black_mean_cpl": round(safe_mean(bm), 3),
         "avg_overall_mean_cpl": round(safe_mean(om), 3),
@@ -636,15 +589,168 @@ def append_analysis_to_pkl(run_dir, analysis_out):
         "avg_played_in_top3_rate": round(safe_mean(t3), 3),
     }
 
+
+def combine_analysis_staging(run_dir):
+    """
+    Combine all chunked pickles in run_dir/analysis_staging into the single
+    ANALYZE_PKL file at run_dir/ANALYZE_PKL. After a successful combine,
+    delete the chunk files.
+
+    Behavior:
+      - If ANALYZE_PKL exists, new chunks are appended to it.
+      - If ANALYZE_PKL does not exist, a new combined file is created.
+      - Chunk files are removed only after the combined pkl is written.
+    """
+    staging = os.path.join(run_dir, "analysis_staging")
+    out_pkl = os.path.join(run_dir, ANALYZE_PKL)
+
+    # nothing to do if staging doesn't exist
+    if not os.path.isdir(staging):
+        print(f"[combine] no staging dir: {staging}")
+        return None
+
+    # list chunk files (stable sort)
+    fns = sorted([fn for fn in os.listdir(staging) if fn.endswith(".pkl")])
+    if not fns:
+        print(f"[combine] no chunk files in {staging}")
+        return None
+
+    # load existing combined (if any)
+    if os.path.exists(out_pkl):
+        with open(out_pkl, "rb") as f:
+            combined = pickle.load(f)
+        prev_results = list(combined.get("results", []))
+        prev_df_all = combined.get("df_all", None)
+        prev_df_means = combined.get("df_means", None)
+    else:
+        prev_results = []
+        prev_df_all = None
+        prev_df_means = None
+
+    # accumulate chunk content
+    chunk_results = []
+    chunk_dfs = []
+    chunk_means = []
+
+    for fn in fns:
+        path = os.path.join(staging, fn)
+        # load each chunk (let exceptions propagate)
+        with open(path, "rb") as f:
+            chunk = pickle.load(f)
+
+        # expect chunk structure {summary, results, df_all, df_means}
+        cres = chunk.get("results", [])
+        if cres:
+            chunk_results.extend(cres)
+
+        cdf = chunk.get("df_all", None)
+        if cdf is not None:
+            chunk_dfs.append(cdf)
+
+        cmeans = chunk.get("df_means", None)
+        if cmeans is not None:
+            chunk_means.append(cmeans)
+
+    # merge results lists
+    merged_results = prev_results + chunk_results
+
+    # merge df_all
+    if prev_df_all is None:
+        if chunk_dfs:
+            df_all = pd.concat(chunk_dfs, ignore_index=True)
+        else:
+            df_all = None
+    else:
+        if chunk_dfs:
+            df_all = pd.concat([prev_df_all] + chunk_dfs, ignore_index=True)
+        else:
+            df_all = prev_df_all
+
+    # merge df_means
+    if prev_df_means is None:
+        if chunk_means:
+            df_means = pd.concat(chunk_means, ignore_index=True)
+        else:
+            df_means = None
+    else:
+        if chunk_means:
+            df_means = pd.concat([prev_df_means] + chunk_means, ignore_index=True)
+        else:
+            df_means = prev_df_means
+
+    # recompute lightweight summary from merged_results
+    summary = lightweight(merged_results)
+
     combined_new = {
         "summary": summary,
-        "results": prev_results,
+        "results": merged_results,
         "df_all": df_all,
         "df_means": df_means
     }
 
-    save_pickle_atomic(combined_new, pkl_path)
+    # persist atomically using existing helper
+    save_pickle_atomic(combined_new, out_pkl)
+    print(f"[combine] wrote combined ANALYZE_PKL -> {out_pkl} "
+          f"({len(merged_results)} games)")
+
+    # delete the chunk files that we just combined
+    for fn in fns:
+        path = os.path.join(staging, fn)
+        os.remove(path)
+    print(f"[combine] removed {len(fns)} chunk files from {staging}")
+
     return combined_new
+
+
+def save_analysis_chunk_simple(run_dir, batch):
+    """
+    Build a combined-style object for `batch` (list of analysis_out dicts)
+    and write it as one pickle into run_dir/analysis_staging/ with a unique
+    filename. No tmp file, no exceptions swallowed.
+    """
+    staging = os.path.join(run_dir, "analysis_staging")
+    os.makedirs(staging, exist_ok=True)
+
+    # results list (one row per game)
+    results = []
+    all_dfs = []
+    for analysis_out in batch:
+        row = {
+            "game_id": analysis_out.get("game_id"),
+            "ts": analysis_out.get("ts"),
+            "white_cpl": analysis_out.get("white_cpl"),
+            "black_cpl": analysis_out.get("black_cpl"),
+            "overall_cpl": analysis_out.get("overall_cpl"),
+            "best_move_rate_white": analysis_out.get("best_move_rate_white"),
+            "best_move_rate_black": analysis_out.get("best_move_rate_black"),
+            "overall_best_move_rate": analysis_out.get("overall_best_move_rate"),
+            "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate"),
+            "raw": {k: v for k, v in analysis_out.items() if k != "df"}
+        }
+        results.append(row)
+        df = analysis_out.get("df")
+        if df is not None:
+            all_dfs.append(df)
+
+    # df_all is concat of per-game dfs (or None)
+    df_all = pd.concat(all_dfs, ignore_index=True) if all_dfs else None
+    df_means = pd.DataFrame.from_records(results) if results else None
+    summary = lightweight_summary(results)
+
+    chunk_obj = {
+        "summary": summary,
+        "results": results,
+        "df_all": df_all,
+        "df_means": df_means
+    }
+
+    fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
+    outp = os.path.join(staging, fname)
+
+    with open(outp, "wb") as f:
+        pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return outp
 
 
 def cp_to_value(cp, mid_cp=400.0):
@@ -661,7 +767,7 @@ def make_fake_visits(b, mv, lms, ratio_best=50):
         return visits
     
     ratio_not_best = 100-ratio_best
-    sup_optimal = min(1, int(ratio_not_best / (len(lms) - 1)))
+    sup_optimal = max(1, int(ratio_not_best / (len(lms) - 1)))
     visits += [[m, int(sup_optimal)] for m in lms if m != mv]
     return visits
 
@@ -717,51 +823,14 @@ def sf_eval(b, engine=None):
         score = score_cp_white_pov(info['score'])
         val = cp_to_value(score)
         best_move = info['pv'][0]
+    except Exception as e:
+        print(e)
 
     finally:
         if new_eng:
             engine.quit()
     
     return val, str(best_move)
-
-
-def process_game_and_update_pkl(game_json_path, run_dir, engine=None, depth=DEPTH):
-    """
-    Load game JSON, run analyze_with_sf_core using a Stockfish engine (or
-    a provided engine instance), append the analysis to the pkl in run_dir,
-    and return (game_data, analysis_out, combined_dict).
-
-    If engine is None, this function will open and close a local engine.
-    If depth is provided, it touches the global DEPTH if your analyze uses it.
-    """
-    with open(game_json_path, "r", encoding="utf-8") as gf:
-        game_data = json.load(gf)
-
-    if engine is None:
-        new_eng = True
-        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        engine.configure({"Threads": 1, "Hash": 128})
-
-    else:
-        new_eng = False
-
-    try:
-        # run analysis.
-        analysis_out = analyze_with_sf_core(game_data, engine)
-
-        # ensure keys exist for pkl row
-        analysis_out["game_id"] = game_data.get("game_id")
-        analysis_out["ts"] = game_data.get("ts")
-
-        # append to combined pkl and persist
-        combined = append_analysis_to_pkl(run_dir, analysis_out)
-
-    finally:
-        if new_eng:
-            engine.quit()
-
-    # return objects so caller has them in memory for training creation
-    return game_data, analysis_out
 
 
 def mine_additional_training_data(analysis_out, game_data, engine=None):
@@ -811,7 +880,6 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             stri = str(i)
             row = df.query("played_move == @mv").query("move_num == @stri")
         if len(row) == 0:
-            print(f"no row found for {i}, {mv}")
             continue
         
         # happy path, not a blunder
@@ -870,7 +938,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
     return training_data
 
 
-def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
+def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
     ## trying to deprioritize the server so it doesnt slow down main training looper
     p = psutil.Process()
 
@@ -895,10 +963,13 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
         # cpu_affinity expects a list of logical/core ids; ok on Linux & Windows
         p.cpu_affinity(cores)
 
+    # post hoc logic starts here
     idx_path = os.path.join(run_dir, "game_index.json")
     pkl_path = os.path.join(run_dir, TRAINING_PKL)
 
-    # post hoc logic starts here
+    # first merge any existing analysis
+    _ = combine_analysis_staging(run_dir)
+
     # seen games from existing analyze pkl
     seen_games = set()
     analyze_pkl_path = os.path.join(run_dir, ANALYZE_PKL)
@@ -910,15 +981,11 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
                 combined["df_means"]["game_id"].astype(str).tolist()
             )
 
-    # load existing accumulated training data
-    if os.path.exists(pkl_path):
-        with open(pkl_path, "rb") as f:
-            master_list = pickle.load(f)
-    else:
-        print(f"No exising games found at {pkl_path}")
-        master_list = []
-
+    # start fresh with training data
+    running_list = []
     batch_samples = []
+    analyzed_batch = []
+
     games_since_flush = 0
     last_flush = time.time()
 
@@ -931,10 +998,9 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
     eng.configure({"Threads": 1, "Hash": 64})
 
     try:
-        total_training_samples = len(master_list)
+        # see if there is a starting pkl file
         last_seen_pkl = os.path.exists(pkl_path)
-        next_threshold = ((total_training_samples // 1000) + 1) * 1000
-
+        next_threshold = 1000
         while not POST_HOC_STOP:
             if not os.path.exists(idx_path):
                 # check shutdown every poll_interval
@@ -945,13 +1011,6 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
             entries = [idx] if isinstance(idx, dict) else idx
 
             for rec in entries:
-                # check if the pkl has been cleared
-                curr_exists = os.path.exists(pkl_path)
-                if last_seen_pkl and not curr_exists:
-                    master_list = []
-                    total_training_samples = 0
-                    next_threshold = 1000
-                last_seen_pkl = curr_exists
                 if POST_HOC_STOP:
                     break
 
@@ -961,13 +1020,19 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
                     continue
                 if gid in seen_games:
                     continue
+                
+                # run analysis in-memory (do NOT persist per-game here)
+                with open(json_path, "r", encoding="utf-8") as gf:
+                    game_data = json.load(gf)
 
-                # run analysis and update combined pkl
-                game_data, analysis_out = process_game_and_update_pkl(
-                    json_path, run_dir, engine=eng
-                )
+                analysis_out = analyze_with_sf_core(game_data, eng=eng)
+                analysis_out["game_id"] = game_data.get("game_id")
+                analysis_out["ts"] = game_data.get("ts")
 
-                # create training tuples for this game
+                # accumulate for bundled saving later
+                analyzed_batch.append(analysis_out)
+
+                # create training tuples for this game (unchanged)
                 samples = mine_additional_training_data(
                     analysis_out, game_data, engine=eng
                 )
@@ -978,20 +1043,29 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
                 seen_games.add(gid)
                 games_since_flush += 1
 
+                # write chunk files of ANALYZE_BATCH games into analysis_staging/
+                if len(analyzed_batch) >= ANALYZE_BATCH:
+                    outp = save_analysis_chunk_simple(run_dir, analyzed_batch)
+                    print(f"[post_hoc] wrote analysis {len(analyzed_batch)}")
+
                 now = time.time()
                 if games_since_flush >= batch_games or (now - last_flush) >= batch_secs:
                     if batch_samples:
-                        master_list.extend(batch_samples)
-                        save_pickle_atomic(master_list, pkl_path)
+                        # check if the pkl has been cleared
+                        curr_exists = os.path.exists(pkl_path)
+                        if last_seen_pkl and not curr_exists:
+                            running_list = []
+                            next_threshold = 1000
+                        last_seen_pkl = curr_exists
+
+                        running_list.extend(batch_samples)
+                        save_pickle_atomic(running_list, pkl_path)
                         # reflect exact on-disk state
-                        total_training_samples = len(master_list)
                         last_seen_pkl = True
-                        if total_training_samples >= next_threshold:
+                        lrl = len(running_list)
+                        if lrl >= next_threshold:
                             next_threshold += 1000
-                            print(
-                                f"pushed {total_training_samples}",
-                                f"training samples -> {pkl_path}"
-                            )
+                            print(f"[post hoc] pushed {lrl} training samples")
                     
                     batch_samples = []
                     games_since_flush = 0
@@ -1004,29 +1078,15 @@ def post_hoc_worker(run_dir, poll_interval=20, batch_games=5, batch_secs=240):
                 time.sleep(1)
 
     finally:
-        # final flush of any pending samples before exit
-        if batch_samples:
-            master_list.extend(batch_samples)
-            save_pickle_atomic(master_list, pkl_path)
-            # reflect exact on-disk state
-            total_training_samples = len(master_list)
-            last_seen_pkl = True
-            if total_training_samples >= next_threshold:
-                next_threshold += 1000
-                print(
-                    f"pushed {total_training_samples}",
-                    f"training samples -> {pkl_path}"
-                )
-
         # ensure engine is cleanly quit
         eng.quit()
-        print("post_hoc_worker exiting cleanly")
+        print("[post_hoc] post_hoc_worker exiting cleanly")
 
 
 def start_post_hoc_server(run_dir):
     p = Process(target=post_hoc_worker, args=(run_dir,), daemon=False)
     p.start()
-    print("started post_hoc_server pid=", p.pid, "watching", run_dir)
+    print("[post hoc] started server pid=", p.pid, "watching", run_dir)
     return p
 
 

@@ -644,8 +644,7 @@ class GameLooper(object):
         A = weights[is_add].sum() if n_add  > 0 else 0.0
 
         # default scale factors (no downscaling)
-        s_main = 1.0
-        s_add  = 1.0
+        s_main, s_add = 1.0, 1.0
 
         if M > 0.0 and A > 0.0:
             R = adr

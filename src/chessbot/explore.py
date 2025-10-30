@@ -111,19 +111,19 @@ def trend_check(df, window=100):
 df_list = []
 #%%
 from pprint import pprint
+from chessbot.review import combine_analysis_staging, ANALYZE_PKL
 #%matplotlib inline
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_test"
+
 all_games = load_game_index(run_dir)
 
 CLIP_UB = 500
-WINDOW = 200
+WINDOW = 500
 
-pkl_files = [f for f in os.listdir(run_dir) if "analyze_results_combined.pkl" in f]
-if pkl_files:
-    outfile = os.path.join(run_dir, pkl_files[0])
-    with open(outfile, "rb") as fp:
-        prev_run = pickle.load(fp)
-        df_means = prev_run['df_means']
+prev_run = combine_analysis_staging(run_dir)
+pkl = os.path.join(run_dir, ANALYZE_PKL)
+with open(pkl, "rb") as f:
+    prev_run = pickle.load(f)
 
 df_all = prev_run['df_all']
 
@@ -149,9 +149,9 @@ df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
 df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
 df_trim = df_trim.sort_values('ts')
 
-df_list.append(df_trim)
-
+#df_list.append(df_trim)
 #df_trim = pd.concat(df_list).drop_duplicates().sort_values("ts")
+
 plot_cpl_and_bmr(df_trim, window=WINDOW)
 
 # compute aggregates

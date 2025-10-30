@@ -17,12 +17,12 @@ class Config(object):
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 100
+    sims_target = 200
     micro_batch_size = 10
 
     # early stop
-    es_min_sims = 100
-    es_check_every = 200
+    es_min_sims = 150
+    es_check_every = 25
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
@@ -34,7 +34,7 @@ class Config(object):
     q_override_top_k = 3
     
     # Game stuff
-    games_at_once = 80
+    games_at_once = 100
     n_training_games = 5000
     
     move_limit = 160
@@ -51,14 +51,14 @@ class Config(object):
     }
     
     # boosts/penalize
-    use_prior_boosts = False
+    use_prior_boosts = True
     prior_clip_max = 0.35
     prior_clip_min = 0.001
     endgame_prior_adjustments = {
-        "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.05
+        "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.1
     }
     
-    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.05}
+    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.1}
 
     # TF
     training_queue_min = 4096

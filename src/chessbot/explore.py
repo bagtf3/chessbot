@@ -120,12 +120,14 @@ all_games = load_game_index(run_dir)
 CLIP_UB = 500
 WINDOW = 500
 
-prev_run = combine_analysis_staging(run_dir)
+_ = combine_analysis_staging(run_dir)
 pkl = os.path.join(run_dir, ANALYZE_PKL)
 with open(pkl, "rb") as f:
     prev_run = pickle.load(f)
 
 df_all = prev_run['df_all']
+df_means = prev_run['df_means']
+
 
 # tidy up CPL
 df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)

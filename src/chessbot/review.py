@@ -24,7 +24,7 @@ from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd
 BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 150
+ANALYZE_BATCH = 60
 
 # default analysis params
 DEPTH = 12
@@ -33,6 +33,7 @@ EQUIV_RANGE = 10
 # stops the post hoc server
 POST_HOC_STOP = False
 
+PH = "[post hoc]"
 
 def post_hoc_signal_handler(signum, frame):
     global POST_HOC_STOP
@@ -590,6 +591,16 @@ def lightweight_summary(results):
     }
 
 
+def dedupe_results(results):
+    df = pd.DataFrame(results)
+    df = df.drop_duplicates(subset='game_id', keep='first')
+    # dont want the raw key, its just extra data
+    if 'raw' in df.columns:
+        df = df.drop(columns=['raw'])
+    
+    return df.to_dict(orient='records')
+
+
 def combine_analysis_staging(run_dir):
     """
     Combine all chunked pickles in run_dir/analysis_staging into the single
@@ -678,8 +689,13 @@ def combine_analysis_staging(run_dir):
         else:
             df_means = prev_df_means
 
+    # de dupe
+    df_all = df_all.drop_duplicates(['game_id', 'move_num']).sort_values("ts")
+    df_means = df_all.drop_duplicates(['game_id']).sort_values("ts")
+    merged_results = dedupe_results(merged_results)
+
     # recompute lightweight summary from merged_results
-    summary = lightweight(merged_results)
+    summary = lightweight_summary(merged_results)
 
     combined_new = {
         "summary": summary,
@@ -724,8 +740,7 @@ def save_analysis_chunk_simple(run_dir, batch):
             "best_move_rate_white": analysis_out.get("best_move_rate_white"),
             "best_move_rate_black": analysis_out.get("best_move_rate_black"),
             "overall_best_move_rate": analysis_out.get("overall_best_move_rate"),
-            "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate"),
-            "raw": {k: v for k, v in analysis_out.items() if k != "df"}
+            "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate")
         }
         results.append(row)
         df = analysis_out.get("df")
@@ -744,13 +759,20 @@ def save_analysis_chunk_simple(run_dir, batch):
         "df_means": df_means
     }
 
+    cpl = df_means.delta.mean()
+    bmr = df_means.played_best_move.mean()
+    top3 = df_means.in_top3.mean()
+
+    print(f"{PH} Saving {len(batch)} analyzed games")
+    print(f"{PH} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f} TOP3 {top3:.3f}")
+
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)
 
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp
+    return outp, cpl, bmr, top3
 
 
 def cp_to_value(cp, mid_cp=400.0):
@@ -986,6 +1008,10 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
     batch_samples = []
     analyzed_batch = []
 
+    # analysis stats
+    n_saved = 0
+    tcpl, tbmr, ttop3 = 0, 0, 0
+
     games_since_flush = 0
     last_flush = time.time()
 
@@ -1045,8 +1071,16 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
 
                 # write chunk files of ANALYZE_BATCH games into analysis_staging/
                 if len(analyzed_batch) >= ANALYZE_BATCH:
-                    outp = save_analysis_chunk_simple(run_dir, analyzed_batch)
-                    print(f"[post_hoc] wrote analysis {len(analyzed_batch)}")
+                    n_saved += 1
+                    outp, c, b, t = save_analysis_chunk_simple(run_dir, analyzed_batch)
+                    tcpl += c; tbmr += b; ttop3 += t
+                    if n_saved >= 2:
+                        print(
+                            f"{PH} {'Overall stats:':<16} CPL {tcpl/n_saved:.3f}",
+                            f"BMR {tbmr/n_saved:.3f} TOP3 {ttop3/n_saved:.3f}"
+                        )
+                    
+                    analyzed_batch.clear()
 
                 now = time.time()
                 if games_since_flush >= batch_games or (now - last_flush) >= batch_secs:
@@ -1065,7 +1099,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                         lrl = len(running_list)
                         if lrl >= next_threshold:
                             next_threshold += 1000
-                            print(f"[post hoc] pushed {lrl} training samples")
+                            print(f"{PH} pushed {lrl} training samples")
                     
                     batch_samples = []
                     games_since_flush = 0

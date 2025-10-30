@@ -635,6 +635,9 @@ class GameLooper(object):
         else:
             Y_value = (1.0 - alpha) * Vwq + alpha * Z
 
+        # just to be super sure additional samples are not blended
+        Y_value[is_add] = Vwq[is_add]
+        
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
 

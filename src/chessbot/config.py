@@ -21,8 +21,8 @@ class Config(object):
     micro_batch_size = 10
 
     # early stop
-    es_min_sims = 150
-    es_check_every = 25
+    es_min_sims = 200
+    es_check_every = 250
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     

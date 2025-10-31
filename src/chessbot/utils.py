@@ -159,6 +159,11 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     save_path : str or Path, optional
         If provided, saves the plot image to this file location.
     """
+    
+    # do not need to show the epoch
+    if 'model_epoch' in all_evals.columns:
+        all_evals = all_evals.drop(columns=['model_epoch'])
+
     cols = list(all_evals.columns)
 
     # Always keep "value" last for consistency
@@ -173,6 +178,9 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     axes = axes.flatten() if n_plots > 1 else [axes]
 
     for i, col in enumerate(cols):
+        if col == 'model_epoch':
+            continue
+
         ax = axes[i]
         y = all_evals[col].values
         ax.plot(y, label=col)

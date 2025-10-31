@@ -7,42 +7,42 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_test"
+    run_tag = "conv_1000_selfplay_phase4"
     selfplay_dir =  SP_DIR
-    init_model = "c:\\Users\\Bryan\\Data\\chessbot_data\\models\\conv_small_init.h5"
+    init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 1.5
+    c_puct = 2.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 200
+    sims_target = 2000
     micro_batch_size = 10
 
     # early stop
-    es_min_sims = 200
-    es_check_every = 250
+    es_min_sims = 1000
+    es_check_every = 60
     es_gap_frac = 0.8
     es_top_node_frac = 0.7
     
     # Q-override selection
-    use_q_override = True
+    use_q_override = False
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
-    q_override_min_vis = 1200
+    q_override_min_vis = 800
     q_override_top_k = 3
     
     # Game stuff
     games_at_once = 100
-    n_training_games = 5000
+    n_training_games = 1000
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
-    sf_depth = 10
+    sf_depth = 15
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.2,
@@ -51,7 +51,7 @@ class Config(object):
     }
     
     # boosts/penalize
-    use_prior_boosts = True
+    use_prior_boosts = False
     prior_clip_max = 0.35
     prior_clip_min = 0.001
     endgame_prior_adjustments = {

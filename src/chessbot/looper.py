@@ -22,7 +22,7 @@ from chessbot.config import Config
 
 import chessbot.utils as cbu
 from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
-from chessbot.review import start_post_hoc_server, stop_post_hoc_server
+from chessbot.review import start_post_hoc_server, stop_post_hoc_server, make_fake_visits
 from chessbot.encoding import score_to_cp_white
 
 
@@ -137,39 +137,63 @@ class ChessGame(object):
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv
         self.tree_data[self.plies] = data
-        
+    
     def make_move_with_stockfish(self, eng):
         """
-        stockfish plays one move. record a supervised-style target where
-        60% prob is on SF's chosen move, 40% is spread uniformly over the rest.
-        The value target is SF signed eval (white-POV).
+        Stockfish plays one move. When the MCTS root has enough sims and the
+        tree agrees (or nearly agrees) with Stockfish, use the tree's visit
+        counts as the policy target (optionally bumping SF's visits so it's #1).
+        Otherwise fall back to the old 60/40 supervised target.
         """
-        # no legal moves -> let terminal handler decide
         legal = self.board.legal_moves()
         if not legal:
             return self.check_for_terminal()
-    
-        # choose SF move + signed eval (white POV)
+
+        # get SF move + signed eval (white POV)
         mv, sf_v = self.get_stockfish_move(eng)
         self.sf_eval = sf_v
-        
-        # build policy over ALL legal moves: 60% on mv, 40% over others
-        n = len(legal)
-        probs = np.zeros(n, dtype=np.float32)
-        sel = legal.index(mv)
-        if n == 1:
-            probs[0] = 1.0
+
+        # gather root visit info from the tree (list sorted desc by visits)
+        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
+        total_visits = sum([n for _, n in rows]) if rows else 0
+
+        use_tree_visits = False
+        visit_map = None
+
+        if rows and total_visits >= 100:
+            # map uci -> visits for quick lookup
+            visit_map = {u: n for u, n in rows}
+            most_visited_uci, max_visits = rows[0]
+            sf_visits = visit_map.get(mv, 0.0)
+
+            # case A: tree already picks SF move as top choice
+            if most_visited_uci == mv:
+                use_tree_visits = True
+
+            # case B: SF move is close to top -> use tree visits but nudge SF to top
+            elif sf_visits >= 0.80 * max_visits:
+                use_tree_visits = True
+                # make SF strictly first by setting its visits > max_visits
+                visit_map[mv] = max_visits + 1
+
+        if use_tree_visits and visit_map is not None:
+            visits = [max(1, visit_map.get(u, 1.0)) for u in legal]
+            ucis = legal
+
         else:
-            probs[sel] = 0.60
-            spill = 0.40 / float(n - 1)
-            for i in range(n):
-                if i != sel:
-                    probs[i] = spill
-    
-        # create the example just like a MCTS move and send to queue
-        self.append_factorized_example(ucis=legal, pi=probs, vwq=sf_v)
+            # make_fake_visits returns [[uci,count], ...]
+            raw = make_fake_visits(mv, legal, ratio_best=60)
+            ucis   = [x[0] for x in raw]
+            visits = [x[1] for x in raw]
+
+        s = sum(visits)
+        pi = np.array([v / s for v in visits], dtype=np.float32)
+
+        self.append_factorized_example(ucis=ucis, pi=pi, vwq=sf_v)
+
+        # finally play SF's move on the board and advance tree (same as before)
         return self.push_move(mv)
-    
+
     def make_move_from_tree(self):
         """
         Snapshot policy targets from root visits, then play best-by-visits.
@@ -585,7 +609,7 @@ class GameLooper(object):
         if os.path.exists(add_pkl):
             with open(add_pkl, "rb") as f:
                 additional = pickle.load(f)
-                print(f"Found {len(additional)} additional training samples")
+                print(f"[retrain] found {len(additional)} additional training samples")
             # remove immediately so nothing is re-read later
             os.remove(add_pkl)
         else:
@@ -637,7 +661,7 @@ class GameLooper(object):
 
         # just to be super sure additional samples are not blended
         Y_value[is_add] = Vwq[is_add]
-        
+
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
 

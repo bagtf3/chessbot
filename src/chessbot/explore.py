@@ -113,12 +113,12 @@ df_list = []
 from pprint import pprint
 from chessbot.review import combine_analysis_staging, ANALYZE_PKL
 #%matplotlib inline
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
 
 all_games = load_game_index(run_dir)
 
 CLIP_UB = 500
-WINDOW = 500
+WINDOW = 50
 
 _ = combine_analysis_staging(run_dir)
 pkl = os.path.join(run_dir, ANALYZE_PKL)
@@ -191,17 +191,12 @@ pprint(trend_check(df_trim, window=WINDOW))
 #%%
 
 d = prev_run['df_all']
-worst = '7d6eaf91-e370-4d97-9ee3-8aa5fd08bd8e'
-worst  = [g for g in all_games if g['game_id'] == worst]
-
-wins = [g for g in all_games if (g['beat_sf'])]
-wins = [g for g in wins if (g['scenario'] == 'piece_odds')]
 
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
-gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
 
 
 

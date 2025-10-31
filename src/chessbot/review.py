@@ -24,7 +24,7 @@ from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd
 BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 60
+ANALYZE_BATCH = 30
 
 # default analysis params
 DEPTH = 12
@@ -759,9 +759,9 @@ def save_analysis_chunk_simple(run_dir, batch):
         "df_means": df_means
     }
 
-    cpl = df_means.delta.mean()
-    bmr = df_means.played_best_move.mean()
-    top3 = df_means.in_top3.mean()
+    cpl = df_all.delta.mean()
+    bmr = df_all.played_best_move.mean()
+    top3 = df_all.in_top3.mean()
 
     print(f"{PH} Saving {len(batch)} analyzed games")
     print(f"{PH} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f} TOP3 {top3:.3f}")
@@ -781,7 +781,7 @@ def cp_to_value(cp, mid_cp=400.0):
     return math.tanh(k * cp)
 
 
-def make_fake_visits(b, mv, lms, ratio_best=50):
+def make_fake_visits(mv, lms, ratio_best=50):
     visits = [[mv, int(ratio_best)]]
     
     # may only be 1 legal move
@@ -887,7 +887,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         
         else:
             # make up fake visits if we dont have any
-            visits = make_fake_visits(b, mv, lms, ratio_best=50)
+            visits = make_fake_visits(mv, lms, ratio_best=50)
         
         # if visits dont look right, skip
         if sum([v[1] for v in visits]) <= 0:
@@ -915,7 +915,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         else:
             best_v = cp_to_value(row['best_absolute'].item())
             best_mv = row['best_move'].item()
-            best_visits = make_fake_visits(b, best_mv, lms)
+            best_visits = make_fake_visits(best_mv, lms)
             ts_best = make_training_sample(b, best_v, best_visits)
             training_data.append(ts_best)
             
@@ -928,7 +928,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 if not lms2:
                     break
                 cont_val, cont_best = sf_eval(b2, engine=engine)
-                cont_visits = make_fake_visits(b2, cont_best, lms2)
+                cont_visits = make_fake_visits(cont_best, lms2)
                 cont_ts = make_training_sample(b2, cont_val, cont_visits)
                 training_data.append(cont_ts)
                 b2.push_uci(cont_best)        
@@ -950,7 +950,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                     break
                 
                 pv_val, pv_best = sf_eval(b2, engine=engine)
-                pv_visits = make_fake_visits(b2, pv_best, lms2)
+                pv_visits = make_fake_visits(pv_best, lms2)
                 pv_ts = make_training_sample(b2, pv_val, pv_visits)
                 training_data.append(pv_ts)
             
@@ -1120,7 +1120,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
 def start_post_hoc_server(run_dir):
     p = Process(target=post_hoc_worker, args=(run_dir,), daemon=False)
     p.start()
-    print("[post hoc] started server pid=", p.pid, "watching", run_dir)
+    print("[post hoc] started server pid=", p.pid)
     return p
 
 

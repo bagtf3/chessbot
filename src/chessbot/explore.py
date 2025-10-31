@@ -1,14 +1,16 @@
-import json, os
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 plt.ion()
 
-import math
 from scipy.stats import spearmanr
 import pickle
 from chessbot.utils import rnd
-from chessbot.review import GameViewer, load_json, load_game_index
+from chessbot.review import GameViewer, load_game_index
+
+from pprint import pprint
+from chessbot.review import combine_analysis_staging, ANALYZE_PKL
 
 RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
 
@@ -108,17 +110,99 @@ def trend_check(df, window=100):
     }
     return out
 
-df_list = []
+
+def plot_and_report(df_trim, window):
+    plot_cpl_and_bmr(df_trim, window=window)
+
+    # compute aggregates
+    overall_cpl = df_trim['overall_cpl'].mean()
+    overall_bmr = df_trim['overall_best_move_rate'].mean()
+    overall_top3 = df_trim['overall_top3_rate'].mean()
+
+    first = df_trim.head(window)
+    last = df_trim.tail(window)
+
+    first_cpl = first['overall_cpl'].mean()
+    first_bmr = first['overall_best_move_rate'].mean()
+    first_top3 = first['overall_top3_rate'].mean()
+
+    last_cpl = last['overall_cpl'].mean()
+    last_bmr = last['overall_best_move_rate'].mean()
+    last_top3 = last['overall_top3_rate'].mean()
+
+    # pretty print
+    label_w = 18
+    val_w = 10
+
+    print("#" * 60)
+    print(f"{'':<{label_w}}{'CPL':>{val_w}}{'BMR':>{val_w}}{'Top3':>{val_w}}")
+    print(f"{'-'*label_w}{'-'*val_w}{'-'*val_w}{'-'*val_w}")
+    print(f"{'First ' + str(window):<{label_w}}{first_cpl:>{val_w}.3f}"
+          f"{first_bmr:>{val_w}.3f}{first_top3:>{val_w}.3f}")
+    print(f"{'Last ' + str(window):<{label_w}}{last_cpl:>{val_w}.3f}"
+          f"{last_bmr:>{val_w}.3f}{last_top3:>{val_w}.3f}")
+    print(f"{'Overall':<{label_w}}{overall_cpl:>{val_w}.3f}"
+          f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
+    print()
+    
 #%%
-from pprint import pprint
-from chessbot.review import combine_analysis_staging, ANALYZE_PKL
-#%matplotlib inline
+## Plot everything so far
+CLIP_UB = 500
+
+df_list = []
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
+suffixes = ["", "_phase2", "_phase3", "_phase4"]
+for s in suffixes:
+    rd = root + s
+    _ = combine_analysis_staging(rd)
+    all_games = load_game_index(rd)
+    
+    pkl = os.path.join(rd, ANALYZE_PKL)
+    with open(pkl, "rb") as f:
+        prev_run = pickle.load(f)
+    
+    df_all = prev_run['df_all']
+    df_means = prev_run['df_means']
+    
+    # tidy up CPL
+    df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+    clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
+
+    # BMR
+    bmr = df_all.groupby("game_id")['played_best_move'].mean()
+
+    #Top3
+    if 'in_top3' not in df_all.columns:
+        df_all['in_top3'] = False
+        
+    df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
+    t3r = df_all.groupby("game_id")["in_top3"].mean()
+
+    df_trim = df_means.copy()
+    df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
+    df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+    df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
+
+    df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
+    df_list.append(df_trim)
+    del df_all
+    del df_means
+    del df_trim
+
+
+df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
+WINDOW = int(len(df_trim) * 0.15 // 10 * 10)
+print(len(df_trim), f"games completed. Using window size {WINDOW}")
+print()
+
+plot_and_report(df_trim, WINDOW)
+pprint(trend_check(df_trim, window=WINDOW))
+#%%
+# plot single phase
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
 
 all_games = load_game_index(run_dir)
-
 CLIP_UB = 500
-WINDOW = 50
 
 _ = combine_analysis_staging(run_dir)
 pkl = os.path.join(run_dir, ANALYZE_PKL)
@@ -127,7 +211,9 @@ with open(pkl, "rb") as f:
 
 df_all = prev_run['df_all']
 df_means = prev_run['df_means']
-
+WINDOW = int(len(df_means) * 0.2 // 10 * 10)
+print(len(df_means), f"games completed. Using window size {WINDOW}")
+print()
 
 # tidy up CPL
 df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
@@ -151,53 +237,14 @@ df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
 df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
 df_trim = df_trim.sort_values('ts')
 
-#df_list.append(df_trim)
-#df_trim = pd.concat(df_list).drop_duplicates().sort_values("ts")
 
-plot_cpl_and_bmr(df_trim, window=WINDOW)
-
-# compute aggregates
-overall_cpl = df_trim['overall_cpl'].mean()
-overall_bmr = df_trim['overall_best_move_rate'].mean()
-overall_top3 = df_trim['overall_top3_rate'].mean()
-
-first = df_trim.head(WINDOW)
-last = df_trim.tail(WINDOW)
-
-first_cpl = first['overall_cpl'].mean()
-first_bmr = first['overall_best_move_rate'].mean()
-first_top3 = first['overall_top3_rate'].mean()
-
-last_cpl = last['overall_cpl'].mean()
-last_bmr = last['overall_best_move_rate'].mean()
-last_top3 = last['overall_top3_rate'].mean()
-
-# pretty print
-label_w = 18
-val_w = 10
-
-print("#" * 60)
-print(f"{'':<{label_w}}{'CPL':>{val_w}}{'BMR':>{val_w}}{'Top3':>{val_w}}")
-print(f"{'-'*label_w}{'-'*val_w}{'-'*val_w}{'-'*val_w}")
-print(f"{'First ' + str(WINDOW):<{label_w}}{first_cpl:>{val_w}.3f}"
-      f"{first_bmr:>{val_w}.3f}{first_top3:>{val_w}.3f}")
-print(f"{'Last ' + str(WINDOW):<{label_w}}{last_cpl:>{val_w}.3f}"
-      f"{last_bmr:>{val_w}.3f}{last_top3:>{val_w}.3f}")
-print(f"{'Overall':<{label_w}}{overall_cpl:>{val_w}.3f}"
-      f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
-print()
-
+plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 #%%
 
 d = prev_run['df_all']
-
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
-gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
-
-
-
-#%%
+gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()

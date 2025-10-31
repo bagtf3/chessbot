@@ -207,6 +207,11 @@ class GameViewer:
     
     def who_moved(self):
         mover = "White" if self.board.turn == chess.WHITE else "Black"
+        
+        vs_stockfish = self.log.get("vs_stockfish", False)
+        if not vs_stockfish:
+            return f"{mover} (MCTS)"
+        
         sf_color = self.log.get("stockfish_color", None)
         if sf_color is None:
             return f"{mover} (MCTS)"

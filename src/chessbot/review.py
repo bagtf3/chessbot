@@ -18,7 +18,7 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd
+from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd, calc_entropy
 
 
 BLUNDER_CP = 60
@@ -59,13 +59,11 @@ class GameViewer:
             try:
                 g = sf_df[sf_df["game_id"] == self.game_id].copy()
                 if not g.empty:
-                    # deterministic order: prefer timestamp, else move_num if present
-                    order = [c for c in ["ts", "move_num"] if c in g.columns]
-                    if order:
-                        g = g.sort_values(order, kind="stable")
+                    g['move_num_int'] = g['move_num'].astype(int)
+                    g = g.sort_values('move_num_int', kind="stable")
                     g = g.reset_index(drop=True)
                     self.sf_rows = g
-                    self._align_sf_rows_to_json()
+                    self.align_sf_rows_to_json()
             except Exception:
                 self.sf_rows = None
                 self._sf_by_ply = {}
@@ -171,20 +169,20 @@ class GameViewer:
             else:
                 print(f"\nPlayed move {upcoming_san} is in SF top-3.")
     
-    def _align_sf_rows_to_json(self):
+    def align_sf_rows_to_json(self):
         self._sf_by_ply = {}
         if self.sf_rows is None:
             return
     
-        seq = list(self.moves_uci or [])
+        seq = self.moves_uci or []
         j = 0  # cursor in JSON move list
-    
         for ridx, r in self.sf_rows.iterrows():
-            uci = str(r.get("played_move", "") or "")
+            uci = r.get("played_move", "")
             if not uci:
                 continue
     
             found = -1
+            # requires the rows to be sorted by move_num correctly
             for k in range(j, len(seq)):
                 if seq[k] == uci:
                     found = k
@@ -194,7 +192,7 @@ class GameViewer:
                 self._sf_by_ply[found] = ridx
                 j = found + 1  # advance so next DF row maps to a later ply
             # else: no match; leave it unmapped (overlay will skip)
-
+        
     def next(self):
         if self.ply < len(self.moves_uci):
             self.board.push_uci(self.moves_uci[self.ply])
@@ -229,26 +227,26 @@ class GameViewer:
         if self.ply >= len(self.moves_uci):
             print("End of game.")
             return
-    
+
         who = self.who_moved()
         chosen = self.moves_uci[self.ply]
         try:
             chosen_san = self.board.san(chess.Move.from_uci(chosen))
         except Exception:
             chosen_san = "?"
-        
+
         print()
         print(f"Ply {self.ply+1}: {who} about to play {chosen_san}")
         print("=" * 60)
-    
+
         node = self.tree_data.get(chosen) or {}
         if not node:
             node = self.tree_data.get(str(self.ply))
-        
+
         if node is None:
             print("  (no candidate_moves in log)")
             return
-        
+
         cands = node.get("candidate_moves") or []
         sims = node.get("sims", 0)
         t = node.get("time", 0.0)
@@ -256,25 +254,32 @@ class GameViewer:
         max_d = node.get("max_depth", 0)
         cv = node.get("children_visited", 0)
         tc = node.get("total_children", 0)
-        # new
+        
         uniq = node.get("unique_sims", None)
-        line = (f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  max_depth={max_d} "
-                f"children visited={cv}/{tc}")
+        line = (f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
+                f"max_depth={max_d} children visited={cv}/{tc}")
         if uniq is not None and sims:
             frac = uniq / max(1, sims)
             line += f"  unique={uniq} ({frac:.0%})"
         print(line)
-    
-        cands_sorted = sorted(cands, key=lambda x: x.get("visits", 0), reverse=True)
+
+        # entropy 
+        visits_list = [c.get("visits", 0) for c in cands]
+        ent, norm = calc_entropy(visits_list)
+        print(f"  entropy: raw={ent:.3f} bits  norm={norm:.3f}")
+
+        cands_sorted = sorted(
+            cands, key=lambda x: x.get("visits", 0), reverse=True
+        )
         is_sf_turn = ("stockfish" in str(who).lower())
-    
+
         # index of SF's actual move among candidates (or None)
         sf_idx = None
         for i, c in enumerate(cands_sorted):
             if c.get("uci") == chosen:
                 sf_idx = i
                 break
-    
+
         def print_row(c, mark=False, show_rank=False, rank_val=None):
             san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
             marker = "  <- SF" if mark else ""
@@ -284,13 +289,13 @@ class GameViewer:
                 f"Q={c.get('Q',0):+.3f} P={c.get('P',0):.3f} U={c.get('U',0):+.3f}"
                 f"{marker}{rank_str}"
             )
-    
+
         shown_ucis = set()
-        # top-N: never show ranks; just mark if SF move happens to be in top-N
+        # top-N: never show ranks; just mark if SF move is in top-N
         for i, c in enumerate(cands_sorted[:top_n]):
             print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
             shown_ucis.add(c.get("uci"))
-    
+
         # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
         if is_sf_turn and sf_idx is not None:
             if cands_sorted[sf_idx].get("uci") not in shown_ucis:
@@ -299,43 +304,43 @@ class GameViewer:
                     cands_sorted[sf_idx], mark=True,
                     show_rank=True, rank_val=sf_idx + 1,
                 )
-        
+
         vwq = node.get("visit_weighted_Q")
         if vwq is not None:
             print(f"\nvisit-weighted Q={vwq}")
-        
+
         # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
             stm_white = (self.board.turn == chess.WHITE)
-        
+
             best_uci   = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
-        
+
             best_cp_raw   = r.get("best_cp", None)
             played_cp_raw = r.get("played_cp", None)
-        
+
             def pov(cp):
                 if cp is None or (isinstance(cp, float) and np.isnan(cp)):
                     return None
                 return int(cp if stm_white else -cp)
-        
+
             best_cp_pov   = pov(best_cp_raw)
             played_cp_pov = pov(played_cp_raw)
-        
+
             loss = r.get("clipped_loss", r.get("loss", None))
             if loss is None and best_cp_pov is not None and played_cp_pov is not None:
                 loss = max(0, best_cp_pov - played_cp_pov)
-        
+
             # recompute match flag from UCIs to avoid DF drift
             matched = (best_uci == played_uci) if best_uci and played_uci else False
-        
+
             def to_san(uci):
                 return self.board.san(chess.Move.from_uci(uci))
-        
+
             best_san   = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"
-        
+
             parts = []
             if loss is not None:
                 parts.append(f"CPL={int(loss)}")
@@ -345,31 +350,45 @@ class GameViewer:
                 parts.append(f"SF best={best_san}")
             if (best_cp_pov is not None) and (played_cp_pov is not None):
                 parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
-        
+
             if parts:
                 print("SF:", "  ".join(parts))
         print("=" * 60)
+
+    def show_options(self):
+        # concise CLI help for replay mode commands
+        print("Commands:")
+        print("  [Enter] / Space      forward one move")
+        print("  b, back              previous move")
+        print("  q, quit, exit        quit replay")
+        print("  o, options, help     show this help text")
+        print("  sf                   stockfish overlay (uses default depth)")
+        print("  sf<D>                stockfish eval to depth D, e.g. sf12")
+        print("  pv                   show principal variation (min_vis=1)")
+        print("  pv<N>                show principal variation filtered by")
+        print("                       minimum visits, e.g. pv8")
 
     def replay(self):
         print(f"Replaying {self.log['scenario']}. Result {self.log['result']}")
         # flip the board if sf plays white
         sf_color = self.log.get("stockfish_color", None)
         flipped = sf_color if sf_color else False
-        print("Controls: Enter/Space=forward, b=back, q=quit")
+        print("Controls: Enter/Space=forward, b=back, q=quit, o=options")
         shown = False
         while True:
             if not shown:
                 self.show_board(flipped=flipped)
                 self.show_moves()
                 shown = True
-            cmd = input("[Enter]=fwd, b=back, q=quit, sf=stockfish eval > ")
+            cmd = input("[Enter]=fwd, b=back, q=quit, sf=stockfish eval, o=options > ")
             cmd = cmd.strip().lower()
             if cmd in ("q", "quit", "exit"):
                 break
+            elif cmd in ("o", "options", "help", "h", "?"):
+                self.show_options()
             elif cmd in ("b", "back"):
                 shown = False
                 self.prev()
-                
             # elif cmd.startswith("pv"):
             #     # pv or pv8
             #     if cmd == "pv":
@@ -380,6 +399,7 @@ class GameViewer:
             #             self.show_pv(min_vis=n)
             #         except Exception:
             #             self.show_pv(min_vis=1)
+            
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
             else:
@@ -904,8 +924,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         if len(row) > 1:
             row = df.query("played_move == @mv").query("move_num == @i")
         if len(row) == 0:
-            stri = str(i)
-            row = df.query("played_move == @mv").query("move_num == @stri")
+            row = df.loc[df.move_num == str(i)].query("played_move == @mv")
         if len(row) == 0:
             continue
         

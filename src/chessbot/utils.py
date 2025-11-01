@@ -95,8 +95,38 @@ def softmax(x):
     x = np.asarray(x, dtype=np.float32)
     x = x - np.max(x)
     y = np.exp(x)
-    s = float(np.sum(y))
+    s = np.sum(y)
     return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
+
+
+def calc_entropy(visits):
+    # visits: sequence or ndarray of nonneg weights/probs
+    if isinstance(visits, list):
+        a = np.array(visits, dtype=float, copy=False)
+    else:
+        a = visits
+
+    if a.size == 0:
+        return 0.0, 0.0
+
+    # force negatives to zero (defensive)
+    a = np.where(a > 0.0, a, 0.0)
+
+    total = a.sum()
+    if total <= 0.0:
+        return 0.0, 0.0
+
+    p = a / total
+    mask = p > 0.0
+    p_mask = p[mask]
+
+    # compute entropy only on positive probs to avoid log2(0)
+    ent = - (p_mask * np.log2(p_mask)).sum()
+
+    n = p.size
+    norm = ent / np.log2(n) if n > 1 else 0.0
+
+    return ent, norm
 
 
 def ensure_df(df_or_dicts):
@@ -147,51 +177,45 @@ def plot_sf_simple(df):
 
 def plot_training_progress(all_evals, max_cols=4, save_path=None):
     """
-    Plots training/eval metrics for each model output in a grid.
-    Adapts rows/cols automatically, up to max_cols wide.
-
-    Parameters
-    ----------
-    all_evals : pd.DataFrame
-        DataFrame containing eval metrics with columns as outputs.
-    max_cols : int, optional
-        Max number of columns in the plot grid (default 4).
-    save_path : str or Path, optional
-        If provided, saves the plot image to this file location.
+    Plots training/eval metrics for each model output in a balanced grid.
+    Keeps 'value' last for consistency. Saves or shows the figure.
     """
-    
-    # do not need to show the epoch
-    if 'model_epoch' in all_evals.columns:
-        all_evals = all_evals.drop(columns=['model_epoch'])
+    if "model_epoch" in all_evals.columns:
+        all_evals = all_evals.drop(columns=["model_epoch"])
 
     cols = list(all_evals.columns)
 
-    # Always keep "value" last for consistency
-    important = ['value']
+    # keep value last
+    important = ["value"]
     cols = [c for c in cols if c not in important] + important
 
     n_plots = len(cols)
-    n_cols = min(max_cols, n_plots)
-    n_rows = math.ceil(n_plots / n_cols)
+    if n_plots == 0:
+        return
+
+    # choose a balanced layout: try ceil(sqrt(n)) cols but don't exceed max_cols
+    n_cols = min(max_cols, max(1, math.ceil(math.sqrt(n_plots))))
+    n_rows = max(1, math.ceil(n_plots / n_cols))
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
-    axes = axes.flatten() if n_plots > 1 else [axes]
+
+    # normalize axes to a flat list for easy indexing
+    if hasattr(axes, "flatten"):
+        axes = axes.flatten()
+    else:
+        axes = [axes]
 
     for i, col in enumerate(cols):
-        if col == 'model_epoch':
-            continue
-
         ax = axes[i]
         y = all_evals[col].values
         ax.plot(y, label=col)
-        # moving average (MA15)
         ma = pd.Series(y).rolling(15, min_periods=1).mean().values
         ax.plot(ma, lw=2, alpha=0.6, label=f"{col} (MA15)")
         ax.set_title(col)
         ax.legend()
 
-    # Hide unused axes
-    for j in range(len(cols), len(axes)):
+    # hide unused axes
+    for j in range(n_plots, len(axes)):
         axes[j].axis("off")
 
     plt.tight_layout()

@@ -12,13 +12,13 @@ class Config(object):
     init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
     
     # MCTS
-    c_puct = 2.0
+    c_puct = 2.5
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 2000
-    micro_batch_size = 10
+    sims_target = 2500
+    micro_batch_size = 12
 
     # early stop
     es_min_sims = 1000
@@ -45,9 +45,9 @@ class Config(object):
     sf_depth = 15
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.2,
-        "random_middle_game": 0.2, "random_endgame": 0.1,
-        "piece_odds": 0.1, "piece_training": 0.15
+        "pre_opened": 0.25, "random_init": 0.25,
+        "random_middle_game": 0.25, "random_endgame": 0.15,
+        "piece_odds": 0.05, "piece_training": 0.05
     }
     
     # boosts/penalize

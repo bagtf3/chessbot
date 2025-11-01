@@ -150,12 +150,22 @@ def plot_and_report(df_trim, window):
 CLIP_UB = 500
 
 df_list = []
+progress_list = []
+epoch_counter = 0
+
 root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 suffixes = ["", "_phase2", "_phase3", "_phase4"]
+
 for s in suffixes:
     rd = root + s
     _ = combine_analysis_staging(rd)
     all_games = load_game_index(rd)
+    
+    eval_progress = os.path.join(rd, "eval_progress.csv")
+    progress_df = pd.read_csv(eval_progress)
+    progress_df['model_epoch'] += 1 + epoch_counter
+    epoch_counter = progress_df['model_epoch'].max()
+    progress_list.append(progress_df)
     
     pkl = os.path.join(rd, ANALYZE_PKL)
     with open(pkl, "rb") as f:
@@ -197,6 +207,10 @@ print()
 
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
+
+all_evals = pd.concat(progress_list)
+from chessbot.utils import plot_training_progress
+plot_training_progress(all_evals, max_cols=4, save_path=None)
 #%%
 # plot single phase
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
@@ -237,7 +251,6 @@ df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
 df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
 df_trim = df_trim.sort_values('ts')
 
-
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 #%%
@@ -248,3 +261,15 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
 gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
+
+g = pre_opened[-2]
+gid = g['game_id']
+
+gdf = d.query("game_id == @gid")
+gdf['move_num']
+gdf['move_num'] = gdf['move_num'].astype(int)
+gdf.sort_values("move_num")
+
+
+
+

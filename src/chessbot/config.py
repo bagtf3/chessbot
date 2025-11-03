@@ -1,4 +1,4 @@
-from chessbot import SP_DIR
+from chessbot import SP_DIR, MODEL_DIR
 
 
 class Config(object):
@@ -17,21 +17,18 @@ class Config(object):
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 3000
+    sims_floor = 1000
+    sims_target = 2000
+    sims_ceiling = 4000
     micro_batch_size = 12
 
     # early stop
-    es_min_sims = 2000
+    use_sim_decision_model = True
+    sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
     es_check_every = 100
-    es_gap_frac = 0.90
-    es_top_node_frac = 0.74
-    
-    # Q-override selection
-    use_q_override = True
-    q_override_vis_ratio = 0.80
-    q_override_q_margin = 0.08
-    q_override_min_vis = 800
-    q_override_top_k = 2
+    es_best_move_threshold = 0.85
+    bs_best_move_threshold = 0.6
+    prefer_top_q = True
     
     # Game stuff
     games_at_once = 100

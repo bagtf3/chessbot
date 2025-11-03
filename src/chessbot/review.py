@@ -984,6 +984,12 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
     return training_data
 
 
+def report_unprocessed(entries, seen_games):
+    unproc = sum([1 for e in entries if e.get('game_id') not in seen_games])
+    if unproc:
+        print(f"{PH} {unproc} unprocessed games currently in queue")
+
+
 def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
     ## trying to deprioritize the server so it doesnt slow down main training looper
     p = psutil.Process()
@@ -1047,6 +1053,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
     eng.configure({"Threads": 1, "Hash": 64})
 
+    unproc_report = True
     try:
         # see if there is a starting pkl file
         last_seen_pkl = os.path.exists(pkl_path)
@@ -1059,6 +1066,9 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
 
             idx = load_game_index(idx_path)
             entries = [idx] if isinstance(idx, dict) else idx
+            if unproc_report:
+                report_unprocessed(entries, seen_games)
+                unproc_report = False
 
             for rec in entries:
                 if POST_HOC_STOP:
@@ -1105,6 +1115,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                         )
                     
                     analyzed_batch.clear()
+                    unproc_report = True
 
                 now = time.time()
                 if games_since_flush >= batch_games or (now - last_flush) >= batch_secs:

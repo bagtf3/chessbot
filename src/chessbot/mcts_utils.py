@@ -3,6 +3,9 @@ from chessbot.psqt import build_weights
 from pyfastchess import Evaluator, MCTSTree as fasttree
 from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
 from collections import OrderedDict
+from chessbot.utils import calc_entropy
+import tl2cgen as tl2
+import numpy as np
 
 
 class MCTSTree(fasttree):
@@ -18,6 +21,7 @@ class MCTSTree(fasttree):
         # bookkeeping mirroring old interface
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
+        self.piece_count = board.piece_count()
         self.sims_target = None
 
         self._move_started_at = _now()
@@ -28,8 +32,7 @@ class MCTSTree(fasttree):
         self._es_history = []
         self._es_last_checked_at = 0
         self._es_tripped = False
-        self._es_reason = ""
-        self._es_after_sims = 0
+        self.sim_stop_reason = ""
 
     def configure_prior_engine(self):
         """Creates and configures singleton prior engine in c++ """
@@ -165,6 +168,57 @@ class MCTSTree(fasttree):
         board.push_uci(move_uci)
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
+        self.piece_count = board.piece_count()
+
+    def get_sim_decision_probs(self):
+        if self.sim_decision_model is None:
+            return None
+        
+        vec = []
+        root = self.root()
+        deets = self.root_child_details()
+        rows = self.root_child_visits()
+
+        # n_cands
+        vec.append(len(root.legal_moves))
+
+        # top share, visit_margin, visit norm
+        visits = [v[1] for v in rows]
+        vec.append(visits[0]/root.N)
+        vec.append(visits[0]-visits[1])
+
+        ent_vis, norm_vis = calc_entropy(visits)
+        vec.append(norm_vis)
+
+        # P norm
+        priors = [c.prior for c in deets]
+        ent_p, norm_p = calc_entropy(priors)
+        vec.append(norm_p)
+
+        # Q norm
+        qs = [c.Q for c in deets]
+        ent_q, norm_q = calc_entropy(qs)
+        vec.append(norm_q)
+
+        # U norm
+        cp = self.c_puct
+        S = root.N
+        Us = [cp * cd.prior * (S ** 0.5) / (1 + cd.N) for cd in deets]
+        ent_u, norm_u = calc_entropy(Us)
+        vec.append(norm_u)
+
+        # top_p, q_margin, q_delta
+        vec.append(deets[0].prior)
+        vec.append(qs[0] - qs[1])
+        vec.append(qs[0] - max(qs))
+
+        # is_middlegame, is endgame
+        vec.append(1*((self.n_plies < 20) and (self.piece_count < 12)))
+        vec.append(1*((self.n_plies > 60) or (self.piece_count < 12)))
+
+        dmat = tl2.DMatrix(np.array(vec, dtype=np.float32, ndmin=2))
+        probs = self.sim_decision_model.predict(dmat)
+        return probs[0][0]
 
     def maybe_early_stop(self):
         if self._es_tripped:

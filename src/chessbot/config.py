@@ -9,33 +9,33 @@ class Config(object):
     # files
     run_tag = "conv_1000_selfplay_phase4"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "conv_1000_selfplay_phase3/conv_1000_selfplay_phase3_model.h5"
+    init_model = SP_DIR + "conv_1000_selfplay_phase4/conv_1000_selfplay_phase4_model.h5"
     
     # MCTS
-    c_puct = 2.5
+    c_puct = 2.0
     anytime_uniform_mix = 0.15
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_target = 2500
+    sims_target = 3000
     micro_batch_size = 12
 
     # early stop
-    es_min_sims = 1000
-    es_check_every = 60
-    es_gap_frac = 0.8
-    es_top_node_frac = 0.7
+    es_min_sims = 2000
+    es_check_every = 100
+    es_gap_frac = 0.90
+    es_top_node_frac = 0.74
     
     # Q-override selection
-    use_q_override = False
+    use_q_override = True
     q_override_vis_ratio = 0.80
     q_override_q_margin = 0.08
     q_override_min_vis = 800
-    q_override_top_k = 3
+    q_override_top_k = 2
     
     # Game stuff
     games_at_once = 100
-    n_training_games = 1000
+    n_training_games = 500
     
     move_limit = 160
     material_diff_cutoff = 15

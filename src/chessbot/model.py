@@ -10,9 +10,6 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 from tensorflow import keras
 
-print("Built with CUDA?", tf.test.is_built_with_cuda())
-print("GPUs available:", tf.config.list_physical_devices('GPU'))
-
 from tensorflow.keras.models import Model
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras.layers import (

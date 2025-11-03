@@ -870,6 +870,30 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
+
+    ## TEMP
+    import tensorflow as tf
+    losses = {
+        "value": tf.keras.losses.MeanSquaredError(),
+        "best_from": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_to":   tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_piece":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "best_promo":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+    }
+
+    loss_weights = {
+        "value": 0.5,
+        "best_from": 0.5,
+        "best_to": 0.5,
+        "best_piece": 0.0,
+        "best_promo": 0.1,
+    }
+    
+    
+    opt = tf.keras.optimizers.Adam(5e-5)
+    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
+    ## END TEMP
+
     looper = GameLooper(model=model, cfg=Config())
     
     # infer the number of trainings already done from existing files

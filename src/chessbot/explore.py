@@ -12,8 +12,6 @@ from chessbot.review import GameViewer, load_game_index
 from pprint import pprint
 from chessbot.review import combine_analysis_staging, ANALYZE_PKL
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase3"
-
 
 def plot_cpl_and_bmr(df, window=30, title=None):
     """
@@ -64,51 +62,100 @@ def plot_cpl_and_bmr(df, window=30, title=None):
 def trend_check(df, window=100):
     """
     Sort by ts, smooth (centered rolling mean), then report:
-    - linear slope per 100 games (with permutation p-value)
+    - linear slope per 1000 games and per window (with block-permutation p)
     - Spearman rank correlation (monotonic trend)
     """
     d = df.sort_values("ts").reset_index(drop=True).copy()
-    x = np.arange(len(d))  # game index
+    n = len(d)
+    x = np.arange(n)
 
-    cpl = d["overall_cpl"].rolling(window, center=True, min_periods=1).mean().values
+    cpl = d["overall_cpl"].rolling(window, center=True,
+                                   min_periods=1).mean().values
     bmr = d["overall_best_move_rate"].rolling(
         window, center=True, min_periods=1).mean().values
 
-    def lin_slope_per100(y):
-        x0 = x - x.mean()
-        b = (x0 @ (y - y.mean())) / (x0 @ x0)
-        return float(100 * b)
+    x0 = x - x.mean()
+    denom = float(x0 @ x0)
 
-    # slopes
-    cpl_s = lin_slope_per100(cpl)
-    bmr_s = lin_slope_per100(bmr)
+    def slope_per_game(y):
+        # returns slope per one game (index unit)
+        return float((x0 @ (y - y.mean())) / denom)
 
-    # permutation p-values for slope (3000 perms, no seed)
+    # observed slopes (per game)
+    cpl_s_pg = slope_per_game(cpl)
+    bmr_s_pg = slope_per_game(bmr)
+
+    # convert to requested units
+    cpl_s_per_1000 = float(1000 * cpl_s_pg)
+    cpl_s_per_window = float(window * cpl_s_pg)
+    bmr_s_per_1000 = float(1000 * bmr_s_pg)
+    bmr_s_per_window = float(window * bmr_s_pg)
+
+    # permutation p-values via block shuffling (block size = window)
     nperm = 3000
-    abs_cpl = abs(cpl_s)
-    abs_bmr = abs(bmr_s)
     cnt_c = 0
     cnt_b = 0
-    x0 = x - x.mean()
+
+    # build block slices
+    blk = []
+    if window <= 1 or window >= n:
+        # degenerate: single block = whole series
+        blk = [slice(0, n)]
+    else:
+        i = 0
+        while i < n:
+            blk.append(slice(i, min(i + window, n)))
+            i += window
+
     for _ in range(nperm):
-        yp = np.random.permutation(cpl)
-        bp = (x0 @ (yp - yp.mean())) / (x0 @ x0) * 100
-        if abs(bp) >= abs_cpl: cnt_c += 1
-        yp2 = np.random.permutation(bmr)
-        bp2 = (x0 @ (yp2 - yp2.mean())) / (x0 @ x0) * 100
-        if abs(bp2) >= abs_bmr: cnt_b += 1
+        # shuffle blocks to preserve short-range dependence
+        order = np.arange(len(blk))
+        np.random.shuffle(order)
+
+        seq = np.empty_like(cpl)
+        pos = 0
+        for j in order:
+            s = blk[j]
+            ln = s.stop - s.start
+            seq[pos:pos + ln] = cpl[s]
+            pos += ln
+        perm_cpl = seq
+
+        order2 = np.arange(len(blk))
+        np.random.shuffle(order2)
+        seq2 = np.empty_like(bmr)
+        pos = 0
+        for j in order2:
+            s = blk[j]
+            ln = s.stop - s.start
+            seq2[pos:pos + ln] = bmr[s]
+            pos += ln
+        perm_bmr = seq2
+
+        # slope per game for permuted series, then scale to per1000
+        bp_c = slope_per_game(perm_cpl) * 1000.0
+        bp_b = slope_per_game(perm_bmr) * 1000.0
+
+        if abs(bp_c) >= abs(cpl_s_per_1000):
+            cnt_c += 1
+        if abs(bp_b) >= abs(bmr_s_per_1000):
+            cnt_b += 1
+
     p_cpl = (cnt_c + 1) / (nperm + 1)
     p_bmr = (cnt_b + 1) / (nperm + 1)
 
     out = {
-        "cpl_slope_per_100": rnd(cpl_s, 5),
+        "cpl_slope_per_1000": rnd(cpl_s_per_1000, 5),
+        "cpl_slope_per_window": rnd(cpl_s_per_window, 5),
         "cpl_slope_p": rnd(p_cpl, 5),
         "cpl_spearman": rnd(spearmanr(x, cpl, nan_policy="omit").statistic, 5),
-        "bmr_slope_per_100": rnd(bmr_s, 5),
+        "bmr_slope_per_1000": rnd(bmr_s_per_1000, 5),
+        "bmr_slope_per_window": rnd(bmr_s_per_window, 5),
         "bmr_slope_p": rnd(p_bmr, 5),
         "bmr_spearman": rnd(spearmanr(x, bmr, nan_policy="omit").statistic, 5),
     }
     return out
+
 
 
 def plot_and_report(df_trim, window):
@@ -208,9 +255,9 @@ print()
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 
-all_evals = pd.concat(progress_list)
-from chessbot.utils import plot_training_progress
-plot_training_progress(all_evals, max_cols=4, save_path=None)
+# all_evals = pd.concat(progress_list)
+# from chessbot.utils import plot_training_progress
+# plot_training_progress(all_evals, max_cols=4, save_path=None)
 #%%
 # plot single phase
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
@@ -269,6 +316,13 @@ gdf = d.query("game_id == @gid")
 gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
+
+
+#%%
+
+
+
+
 
 
 

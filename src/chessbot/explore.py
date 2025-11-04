@@ -260,7 +260,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 # plot_training_progress(all_evals, max_cols=4, save_path=None)
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_better_stopping_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -316,14 +316,4 @@ gdf = d.query("game_id == @gid")
 gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
-
-
 #%%
-
-
-
-
-
-
-
-

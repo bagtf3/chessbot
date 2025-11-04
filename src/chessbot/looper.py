@@ -108,7 +108,8 @@ class ChessGame(object):
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
             "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
+            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
+            "stop_reason": self.tree.sim_stop_reason
         }
         # sumN for U term
         sumN = max(1, root.N)
@@ -320,6 +321,7 @@ class GameLooper(object):
         self._last_stats_log = 0.0
 
     def fill_active_games(self):
+        fens_seen = set()
         cfg = self.config
         needed = cfg.n_training_games - self.games_finished - len(self.active_games)
         if needed <= 0:
@@ -332,6 +334,13 @@ class GameLooper(object):
 
             # this has game probs from the config
             board, meta = self.game_gen.new_board()
+            fen = board.fen()
+            while fen in fens_seen:
+                board, meta = self.game_gen.new_board()
+                fen = board.fen()
+
+            # add new unique fen
+            fens_seen.add(fen)
 
             meta['vs_stockfish'] = False
             meta['stockfish_is_white'] = False
@@ -438,13 +447,13 @@ class GameLooper(object):
                     p_q    = pc.get("queries", 0)
                     p_h    = pc.get("hits", 0)
                     p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
-                    p_ev_r = (100.0 * p_ev / p_cap) if p_cap else 0.0
+                    p_evr = (100.0 * p_ev / p_cap) if p_cap else 0.0
 
-                    print("Clearing caches after training:")
+                    print("Clearing caches after training")
+                    cs = "[cache stats]"
                     print(
-                        f"Priors cache:\n \tsize={p_size}/{p_cap}  evictions={p_ev}  "
-                        f"queries={p_q}  hits={p_h}\n"
-                        f"\thit_rate={p_hit:.2f}% evict_rate={p_ev_r:.2f}%"
+                        f"{cs} size={p_size}/{p_cap} evictions={p_ev} queries={p_q}"
+                        f"{cs} hits={p_h} hit_rate={p_hit:.2f}% evict_rate={p_evr:.2f}%"
                     )
 
                     # finally clear them

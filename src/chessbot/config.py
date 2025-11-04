@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_selfplay_phase4"
+    run_tag = "conv_1000_better_stopping_test"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "conv_1000_selfplay_phase4/conv_1000_selfplay_phase4_model.h5"
     
@@ -19,20 +19,20 @@ class Config(object):
     # Simulation schedule
     sims_floor = 1000
     sims_target = 2000
-    sims_ceiling = 4000
+    sims_ceiling = 3500
     micro_batch_size = 12
 
     # early stop
     use_sim_decision_model = True
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 100
-    es_best_move_threshold = 0.85
-    bs_best_move_threshold = 0.6
-    prefer_top_q = True
+    es_check_every = 250
+    es_best_move_threshold = 0.88
+    bs_best_move_threshold = 0.5
+    prefer_top_q = False
     
     # Game stuff
     games_at_once = 100
-    n_training_games = 500
+    n_training_games = 1000
     
     move_limit = 160
     material_diff_cutoff = 15

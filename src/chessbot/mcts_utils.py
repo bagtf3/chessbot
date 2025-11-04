@@ -22,7 +22,6 @@ class MCTSTree(fasttree):
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()
-        self.sims_target = None
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -189,6 +188,12 @@ class MCTSTree(fasttree):
         # n_cands, top share, visit_margin, visit norm
         vec.append(len(root.legal_moves))
         visits = [v[1] for v in rows]
+
+        # not sure how this happens, but return None
+        if len(visits) < 2:
+            print("len(visists) < 2 somehow")
+            return None
+        
         vec.append(visits[0] / max(1.0, root.N))
         vec.append(visits[0]-visits[1])
 
@@ -226,7 +231,7 @@ class MCTSTree(fasttree):
         vec.append(q_margin)
 
         # is_middlegame, is endgame
-        vec.append(1*((self.n_plies < 20) and (self.piece_count < 12)))
+        vec.append(1*((self.n_plies < 20) and (self.piece_count > 12)))
         vec.append(1*((self.n_plies > 60) or (self.piece_count < 12)))
 
         dmat = tl2.DMatrix(np.array(vec, dtype=np.float32, ndmin=2))
@@ -236,54 +241,51 @@ class MCTSTree(fasttree):
     def maybe_early_stop(self):
         if self._es_tripped:
             return True
-
+                    
         sims_done = self.sims_completed_this_move
+        sims_target = self.config.sims_target
+
+        if sims_done < self.config.sims_floor:
+            return False
+        
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
             return False
 
         # if here, run ES check
         self._es_last_checked_at = sims_done
-
-        if sims_done < self.config.sims_floor:
-            return False
-
-        if sims_done >= self.config.sims_ceiling:
-            self.sim_stop_reason = f"Sim Limit reached: {sims_done}"
-            return True
-
         probs = self.get_sim_decision_probs()
         if probs is None:
             return False
 
         # best move prob
         bmp = np.ravel(probs)[-1]
-
+        string = f"best move prob {bmp:.3f} sims_done {sims_done}"
         # need to be above the es (early stop) threshold to stop here
-        if sims_done < self.sims_target:
+        if sims_done >= self.config.sims_ceiling:
+            self.sim_stop_reason = f"Sim Limit reached: {string}"
+            return True
+
+        if sims_done < sims_target:
             if bmp > self.config.es_best_move_threshold:
                 self._es_tripped = True
-                self.sim_stop_reason = f"ES triggered: best move prob {bmp:.3f}"
+                self.sim_stop_reason = f"ES triggered: {string}"
                 return True
-        else:
+
+        if sims_done >= sims_target:
             # need to be above the bs (bonus sims) threshold to stop here
             if bmp > self.config.bs_best_move_threshold:
-                self.sim_stop_reason = f"Sufficient: best move prob {bmp:.3f}"
+                self.sim_stop_reason = f"Sufficient: {string}"
                 return True
+        
         # otherwise keep searching
         return False
 
-    def stop_simulating(self):
-        if self.sims_target is None:
-            b = self.root().board
-            mvs = b.legal_moves()
-            # if there is only 1 move, make it
-            if len(mvs) == 1:
-                # set this ultra low just incase
-                self.sims_target = 1
-                self.sim_stop_reason = "Only 1 legal move"
-                return True
+    def stop_simulating(self):    
+        # check for only 1 move
+        if len(self.root().legal_moves) < 2:
+            self.sim_stop_reason = "Only 1 legal move"
+            return True
 
-            self.sims_target = self.config.sims_target
         return self.maybe_early_stop()
 
     def reset_for_new_move(self):
@@ -310,7 +312,6 @@ class MCTSTree(fasttree):
         # standard housekeeping
         self.awaiting_predictions.clear()
         self._move_started_at = _now()
-        self.sims_target = None
 
         # early-stop state
         self._es_last_checked_at = 0

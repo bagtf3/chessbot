@@ -20,7 +20,7 @@ class Config(object):
     sims_floor = 1000
     sims_target = 2000
     sims_ceiling = 3500
-    micro_batch_size = 12
+    micro_batch_size = 10
 
     # early stop
     use_sim_decision_model = False
@@ -53,19 +53,13 @@ class Config(object):
         "piece_odds": 0.05, "piece_training": 0.05
     }
     
-    # boosts/penalize
-    use_prior_boosts = False
+    # priors
     prior_clip_max = 0.35
     prior_clip_min = 0.001
-    endgame_prior_adjustments = {
-        "pawn_push":0.1, "capture":0.1, "repetition_penalty": 0.1
-    }
-    
-    anytime_prior_adjustments = {"gives_check": 0.1, "repetition_penalty": 0.1}
 
     # TF
     training_queue_min = 4096
-    fwd_batch = 1200
+    fwd_batch = 1024
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
     target_mean = 0.1

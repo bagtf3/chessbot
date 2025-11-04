@@ -723,16 +723,112 @@ class MaskedPolicyModel(tf.keras.Model):
         
         return core
 
-# from chessbot import MODEL_DIR
+    def make_infer(self, max_bs=1024, warm_shapes=(64, 256, 512)):
+        """
+        Return fwd((boards_np, legal_np), min_p, max_p, temp) -> [probs_np, val_np].
+        GPU-side masked softmax + clip + renorm. Chunks > max_bs.
+        """
 
+        BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
+        EPS = tf.constant(1e-12, dtype=tf.float32)
+
+        @tf.function(input_signature=[
+            tf.TensorSpec([None, 8, 8, 29], tf.float32),
+            tf.TensorSpec([None, 4096], tf.int32),
+            tf.TensorSpec([], tf.float32),  # min_p
+            tf.TensorSpec([], tf.float32),  # max_p
+            tf.TensorSpec([], tf.float32),  # temp
+        ])
+        def graph(board, legal, min_p, max_p, temp):
+            # forward
+            logits, value = self.core([board, legal], training=False)
+            logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
+            mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]),
+                        dtype=logits.dtype)
+
+            # mask illegal logits -> BIG_NEG
+            masked_logits = tf.where(mask > 0.5, logits,
+                                    tf.ones_like(logits) * BIG_NEG)
+
+            # temperature-stable softmax over legal entries only
+            scaled = masked_logits / tf.cast(temp, masked_logits.dtype)
+            row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
+            exp = tf.exp(scaled - row_max) * mask
+            sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
+            has_any = sumexp > 0.0
+            probs = tf.where(has_any, exp / (sumexp + EPS),
+                            tf.zeros_like(exp))
+
+            # clamp only legal slots then renormalize
+            min_p = tf.cast(min_p, probs.dtype)
+            max_p = tf.cast(max_p, probs.dtype)
+            clipped = tf.where(mask > 0.5,
+                            tf.clip_by_value(probs, min_p, max_p),
+                            tf.zeros_like(probs))
+            s = tf.reduce_sum(clipped, axis=1, keepdims=True)
+            valid = s > EPS
+            probs_final = tf.where(valid, clipped / (s + (1.0 - tf.cast(valid, probs.dtype))),
+                                tf.zeros_like(clipped))
+
+            return probs_final, value
+
+        # warm up traces
+        for B in warm_shapes:
+            _ = graph(tf.zeros([B, 8, 8, 29], tf.float32),
+                    tf.zeros([B, 4096], tf.int32),
+                    tf.constant(0.001, tf.float32),
+                    tf.constant(0.35,  tf.float32),
+                    tf.constant(1.0,   tf.float32))
+
+        def base_fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
+            # pair is (boards_np, legal_np)
+            if not isinstance(pair, (list, tuple)):
+                raise ValueError("pass (boards_np, legal_np) tuple")
+            boards_np, legal_np = pair
+            b_tf = tf.convert_to_tensor(boards_np, dtype=tf.float32)
+            l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
+            probs_tf, val_tf = graph(b_tf, l_tf,
+                                    tf.cast(min_p, tf.float32),
+                                    tf.cast(max_p, tf.float32),
+                                    tf.cast(temp,  tf.float32))
+            return probs_tf.numpy(), val_tf.numpy()
+
+        if max_bs is None:
+            return base_fwd
+
+        def fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
+            boards_np, legal_np = pair
+            B = boards_np.shape[0]
+            if B <= max_bs:
+                return base_fwd((boards_np, legal_np), min_p, max_p, temp)
+            parts = None
+            i = 0
+            while i < B:
+                j = min(i + max_bs, B)
+                p_probs, p_val = base_fwd((boards_np[i:j], legal_np[i:j]),
+                                        min_p, max_p, temp)
+                if parts is None:
+                    parts = [p_probs, p_val]
+                else:
+                    parts[0] = np.concatenate([parts[0], p_probs], axis=0)
+                    parts[1] = np.concatenate([parts[1], p_val],  axis=0)
+                i = j
+            return parts
+
+        return fwd
+
+### TO MAKE A MODEL ###
+# from chessbot import MODEL_DIR
 # model_loc = MODEL_DIR + "conv_stm_pov_test.h5"
 # core = MaskedPolicyModel.build_core(n_blocks=10, name="stm_pov_v1")
-
 # core.compile(
 #     optimizer=tf.keras.optimizers.Adam(1e-4),
 #     loss=["categorical_crossentropy", "mse"],
 #     loss_weights=[1.0, 1.0]
 # )
-
 # model = MaskedPolicyModel(core)
 # model.save(model_loc)
+
+## USAGE ###
+#infer = model.make_infer(max_bs=1024)
+#probs_np, vals_np = infer((boards_np, legals_np), min_p=0.001, max_p=0.35, temp=1.0)

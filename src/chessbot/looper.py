@@ -419,7 +419,7 @@ class GameLooper(object):
                     game.tree.sims_completed_this_move += nn + nt + nc
 
                     if nn:
-                        preds_batch += game.tree.pending_encoded(5)
+                        preds_batch += game.tree.pending_encoded_stm_pov(1)
 
                     fastpaths = nt + nc
                     fast_stop, collect_stop = 0, 1
@@ -899,7 +899,6 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
-
     looper = GameLooper(model=model, cfg=Config())
     
     # infer the number of trainings already done from existing files

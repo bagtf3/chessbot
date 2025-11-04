@@ -685,7 +685,7 @@ class MaskedPolicyModel(tf.keras.Model):
         return inst
 
     @classmethod
-    def build_core_model_stm_pov(self):
+    def build_core(self, n_blocks, name):
         board_in = Input(shape=(8, 8, 29), name="board")
         legal_in = Input(shape=(4096,), name="legal_mask")
 
@@ -693,8 +693,8 @@ class MaskedPolicyModel(tf.keras.Model):
         x = layers.BatchNormalization()(x)
         x = layers.LeakyReLU()(x)
 
-        # Residual-ish trunk: 12 blocks of 256 filters (wide & deep)
-        for i in range(10):
+        # Residual-ish trunk: N blocks of 256 filters (wide & deep)
+        for i in range(n_blocks):
             r = layers.Conv2D(256, 3, padding="same", name=f"b{i}_c1")(x)
             r = layers.BatchNormalization()(r)
             r = layers.LeakyReLU()(r)
@@ -715,8 +715,24 @@ class MaskedPolicyModel(tf.keras.Model):
         v = layers.Dense(256, activation="relu", name="v_fc2")(v)
         v_out = layers.Dense(1, activation="tanh", name="value_out")(v)
 
-        core = Model(inputs=[board_in, legal_in],
-                     outputs=[policy_logits, v_out],
-                     name="core_v12m")
+        core = Model(
+            inputs=[board_in, legal_in],
+            outputs=[policy_logits, v_out],
+            name=name
+        )
+        
         return core
 
+# from chessbot import MODEL_DIR
+
+# model_loc = MODEL_DIR + "conv_stm_pov_test.h5"
+# core = MaskedPolicyModel.build_core(n_blocks=10, name="stm_pov_v1")
+
+# core.compile(
+#     optimizer=tf.keras.optimizers.Adam(1e-4),
+#     loss=["categorical_crossentropy", "mse"],
+#     loss_weights=[1.0, 1.0]
+# )
+
+# model = MaskedPolicyModel(core)
+# model.save(model_loc)

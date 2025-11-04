@@ -316,4 +316,10 @@ gdf = d.query("game_id == @gid")
 gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
-#%%
+
+
+
+
+
+
+

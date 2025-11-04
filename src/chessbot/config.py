@@ -7,9 +7,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_1000_better_stopping_test"
+    run_tag = "conv_stm_pov_phase1"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "conv_1000_selfplay_phase4/conv_1000_selfplay_phase4_model.h5"
+    init_model = MODEL_DIR + "conv_stm_pov_test.h5"
     
     # MCTS
     c_puct = 2.0
@@ -23,14 +23,14 @@ class Config(object):
     micro_batch_size = 12
 
     # early stop
-    use_sim_decision_model = True
+    use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
     es_check_every = 250
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
     
-    use_q_override = True
+    use_q_override = False
     q_override_vis_ratio = 0.8
     q_override_q_margin = 0.08
     q_override_min_vis = 800

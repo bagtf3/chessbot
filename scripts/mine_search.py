@@ -438,6 +438,7 @@ def predict_row(pred, meta, row_df):
 write_model_artifact(libpath, clf.feature_names_in_, clf.classes_)
 pred, meta = load_predictor_and_meta(libpath)
 probs = predict_row(pred, meta, X.iloc[[69]])
+probs.ravel()[-1]
 #%%
 import numpy as np
 import pandas as pd
@@ -522,13 +523,16 @@ meta['feature_names']
 from chessbot.config import Config
 from chessbot.utils import random_init
 from chessbot.mcts_utils import MCTSTree
-from chessbot.utils import calc_entropy
+from chessbot.utils import calc_entropy, softmax
 
 tree = MCTSTree(random_init(5), Config())
+tree.collect_many_leaves(50, 50)
+best_move_probs = tree.get_sim_decision_probs()
+z, o = best_move_probs
+print(f"probs {z} {o}")
 
 
-tree.collect_many_leaves(250, 250)
-tree.sim_decision_model = tl2.Predictor(libpath, nthread=1)
-vec, dmat, probs = tree.get_sim_decision_probs()
+
+
 
 

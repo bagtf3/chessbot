@@ -18,21 +18,28 @@ class MCTSTree(fasttree):
         super().__init__(board, self.c_puct, MCTSTree.ev)
         self.configure_prior_engine()
 
-        # bookkeeping mirroring old interface
+        # bookkeeping
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()
-        self.sims_target = None
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
 
+        self.moves_played = 0
+        self.sims_done_total = 0
+
         # early-stop rolling state
-        self._es_history = []
         self._es_last_checked_at = 0
         self._es_tripped = False
         self.sim_stop_reason = ""
+
+        self.sim_decision_model = None
+        if self.config.use_sim_decision_model:
+            self.sim_decision_model = tl2.Predictor(
+                self.config.sim_decision_model_path, nthread=1
+            )
 
     def configure_prior_engine(self):
         """Creates and configures singleton prior engine in c++ """
@@ -121,8 +128,10 @@ class MCTSTree(fasttree):
     
         # build candidate list
         cands = []
+        white_to_move = self.root().board.side_to_move() == 'w'
+        mult = 1 if white_to_move else -1
         for d in details:
-            cands.append({"uci": d.uci, "visits": d.N, "Q": d.Q, "P": d.prior})
+            cands.append({"uci": d.uci, "visits": d.N, "Q": mult * d.Q, "P": d.prior})
     
         # sort by visits descending
         c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
@@ -137,7 +146,7 @@ class MCTSTree(fasttree):
         top_k = self.config.q_override_top_k
     
         # Compute absolute minimum visits required
-        vis_min = max(min_vis_cfg, int(top_vis * vis_ratio))
+        vis_min = max(min_vis_cfg, top_vis * vis_ratio)
     
         # Eligible among top_k
         eligible = [c for c in c_sorted[:top_k] if c["visits"] >= vis_min]
@@ -149,6 +158,9 @@ class MCTSTree(fasttree):
         best_q_c = max(eligible, key=lambda x: x["Q"])
     
         if best_q_c["Q"] >= top_q + q_margin and best_q_c["uci"] != top["uci"]:
+            
+            print(f"[choose move] Playing non-top-Q  white to move: {white_to_move}")
+            print(f"[choose move] {best_q_c} vs {top}")
             return best_q_c["uci"], None
         else:
             return top["uci"], None
@@ -179,111 +191,117 @@ class MCTSTree(fasttree):
         deets = self.root_child_details()
         rows = self.root_child_visits()
 
-        # n_cands
+        # n_cands, top share, visit_margin, visit norm
         vec.append(len(root.legal_moves))
-
-        # top share, visit_margin, visit norm
         visits = [v[1] for v in rows]
-        vec.append(visits[0]/root.N)
+
+        # not sure how this happens, but return None
+        if len(visits) < 2:
+            print("len(visists) < 2 somehow")
+            return None
+        
+        vec.append(visits[0] / max(1.0, root.N))
         vec.append(visits[0]-visits[1])
 
-        ent_vis, norm_vis = calc_entropy(visits)
+        _, norm_vis = calc_entropy(visits)
         vec.append(norm_vis)
 
-        # P norm
-        priors = [c.prior for c in deets]
-        ent_p, norm_p = calc_entropy(priors)
-        vec.append(norm_p)
-
-        # Q norm
-        qs = [c.Q for c in deets]
-        ent_q, norm_q = calc_entropy(qs)
-        vec.append(norm_q)
-
-        # U norm
-        cp = self.c_puct
+        # P norm,  Q norm, # U norm
+        c_puct = self.c_puct
         S = root.N
-        Us = [cp * cd.prior * (S ** 0.5) / (1 + cd.N) for cd in deets]
-        ent_u, norm_u = calc_entropy(Us)
+        Ps, Qs, Us = [], [], []
+        mult = 1 if root.board.side_to_move() == 'w' else -1
+        for c in deets:
+            Ps.append(c.prior)
+            Qs.append(mult * c.Q)
+            Us.append(c_puct * c.prior * (S ** 0.5) / (1 + c.N))
+
+        # prefer selected Q to be the best Q at stop
+        # i.e. do not stop unless the top move is best Q, independent of everything else
+        q_margin = Qs[0] - max(Qs)
+        if self.config.prefer_top_q:
+            if q_margin < 0:
+                return np.array([1.0, 0.0])
+
+        _, norm_p = calc_entropy(Ps)
+        _, norm_q = calc_entropy(Qs)
+        _, norm_u = calc_entropy(Us)
+
+        vec.append(norm_p)
+        vec.append(norm_q)
         vec.append(norm_u)
 
         # top_p, q_margin, q_delta
-        vec.append(deets[0].prior)
-        vec.append(qs[0] - qs[1])
-        vec.append(qs[0] - max(qs))
+        vec.append(Ps[0])
+        vec.append(Qs[0] - Qs[1])
+        vec.append(q_margin)
 
         # is_middlegame, is endgame
-        vec.append(1*((self.n_plies < 20) and (self.piece_count < 12)))
+        vec.append(1*((self.n_plies < 20) and (self.piece_count > 12)))
         vec.append(1*((self.n_plies > 60) or (self.piece_count < 12)))
 
         dmat = tl2.DMatrix(np.array(vec, dtype=np.float32, ndmin=2))
         probs = self.sim_decision_model.predict(dmat)
-        return probs[0][0]
+        return probs.ravel()
 
     def maybe_early_stop(self):
         if self._es_tripped:
             return True
-        
+                    
         sims_done = self.sims_completed_this_move
+        sims_target = self.config.sims_target
+
+        if sims_done < self.config.sims_floor:
+            return False
+        
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
             return False
 
-        # immediate checks that apply regardless of es_min_sims
-        sims_target = self.sims_target
-        rows = self.root_child_visits()
-        if rows:
-            # if the top node already has >= es_top_node_frac * sims_target, stop
-            top_vis = rows[0][1]
-            if top_vis >= self.config.es_top_node_frac * sims_target:
-                self._es_tripped = True
-                self._es_after_sims = sims_done
-                thresh = self.config.es_top_node_frac * sims_target
-                self._es_reason = f"top_node_frac top_vis={top_vis} thresh={thresh:.1f}"
-                return True
-    
-        # from here on enforce min sims and periodic checking as before
-        if sims_done < self.config.es_min_sims:
-            return False
-        
+        # if here, run ES check
         self._es_last_checked_at = sims_done
-        rows = self.root_child_visits()
-        if len(rows) < 2:
+        probs = self.get_sim_decision_probs()
+        if probs is None:
             return False
-    
-        n1, n2 = rows[0][1], rows[1][1]
-        gap = n1 - n2
-        remaining = max(0, sims_target - sims_done)
-    
-        if gap > self.config.es_gap_frac * remaining:
-            self._es_tripped = True
-            self._es_reason = (
-                f"gap_vs_remaining n1={n1} n2={n2} gap={gap} "
-                f"remaining={remaining} thresh={self.config.es_gap_frac * remaining:.1f}"
-            )
-            self._es_after_sims = sims_done
+
+        # best move prob
+        bmp = np.ravel(probs)[-1]
+        string = f"best move prob {bmp:.3f} sims_done {sims_done}"
+        # need to be above the es (early stop) threshold to stop here
+        if sims_done >= self.config.sims_ceiling:
+            self.sim_stop_reason = f"Sim Limit reached: {string}"
             return True
+
+        if sims_done < sims_target:
+            if bmp > self.config.es_best_move_threshold:
+                self._es_tripped = True
+                self.sim_stop_reason = f"ES triggered: {string}"
+                return True
+
+        if sims_done >= sims_target:
+            # need to be above the bs (bonus sims) threshold to stop here
+            if bmp > self.config.bs_best_move_threshold:
+                self.sim_stop_reason = f"Sufficient: {string}"
+                return True
+        
+        # otherwise keep searching
         return False
 
-    def stop_simulating(self):
-        if self.sims_target is None:
-            b = self.root().board
-            mvs = b.legal_moves()
-            # if there is only 1 move, make it
-            if len(mvs) == 1:
-                # set this ultra low just incase
-                self.sims_target = 1
-                return True
-            
-            # use the sims target, or 600*num_moves to speed up forced positions
-            self.sims_target = min(self.config.sims_target, 600*len(mvs))
-        if self.sims_completed_this_move >= self.sims_target:
+    def stop_simulating(self):    
+        # check for only 1 move
+        if len(self.root().legal_moves) < 2:
+            self.sim_stop_reason = "Only 1 legal move"
             return True
+
         return self.maybe_early_stop()
 
     def reset_for_new_move(self):
         """
         Resets everything, counts visits from previous trees.
         """
+
+        self.moves_played += 1
+        self.sims_done_total += self.sims_completed_this_move
+
         existing = 0
         try:
             r = self.root()
@@ -304,14 +322,11 @@ class MCTSTree(fasttree):
         # standard housekeeping
         self.awaiting_predictions.clear()
         self._move_started_at = _now()
-        self.sims_target = None
 
         # early-stop state
-        self._es_history.clear()
         self._es_last_checked_at = 0
         self._es_tripped = False
-        self._es_reason = ""
-        self._es_after_sims = 0
+        self.sim_stop_reason = ""
 
 
 class LRUCache:

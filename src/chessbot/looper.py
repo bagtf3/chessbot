@@ -108,7 +108,8 @@ class ChessGame(object):
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
             "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4)
+            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
+            "stop_reason": self.tree.sim_stop_reason
         }
         # sumN for U term
         sumN = max(1, root.N)
@@ -198,6 +199,7 @@ class ChessGame(object):
         """
         Snapshot policy targets from root visits, then play best-by-visits.
         """
+
         root = self.tree.root()
         if not root.is_expanded:
             return False
@@ -315,11 +317,16 @@ class GameLooper(object):
         self.all_evals = pd.DataFrame()
         self.clear_cache = False
         
+        self._run_start = _now()
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
         self._last_stats_log = 0.0
 
+        self.moves_played = 0
+        self.sims_done_total = 0
+
     def fill_active_games(self):
+        fens_seen = set()
         cfg = self.config
         needed = cfg.n_training_games - self.games_finished - len(self.active_games)
         if needed <= 0:
@@ -332,6 +339,13 @@ class GameLooper(object):
 
             # this has game probs from the config
             board, meta = self.game_gen.new_board()
+            fen = board.fen()
+            while fen in fens_seen:
+                board, meta = self.game_gen.new_board()
+                fen = board.fen()
+
+            # add new unique fen
+            fens_seen.add(fen)
 
             meta['vs_stockfish'] = False
             meta['stockfish_is_white'] = False
@@ -359,15 +373,14 @@ class GameLooper(object):
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            eng.configure({"Threads": 2})
-            eng.configure({"Hash": 256})
+            eng.configure({"Threads": 2, "Hash": 256})
             while self.games_finished < cfg.n_training_games:
                 if not self.active_games:
                     break
         
                 preds_batch = []
                 finished = []
-                for game in list(self.active_games):
+                for game in self.active_games:
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
                         sf_terminal = game.make_move_with_stockfish(eng)
@@ -438,13 +451,13 @@ class GameLooper(object):
                     p_q    = pc.get("queries", 0)
                     p_h    = pc.get("hits", 0)
                     p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
-                    p_ev_r = (100.0 * p_ev / p_cap) if p_cap else 0.0
+                    p_evr = (100.0 * p_ev / p_cap) if p_cap else 0.0
 
-                    print("Clearing caches after training:")
+                    print("Clearing caches after training")
+                    cs = "[cache stats]"
+                    print(f"{cs} size={p_size}/{p_cap} evictions={p_ev} queries={p_q}")
                     print(
-                        f"Priors cache:\n \tsize={p_size}/{p_cap}  evictions={p_ev}  "
-                        f"queries={p_q}  hits={p_h}\n"
-                        f"\thit_rate={p_hit:.2f}% evict_rate={p_ev_r:.2f}%"
+                        f"{cs} hits={p_h} hit_rate={p_hit:.2f}% evict_rate={p_evr:.2f}%"
                     )
 
                     # finally clear them
@@ -507,7 +520,6 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
-        
         # aggregate stats
         self.games_finished += 1
         self.total_plies += game.plies
@@ -518,15 +530,24 @@ class GameLooper(object):
         else:
             self.draws += 1
         
+        sims_total = game.tree.sims_done_total 
+        moves = game.tree.moves_played
+        avg_sims = sims_total/moves if moves > 0 else 0
+
+        # store for logging too
+        self.moves_played += moves
+        self.sims_done_total += sims_total
+
         mem_summary = {
             "ts": _now(),
             "game_id": game.game_id,
             "scenario": game.meta.get("scenario", ""),
-            "plies": int(game.plies),
+            "plies": game.plies,
             "result": game.outcome or 0.0,
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
-            "duration": _now() - game.started_at
+            "duration": _now() - game.started_at,
+            "sims_per_move": round(avg_sims, 3)
         }
         # small in-memory record for recent prints only
         self.recent_games.append(mem_summary)
@@ -754,12 +775,14 @@ class GameLooper(object):
         self._last_stats_log = now
 
         avg_moves = (self.total_plies / max(1, self.games_finished))
+        gph =  3600 * self.games_finished / (now - self._run_start)
+
         print("~" * 60)
         print(
             f"[stats] finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
             f"avg_len={avg_moves:.1f} moves  |  "
-            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}"
+            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}  gph={gph:.2f}"
         )
         print("-" * 60)
 
@@ -831,6 +854,12 @@ class GameLooper(object):
         if sum(durations) > 0:
             avg_len_str = cbu.format_time(np.mean(durations))
             print(f"Avg game runtime (last {len(last50)}) {avg_len_str}")
+        
+        sims = self.sims_done_total
+        moves = self.moves_played
+        sims_per_move = sims/moves if moves > 0 else 0
+        if sims_per_move:
+            print(f"Avg sims per move {sims_per_move:.3f}")
         print("------------------------------------------------------------")
 
 

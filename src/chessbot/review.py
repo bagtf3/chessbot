@@ -588,7 +588,7 @@ def save_pickle_atomic(obj, path):
 
 def safe_mean(arr):
     a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
-    return float(np.nanmean(a)) if a.size else float("nan")
+    return np.nanmean(a) if a.size else float("nan")
 
 
 def lightweight_summary(results):
@@ -642,13 +642,13 @@ def combine_analysis_staging(run_dir):
 
     # nothing to do if staging doesn't exist
     if not os.path.isdir(staging):
-        print(f"[combine] no staging dir: {staging}")
+        print(f"[combine] no /analysis_staging dir")
         return None
 
-    # list chunk files (stable sort)
+    # list chunk files
     fns = sorted([fn for fn in os.listdir(staging) if fn.endswith(".pkl")])
     if not fns:
-        print(f"[combine] no chunk files in {staging}")
+        print(f"[combine] no chunk files in /analysis_staging dir")
         return None
 
     # load existing combined (if any)

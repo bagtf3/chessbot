@@ -1126,7 +1126,7 @@ def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
 class RateMeter(object):
     def __init__(self, name, interval_s=120.0):
         self.name = name
-        self.interval_s = float(interval_s)
+        self.interval_s = interval_s
         self.t0 = _now()
         self.t_last = self.t0
         self.total = 0

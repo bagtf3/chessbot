@@ -18,7 +18,7 @@ class MCTSTree(fasttree):
         super().__init__(board, self.c_puct, MCTSTree.ev)
         self.configure_prior_engine()
 
-        # bookkeeping mirroring old interface
+        # bookkeeping
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()
@@ -26,6 +26,9 @@ class MCTSTree(fasttree):
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
         self.awaiting_predictions = []
+
+        self.moves_played = 0
+        self.sims_done_total = 0
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -118,46 +121,49 @@ class MCTSTree(fasttree):
 
     def best(self):
         # If not configured, delegate straight to the C++/base implementation.
-        return super().best()
-
-        # if not self.config.use_q_override:
-        #     return super().best()
+        if not self.config.use_q_override:
+            return super().best()
     
-        # details = self.root_child_details()
+        details = self.root_child_details()
     
-        # # build candidate list
-        # cands = []
-        # for d in details:
-        #     cands.append({"uci": d.uci, "visits": d.N, "Q": d.Q, "P": d.prior})
+        # build candidate list
+        cands = []
+        white_to_move = self.root().board.side_to_move() == 'w'
+        mult = 1 if white_to_move else -1
+        for d in details:
+            cands.append({"uci": d.uci, "visits": d.N, "Q": mult * d.Q, "P": d.prior})
     
-        # # sort by visits descending
-        # c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
-        # top = c_sorted[0]
-        # top_vis = top["visits"]
-        # top_q = top["Q"]
+        # sort by visits descending
+        c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
+        top = c_sorted[0]
+        top_vis = top["visits"]
+        top_q = top["Q"]
     
-        # # read thresholds from Config
-        # vis_ratio = self.config.q_override_vis_ratio
-        # q_margin = self.config.q_override_q_margin
-        # min_vis_cfg = self.config.q_override_min_vis
-        # top_k = self.config.q_override_top_k
+        # read thresholds from Config
+        vis_ratio = self.config.q_override_vis_ratio
+        q_margin = self.config.q_override_q_margin
+        min_vis_cfg = self.config.q_override_min_vis
+        top_k = self.config.q_override_top_k
     
-        # # Compute absolute minimum visits required
-        # vis_min = max(min_vis_cfg, int(top_vis * vis_ratio))
+        # Compute absolute minimum visits required
+        vis_min = max(min_vis_cfg, top_vis * vis_ratio)
     
-        # # Eligible among top_k
-        # eligible = [c for c in c_sorted[:top_k] if c["visits"] >= vis_min]
+        # Eligible among top_k
+        eligible = [c for c in c_sorted[:top_k] if c["visits"] >= vis_min]
     
-        # if not eligible:
-        #     return top["uci"], None
+        if not eligible:
+            return top["uci"], None
     
-        # # Pick the eligible one with highest Q
-        # best_q_c = max(eligible, key=lambda x: x["Q"])
+        # Pick the eligible one with highest Q
+        best_q_c = max(eligible, key=lambda x: x["Q"])
     
-        # if best_q_c["Q"] >= top_q + q_margin and best_q_c["uci"] != top["uci"]:
-        #     return best_q_c["uci"], None
-        # else:
-        #     return top["uci"], None
+        if best_q_c["Q"] >= top_q + q_margin and best_q_c["uci"] != top["uci"]:
+            
+            print(f"[choose move] Playing non-top-Q  white to move: {white_to_move}")
+            print(f"[choose move] {best_q_c} vs {top}")
+            return best_q_c["uci"], None
+        else:
+            return top["uci"], None
 
     def advance(self, board, move_uci):
         """
@@ -292,6 +298,10 @@ class MCTSTree(fasttree):
         """
         Resets everything, counts visits from previous trees.
         """
+
+        self.moves_played += 1
+        self.sims_done_total += self.sims_completed_this_move
+
         existing = 0
         try:
             r = self.root()

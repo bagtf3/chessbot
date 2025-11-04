@@ -26,10 +26,16 @@ class Config(object):
     use_sim_decision_model = True
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
     es_check_every = 250
-    es_best_move_threshold = 0.88
+    es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
     
+    use_q_override = True
+    q_override_vis_ratio = 0.8
+    q_override_q_margin = 0.08
+    q_override_min_vis = 800
+    q_override_top_k = 2
+
     # Game stuff
     games_at_once = 100
     n_training_games = 1000

@@ -5,5 +5,5 @@ AI/ML Chessbot
 ```bash
 pip install -r requirements.txt
 export PYTHONPATH=./src
-python scripts/chess_training.py
+python src/chessbot/looper.py
 ```

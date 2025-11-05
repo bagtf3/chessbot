@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 pd.set_option('display.width', None)
@@ -6,9 +7,8 @@ pd.set_option('display.max_columns', None)
 import math, random, time, pickle
 from time import time as _now
 
-import tensorflow as tf
 import matplotlib.pyplot as plt
-
+import seaborn as sns
 import chess
 import chess.engine
 import chess.svg
@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MATE_CP = 2500
 CLIP_MAX = 1200
-
+EPS = 1e-12
 
 def cp_to_value(cp):
     #check for mates
@@ -65,7 +65,7 @@ def score_cp_white_pov(pov_score, clipped=True, mate_cp=MATE_CP):
     return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
 
 
-def score_cp_relative(pov_score, clipped=True):
+def score_cp_relative(pov_score, clipped=True, mate_cp=MATE_CP):
     scr = pov_score.relative
     return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
 
@@ -202,205 +202,405 @@ def plot_sf_simple(df):
     plt.title("SF600 exhibitions: wins/draws and avg game length")
     plt.tight_layout()
     plt.show()
-    
+
 
 def plot_training_progress(all_evals, max_cols=4, save_path=None):
     """
-    Plots training/eval metrics for each model output in a balanced grid.
-    Keeps 'value' last for consistency. Saves or shows the figure.
+    Two figures:
+      1) 1 row x 3 cols: total_loss, policy_logits, value_out (MA15)
+      2) 2 rows x 3 cols: 6 plots:
+         - topk (mean_top1/3/10 together, no MA)
+         - legal_mass_mean (MA15)
+         - mean_kl (MA15)
+         - mean_pred_entropy (MA15)
+         - value_corr (MA15)
+         - value_bias (MA15)
+    Saves to save_path and save_path_extra (same dir) or shows if save_path is None.
     """
     if "model_epoch" in all_evals.columns:
         all_evals = all_evals.drop(columns=["model_epoch"])
 
-    cols = list(all_evals.columns)
+    # helper: safe get column values, returns None if missing
+    def col_vals(name):
+        return all_evals[name].values if name in all_evals.columns else None
 
-    # keep value last
-    important = ["value"]
-    cols = [c for c in cols if c not in important] + important
-
-    n_plots = len(cols)
-    if n_plots == 0:
-        return
-
-    # choose a balanced layout: try ceil(sqrt(n)) cols but don't exceed max_cols
-    n_cols = min(max_cols, max(1, math.ceil(math.sqrt(n_plots))))
-    n_rows = max(1, math.ceil(n_plots / n_cols))
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
-
-    # normalize axes to a flat list for easy indexing
-    if hasattr(axes, "flatten"):
-        axes = axes.flatten()
-    else:
-        axes = [axes]
-
-    for i, col in enumerate(cols):
-        ax = axes[i]
-        y = all_evals[col].values
-        ax.plot(y, label=col)
+    # First figure: 1x3 (MA15)
+    figs = []
+    ######################
+    cols1 = ["total_loss", "policy_logits", "value_out"]
+    fig1, axs1 = plt.subplots(1, 3, figsize=(15, 4))
+    palette = sns.color_palette(None)
+    for ax, name, c in zip(axs1, cols1, palette):
+        y = col_vals(name)
+        if y is None:
+            ax.text(0.5, 0.5, f"missing: {name}", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+        x = np.arange(len(y))
+        ax.plot(x, y, label=name, color=c)
         ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(ma, lw=2, alpha=0.6, label=f"{col} (MA15)")
-        ax.set_title(col)
+        ax.plot(x, ma, lw=2, alpha=0.7, label=f"{name} (MA15)", color=c)
+        ax.set_title(name)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    figs.append((fig1, axs1))
+
+    # Second figure: 2x3
+    fig2, axs2 = plt.subplots(2, 3, figsize=(15, 8))
+    axs2 = axs2.flatten()
+
+    # (1) topk together no MA
+    ax = axs2[0]
+    t1 = col_vals("mean_top1_mass")
+    t3 = col_vals("mean_top3_mass")
+    t10 = col_vals("mean_top10_mass")
+    if t1 is None and t3 is None and t10 is None:
+        ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        # safe lengths (avoid evaluating numpy array truthiness)
+        l1 = len(t1) if t1 is not None else 0
+        l3 = len(t3) if t3 is not None else 0
+        l10 = len(t10) if t10 is not None else 0
+        maxlen = max(l1, l3, l10)
+        x = np.arange(maxlen)
+
+        if t1 is not None:
+            ax.plot(np.arange(len(t1)), t1, label="top1", color=palette[0])
+        if t3 is not None:
+            ax.plot(np.arange(len(t3)), t3, label="top3", color=palette[1])
+        if t10 is not None:
+            ax.plot(np.arange(len(t10)), t10, label="top10", color=palette[2])
+
+        # autoscale: use log if all tiny and >0
+        maxv = 0.0
+        for arr in (t1, t3, t10):
+            if arr is not None and np.size(arr):
+                try:
+                    maxv = max(maxv, float(np.nanmax(arr)))
+                except ValueError:
+                    pass
+        if 0 < maxv < 1e-3:
+            ax.set_yscale("log")
+            ax.set_ylim(max(1e-6, maxv * 1e-4), max(1e-3, maxv * 10.0))
+        else:
+            ax.set_ylim(0, max(1e-3, maxv * 1.2))
+        ax.set_title("mean top-k mass (no MA)")
         ax.legend()
 
-    # hide unused axes
-    for j in range(n_plots, len(axes)):
-        axes[j].axis("off")
+    # (2) legal_mass_mean MA15
+    ax = axs2[1]
+    y = col_vals("legal_mass_mean")
+    if y is None:
+        ax.text(0.5, 0.5, "missing: legal_mass_mean", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(y))
+        ax.plot(x, y, label="legal_mass_mean")
+        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
+        ax.plot(x, ma, lw=2, alpha=0.7, label="legal_mass_mean (MA15)")
+        ax.set_title("legal_mass_mean")
+        ax.legend(fontsize=8)
+
+    # (3) mean_kl MA15
+    ax = axs2[2]
+    y = col_vals("mean_kl")
+    if y is None:
+        ax.text(0.5, 0.5, "missing: mean_kl", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(y))
+        ax.plot(x, y, label="mean_kl")
+        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
+        ax.plot(x, ma, lw=2, alpha=0.7, label="mean_kl (MA15)")
+        ax.set_title("mean_kl")
+        ax.legend(fontsize=8)
+
+    # (4) mean_pred_entropy MA15
+    ax = axs2[3]
+    y = col_vals("mean_pred_entropy")
+    if y is None:
+        ax.text(0.5, 0.5, "missing: mean_pred_entropy",
+                ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(y))
+        ax.plot(x, y, label="mean_pred_entropy")
+        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
+        ax.plot(x, ma, lw=2, alpha=0.7,
+                label="mean_pred_entropy (MA15)")
+        ax.set_title("mean_pred_entropy")
+        ax.legend(fontsize=8)
+
+    # (5) value_corr MA15
+    ax = axs2[4]
+    y = col_vals("value_corr")
+    if y is None:
+        ax.text(0.5, 0.5, "missing: value_corr", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(y))
+        ax.plot(x, y, label="value_corr")
+        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
+        ax.plot(x, ma, lw=2, alpha=0.7, label="value_corr (MA15)")
+        ax.set_title("value_corr")
+        ax.legend(fontsize=8)
+
+    # (6) value_bias MA15
+    ax = axs2[5]
+    y = col_vals("value_bias")
+    if y is None:
+        ax.text(0.5, 0.5, "missing: value_bias", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(y))
+        ax.plot(x, y, label="value_bias")
+        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
+        ax.plot(x, ma, lw=2, alpha=0.7, label="value_bias (MA15)")
+        ax.set_title("value_bias")
+        ax.legend(fontsize=8)
 
     plt.tight_layout()
+    figs.append((fig2, axs2))
+
+    # Save or show
     if save_path is not None:
-        plt.savefig(save_path, dpi=150)
-        plt.close(fig)
+        # primary save
+        root, ext = os.path.splitext(save_path or "")
+        if ext == "":
+            ext = ".png"
+            root = save_path or "training_progress"
+        out1 = root + ext
+        figs[0][0].savefig(out1, dpi=150)
+        plt.close(figs[0][0])
+        # extra save
+        out2 = root + "_extra" + ext
+        figs[1][0].savefig(out2, dpi=150)
+        plt.close(figs[1][0])
     else:
-        plt.show()
-    
+        # interactive show both
+        for f, _ in figs:
+            f.show()
+
 
 def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
-    names = list(model.output_names)
+    """
+    Single figure: value (hexbin) + policy diagnostics for flat 4096 head.
+    Returns a dict of numeric metrics (so caller can write them into df).
+    Assumes exact keys:
+      preds['policy_logits'] (N,4096), preds['value_out'] (N,1)
+      y_true_dict['policy'] (N,4096), y_true_dict['value'] (N,)
+    """
+    EPS = 1e-12
 
-    chunk_size = 9
-    n_chunks = math.ceil(len(names) / chunk_size)
+    # value arrays (explicit)
+    yp_v = np.asarray(preds['value_out'], dtype=np.float32).reshape(-1)
+    yt_v = np.asarray(y_true_dict['value'], dtype=np.float32).reshape(-1)
 
-    for chunk_idx in range(n_chunks):
-        start = chunk_idx * chunk_size
-        end = start + chunk_size
-        chunk_names = names[start:end]
+    # policy logits -> softmax probs (explicit stable softmax)
+    P_logits = np.asarray(preds['policy_logits'], dtype=np.float32)
+    P_logits = P_logits - P_logits.max(axis=1, keepdims=True)
+    P_exp = np.exp(P_logits)
+    P_pred = P_exp / (P_exp.sum(axis=1, keepdims=True) + EPS)
 
-        fig, axes = plt.subplots(3, 3, figsize=(14, 8))
-        axes = axes.flatten()
+    # true policy probs (explicit normalize)
+    P_true = np.asarray(y_true_dict['policy'], dtype=np.float32)
+    P_true = P_true / (P_true.sum(axis=1, keepdims=True) + EPS)
 
-        for ax, name in zip(axes, chunk_names):
-            if name not in y_true_dict:
-                ax.set_visible(False)
-                continue
+    # plotting canvas (2x2)
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    ax_v = axs[0, 0]
+    ax_scatter = axs[0, 1]
+    ax_bar = axs[1, 0]
+    ax_heat = axs[1, 1]
 
-            y_pred = np.asarray(preds[name])
-            y_true = np.asarray(y_true_dict[name])
+    # value hexbin
+    yp = yp_v.reshape(-1)
+    yt = yt_v.reshape(-1)
+    n = min(len(yp), len(yt))
+    if n > 0:
+        yp, yt = yp[:n], yt[:n]
+        hb = ax_v.hexbin(yt, yp, gridsize=80, mincnt=1, cmap="magma")
+        lo = float(min(yt.min(), yp.min()))
+        hi = float(max(yt.max(), yp.max()))
+        ax_v.plot([lo, hi], [lo, hi], "r--", linewidth=1)
+        ax_v.set_title("value: pred vs true (hexbin)")
+        ax_v.set_xlabel("True")
+        ax_v.set_ylabel("Pred")
+        fig.colorbar(hb, ax=ax_v, fraction=0.046, pad=0.04)
+    else:
+        ax_v.text(0.5, 0.5, "no value data", ha="center", va="center")
+        ax_v.set_axis_off()
 
-            # squeeze singleton dims
-            if y_pred.ndim > 1 and y_pred.shape[-1] == 1:
-                y_pred = y_pred.reshape(-1)
-            if y_true.ndim > 1 and y_true.shape[-1] == 1 and name == "value":
-                y_true = y_true.reshape(-1)
-
-            if name == "value":
-                # regression scatter
-                yp = y_pred.reshape(-1)
-                yt = y_true.reshape(-1)
-                n = min(len(yp), len(yt))
-                yp, yt = yp[:n], yt[:n]
-                ax.scatter(yt, yp, s=8, alpha=0.5)
-                lo = float(min(yt.min(), yp.min()))
-                hi = float(max(yt.max(), yp.max()))
-                ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1)
-                ax.set_title("value")
-                ax.set_xlabel("True")
-                ax.set_ylabel("Pred")
-                ax.grid(True, alpha=0.3)
-                continue
-
-            # classification heads: handle soft or sparse y_true
-            pred_classes = y_pred.argmax(axis=1)
-
-            if y_true.ndim == 2:
-                true_classes = y_true.argmax(axis=1)
-            else:
-                true_classes = y_true.reshape(-1)
-
-            pred_classes = pred_classes.reshape(-1)
-            true_classes = true_classes.reshape(-1)
-
-            n = min(len(true_classes), len(pred_classes))
-            ax.scatter(true_classes[:n], pred_classes[:n], s=5, alpha=0.5)
-            ax.set_title(name)
-            ax.set_xlabel("True class")
-            ax.set_ylabel("Pred class")
-            ax.grid(True, alpha=0.3)
-
-        for i in range(len(chunk_names), len(axes)):
-            axes[i].set_visible(False)
-
+    # ensure policy arrays exist (they do by contract)
+    if P_pred.size == 0 or P_true.size == 0:
+        ax_scatter.text(0.5, 0.5, "no policy head found", ha="center",
+                        va="center")
+        ax_bar.set_visible(False)
+        ax_heat.set_visible(False)
         plt.tight_layout()
-        # optional: name the window per chunk
-        try:
-            fig.canvas.manager.set_window_title(f"Pred vs True [{start}:{end}]")
-        except Exception:
-            pass
-        if save_path is not None:
-            plt.savefig(save_path, dpi=150)
+        if save_path:
+            root, ext = os.path.splitext(save_path or "")
+            out = root + "_value" + ext
+            plt.savefig(out, dpi=150)
             plt.close(fig)
         else:
             plt.show(block=False)
+        # return minimal metrics (N=0) to caller
+        return {
+            "N": 0, "value_mse": float("nan"), "value_bias": float("nan"),
+            "value_corr": float("nan")
+        }
 
+    # policy diagnostics numbers
+    N = P_pred.shape[0]
+    idx_true_top1 = P_true.argmax(axis=1)
+    true_top1_prob = P_true[np.arange(N), idx_true_top1]
+    pred_on_true = P_pred[np.arange(N), idx_true_top1]
+    pred_top1_prob = P_pred.max(axis=1)
 
-def top_k_accuracy(y_true, y_pred, k=3):
-    """
-    Computes Top-K accuracy for classification heads.
-    y_true : (N,) int labels
-    y_pred : (N, C) logits or probs
-    k      : how many top guesses to consider
-    """
-    # convert logits -> probs
-    probs = tf.nn.softmax(y_pred, axis=-1).numpy()
-    # indices of top-k per sample
-    topk = np.argpartition(-probs, k, axis=1)[:, :k]
-    # check if true label is in top-k
-    correct = [y_true[i] in topk[i] for i in range(len(y_true))]
-    return np.mean(correct)
+    # scatter hexbin: pred_on_true vs true_top1_prob
+    ax_scatter.hexbin(true_top1_prob, pred_on_true, gridsize=80, mincnt=1)
+    ax_scatter.plot([0, 1], [0, 1], "r--", linewidth=1)
+    ax_scatter.set_xlabel("true top1 prob")
+    ax_scatter.set_ylabel("model prob on true top1")
+    ax_scatter.set_title(
+        "model prob on true top1 vs true top1 (hexbin)")
 
+    # mean mass on target top-k (explicit)
+    ranks_true = np.argsort(P_true, axis=1)  # ascending indices
+    def mean_mass(k):
+        idx = ranks_true[:, -k:]
+        return float(np.mean([P_pred[i, idx[i]].sum() for i in range(N)]))
+    m1 = mean_mass(1)
+    m3 = mean_mass(3)
+    m10 = mean_mass(10)
 
-def _to_sparse_labels(y):
-    y = np.asarray(y)
-    if y.ndim == 2:  # one-hot / soft
-        return y.argmax(axis=1).astype(np.int64)
-    return y.reshape(-1).astype(np.int64)
+    # draw bar with numeric labels (keeps simple)
+    bars = ax_bar.bar(["top1", "top3", "top10"], [m1, m3, m10])
+    ax_bar.set_ylim(0, 1.0)
+    ax_bar.set_title("mean model mass on target top-k")
+    for rect, v in zip(bars, (m1, m3, m10)):
+        label = f"{v:.3e}" if v < 1e-3 else f"{v:.3f}"
+        ax_bar.text(rect.get_x() + rect.get_width() / 2, v * 1.05,
+                    label, ha="center", va="bottom", fontsize=8)
 
+    # heatmap: mean 'from' map true || pred (8x8 each)
+    P2_true = P_true.reshape((N, 64, 64))
+    P2_pred = P_pred.reshape((N, 64, 64))
+    mean_from_true = P2_true.sum(axis=2).mean(axis=0).reshape(8, 8)
+    mean_from_pred = P2_pred.sum(axis=2).mean(axis=0).reshape(8, 8)
+    combined = np.hstack([mean_from_true, mean_from_pred])
+    im = ax_heat.imshow(
+        combined, interpolation="nearest", aspect="auto", origin="lower"
+    )
 
-def _topk_from_logits(y_true_sparse, y_pred_logits, k=1):
-    y_pred = np.asarray(y_pred_logits)
-    topk = np.argpartition(-y_pred, kth=min(k, y_pred.shape[1]-1), axis=1)[:, :k]
-    # count hits
-    hits = (topk == y_true_sparse[:, None]).any(axis=1)
-    return float(hits.mean())
+    h, w = combined.shape
+    ax_heat.set_xticks(np.arange(w))
+    ax_heat.set_yticks(np.arange(h))
+
+    files = list("abcdefgh")
+    xticks = files + [""] * 8   # left block labeled, right block blank
+    ax_heat.set_xticklabels(xticks, rotation=90, fontsize=8)
+    ax_heat.set_yticklabels([str(r) for r in range(1, 9)], fontsize=8)
+
+    # optional light grid between squares
+    ax_heat.set_xticks(np.arange(-0.5, w, 1), minor=True)
+    ax_heat.set_yticks(np.arange(-0.5, h, 1), minor=True)
+    ax_heat.grid(which="minor", color="w", linewidth=0.5, alpha=0.6)
+
+    ax_heat.set_title("mean 'from' map: [true || pred]")
+    ax_heat.axvline(7.5, color="w", linewidth=1)
+    fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+
+    if save_path:
+        root, ext = os.path.splitext(save_path or "")
+        out = root + "_vp" + ext
+        plt.savefig(out, dpi=150)
+        plt.close(fig)
+    else:
+        plt.show(block=False)
+
+    # ----- numeric metrics to return -----
+    # KL (mean over batch, nats): mean sum P_true * (log P_true - log P_pred)
+    kl_per = (P_true * (np.log(P_true + EPS) - np.log(P_pred + EPS))).sum(axis=1)
+    mean_kl = float(np.mean(kl_per))
+
+    # entropy of predictions (mean)
+    ent_per = (-(P_pred * np.log(P_pred + EPS))).sum(axis=1)
+    mean_entropy = float(np.mean(ent_per))
+
+    # legal_mass_mean: use P_true>0 as proxy for legal moves
+    legal_mask = (P_true > 0).astype(np.float32)
+    legal_mass = (P_pred * legal_mask).sum(axis=1)
+    legal_mass_mean = float(np.mean(legal_mass))
+
+    # mean pred_on_true and mean pred_top1
+    mean_pred_on_true = float(np.mean(pred_on_true))
+    mean_pred_top1 = float(np.mean(pred_top1_prob))
+
+    # value metrics computed here (so caller doesn't need to)
+    # align lengths
+    nval = min(len(yp_v), len(yt_v))
+    yp_val = yp_v[:nval]
+    yt_val = yt_v[:nval]
+    value_mse = float(np.mean((yt_val - yp_val) ** 2)) if nval > 0 else float("nan")
+    value_bias = float(np.mean(yp_val - yt_val)) if nval > 0 else float("nan")
+    if nval > 1 and yt_val.std() > 0 and yp_val.std() > 0:
+        value_corr = float(np.corrcoef(yt_val, yp_val)[0, 1])
+    else:
+        value_corr = float("nan")
+
+    metrics = {
+        "N": int(N),
+        "mean_kl": mean_kl,
+        "mean_pred_entropy": mean_entropy,
+        "legal_mass_mean": legal_mass_mean,
+        "mean_pred_top1": mean_pred_top1,
+        "mean_top1_mass": m1,
+        "mean_top3_mass": m3,
+        "mean_top10_mass": m10,
+        "value_mse": value_mse,
+        "value_bias": value_bias,
+        "value_corr": value_corr
+    }
+
+    return metrics
 
 
 def score_game_data(model, X, Y_batch, save_path=None):
-    import pdb; pdb.set_trace()
-    raw_preds = model.predict(X, batch_size=256, verbose=0)
+    """
+    Run model.predict -> plot -> model.evaluate -> return a single-row
+    DataFrame with Keras numeric outputs + our custom metrics.
+    """
+    raw_preds = model.predict(X, batch_size=512, verbose=0)
     preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
 
-    # Plot overview grid
-    plot_pred_vs_true_grid(model, preds, Y_batch, save_path=save_path)
+    # Plot overview grid and get metrics (plot function returns metrics dict)
+    metrics = plot_pred_vs_true_grid(model, preds, Y_batch, save_path=save_path)
 
-    # Keras evaluate -> dataframe row
+    # Keras evaluate -> dataframe row (keep original columns)
     cols = ['total_loss'] + model.output_names
-    eval_df = pd.DataFrame(model.evaluate(X, Y_batch, verbose=0), index=cols).T
+    eval_vals = model.evaluate(X, Y_batch, verbose=0)
+    eval_df = pd.DataFrame(eval_vals, index=cols).T
 
-    # ----- Value head metrics -----
-    yt_val = np.asarray(Y_batch['value']).reshape(-1)
-    yp_val = np.asarray(preds['value']).reshape(-1)
+    # Add our metrics as columns (explicit)
+    for k, v in metrics.items():
+        # if metric exists already in eval_df, overwrite; else create column
+        eval_df[k] = v
 
-    val_mse = float(np.mean((yt_val - yp_val) ** 2))
-
-    # safe correlation (avoid NaNs if std=0)
-    yt_std = yt_val.std()
-    yp_std = yp_val.std()
-    if yt_val.size > 1 and yt_std > 0 and yp_std > 0:
-        corr = float(np.corrcoef(yt_val, yp_val)[0, 1])
-    else:
-        corr = 0.0
-
-    # ----- Classification metrics -----
-    cls_metrics = {}
-    for head in [n for n in model.output_names if n != "value"]:
-        y_true_sparse = _to_sparse_labels(Y_batch[head])
-        y_pred_sparse = np.asarray(preds[head]).argmax(axis=1)
-        acc = float((y_true_sparse == y_pred_sparse).mean())
-        cls_metrics[head] = acc
-
+    # Also print some chosen metrics for quick console feedback
     print("\n=== Extra Metrics ===")
-    print(f"Value : MSE={val_mse:.4f}, Corr={corr:.3f}")
-
+    print(
+        f"value MSE: {metrics.get('value_mse'):.5f} ",
+        f"value corr: {metrics.get('value_corr'):.3f}"
+    )
+    
+    print(
+        f"N: {metrics.get('N')}  mean KL:{metrics.get('mean_kl'):.5f} ",
+        f"mean top1 mass: {metrics.get('mean_top1_mass'):.5e}\n"
+    )
     return eval_df
 
 
@@ -492,113 +692,42 @@ def format_time(seconds):
         m, s = divmod(rem, 60)
         return f"{int(h)}h {int(m)}m {s:.2f}s"
 
-##    
-## board/ position generation
-##
 
-OPENING_BOOK = {
-    "Ruy Lopez, Morphy Defense": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"
-    ],
-    "Italian Game (Giuoco Piano)": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "c2c3", "g8f6"
-    ],
-    "Scotch Game": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f3d4", "g8f6"
-    ],
-    "Sicilian Defense, Najdorf": [
-        "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6"
-    ],
-    "Sicilian Defense, Dragon": [
-        "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "g7g6"
-    ],
-    "French Defense, Classical": [
-        "e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6", "e4e5", "f6d7"
-    ],
-    "Caro-Kann, Advance": [
-        "e2e4", "c7c6", "d2d4", "d7d5", "e4e5", "c8f5", "c2c4", "e7e6"
-    ],
-    "Caro-Kann, Classical": [
-        "e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4", "c3e4", "c8f5"
-    ],
-    "Queen's Gambit Declined": [
-        "d2d4", "d7d5", "c2c4", "e7e6", "g1f3", "g8f6", "b1c3", "c7c6"
-    ],
-    "Queen's Gambit Accepted": [
-        "d2d4", "d7d5", "c2c4", "d5c4", "g1f3", "g8f6", "e2e3", "e7e6"
-    ],
-    "Slav Defense": [
-        "d2d4", "d7d5", "c2c4", "c7c6", "g1f3", "g8f6", "b1c3", "d5c4"
-    ],
-    "Nimzo-Indian Defense": [
-        "d2d4", "g8f6", "c2c4", "e7e6", "b1c3", "f8b4"
-    ],
-    "King's Indian Defense": [
-        "d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7", "e2e4", "d7d6"
-    ],
-    "Grünfeld Defense": [
-        "d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5"
-    ],
-    "London System": [
-        "d2d4", "d7d5", "c1f4", "g8f6", "e2e3", "c7c5", "c2c3", "b8c6"
-    ],
-    "English Opening, Four Knights": [
-        "c2c4", "e7e5", "g1f3", "b8c6", "g2g3", "g8f6", "f1g2", "f8c5"
-    ],
-    "English Opening, Symmetrical": [
-        "c2c4", "c7c5", "g1f3", "g8f6", "d2d4", "c5d4", "f3d4", "b8c6"
-    ],
-    "Scandinavian Defense": [
-        "e2e4", "d7d5", "e4d5", "d8d5", "g1f3", "c8g4", "f1e2", "g4f3"
-    ],
-    "Pirc Defense": [
-        "e2e4", "d7d6", "d2d4", "g8f6", "b1c3", "g7g6", "f2f4", "f8g7"
-    ],
-    "Modern Defense": [
-        "e2e4", "g7g6", "d2d4", "f8g7", "b1c3", "d7d6", "f2f4", "c7c5"
-    ],
-    # Ultra-canonical stubs
-    "Double King Pawn (e4 e5)": ["e2e4", "e7e5"],
-    "Double Queen Pawn (d4 d5)": ["d2d4", "d7d5"],
-    "Sicilian Defense Stub (e4 c5)": ["e2e4", "c7c5"],
-    "French Defense Stub (e4 e6)": ["e2e4", "e7e6"],
-    "Caro-Kann Stub (e4 c6)": ["e2e4", "c7c6"],
-    "Pirc Stub (e4 d6)": ["e2e4", "d7d6"],
-    "Modern Stub (e4 g6)": ["e2e4", "g7g6"],
-    "English Opening Stub (c4)": ["c2c4"],
-    "Reti Stub (Nf3)": ["g1f3"],
-    "Indian Defense Stub (d4 Nf6)": ["d2d4", "g8f6"],
-    "Dutch Stub (d4 f5)": ["d2d4", "f7f5"],
-    "Benoni Stub (d4 c5)": ["d2d4", "c7c5"],
-    "Catalan Stub (d4 Nf6 c4 e6 g3)": ["d2d4", "g8f6", "c2c4", "e7e6", "g2g3"],
-    "London Stub (d4 d5 Bf4)": ["d2d4", "d7d5", "c1f4"],
-    "King’s Indian Stub (d4 Nf6 c4 g6)": ["d2d4", "g8f6", "c2c4"],
-    "Grünfeld Stub (d4 Nf6 c4 g6 Nc3 d5)": ["d2d4", "g8f6", "c2c4", "g7g6"]
-}
-
-
-def get_opening(name=None):
+def make_jsonable(obj):
+    """Recursively convert numpy types to built-in Python types so json.dump works.
+    - ndarray -> list (obj.tolist())
+    - numpy scalar -> int/float/bool via .item()
+    - dict/list/tuple -> recurse
+    Leaves normal Python objects untouched.
     """
-    Return a board set up in a chosen or random opening.
-    """
-    if name is None:
-        name = random.choice(list(OPENING_BOOK.keys()))
-    moves = OPENING_BOOK[name]
-    
-    board = chess.Board()
-    for uci in moves:
-        board.push(chess.Move.from_uci(uci))
-    return name, board
+    # numpy array
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
 
+    # numpy scalar (int32, float64, bool_, ...)
+    if isinstance(obj, (np.generic,)):
+        try:
+            return obj.item()
+        except Exception:
+            # fallback: cast with Python builtins
+            if np.issubdtype(obj.dtype, np.integer):
+                return int(obj)
+            if np.issubdtype(obj.dtype, np.floating):
+                return float(obj)
+            if np.issubdtype(obj.dtype, np.bool_):
+                return bool(obj)
+            return str(obj)
 
-def get_all_openings():
-    names, boards = [], []
-    for O in OPENING_BOOK.keys():
-        names.append(O)
-        n, b = get_opening(O)
-        boards.append(b)
-    
-    return names, boards
+    # dict: recurse
+    if isinstance(obj, dict):
+        return {k: make_jsonable(v) for k, v in obj.items()}
+
+    # list/tuple: recurse and keep type as list
+    if isinstance(obj, (list, tuple)):
+        return [make_jsonable(v) for v in obj]
+
+    # other objects: leave as-is (json.dump will fail if it's unsupported)
+    return obj
 
 
 def random_init(plies=5, python_chess=False):

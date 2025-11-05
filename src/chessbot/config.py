@@ -58,7 +58,7 @@ class Config(object):
     prior_clip_min = 0.001
 
     # TF
-    training_queue_min = 512
+    training_queue_min = 1024
     fwd_batch = 1024
     vwq_blend = 0.5
     use_vwq_alpha_taper = True

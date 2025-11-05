@@ -15,6 +15,7 @@ from tensorflow import keras
 
 from tensorflow.keras.models import Model
 from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.utils import unpack_x_y_sample_weight
 from tensorflow.keras.layers import (
     Input, Conv2D, BatchNormalization, LeakyReLU, Add,
     GlobalAveragePooling2D, Dense, Lambda
@@ -570,6 +571,7 @@ class MaskedPolicyModel(tf.keras.Model):
         self.policy_loss_tracker = tf.keras.metrics.Mean(name="policy_loss")
         self.value_loss_tracker = tf.keras.metrics.Mean(name="value_loss")
         self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.output_names = self.core.output_names
 
     @property
     def metrics(self):
@@ -585,7 +587,11 @@ class MaskedPolicyModel(tf.keras.Model):
         self.value_loss_weight = value_loss_weight
 
     def train_step(self, data):
-        (boards, legal_mask), y = data
+        # unpack robustly (handles x,y and optional sample_weight)
+        x, y, sample_weight = unpack_x_y_sample_weight(data)
+        # x is expected to be (boards, legal_mask)
+        boards, legal_mask = x
+
         labels = y["policy"]
         values = y["value"]
 
@@ -597,8 +603,8 @@ class MaskedPolicyModel(tf.keras.Model):
             mask = tf.cast(tf.reshape(legal_mask, [B, -1]), logits.dtype)
 
             masked_logits = tf.where(mask > 0.5,
-                                     logits,
-                                     tf.ones_like(logits) * BIG_NEG)
+                                    logits,
+                                    tf.ones_like(logits) * BIG_NEG)
             logp = tf.nn.log_softmax(masked_logits, axis=1)
 
             label_sums = tf.reduce_sum(labels, axis=1, keepdims=True)
@@ -610,9 +616,21 @@ class MaskedPolicyModel(tf.keras.Model):
                 tf.where(valid, per_sample_ce, tf.zeros_like(per_sample_ce))
             ) / (tf.reduce_sum(tf.cast(valid, tf.float32)) + EPS)
 
-            value_loss = tf.reduce_mean(tf.square(v_pred - values))
+            # value loss (optionally apply sample_weight['value'] if provided)
+            if sample_weight is not None and isinstance(sample_weight, dict):
+                sw_val = sample_weight.get("value", None)
+                if sw_val is not None:
+                    sw_val = tf.cast(sw_val, v_pred.dtype)
+                    # make sure shapes align: (B,) or (B,1)
+                    sw_val = tf.reshape(sw_val, tf.shape(v_pred))
+                    value_loss = tf.reduce_mean(tf.square(v_pred - values) * sw_val)
+                else:
+                    value_loss = tf.reduce_mean(tf.square(v_pred - values))
+            else:
+                value_loss = tf.reduce_mean(tf.square(v_pred - values))
+
             total_loss = (self.policy_loss_weight * policy_loss +
-                          self.value_loss_weight * value_loss)
+                        self.value_loss_weight * value_loss)
 
         grads = tape.gradient(total_loss, self.core.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.core.trainable_variables))
@@ -625,8 +643,11 @@ class MaskedPolicyModel(tf.keras.Model):
                 "policy_loss": self.policy_loss_tracker.result(),
                 "value_loss": self.value_loss_tracker.result()}
 
+
     def test_step(self, data):
-        (boards, legal_mask), y = data
+        x, y, sample_weight = unpack_x_y_sample_weight(data)
+        boards, legal_mask = x
+
         labels = y["policy"]
         values = y["value"]
 
@@ -637,8 +658,8 @@ class MaskedPolicyModel(tf.keras.Model):
         mask = tf.cast(tf.reshape(legal_mask, [B, -1]), logits.dtype)
 
         masked_logits = tf.where(mask > 0.5,
-                                 logits,
-                                 tf.ones_like(logits) * BIG_NEG)
+                                logits,
+                                tf.ones_like(logits) * BIG_NEG)
         logp = tf.nn.log_softmax(masked_logits, axis=1)
 
         label_sums = tf.reduce_sum(labels, axis=1, keepdims=True)
@@ -649,9 +670,20 @@ class MaskedPolicyModel(tf.keras.Model):
             tf.where(valid, per_sample_ce, tf.zeros_like(per_sample_ce))
         ) / (tf.reduce_sum(tf.cast(valid, tf.float32)) + EPS)
 
-        value_loss = tf.reduce_mean(tf.square(v_pred - values))
+        # value loss (optionally weighted)
+        if sample_weight is not None and isinstance(sample_weight, dict):
+            sw_val = sample_weight.get("value", None)
+            if sw_val is not None:
+                sw_val = tf.cast(sw_val, v_pred.dtype)
+                sw_val = tf.reshape(sw_val, tf.shape(v_pred))
+                value_loss = tf.reduce_mean(tf.square(v_pred - values) * sw_val)
+            else:
+                value_loss = tf.reduce_mean(tf.square(v_pred - values))
+        else:
+            value_loss = tf.reduce_mean(tf.square(v_pred - values))
+
         total_loss = (self.policy_loss_weight * policy_loss +
-                      self.value_loss_weight * value_loss)
+                    self.value_loss_weight * value_loss)
 
         self.policy_loss_tracker.update_state(policy_loss)
         self.value_loss_tracker.update_state(value_loss)
@@ -660,28 +692,42 @@ class MaskedPolicyModel(tf.keras.Model):
         return {"loss": self.total_loss_tracker.result(),
                 "policy_loss": self.policy_loss_tracker.result(),
                 "value_loss": self.value_loss_tracker.result()}
+
     
     def call(self, inputs, training):
         return self.core(inputs, training=training)
-    
+
     def save(self, path):
         self.core.save(path)
 
     @classmethod
-    def from_saved(cls, path):
+    def from_saved(cls, path, compile_model=True, lr=1e-4,
+                   policy_loss_weight=1.0, value_loss_weight=1.0):
         """
         Load a MaskedPolicyModel previously saved with save(path).
-        Returns a built subclass instance (not compiled).
+        Builds the subclass and optionally compiles it with defaults.
         """
-        # load the functional core (works for SavedModel dir or .h5 file)
         core_loaded = tf.keras.models.load_model(path)
         inst = cls(core_loaded)
         # try to build so model.summary() is usable immediately
         try:
             inst.build(input_shape=[(None, 8, 8, 29), (None, 4096)])
         except Exception:
-            # if build fails (nonstandard shapes), ignore — user can call build/call
             pass
+
+        if compile_model:
+            try:
+                inst.compile(
+                    optimizer=tf.keras.optimizers.Adam(lr),
+                    policy_loss_weight=policy_loss_weight,
+                    value_loss_weight=value_loss_weight
+                )
+            except Exception:
+                # best-effort fallback: set attributes manually so eval works
+                inst.optimizer = tf.keras.optimizers.Adam(lr)
+                inst.policy_loss_weight = policy_loss_weight
+                inst.value_loss_weight = value_loss_weight
+
         return inst
 
     @classmethod
@@ -818,8 +864,8 @@ class MaskedPolicyModel(tf.keras.Model):
         return fwd
 
 ### TO MAKE A MODEL ###
-# from chessbot import MODEL_DIR
-# model_loc = MODEL_DIR + "conv_stm_pov_test.h5"
+#from chessbot import MODEL_DIR
+#model_loc = MODEL_DIR + "conv_stm_pov_test.h5"
 # core = MaskedPolicyModel.build_core(n_blocks=10, name="stm_pov_v1")
 # core.compile(
 #     optimizer=tf.keras.optimizers.Adam(1e-4),

@@ -544,7 +544,8 @@ class GameLooper(object):
         # store for logging too
         self.moves_played += moves
         self.sims_done_total += sims_total
-
+        
+        # cast types for JSON 
         mem_summary = {
             "ts": _now(),
             "game_id": game.game_id,
@@ -553,7 +554,7 @@ class GameLooper(object):
             "result": game.outcome or 0.0,
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
-            "duration": _now() - game.started_at,
+            "duration": int(_now() - game.started_at),
             "sims_per_move": round(avg_sims, 3)
         }
         # small in-memory record for recent prints only
@@ -574,6 +575,9 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
 
+        # make json safe
+        res = cbu.make_jsonable(res)
+        
         # save per-game JSON
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.json")
         out_path = pathlib.Path(out_file)
@@ -648,8 +652,6 @@ class GameLooper(object):
         # combined list: existing queue first, additional appended
         combined = list(self.training_queue) + list(additional)
         n_main = len(self.training_queue)
-        n_add  = len(additional)
-        total = len(combined)
 
         # Unpack examples, but only accept examples that include 'policy'
         X_list = []
@@ -705,7 +707,6 @@ class GameLooper(object):
 
         # default scale factors (no downscaling)
         s_main, s_add = 1.0, 1.0
-
         if M_sum > 0.0 and A_sum > 0.0:
             R = adr
             required_s_main = A_sum / (R * M_sum)
@@ -741,14 +742,17 @@ class GameLooper(object):
         eval_df = cbu.score_game_data(self.model, [X, M], Y, save_path=plt_file)
         eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
-        self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)
+        self.all_evals.round(5).to_csv(self.config.progress_csv_path, index=False)
 
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             plt_file = self.config.progress_plot_path
             cbu.plot_training_progress(self.all_evals, save_path=plt_file)
 
-        # fit and save new model: note X is a list/tuple matching model inputs (planes, mask)
-        self.model.fit([X, M], Y, epochs=2, batch_size=512, verbose=0, sample_weight=s_wts)
+        # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
+        self.model.fit(
+            [X, M], Y, epochs=2, batch_size=512, verbose=0, sample_weight=s_wts
+        )
+        
         self.model.save(self.config.model_path)
 
         # update the fwd helper and clear queues/caches
@@ -907,18 +911,16 @@ def main():
         except Exception as e:
             print(e)
     
-    looper.run()
     # start the analysis server
-    #phs = start_post_hoc_server(looper.config.run_dir)
+    phs = start_post_hoc_server(looper.config.run_dir)
+    try:
+       looper.run()
     
-    #try:
-    #    looper.run()
+    except Exception as e:
+       print("Error encountered", e)
         
-    #except Exception as e:
-    #    print("Error encountered", e)
-        
-    #finally:
-    #    stop_post_hoc_server(phs, timeout=10)
+    finally:
+       stop_post_hoc_server(phs, timeout=10)
         
 
 if __name__ == '__main__':

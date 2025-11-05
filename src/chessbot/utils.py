@@ -27,6 +27,35 @@ MATE_CP = 2500
 CLIP_MAX = 1200
 
 
+def cp_to_value(cp):
+    #check for mates
+    if cp.score() is None:
+        return np.clip(cp.score(mate_score=16), -10, 10) / 10
+        
+    else:
+        return np.clip(cp.score() / 1000, -0.95, 0.95)
+
+
+def cp_to_value_tanh(cp, mid_cp=400.0):
+    # scale so tanh(k * mid_cp) == 0.5  =>  k = atanh(0.5) / mid_cp
+    k = math.atanh(0.5) / mid_cp
+
+    # clip so checkmates still look much better
+    return np.clip(math.tanh(k * cp), -0.97, 0.97)
+
+
+def score_to_value_white(board_score):
+    # always look from whites perspective
+    from_white = board_score.white()
+    return cp_to_value(from_white)
+
+
+def score_to_value_stm_pov(board_score):
+    # always look from whites perspective
+    rel_score = board_score.relative
+    return cp_to_value(rel_score)
+
+# another method of converting scores
 def score_clipped(x, clip_max=CLIP_MAX):
     return np.clip(x.score(mate_score=MATE_CP), -clip_max, clip_max)
 
@@ -336,6 +365,7 @@ def _topk_from_logits(y_true_sparse, y_pred_logits, k=1):
 
 
 def score_game_data(model, X, Y_batch, save_path=None):
+    import pdb; pdb.set_trace()
     raw_preds = model.predict(X, batch_size=256, verbose=0)
     preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
 

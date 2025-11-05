@@ -317,7 +317,23 @@ gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
 
+from pyfastchess import Board
+from chessbot.utils import random_init
 
+b = random_init(4)
+
+b = Board()
+ucis = b.legal_moves()
+i1 = b.moves_to_indices(ucis)
+
+
+b.push_uci("e2e4")
+b.push_uci("e7e5")
+b.push_uci("d2d4")
+ucis = b.legal_moves()
+i2 = b.moves_to_indices(ucis)
+
+[x for x in i2 if x not in i1]
 
 
 

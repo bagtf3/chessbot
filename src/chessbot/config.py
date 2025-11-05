@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_stm_pov_phase1"
+    run_tag = "conv_stm_pov_test"
     selfplay_dir =  SP_DIR
     init_model = MODEL_DIR + "conv_stm_pov_test.h5"
     
@@ -17,9 +17,9 @@ class Config(object):
     endgame_uniform_mix = 0.2
 
     # Simulation schedule
-    sims_floor = 1000
-    sims_target = 2000
-    sims_ceiling = 3500
+    sims_floor = 50
+    sims_target = 100
+    sims_ceiling = 200
     micro_batch_size = 10
 
     # early stop
@@ -58,13 +58,12 @@ class Config(object):
     prior_clip_min = 0.001
 
     # TF
-    training_queue_min = 4096
+    training_queue_min = 512
     fwd_batch = 1024
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
     target_mean = 0.1
     additional_data_ratio = 1.0
-    factorized_bins = (64, 64, 6, 4)
 
     def to_dict(self):
         return {

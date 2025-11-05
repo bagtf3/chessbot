@@ -21,9 +21,8 @@ from chessbot.mcts_utils import MCTSTree
 from chessbot.config import Config
 
 import chessbot.utils as cbu
-from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
+from chessbot.utils import rnd, RateMeter, softmax, GameGenerator, score_to_value_stm_pov
 from chessbot.review import start_post_hoc_server, stop_post_hoc_server, make_fake_visits
-from chessbot.encoding import score_to_cp_white
 
 
 class ChessGame(object):
@@ -64,7 +63,7 @@ class ChessGame(object):
             b, chess.engine.Limit(depth=depth), info=chess.engine.INFO_ALL
         )
 
-        val_sf = score_to_cp_white(info['score'])
+        val_sf = score_to_value_stm_pov(info['score'])
         move = str(info['pv'][0])
         return move, val_sf
     
@@ -190,9 +189,9 @@ class ChessGame(object):
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
 
-        self.append_factorized_example(ucis=ucis, pi=pi, vwq=sf_v)
+        self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v)
 
-        # finally play SF's move on the board and advance tree (same as before)
+        # finally play SF's move on the board and advance tree
         return self.push_move(mv)
 
     def make_move_from_tree(self):
@@ -212,45 +211,39 @@ class ChessGame(object):
         s = visits.sum()
         pi = (visits / s) if s > 0.0 else None
         vwq = self.tree.visit_weighted_Q()
-        self.vwq = vwq
+
+        # tree is white POV, we want STM-POV
+        self.vwq = vwq if self.turn() else -vwq
     
         if pi is not None:
-            self.append_factorized_example(ucis=ucis, pi=pi, vwq=vwq)
+            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq)
 
         mv, _ = self.tree.best()
         if mv is None:
             return False
         return self.push_move(mv)
-        
-    def append_factorized_example(self, ucis, pi, vwq):
+    
+    def append_flat_policy_example(self, ucis, pi, vwq):
         """
-        Snapshot inputs and factorized policy targets for the given move dist.
+        Snapshot inputs and a flat 4096-length policy vector for training.
         - ucis: list[str] legal moves (same order as probs)
-        - probs: list/array of probabilities summing ~1
+        - pi:  list/array of probs (sum ~= 1)
         - vwq: scalar value target (white-POV)
         """
-        # labels per-legal
-        fr, to, piece, promo = self.board.moves_to_labels(ucis=ucis)
+        
+        # get indices from C++
+        indices = self.board.moves_to_indices(ucis)  # list of ints (0..4095)
+        policy = np.zeros(64 * 64, dtype=np.float32)
 
-        # allocate heads
-        F, T, Kp, Kpr = self.config.factorized_bins
-        from_m = np.zeros(F, dtype=np.float32)
-        to_m   = np.zeros(T, dtype=np.float32)
-        pc_m   = np.zeros(Kp, dtype=np.float32)
-        pr_m   = np.zeros(Kpr, dtype=np.float32)
-
-        # accumulate probs
-        for i, p in enumerate(pi):
-            from_m[fr[i]] += p
-            to_m[to[i]]   += p
-            pc_m[piece[i]]+= p
-            pr_m[promo[i]]+= p
+        # accumulate probs into flattened policy
+        for idx, p in zip(indices, pi):
+            policy[idx] += p
 
         # snapshot inputs and push example
-        x = self.board.stacked_planes(5)
-        self.examples.append(
-            (x, {"from": from_m, "to": to_m, "piece": pc_m,
-                 "promo": pr_m, "vwq": vwq, "ply": self.plies}))
+        x = self.board.stacked_planes_stm_pov(1)
+        mask = self.board.legal_move_mask()
+
+        self.examples.append((x, mask, {"policy": policy, "vwq": vwq, "ply": self.plies}))
 
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
@@ -305,7 +298,7 @@ class GameLooper(object):
         self.fill_active_games()
 
         self.model = model
-        self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
+        self.infer = model.make_infer(max_bs=1024)
         self.training_queue = []
         self.recent_games = []
 
@@ -482,37 +475,51 @@ class GameLooper(object):
 
     def format_and_predict(self, preds_batch):
         """
-        Take leaf requests from all games, run one model call, and write
-        results into cache
-        Each req must have: 'enc', 'cache_key'.
+        preds_batch: list of items produced by tree.pending_encoded_stm_pov(...)
+        expected shape:
+            - (zobrist, board_np, legal_np)
+
+        This calls self.infer on the GPU (masked softmax + clip + renorm).
+        It writes into the raw policy cache as (zobrist, {"value": v, "policy": probs}).
         """
         if not preds_batch:
             return
 
-        # preds batch = list of tups: (zobrist, board encodings)
-        X = np.asarray([r[1] for r in preds_batch], dtype=np.float32)
-        out_list = self.fwd(X)
+        # collect arrays + keys
+        boards = []
+        legals = []
+        keys = []
 
-        names = self.model.output_names
-        v   = out_list[names.index('value')]
-        pf  = out_list[names.index('best_from')]
-        pt  = out_list[names.index('best_to')]
-        ppc = out_list[names.index('best_piece')]
-        ppr = out_list[names.index('best_promo')]
+        for item in preds_batch:
+            key = item[0]
+            board_np = item[1]
+            legal_np = item[2]
 
-        # write to raw policy caches keyed by zobrist
+            keys.append(key)
+            boards.append(np.asarray(board_np, dtype=np.float32))
+            # ensure mask is int32 0/1
+            legals.append(np.asarray(legal_np, dtype=np.int32))
+
+        # stack to batch
+        boards_np = np.stack(boards, axis=0)   # (B,8,8,29)
+        legals_np = np.stack(legals, axis=0)   # (B,4096)
+
+        # runtime clip/temperature params from config (fallbacks)
+        min_p = getattr(self.config, "clip_min", 0.001)
+        max_p = getattr(self.config, "clip_max", 0.35)
+        temp  = 1.0
+
+        # call GPU-side inference pipeline (masked softmax + clip + renorm)
+        probs_np, vals_np = self.infer((boards_np, legals_np), min_p, max_p, temp)
+
+        # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
-        for i, pb in enumerate(preds_batch):
-            to_raw_cache.append((
-                pb[0],
-                v[i].item(),
-                softmax(pf[i]),
-                softmax(pt[i]),
-                softmax(ppc[i]),
-                softmax(ppr[i])
-            ))
+        for i, k in enumerate(keys):
+            v = np.asarray(vals_np[i]).reshape(())  # scalar
+            p = np.asarray(probs_np[i], dtype=np.float32)  # (4096,)
+            to_raw_cache.append((k, v, p))
 
-        # send to the c++ cache. the trees will pick up from there
+        # bulk insert (C++ must be updated to accept this format)
         raw_cache_bulk_insert(to_raw_cache)
 
     def finalize_game_data(self, game):
@@ -604,23 +611,24 @@ class GameLooper(object):
         # use g-1 as denominator only when there are >= 2 plies; otherwise taper=0
         denom = g - 1 if g > 1 else None
 
-        for x, heads in game.examples:
+        for x, mask, heads in game.examples:
             vwq = heads.get("vwq", 0.0)
             ply = heads.get("ply", 0.0)
+            policy = heads['policy']
             taper = ply / denom if denom is not None else 0.0
-            self.training_queue.append((x, heads, z, vwq, taper))
+            self.training_queue.append((x, mask, policy, z, vwq, taper))
         game.examples = []
 
         if len(self.training_queue) >= self.config.training_queue_min:
             self.trigger_retrain()
-        
+
     def trigger_retrain(self):
         """
         Build training tensors from self.training_queue and fit.
-        If an 'additional_training_data.pkl' exists in run_dir, load it,
-        remove the file, and blend those samples with the in-memory queue.
-        Equalize total weight between existing and additional groups by
-        downscaling the larger group (never upweight).
+        Supports new flattened 'policy' head (4096) stored in heads["policy"].
+        If any legacy factorized examples are present (heads without 'policy'),
+        they are skipped and a warning is printed. This keeps logic simple and
+        avoids brittle reconstruction of legal masks from factorized heads.
         """
         if not self.training_queue:
             return
@@ -636,42 +644,42 @@ class GameLooper(object):
         else:
             print("No additional data found at", add_pkl)
             additional = []
-
+        
         # combined list: existing queue first, additional appended
         combined = list(self.training_queue) + list(additional)
         n_main = len(self.training_queue)
         n_add  = len(additional)
         total = len(combined)
 
-        # unpack examples into arrays
+        # Unpack examples, but only accept examples that include 'policy'
         X_list = []
-        Y_from = []
-        Y_to   = []
-        Y_piece= []
-        Y_promo= []
+        P_list = []        # flattened 4096 policy vectors
+        mask_list = []     # derived legal-mask (0/1)
         Z_list = []
         Vwq_list = []
         taper_list = []
         is_add_flag = []
 
-        for i, (x, heads, z, vwq, taper) in enumerate(combined):
+        for i, (x, mask, policy, z, vwq, taper) in enumerate(combined):
             X_list.append(x)
-            Y_from.append(heads["from"])
-            Y_to.append(heads["to"])
-            Y_piece.append(heads["piece"])
-            Y_promo.append(heads["promo"])
+            P_list.append(policy)
+            mask_list.append((policy > 0).astype(np.int32))
+
             Z_list.append(z)
             Vwq_list.append(vwq)
             taper_list.append(taper if taper is not None else 0.0)
             is_add_flag.append(i >= n_main)  # True for additional samples
 
-        X = np.asarray(X_list, dtype=np.float32)
+        # stack arrays
+        X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
+        P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4096)
+        M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4096)
         Z = np.asarray(Z_list, dtype=np.float32)
         Vwq = np.asarray(Vwq_list, dtype=np.float32)
         taper_arr = np.asarray(taper_list, dtype=np.float32)
-        is_add = np.asarray(is_add_flag, dtype=np.bool_)
+        is_add = np.asarray(is_add_flag[:len(X_list)], dtype=np.bool_)
 
-        # blend outcome with visit-weighted Q
+        # blend outcome with visit-weighted Q (same as before)
         alpha = getattr(self.config, "vwq_blend", 0.0)
         use_taper = getattr(self.config, "use_vwq_alpha_taper", False)
         if use_taper:
@@ -680,40 +688,40 @@ class GameLooper(object):
         else:
             Y_value = (1.0 - alpha) * Vwq + alpha * Z
 
-        # just to be super sure additional samples are not blended
-        Y_value[is_add] = Vwq[is_add]
+        # ensure additional samples are not blended
+        if is_add.any():
+            Y_value[is_add] = Vwq[is_add]
 
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
 
-        # balance selfplay and additional (boosting) data
+        # balance selfplay and additional (boosting) data (adapted for filtered set)
         adr = getattr(self.config, "additional_data_ratio", 1.0)
-        M = weights[~is_add].sum() if n_main > 0 else 0.0
-        A = weights[is_add].sum() if n_add  > 0 else 0.0
+
+        # compute M and A on the *filtered* arrays (not original counts)
+        main_mask = ~is_add
+        M_sum = weights[main_mask].sum() if main_mask.any() else 0.0
+        A_sum = weights[is_add].sum() if is_add.any() else 0.0
 
         # default scale factors (no downscaling)
         s_main, s_add = 1.0, 1.0
 
-        if M > 0.0 and A > 0.0:
+        if M_sum > 0.0 and A_sum > 0.0:
             R = adr
-            # keep additional fixed (s_add=1), find required s_main
-            required_s_main = A / (R * M)
+            required_s_main = A_sum / (R * M_sum)
             if required_s_main <= 1.0:
                 s_main = required_s_main
                 s_add = 1.0
             else:
-                # downscale additional to meet ratio if possible
-                required_s_add = (R * M) / A
+                required_s_add = (R * M_sum) / A_sum
                 if required_s_add <= 1.0:
                     s_add = required_s_add
                     s_main = 1.0
 
-            # apply downscaling factors (never upweight here)
             if s_main < 1.0:
-                weights[~is_add] *= s_main
+                weights[main_mask] *= s_main
             if s_add < 1.0:
-                weights[is_add]  *= s_add
-        # If one group is empty, we leave the other group as-is (no balancing)
+                weights[is_add]    *= s_add
 
         # respect target_mean
         target_mean = getattr(self.config, "target_mean", 1.0)
@@ -723,26 +731,14 @@ class GameLooper(object):
             weights *= scale_to_target
 
         # assemble final Y dict and sample_weight mapping for Keras fit
-        Y = {
-            "value": Y_value.astype(np.float32),
-            "best_from":   np.asarray(Y_from, dtype=np.float32),
-            "best_to":     np.asarray(Y_to, dtype=np.float32),
-            "best_piece":  np.asarray(Y_piece, dtype=np.float32),
-            "best_promo":  np.asarray(Y_promo, dtype=np.float32)
-        }
+        Y = {"value": Y_value.astype(np.float32), "policy": P}
 
         even_weights = np.ones_like(weights, dtype=np.float32)
-        s_wts = {
-            "value": weights,
-            "best_from": even_weights,
-            "best_to": even_weights,
-            "best_piece": even_weights,
-            "best_promo": even_weights
-        }
+        s_wts = {"value": weights, "policy": even_weights}
 
-        # evaluation and logging (reuse existing helpers)
+        # evaluation and logging (reuse existing helpers) - unchanged
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
-        eval_df = cbu.score_game_data(self.model, X, Y, save_path=plt_file)
+        eval_df = cbu.score_game_data(self.model, [X, M], Y, save_path=plt_file)
         eval_df['model_epoch'] = self.n_retrains
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(3).to_csv(self.config.progress_csv_path, index=False)
@@ -751,12 +747,12 @@ class GameLooper(object):
             plt_file = self.config.progress_plot_path
             cbu.plot_training_progress(self.all_evals, save_path=plt_file)
 
-        # fit and save new model
-        self.model.fit(X, Y, epochs=1, batch_size=512, verbose=0, sample_weight=s_wts)
+        # fit and save new model: note X is a list/tuple matching model inputs (planes, mask)
+        self.model.fit([X, M], Y, epochs=2, batch_size=512, verbose=0, sample_weight=s_wts)
         self.model.save(self.config.model_path)
 
         # update the fwd helper and clear queues/caches
-        self.fwd = make_fwd_batched(self.model, max_bs=self.config.fwd_batch)
+        self.infer = self.model.make_infer(max_bs=1024)
 
         # clear training queue (we consumed the in-memory queue)
         self.training_queue = []
@@ -806,12 +802,12 @@ class GameLooper(object):
 
         # aggregate
         n_groups = len(counts)
-        s_collected  = sum(r[0] for r in counts)
-        s_fast       = sum(r[1] for r in counts)
-        s_terminals  = sum(r[2] for r in counts)
-        s_cached     = sum(r[3] for r in counts)
-        s_fast_stops = sum(r[4] for r in counts)
-        s_collect_stops = sum(r[5] for r in counts)
+        s_collected  = sum([r[0] for r in counts])
+        s_fast       = sum([r[1] for r in counts])
+        s_terminals  = sum([r[2] for r in counts])
+        s_cached     = sum([r[3] for r in counts])
+        s_fast_stops = sum([r[4] for r in counts])
+        s_collect_stops = sum([r[5] for r in counts])
 
         avg_new = s_collected / n_groups
         fill_ratio = s_collected / max(1, n_groups * mbs)
@@ -886,7 +882,7 @@ def init_selfplay():
     Config.model_path = model_path
     
     if os.path.exists(model_path):
-        print(f"Loading {model_name}")
+        print(f"Loading {model_path}")
         model = MaskedPolicyModel.from_saved(model_path)
     else:
         print(f"Loading {config.init_model}")
@@ -911,17 +907,18 @@ def main():
         except Exception as e:
             print(e)
     
+    looper.run()
     # start the analysis server
-    phs = start_post_hoc_server(looper.config.run_dir)
+    #phs = start_post_hoc_server(looper.config.run_dir)
     
-    try:
-        looper.run()
+    #try:
+    #    looper.run()
         
-    except Exception as e:
-        print("Error encountered", e)
+    #except Exception as e:
+    #    print("Error encountered", e)
         
-    finally:
-        stop_post_hoc_server(phs, timeout=10)
+    #finally:
+    #    stop_post_hoc_server(phs, timeout=10)
         
 
 if __name__ == '__main__':

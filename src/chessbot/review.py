@@ -3,7 +3,6 @@ import psutil
 import uuid
 
 import pickle
-import math
 
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
@@ -18,7 +17,10 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd, calc_entropy
+from chessbot.utils import (
+    score_cp_relative, score_cp_white_pov, score_to_value_stm_pov, rnd,
+    calc_entropy, cp_to_value_tanh
+)
 
 
 BLUNDER_CP = 60
@@ -800,12 +802,6 @@ def save_analysis_chunk_simple(run_dir, batch):
     return outp, cpl, bmr, top3
 
 
-def cp_to_value(cp, mid_cp=400.0):
-    # scale so tanh(k * mid_cp) == 0.5  =>  k = atanh(0.5) / mid_cp
-    k = math.atanh(0.5) / mid_cp
-    return math.tanh(k * cp)
-
-
 def make_fake_visits(mv, lms, ratio_best=50):
     visits = [[mv, int(ratio_best)]]
     
@@ -826,29 +822,21 @@ def make_training_sample(b, v, visits):
     s = counts.sum()
     pi = (counts / s) if s > 0.0 else None
     
-    # labels per-legal
-    fr, to, piece, promo = b.moves_to_labels(ucis=ucis)
+    # get indices from C++
+    indices = b.moves_to_indices(ucis)  # list of ints (0..4095)
+    policy = np.zeros(64 * 64, dtype=np.float32)
 
-    # allocate heads
-    from_m = np.zeros(64, dtype=np.float32)
-    to_m   = np.zeros(64, dtype=np.float32)
-    pc_m   = np.zeros(6, dtype=np.float32)
-    pr_m   = np.zeros(4, dtype=np.float32)
+    # accumulate probs into flattened policy
+    for idx, p in zip(indices, pi):
+        policy[idx] += p
 
-    # accumulate probs
-    for i, p in enumerate(pi):
-        from_m[fr[i]] += p
-        to_m[to[i]]   += p
-        pc_m[piece[i]]+= p
-        pr_m[promo[i]]+= p
+    x = b.stacked_planes_stm_pov(1)
+    mask = b.legal_move_mask()
 
-    # snapshot inputs and push example
-    x = b.stacked_planes(5)
-    policy_heads = {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m}
-
-    # needs to match looper's training_queue: x, heads, Z (outcome), value, taper
-    tup = (x, policy_heads, 0, v, None)
+    # needs to match looper's training_queue: (x, mask, policy, z, vwq, taper)
+    tup = (x, mask, policy, 0, v, 0)
     return tup
+
 
 def sf_eval(b, engine=None):
     if not isinstance(b, chess.Board):
@@ -867,8 +855,7 @@ def sf_eval(b, engine=None):
             b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
         )
         
-        score = score_cp_white_pov(info['score'])
-        val = cp_to_value(score)
+        val = score_to_value_stm_pov(info['score'])
         best_move = info['pv'][0]
     except Exception as e:
         print(e)
@@ -930,14 +917,14 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         
         # happy path, not a blunder
         if row['delta'].item() < BLUNDER_CP:
-            v = cp_to_value(row['played_absolute'].item())
+            v = cp_to_value_tanh(row['played_absolute'].item())
             ts = make_training_sample(b, v, visits)
             training_data.append(ts)
             b.push_uci(mv)
         
         # if a blunder, dont use actual visits (theyre wrong)
         else:
-            best_v = cp_to_value(row['best_absolute'].item())
+            best_v = cp_to_value_tanh(row['best_absolute'].item())
             best_mv = row['best_move'].item()
             best_visits = make_fake_visits(best_mv, lms)
             ts_best = make_training_sample(b, best_v, best_visits)
@@ -987,7 +974,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
 def report_unprocessed(entries, seen_games):
     unproc = sum([1 for e in entries if e.get('game_id') not in seen_games])
     if unproc:
-        print(f"{PH} {unproc} unprocessed games currently in queue")
+        print(f"{PH} {unproc} unprocessed game(s) currently in queue")
 
 
 def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):

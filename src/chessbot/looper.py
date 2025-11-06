@@ -448,9 +448,9 @@ class GameLooper(object):
 
                     print("Clearing caches after training")
                     cs = "[cache stats]"
-                    print(f"{cs} size={p_size}/{p_cap} evictions={p_ev} queries={p_q}")
+                    print(f"{cs} size: {p_size}/{p_cap} evictions: {p_ev} queries: {p_q}")
                     print(
-                        f"{cs} hits={p_h} hit_rate={p_hit:.2f}% evict_rate={p_evr:.2f}%"
+                        f"{cs} hits: {p_h} hit_rate: {p_hit:.2f}% evict_rate: {p_evr:.2f}%"
                     )
 
                     # finally clear them
@@ -491,13 +491,11 @@ class GameLooper(object):
         keys = []
 
         for item in preds_batch:
-            key = item[0]
+            keys.append(item[0])
             board_np = item[1]
             legal_np = item[2]
-
-            keys.append(key)
+            
             boards.append(np.asarray(board_np, dtype=np.float32))
-            # ensure mask is int32 0/1
             legals.append(np.asarray(legal_np, dtype=np.int32))
 
         # stack to batch
@@ -511,7 +509,7 @@ class GameLooper(object):
 
         # call GPU-side inference pipeline (masked softmax + clip + renorm)
         probs_np, vals_np = self.infer((boards_np, legals_np), min_p, max_p, temp)
-
+        
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
         for i, k in enumerate(keys):
@@ -914,14 +912,12 @@ def main():
     # start the analysis server
     phs = start_post_hoc_server(looper.config.run_dir)
     try:
-       looper.run()
-    
+        looper.run()
     except Exception as e:
        print("Error encountered", e)
-        
     finally:
        stop_post_hoc_server(phs, timeout=10)
-        
+
 
 if __name__ == '__main__':
     main()

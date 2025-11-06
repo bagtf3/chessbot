@@ -7,9 +7,9 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_stm_pov_test"
+    run_tag = "conv_stm_pov_phase1"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_stm_pov_test.h5"
+    init_model = MODEL_DIR + "conv_stm_pov_init.h5"
     
     # MCTS
     c_puct = 2.0
@@ -18,7 +18,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 100
+    sims_target = 150
     sims_ceiling = 200
     micro_batch_size = 10
 
@@ -38,7 +38,7 @@ class Config(object):
 
     # Game stuff
     games_at_once = 100
-    n_training_games = 1000
+    n_training_games = 2000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -48,8 +48,8 @@ class Config(object):
     sf_depth = 15
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
-        "random_middle_game": 0.25, "random_endgame": 0.15,
+        "pre_opened": 0.3, "random_init": 0.3,
+        "random_middle_game": 0.25, "random_endgame": 0.05,
         "piece_odds": 0.05, "piece_training": 0.05
     }
     
@@ -58,11 +58,11 @@ class Config(object):
     prior_clip_min = 0.001
 
     # TF
-    training_queue_min = 1024
+    training_queue_min = 2048
     fwd_batch = 1024
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
-    target_mean = 0.1
+    target_mean = 0.25
     additional_data_ratio = 1.0
 
     def to_dict(self):

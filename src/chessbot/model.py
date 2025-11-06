@@ -864,8 +864,8 @@ class MaskedPolicyModel(tf.keras.Model):
         return fwd
 
 ### TO MAKE A MODEL ###
-#from chessbot import MODEL_DIR
-#model_loc = MODEL_DIR + "conv_stm_pov_test.h5"
+# from chessbot import MODEL_DIR
+# model_loc = MODEL_DIR + "conv_stm_pov_init.h5"
 # core = MaskedPolicyModel.build_core(n_blocks=10, name="stm_pov_v1")
 # core.compile(
 #     optimizer=tf.keras.optimizers.Adam(1e-4),

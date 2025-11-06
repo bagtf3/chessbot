@@ -224,24 +224,30 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     def col_vals(name):
         return all_evals[name].values if name in all_evals.columns else None
 
-    # First figure: 1x3 (MA15)
-    figs = []
-    ######################
-    cols1 = ["total_loss", "policy_logits", "value_out"]
+    # First figure: 1x3 (MA15) — raw lines one color, MA lines another color
     fig1, axs1 = plt.subplots(1, 3, figsize=(15, 4))
-    palette = sns.color_palette(None)
-    for ax, name, c in zip(axs1, cols1, palette):
+
+    # choose stable colors: blue for raw, orange for MA (matches your attached plot)
+    palette = sns.color_palette("tab10")
+    RAW_COL = palette[0]
+    MA_COL  = palette[1]   
+    MA_ALPHA = 0.6         
+
+    for ax, name in zip(axs1, cols1):
         y = col_vals(name)
         if y is None:
             ax.text(0.5, 0.5, f"missing: {name}", ha="center", va="center")
             ax.set_axis_off()
             continue
         x = np.arange(len(y))
-        ax.plot(x, y, label=name, color=c)
+        # raw series (same color for all panels)
+        ax.plot(x, y, label=name, color=RAW_COL)
+        # MA15 (same MA color for all panels, slightly transparent)
         ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7, label=f"{name} (MA15)", color=c)
+        ax.plot(x, ma, lw=2, alpha=MA_ALPHA, label=f"{name} (MA15)", color=MA_COL)
         ax.set_title(name)
         ax.legend(fontsize=8)
+
     plt.tight_layout()
     figs.append((fig1, axs1))
 
@@ -383,7 +389,7 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
             f.show()
 
 
-def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
+def plot_pred_vs_true_grid(model, preds, X, y_true_dict, save_path=None):
     """
     Single figure: value (hexbin) + policy diagnostics for flat 4096 head.
     Returns a dict of numeric metrics (so caller can write them into df).
@@ -391,17 +397,28 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
       preds['policy_logits'] (N,4096), preds['value_out'] (N,1)
       y_true_dict['policy'] (N,4096), y_true_dict['value'] (N,)
     """
+    
     EPS = 1e-12
-
     # value arrays (explicit)
     yp_v = np.asarray(preds['value_out'], dtype=np.float32).reshape(-1)
     yt_v = np.asarray(y_true_dict['value'], dtype=np.float32).reshape(-1)
 
     # policy logits -> softmax probs (explicit stable softmax)
-    P_logits = np.asarray(preds['policy_logits'], dtype=np.float32)
-    P_logits = P_logits - P_logits.max(axis=1, keepdims=True)
-    P_exp = np.exp(P_logits)
-    P_pred = P_exp / (P_exp.sum(axis=1, keepdims=True) + EPS)
+    # X is the model input list/tuple: [boards, legal_mask]
+    legal_mask = np.asarray(X[1])
+    mask = (legal_mask > 0.5)
+    
+    logits = np.asarray(preds['policy_logits'], dtype=np.float64)  # (N,4096)
+    masked = np.where(mask, logits, -np.inf)                       # illegal -> -inf
+    row_max = np.max(masked, axis=1, keepdims=True)                # -inf if fully masked
+    finite = np.isfinite(row_max).flatten()
+    P_pred = np.zeros_like(masked, dtype=np.float64)
+    
+    # masked softmax leveraging np.exp(-np.inf) = 0
+    if finite.any():
+        shifted = masked[finite] - row_max[finite]                # stable shift
+        exp_shift = np.exp(shifted)
+        P_pred[finite] = exp_shift / (exp_shift.sum(axis=1, keepdims=True) + 1e-300)
 
     # true policy probs (explicit normalize)
     P_true = np.asarray(y_true_dict['policy'], dtype=np.float32)
@@ -456,11 +473,11 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     N = P_pred.shape[0]
     idx_true_top1 = P_true.argmax(axis=1)
     true_top1_prob = P_true[np.arange(N), idx_true_top1]
-    pred_on_true = P_pred[np.arange(N), idx_true_top1]
+    pred_on_true_top1 = P_pred[np.arange(N), idx_true_top1]
     pred_top1_prob = P_pred.max(axis=1)
 
     # scatter hexbin: pred_on_true vs true_top1_prob
-    ax_scatter.hexbin(true_top1_prob, pred_on_true, gridsize=80, mincnt=1)
+    ax_scatter.hexbin(true_top1_prob, pred_on_true_top1, gridsize=80, mincnt=1)
     ax_scatter.plot([0, 1], [0, 1], "r--", linewidth=1)
     ax_scatter.set_xlabel("true top1 prob")
     ax_scatter.set_ylabel("model prob on true top1")
@@ -471,7 +488,7 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     ranks_true = np.argsort(P_true, axis=1)  # ascending indices
     def mean_mass(k):
         idx = ranks_true[:, -k:]
-        return float(np.mean([P_pred[i, idx[i]].sum() for i in range(N)]))
+        return np.mean([P_pred[i, idx[i]].sum() for i in range(N)])
     m1 = mean_mass(1)
     m3 = mean_mass(3)
     m10 = mean_mass(10)
@@ -488,8 +505,10 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     # heatmap: mean 'from' map true || pred (8x8 each)
     P2_true = P_true.reshape((N, 64, 64))
     P2_pred = P_pred.reshape((N, 64, 64))
+    
     mean_from_true = P2_true.sum(axis=2).mean(axis=0).reshape(8, 8)
     mean_from_pred = P2_pred.sum(axis=2).mean(axis=0).reshape(8, 8)
+
     combined = np.hstack([mean_from_true, mean_from_pred])
     im = ax_heat.imshow(
         combined, interpolation="nearest", aspect="auto", origin="lower"
@@ -525,30 +544,32 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
     # ----- numeric metrics to return -----
     # KL (mean over batch, nats): mean sum P_true * (log P_true - log P_pred)
     kl_per = (P_true * (np.log(P_true + EPS) - np.log(P_pred + EPS))).sum(axis=1)
-    mean_kl = float(np.mean(kl_per))
+    mean_kl = np.mean(kl_per)
 
     # entropy of predictions (mean)
     ent_per = (-(P_pred * np.log(P_pred + EPS))).sum(axis=1)
-    mean_entropy = float(np.mean(ent_per))
+    mean_entropy = np.mean(ent_per)
+    
+    ent_true_per = (-(P_true * np.log(P_true + EPS))).sum(axis=1)  # true entropy (nats)
+    mean_true_entropy = np.mean(ent_true_per)
 
     # legal_mass_mean: use P_true>0 as proxy for legal moves
     legal_mask = (P_true > 0).astype(np.float32)
-    legal_mass = (P_pred * legal_mask).sum(axis=1)
-    legal_mass_mean = float(np.mean(legal_mass))
+    legal_mass = (logits * legal_mask).sum(axis=1)
+    legal_mass_mean = np.mean(legal_mass)
 
     # mean pred_on_true and mean pred_top1
-    mean_pred_on_true = float(np.mean(pred_on_true))
-    mean_pred_top1 = float(np.mean(pred_top1_prob))
+    mean_highest_prob = np.mean(pred_top1_prob)
 
     # value metrics computed here (so caller doesn't need to)
     # align lengths
     nval = min(len(yp_v), len(yt_v))
     yp_val = yp_v[:nval]
     yt_val = yt_v[:nval]
-    value_mse = float(np.mean((yt_val - yp_val) ** 2)) if nval > 0 else float("nan")
-    value_bias = float(np.mean(yp_val - yt_val)) if nval > 0 else float("nan")
+    value_mse = np.mean((yt_val - yp_val) ** 2) if nval > 0 else float("nan")
+    value_bias = np.mean(yp_val - yt_val) if nval > 0 else float("nan")
     if nval > 1 and yt_val.std() > 0 and yp_val.std() > 0:
-        value_corr = float(np.corrcoef(yt_val, yp_val)[0, 1])
+        value_corr = np.corrcoef(yt_val, yp_val)[0, 1]
     else:
         value_corr = float("nan")
 
@@ -556,8 +577,9 @@ def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
         "N": int(N),
         "mean_kl": mean_kl,
         "mean_pred_entropy": mean_entropy,
+        "mean_true_entropy": mean_true_entropy,
         "legal_mass_mean": legal_mass_mean,
-        "mean_pred_top1": mean_pred_top1,
+        "mean_highest_prob": mean_highest_prob,
         "mean_top1_mass": m1,
         "mean_top3_mass": m3,
         "mean_top10_mass": m10,
@@ -578,7 +600,7 @@ def score_game_data(model, X, Y_batch, save_path=None):
     preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
 
     # Plot overview grid and get metrics (plot function returns metrics dict)
-    metrics = plot_pred_vs_true_grid(model, preds, Y_batch, save_path=save_path)
+    metrics = plot_pred_vs_true_grid(model, preds, X, Y_batch, save_path=save_path)
 
     # Keras evaluate -> dataframe row (keep original columns)
     cols = ['total_loss'] + model.output_names
@@ -598,8 +620,8 @@ def score_game_data(model, X, Y_batch, save_path=None):
     )
     
     print(
-        f"N: {metrics.get('N')}  mean KL:{metrics.get('mean_kl'):.5f} ",
-        f"mean top1 mass: {metrics.get('mean_top1_mass'):.5e}\n"
+        f"N: {metrics.get('N')}  mean KL: {metrics.get('mean_kl'):.5f} ",
+        f"mean top1 mass: {metrics.get('mean_top1_mass'):.5f}\n"
     )
     return eval_df
 

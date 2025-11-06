@@ -260,7 +260,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 # plot_training_progress(all_evals, max_cols=4, save_path=None)
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay_phase4"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_stm_pov_test"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -317,23 +317,8 @@ gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
 
-from pyfastchess import Board
-from chessbot.utils import random_init
+#%%
 
-b = random_init(4)
-
-b = Board()
-ucis = b.legal_moves()
-i1 = b.moves_to_indices(ucis)
-
-
-b.push_uci("e2e4")
-b.push_uci("e7e5")
-b.push_uci("d2d4")
-ucis = b.legal_moves()
-i2 = b.moves_to_indices(ucis)
-
-[x for x in i2 if x not in i1]
 
 
 

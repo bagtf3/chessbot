@@ -20,7 +20,6 @@ class Config(object):
     sims_floor = 50
     sims_target = 150
     sims_ceiling = 200
-    micro_batch_size = 10
 
     # early stop
     use_sim_decision_model = False
@@ -37,6 +36,7 @@ class Config(object):
     q_override_top_k = 2
 
     # Game stuff
+    micro_batch_size = 10
     games_at_once = 100
     n_training_games = 2000
     

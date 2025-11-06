@@ -224,10 +224,13 @@ def plot_training_progress(all_evals, max_cols=4, save_path=None):
     def col_vals(name):
         return all_evals[name].values if name in all_evals.columns else None
 
-    # First figure: 1x3 (MA15) — raw lines one color, MA lines another color
+    # First figure: 1x3 (MA15)
     fig1, axs1 = plt.subplots(1, 3, figsize=(15, 4))
 
-    # choose stable colors: blue for raw, orange for MA (matches your attached plot)
+    # choose stable colors: blue for raw, orange for MA
+    cols1 = ['total_loss', 'policy_logits', 'value_out']
+    figs = []
+
     palette = sns.color_palette("tab10")
     RAW_COL = palette[0]
     MA_COL  = palette[1]   
@@ -451,8 +454,7 @@ def plot_pred_vs_true_grid(model, preds, X, y_true_dict, save_path=None):
 
     # ensure policy arrays exist (they do by contract)
     if P_pred.size == 0 or P_true.size == 0:
-        ax_scatter.text(0.5, 0.5, "no policy head found", ha="center",
-                        va="center")
+        ax_scatter.text(0.5, 0.5, "no policy head found", ha="center", va="center")
         ax_bar.set_visible(False)
         ax_heat.set_visible(False)
         plt.tight_layout()
@@ -541,7 +543,7 @@ def plot_pred_vs_true_grid(model, preds, X, y_true_dict, save_path=None):
     else:
         plt.show(block=False)
 
-    # ----- numeric metrics to return -----
+    # numeric metrics to return
     # KL (mean over batch, nats): mean sum P_true * (log P_true - log P_pred)
     kl_per = (P_true * (np.log(P_true + EPS) - np.log(P_pred + EPS))).sum(axis=1)
     mean_kl = np.mean(kl_per)
@@ -550,7 +552,7 @@ def plot_pred_vs_true_grid(model, preds, X, y_true_dict, save_path=None):
     ent_per = (-(P_pred * np.log(P_pred + EPS))).sum(axis=1)
     mean_entropy = np.mean(ent_per)
     
-    ent_true_per = (-(P_true * np.log(P_true + EPS))).sum(axis=1)  # true entropy (nats)
+    ent_true_per = (-(P_true * np.log(P_true + EPS))).sum(axis=1)
     mean_true_entropy = np.mean(ent_true_per)
 
     # legal_mass_mean: use P_true>0 as proxy for legal moves

@@ -18,7 +18,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 150
+    sims_target = 200
     sims_ceiling = 200
 
     # early stop
@@ -38,7 +38,7 @@ class Config(object):
     # Game stuff
     micro_batch_size = 10
     games_at_once = 100
-    n_training_games = 2000
+    n_training_games = 4000
     
     move_limit = 160
     material_diff_cutoff = 15
@@ -62,7 +62,7 @@ class Config(object):
     fwd_batch = 1024
     vwq_blend = 0.5
     use_vwq_alpha_taper = True
-    target_mean = 0.25
+    target_mean = 0.8
     additional_data_ratio = 1.0
 
     def to_dict(self):

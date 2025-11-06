@@ -70,6 +70,35 @@ def score_cp_relative(pov_score, clipped=True, mate_cp=MATE_CP):
     return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
 
 
+def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, engine=None):
+    if not isinstance(b, chess.Board):
+        b = chess.Board(b.fen())
+        
+    if engine is None:
+        new_eng = True
+        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        engine.configure({"Threads": 1, "Hash": 128})
+
+    else:
+        new_eng = False
+
+    try:
+        info = engine.analyse(
+            b, limit=chess.engine.Limit(depth=depth), info=chess.engine.INFO_ALL
+        )
+        
+        val = score_fn(info['score'])
+        best_move = info.get("pv", [""])[0]
+    except Exception as e:
+        print(e)
+
+    finally:
+        if new_eng:
+            engine.quit()
+    
+    return val, str(best_move)
+
+
 uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"
 with open(uci_path_path, "rb") as f:
     PATHS = pickle.load(f)

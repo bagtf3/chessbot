@@ -191,7 +191,49 @@ def plot_and_report(df_trim, window):
     print(f"{'Overall':<{label_w}}{overall_cpl:>{val_w}.3f}"
           f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
     print()
+
+#%%
+# plot single phase
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_stm_pov_phase1"
+
+all_games = load_game_index(run_dir)
+CLIP_UB = 500
+
+_ = combine_analysis_staging(run_dir)
+pkl = os.path.join(run_dir, ANALYZE_PKL)
+with open(pkl, "rb") as f:
+    prev_run = pickle.load(f)
+
+df_all = prev_run['df_all']
+df_means = prev_run['df_means']
+WINDOW = int(len(df_means) * 0.2 // 10 * 10)
+print(len(df_means), f"games completed. Using window size {WINDOW}")
+print()
+
+# tidy up CPL
+df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
+
+# BMR
+bmr = df_all.groupby("game_id")['played_best_move'].mean()
+
+#Top3
+if 'in_top3' not in df_all.columns:
+    df_all['in_top3'] = False
     
+df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
+t3r = df_all.groupby("game_id")["in_top3"].mean()
+
+df_trim = df_means.copy()
+df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
+df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
+df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
+
+df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
+df_trim = df_trim.sort_values('ts')
+
+plot_and_report(df_trim, WINDOW)
+pprint(trend_check(df_trim, window=WINDOW))
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -259,48 +301,6 @@ pprint(trend_check(df_trim, window=WINDOW))
 # from chessbot.utils import plot_training_progress
 # plot_training_progress(all_evals, max_cols=4, save_path=None)
 #%%
-# plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_stm_pov_test"
-
-all_games = load_game_index(run_dir)
-CLIP_UB = 500
-
-_ = combine_analysis_staging(run_dir)
-pkl = os.path.join(run_dir, ANALYZE_PKL)
-with open(pkl, "rb") as f:
-    prev_run = pickle.load(f)
-
-df_all = prev_run['df_all']
-df_means = prev_run['df_means']
-WINDOW = int(len(df_means) * 0.2 // 10 * 10)
-print(len(df_means), f"games completed. Using window size {WINDOW}")
-print()
-
-# tidy up CPL
-df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
-clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
-
-# BMR
-bmr = df_all.groupby("game_id")['played_best_move'].mean()
-
-#Top3
-if 'in_top3' not in df_all.columns:
-    df_all['in_top3'] = False
-    
-df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
-t3r = df_all.groupby("game_id")["in_top3"].mean()
-
-df_trim = df_means.copy()
-df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
-df_trim['overall_cpl'] = df_trim.game_id.map(clipped_cpl)
-df_trim['overall_top3_rate'] = df_trim.game_id.map(t3r)
-
-df_trim.overall_cpl = np.clip(df_trim.overall_cpl, 0, CLIP_UB)
-df_trim = df_trim.sort_values('ts')
-
-plot_and_report(df_trim, WINDOW)
-pprint(trend_check(df_trim, window=WINDOW))
-#%%
 
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
@@ -320,7 +320,47 @@ gdf.sort_values("move_num")
 #%%
 
 
+from chessbot import WHITE_WINNING_BLACK_MOVE, WHITE_WINNING_WHITE_MOVE, BLACK_WINNING_BLACK_MOVE, BLACK_WINNING_WHITE_MOVE
+from chessbot import BLACK_HAS_LOST, WHITE_HAS_LOST
+from chessbot.review import sf_eval
 
 
+val, bm = sf_eval(WHITE_WINNING_BLACK_MOVE)
+val, bm = sf_eval(WHITE_WINNING_WHITE_MOVE)
+val, bm = sf_eval(BLACK_WINNING_BLACK_MOVE)
+val, bm = sf_eval(BLACK_WINNING_WHITE_MOVE)
+val, bm = sf_eval(BLACK_HAS_LOST)
+
+b = BLACK_HAS_LOST
+def sf_eval(b, score_fn, engine=None):
+    if not isinstance(b, chess.Board):
+        b = chess.Board(b.fen())
+    
+    if engine is None:
+        new_eng = True
+        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        engine.configure({"Threads": 1, "Hash": 128})
+
+    else:
+        new_eng = False
+
+    try:
+        info = engine.analyse(
+            b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
+        )
+        
+        val = score_fn(info['score'])
+        if 'pv' in info:
+            best_move = info['pv'][0]
+        else:
+            best_move = ""
+    except Exception as e:
+        print(e)
+
+    finally:
+        if new_eng:
+            engine.quit()
+    
+    return val, str(best_move)
 
 

@@ -57,15 +57,12 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        b = chess.Board(self.board.fen())
-        depth = self.config.sf_depth
-        info = eng.analyse(
-            b, chess.engine.Limit(depth=depth), info=chess.engine.INFO_ALL
+        val_sf, best_move = cbu.sf_eval(
+            b, score_fn=score_to_value_stm_pov,
+            depth=self.config.sf_depth, engine=eng
         )
 
-        val_sf = score_to_value_stm_pov(info['score'])
-        move = str(info['pv'][0])
-        return move, val_sf
+        return best_move, val_sf
     
     def push_move(self, mv):
         # collect search data then push and update
@@ -552,7 +549,7 @@ class GameLooper(object):
             "result": game.outcome or 0.0,
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
-            "duration": int(_now() - game.started_at),
+            "duration": _now() - game.started_at,
             "sims_per_move": round(avg_sims, 3)
         }
         # small in-memory record for recent prints only
@@ -637,15 +634,26 @@ class GameLooper(object):
 
         # check for additional data pkl and load+remove if present
         add_pkl = os.path.join(self.config.run_dir, "additional_training_data.pkl")
+        additional = []
         if os.path.exists(add_pkl):
-            with open(add_pkl, "rb") as f:
-                additional = pickle.load(f)
-                print(f"[retrain] found {len(additional)} additional training samples")
-            # remove immediately so nothing is re-read later
-            os.remove(add_pkl)
-        else:
+            # may hit an unlucky access deny if during a write.
+            tries = 0
+            while tries < 3:
+                try:
+                    with open(add_pkl, "rb") as f:
+                        additional = pickle.load(f)
+                    # remove immediately so nothing is re-read later
+                    os.remove(add_pkl)
+                    n_add = len(additional)
+                    print(f"[retrain] found {n_add} additional training samples")
+                    break
+                except:
+                    # if we get an error, wait a bit and try again
+                    time.sleep(0.5)
+                    tries += 1
+        
+        if not additional:
             print("No additional data found at", add_pkl)
-            additional = []
         
         # combined list: existing queue first, additional appended
         combined = list(self.training_queue) + list(additional)

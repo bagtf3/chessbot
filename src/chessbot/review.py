@@ -19,7 +19,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_relative, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh
+    calc_entropy, cp_to_value_tanh, sf_eval
 )
 
 
@@ -581,11 +581,18 @@ def analyze_with_sf_core(game_data, eng, depth=DEPTH):
     return out
 
 ## post hoc server
-def save_pickle_atomic(obj, path):
-    tmp = str(path) + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, str(path))
+def save_pickle_atomic(obj, path, tries=0):
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, str(path))
+    except Exception as e:
+        if tries <= 5:
+            time.sleep(0.5)
+            save_pickle_atomic(obj, path, tries=tries+1)
+        else:
+            raise e
 
 
 def safe_mean(arr):
@@ -838,33 +845,9 @@ def make_training_sample(b, v, visits):
     return tup
 
 
-def sf_eval(b, engine=None):
-    if not isinstance(b, chess.Board):
-        b = chess.Board(b.fen())
-        
-    if engine is None:
-        new_eng = True
-        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        engine.configure({"Threads": 1, "Hash": 128})
-
-    else:
-        new_eng = False
-
-    try:
-        info = engine.analyse(
-            b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
-        )
-        
-        val = score_to_value_stm_pov(info['score'])
-        best_move = info['pv'][0]
-    except Exception as e:
-        print(e)
-
-    finally:
-        if new_eng:
-            engine.quit()
-    
-    return val, str(best_move)
+def sfe(b, engine):
+    """ Quick SF eval wrapper """
+    return sf_eval(b, score_fn=score_to_value_stm_pov, depth=DEPTH, engine=engine)
 
 
 def mine_additional_training_data(analysis_out, game_data, engine=None):
@@ -915,16 +898,16 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         if len(row) == 0:
             continue
         
-        # happy path, not a blunder
+        # happy path, not a blunder, take stm pov sf eval
         if row['delta'].item() < BLUNDER_CP:
-            v = cp_to_value_tanh(row['played_absolute'].item())
+            v = cp_to_value_tanh(row['played_cp'].item())
             ts = make_training_sample(b, v, visits)
             training_data.append(ts)
             b.push_uci(mv)
         
         # if a blunder, dont use actual visits (theyre wrong)
         else:
-            best_v = cp_to_value_tanh(row['best_absolute'].item())
+            best_v = cp_to_value_tanh(row['best_cp'].item())
             best_mv = row['best_move'].item()
             best_visits = make_fake_visits(best_mv, lms)
             ts_best = make_training_sample(b, best_v, best_visits)
@@ -938,7 +921,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 lms2 = b2.legal_moves()
                 if not lms2:
                     break
-                cont_val, cont_best = sf_eval(b2, engine=engine)
+                cont_val, cont_best = sfe(b2, engine=engine)
                 cont_visits = make_fake_visits(cont_best, lms2)
                 cont_ts = make_training_sample(b2, cont_val, cont_visits)
                 training_data.append(cont_ts)
@@ -960,7 +943,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 if not lms2:
                     break
                 
-                pv_val, pv_best = sf_eval(b2, engine=engine)
+                pv_val, pv_best = sfe(b2, engine=engine)
                 pv_visits = make_fake_visits(pv_best, lms2)
                 pv_ts = make_training_sample(b2, pv_val, pv_visits)
                 training_data.append(pv_ts)

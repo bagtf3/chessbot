@@ -168,7 +168,7 @@ class ChessGame(object):
                 use_tree_visits = True
 
             # case B: SF move is close to top -> use tree visits but nudge SF to top
-            elif sf_visits >= 0.80 * max_visits:
+            elif sf_visits >= 0.6 * max_visits:
                 use_tree_visits = True
                 # make SF strictly first by setting its visits > max_visits
                 visit_map[mv] = max_visits + 1
@@ -185,8 +185,7 @@ class ChessGame(object):
 
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-
-        self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v)
+        self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
 
         # finally play SF's move on the board and advance tree
         return self.push_move(mv)
@@ -213,14 +212,14 @@ class ChessGame(object):
         self.vwq = vwq if self.turn() else -vwq
     
         if pi is not None:
-            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq)
+            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq turn=self.turn())
 
         mv, _ = self.tree.best()
         if mv is None:
             return False
         return self.push_move(mv)
     
-    def append_flat_policy_example(self, ucis, pi, vwq):
+    def append_flat_policy_example(self, ucis, pi, vwq, turn):
         """
         Snapshot inputs and a flat 4096-length policy vector for training.
         - ucis: list[str] legal moves (same order as probs)
@@ -240,7 +239,7 @@ class ChessGame(object):
         x = self.board.stacked_planes_stm_pov(1)
         mask = self.board.legal_move_mask()
 
-        self.examples.append((x, mask, {"policy": policy, "vwq": vwq, "ply": self.plies}))
+        self.examples.append((x, mask, policy, vwq, self.plies, turn))
 
     def check_for_terminal(self):
         reason, result = self.board.is_game_over()
@@ -604,22 +603,24 @@ class GameLooper(object):
         with open(idx_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
         
+        # game outcome in white POV (1 = white win, -1 = black win)
         z = game.outcome if game.outcome is not None else 0.0
         g = game.plies or 0  # game length
 
         # use g-1 as denominator only when there are >= 2 plies; otherwise taper=0
-        denom = g - 1 if g > 1 else None
+        denom = max(1, g-1)
 
-        for x, mask, heads in game.examples:
-            vwq = heads.get("vwq", 0.0)
-            ply = heads.get("ply", 0.0)
-            policy = heads['policy']
-            taper = ply / denom if denom is not None else 0.0
-            self.training_queue.append((x, mask, policy, z, vwq, taper))
+        for x, mask, policy, vwq, ply, turn in game.examples:
+            # linear taper of outcome in [0, 1]
+            taper = 0.0 if z == 0 else ply / denom
+            z_stm = z if turn else -z # flip based on stm pov
+            z_tapered = taper * z_stm
+            self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
         if len(self.training_queue) >= self.config.training_queue_min:
             self.trigger_retrain()
+
 
     def trigger_retrain(self):
         """
@@ -664,18 +665,17 @@ class GameLooper(object):
         P_list = []        # flattened 4096 policy vectors
         mask_list = []     # derived legal-mask (0/1)
         Z_list = []
+        Z_taper_list = []
         Vwq_list = []
-        taper_list = []
         is_add_flag = []
 
-        for i, (x, mask, policy, z, vwq, taper) in enumerate(combined):
+        for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
             X_list.append(x)
             P_list.append(policy)
             mask_list.append((policy > 0).astype(np.int32))
-
-            Z_list.append(z)
+            Z_list.append(z_stm)
             Vwq_list.append(vwq)
-            taper_list.append(taper if taper is not None else 0.0)
+            Z_taper_list.append(z_tapered)
             is_add_flag.append(i >= n_main)  # True for additional samples
 
         # stack arrays
@@ -684,17 +684,14 @@ class GameLooper(object):
         M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4096)
         Z = np.asarray(Z_list, dtype=np.float32)
         Vwq = np.asarray(Vwq_list, dtype=np.float32)
-        taper_arr = np.asarray(taper_list, dtype=np.float32)
+        Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)
         is_add = np.asarray(is_add_flag[:len(X_list)], dtype=np.bool_)
 
-        # blend outcome with visit-weighted Q (same as before)
-        alpha = getattr(self.config, "vwq_blend", 0.0)
-        use_taper = getattr(self.config, "use_vwq_alpha_taper", False)
-        if use_taper:
-            w_alpha = np.clip(alpha * taper_arr, 0.0, 1.0)
-            Y_value = (1.0 - w_alpha) * Vwq + w_alpha * Z
-        else:
-            Y_value = (1.0 - alpha) * Vwq + alpha * Z
+        # optionally blend (possibly tapered) outcome with visit-weighted Q
+        use_taper = getattr(self.config, "use_z_taper", True)
+        alpha = getattr(self.config, "z_blend", 0.5)
+        Zstar = Z_taper_arr if use_taper else Z
+        Y_value = np.clip((1.0-alpha)*Vwq + alpha*Zstar, -1.0, 1.0)
 
         # ensure additional samples are not blended
         if is_add.any():

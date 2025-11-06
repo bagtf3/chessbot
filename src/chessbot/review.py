@@ -18,7 +18,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_relative, score_cp_white_pov, score_to_value_stm_pov, rnd,
+    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval
 )
 
@@ -439,7 +439,7 @@ def analyze_with_rank(move, board, limit, eng):
     best = [t for t in top3 if t['multipv'] == 1][0]
     
     best_move = best['pv'][0]
-    best_cp   = score_cp_relative(best["score"])
+    best_cp   = score_cp_stm_pov(best["score"])
     best_abs  = score_cp_white_pov(best["score"], clipped=False)
     
     # default
@@ -840,7 +840,8 @@ def make_training_sample(b, v, visits):
     x = b.stacked_planes_stm_pov(1)
     mask = b.legal_move_mask()
 
-    # needs to match looper's training_queue: (x, mask, policy, z, vwq, taper)
+    # needs to match looper's training_queue
+    # (x, mask, policy, z_stm, vwq, z_tapered)
     tup = (x, mask, policy, 0, v, 0)
     return tup
 

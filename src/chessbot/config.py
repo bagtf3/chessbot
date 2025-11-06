@@ -60,9 +60,9 @@ class Config(object):
     # TF
     training_queue_min = 2048
     fwd_batch = 1024
-    vwq_blend = 0.5
-    use_vwq_alpha_taper = True
-    target_mean = 0.8
+    z_blend = 0.5
+    use_z_taper = True
+    target_mean = 1.0
     additional_data_ratio = 1.0
 
     def to_dict(self):

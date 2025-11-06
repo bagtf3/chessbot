@@ -65,7 +65,7 @@ def score_cp_white_pov(pov_score, clipped=True, mate_cp=MATE_CP):
     return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
 
 
-def score_cp_relative(pov_score, clipped=True, mate_cp=MATE_CP):
+def score_cp_stm_pov(pov_score, clipped=True, mate_cp=MATE_CP):
     scr = pov_score.relative
     return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
 

@@ -702,7 +702,7 @@ class MaskedPolicyModel(tf.keras.Model):
 
     @classmethod
     def from_saved(cls, path, compile_model=True, lr=1e-4,
-                   policy_loss_weight=1.0, value_loss_weight=1.0):
+                   policy_loss_weight=1.0, value_loss_weight=2.0):
         """
         Load a MaskedPolicyModel previously saved with save(path).
         Builds the subclass and optionally compiles it with defaults.
@@ -712,7 +712,8 @@ class MaskedPolicyModel(tf.keras.Model):
         # try to build so model.summary() is usable immediately
         try:
             inst.build(input_shape=[(None, 8, 8, 29), (None, 4096)])
-        except Exception:
+        except Exception as e:
+            print(e)
             pass
 
         if compile_model:

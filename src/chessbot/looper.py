@@ -212,7 +212,7 @@ class ChessGame(object):
         self.vwq = vwq if self.turn() else -vwq
     
         if pi is not None:
-            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq turn=self.turn())
+            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq, turn=self.turn())
 
         mv, _ = self.tree.best()
         if mv is None:
@@ -736,9 +736,7 @@ class GameLooper(object):
 
         # assemble final Y dict and sample_weight mapping for Keras fit
         Y = {"value": Y_value.astype(np.float32), "policy": P}
-
-        even_weights = np.ones_like(weights, dtype=np.float32)
-        s_wts = {"value": weights, "policy": even_weights}
+        s_wts = {"value": weights, "policy": weights}
 
         # evaluation and logging (reuse existing helpers) - unchanged
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
@@ -923,6 +921,6 @@ def main():
     finally:
        stop_post_hoc_server(phs, timeout=10)
 
-
+#%%
 if __name__ == '__main__':
     main()

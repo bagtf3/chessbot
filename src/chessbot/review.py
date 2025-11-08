@@ -468,7 +468,7 @@ def analyze_with_rank(move, board, limit, eng):
         played = played[0]
         in_top3 = True
     
-    played_cp = score_cp_relative(played['score'])
+    played_cp = score_cp_stm_pov(played['score'])
     played_abs = score_cp_white_pov(played["score"], clipped=False)
     delta = best_cp - played_cp
 
@@ -914,7 +914,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             ts_best = make_training_sample(b, best_v, best_visits)
             training_data.append(ts_best)
             
-            # furthermore, show the best continuation
+            # # furthermore, show the best continuation
             b2 = b.clone()
             b2.push_uci(best_mv)
             cont_moves = 1
@@ -943,7 +943,7 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 lms2 = b2.legal_moves()
                 if not lms2:
                     break
-                
+               
                 pv_val, pv_best = sfe(b2, engine=engine)
                 pv_visits = make_fake_visits(pv_best, lms2)
                 pv_ts = make_training_sample(b2, pv_val, pv_visits)

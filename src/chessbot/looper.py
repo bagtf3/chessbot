@@ -50,7 +50,7 @@ class ChessGame(object):
         self.sf_eval = None
     
     def turn(self, return_bool=True):
-        stm = self.board.side_to_move()
+        stm = self.tree.root().board.side_to_move()
         return stm == 'w' if return_bool else stm
     
     def is_stockfish_turn(self):
@@ -58,7 +58,7 @@ class ChessGame(object):
     
     def get_stockfish_move(self, eng):
         val_sf, best_move = cbu.sf_eval(
-            b, score_fn=score_to_value_stm_pov,
+            self.tree.root().board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, engine=eng
         )
 
@@ -208,7 +208,7 @@ class ChessGame(object):
         pi = (visits / s) if s > 0.0 else None
         vwq = self.tree.visit_weighted_Q()
 
-        # tree is white POV, we want STM-POV
+        # tree is white POV, we want STM-POV so we flip here
         self.vwq = vwq if self.turn() else -vwq
     
         if pi is not None:
@@ -692,7 +692,6 @@ class GameLooper(object):
         alpha = getattr(self.config, "z_blend", 0.5)
         Zstar = Z_taper_arr if use_taper else Z
         Y_value = np.clip((1.0-alpha)*Vwq + alpha*Zstar, -1.0, 1.0)
-
         # ensure additional samples are not blended
         if is_add.any():
             Y_value[is_add] = Vwq[is_add]
@@ -700,34 +699,25 @@ class GameLooper(object):
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
 
-        # balance selfplay and additional (boosting) data (adapted for filtered set)
-        adr = getattr(self.config, "additional_data_ratio", 1.0)
-
-        # compute M and A on the *filtered* arrays (not original counts)
+        # desired ratio: additional_data_ratio = A_scaled / M_scaled
+        R = getattr(self.config, "additional_data_ratio", 1.0)
         main_mask = ~is_add
+        add_mask = is_add
+
+        # sums (counts here because weights start as ones)
         M_sum = weights[main_mask].sum() if main_mask.any() else 0.0
-        A_sum = weights[is_add].sum() if is_add.any() else 0.0
+        A_sum = weights[add_mask].sum()  if add_mask.any()  else 0.0
 
-        # default scale factors (no downscaling)
-        s_main, s_add = 1.0, 1.0
         if M_sum > 0.0 and A_sum > 0.0:
-            R = adr
-            required_s_main = A_sum / (R * M_sum)
-            if required_s_main <= 1.0:
-                s_main = required_s_main
-                s_add = 1.0
-            else:
-                required_s_add = (R * M_sum) / A_sum
-                if required_s_add <= 1.0:
-                    s_add = required_s_add
-                    s_main = 1.0
+            k = A_sum / (R * M_sum)
+            s_main = np.sqrt(k)
+            s_add  = 1.0 / np.sqrt(k)
 
-            if s_main < 1.0:
-                weights[main_mask] *= s_main
-            if s_add < 1.0:
-                weights[is_add]    *= s_add
+            # apply
+            weights[main_mask] *= s_main
+            weights[add_mask]  *= s_add
 
-        # respect target_mean
+        # respect target_mean (keep average weight stable)
         target_mean = getattr(self.config, "target_mean", 1.0)
         mean_w = weights.mean() if weights.size else 1.0
         if mean_w > 0.0:
@@ -751,9 +741,11 @@ class GameLooper(object):
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
         self.model.fit(
-            [X, M], Y, epochs=2, batch_size=512, verbose=0, sample_weight=s_wts
+            [X, M], Y, epochs=2, batch_size=512, verbose=1, sample_weight=s_wts
         )
-        
+        print(f"[model] value_loss_weight {self.model.value_loss_weight}")
+        print(f"[model] policy_loss_weight {self.model.policy_loss_weight}")
+
         self.model.save(self.config.model_path)
 
         # update the fwd helper and clear queues/caches
@@ -900,8 +892,18 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
-    looper = GameLooper(model=model, cfg=Config())
     
+    ### TEMP TEST
+    import tensorflow as tf
+    # recompile with a much larger value loss weight for the POC
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),
+        policy_loss_weight=0.0,
+        value_loss_weight=2.0,
+    )
+    ### END TEMP
+
+    looper = GameLooper(model=model, cfg=Config())
     # infer the number of trainings already done from existing files
     if os.path.exists(config.progress_csv_path):
         try:
@@ -912,14 +914,15 @@ def main():
         except Exception as e:
             print(e)
     
+    looper.run()
     # start the analysis server
-    phs = start_post_hoc_server(looper.config.run_dir)
-    try:
-        looper.run()
-    except Exception as e:
-       print("Error encountered", e)
-    finally:
-       stop_post_hoc_server(phs, timeout=10)
+    # phs = start_post_hoc_server(looper.config.run_dir)
+    # try:
+    #     looper.run()
+    # except Exception as e:
+    #    print("Error encountered", e)
+    # finally:
+    #    stop_post_hoc_server(phs, timeout=10)
 
 #%%
 if __name__ == '__main__':

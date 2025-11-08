@@ -7,18 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_stm_pov_phase1"
+    run_tag = "conv_stm_pov_value_test"
     selfplay_dir =  SP_DIR
     init_model = MODEL_DIR + "conv_stm_pov_init.h5"
     
     # MCTS
     c_puct = 2.0
-    anytime_uniform_mix = 0.15
-    endgame_uniform_mix = 0.2
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 200
+    sims_target = 50
     sims_ceiling = 200
 
     # early stop
@@ -38,27 +36,27 @@ class Config(object):
     # Game stuff
     micro_batch_size = 10
     games_at_once = 100
-    n_training_games = 4000
+    n_training_games = 2000
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
-    sf_depth = 15
+    sf_depth = 9
     
     game_probs = {
-        "pre_opened": 0.3, "random_init": 0.3,
-        "random_middle_game": 0.25, "random_endgame": 0.05,
-        "piece_odds": 0.05, "piece_training": 0.05
+        "pre_opened": 0.25, "random_init": 0.25,
+        "random_middle_game": 0.25, "random_endgame": 0.1,
+        "piece_odds": 0.10, "piece_training": 0.05
     }
     
     # priors
     prior_clip_max = 0.35
     prior_clip_min = 0.001
 
-    # TF
-    training_queue_min = 2048
+    # training
+    training_queue_min = 1024
     fwd_batch = 1024
     z_blend = 0.5
     use_z_taper = True

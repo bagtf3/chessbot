@@ -318,49 +318,62 @@ gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
 
 #%%
+import time
+from pyfastchess import Board
+from chessbot.utils import random_init, sf_eval, show_board
+from chessbot.mcts_utils import MCTSTree
+from chessbot.config import Config
+from chessbot import SF_LOC
+import chess, chess.engine
 
 
-from chessbot import WHITE_WINNING_BLACK_MOVE, WHITE_WINNING_WHITE_MOVE, BLACK_WINNING_BLACK_MOVE, BLACK_WINNING_WHITE_MOVE
-from chessbot import BLACK_HAS_LOST, WHITE_HAS_LOST
-from chessbot.review import sf_eval
+eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+eng.configure({"Threads": 1, "Hash": 64})
 
+b = random_init(3)
+config = Config()
+tree = MCTSTree(b, config)
 
-val, bm = sf_eval(WHITE_WINNING_BLACK_MOVE)
-val, bm = sf_eval(WHITE_WINNING_WHITE_MOVE)
-val, bm = sf_eval(BLACK_WINNING_BLACK_MOVE)
-val, bm = sf_eval(BLACK_WINNING_WHITE_MOVE)
-val, bm = sf_eval(BLACK_HAS_LOST)
-
-b = BLACK_HAS_LOST
-def sf_eval(b, score_fn, engine=None):
-    if not isinstance(b, chess.Board):
-        b = chess.Board(b.fen())
+for rep in range(1000):
+    base = rep % 20
+    rb = random_init(2*base + 1)
+    rbe = rb.stacked_planes_stm_pov(1)
+    cb = chess.Board(rb.fen())
     
-    if engine is None:
-        new_eng = True
-        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        engine.configure({"Threads": 1, "Hash": 128})
-
-    else:
-        new_eng = False
-
-    try:
-        info = engine.analyse(
-            b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
-        )
-        
-        val = score_fn(info['score'])
-        if 'pv' in info:
-            best_move = info['pv'][0]
-        else:
-            best_move = ""
-    except Exception as e:
-        print(e)
-
-    finally:
-        if new_eng:
-            engine.quit()
+    cbm = cb.mirror()
+    cbm_fast = Board(cbm.fen())
+    cbm_faste = cbm_fast.stacked_planes_stm_pov(1)
+    assert np.all(cbm_faste == rbe)
     
-    return val, str(best_move)
+    eval_black, _ = sf_eval(cb, depth=16, engine=eng)
+    eval_white, _ = sf_eval(cbm, depth=16, engine=eng)
+    
+    assert np.square(eval_black - eval_white) < 0.1
+
+
+
+boards = []
+for rep in range(10000):
+    base = 3 + (rep % 35)
+    boards.append(random_init(base))
+    
+
+start = time.time()
+_ = [b.stacked_planes_stm_pov(1) for b in boards]
+stop = time.time()
+print(f"{stop-start:.3f}")
+      
+start = time.time()
+_ = [b.stacked_planes_stm_pov(5) for b in boards]
+stop = time.time()
+print(f"{stop-start:.3f}")
+      
+
+
+
+
+
+
+
 
 

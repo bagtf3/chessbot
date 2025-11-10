@@ -837,7 +837,7 @@ def make_training_sample(b, v, visits):
     for idx, p in zip(indices, pi):
         policy[idx] += p
 
-    x = b.stacked_planes_stm_pov(1)
+    x = b.encode_64_tokens()
     mask = b.legal_move_mask()
 
     # needs to match looper's training_queue

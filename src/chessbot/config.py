@@ -7,16 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_stm_pov_value_test"
+    run_tag = "conv_embedded_test"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_stm_pov_init.h5"
-    
+    init_model = MODEL_DIR + "conv_64_token_pt1000.h5"
+
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 50
+    sims_target = 1600
     sims_ceiling = 200
 
     # early stop
@@ -34,16 +34,16 @@ class Config(object):
     q_override_top_k = 2
 
     # Game stuff
-    micro_batch_size = 10
-    games_at_once = 100
-    n_training_games = 2000
+    micro_batch_size = 4
+    games_at_once = 256
+    n_training_games = 500
     
     move_limit = 160
     material_diff_cutoff = 15
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 0.5
-    sf_depth = 9
+    play_vs_sf_prob = 0.0
+    sf_depth = 15
     
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.25,
@@ -58,10 +58,12 @@ class Config(object):
     # training
     training_queue_min = 1024
     fwd_batch = 1024
+
     z_blend = 0.5
     use_z_taper = True
-    target_mean = 1.0
-    additional_data_ratio = 1.0
+
+    target_loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
+
 
     def to_dict(self):
         return {

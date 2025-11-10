@@ -15,7 +15,7 @@ from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
 from chessbot import ENDGAME_LOC, SF_LOC
-from chessbot.model import MaskedPolicyModel, make_fwd_batched
+from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.mcts_utils import MCTSTree
 
 from chessbot.config import Config
@@ -236,7 +236,7 @@ class ChessGame(object):
             policy[idx] += p
 
         # snapshot inputs and push example
-        x = self.board.stacked_planes_stm_pov(1)
+        x = self.board.encode_64_tokens()
         mask = self.board.legal_move_mask()
 
         self.examples.append((x, mask, policy, vwq, self.plies, turn))
@@ -294,7 +294,13 @@ class GameLooper(object):
         self.fill_active_games()
 
         self.model = model
-        self.infer = model.make_infer(max_bs=1024)
+
+        cfg = self.config
+        self.infer = make_conv_infer(
+            self.model, max_bs=cfg.fwd_batch,
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
+        )
+
         self.training_queue = []
         self.recent_games = []
 
@@ -408,7 +414,7 @@ class GameLooper(object):
                     game.tree.sims_completed_this_move += nn + nt + nc
 
                     if nn:
-                        preds_batch += game.tree.pending_encoded_stm_pov(1)
+                        preds_batch += game.tree.pending_encoded_64_tokens()
 
                     fastpaths = nt + nc
                     fast_stop, collect_stop = 0, 1
@@ -463,8 +469,9 @@ class GameLooper(object):
                 self.fill_active_games()
                     
         # train with whatever we got and final report (> 2000)
-        if len(self.training_queue) >= 2000:
-            self.trigger_retrain()
+        # if len(self.training_queue) >= 2000:
+        #     self.trigger_retrain()
+        self.training_queue.clear()
 
         self.maybe_log_results(force=True)
         return
@@ -490,22 +497,29 @@ class GameLooper(object):
             keys.append(item[0])
             board_np = item[1]
             legal_np = item[2]
-            
-            boards.append(np.asarray(board_np, dtype=np.float32))
+
+            boards.append(np.asarray(board_np, dtype=np.int32))
             legals.append(np.asarray(legal_np, dtype=np.int32))
 
         # stack to batch
         boards_np = np.stack(boards, axis=0)   # (B,8,8,29)
         legals_np = np.stack(legals, axis=0)   # (B,4096)
 
-        # runtime clip/temperature params from config (fallbacks)
-        min_p = getattr(self.config, "clip_min", 0.001)
-        max_p = getattr(self.config, "clip_max", 0.35)
-        temp  = 1.0
+        # pad up to fwd_batch if needed (helps XLA/static-trace shapes)
+        target_bs = self.config.fwd_batch
+        B = boards_np.shape[0]
+        if B < target_bs:
+            pad = target_bs - B
+            pad_boards = np.zeros((pad, ) + boards_np.shape[1:], dtype=boards_np.dtype)
+            pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
+            boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
+            legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
+            probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
+            probs_np = probs_np_p[:B]
+            vals_np = vals_np_p[:B]
+        else:
+            probs_np, vals_np = self.infer((boards_np, legals_np))
 
-        # call GPU-side inference pipeline (masked softmax + clip + renorm)
-        probs_np, vals_np = self.infer((boards_np, legals_np), min_p, max_p, temp)
-        
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
         for i, k in enumerate(keys):
@@ -618,8 +632,8 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
-        if len(self.training_queue) >= self.config.training_queue_min:
-            self.trigger_retrain()
+        #if len(self.training_queue) >= self.config.training_queue_min:
+        #    self.trigger_retrain()
 
 
     def trigger_retrain(self):
@@ -698,35 +712,11 @@ class GameLooper(object):
 
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
-
-        # desired ratio: additional_data_ratio = A_scaled / M_scaled
-        R = getattr(self.config, "additional_data_ratio", 1.0)
-        main_mask = ~is_add
-        add_mask = is_add
-
-        # sums (counts here because weights start as ones)
-        M_sum = weights[main_mask].sum() if main_mask.any() else 0.0
-        A_sum = weights[add_mask].sum()  if add_mask.any()  else 0.0
-
-        if M_sum > 0.0 and A_sum > 0.0:
-            k = A_sum / (R * M_sum)
-            s_main = np.sqrt(k)
-            s_add  = 1.0 / np.sqrt(k)
-
-            # apply
-            weights[main_mask] *= s_main
-            weights[add_mask]  *= s_add
-
-        # respect target_mean (keep average weight stable)
-        target_mean = getattr(self.config, "target_mean", 1.0)
-        mean_w = weights.mean() if weights.size else 1.0
-        if mean_w > 0.0:
-            scale_to_target = target_mean / mean_w
-            weights *= scale_to_target
+        lw = self.config.target_loss_weights
 
         # assemble final Y dict and sample_weight mapping for Keras fit
-        Y = {"value": Y_value.astype(np.float32), "policy": P}
-        s_wts = {"value": weights, "policy": weights}
+        Y = {"value_out": Y_value.astype(np.float32), "policy_logits": P}
+        s_wts = {k: weights*lw.get(k, 1.0) for k in Y.keys()}
 
         # evaluation and logging (reuse existing helpers) - unchanged
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
@@ -743,8 +733,6 @@ class GameLooper(object):
         self.model.fit(
             [X, M], Y, epochs=2, batch_size=512, verbose=1, sample_weight=s_wts
         )
-        print(f"[model] value_loss_weight {self.model.value_loss_weight}")
-        print(f"[model] policy_loss_weight {self.model.policy_loss_weight}")
 
         self.model.save(self.config.model_path)
 
@@ -880,11 +868,11 @@ def init_selfplay():
     
     if os.path.exists(model_path):
         print(f"Loading {model_path}")
-        model = MaskedPolicyModel.from_saved(model_path)
+        model = load_model(model_path)
     else:
         print(f"Loading {config.init_model}")
-        model = MaskedPolicyModel.from_saved(config.init_model)
-        model.save(model_path)
+        model = load_model(config.init_model)
+        save_model(model, model_path)
     config = Config()
     
     return model, config
@@ -892,16 +880,6 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
-    
-    ### TEMP TEST
-    import tensorflow as tf
-    # recompile with a much larger value loss weight for the POC
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),
-        policy_loss_weight=0.0,
-        value_loss_weight=2.0,
-    )
-    ### END TEMP
 
     looper = GameLooper(model=model, cfg=Config())
     # infer the number of trainings already done from existing files

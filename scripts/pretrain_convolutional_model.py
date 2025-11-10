@@ -2,7 +2,7 @@ from chessbot import MODEL_DIR, SF_LOC
 
 from chessbot.utils import sf_eval, random_init, mirror_move, format_time
 from chessbot.utils import GameGenerator
-from chessbot.model import save_transformer_model
+from chessbot.model import save_transformer_model as save_custom_model
 
 from chessbot.review import make_fake_visits
 import chess, chess.engine
@@ -21,145 +21,94 @@ policy = mixed_precision.Policy("mixed_float16")
 mixed_precision.set_global_policy(policy)
 
 
-def build_transformer_64pv(
-    d_model=256, n_heads=8, n_layers=5, ff_dim=None, proj_dim=48,
-    dropout=0.05, vocab_size=21, name="transformer_64pv"
+def build_conv_64pv(
+    d_model_embed=128,
+    vocab_size=21,
+    filters=256,
+    n_conv=12,
+    proj_dim=64,
+    name="conv_64pv",
 ):
-    if ff_dim is None:
-        ff_dim = d_model * 2
-
+    DE, FL, VS = d_model_embed, filters, vocab_size
+    
+    # inputs
     enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    legal_in = Input(shape=(4096,), dtype="int32", name="legal_mask")
 
-    token_emb = layers.Embedding(
-        input_dim=vocab_size, output_dim=d_model, name="token_emb"
-    )(enc_in)
-
-    pos_indices = tf.range(start=0, limit=64, delta=1)
+    # embedding -> (B,64,128) -> reshape (B,8,8,128)
+    tok_emb = layers.Embedding(input_dim=VS, output_dim=DE, name="token_emb")(enc_in)
     
-    pos_emb = layers.Embedding(
-        input_dim=64, output_dim=d_model, name="pos_emb")(pos_indices)
-    
-    pos_emb = tf.expand_dims(pos_emb, axis=0)
-    x = token_emb + pos_emb
+    x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
 
-    for i in range(n_layers):
-        # pre-LN transformer block
-        #ln1 = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{i}")(x)
-        att = layers.MultiHeadAttention(
-            num_heads=n_heads,
-            key_dim=d_model // n_heads,
-            name=f"mha_{i}")(x, x, x)
+    # initial conv to filters
+    x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
+
+    # main conv stack (repeated 3x3 convs)
+    for i in range(n_conv):
+        y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
+        y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
         
-        att = layers.Dropout(dropout)(att)
-        x = layers.Add()([x, att])
-        
-        #ln2 = layers.LayerNormalization(epsilon=1e-6, name=f"ln2_{i}")(x)
-        ff = layers.Dense(ff_dim, activation="gelu", name=f"ff1_{i}")(x)
-        ff = layers.Dropout(dropout)(ff)
-        ff = layers.Dense(d_model, name=f"ff2_{i}")(ff)
-        ff = layers.Dropout(dropout)(ff)
-        x = layers.Add()([x, ff])
+        # residual
+        x = layers.Add(name=f"res_{i}")([x, y])
 
-    square_feats = x  # (B,64,d)
+    # expand to 512 then mix
+    x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
+    x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
 
-    def legal_summaries(mask_tensor, **kwargs):
-        # mask_tensor may be int32; cast to float32 first
-        m = tf.reshape(tf.cast(mask_tensor, tf.float32), (-1, 64, 64))
-        from_count = tf.reduce_sum(m, axis=2)
-        from_has = tf.cast(from_count > 0.0, tf.float32)
-        from_count_norm = tf.math.log1p(from_count) / tf.math.log(64.0)
-        return tf.expand_dims(from_has, axis=2), tf.expand_dims(
-            from_count_norm, axis=2
-        )
+    # project back to FL (optional)
+    x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
 
+    # flatten to (B,64,channels)
+    #b, h, w, c = None, 8, 8, FL
+    feat = layers.Reshape((64, FL), name="to_64_x")(x)
 
-    from_has, from_count_norm = layers.Lambda(
-        legal_summaries, name="from_legal_feats")(legal_in)
+    # pairwise policy: from/to projections + biases -> 64x64 -> 4096
+    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)
+    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)
 
-    # append legal features to each square token
-    from_has_tiled = tf.cast(from_has, square_feats.dtype)
-    from_count_tiled = tf.cast(from_count_norm, square_feats.dtype)
-    square_aug = layers.Concatenate(axis=2, name="square_aug")(
-        [square_feats, from_has_tiled, from_count_tiled]
-    )
-
-    from_proj = layers.Dense(proj_dim, name="from_proj")(square_aug)
-    to_proj = layers.Dense(proj_dim, name="to_proj")(square_aug)
-
-    pair_scores = layers.Lambda(
-        lambda t: tf.einsum('bif,bjf->bij', t[0], t[1]),
-        name="pair_scores")([from_proj, to_proj]
-    )
+    # from_proj, to_proj: (B, 64, F)
+    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # -> (B,64,64)
 
     # per-from and per-to biases
-    b_from = layers.Dense(1, name="b_from")(from_proj)
-    b_to = layers.Dense(1, name="b_to")(to_proj)
-    b_from = tf.squeeze(b_from, axis=2)[:, :, None]
-    b_to = tf.squeeze(b_to, axis=2)[:, None, :]
+    b_from = layers.Dense(1, name="b_from")(from_proj)   # (B,64,1)
+    # b_from is already (B,64,1) after Dense
+    # ensure shape is explicit (B,64,1)
+    b_from = layers.Reshape((64, 1), name="b_from_reshape")(b_from)
 
-    pair_scores = pair_scores + b_from + b_to
+    b_to = layers.Dense(1, name="b_to")(to_proj)        # (B,64,1)
+    # want (B,1,64) - use Permute to avoid lambdas
+    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)  # -> (B,1,64)
 
-    policy_logits_raw = layers.Reshape((4096,), name="policy_logits_raw")(pair_scores)
-
-    # hard mask inside model (do masking in float32 to avoid fp16 issues)
-    def apply_mask(args):
-        logits, mask = args
-        logits32 = tf.cast(logits, tf.float32)
-        mask32 = tf.cast(mask, tf.float32)
-        # safe large negative inside float16 range (use margin)
-        float16_max = tf.constant(np.finfo(np.float16).max, dtype=tf.float32)
-        big_neg = -0.9 * float16_max   # ~ -58953.0, safe to cast to float16
-        masked = tf.where(mask32 > 0.5, logits32, big_neg)
-        # cast back to model dtype (mixed_float16) if necessary
-        return tf.cast(masked, logits.dtype)
-
-    policy_logits = layers.Lambda(apply_mask, name="policy_logits")(
-        [policy_logits_raw, legal_in]
-    )
+    pair_scores = layers.Add(name="add_biases")([pair_scores, b_from, b_to])
+    policy_logits = layers.Reshape((4096,), name="policy_logits")(pair_scores)
 
     # value head
-    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(x)
-    v = layers.Dense(d_model // 2, activation="relu", name="v_fc1")(v_pool)
-    v = layers.Dense(d_model // 4, activation="relu", name="v_fc2")(v)
+    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
+    v = layers.Dense(FL // 2, activation='relu', name="v_fc1")(v_pool)
+    v = layers.Dense(FL // 4, activation='relu', name="v_fc2")(v)
     value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
 
-    model = Model(
-        inputs=[enc_in, legal_in],
-        outputs=[policy_logits, value_out], name=name
-    )
-    
-    # attach compact init params and loss_weights placeholder
-    model.init_params = dict(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers=n_layers,
-        ff_dim=ff_dim,
-        proj_dim=proj_dim,
-        dropout=dropout,
-        vocab_size=vocab_size,
-        name=name,
-    )
-    
-    model.loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
-    model._default_opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    model._default_loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse"}
-    
-    model.compile(
-        optimizer=model._default_opt,
-        loss=model._default_loss_dict,
-        loss_weights=model.loss_weights
-    )
-    
-    return model
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
+    # compile: losses, weights, optimizer
+    loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+    
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
+    
+    return model, opt, loss_weights, loss_dict
+
+model, opt, loss_weights, loss_dict = build_conv_64pv()
+model.summary()
+#model.load_weights("C:/Users/Bryan/Data/chessbot_data/models/conv_embedded_pt1000.h5")
+#model.save("C:/Users/Bryan/Data/chessbot_data/models/conv_64_token_pt1000.h5")
+#%%
 
 weights_schedule = {
-    0:   {"policy_logits": 0.01, "value_out": 0.01},
-    10:  {"policy_logits": 1.00, "value_out": 1.00},
-    20:  {"policy_logits": 1.50, "value_out": 2.00},
+    0:   {"policy_logits": 1.50, "value_out": 3.00},
     200: {"policy_logits": 2.00, "value_out": 2.75},
     300: {"policy_logits": 2.50, "value_out": 2.25},
     400: {"policy_logits": 2.00, "value_out": 1.50},
@@ -167,6 +116,7 @@ weights_schedule = {
     # post-500 fine-tune taper (MSE maintenance mostly)
     600: {"policy_logits": 1.00, "value_out": 0.50}
 }
+
 
 def weights_for_epoch(epoch, schedule):
     """Return (policy_w, value_w) for the largest key <= epoch."""
@@ -181,34 +131,17 @@ def weights_for_epoch(epoch, schedule):
     return s["policy_logits"], s["value_out"]
 
 
-from chessbot.model import set_loss_weights
-def apply_weights_for_epoch(epoch, model):
+def apply_weights_for_epoch(epoch, model, opt, loss_dict):
     p_w, v_w = weights_for_epoch(epoch, weights_schedule)
-    loss_weights = {"policy_logits": p_w, "value_out": v_w}
-    model = set_loss_weights(model, loss_weights)    
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
     print(f"[epoch {epoch:4d}] [weight update] policy={p_w} value={v_w}")
     return model
-   
 
-params = {
-    "d_model": 288,
-    "n_heads": 12,
-    "n_layers": 12,
-    "ff_dim": 576,
-    "proj_dim": 64,
-    "dropout": 0.05,
-    "vocab_size": 21,
-    "name": "t64pv_no_norm"
-}
 
-model = build_transformer_64pv(**params)
-model.summary()
-
-model = apply_weights_for_epoch(0, model)
+model = apply_weights_for_epoch(0, model, opt, loss_dict)
 #%%
 eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
 eng.configure({"Threads": 1, "Hash": 64})
-
     
 #%%
 metrics_history = {
@@ -358,7 +291,7 @@ while epoch <= 1000:
         
         counts = np.array([x[1] for x in visits], dtype=np.float32)
         s = counts.sum()
-        pi = (counts / s) if s > 0.0 else np.zeros_like(counts)
+        pi = (counts / s) if s > 0.0 else None
         
         # get indices from C++
         indices = rb.moves_to_indices(lms)  # list of ints (0..4095)
@@ -367,12 +300,6 @@ while epoch <= 1000:
         # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
             policy[idx] += p
-        
-        # quick illegal-mass check (mask: 1 legal, 0 illegal or bool)
-        mask = np.array(mask)
-        bmask = mask == 0
-        illegal_mass = policy[bmask].sum()
-        if illegal_mass > 1e-9: print(f"[warn] rep={rep} illegal_mass={illegal_mass:.6e}")
 
         X.append(x); M.append(mask); P.append(policy); Y.append(sf_val)
 
@@ -485,7 +412,7 @@ while epoch <= 1000:
     # main eval/fit on selected 1024
     Ydict = {"value_out": Ystack.astype(np.float32), "policy_logits": Pstack}
     print("-"*100)
-    history = model.fit([Xstack, Mstack], Ydict, epochs=4, batch_size=128, verbose=0)
+    history = model.fit([Xstack, Mstack], Ydict, epochs=4, batch_size=512, verbose=0)
     rows = []
     for m, v in history.history.items():
         name = "total" if m == "loss" else m.replace("_loss", "")
@@ -506,8 +433,8 @@ while epoch <= 1000:
     
     epoch += 1
     if epoch in [0, 100, 200, 500, 1000] == 0:
-        model_name = "t64pv_no_norm"
-        save_transformer_model(model, MODEL_DIR + f"{model_name}_{epoch}.h5")
+        model_name = "conv_embedded_v2"
+        model.save(MODEL_DIR + f"{model_name}_{epoch}.h5")
         with open(MODEL_DIR + f"{model_name}_train_metrics_{epoch}.pkl", "wb") as f:
             pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)
             
@@ -521,3 +448,6 @@ while epoch <= 1000:
     print(f"[time check] last epoch: {e_time}, avg epoch: {avg_epoch},  "
           f"total runtime: {runtime}")
     print()
+#%%
+
+

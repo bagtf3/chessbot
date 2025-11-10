@@ -1,6 +1,8 @@
 # try to get ahead of TF GPU mem management
 import os
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["XLA_FLAGS"] = '--xla_gpu_cuda_data_dir="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"'
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
 
 try:
     import tensorflow as tf

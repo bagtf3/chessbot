@@ -4,6 +4,9 @@ import pandas as pd
 pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
 
+import json
+from pathlib import Path
+
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 HE = "he_normal"
 BIG_NEG = -1e9
@@ -563,372 +566,402 @@ def make_fwd_batched(model, max_bs=1024, warm_shapes=(256, 512, 1024)):
     return fwd
 
 
-class MaskedPolicyModel(tf.keras.Model):
-    def __init__(self, core):
-        super().__init__()
-        
-        self.core = core
-        self.policy_loss_tracker = tf.keras.metrics.Mean(name="policy_loss")
-        self.value_loss_tracker = tf.keras.metrics.Mean(name="value_loss")
-        self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
-        self.output_names = self.core.output_names
+def build_transformer_64pv(
+    d_model=256, n_heads=8, n_layers=5, ff_dim=None, proj_dim=48,
+    dropout=0.05, vocab_size=21, name="transformer_64pv"
+):
+    if ff_dim is None:
+        ff_dim = d_model * 2
 
-        # weights for the new moment penalties
-        self.moment_mean_weight = 0.1
-        self.moment_var_weight  = 2.0
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
+    legal_in = Input(shape=(4096,), dtype="int32", name="legal_mask")
 
-    @property
-    def metrics(self):
-        return [self.total_loss_tracker,
-                self.policy_loss_tracker,
-                self.value_loss_tracker]
+    token_emb = layers.Embedding(
+        input_dim=vocab_size, output_dim=d_model, name="token_emb"
+    )(enc_in)
 
-    def compile(self, optimizer, policy_loss_weight=0.5, value_loss_weight=10.0,
-                **kwargs):
-        super().compile(**kwargs)
-        self.optimizer = tf.keras.optimizers.get(optimizer)
-        self.policy_loss_weight = policy_loss_weight
-        self.value_loss_weight = value_loss_weight
-
-    def train_step(self, data):
-        # unpack robustly (handles x,y and optional sample_weight)
-        x, y, sample_weight = unpack_x_y_sample_weight(data)
-        boards, legal_mask = x
-
-        labels = y["policy"]
-        values = y["value"]
-
-        with tf.GradientTape() as tape:
-            logits, v_pred = self.core([boards, legal_mask], training=True)
-            B = tf.shape(logits)[0]
-            logits = tf.reshape(logits, [B, -1])
-            labels = tf.reshape(labels, [B, -1])
-            mask = tf.cast(tf.reshape(legal_mask, [B, -1]), logits.dtype)
-
-            # numeric constants (match logits dtype)
-            BIG_NEG = tf.cast(tf.constant(-1e9), logits.dtype)
-            EPS = tf.cast(tf.constant(1e-12), logits.dtype)
-
-            # mask illegal logits -> BIG_NEG
-            masked_logits = tf.where(
-                mask > tf.cast(0.5, mask.dtype), logits,
-                tf.ones_like(logits) * BIG_NEG
-            )
-
-            # defensive: ensure float and zero illegal slots, then normalize
-            labels = tf.cast(labels, logits.dtype)
-            labels = labels * mask                     # ZERO illegal slots
-            label_sums = tf.reduce_sum(labels, axis=1, keepdims=True)
-            labels_norm = labels / (label_sums + EPS)
-
-            per_sample_ce = tf.nn.softmax_cross_entropy_with_logits(
-                labels=labels_norm, logits=masked_logits
-            )
-
-            valid = tf.squeeze(label_sums > EPS, axis=1)
-            policy_loss = tf.reduce_sum(
-                tf.where(valid, per_sample_ce, tf.zeros_like(per_sample_ce))
-            ) / (tf.reduce_sum(tf.cast(valid, tf.float32)) + EPS)
-
-            # value loss (unchanged)
-            if sample_weight is not None and isinstance(sample_weight, dict):
-                sw_val = sample_weight.get("value", None)
-                if sw_val is not None:
-                    sw_val = tf.cast(sw_val, v_pred.dtype)
-                    sw_val = tf.reshape(sw_val, tf.shape(v_pred))
-                    value_loss = tf.reduce_mean(tf.square(v_pred - values) * sw_val)
-                else:
-                    value_loss = tf.reduce_mean(tf.square(v_pred - values))
-            else:
-                value_loss = tf.reduce_mean(tf.square(v_pred - values))
-
-            # ensure values shape matches v_pred (v_pred is (B,1))
-            values = tf.cast(values, v_pred.dtype)
-            values = tf.reshape(values, tf.shape(v_pred))
-
-            # batch moments
-            pred_mean = tf.reduce_mean(v_pred)
-            targ_mean = tf.reduce_mean(values)
-            pred_var  = tf.reduce_mean(tf.square(v_pred - pred_mean))
-            targ_var  = tf.reduce_mean(tf.square(values - targ_mean))
-
-            # moment penalties (weights are already on the model: 1.0 each)
-            mean_term = tf.square(pred_mean - targ_mean)
-            var_term  = tf.square(pred_var  - targ_var)
-            moment_loss = (
-                self.moment_mean_weight * mean_term +
-                self.moment_var_weight  * var_term)
-
-            # combine losses
-            total_loss = (
-                self.policy_loss_weight * policy_loss +
-                self.value_loss_weight  * value_loss + moment_loss)
-        
-        grads = tape.gradient(total_loss, self.core.trainable_variables)
-        self.optimizer.apply_gradients(zip(grads, self.core.trainable_variables))
-
-        self.policy_loss_tracker.update_state(policy_loss)
-        self.value_loss_tracker.update_state(value_loss)
-        self.total_loss_tracker.update_state(total_loss)
-
-        return {"loss": self.total_loss_tracker.result(),
-                "policy_loss": self.policy_loss_tracker.result(),
-                "value_loss": self.value_loss_tracker.result()}
-
-
-    def test_step(self, data):
-        x, y, sample_weight = unpack_x_y_sample_weight(data)
-        boards, legal_mask = x
-
-        labels = y["policy"]
-        values = y["value"]
-
-        logits, v_pred = self.core([boards, legal_mask], training=False)
-        B = tf.shape(logits)[0]
-        logits = tf.reshape(logits, [B, -1])
-        labels = tf.reshape(labels, [B, -1])
-        mask = tf.cast(tf.reshape(legal_mask, [B, -1]), logits.dtype)
-
-        BIG_NEG = tf.cast(tf.constant(-1e9), logits.dtype)
-        EPS = tf.cast(tf.constant(1e-12), logits.dtype)
-
-        masked_logits = tf.where(mask > tf.cast(0.5, mask.dtype),
-                                logits,
-                                tf.ones_like(logits) * BIG_NEG)
-
-        # defensive: ensure float and zero illegal slots, then normalize
-        labels = tf.cast(labels, logits.dtype)
-        labels = labels * mask                     # ZERO illegal slots
-        label_sums = tf.reduce_sum(labels, axis=1, keepdims=True)
-        labels_norm = labels / (label_sums + EPS)
-
-        per_sample_ce = tf.nn.softmax_cross_entropy_with_logits(
-            labels=labels_norm, logits=masked_logits
-        )
-
-        valid = tf.squeeze(label_sums > EPS, axis=1)
-        policy_loss = tf.reduce_sum(
-            tf.where(valid, per_sample_ce, tf.zeros_like(per_sample_ce))
-        ) / (tf.reduce_sum(tf.cast(valid, tf.float32)) + EPS)
-
-        # value loss (unchanged)
-        if sample_weight is not None and isinstance(sample_weight, dict):
-            sw_val = sample_weight.get("value", None)
-            if sw_val is not None:
-                sw_val = tf.cast(sw_val, v_pred.dtype)
-                sw_val = tf.reshape(sw_val, tf.shape(v_pred))
-                value_loss = tf.reduce_mean(tf.square(v_pred - values) * sw_val)
-            else:
-                value_loss = tf.reduce_mean(tf.square(v_pred - values))
-        else:
-            value_loss = tf.reduce_mean(tf.square(v_pred - values))
-
-        total_loss = (self.policy_loss_weight * policy_loss +
-                    self.value_loss_weight * value_loss)
-
-        self.policy_loss_tracker.update_state(policy_loss)
-        self.value_loss_tracker.update_state(value_loss)
-        self.total_loss_tracker.update_state(total_loss)
-
-        return {"loss": self.total_loss_tracker.result(),
-                "policy_loss": self.policy_loss_tracker.result(),
-                "value_loss": self.value_loss_tracker.result()}
-
+    pos_indices = tf.range(start=0, limit=64, delta=1)
     
-    def call(self, inputs, training):
-        return self.core(inputs, training=training)
+    pos_emb = layers.Embedding(
+        input_dim=64, output_dim=d_model, name="pos_emb")(pos_indices)
+    
+    pos_emb = tf.expand_dims(pos_emb, axis=0)
+    x = token_emb + pos_emb
 
-    def save(self, path):
-        self.core.save(path)
+    for i in range(n_layers):
+        # pre-LN transformer block
+        ln1 = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{i}")(x)
+        att = layers.MultiHeadAttention(
+            num_heads=n_heads,
+            key_dim=d_model // n_heads,
+            name=f"mha_{i}")(ln1, ln1, ln1)
+        
+        att = layers.Dropout(dropout)(att)
+        x = layers.Add()([x, att])
+        
+        ln2 = layers.LayerNormalization(epsilon=1e-6, name=f"ln2_{i}")(x)
+        ff = layers.Dense(ff_dim, activation="gelu", name=f"ff1_{i}")(ln2)
+        ff = layers.Dropout(dropout)(ff)
+        ff = layers.Dense(d_model, name=f"ff2_{i}")(ff)
+        ff = layers.Dropout(dropout)(ff)
+        x = layers.Add()([x, ff])
 
-    @classmethod
-    def from_saved(cls, path, compile_model=True, lr=1e-4,
-                   policy_loss_weight=0.5, value_loss_weight=10.0):
-        """
-        Load a MaskedPolicyModel previously saved with save(path).
-        Builds the subclass and optionally compiles it with defaults.
-        """
-        core_loaded = tf.keras.models.load_model(path)
-        inst = cls(core_loaded)
-        # try to build so model.summary() is usable immediately
-        try:
-            inst.build(input_shape=[(None, 8, 8, 29), (None, 4096)])
-        except Exception as e:
-            print(e)
-            pass
+    square_feats = x  # (B,64,d)
 
-        if compile_model:
-            try:
-                inst.compile(
-                    optimizer=tf.keras.optimizers.Adam(lr),
-                    policy_loss_weight=policy_loss_weight,
-                    value_loss_weight=value_loss_weight
-                )
-            except Exception:
-                # best-effort fallback: set attributes manually so eval works
-                inst.optimizer = tf.keras.optimizers.Adam(lr)
-                inst.policy_loss_weight = policy_loss_weight
-                inst.value_loss_weight = value_loss_weight
-
-        return inst
-
-    @classmethod
-    def build_core(self, n_blocks, name):
-        board_in = Input(shape=(8, 8, 29), name="board")
-        legal_in = Input(shape=(4096,), name="legal_mask")
-
-        x = layers.Conv2D(256, 3, padding="same", name="conv0")(board_in)
-        x = layers.BatchNormalization()(x)
-        x = layers.LeakyReLU()(x)
-
-        branch = None
-        for i in range(n_blocks):
-            r = layers.Conv2D(256, 3, padding="same", name=f"b{i}_c1")(x)
-            r = layers.BatchNormalization()(r)
-            r = layers.LeakyReLU()(r)
-            r = layers.Conv2D(256, 3, padding="same", name=f"b{i}_c2")(r)
-            r = layers.BatchNormalization()(r)
-            x = layers.Add()([x, r])
-            x = layers.LeakyReLU()(x)
-            if i == 3:
-                branch = x
-
-        if branch is None:
-            branch = x
-
-        trunk = x  # full trunk for policy
-
-        # Policy head (unchanged)
-        p = layers.Conv2D(64, 1, padding="same", name="policy_conv1x1")(trunk)
-        policy_logits = layers.Reshape((4096,), name="policy_logits")(p)
-
-        # Value head from earlier branch
-        v = layers.Conv2D(32, 3, padding="same", name="v_conv")(branch)
-        v = layers.BatchNormalization()(v)
-        v = layers.LeakyReLU()(v)
-        v = layers.Flatten(name="v_flat")(v)
-        v = layers.Dense(512, activation="relu", name="v_fc2")(v)
-        v = layers.Dense(128, activation="relu", name="v_fc3")(v)
-        v_out = layers.Dense(1, activation="tanh", name="value_out")(v)
-
-        core = Model(
-            inputs=[board_in, legal_in],
-            outputs=[policy_logits, v_out],
-            name=name
+    def legal_summaries(mask_tensor, **kwargs):
+        # mask_tensor may be int32; cast to float32 first
+        m = tf.reshape(tf.cast(mask_tensor, tf.float32), (-1, 64, 64))
+        from_count = tf.reduce_sum(m, axis=2)
+        from_has = tf.cast(from_count > 0.0, tf.float32)
+        from_count_norm = tf.math.log1p(from_count) / tf.math.log(64.0)
+        return tf.expand_dims(from_has, axis=2), tf.expand_dims(
+            from_count_norm, axis=2
         )
 
-        return core
+
+    from_has, from_count_norm = layers.Lambda(
+        legal_summaries, name="from_legal_feats")(legal_in)
+
+    # append legal features to each square token
+    from_has_tiled = tf.cast(from_has, square_feats.dtype)
+    from_count_tiled = tf.cast(from_count_norm, square_feats.dtype)
+    square_aug = layers.Concatenate(axis=2, name="square_aug")(
+        [square_feats, from_has_tiled, from_count_tiled]
+    )
+
+    from_proj = layers.Dense(proj_dim, name="from_proj")(square_aug)
+    to_proj = layers.Dense(proj_dim, name="to_proj")(square_aug)
+
+    pair_scores = layers.Lambda(
+        lambda t: tf.einsum('bif,bjf->bij', t[0], t[1]),
+        name="pair_scores")([from_proj, to_proj]
+    )
+
+    # per-from and per-to biases
+    b_from = layers.Dense(1, name="b_from")(from_proj)
+    b_to = layers.Dense(1, name="b_to")(to_proj)
+    b_from = tf.squeeze(b_from, axis=2)[:, :, None]
+    b_to = tf.squeeze(b_to, axis=2)[:, None, :]
+
+    pair_scores = pair_scores + b_from + b_to
+
+    policy_logits_raw = layers.Reshape((4096,), name="policy_logits_raw")(pair_scores)
+
+    # hard mask inside model (do masking in float32 to avoid fp16 issues)
+    def apply_mask(args):
+        logits, mask = args
+        logits32 = tf.cast(logits, tf.float32)
+        mask32 = tf.cast(mask, tf.float32)
+        big_neg = tf.constant(-1e6, dtype=tf.float32)
+        masked = tf.where(mask32 > 0.5, logits32, big_neg)
+        return tf.cast(masked, logits.dtype)
+
+    policy_logits = layers.Lambda(apply_mask, name="policy_logits")(
+        [policy_logits_raw, legal_in]
+    )
+
+    # value head
+    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(x)
+    v = layers.Dense(d_model // 2, activation="relu", name="v_fc1")(v_pool)
+    v = layers.Dense(d_model // 4, activation="relu", name="v_fc2")(v)
+    value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
+
+    model = Model(
+        inputs=[enc_in, legal_in],
+        outputs=[policy_logits, value_out], name=name
+    )
+    
+    # attach compact init params and loss_weights placeholder
+    model.init_params = dict(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        ff_dim=ff_dim,
+        proj_dim=proj_dim,
+        dropout=dropout,
+        vocab_size=vocab_size,
+        name=name,
+    )
+    
+    model.loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
+    model._default_opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    model._default_loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse"}
+    
+    model.compile(
+        optimizer=model._default_opt,
+        loss=model._default_loss_dict,
+        loss_weights=model.loss_weights
+    )
+    
+    return model
 
 
-    def make_infer(self, max_bs=1024, warm_shapes=(64, 256, 512)):
-        """
-        Return fwd((boards_np, legal_np), min_p, max_p, temp) -> [probs_np, val_np].
-        GPU-side masked softmax + clip + renorm. Chunks > max_bs.
-        """
+def save_transformer_model(model, path):
+    path = Path(path)
+    weights_path = path
+    meta_path = path.with_suffix(".json")
 
+    # save weights and metadata
+    model.save_weights(str(weights_path), save_format="h5")
+
+    payload = {
+        "params": model.init_params,
+        "weights_path": str(weights_path),
+        "loss_weights": model.loss_weights
+    }
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with meta_path.open("w", encoding="utf8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+
+def load_transformer_model(path):
+    meta_path = Path(path)
+    if meta_path.suffix != ".json":
+        meta_path = meta_path.with_suffix(".json")
+
+    with meta_path.open("r", encoding="utf8") as fh:
+        payload = json.load(fh)
+
+    params = payload["params"]
+    weights_path = payload["weights_path"]
+    loss_weights = payload.get("loss_weights")
+
+    model = build_transformer_64pv(**params)
+    model.load_weights(weights_path)
+    model.init_params = params
+    
+    if loss_weights is not None:
+        model = set_loss_weights(model, loss_weights)
+        
+    return model
+
+
+def set_loss_weights(model, loss_weights):
+    # Get a fresh optimizer (same config) to avoid double-wrapping
+    opt_candidate = model._default_opt
+    if isinstance(opt_candidate, tf.keras.mixed_precision.LossScaleOptimizer):
+        base_opt = opt_candidate.inner_optimizer
+    else:
+        base_opt = opt_candidate
+
+    # create a new optimizer instance with same config
+    opt_cfg = tf.keras.optimizers.serialize(base_opt)
+    opt = tf.keras.optimizers.deserialize(opt_cfg)
+
+    model.compile(
+        optimizer=opt,
+        loss=model._default_loss_dict,
+        loss_weights=loss_weights
+    )
+    model.loss_weights = loss_weights
+    # remember the fresh optimizer for later use
+    model._default_opt = opt
+    return model
+
+
+## USAGE 
+#model = build_transformer_64pv(
+#    d_model=288, n_heads=12, n_layers=12, ff_dim=None, proj_dim=64, dropout=0.05,
+#    vocab_size=21, name="t64pv"
+#)
+#
+#save_transformer_model(model, MODEL_DIR + "transformer_large_init.h5")
+
+
+def make_transformer_infer(model, max_bs=1024, warm_shapes=(64, 256, 512)):
+    """
+    Returns fwd((enc_np, legal_np), min_p, max_p, temp) -> (probs_np, val_np).
+    enc_np: int32 [B,64], legal_np: int32 [B,4096].
+    """
+    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
+    EPS = tf.constant(1e-12, dtype=tf.float32)
+
+    @tf.function(input_signature=[
+        tf.TensorSpec([None, 64], tf.int32),
+        tf.TensorSpec([None, 4096], tf.int32),
+        tf.TensorSpec([], tf.float32),  # min_p
+        tf.TensorSpec([], tf.float32),  # max_p
+        tf.TensorSpec([], tf.float32),  # temp
+    ],experimental_compile=True)
+    def graph(enc, legal, min_p, max_p, temp):
+        # logits from model: reshape to (B,4096)
+        logits, value = model([enc, legal], training=False)
+        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
+
+        # mask as float32 for softmax computations
+        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]),
+                    dtype=tf.float32)
+
+        # cast logits -> float32 for stable softmax under mixed precision
+        logits32 = tf.cast(logits, tf.float32)
+
+        # big negative in float32, then mask illegal moves
         BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-        EPS = tf.constant(1e-12, dtype=tf.float32)
+        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
 
-        @tf.function(input_signature=[
-            tf.TensorSpec([None, 8, 8, 29], tf.float32),
-            tf.TensorSpec([None, 4096], tf.int32),
-            tf.TensorSpec([], tf.float32),  # min_p
-            tf.TensorSpec([], tf.float32),  # max_p
-            tf.TensorSpec([], tf.float32),  # temp
-        ])
-        def graph(board, legal, min_p, max_p, temp):
-            # forward
-            logits, value = self.core([board, legal], training=False)
-            logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
-            mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]),
-                        dtype=logits.dtype)
+        # temperature-stable softmax in float32
+        scaled = masked_logits32 / tf.cast(temp, tf.float32)
+        row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
+        exp = tf.exp(scaled - row_max) * mask
+        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
+        has_any = sumexp > 0.0
+        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
 
-            # mask illegal logits -> BIG_NEG
-            masked_logits = tf.where(mask > 0.5, logits,
-                                    tf.ones_like(logits) * BIG_NEG)
+        # clipping on legal slots and renormalize (float32)
+        min_p_f = tf.cast(min_p, tf.float32)
+        max_p_f = tf.cast(max_p, tf.float32)
+        clipped = tf.where(mask > 0.5,
+                        tf.clip_by_value(probs, min_p_f, max_p_f),
+                        tf.zeros_like(probs))
+        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
+        valid = s > EPS
+        probs_final = tf.where(
+            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
+            tf.zeros_like(clipped)
+        )
 
-            # temperature-stable softmax over legal entries only
-            scaled = masked_logits / tf.cast(temp, masked_logits.dtype)
-            row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
-            exp = tf.exp(scaled - row_max) * mask
-            sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
-            has_any = sumexp > 0.0
-            probs = tf.where(has_any, exp / (sumexp + EPS),
-                            tf.zeros_like(exp))
+        # ensure returned probs are float32; cast value to float32 too
+        value_f = tf.cast(value, tf.float32)
+        return probs_final, value_f
 
-            # clamp only legal slots then renormalize
-            min_p = tf.cast(min_p, probs.dtype)
-            max_p = tf.cast(max_p, probs.dtype)
-            clipped = tf.where(mask > 0.5,
-                            tf.clip_by_value(probs, min_p, max_p),
-                            tf.zeros_like(probs))
-            s = tf.reduce_sum(clipped, axis=1, keepdims=True)
-            valid = s > EPS
-            probs_final = tf.where(
-                valid, clipped / (s + (1.0 - tf.cast(valid, probs.dtype))),
-                tf.zeros_like(clipped)
-            )
-            
-            return probs_final, value
 
-        # warm up traces
-        for B in warm_shapes:
-            _ = graph(tf.zeros([B, 8, 8, 29], tf.float32),
-                    tf.zeros([B, 4096], tf.int32),
-                    tf.constant(0.001, tf.float32),
-                    tf.constant(0.35,  tf.float32),
-                    tf.constant(1.0,   tf.float32))
+    # warm up traces for common batch sizes
+    for B in warm_shapes:
+        _ = graph(tf.zeros([B, 64], tf.int32),
+                  tf.zeros([B, 4096], tf.int32),
+                  tf.constant(0.001, tf.float32),
+                  tf.constant(0.35,  tf.float32),
+                  tf.constant(1.0,   tf.float32))
 
-        def base_fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
-            # pair is (boards_np, legal_np)
-            if not isinstance(pair, (list, tuple)):
-                raise ValueError("pass (boards_np, legal_np) tuple")
-            boards_np, legal_np = pair
-            b_tf = tf.convert_to_tensor(boards_np, dtype=tf.float32)
-            l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
-            probs_tf, val_tf = graph(b_tf, l_tf,
-                                    tf.cast(min_p, tf.float32),
-                                    tf.cast(max_p, tf.float32),
-                                    tf.cast(temp,  tf.float32))
-            return probs_tf.numpy(), val_tf.numpy()
+    def base_fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
+        if not isinstance(pair, (list, tuple)):
+            raise ValueError("pass (enc_np, legal_np) tuple")
+        enc_np, legal_np = pair
+        e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
+        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
+        probs_tf, val_tf = graph(e_tf, l_tf,
+                                 tf.cast(min_p, tf.float32),
+                                 tf.cast(max_p, tf.float32),
+                                 tf.cast(temp,  tf.float32))
+        return probs_tf.numpy(), val_tf.numpy()
 
-        if max_bs is None:
-            return base_fwd
+    if max_bs is None:
+        return base_fwd
 
-        def fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
-            boards_np, legal_np = pair
-            B = boards_np.shape[0]
-            if B <= max_bs:
-                return base_fwd((boards_np, legal_np), min_p, max_p, temp)
-            parts = None
-            i = 0
-            while i < B:
-                j = min(i + max_bs, B)
-                p_probs, p_val = base_fwd((boards_np[i:j], legal_np[i:j]),
-                                        min_p, max_p, temp)
-                if parts is None:
-                    parts = [p_probs, p_val]
-                else:
-                    parts[0] = np.concatenate([parts[0], p_probs], axis=0)
-                    parts[1] = np.concatenate([parts[1], p_val],  axis=0)
-                i = j
-            return parts
+    def fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
+        enc_np, legal_np = pair
+        B = enc_np.shape[0]
+        if B <= max_bs:
+            return base_fwd((enc_np, legal_np), min_p, max_p, temp)
+        parts = None
+        i = 0
+        while i < B:
+            j = min(i + max_bs, B)
+            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]),
+                                     min_p, max_p, temp)
+            if parts is None:
+                parts = [p_probs, p_val]
+            else:
+                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
+                parts[1] = np.concatenate([parts[1], p_val],  axis=0)
+            i = j
+        return parts
 
-        return fwd
+    return fwd
 
-### TO MAKE A MODEL ###
-# from chessbot import MODEL_DIR
-# model_loc = MODEL_DIR + "conv_stm_pov_init.h5"
-# core = MaskedPolicyModel.build_core(n_blocks=10, name="stm_pov_v1")
-# core.compile(
-#     optimizer=tf.keras.optimizers.Adam(1e-4),
-#     loss=["categorical_crossentropy", "mse"],
-#     loss_weights=[0.0, 1.0]
-# )
-# model = MaskedPolicyModel(core)
-# model.core.summary()
-# model.save(model_loc)
 
-## USAGE ###
-#infer = model.make_infer(max_bs=1024)
-#probs_np, vals_np = infer((boards_np, legals_np), min_p=0.001, max_p=0.35, temp=1.0)
+def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
+    """
+    Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
+    enc_np: int32 [B,64], legal_np: int32 [B,4096].
+    min_p, max_p, temp are baked into the closure.
+    """
+    
+    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
+    EPS = tf.constant(1e-12, dtype=tf.float32)
+
+    # baked float32 constants for the graph
+    min_p_c = tf.constant(float(min_p), dtype=tf.float32)
+    max_p_c = tf.constant(float(max_p), dtype=tf.float32)
+    temp_c = tf.constant(float(temp), dtype=tf.float32)
+
+    @tf.function(input_signature=[
+        tf.TensorSpec([None, 64], tf.int32),
+        tf.TensorSpec([None, 4096], tf.int32),
+    ], experimental_compile=True)
+    def graph(enc, legal):
+        # model returns (policy_logits, value)
+        logits, value = model(enc, training=False)
+        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4096)
+
+        # mask as float32
+        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
+
+        # cast logits -> float32 for stable softmax under mixed precision
+        logits32 = tf.cast(logits, tf.float32)
+
+        # mask illegal moves with a large negative in float32
+        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
+
+        # temperature-stable softmax in float32
+        scaled = masked_logits32 / temp_c
+        row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
+        exp = tf.exp(scaled - row_max) * mask
+        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
+        has_any = sumexp > 0.0
+        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
+
+        # clipping on legal slots and renormalize (float32)
+        clipped = tf.where(mask > 0.5,
+                           tf.clip_by_value(probs, min_p_c, max_p_c),
+                           tf.zeros_like(probs))
+        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
+        valid = s > EPS
+        probs_final = tf.where(
+            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
+            tf.zeros_like(clipped)
+        )
+
+        # cast value to float32
+        value_f = tf.cast(value, tf.float32)
+        return probs_final, value_f
+
+    # warm up traces for common batch sizes
+    if max_bs is not None:
+        for B in (max_bs, max_bs):
+            _ = graph(tf.zeros([B, 64], tf.int32),
+                    tf.zeros([B, 4096], tf.int32))
+
+    def base_fwd(pair):
+        if not isinstance(pair, (list, tuple)):
+            raise ValueError("pass (enc_np, legal_np) tuple")
+        enc_np, legal_np = pair
+        e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
+        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
+        probs_tf, val_tf = graph(e_tf, l_tf)
+        return probs_tf.numpy(), val_tf.numpy()
+
+    if max_bs is None:
+        return base_fwd
+
+    def fwd(pair):
+        enc_np, legal_np = pair
+        B = int(enc_np.shape[0])
+        if B <= max_bs:
+            return base_fwd((enc_np, legal_np))
+        parts = None
+        i = 0
+        while i < B:
+            j = min(i + max_bs, B)
+            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]))
+            if parts is None:
+                parts = [p_probs, p_val]
+            else:
+                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
+                parts[1] = np.concatenate([parts[1], p_val],  axis=0)
+            i = j
+        return parts
+    return fwd

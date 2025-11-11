@@ -38,11 +38,11 @@ class Config(object):
     games_at_once = 256
     n_training_games = 500
     
-    move_limit = 160
-    material_diff_cutoff = 15
+    move_limit = 200
+    material_diff_cutoff = 20
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 0.0
+    play_vs_sf_prob = 2
     sf_depth = 15
     
     game_probs = {
@@ -52,7 +52,7 @@ class Config(object):
     }
     
     # priors
-    prior_clip_max = 0.35
+    prior_clip_max = 0.5
     prior_clip_min = 0.001
 
     # training

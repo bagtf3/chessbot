@@ -233,428 +233,289 @@ def plot_sf_simple(df):
     plt.show()
 
 
-def plot_training_progress(all_evals, max_cols=4, save_path=None):
-    """
-    Two figures:
-      1) 1 row x 3 cols: total_loss, policy_logits, value_out (MA15)
-      2) 2 rows x 3 cols: 6 plots:
-         - topk (mean_top1/3/10 together, no MA)
-         - legal_mass_mean (MA15)
-         - mean_kl (MA15)
-         - mean_pred_entropy (MA15)
-         - value_corr (MA15)
-         - value_bias (MA15)
-    Saves to save_path and save_path_extra (same dir) or shows if save_path is None.
-    """
-    if "model_epoch" in all_evals.columns:
-        all_evals = all_evals.drop(columns=["model_epoch"])
+def batch_policy_metrics(logits, labels, mask):
+    # mask logits, compute stable softmax
+    masked_logits = np.where(mask > 0.5, logits, big_neg)
+    probs = stable_softmax(masked_logits)
 
-    # helper: safe get column values, returns None if missing
+    # CE vs labels and vs uniform on legal set
+    per_ce = -np.sum(labels * np.log(probs + eps), axis=1)
+    policy_ce = per_ce.mean()
+
+    legal_counts = mask.sum(axis=1, keepdims=True)
+    uniform = mask / (legal_counts + eps)
+    per_ce_uniform = -np.sum(labels * np.log(uniform + eps), axis=1)
+    uniform_ce = per_ce_uniform.mean()
+
+    exp_prob_model = np.sum(labels * probs, axis=1).mean()
+    exp_prob_uniform = np.sum(labels * uniform, axis=1).mean()
+
+    # best indices
+    true_best = labels.argmax(axis=1)
+    model_best = probs.argmax(axis=1)
+
+    # top1 exact (model picks same argmax as labels)
+    top1_exact = (model_best == true_best).mean()
+
+    # avg prob of model's chosen best (keeps backward compat)
+    top_probs = probs[np.arange(probs.shape[0]), model_best]
+    avg_top_prob = top_probs.mean()
+
+    # mass on label-defined top-1 / top-3 / top-5 (per-sample then batch mean)
+    top1_per = probs[np.arange(probs.shape[0]), true_best]
+
+    # get top-k indices by label (unsorted within the k)
+    top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :k3]
+    top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :k5]
+
+    top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
+    top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
+
+    top1_mass = top1_per.mean()
+    top3_mass = top3_per.mean()
+    top5_mass = top5_per.mean()
+
+    # other support / distribution metrics
+    support_mask = labels > 0
+    support_mask[np.arange(support_mask.shape[0]), true_best] = False
+    prob_on_others_per = (probs * support_mask).sum(axis=1)
+    prob_on_others = prob_on_others_per.mean()
+
+    top1_in_support = (labels[np.arange(labels.shape[0]), model_best] > 0).mean()
+
+    return {
+        "policy_ce": policy_ce,
+        "uniform_ce": uniform_ce,
+        "ce_gain": (uniform_ce - policy_ce),
+        "exp_prob_model": exp_prob_model,
+        "exp_prob_uniform": exp_prob_uniform,
+        "top1_in_support": top1_in_support,
+        "top1_exact": top1_exact,
+        "avg_top_prob": avg_top_prob,
+        "top1_mass": top1_mass,
+        "top3_mass": top3_mass,
+        "top5_mass": top5_mass,
+        "prob_on_others": prob_on_others
+    }
+
+
+def print_validation(epoch, stats):
+    keys = [
+        "val_mse", "val_corr",
+        "policy_ce", "uniform_ce", "ce_gain",
+        "top1_exact", "avg_top_prob",
+        "top1_mass", "prob_on_others"
+    ]
+    name_w = max(len(k) for k in keys)
+    num_w = 8
+    fmt_num = f"{{value:{num_w}.4f}}"
+    def pair(k, v):
+        return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
+    ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
+
+    print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
+          f"{pair('value_corr', stats['value_corr'])}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
+          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
+          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "
+          f"{pair('true ratio', ratio)}")
+
+
+def score_game_data(model, X, M, Y, epoch, save_path=None):
+    """ Run model.predict -> plot -> metrics -> return a single-row """
+    preds = model.predict(X, verbose=0, batch_size=512)
+    value_preds = preds[1].ravel(); targets = np.asarray(Ystack).ravel()
+
+    plt.scatter(targets, value_preds, s=6)
+    plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
+    plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
+    plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target")
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path)
+    plt.close()
+
+    value_preds = preds[1].ravel()  # (B,)
+    targets = Y['value_out'].ravel()
+    value_mse = np.mean((value_preds - targets) ** 2)
+    value_corr = np.corrcoef(value_preds, targets)[0, 1]
+    
+    policy_logits = preds[0]  # (B,4096)
+    policy_true = Y['policy_logits']
+    policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
+
+    # build print dict and call the printer
+    print_metrics = {"value_mse": value_mse, "value_corr": value_corr}
+    print_metrics.update(policy_stats)
+    print_validation(epoch, print_metrics)
+
+    # create DF and return
+    eval_df = pd.DataFrame([print_metrics])
+    eval_df['model_epoch'] = epoch
+
+    return eval_df
+
+
+def moving_average_pd(arr, window=15):
+    s = pd.Series(arr)
+    return s.rolling(window, center=True, min_periods=1).mean().values
+
+
+def plot_training_progress(metrics_history, epoch=None, save_path=None):
+    """
+    metrics_history: pd.DataFrame or dict-like with columns used below.
+    If epoch is None, try to infer from metrics_history['model_epoch'].max(),
+    otherwise use number of rows.
+    Produces two figures and either shows them or writes:
+      save_path           -> primary (2x2)
+      save_path + "_extra"-> extra (1x3)
+    """
+
+    df = metrics_history.copy()
+
+    # helper to safely extract column arrays (or None)
     def col_vals(name):
-        return all_evals[name].values if name in all_evals.columns else None
+        if name in df.columns:
+            return df[name].values
+        return None
 
-    # First figure: 1x3 (MA15)
-    fig1, axs1 = plt.subplots(1, 3, figsize=(15, 4))
+    # compute hide / MA window exactly as you specified
+    hide_first = max(int(0.1 * epoch), 5)
+    do_plot = (epoch > hide_first) and (epoch % 5 == 0)
 
-    # choose stable colors: blue for raw, orange for MA
-    cols1 = ['total_loss', 'policy_logits', 'value_out']
-    figs = []
+    if not do_plot:
+        # Nothing to draw — either too early or not on interval.
+        return
 
-    palette = sns.color_palette("tab10")
-    RAW_COL = palette[0]
-    MA_COL  = palette[1]   
-    MA_ALPHA = 0.6         
+    ma_window = min(max(3, int(epoch * 0.2)), 15)
+    if ma_window % 2 == 0:
+        ma_window += 1
 
-    for ax, name in zip(axs1, cols1):
-        y = col_vals(name)
-        if y is None:
-            ax.text(0.5, 0.5, f"missing: {name}", ha="center", va="center")
-            ax.set_axis_off()
-            continue
-        x = np.arange(len(y))
-        # raw series (same color for all panels)
-        ax.plot(x, y, label=name, color=RAW_COL)
-        # MA15 (same MA color for all panels, slightly transparent)
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=MA_ALPHA, label=f"{name} (MA15)", color=MA_COL)
-        ax.set_title(name)
-        ax.legend(fontsize=8)
+    # prepare x-axis baseline
+    N = len(df)
+    x_full = np.arange(N)
+    start = hide_first
+    xs = x_full[start:]
+
+    # first figure (2x2)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # policy CE
+    ax = axes[0, 0]
+    raw = np.array(col_vals("policy_ce") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="policy_ce", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("policy CE (nats)")
+    ax.legend()
+
+    # CE gain vs uniform
+    ax = axes[0, 1]
+    raw = np.array(col_vals("ce_gain") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="ce_gain", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("CE gain vs uniform")
+    ax.legend()
+
+    # value MSE
+    ax = axes[1, 0]
+    raw = np.array(col_vals("value_mse") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="mse", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("value MSE")
+    ax.legend()
+
+    # value corr
+    ax = axes[1, 1]
+    raw = np.array(col_vals("value_corr") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="corr", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("value corr")
+    ax.legend()
 
     plt.tight_layout()
-    figs.append((fig1, axs1))
 
-    # Second figure: 2x3
-    fig2, axs2 = plt.subplots(2, 3, figsize=(15, 8))
-    axs2 = axs2.flatten()
+    # Second figure (1x3)
+    fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
 
-    # (1) topk together no MA
-    ax = axs2[0]
+    # (1) top1 / top3 / top5 on same plot (raw, no MA)
+    ax = axs[0]
     t1 = col_vals("mean_top1_mass")
     t3 = col_vals("mean_top3_mass")
-    t10 = col_vals("mean_top10_mass")
-    if t1 is None and t3 is None and t10 is None:
+    t5 = col_vals("mean_top5_mass")
+    any_top = any(arr is not None and len(arr) for arr in (t1, t3, t5))
+    if not any_top:
         ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
         ax.set_axis_off()
     else:
-        # safe lengths (avoid evaluating numpy array truthiness)
-        l1 = len(t1) if t1 is not None else 0
-        l3 = len(t3) if t3 is not None else 0
-        l10 = len(t10) if t10 is not None else 0
-        maxlen = max(l1, l3, l10)
-        x = np.arange(maxlen)
-
-        if t1 is not None:
-            ax.plot(np.arange(len(t1)), t1, label="top1", color=palette[0])
-        if t3 is not None:
-            ax.plot(np.arange(len(t3)), t3, label="top3", color=palette[1])
-        if t10 is not None:
-            ax.plot(np.arange(len(t10)), t10, label="top10", color=palette[2])
-
-        # autoscale: use log if all tiny and >0
-        maxv = 0.0
-        for arr in (t1, t3, t10):
-            if arr is not None and np.size(arr):
-                try:
-                    maxv = max(maxv, float(np.nanmax(arr)))
-                except ValueError:
-                    pass
-        if 0 < maxv < 1e-3:
-            ax.set_yscale("log")
-            ax.set_ylim(max(1e-6, maxv * 1e-4), max(1e-3, maxv * 10.0))
-        else:
-            ax.set_ylim(0, max(1e-3, maxv * 1.2))
+        if t1 is not None and len(t1):
+            ax.plot(np.arange(len(t1)), t1, label="top1", linewidth=1)
+        if t3 is not None and len(t3):
+            ax.plot(np.arange(len(t3)), t3, label="top3", linewidth=1)
+        if t5 is not None and len(t5):
+            ax.plot(np.arange(len(t5)), t5, label="top5", linewidth=1)
         ax.set_title("mean top-k mass (no MA)")
-        ax.legend()
-
-    # (2) legal_mass_mean MA15
-    ax = axs2[1]
-    y = col_vals("legal_mass_mean")
-    if y is None:
-        ax.text(0.5, 0.5, "missing: legal_mass_mean", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        x = np.arange(len(y))
-        ax.plot(x, y, label="legal_mass_mean")
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7, label="legal_mass_mean (MA15)")
-        ax.set_title("legal_mass_mean")
         ax.legend(fontsize=8)
 
-    # (3) mean_kl MA15
-    ax = axs2[2]
-    y = col_vals("mean_kl")
+    # (2) avg_top_prob (raw, plus optional MA overlay)
+    ax = axs[1]
+    y = col_vals("avg_top_prob")
     if y is None:
-        ax.text(0.5, 0.5, "missing: mean_kl", ha="center", va="center")
+        ax.text(0.5, 0.5, "missing: avg_top_prob", ha="center", va="center")
         ax.set_axis_off()
     else:
         x = np.arange(len(y))
-        ax.plot(x, y, label="mean_kl")
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7, label="mean_kl (MA15)")
-        ax.set_title("mean_kl")
+        ax.plot(x, y, label="avg_top_prob", alpha=0.6, lw=1)
+        ma_y = moving_average_pd(y, window=ma_window)
+        ax.plot(x, ma_y, lw=2, alpha=0.7, label=f"MA{ma_window}")
+        ax.set_title("avg_top_prob")
         ax.legend(fontsize=8)
 
-    # (4) mean_pred_entropy MA15
-    ax = axs2[3]
-    y = col_vals("mean_pred_entropy")
+    # (3) top1_exact (raw, plus MA)
+    ax = axs[2]
+    y = col_vals("top1_exact")
     if y is None:
-        ax.text(0.5, 0.5, "missing: mean_pred_entropy",
-                ha="center", va="center")
+        ax.text(0.5, 0.5, "missing: top1_exact", ha="center", va="center")
         ax.set_axis_off()
     else:
         x = np.arange(len(y))
-        ax.plot(x, y, label="mean_pred_entropy")
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7,
-                label="mean_pred_entropy (MA15)")
-        ax.set_title("mean_pred_entropy")
-        ax.legend(fontsize=8)
-
-    # (5) value_corr MA15
-    ax = axs2[4]
-    y = col_vals("value_corr")
-    if y is None:
-        ax.text(0.5, 0.5, "missing: value_corr", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        x = np.arange(len(y))
-        ax.plot(x, y, label="value_corr")
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7, label="value_corr (MA15)")
-        ax.set_title("value_corr")
-        ax.legend(fontsize=8)
-
-    # (6) value_bias MA15
-    ax = axs2[5]
-    y = col_vals("value_bias")
-    if y is None:
-        ax.text(0.5, 0.5, "missing: value_bias", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        x = np.arange(len(y))
-        ax.plot(x, y, label="value_bias")
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(x, ma, lw=2, alpha=0.7, label="value_bias (MA15)")
-        ax.set_title("value_bias")
+        ax.plot(x, y, label="top1_exact", alpha=0.6, lw=1)
+        ma_y = moving_average_pd(y, window=ma_window)
+        ax.plot(x, ma_y, lw=2, alpha=0.7, label=f"MA{ma_window}")
+        ax.set_title("top1_exact")
         ax.legend(fontsize=8)
 
     plt.tight_layout()
-    figs.append((fig2, axs2))
 
-    # Save or show
+    # save
     if save_path is not None:
-        # primary save
-        root, ext = os.path.splitext(save_path or "")
+        root, ext = os.path.splitext(save_path)
         if ext == "":
             ext = ".png"
-            root = save_path or "training_progress"
+            root = save_path
         out1 = root + ext
-        figs[0][0].savefig(out1, dpi=150)
-        plt.close(figs[0][0])
-        # extra save
         out2 = root + "_extra" + ext
-        figs[1][0].savefig(out2, dpi=150)
-        plt.close(figs[1][0])
-    else:
-        # interactive show both
-        for f, _ in figs:
-            f.show()
-
-
-def plot_pred_vs_true_grid(model, preds, X, y_true_dict, save_path=None):
-    """
-    Single figure: value (hexbin) + policy diagnostics for flat 4096 head.
-    Returns a dict of numeric metrics (so caller can write them into df).
-    Assumes exact keys:
-      preds['policy_logits'] (N,4096), preds['value_out'] (N,1)
-      y_true_dict['policy'] (N,4096), y_true_dict['value'] (N,)
-    """
-    
-    EPS = 1e-12
-    # value arrays (explicit)
-    yp_v = np.asarray(preds['value_out'], dtype=np.float32).reshape(-1)
-    yt_v = np.asarray(y_true_dict['value'], dtype=np.float32).reshape(-1)
-
-    # policy logits -> softmax probs (explicit stable softmax)
-    # X is the model input list/tuple: [boards, legal_mask]
-    legal_mask = np.asarray(X[1])
-    mask = (legal_mask > 0.5)
-    
-    logits = np.asarray(preds['policy_logits'], dtype=np.float64)  # (N,4096)
-    masked = np.where(mask, logits, -np.inf)                       # illegal -> -inf
-    row_max = np.max(masked, axis=1, keepdims=True)                # -inf if fully masked
-    finite = np.isfinite(row_max).flatten()
-    P_pred = np.zeros_like(masked, dtype=np.float64)
-    
-    # masked softmax leveraging np.exp(-np.inf) = 0
-    if finite.any():
-        shifted = masked[finite] - row_max[finite]                # stable shift
-        exp_shift = np.exp(shifted)
-        P_pred[finite] = exp_shift / (exp_shift.sum(axis=1, keepdims=True) + 1e-300)
-
-    # true policy probs (explicit normalize)
-    P_true = np.asarray(y_true_dict['policy'], dtype=np.float32)
-    P_true = P_true / (P_true.sum(axis=1, keepdims=True) + EPS)
-
-    # plotting canvas (2x2)
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-    ax_v = axs[0, 0]
-    ax_scatter = axs[0, 1]
-    ax_bar = axs[1, 0]
-    ax_heat = axs[1, 1]
-
-    # value hexbin
-    yp = yp_v.reshape(-1)
-    yt = yt_v.reshape(-1)
-    n = min(len(yp), len(yt))
-    if n > 0:
-        yp, yt = yp[:n], yt[:n]
-        hb = ax_v.hexbin(yt, yp, gridsize=80, mincnt=1, cmap="magma")
-        lo = float(min(yt.min(), yp.min()))
-        hi = float(max(yt.max(), yp.max()))
-        ax_v.plot([lo, hi], [lo, hi], "r--", linewidth=1)
-        ax_v.set_title("value: pred vs true (hexbin)")
-        ax_v.set_xlabel("True")
-        ax_v.set_ylabel("Pred")
-        fig.colorbar(hb, ax=ax_v, fraction=0.046, pad=0.04)
-    else:
-        ax_v.text(0.5, 0.5, "no value data", ha="center", va="center")
-        ax_v.set_axis_off()
-
-    # ensure policy arrays exist (they do by contract)
-    if P_pred.size == 0 or P_true.size == 0:
-        ax_scatter.text(0.5, 0.5, "no policy head found", ha="center", va="center")
-        ax_bar.set_visible(False)
-        ax_heat.set_visible(False)
-        plt.tight_layout()
-        if save_path:
-            root, ext = os.path.splitext(save_path or "")
-            out = root + "_value" + ext
-            plt.savefig(out, dpi=150)
-            plt.close(fig)
-        else:
-            plt.show(block=False)
-        # return minimal metrics (N=0) to caller
-        return {
-            "N": 0, "value_mse": float("nan"), "value_bias": float("nan"),
-            "value_corr": float("nan")
-        }
-
-    # policy diagnostics numbers
-    N = P_pred.shape[0]
-    idx_true_top1 = P_true.argmax(axis=1)
-    true_top1_prob = P_true[np.arange(N), idx_true_top1]
-    pred_on_true_top1 = P_pred[np.arange(N), idx_true_top1]
-    pred_top1_prob = P_pred.max(axis=1)
-
-    # scatter hexbin: pred_on_true vs true_top1_prob
-    ax_scatter.hexbin(true_top1_prob, pred_on_true_top1, gridsize=80, mincnt=1)
-    ax_scatter.plot([0, 1], [0, 1], "r--", linewidth=1)
-    ax_scatter.set_xlabel("true top1 prob")
-    ax_scatter.set_ylabel("model prob on true top1")
-    ax_scatter.set_title(
-        "model prob on true top1 vs true top1 (hexbin)")
-
-    # mean mass on target top-k (explicit)
-    ranks_true = np.argsort(P_true, axis=1)  # ascending indices
-    def mean_mass(k):
-        idx = ranks_true[:, -k:]
-        return np.mean([P_pred[i, idx[i]].sum() for i in range(N)])
-    m1 = mean_mass(1)
-    m3 = mean_mass(3)
-    m10 = mean_mass(10)
-
-    # draw bar with numeric labels (keeps simple)
-    bars = ax_bar.bar(["top1", "top3", "top10"], [m1, m3, m10])
-    ax_bar.set_ylim(0, 1.0)
-    ax_bar.set_title("mean model mass on target top-k")
-    for rect, v in zip(bars, (m1, m3, m10)):
-        label = f"{v:.3e}" if v < 1e-3 else f"{v:.3f}"
-        ax_bar.text(rect.get_x() + rect.get_width() / 2, v * 1.05,
-                    label, ha="center", va="bottom", fontsize=8)
-
-    # heatmap: mean 'from' map true || pred (8x8 each)
-    P2_true = P_true.reshape((N, 64, 64))
-    P2_pred = P_pred.reshape((N, 64, 64))
-    
-    mean_from_true = P2_true.sum(axis=2).mean(axis=0).reshape(8, 8)
-    mean_from_pred = P2_pred.sum(axis=2).mean(axis=0).reshape(8, 8)
-
-    combined = np.hstack([mean_from_true, mean_from_pred])
-    im = ax_heat.imshow(
-        combined, interpolation="nearest", aspect="auto", origin="lower"
-    )
-
-    h, w = combined.shape
-    ax_heat.set_xticks(np.arange(w))
-    ax_heat.set_yticks(np.arange(h))
-
-    files = list("abcdefgh")
-    xticks = files + [""] * 8   # left block labeled, right block blank
-    ax_heat.set_xticklabels(xticks, rotation=90, fontsize=8)
-    ax_heat.set_yticklabels([str(r) for r in range(1, 9)], fontsize=8)
-
-    # optional light grid between squares
-    ax_heat.set_xticks(np.arange(-0.5, w, 1), minor=True)
-    ax_heat.set_yticks(np.arange(-0.5, h, 1), minor=True)
-    ax_heat.grid(which="minor", color="w", linewidth=0.5, alpha=0.6)
-
-    ax_heat.set_title("mean 'from' map: [true || pred]")
-    ax_heat.axvline(7.5, color="w", linewidth=1)
-    fig.colorbar(im, ax=ax_heat, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-
-    if save_path:
-        root, ext = os.path.splitext(save_path or "")
-        out = root + "_vp" + ext
-        plt.savefig(out, dpi=150)
+        fig.savefig(out1, dpi=150)
         plt.close(fig)
-    else:
-        plt.show(block=False)
-
-    # numeric metrics to return
-    # KL (mean over batch, nats): mean sum P_true * (log P_true - log P_pred)
-    kl_per = (P_true * (np.log(P_true + EPS) - np.log(P_pred + EPS))).sum(axis=1)
-    mean_kl = np.mean(kl_per)
-
-    # entropy of predictions (mean)
-    ent_per = (-(P_pred * np.log(P_pred + EPS))).sum(axis=1)
-    mean_entropy = np.mean(ent_per)
-    
-    ent_true_per = (-(P_true * np.log(P_true + EPS))).sum(axis=1)
-    mean_true_entropy = np.mean(ent_true_per)
-
-    # legal_mass_mean: use P_true>0 as proxy for legal moves
-    legal_mask = (P_true > 0).astype(np.float32)
-    legal_mass = (logits * legal_mask).sum(axis=1)
-    legal_mass_mean = np.mean(legal_mass)
-
-    # mean pred_on_true and mean pred_top1
-    mean_highest_prob = np.mean(pred_top1_prob)
-
-    # value metrics computed here (so caller doesn't need to)
-    # align lengths
-    nval = min(len(yp_v), len(yt_v))
-    yp_val = yp_v[:nval]
-    yt_val = yt_v[:nval]
-    value_mse = np.mean((yt_val - yp_val) ** 2) if nval > 0 else float("nan")
-    value_bias = np.mean(yp_val - yt_val) if nval > 0 else float("nan")
-    if nval > 1 and yt_val.std() > 0 and yp_val.std() > 0:
-        value_corr = np.corrcoef(yt_val, yp_val)[0, 1]
-    else:
-        value_corr = float("nan")
-
-    metrics = {
-        "N": int(N),
-        "mean_kl": mean_kl,
-        "mean_pred_entropy": mean_entropy,
-        "mean_true_entropy": mean_true_entropy,
-        "legal_mass_mean": legal_mass_mean,
-        "mean_highest_prob": mean_highest_prob,
-        "mean_top1_mass": m1,
-        "mean_top3_mass": m3,
-        "mean_top10_mass": m10,
-        "value_mse": value_mse,
-        "value_bias": value_bias,
-        "value_corr": value_corr
-    }
-
-    return metrics
-
-
-def score_game_data(model, X, Y_batch, save_path=None):
-    """
-    Run model.predict -> plot -> model.evaluate -> return a single-row
-    DataFrame with Keras numeric outputs + our custom metrics.
-    """
-    raw_preds = model.predict(X, batch_size=512, verbose=0)
-    preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
-
-    # Plot overview grid and get metrics (plot function returns metrics dict)
-    metrics = plot_pred_vs_true_grid(model, preds, X, Y_batch, save_path=save_path)
-
-    # Keras evaluate -> dataframe row (keep original columns)
-    cols = ['total_loss'] + model.output_names
-    eval_vals = model.evaluate(X, Y_batch, verbose=0)
-    eval_df = pd.DataFrame(eval_vals, index=cols).T
-
-    # Add our metrics as columns (explicit)
-    for k, v in metrics.items():
-        # if metric exists already in eval_df, overwrite; else create column
-        eval_df[k] = v
-
-    # Also print some chosen metrics for quick console feedback
-    print("\n=== Extra Metrics ===")
-    print(
-        f"value MSE: {metrics.get('value_mse'):.5f} ",
-        f"value corr: {metrics.get('value_corr'):.3f}"
-    )
-    
-    print(
-        f"N: {metrics.get('N')}  mean KL: {metrics.get('mean_kl'):.5f} ",
-        f"mean top1 mass: {metrics.get('mean_top1_mass'):.5f}\n"
-    )
-    return eval_df
+        fig2.savefig(out2, dpi=150)
+        plt.close(fig2)
 
 
 def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):

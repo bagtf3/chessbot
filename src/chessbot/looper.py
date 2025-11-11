@@ -228,7 +228,7 @@ class ChessGame(object):
         """
         
         # get indices from C++
-        indices = self.board.moves_to_indices(ucis)  # list of ints (0..4095)
+        indices = self.root().board.moves_to_indices(ucis)  # list of ints (0..4095)
         policy = np.zeros(64 * 64, dtype=np.float32)
 
         # accumulate probs into flattened policy
@@ -469,9 +469,8 @@ class GameLooper(object):
                 self.fill_active_games()
                     
         # train with whatever we got and final report (> 2000)
-        # if len(self.training_queue) >= 2000:
-        #     self.trigger_retrain()
-        self.training_queue.clear()
+        if len(self.training_queue) >= 2000:
+            self.trigger_retrain()
 
         self.maybe_log_results(force=True)
         return
@@ -632,8 +631,8 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
-        #if len(self.training_queue) >= self.config.training_queue_min:
-        #    self.trigger_retrain()
+        if len(self.training_queue) >= self.config.training_queue_min:
+            self.trigger_retrain()
 
 
     def trigger_retrain(self):
@@ -702,8 +701,8 @@ class GameLooper(object):
         is_add = np.asarray(is_add_flag[:len(X_list)], dtype=np.bool_)
 
         # optionally blend (possibly tapered) outcome with visit-weighted Q
-        use_taper = getattr(self.config, "use_z_taper", True)
-        alpha = getattr(self.config, "z_blend", 0.5)
+        use_taper = self.config.use_z_taper
+        alpha = self.config.z_blend
         Zstar = Z_taper_arr if use_taper else Z
         Y_value = np.clip((1.0-alpha)*Vwq + alpha*Zstar, -1.0, 1.0)
         # ensure additional samples are not blended
@@ -720,20 +719,17 @@ class GameLooper(object):
 
         # evaluation and logging (reuse existing helpers) - unchanged
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
-        eval_df = cbu.score_game_data(self.model, [X, M], Y, save_path=plt_file)
-        eval_df['model_epoch'] = self.n_retrains
+        epoch = self.n_retrains
+        eval_df = cbu.score_game_data(self.model, X, M, Y, epoch, save_path=plt_file)
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(5).to_csv(self.config.progress_csv_path, index=False)
 
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
-            plt_file = self.config.progress_plot_path
-            cbu.plot_training_progress(self.all_evals, save_path=plt_file)
+            prog_plt_file = self.config.progress_plot_path
+            cbu.plot_training_progress(self.all_evals, save_path=prog_plt_file)
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
-        self.model.fit(
-            [X, M], Y, epochs=2, batch_size=512, verbose=1, sample_weight=s_wts
-        )
-
+        self.model.fit(X, Y, epochs=3, batch_size=512, verbose=1, sample_weight=s_wts)
         self.model.save(self.config.model_path)
 
         # update the fwd helper and clear queues/caches

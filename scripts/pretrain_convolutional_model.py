@@ -2,7 +2,6 @@ from chessbot import MODEL_DIR, SF_LOC
 
 from chessbot.utils import sf_eval, random_init, mirror_move, format_time
 from chessbot.utils import GameGenerator
-from chessbot.model import save_transformer_model as save_custom_model
 
 from chessbot.review import make_fake_visits
 import chess, chess.engine
@@ -16,10 +15,6 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 
-from tensorflow.keras import mixed_precision
-policy = mixed_precision.Policy("mixed_float16")
-mixed_precision.set_global_policy(policy)
-
 
 def build_conv_64pv(
     d_model_embed=128,
@@ -27,7 +22,7 @@ def build_conv_64pv(
     filters=256,
     n_conv=12,
     proj_dim=64,
-    name="conv_64pv",
+    name="conv_64pv"
 ):
     DE, FL, VS = d_model_embed, filters, vocab_size
     
@@ -90,7 +85,7 @@ def build_conv_64pv(
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
     # compile: losses, weights, optimizer
-    loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
@@ -101,45 +96,11 @@ def build_conv_64pv(
     
     return model, opt, loss_weights, loss_dict
 
-model, opt, loss_weights, loss_dict = build_conv_64pv()
+MODEL_NAME = 'conv_64_token_v1'
+model, opt, loss_weights, loss_dict = build_conv_64pv(name=MODEL_NAME)
 model.summary()
-#model.load_weights("C:/Users/Bryan/Data/chessbot_data/models/conv_embedded_pt1000.h5")
-#model.save("C:/Users/Bryan/Data/chessbot_data/models/conv_64_token_pt1000.h5")
 #%%
 
-weights_schedule = {
-    0:   {"policy_logits": 1.50, "value_out": 3.00},
-    200: {"policy_logits": 2.00, "value_out": 2.75},
-    300: {"policy_logits": 2.50, "value_out": 2.25},
-    400: {"policy_logits": 2.00, "value_out": 1.50},
-    500: {"policy_logits": 1.50, "value_out": 0.50},
-    # post-500 fine-tune taper (MSE maintenance mostly)
-    600: {"policy_logits": 1.00, "value_out": 0.50}
-}
-
-
-def weights_for_epoch(epoch, schedule):
-    """Return (policy_w, value_w) for the largest key <= epoch."""
-    keys = sorted(schedule.keys())
-    chosen = keys[0]
-    for k in keys:
-        if k <= epoch:
-            chosen = k
-        else:
-            break
-    s = schedule[chosen]
-    return s["policy_logits"], s["value_out"]
-
-
-def apply_weights_for_epoch(epoch, model, opt, loss_dict):
-    p_w, v_w = weights_for_epoch(epoch, weights_schedule)
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-    print(f"[epoch {epoch:4d}] [weight update] policy={p_w} value={v_w}")
-    return model
-
-
-model = apply_weights_for_epoch(0, model, opt, loss_dict)
-#%%
 eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
 eng.configure({"Threads": 1, "Hash": 64})
     
@@ -148,6 +109,19 @@ metrics_history = {
     "policy_ce": [], "ce_uniform": [], "ce_gain": [],
     "exp_prob_model": [], "exp_prob_uniform": [],
     "value_mse": [], "value_corr": [], "epoch_time": []
+}
+
+weights_schedule = {
+    # slow start
+    5  : {"policy_logits": 0.1, "value_out": 0.10},
+    20 : {"policy_logits": 1.0, "value_out": 1.00},
+    75 : {"policy_logits": 1.5, "value_out": 2.00},
+    150: {"policy_logits": 2.0, "value_out": 2.75},
+    300: {"policy_logits": 2.5, "value_out": 2.25},
+    400: {"policy_logits": 2.0, "value_out": 1.50},
+    500: {"policy_logits": 1.5, "value_out": 0.50},
+    # post-500 fine-tune taper (MSE maintenance mostly)
+    600: {"policy_logits": 1.0, "value_out": 0.50}
 }
 
 eps = 1e-12
@@ -261,8 +235,10 @@ from chessbot.config import Config
 gg = GameGenerator(Config())
 
 while epoch <= 1000:
-    if epoch in weights_schedule.keys():
-        model = apply_weights_for_epoch(epoch, model)
+    for k in sorted(weights_schedule.keys()):
+        if epoch < k:
+            loss_weights = weights_schedule[k]
+            break
     
     epoch_start = time.time()
     X, M, Y, P = [], [], [], []
@@ -309,7 +285,7 @@ while epoch <= 1000:
     Pstack = np.stack(P, axis=0)
     
     # pred validate and train
-    preds = model.predict([Xstack, Mstack], verbose=0)
+    preds = model.predict(Xstack, verbose=0)
     
     value_preds = preds[1].ravel(); targets = np.asarray(Ystack).ravel()
     plt.scatter(targets, value_preds, s=6)
@@ -411,8 +387,13 @@ while epoch <= 1000:
 
     # main eval/fit on selected 1024
     Ydict = {"value_out": Ystack.astype(np.float32), "policy_logits": Pstack}
+    weights = np.ones_like(Ystack)
+    s_wts = {k: weights*loss_weights[k] for k in Ydict.keys()}
     print("-"*100)
-    history = model.fit([Xstack, Mstack], Ydict, epochs=4, batch_size=512, verbose=0)
+    history = model.fit(
+        Xstack, Ydict, epochs=4, batch_size=512, verbose=0, sample_weight=s_wts
+    )
+    
     rows = []
     for m, v in history.history.items():
         name = "total" if m == "loss" else m.replace("_loss", "")
@@ -432,10 +413,9 @@ while epoch <= 1000:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
     epoch += 1
-    if epoch in [0, 100, 200, 500, 1000] == 0:
-        model_name = "conv_embedded_v2"
-        model.save(MODEL_DIR + f"{model_name}_{epoch}.h5")
-        with open(MODEL_DIR + f"{model_name}_train_metrics_{epoch}.pkl", "wb") as f:
+    if epoch in [1, 100, 200, 500, 1000] == 0:
+        model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
+        with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
             pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)
             
     epoch_time = time.time() - epoch_start

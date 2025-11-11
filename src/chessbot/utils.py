@@ -238,7 +238,7 @@ def stable_softmax(logits):
     m = logits.max(axis=1, keepdims=True)
     e = np.exp(logits - m)
     s = e.sum(axis=1, keepdims=True)
-    return e / (s + 1e-20)
+    return e / (s + 1e-9)
 
 
 def batch_policy_metrics(logits, labels, mask):
@@ -338,7 +338,7 @@ def print_validation(epoch, stats):
 
 def score_game_data(model, X, M, Y, epoch, save_path=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
-    preds = model.predict(X, verbose=0, batch_size=256)
+    preds = model.predict(X, verbose=0, batch_size=128)
     value_preds = preds[1].ravel()
 
     value_preds = preds[1].ravel()  # (B,)
@@ -391,8 +391,8 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     # helper to safely extract column arrays (or None)
     def col_vals(name):
         if name in df.columns:
-            return df[name].values
-        return None
+            return df[name].tolist()
+        return []
 
     # compute hide / MA window exactly as you specified
     hide_first = max(int(0.1 * epoch), 5)
@@ -470,9 +470,9 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
 
     # (1) top1 / top3 / top5 on same plot (raw, no MA)
     ax = axs[0]
-    t1 = col_vals("mean_top1_mass")
-    t3 = col_vals("mean_top3_mass")
-    t5 = col_vals("mean_top5_mass")
+    t1 = col_vals("top1_mass")
+    t3 = col_vals("top3_mass")
+    t5 = col_vals("top5_mass")
     any_top = any(arr is not None and len(arr) for arr in (t1, t3, t5))
     if not any_top:
         ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")

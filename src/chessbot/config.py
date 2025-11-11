@@ -7,22 +7,22 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_embedded_test"
+    run_tag = "conv_embedded_selfplay1"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_v1_204.h5"
+    init_model = MODEL_DIR + "conv_64_token_v1_10.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 800
+    sims_target = 64
     sims_ceiling = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 250
+    es_check_every = 16
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
@@ -36,7 +36,7 @@ class Config(object):
     # Game stuff
     micro_batch_size = 4
     games_at_once = 256
-    n_training_games = 500
+    n_training_games = 1500
     
     move_limit = 200
     material_diff_cutoff = 20
@@ -44,28 +44,32 @@ class Config(object):
 
     play_vs_sf_prob = 0
     sf_depth = 15
+
+    # post hoc server
+    run_post_hoc = True
+    mine_bonus_data = False
     
     game_probs = {
-        "pre_opened": 0.3, "random_init": 0.25,
-        "random_middle_game": 0.25, "random_endgame": 0.05,
+        "pre_opened": 0.25, "random_init": 0.25,
+        "random_middle_game": 0.25, "random_endgame": 0.10,
         "piece_odds": 0.10, "piece_training": 0.05
     }
     
     # priors
-    prior_clip_max = 0.5
+    prior_clip_max = 0.65
     prior_clip_min = 0.001
 
     # training
     training_queue_min = 2048
     fwd_batch = 1024
 
-    z_blend = 0.5
+    z_blend = 0.75
     use_z_taper = True
     target_loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
 
     # root noise
     add_root_noise = True
-    dirichlet_eps = 0.25
+    dirichlet_eps = 0.15
     dirichlet_alpha = 0.1
 
     def to_dict(self):

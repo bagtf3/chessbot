@@ -194,7 +194,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_stm_pov_phase1"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_first_run"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500

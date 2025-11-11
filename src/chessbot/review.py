@@ -23,6 +23,8 @@ from chessbot.utils import (
 )
 
 
+POLL_INTERVAL = 7
+
 BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
@@ -901,9 +903,9 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         
         # happy path, not a blunder, take stm pov sf eval
         if row['delta'].item() < BLUNDER_CP:
-            v = cp_to_value_tanh(row['played_cp'].item())
-            ts = make_training_sample(b, v, visits)
-            training_data.append(ts)
+            #v = cp_to_value_tanh(row['played_cp'].item())
+            #ts = make_training_sample(b, v, visits)
+            #training_data.append(ts)
             b.push_uci(mv)
         
         # if a blunder, dont use actual visits (theyre wrong)
@@ -961,7 +963,7 @@ def report_unprocessed(entries, seen_games):
         print(f"{PH} {unproc} unprocessed game(s) currently in queue")
 
 
-def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
+def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
     ## trying to deprioritize the server so it doesnt slow down main training looper
     p = psutil.Process()
 
@@ -1032,7 +1034,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
         while not POST_HOC_STOP:
             if not os.path.exists(idx_path):
                 # check shutdown every poll_interval
-                time.sleep(poll_interval)
+                time.sleep(POLL_INTERVAL)
                 continue
 
             idx = load_game_index(idx_path)
@@ -1064,12 +1066,13 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                 analyzed_batch.append(analysis_out)
 
                 # create training tuples for this game (unchanged)
-                samples = mine_additional_training_data(
-                    analysis_out, game_data, engine=eng
-                )
+                if bonus_data:
+                    samples = mine_additional_training_data(
+                        analysis_out, game_data, engine=eng
+                    )
 
-                if samples:
-                    batch_samples.extend(samples)
+                    if samples:
+                        batch_samples.extend(samples)
 
                 seen_games.add(gid)
                 games_since_flush += 1
@@ -1112,7 +1115,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                     last_flush = now
 
             # sleep but wake quickly if shutdown requested
-            for _ in range(max(1, int(poll_interval))):
+            for _ in range(max(1, POLL_INTERVAL)):
                 if POST_HOC_STOP:
                     break
                 time.sleep(1)
@@ -1123,10 +1126,11 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
         print("[post_hoc] post_hoc_worker exiting cleanly")
 
 
-def start_post_hoc_server(run_dir):
-    p = Process(target=post_hoc_worker, args=(run_dir,), daemon=False)
+def start_post_hoc_server(run_dir, bonus_data=True):
+    """Start post-hoc worker process and forward bonus_data toggle."""
+    p = Process(target=post_hoc_worker, args=(run_dir, bonus_data), daemon=False)
     p.start()
-    print("[post hoc] started server pid=", p.pid)
+    print(f"[post hoc] started server pid={p.pid} bonus_data={bonus_data}")
     return p
 
 

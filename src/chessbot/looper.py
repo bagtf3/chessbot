@@ -209,7 +209,7 @@ class ChessGame(object):
         vwq = self.tree.visit_weighted_Q()
 
         # tree is white POV, we want STM-POV so we flip here
-        self.vwq = vwq if self.turn() else -vwq
+        vwq = vwq if self.turn() else -vwq
     
         if pi is not None:
             self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq, turn=self.turn())
@@ -726,12 +726,14 @@ class GameLooper(object):
 
         if len(self.all_evals) and len(self.all_evals) % 4 == 0:
             prog_plt_file = self.config.progress_plot_path
-            cbu.plot_training_progress(self.all_evals, save_path=prog_plt_file)
+            cbu.plot_training_progress(
+                self.all_evals, epoch=epoch, save_path=prog_plt_file
+            )
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
         history = self.model.fit(
-            X, Y, epochs=3, batch_size=128,
-            verbose=1, sample_weight=s_wts
+            X, Y, epochs=3, batch_size=128, verbose=0,
+            sample_weight=s_wts, shuffle=True
         )
 
         rows = []
@@ -744,18 +746,12 @@ class GameLooper(object):
         
         name_w = max(len(r[0]) for r in rows)
         num_w = 8   # width for numbers (including decimal point)
-        fmt = (f"[epoch {epoch:4d}] [model fit] "
+        fmt = (f"[epoch {epoch:4d}] [model fit]  "
             f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
             f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
 
         for name, start, end, delta, mark in rows:
             print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
-        
-        epoch += 1
-        if epoch in [1, 100, 200, 500, 1000]:
-            model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
-            with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
-                pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         self.model.save(self.config.model_path)
 
@@ -785,22 +781,25 @@ class GameLooper(object):
         avg_moves = (self.total_plies / max(1, self.games_finished))
         gph =  3600 * self.games_finished / (now - self._run_start)
 
-        print("~" * 60)
+        print()
+        print("~" * 72)
         print(
-            f"[stats] finished={self.games_finished}  "
+            f"[speed stats] mps={self.mps.rate():.1f}  "
+            f"lps={self.lps.rate():.1f}  gph={gph:.2f}")
+        
+        print(
+            f"[game stats]  finished={self.games_finished}  "
             f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
-            f"avg_len={avg_moves:.1f} moves  |  "
-            f"mps={self.mps.rate():.1f}  lps={self.lps.rate():.1f}  gph={gph:.2f}"
-        )
-        print("-" * 60)
+            f"avg_len={avg_moves:.1f} moves")
+        print("-" * 72)
 
         recent = list(self.recent_games)[-min(window, len(self.recent_games)):]
         if not recent:
             print("(no recent games to break down)")
-            print("~" * 60)
+            print("~" * 72)
             return True
 
-        # re-use your existing pretty printer
+        # pretty printer
         cbu.print_recent_summary(recent, window=window)
         print(
             f"Length of training queue: {len(self.training_queue)} ",
@@ -822,7 +821,6 @@ class GameLooper(object):
         s_collect_stops = sum([r[5] for r in counts])
 
         avg_new = s_collected / n_groups
-        fill_ratio = s_collected / max(1, n_groups * mbs)
 
         total_overall = s_collected + s_terminals + s_cached
         term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
@@ -832,22 +830,20 @@ class GameLooper(object):
         fast_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
         collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
 
-        print("----------------------------------------------------------")
-        print("Loop stats"
-            f" | groups={n_groups}  mbs={mbs}"
-            f" | new: collected={s_collected}, avg={avg_new:.2f}"
-            f" | fill_ratio={fill_ratio:.3f}")
-        print(f"Stops: fastpath_breaks={s_fast_stops} "
-            f"({fast_stops_pct:.2f}%) "
-            f"collect_breaks={s_collect_stops} "
-            f"({collect_stops_pct:.2f}%)")
+        print("-"*72)
+        left1 = f"[loop stats] groups={n_groups}  mbs={mbs}"
+        right1 = f"new: collected={s_collected}, avg={avg_new:.2f}"
 
-        print(
-            "Hits: "
-            f"cached={s_cached} ({pct_cached_overall:.3f}%) | "
-            f"terminals={s_terminals} ({pct_term_overall:.3f}%) | ",
-            f"terminals/cached={term_to_cached:.3f}"
-        )
+        left2 = f"[stop stats] fastpath_breaks={s_fast_stops} ({fast_stops_pct:.2f}%)"
+        right2 = f"collect_breaks={s_collect_stops} ({collect_stops_pct:.2f}%)"
+
+        left3 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
+        right3 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
+
+        col_width = 38
+        print(f"{left1:<{col_width}} | {right1}")
+        print(f"{left2:<{col_width}} | {right2}")
+        print(f"{left3:<{col_width}} | {right3}")
 
         if lpb:
             print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
@@ -868,7 +864,7 @@ class GameLooper(object):
         sims_per_move = sims/moves if moves > 0 else 0
         if sims_per_move:
             print(f"Avg sims per move {sims_per_move:.3f}")
-        print("------------------------------------------------------------")
+        print("-"*72)
 
 
 def init_selfplay():
@@ -920,13 +916,20 @@ def main():
             print(e)
     
     # start the analysis server
-    phs = start_post_hoc_server(looper.config.run_dir)
-    try:
+    if config.run_post_hoc:
+        phs = start_post_hoc_server(
+            looper.config.run_dir,
+            bonus_data=config.mine_bonus_data
+        )
+        try:
+            looper.run()
+        except Exception as e:
+        print("Error encountered", e)
+        finally:
+        stop_post_hoc_server(phs, timeout=10)
+    
+    else:
         looper.run()
-    except Exception as e:
-       print("Error encountered", e)
-    finally:
-       stop_post_hoc_server(phs, timeout=10)
 
 #%%
 if __name__ == '__main__':

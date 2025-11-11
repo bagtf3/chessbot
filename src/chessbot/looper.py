@@ -720,6 +720,20 @@ class GameLooper(object):
         Y = {"value_out": Y_value.astype(np.float32), "policy_logits": P}
         s_wts = {k: weights*lw.get(k, 1.0) for k in Y.keys()}
 
+        # downweight draws so value head doesnt collapse
+        v_wts = s_wts['value_out']
+        wts_before = v_wts.sum()
+        draw_mask = Z == 0
+        v_wts[draw_mask] *= max(self.config.draw_weight, 0.001)
+        wts_after = v_wts.sum()
+
+        wt_lost = wts_before - wts_after
+        n_non_draws = (~draw_mask).sum()
+        if wt_lost > 0 and n_non_draws > 0:
+            v_wts[~draw_mask] += wt_lost/n_non_draws
+        
+        s_wts['value_out'] = v_wts
+
         # evaluation and logging (reuse existing helpers) - unchanged
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
         epoch = self.n_retrains
@@ -843,7 +857,7 @@ class GameLooper(object):
         left3 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
         right3 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
 
-        col_width = 38
+        col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
         print(f"{left2:<{col_width}} | {right2}")
         print(f"{left3:<{col_width}} | {right3}")

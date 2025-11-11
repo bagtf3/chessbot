@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 128
+    sims_target = 256
     sims_ceiling = 200
 
     # early stop
@@ -42,8 +42,8 @@ class Config(object):
     material_diff_cutoff = 15
     material_diff_cutoff_span = 20
 
-    play_vs_sf_prob = 1.0
-    sf_depth = 4
+    play_vs_sf_prob = 0
+    sf_depth = 6
 
     # post hoc server
     run_post_hoc = True
@@ -59,18 +59,19 @@ class Config(object):
     prior_clip_max = 0.65
     prior_clip_min = 0.001
 
-    # training
-    training_queue_min = 2048
-    fwd_batch = 1024
-
-    z_blend = 1.0
-    use_z_taper = True
-    target_loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
-
     # root noise
     add_root_noise = False
     dirichlet_eps = 0.1
     dirichlet_alpha = 0.1
+
+    # training
+    training_queue_min = 2048
+    fwd_batch = 1024
+
+    z_blend = 0.75
+    use_z_taper = True
+    target_loss_weights = {"policy_logits": 1.5, "value_out": 2.0}
+    draw_weight = 0.25
 
     def to_dict(self):
         return {

@@ -31,7 +31,7 @@ ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 12
+DEPTH = 10
 EQUIV_RANGE = 10
 
 # stops the post hoc server
@@ -901,11 +901,8 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         if len(row) == 0:
             continue
         
-        # happy path, not a blunder, take stm pov sf eval
+        # happy path, not a blunder, no action
         if row['delta'].item() < BLUNDER_CP:
-            #v = cp_to_value_tanh(row['played_cp'].item())
-            #ts = make_training_sample(b, v, visits)
-            #training_data.append(ts)
             b.push_uci(mv)
         
         # if a blunder, dont use actual visits (theyre wrong)

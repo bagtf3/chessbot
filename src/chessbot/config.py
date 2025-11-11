@@ -9,14 +9,14 @@ class Config(object):
     # files
     run_tag = "conv_embedded_selfplay1"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_v1_10.h5"
+    init_model = MODEL_DIR + "conv_64_token_v1_0.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 64
+    sims_target = 128
     sims_ceiling = 200
 
     # early stop
@@ -39,20 +39,20 @@ class Config(object):
     n_training_games = 1500
     
     move_limit = 200
-    material_diff_cutoff = 20
-    material_diff_cutoff_span = 30
+    material_diff_cutoff = 15
+    material_diff_cutoff_span = 20
 
-    play_vs_sf_prob = 0
-    sf_depth = 15
+    play_vs_sf_prob = 1.0
+    sf_depth = 4
 
     # post hoc server
     run_post_hoc = True
     mine_bonus_data = False
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
+        "pre_opened": 0.20, "random_init": 0.20,
         "random_middle_game": 0.25, "random_endgame": 0.10,
-        "piece_odds": 0.10, "piece_training": 0.05
+        "piece_odds": 0.20, "piece_training": 0.05
     }
     
     # priors
@@ -63,13 +63,13 @@ class Config(object):
     training_queue_min = 2048
     fwd_batch = 1024
 
-    z_blend = 0.75
+    z_blend = 1.0
     use_z_taper = True
     target_loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
 
     # root noise
-    add_root_noise = True
-    dirichlet_eps = 0.15
+    add_root_noise = False
+    dirichlet_eps = 0.1
     dirichlet_alpha = 0.1
 
     def to_dict(self):

@@ -142,12 +142,14 @@ class ChessGame(object):
         counts as the policy target (optionally bumping SF's visits so it's #1).
         Otherwise fall back to the old 60/40 supervised target.
         """
+        
         legal = self.board.legal_moves()
         if not legal:
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
         mv, sf_v = self.get_stockfish_move(eng)
+        
         self.sf_eval = sf_v
 
         # gather root visit info from the tree (list sorted desc by visits)
@@ -157,7 +159,7 @@ class ChessGame(object):
         use_tree_visits = False
         visit_map = None
 
-        if rows and total_visits >= 100:
+        if rows and total_visits >= 20:
             # map uci -> visits for quick lookup
             visit_map = {u: n for u, n in rows}
             most_visited_uci, max_visits = rows[0]
@@ -168,7 +170,7 @@ class ChessGame(object):
                 use_tree_visits = True
 
             # case B: SF move is close to top -> use tree visits but nudge SF to top
-            elif sf_visits >= 0.6 * max_visits:
+            elif sf_visits >= 0.5 * max_visits:
                 use_tree_visits = True
                 # make SF strictly first by setting its visits > max_visits
                 visit_map[mv] = max_visits + 1
@@ -182,7 +184,7 @@ class ChessGame(object):
             raw = make_fake_visits(mv, legal, ratio_best=60)
             ucis   = [x[0] for x in raw]
             visits = [x[1] for x in raw]
-
+        
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
         self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
@@ -230,7 +232,7 @@ class ChessGame(object):
         # get indices from C++
         indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4095)
         policy = np.zeros(64 * 64, dtype=np.float32)
-
+        
         # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
             policy[idx] += p
@@ -238,7 +240,6 @@ class ChessGame(object):
         # snapshot inputs and push example
         x = self.board.encode_64_tokens()
         mask = self.board.legal_move_mask()
-
         self.examples.append((x, mask, policy, vwq, self.plies, turn))
 
     def check_for_terminal(self):
@@ -649,25 +650,27 @@ class GameLooper(object):
         # check for additional data pkl and load+remove if present
         add_pkl = os.path.join(self.config.run_dir, "additional_training_data.pkl")
         additional = []
-        if os.path.exists(add_pkl):
-            # may hit an unlucky access deny if during a write.
-            tries = 0
-            while tries < 3:
-                try:
-                    with open(add_pkl, "rb") as f:
-                        additional = pickle.load(f)
-                    # remove immediately so nothing is re-read later
-                    os.remove(add_pkl)
-                    n_add = len(additional)
-                    print(f"[retrain] found {n_add} additional training samples")
-                    break
-                except:
-                    # if we get an error, wait a bit and try again
-                    time.sleep(0.5)
-                    tries += 1
-        
-        if not additional:
-            print("No additional data found at", add_pkl)
+
+        if self.config.mine_bonus_data:
+            if os.path.exists(add_pkl):
+                # may hit an unlucky access deny if during a write.
+                tries = 0
+                while tries < 3:
+                    try:
+                        with open(add_pkl, "rb") as f:
+                            additional = pickle.load(f)
+                        # remove immediately so nothing is re-read later
+                        os.remove(add_pkl)
+                        n_add = len(additional)
+                        print(f"[retrain] found {n_add} additional training samples")
+                        break
+                    except:
+                        # if we get an error, wait a bit and try again
+                        time.sleep(0.5)
+                        tries += 1
+            
+            if not additional:
+                print("No additional data found at", add_pkl)
         
         # combined list: existing queue first, additional appended
         combined = list(self.training_queue) + list(additional)
@@ -924,13 +927,13 @@ def main():
         try:
             looper.run()
         except Exception as e:
-        print("Error encountered", e)
+            print("Error encountered", e)
         finally:
-        stop_post_hoc_server(phs, timeout=10)
+            stop_post_hoc_server(phs, timeout=10)
     
     else:
         looper.run()
 
-#%%
+
 if __name__ == '__main__':
     main()

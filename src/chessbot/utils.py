@@ -292,7 +292,10 @@ def batch_policy_metrics(logits, labels, mask):
     prob_on_others_per = (probs * support_mask).sum(axis=1)
     prob_on_others = prob_on_others_per.mean()
 
-    top1_in_support = (labels[np.arange(labels.shape[0]), model_best] > 0).mean()
+    # fraction of raw (unmasked) softmax mass that lie on legal moves
+    raw_probs = stable_softmax(logits)       # do not apply mask here
+    mass_on_legal_per = np.sum(raw_probs * mask, axis=1)
+    mass_on_legal = mass_on_legal_per.mean()
 
     return {
         "policy_ce": policy_ce,
@@ -300,13 +303,13 @@ def batch_policy_metrics(logits, labels, mask):
         "ce_gain": (uniform_ce - policy_ce),
         "exp_prob_model": exp_prob_model,
         "exp_prob_uniform": exp_prob_uniform,
-        "top1_in_support": top1_in_support,
         "top1_exact": top1_exact,
         "avg_top_prob": avg_top_prob,
         "top1_mass": top1_mass,
         "top3_mass": top3_mass,
         "top5_mass": top5_mass,
-        "prob_on_others": prob_on_others
+        "prob_on_others": prob_on_others,
+        "mass_on_legal": mass_on_legal
     }
 
 
@@ -367,6 +370,7 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     # create DF and return
     eval_df = pd.DataFrame([print_metrics])
     eval_df['model_epoch'] = epoch
+    eval_df['n_samples'] = int(np.asarray(targets).shape[0])
 
     return eval_df
 
@@ -388,21 +392,24 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
 
     df = metrics_history.copy()
 
-    # helper to safely extract column arrays (or None)
+    # helper to safely extract column arrays (or empty list)
     def col_vals(name):
         if name in df.columns:
             return df[name].tolist()
         return []
 
-    # compute hide / MA window exactly as you specified
-    hide_first = max(int(0.1 * epoch), 5)
-    do_plot = (epoch > hide_first) and (epoch % 5 == 0)
+    # infer epoch if needed
+    if epoch is None:
+        if "model_epoch" in df.columns and len(df):
+            epoch = int(max(df["model_epoch"]))
+        else:
+            epoch = len(df)
 
-    if not do_plot:
-        # Nothing to draw — either too early or not on interval.
+    hide_first = 2
+    if epoch < 12:
         return
 
-    ma_window = min(max(3, int(epoch * 0.2)), 15)
+    ma_window = max(3, int(epoch * 0.2))
     if ma_window % 2 == 0:
         ma_window += 1
 
@@ -468,56 +475,60 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     # Second figure (1x3)
     fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
 
-    # (1) top1 / top3 / top5 on same plot (raw, no MA)
+    # (0) left: top1 / top3 / top5 on same plot (raw, no MA)
     ax = axs[0]
     t1 = col_vals("top1_mass")
     t3 = col_vals("top3_mass")
     t5 = col_vals("top5_mass")
-    any_top = any(arr is not None and len(arr) for arr in (t1, t3, t5))
+    any_top = any(len(arr) for arr in (t1, t3, t5))
     if not any_top:
         ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
         ax.set_axis_off()
     else:
-        if t1 is not None and len(t1):
+        if len(t1):
             ax.plot(np.arange(len(t1)), t1, label="top1", linewidth=1)
-        if t3 is not None and len(t3):
+        if len(t3):
             ax.plot(np.arange(len(t3)), t3, label="top3", linewidth=1)
-        if t5 is not None and len(t5):
+        if len(t5):
             ax.plot(np.arange(len(t5)), t5, label="top5", linewidth=1)
         ax.set_title("mean top-k mass (no MA)")
         ax.legend(fontsize=8)
 
-    # (2) avg_top_prob (raw, plus optional MA overlay)
+    # (1) middle: mass_on_legal (raw + MA)
     ax = axs[1]
-    y = col_vals("avg_top_prob")
-    if y is None:
-        ax.text(0.5, 0.5, "missing: avg_top_prob", ha="center", va="center")
+    mol = col_vals("mass_on_legal")
+    if not len(mol):
+        ax.text(0.5, 0.5, "missing: mass_on_legal", ha="center", va="center")
         ax.set_axis_off()
     else:
-        x = np.arange(len(y))
-        ax.plot(x, y, label="avg_top_prob", alpha=0.6, lw=1)
-        ma_y = moving_average_pd(y, window=ma_window)
-        ax.plot(x, ma_y, lw=2, alpha=0.7, label=f"MA{ma_window}")
-        ax.set_title("avg_top_prob")
+        x = np.arange(len(mol))
+        ax.plot(x, mol, label="mass_on_legal", alpha=0.6, lw=1)
+        ma_mol = moving_average_pd(np.array(mol), window=ma_window)
+        ax.plot(x, ma_mol, lw=2, alpha=0.7, label=f"MA{ma_window}")
+        ax.set_title("mass_on_legal")
         ax.legend(fontsize=8)
 
-    # (3) top1_exact (raw, plus MA)
+    # (2) right: avg_top_prob (avg_max_prob) AND top1_exact on same axes
     ax = axs[2]
-    y = col_vals("top1_exact")
-    if y is None:
-        ax.text(0.5, 0.5, "missing: top1_exact", ha="center", va="center")
+    avg_tp = col_vals("avg_top_prob")
+    t1_exact = col_vals("top1_exact")
+    have_any = len(avg_tp) or len(t1_exact)
+    if not have_any:
+        ax.text(0.5, 0.5, "missing: avg_top_prob / top1_exact", ha="center", va="center")
         ax.set_axis_off()
     else:
-        x = np.arange(len(y))
-        ax.plot(x, y, label="top1_exact", alpha=0.6, lw=1)
-        ma_y = moving_average_pd(y, window=ma_window)
-        ax.plot(x, ma_y, lw=2, alpha=0.7, label=f"MA{ma_window}")
-        ax.set_title("top1_exact")
+        if len(avg_tp):
+            x = np.arange(len(avg_tp))
+            ax.plot(x, avg_tp, label="avg_max_prob", alpha=0.7, lw=1)
+        if len(t1_exact):
+            x2 = np.arange(len(t1_exact))
+            ax.plot(x2, t1_exact, label="top1_exact", alpha=0.7, lw=1)
+        ax.set_title("avg_max_prob & top1_exact")
         ax.legend(fontsize=8)
 
     plt.tight_layout()
 
-    # save
+    # save (primary and _extra)
     if save_path is not None:
         root, ext = os.path.splitext(save_path)
         if ext == "":
@@ -529,6 +540,9 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         plt.close(fig)
         fig2.savefig(out2, dpi=150)
         plt.close(fig2)
+    else:
+        fig.show()
+        fig2.show()
 
 
 def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
@@ -961,6 +975,21 @@ def make_piece_odds_board():
     return fastboard(b.fen()), meta
 
 
+def random_backrow_fen():
+    pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
+
+    # shuffle to get a random white backrank
+    random.shuffle(pieces)
+    white_back = "".join(pieces)
+
+    random.shuffle(pieces)
+    black_back = "".join(pieces).lower()
+
+    # pawns and empty ranks standard; castling field '-' disables castling
+    fen = f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
+    return fen
+
+
 def make_piece_training_board():
     fens = {
         "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
@@ -968,7 +997,8 @@ def make_piece_training_board():
         "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
         "only_pawns": "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
         "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1'
+        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1',
+        "random_backrow": random_backrow_fen()
     }
     
     pick = random.choice(list(fens.keys()))

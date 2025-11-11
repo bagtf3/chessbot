@@ -194,7 +194,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_first_run"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_selfplay1"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -316,63 +316,6 @@ gdf = d.query("game_id == @gid")
 gdf['move_num']
 gdf['move_num'] = gdf['move_num'].astype(int)
 gdf.sort_values("move_num")
-
-#%%
-import time
-from pyfastchess import Board
-from chessbot.utils import random_init, sf_eval, show_board
-from chessbot.mcts_utils import MCTSTree
-from chessbot.config import Config
-from chessbot import SF_LOC
-import chess, chess.engine
-
-
-eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-eng.configure({"Threads": 1, "Hash": 64})
-
-b = random_init(3)
-config = Config()
-tree = MCTSTree(b, config)
-
-for rep in range(1000):
-    base = rep % 20
-    rb = random_init(2*base + 1)
-    rbe = rb.stacked_planes_stm_pov(1)
-    cb = chess.Board(rb.fen())
-    
-    cbm = cb.mirror()
-    cbm_fast = Board(cbm.fen())
-    cbm_faste = cbm_fast.stacked_planes_stm_pov(1)
-    assert np.all(cbm_faste == rbe)
-    
-    eval_black, _ = sf_eval(cb, depth=16, engine=eng)
-    eval_white, _ = sf_eval(cbm, depth=16, engine=eng)
-    
-    assert np.square(eval_black - eval_white) < 0.1
-
-
-
-boards = []
-for rep in range(10000):
-    base = 3 + (rep % 35)
-    boards.append(random_init(base))
-    
-
-start = time.time()
-_ = [b.stacked_planes_stm_pov(1) for b in boards]
-stop = time.time()
-print(f"{stop-start:.3f}")
-      
-start = time.time()
-_ = [b.stacked_planes_stm_pov(5) for b in boards]
-stop = time.time()
-print(f"{stop-start:.3f}")
-      
-
-
-
-
-
 
 
 

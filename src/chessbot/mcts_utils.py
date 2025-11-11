@@ -95,6 +95,14 @@ class MCTSTree(fasttree):
 
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
+
+        # add noise to the root for exploration
+        if self.config.add_root_noise:
+            self.add_root_dirichlet_noise(
+                eps=self.config.dirichlet_eps,
+                alpha=self.config.dirichlet_alpha
+            )
+
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()

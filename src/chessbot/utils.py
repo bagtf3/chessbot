@@ -233,7 +233,18 @@ def plot_sf_simple(df):
     plt.show()
 
 
+def stable_softmax(logits):
+    # logits: (B,4096) float32
+    m = logits.max(axis=1, keepdims=True)
+    e = np.exp(logits - m)
+    s = e.sum(axis=1, keepdims=True)
+    return e / (s + 1e-20)
+
+
 def batch_policy_metrics(logits, labels, mask):
+    eps = 1e-12
+    big_neg = -1e6
+
     # mask logits, compute stable softmax
     masked_logits = np.where(mask > 0.5, logits, big_neg)
     probs = stable_softmax(masked_logits)
@@ -265,8 +276,8 @@ def batch_policy_metrics(logits, labels, mask):
     top1_per = probs[np.arange(probs.shape[0]), true_best]
 
     # get top-k indices by label (unsorted within the k)
-    top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :k3]
-    top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :k5]
+    top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :3]
+    top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :5]
 
     top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
     top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
@@ -300,6 +311,8 @@ def batch_policy_metrics(logits, labels, mask):
 
 
 def print_validation(epoch, stats):
+    eps = 1e-12
+
     keys = [
         "val_mse", "val_corr",
         "policy_ce", "uniform_ce", "ce_gain",
@@ -328,6 +341,11 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     preds = model.predict(X, verbose=0, batch_size=256)
     value_preds = preds[1].ravel()
 
+    value_preds = preds[1].ravel()  # (B,)
+    targets = Y['value_out'].ravel()
+    value_mse = np.mean((value_preds - targets) ** 2)
+    value_corr = np.corrcoef(value_preds, targets)[0, 1]
+    
     plt.scatter(targets, value_preds, s=6)
     plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
     plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
@@ -337,11 +355,6 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
         plt.savefig(save_path)
     plt.close()
 
-    value_preds = preds[1].ravel()  # (B,)
-    targets = Y['value_out'].ravel()
-    value_mse = np.mean((value_preds - targets) ** 2)
-    value_corr = np.corrcoef(value_preds, targets)[0, 1]
-    
     policy_logits = preds[0]  # (B,4096)
     policy_true = Y['policy_logits']
     policy_stats = batch_policy_metrics(policy_logits, policy_true, M)

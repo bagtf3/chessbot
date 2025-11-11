@@ -56,14 +56,17 @@ class Config(object):
     prior_clip_min = 0.001
 
     # training
-    training_queue_min = 2048
+    training_queue_min = 96
     fwd_batch = 1024
 
     z_blend = 0.5
     use_z_taper = True
-
     target_loss_weights = {"policy_logits": 1.0, "value_out": 2.0}
 
+    # root noise
+    add_root_noise = True
+    dirichlet_eps = 0.25
+    dirichlet_alpha = 0.1
 
     def to_dict(self):
         return {

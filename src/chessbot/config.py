@@ -56,7 +56,7 @@ class Config(object):
     prior_clip_min = 0.001
 
     # training
-    training_queue_min = 96
+    training_queue_min = 2048
     fwd_batch = 1024
 
     z_blend = 0.5

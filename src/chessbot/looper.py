@@ -729,11 +729,42 @@ class GameLooper(object):
             cbu.plot_training_progress(self.all_evals, save_path=prog_plt_file)
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
-        self.model.fit(X, Y, epochs=3, batch_size=512, verbose=1, sample_weight=s_wts)
+        history = self.model.fit(
+            X, Y, epochs=3, batch_size=128,
+            verbose=1, sample_weight=s_wts
+        )
+
+        rows = []
+        for m, v in history.history.items():
+            name = "total" if m == "loss" else m.replace("_loss", "")
+            start = v[0]; end = v[-1]
+            delta = start - end
+            mark = "*" if delta < 0 else "+"
+            rows.append((name, start, end, delta, mark))
+        
+        name_w = max(len(r[0]) for r in rows)
+        num_w = 8   # width for numbers (including decimal point)
+        fmt = (f"[epoch {epoch:4d}] [model fit] "
+            f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
+            f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
+
+        for name, start, end, delta, mark in rows:
+            print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
+        
+        epoch += 1
+        if epoch in [1, 100, 200, 500, 1000]:
+            model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
+            with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
+                pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)
+
         self.model.save(self.config.model_path)
 
         # update the fwd helper and clear queues/caches
-        self.infer = self.model.make_infer(max_bs=1024)
+        cfg = self.config
+        self.infer = make_conv_infer(
+            self.model, max_bs=cfg.fwd_batch,
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
+        )
 
         # clear training queue (we consumed the in-memory queue)
         self.training_queue = []

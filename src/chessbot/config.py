@@ -9,14 +9,14 @@ class Config(object):
     # files
     run_tag = "conv_embedded_test"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_pt1000.h5"
+    init_model = MODEL_DIR + "conv_64_token_v1_204.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 1600
+    sims_target = 800
     sims_ceiling = 200
 
     # early stop
@@ -42,12 +42,12 @@ class Config(object):
     material_diff_cutoff = 20
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 2
+    play_vs_sf_prob = 0
     sf_depth = 15
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
-        "random_middle_game": 0.25, "random_endgame": 0.1,
+        "pre_opened": 0.3, "random_init": 0.25,
+        "random_middle_game": 0.25, "random_endgame": 0.05,
         "piece_odds": 0.10, "piece_training": 0.05
     }
     
@@ -56,7 +56,7 @@ class Config(object):
     prior_clip_min = 0.001
 
     # training
-    training_queue_min = 1024
+    training_queue_min = 2048
     fwd_batch = 1024
 
     z_blend = 0.5

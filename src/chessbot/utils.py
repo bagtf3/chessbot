@@ -325,8 +325,8 @@ def print_validation(epoch, stats):
 
 def score_game_data(model, X, M, Y, epoch, save_path=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
-    preds = model.predict(X, verbose=0, batch_size=512)
-    value_preds = preds[1].ravel(); targets = np.asarray(Ystack).ravel()
+    preds = model.predict(X, verbose=0, batch_size=256)
+    value_preds = preds[1].ravel()
 
     plt.scatter(targets, value_preds, s=6)
     plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)

@@ -205,7 +205,7 @@ class ChessGame(object):
         ucis   = [u for u, _ in rows]
         visits = np.array([n for _, n in rows], dtype=np.float32)
         s = visits.sum()
-        pi = (visits / s) if s > 0.0 else None
+        pi = (visits / s) if s > 0.0 else np.zeros_like(visits)
         vwq = self.tree.visit_weighted_Q()
 
         # tree is white POV, we want STM-POV so we flip here
@@ -228,7 +228,7 @@ class ChessGame(object):
         """
         
         # get indices from C++
-        indices = self.root().board.moves_to_indices(ucis)  # list of ints (0..4095)
+        indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4095)
         policy = np.zeros(64 * 64, dtype=np.float32)
 
         # accumulate probs into flattened policy
@@ -876,8 +876,8 @@ def init_selfplay():
 
 def main():
     model, config = init_selfplay()
-
     looper = GameLooper(model=model, cfg=Config())
+
     # infer the number of trainings already done from existing files
     if os.path.exists(config.progress_csv_path):
         try:
@@ -888,15 +888,14 @@ def main():
         except Exception as e:
             print(e)
     
-    looper.run()
     # start the analysis server
-    # phs = start_post_hoc_server(looper.config.run_dir)
-    # try:
-    #     looper.run()
-    # except Exception as e:
-    #    print("Error encountered", e)
-    # finally:
-    #    stop_post_hoc_server(phs, timeout=10)
+    phs = start_post_hoc_server(looper.config.run_dir)
+    try:
+        looper.run()
+    except Exception as e:
+       print("Error encountered", e)
+    finally:
+       stop_post_hoc_server(phs, timeout=10)
 
 #%%
 if __name__ == '__main__':

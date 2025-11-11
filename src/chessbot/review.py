@@ -827,7 +827,7 @@ def make_training_sample(b, v, visits):
     ucis   = [x[0] for x in visits]
     counts = np.array([x[1] for x in visits], dtype=np.float32)
     s = counts.sum()
-    pi = (counts / s) if s > 0.0 else None
+    pi = (counts / s) if s > 0.0 else np.zeros_like(counts)
     
     # get indices from C++
     indices = b.moves_to_indices(ucis)  # list of ints (0..4095)

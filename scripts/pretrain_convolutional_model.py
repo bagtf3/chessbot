@@ -413,7 +413,7 @@ while epoch <= 1000:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
     epoch += 1
-    if epoch in [1, 100, 200, 500, 1000] == 0:
+    if epoch in [1, 100, 200, 500, 1000]:
         model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
         with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
             pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)

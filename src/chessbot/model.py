@@ -876,7 +876,7 @@ def make_transformer_infer(model, max_bs=1024, warm_shapes=(64, 256, 512)):
 def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-    enc_np: int32 [B,64], legal_np: int32 [B,4096].
+    enc_np: int32 [B,64], legal_np: int32 [B,4288].
     min_p, max_p, temp are baked into the closure.
     """
     
@@ -890,12 +890,12 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
 
     @tf.function(input_signature=[
         tf.TensorSpec([None, 64], tf.int32),
-        tf.TensorSpec([None, 4096], tf.int32),
+        tf.TensorSpec([None, 4288], tf.int32),
     ], experimental_compile=True)
     def graph(enc, legal):
         # model returns (policy_logits, value)
         logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4096)
+        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4288)
 
         # mask as float32
         mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
@@ -933,7 +933,7 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     if max_bs is not None:
         for B in (max_bs, max_bs):
             _ = graph(tf.zeros([B, 64], tf.int32),
-                    tf.zeros([B, 4096], tf.int32))
+                    tf.zeros([B, 4288], tf.int32))
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):

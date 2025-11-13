@@ -7,22 +7,22 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_embedded_selfplay1"
+    run_tag = "conv_embedded_phase0"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_v1_0.h5"
+    init_model = MODEL_DIR + "conv_64_token_v2_200.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 256
+    sims_target = 200
     sims_ceiling = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 16
+    es_check_every = 32
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
@@ -36,23 +36,23 @@ class Config(object):
     # Game stuff
     micro_batch_size = 4
     games_at_once = 256
-    n_training_games = 1500
+    n_training_games = 1000
     
     move_limit = 200
-    material_diff_cutoff = 15
-    material_diff_cutoff_span = 20
+    material_diff_cutoff = 10
+    material_diff_cutoff_span = 15
 
-    play_vs_sf_prob = 0
-    sf_depth = 6
+    play_vs_sf_prob = 0.5
+    sf_depth = 3
 
     # post hoc server
     run_post_hoc = True
-    mine_bonus_data = False
+    mine_bonus_data = True
     
     game_probs = {
-        "pre_opened": 0.20, "random_init": 0.20,
-        "random_middle_game": 0.25, "random_endgame": 0.10,
-        "piece_odds": 0.20, "piece_training": 0.05
+        "pre_opened": 0.15, "random_init": 0.25,
+        "random_middle_game": 0.25, "random_endgame": 0.15,
+        "piece_odds": 0.15, "piece_training": 0.05
     }
     
     # priors
@@ -68,10 +68,10 @@ class Config(object):
     training_queue_min = 2048
     fwd_batch = 1024
 
-    z_blend = 0.75
+    z_blend = 0.8
     use_z_taper = True
-    target_loss_weights = {"policy_logits": 1.5, "value_out": 2.0}
-    draw_weight = 0.25
+    target_loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    draw_weight = 0.2
 
     def to_dict(self):
         return {

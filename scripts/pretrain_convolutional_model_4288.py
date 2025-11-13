@@ -20,83 +20,87 @@ def build_conv_64pv(
     d_model_embed=128,
     vocab_size=21,
     filters=256,
-    n_conv=12,
+    n_conv=16,
     proj_dim=96,
-    name="conv_64pv"
+    name="conv_64pv",
 ):
     DE, FL, VS = d_model_embed, filters, vocab_size
-    
-    # inputs
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
 
-    # embedding -> (B,64,128) -> reshape (B,8,8,128)
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
     tok_emb = layers.Embedding(input_dim=VS, output_dim=DE, name="token_emb")(enc_in)
-    
     x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
 
-    # initial conv to filters
     x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
 
-    # main conv stack (repeated 3x3 convs)
     for i in range(n_conv):
         y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
         y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
-        
-        # residual
         x = layers.Add(name=f"res_{i}")([x, y])
 
-    # expand to 512 then mix
     x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
     x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
-
-    # project back to FL (optional)
     x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
 
-    # flatten to (B,64,channels)
-    #b, h, w, c = None, 8, 8, FL
-    feat = layers.Reshape((64, FL), name="to_64_x")(x)
+    # feat for pairwise head: flatten 8x8 -> 64
+    feat = layers.Reshape((64, FL), name="to_64_x")(x)  # (B,64,FL)
 
-    # pairwise policy: from/to projections + biases -> 64x64 -> 4096
-    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)
-    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)
+    # from/to projections and outer-product -> (B,64,64)
+    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)  # (B,64,proj)
+    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)      # (B,64,proj)
+    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # (B,64,64)
 
-    # from_proj, to_proj: (B, 64, F)
-    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # -> (B,64,64)
-
-    # per-from and per-to biases
-    b_from = layers.Dense(1, name="b_from")(from_proj)   # (B,64,1)
-    # b_from is already (B,64,1) after Dense
-    # ensure shape is explicit (B,64,1)
+    # biases and base flatten
+    b_from = layers.Dense(1, name="b_from")(from_proj)            # (B,64,1)
     b_from = layers.Reshape((64, 1), name="b_from_reshape")(b_from)
-
-    b_to = layers.Dense(1, name="b_to")(to_proj)        # (B,64,1)
-    # want (B,1,64) - use Permute to avoid lambdas
-    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)  # -> (B,1,64)
-
+    b_to = layers.Dense(1, name="b_to")(to_proj)                 # (B,64,1)
+    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)     # (B,1,64)
     pair_scores = layers.Add(name="add_biases")([pair_scores, b_from, b_to])
-    policy_logits = layers.Reshape((4096,), name="policy_logits")(pair_scores)
+    
+    # (B,4096)
+    base_flat = layers.Reshape((64 * 64,), name="policy_base_flat")(pair_scores)
+
+    # underpromo conv path: operate on 8x8 feature map x (B,8,8,FL)
+    # produce 3 channels per board square (B,8,8,3)
+    up_conv1 = layers.Conv2D(
+        FL // 2, 2, padding="same", activation="relu", name="under_promo_conv1")(x)
+    
+    # (B,8,8,3)
+    up_conv2 = layers.Conv2D(
+        3, 1, padding="same", activation=None, name="under_promo_conv2")(up_conv1)
+
+    # reshape to (B,64,3) then flatten to (B,192)
+    up_flat_64_3 = layers.Reshape((64, 3), name="promo_64_3")(up_conv2)  # (B,64,3)
+    up_flat = layers.Reshape((64 * 3,), name="promo_flat_raw")(up_flat_64_3)  # (B,192)
+
+    # add a small learned bias/offset per promo slot: create a transform and add it
+    # using Dense with zero kernel init so it's effectively a bias addition at start
+    promo_bias = layers.Dense(64 * 3, use_bias=True, name="promo_bias_dense")(up_flat)
+    promo_logits = layers.Add(name="promo_with_bias")([up_flat, promo_bias])  # (B,192)
+
+    # concat base 4096 + promo 192 -> final logits (B,4288)
+    policy_logits = layers.Concatenate(
+        name="policy_logits")([base_flat, promo_logits])
 
     # value head
     v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
-    v = layers.Dense(FL // 2, activation='relu', name="v_fc1")(v_pool)
-    v = layers.Dense(FL // 4, activation='relu', name="v_fc2")(v)
+    v = layers.Dense(FL // 2, activation="relu", name="v_fc1")(v_pool)
+    v = layers.Dense(FL // 4, activation="relu", name="v_fc2")(v)
     value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
-    # compile: losses, weights, optimizer
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
     }
-    
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-    
+
     return model, opt, loss_weights, loss_dict
 
-MODEL_NAME = 'conv_64_token_v1'
+
+MODEL_NAME = 'conv_64_token_v2'
 model, opt, loss_weights, loss_dict = build_conv_64pv(name=MODEL_NAME)
 model.summary()
 #%%
@@ -114,8 +118,9 @@ metrics_history = {
 weights_schedule = {
     # slow start
     5  : {"policy_logits": 0.1, "value_out": 0.10},
-    20 : {"policy_logits": 1.0, "value_out": 1.00},
-    75 : {"policy_logits": 1.5, "value_out": 2.00},
+    10 : {"policy_logits": 1.0, "value_out": 1.00},
+    20 : {"policy_logits": 1.2, "value_out": 2.00},
+    75 : {"policy_logits": 1.5, "value_out": 2.25},
     150: {"policy_logits": 2.0, "value_out": 2.75},
     300: {"policy_logits": 2.5, "value_out": 2.25},
     400: {"policy_logits": 2.0, "value_out": 1.50},
@@ -235,7 +240,7 @@ def mm(uci):
 from chessbot.config import Config
 gg = GameGenerator(Config())
 
-while epoch <= 10:
+while epoch <= 1000:
     for k in sorted(weights_schedule.keys()):
         if epoch < k:
             loss_weights = weights_schedule[k]
@@ -272,7 +277,7 @@ while epoch <= 10:
         
         # get indices from C++
         indices = rb.moves_to_indices(lms)  # list of ints (0..4095)
-        policy = np.zeros(64 * 64, dtype=np.float32)
+        policy = np.zeros(64 * 67, dtype=np.float32)
 
         # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
@@ -414,7 +419,7 @@ while epoch <= 10:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
     epoch += 1
-    if epoch in [10, 100, 200, 500, 1000]:
+    if epoch in [10, 75, 100, 200, 500, 1000]:
         model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
         with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
             pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)

@@ -194,7 +194,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_selfplay1"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_first_run"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -234,6 +234,19 @@ df_trim = df_trim.sort_values('ts')
 
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
+
+#%%
+cols = ['overall_best_move_rate', 'overall_cpl', 'overall_top3_rate']
+before = df_trim.iloc[:-WINDOW, ].groupby(['scenario'])[cols].mean()
+after = df_trim.iloc[WINDOW:, ].groupby(['scenario'])[cols].mean()
+print(f"Breakdown by scenario last {WINDOW} games")
+print(after.sort_values("overall_cpl").round(3))
+
+delta = (after-before).sort_values("overall_cpl", ascending=False).round(3)
+print()
+print(f"Delta by scenario last {WINDOW} games")
+print(delta)
+print()
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -305,18 +318,10 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
+pre_opened = [g for g in scored if g['scenario'] == 'random_middle_game']
 
-gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
 
-g = pre_opened[-2]
-gid = g['game_id']
-
-gdf = d.query("game_id == @gid")
-gdf['move_num']
-gdf['move_num'] = gdf['move_num'].astype(int)
-gdf.sort_values("move_num")
-
-
-
+df_trim
+#%%
 

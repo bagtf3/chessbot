@@ -231,7 +231,7 @@ class ChessGame(object):
         
         # get indices from C++
         indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4095)
-        policy = np.zeros(64 * 64, dtype=np.float32)
+        policy = np.zeros(64 * 67, dtype=np.float32)
         
         # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
@@ -784,7 +784,7 @@ class GameLooper(object):
         self.n_retrains += 1
         self.clear_cache = True
 
-    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=30.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"

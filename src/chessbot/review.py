@@ -23,7 +23,7 @@ from chessbot.utils import (
 )
 
 
-POLL_INTERVAL = 7
+POLL_INTERVAL = 20
 
 BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
@@ -31,7 +31,7 @@ ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 10
+DEPTH = 11
 EQUIV_RANGE = 10
 
 # stops the post hoc server
@@ -833,7 +833,7 @@ def make_training_sample(b, v, visits):
     
     # get indices from C++
     indices = b.moves_to_indices(ucis)  # list of ints (0..4095)
-    policy = np.zeros(64 * 64, dtype=np.float32)
+    policy = np.zeros(64 * 67, dtype=np.float32)
 
     # accumulate probs into flattened policy
     for idx, p in zip(indices, pi):

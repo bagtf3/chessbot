@@ -332,7 +332,7 @@ def print_validation(epoch, stats):
     print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
           f"{pair('value_corr', stats['value_corr'])}")
     print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
-          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
+          f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
     print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
           f"{pair('avg_top_prob', stats['avg_top_prob'])}")
     print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "

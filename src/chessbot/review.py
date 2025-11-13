@@ -31,7 +31,7 @@ ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 9
+DEPTH = 10
 EQUIV_RANGE = 10
 
 # stops the post hoc server
@@ -904,46 +904,29 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         # happy path, not a blunder, no action
         if row['delta'].item() < BLUNDER_CP:
             b.push_uci(mv)
+            continue
         
         # if a blunder, dont use actual visits (theyre wrong)
-        else:
-            best_v = cp_to_value_tanh(row['best_cp'].item())
-            best_mv = row['best_move'].item()
-            best_visits = make_fake_visits(best_mv, lms)
-            ts_best = make_training_sample(b, best_v, best_visits)
-            training_data.append(ts_best)
+        best_v = cp_to_value_tanh(row['best_cp'].item())
+        best_mv = row['best_move'].item()
+        best_visits = make_fake_visits(best_mv, lms)
+        ts_best = make_training_sample(b, best_v, best_visits)
+        training_data.append(ts_best)
+        
+        # # show the best continuation
+        # bc = b.clone()
+        # pushed = bc.push_uci(best_mv)
+        # lms_cont = bc.legal_moves()
+        # if (not lms_cont) or (not pushed):
+        #     continue
+
+        # cont_val, cont_best = sfe(bc, engine=engine)
+        # cont_visits = make_fake_visits(cont_best, lms_cont)
+        # cont_ts = make_training_sample(bc, cont_val, cont_visits)
+        # training_data.append(cont_ts)
             
-            # furthermore, show the best continuation
-            bc = b.clone()
-            bc.push_uci(best_mv)
-            lms_cont = bc.legal_moves()
-            if not lms_cont:
-                continue
-            cont_val, cont_best = sfe(bc, engine=engine)
-            cont_visits = make_fake_visits(cont_best, lms_cont)
-            cont_ts = make_training_sample(bc, cont_val, cont_visits)
-            training_data.append(cont_ts)
-            
-            # and the values of its PV to learn those positions are bad
-            pv = tr.get('pv', [])
-            # if no PV, just move on
-            if not pv:
-                b.push_uci(mv)
-                continue
-            
-            bp = b.clone()
-            bp.push_uci(m['uci'])
-            lms_pv = bp.legal_moves()
-            if not lms_pv:
-                continue
-            
-            pv_val, pv_best = sfe(bp, engine=engine)
-            pv_visits = make_fake_visits(pv_best, lms_pv)
-            pv_ts = make_training_sample(bp, pv_val, pv_visits)
-            training_data.append(pv_ts)
-            
-            # push to move and let the loop roll over
-            b.push_uci(mv)
+        # push to move and let the loop roll over
+        b.push_uci(mv)
 
     return training_data
 
@@ -1021,7 +1004,7 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
     try:
         # see if there is a starting pkl file
         last_seen_pkl = os.path.exists(pkl_path)
-        next_threshold = 1000
+        next_threshold = 500
         while not POST_HOC_STOP:
             if not os.path.exists(idx_path):
                 # check shutdown every poll_interval
@@ -1035,8 +1018,6 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                 unproc_report = False
 
             for rec in entries:
-                # try to throttle post hoc a bit
-                time.sleep(0.25)
                 if POST_HOC_STOP:
                     break
 
@@ -1091,7 +1072,7 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                         curr_exists = os.path.exists(pkl_path)
                         if last_seen_pkl and not curr_exists:
                             running_list = []
-                            next_threshold = 1000
+                            next_threshold = 500
                         last_seen_pkl = curr_exists
 
                         running_list.extend(batch_samples)
@@ -1100,7 +1081,7 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                         last_seen_pkl = True
                         lrl = len(running_list)
                         if lrl >= next_threshold:
-                            next_threshold += 1000
+                            next_threshold += 500
                             print(f"{PH} pushed {lrl} training samples")
                     
                     batch_samples = []

@@ -7,16 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_embedded_phase0"
+    run_tag = "conv_embedded_large_test"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_v2_10.h5"
+    init_model = MODEL_DIR + "conv_64_token_large_0.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 128
+    sims_target = 96
     sims_ceiling = 200
 
     # early stop
@@ -36,13 +36,13 @@ class Config(object):
     # Game stuff
     micro_batch_size = 4
     games_at_once = 256
-    n_training_games = 4000
+    n_training_games = 1000
     
     move_limit = 200
-    material_diff_cutoff = 15
-    material_diff_cutoff_span = 30
+    material_diff_cutoff = 10
+    material_diff_cutoff_span = 10
 
-    play_vs_sf_prob = 0
+    play_vs_sf_prob = 1.0
     sf_depth = 2
 
     # post hoc server
@@ -69,7 +69,7 @@ class Config(object):
     fwd_batch = 1024
 
     z_blend = 0.8
-    use_z_taper = True
+    use_z_taper = False
     target_loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     draw_weight = 0.2
 

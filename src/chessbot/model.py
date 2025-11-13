@@ -762,124 +762,15 @@ def set_loss_weights(model, loss_weights):
     return model
 
 
-## USAGE 
-#model = build_transformer_64pv(
-#    d_model=288, n_heads=12, n_layers=12, ff_dim=None, proj_dim=64, dropout=0.05,
-#    vocab_size=21, name="t64pv"
-#)
-#
-#save_transformer_model(model, MODEL_DIR + "transformer_large_init.h5")
-
-
-def make_transformer_infer(model, max_bs=1024, warm_shapes=(64, 256, 512)):
-    """
-    Returns fwd((enc_np, legal_np), min_p, max_p, temp) -> (probs_np, val_np).
-    enc_np: int32 [B,64], legal_np: int32 [B,4096].
-    """
-    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-    EPS = tf.constant(1e-12, dtype=tf.float32)
-
-    @tf.function(input_signature=[
-        tf.TensorSpec([None, 64], tf.int32),
-        tf.TensorSpec([None, 4096], tf.int32),
-        tf.TensorSpec([], tf.float32),  # min_p
-        tf.TensorSpec([], tf.float32),  # max_p
-        tf.TensorSpec([], tf.float32),  # temp
-    ],experimental_compile=True)
-    def graph(enc, legal, min_p, max_p, temp):
-        # logits from model: reshape to (B,4096)
-        logits, value = model([enc, legal], training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
-
-        # mask as float32 for softmax computations
-        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]),
-                    dtype=tf.float32)
-
-        # cast logits -> float32 for stable softmax under mixed precision
-        logits32 = tf.cast(logits, tf.float32)
-
-        # big negative in float32, then mask illegal moves
-        BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
-
-        # temperature-stable softmax in float32
-        scaled = masked_logits32 / tf.cast(temp, tf.float32)
-        row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
-        exp = tf.exp(scaled - row_max) * mask
-        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
-        has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
-
-        # clipping on legal slots and renormalize (float32)
-        min_p_f = tf.cast(min_p, tf.float32)
-        max_p_f = tf.cast(max_p, tf.float32)
-        clipped = tf.where(mask > 0.5,
-                        tf.clip_by_value(probs, min_p_f, max_p_f),
-                        tf.zeros_like(probs))
-        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
-        valid = s > EPS
-        probs_final = tf.where(
-            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
-            tf.zeros_like(clipped)
-        )
-
-        # ensure returned probs are float32; cast value to float32 too
-        value_f = tf.cast(value, tf.float32)
-        return probs_final, value_f
-
-
-    # warm up traces for common batch sizes
-    for B in warm_shapes:
-        _ = graph(tf.zeros([B, 64], tf.int32),
-                  tf.zeros([B, 4096], tf.int32),
-                  tf.constant(0.001, tf.float32),
-                  tf.constant(0.35,  tf.float32),
-                  tf.constant(1.0,   tf.float32))
-
-    def base_fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
-        if not isinstance(pair, (list, tuple)):
-            raise ValueError("pass (enc_np, legal_np) tuple")
-        enc_np, legal_np = pair
-        e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
-        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
-        probs_tf, val_tf = graph(e_tf, l_tf,
-                                 tf.cast(min_p, tf.float32),
-                                 tf.cast(max_p, tf.float32),
-                                 tf.cast(temp,  tf.float32))
-        return probs_tf.numpy(), val_tf.numpy()
-
-    if max_bs is None:
-        return base_fwd
-
-    def fwd(pair, min_p=0.001, max_p=0.35, temp=1.0):
-        enc_np, legal_np = pair
-        B = enc_np.shape[0]
-        if B <= max_bs:
-            return base_fwd((enc_np, legal_np), min_p, max_p, temp)
-        parts = None
-        i = 0
-        while i < B:
-            j = min(i + max_bs, B)
-            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]),
-                                     min_p, max_p, temp)
-            if parts is None:
-                parts = [p_probs, p_val]
-            else:
-                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
-                parts[1] = np.concatenate([parts[1], p_val],  axis=0)
-            i = j
-        return parts
-
-    return fwd
-
-
 def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
     enc_np: int32 [B,64], legal_np: int32 [B,4288].
     min_p, max_p, temp are baked into the closure.
     """
-    
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy('mixed_float16')
+
     BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
     EPS = tf.constant(1e-12, dtype=tf.float32)
 

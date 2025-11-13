@@ -4,6 +4,11 @@ os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 os.environ["XLA_FLAGS"] = '--xla_gpu_cuda_data_dir="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"'
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
 
+# global mixed precision policy
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')
+print("Mixed precision policy:", mixed_precision.global_policy())
+
 try:
     import tensorflow as tf
     gpus = tf.config.list_physical_devices('GPU')

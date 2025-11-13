@@ -19,11 +19,15 @@ import pickle
 def build_conv_64pv(
     d_model_embed=128,
     vocab_size=21,
-    filters=256,
-    n_conv=12,
+    filters=288,
+    n_conv=16,
     proj_dim=96,
     name="conv_64pv",
 ):
+    
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy('mixed_float16')
+    
     DE, FL, VS = d_model_embed, filters, vocab_size
 
     enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
@@ -31,14 +35,26 @@ def build_conv_64pv(
     x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
 
     x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
-
+    
+    # residual blocks
     for i in range(n_conv):
         y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
+        # light regularization
+        if i % 2 == 1:
+            y = layers.LayerNormalization(epsilon=1e-5, center=False, scale=False)(y)
+            
         y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
         x = layers.Add(name=f"res_{i}")([x, y])
-
+    
+    # expand to (B, 64, 512) then (B, 64, FL)
     x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
     x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
+    
+    x = layers.LayerNormalization(
+        epsilon=1e-5, center=False, scale=False,
+        dtype="float32", name="ln_x512"
+    )(x)
+    
     x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
 
     # feat for pairwise head: flatten 8x8 -> 64
@@ -90,6 +106,8 @@ def build_conv_64pv(
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
     opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+    
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
@@ -100,9 +118,10 @@ def build_conv_64pv(
     return model, opt, loss_weights, loss_dict
 
 
-MODEL_NAME = 'conv_64_token_v2'
+MODEL_NAME = 'conv_64_token_large'
 model, opt, loss_weights, loss_dict = build_conv_64pv(name=MODEL_NAME)
 model.summary()
+model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
 #%%
 
 eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
@@ -118,10 +137,24 @@ metrics_history = {
 weights_schedule = {
     # slow start
     5  : {"policy_logits": 0.1, "value_out": 0.10},
-    10 : {"policy_logits": 1.0, "value_out": 1.00},
-    20 : {"policy_logits": 1.2, "value_out": 2.00},
-    75 : {"policy_logits": 1.5, "value_out": 2.25},
+    10 : {"policy_logits": 0.5, "value_out": 2.00},
+    20 : {"policy_logits": 1.0, "value_out": 2.00},
+    75 : {"policy_logits": 1.5, "value_out": 2.50},
     150: {"policy_logits": 2.0, "value_out": 2.75},
+    300: {"policy_logits": 2.5, "value_out": 2.25},
+    400: {"policy_logits": 2.0, "value_out": 1.50},
+    500: {"policy_logits": 1.5, "value_out": 0.50},
+    # post-500 fine-tune taper (MSE maintenance mostly)
+    600: {"policy_logits": 1.0, "value_out": 0.50}
+}
+
+weights_schedule = {
+    # slow start
+    3  : {"policy_logits": 0.01, "value_out": 0.10},
+    10 : {"policy_logits": 0.01, "value_out": 2.00},
+    20 : {"policy_logits": 0.01, "value_out": 2.25},
+    75 : {"policy_logits": 0.01, "value_out": 2.50},
+    150: {"policy_logits": 0.01, "value_out": 2.75},
     300: {"policy_logits": 2.5, "value_out": 2.25},
     400: {"policy_logits": 2.0, "value_out": 1.50},
     500: {"policy_logits": 1.5, "value_out": 0.50},
@@ -240,7 +273,7 @@ def mm(uci):
 from chessbot.config import Config
 gg = GameGenerator(Config())
 
-while epoch <= 1000:
+while epoch <= 0:
     for k in sorted(weights_schedule.keys()):
         if epoch < k:
             loss_weights = weights_schedule[k]
@@ -435,5 +468,88 @@ while epoch <= 1000:
           f"total runtime: {runtime}")
     print()
 #%%
+from chessbot.model import make_conv_infer
+import time
+import numpy as np
+import pandas as pd
+import gc
 
+def make_random_batch(B, vocab_size=64, move_space=4288, legal_prob=0.02):
+    """Create random enc (B,64) and legal mask (B,4288) with >=1 legal move per row."""
+    enc = np.random.randint(0, vocab_size, size=(B, 64), dtype=np.int32)
+    # sparse random legal mask
+    legal = (np.random.rand(B, move_space) < legal_prob).astype(np.int32)
+    # ensure at least one legal slot per row
+    idx = np.random.randint(0, move_space, size=(B,))
+    legal[np.arange(B), idx] = 1
+    return enc, legal
 
+def speed_test_infer(
+        infer, batch_sizes=(32, 64, 128, 256, 512, 1024), reps=20,
+        warmup=3, rng_seed=12345, verbose=True):
+    """
+    Run timing for given batch sizes.
+
+    Parameters
+    - infer: your inference function `infer((enc_np, legal_np)) -> (probs, val)`
+    - batch_sizes: iterable of ints
+    - reps: number of timed repetitions per batch size
+    - warmup: number of warmup calls before timing
+    - rng_seed: reproducible random generator seed (optional)
+    - verbose: print progress
+
+    Returns
+    - pandas.DataFrame with columns: batch, total_s, per_batch_s, samples_per_s, median_batch_s, std_batch_s
+    """
+    np.random.seed(rng_seed)
+    results = []
+
+    for B in batch_sizes:
+        enc_np, legal_np = make_random_batch(B)
+        # GC + optional small pause to stabilise memory effects
+        gc.collect()
+
+        if verbose:
+            print(f"Warmup: batch={B}, warmup={warmup} ...")
+
+        # warmup runs (un-timed)
+        for _ in range(warmup):
+            _ = infer((enc_np, legal_np))
+
+        # timed runs: store per-run times to compute median/std if wanted
+        times = []
+        if verbose:
+            print(f"Timing: batch={B}, reps={reps} ...")
+
+        for r in range(reps):
+            t0 = time.perf_counter()
+            _ = infer((enc_np, legal_np))
+            t1 = time.perf_counter()
+            times.append(t1 - t0)
+
+        total = sum(times)
+        per_batch = total / len(times)
+        samples_per_s = B / per_batch if per_batch > 0 else float("inf")
+
+        results.append({
+            "batch": B,
+            "total_s": total,
+            "per_batch_s": per_batch,
+            "samples_per_s": samples_per_s,
+            "median_batch_s": float(np.median(times)),
+            "std_batch_s": float(np.std(times, ddof=1))
+        })
+
+        if verbose:
+            print(f" -> B={B:4d} | per-batch {per_batch:.6f}s | {samples_per_s:8.1f} samples/s")
+
+    df = pd.DataFrame(results).sort_values("batch")
+    print("\nSummary:")
+    print(df.to_string(index=False))
+    return df
+
+infer = make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.65, temp=1.0)
+df = speed_test_infer(
+    infer, batch_sizes=(32, 64, 128, 256, 512, 1024),
+    reps=20, warmup=3, verbose=True
+)

@@ -505,18 +505,25 @@ class GameLooper(object):
         boards_np = np.stack(boards, axis=0)   # (B,8,8,29)
         legals_np = np.stack(legals, axis=0)   # (B,4096)
 
-        # pad up to fwd_batch if needed (helps XLA/static-trace shapes)
+        # pad up to fwd_batch or a smaller power of 2 if needed
+        # (helps XLA/static-trace shapes)
         target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
         if B < target_bs:
-            pad = target_bs - B
-            pad_boards = np.zeros((pad, ) + boards_np.shape[1:], dtype=boards_np.dtype)
-            pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
-            boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
-            legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
-            probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
-            probs_np = probs_np_p[:B]
-            vals_np = vals_np_p[:B]
+            # next power of 2 >= N
+            new_target = 1 << ((B - 1).bit_length())
+            pad = new_target - B
+            if pad:
+                pad_boards = np.zeros((pad, ) + boards_np.shape[1:], dtype=boards_np.dtype)
+                pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
+                boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
+                legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
+                probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
+                probs_np = probs_np_p[:B]
+                vals_np = vals_np_p[:B]
+            # might already be a smaller power of 2
+            else:
+                probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
             probs_np, vals_np = self.infer((boards_np, legals_np))
 
@@ -524,7 +531,7 @@ class GameLooper(object):
         to_raw_cache = []
         for i, k in enumerate(keys):
             v = np.asarray(vals_np[i]).reshape(())  # scalar
-            p = np.asarray(probs_np[i], dtype=np.float32)  # (4096,)
+            p = np.asarray(probs_np[i], dtype=np.float32)  # (4288,)
             to_raw_cache.append((k, v, p))
 
         # bulk insert (C++ must be updated to accept this format)

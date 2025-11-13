@@ -7,7 +7,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
 # global mixed precision policy
 from tensorflow.keras import mixed_precision
 mixed_precision.set_global_policy('mixed_float16')
-print("Mixed precision policy:", mixed_precision.global_policy())
 
 try:
     import tensorflow as tf

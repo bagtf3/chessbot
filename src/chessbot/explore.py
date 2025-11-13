@@ -194,7 +194,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_first_run"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_embedded_phase0"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -324,4 +324,23 @@ gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
 
 df_trim
 #%%
+sqs = [48, 49, 50, 51, 52, 53, 54, 55]
 
+[s % 8 for s in sqs]
+
+
+
+from_sq = 49
+from_file = 49 % 8
+
+to_sq = 57
+to_file = to_sq %8
+from_file + to_file*8
+
+c = 0
+for from_file in range(8):
+    for to_file in range(8):
+        c += 1
+        print(from_file + to_file*8)
+
+from_file + 8*to_file + 64 * underpromo_type

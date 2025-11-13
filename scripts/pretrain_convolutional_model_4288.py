@@ -20,7 +20,7 @@ def build_conv_64pv(
     d_model_embed=128,
     vocab_size=21,
     filters=256,
-    n_conv=16,
+    n_conv=12,
     proj_dim=96,
     name="conv_64pv",
 ):

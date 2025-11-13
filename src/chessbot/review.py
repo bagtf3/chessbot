@@ -25,13 +25,13 @@ from chessbot.utils import (
 
 POLL_INTERVAL = 20
 
-BLUNDER_CP = 60
+BLUNDER_CP = 80
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 11
+DEPTH = 9
 EQUIV_RANGE = 10
 
 # stops the post hoc server
@@ -913,20 +913,16 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             ts_best = make_training_sample(b, best_v, best_visits)
             training_data.append(ts_best)
             
-            # # furthermore, show the best continuation
-            b2 = b.clone()
-            b2.push_uci(best_mv)
-            cont_moves = 1
-            while cont_moves < 2 :
-                lms2 = b2.legal_moves()
-                if not lms2:
-                    break
-                cont_val, cont_best = sfe(b2, engine=engine)
-                cont_visits = make_fake_visits(cont_best, lms2)
-                cont_ts = make_training_sample(b2, cont_val, cont_visits)
-                training_data.append(cont_ts)
-                b2.push_uci(cont_best)        
-                cont_moves += 1
+            # furthermore, show the best continuation
+            bc = b.clone()
+            bc.push_uci(best_mv)
+            lms_cont = bc.legal_moves()
+            if not lms_cont:
+                continue
+            cont_val, cont_best = sfe(bc, engine=engine)
+            cont_visits = make_fake_visits(cont_best, lms_cont)
+            cont_ts = make_training_sample(bc, cont_val, cont_visits)
+            training_data.append(cont_ts)
             
             # and the values of its PV to learn those positions are bad
             pv = tr.get('pv', [])
@@ -935,18 +931,16 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
                 b.push_uci(mv)
                 continue
             
-            # run the 2 next PV moves
-            b2 = b.clone()
-            for m in pv[:3]:
-                b2.push_uci(m['uci'])
-                lms2 = b2.legal_moves()
-                if not lms2:
-                    break
-               
-                pv_val, pv_best = sfe(b2, engine=engine)
-                pv_visits = make_fake_visits(pv_best, lms2)
-                pv_ts = make_training_sample(b2, pv_val, pv_visits)
-                training_data.append(pv_ts)
+            bp = b.clone()
+            bp.push_uci(m['uci'])
+            lms_pv = bp.legal_moves()
+            if not lms_pv:
+                continue
+            
+            pv_val, pv_best = sfe(bp, engine=engine)
+            pv_visits = make_fake_visits(pv_best, lms_pv)
+            pv_ts = make_training_sample(bp, pv_val, pv_visits)
+            training_data.append(pv_ts)
             
             # push to move and let the loop roll over
             b.push_uci(mv)
@@ -1021,7 +1015,7 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
 
     # single engine reused across loop
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 1, "Hash": 64})
+    eng.configure({"Threads": 1, "Hash": 128})
 
     unproc_report = True
     try:
@@ -1041,6 +1035,8 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                 unproc_report = False
 
             for rec in entries:
+                # try to throttle post hoc a bit
+                time.sleep(0.25)
                 if POST_HOC_STOP:
                     break
 

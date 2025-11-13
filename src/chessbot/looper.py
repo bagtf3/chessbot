@@ -650,27 +650,26 @@ class GameLooper(object):
         # check for additional data pkl and load+remove if present
         add_pkl = os.path.join(self.config.run_dir, "additional_training_data.pkl")
         additional = []
-
-        if self.config.mine_bonus_data:
-            if os.path.exists(add_pkl):
-                # may hit an unlucky access deny if during a write.
-                tries = 0
-                while tries < 3:
-                    try:
-                        with open(add_pkl, "rb") as f:
-                            additional = pickle.load(f)
-                        # remove immediately so nothing is re-read later
-                        os.remove(add_pkl)
-                        n_add = len(additional)
-                        print(f"[retrain] found {n_add} additional training samples")
-                        break
-                    except:
-                        # if we get an error, wait a bit and try again
-                        time.sleep(0.5)
-                        tries += 1
-            
-            if not additional:
-                print("No additional data found at", add_pkl)
+        
+        if os.path.exists(add_pkl):
+            # may hit an unlucky access deny if during a write.
+            tries = 0
+            while tries < 3:
+                try:
+                    with open(add_pkl, "rb") as f:
+                        additional = pickle.load(f)
+                    # remove immediately so nothing is re-read later
+                    os.remove(add_pkl)
+                    n_add = len(additional)
+                    print(f"[retrain] found {n_add} additional training samples")
+                    break
+                except:
+                    # if we get an error, wait a bit and try again
+                    time.sleep(0.5)
+                    tries += 1
+        
+        if not additional:
+            print("No additional data found at", add_pkl)
         
         # combined list: existing queue first, additional appended
         combined = list(self.training_queue) + list(additional)

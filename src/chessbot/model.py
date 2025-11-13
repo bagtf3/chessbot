@@ -762,6 +762,108 @@ def set_loss_weights(model, loss_weights):
     return model
 
 
+def build_conv_64pv(
+    d_model_embed=128,
+    vocab_size=21,
+    filters=288,
+    n_conv=16,
+    proj_dim=96,
+    name="conv_64pv"
+):
+    
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy('mixed_float16')
+    
+    DE, FL, VS = d_model_embed, filters, vocab_size
+
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
+    tok_emb = layers.Embedding(input_dim=VS, output_dim=DE, name="token_emb")(enc_in)
+    x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
+
+    x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
+    
+    # residual blocks
+    for i in range(n_conv):
+        y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
+        # light regularization
+        if i % 2 == 1:
+            y = layers.LayerNormalization(epsilon=1e-5, center=False, scale=False)(y)
+            
+        y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
+        x = layers.Add(name=f"res_{i}")([x, y])
+    
+    # expand to (B, 64, 512) then (B, 64, FL)
+    x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
+    x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
+    
+    x = layers.LayerNormalization(
+        epsilon=1e-5, center=False, scale=False,
+        dtype="float32", name="ln_x512"
+    )(x)
+    
+    x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
+
+    # feat for pairwise head: flatten 8x8 -> 64
+    feat = layers.Reshape((64, FL), name="to_64_x")(x)  # (B,64,FL)
+
+    # from/to projections and outer-product -> (B,64,64)
+    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)  # (B,64,proj)
+    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)      # (B,64,proj)
+    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # (B,64,64)
+
+    # biases and base flatten
+    b_from = layers.Dense(1, name="b_from")(from_proj)            # (B,64,1)
+    b_from = layers.Reshape((64, 1), name="b_from_reshape")(b_from)
+    b_to = layers.Dense(1, name="b_to")(to_proj)                 # (B,64,1)
+    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)     # (B,1,64)
+    pair_scores = layers.Add(name="add_biases")([pair_scores, b_from, b_to])
+    
+    # (B,4096)
+    base_flat = layers.Reshape((64 * 64,), name="policy_base_flat")(pair_scores)
+
+    # underpromo conv path: operate on 8x8 feature map x (B,8,8,FL)
+    # produce 3 channels per board square (B,8,8,3)
+    up_conv1 = layers.Conv2D(
+        FL // 2, 2, padding="same", activation="relu", name="under_promo_conv1")(x)
+    
+    # (B,8,8,3)
+    up_conv2 = layers.Conv2D(
+        3, 1, padding="same", activation=None, name="under_promo_conv2")(up_conv1)
+
+    # reshape to (B,64,3) then flatten to (B,192)
+    up_flat_64_3 = layers.Reshape((64, 3), name="promo_64_3")(up_conv2)  # (B,64,3)
+    up_flat = layers.Reshape((64 * 3,), name="promo_flat_raw")(up_flat_64_3)  # (B,192)
+
+    # add a small learned bias/offset per promo slot: create a transform and add it
+    # using Dense with zero kernel init so it's effectively a bias addition at start
+    promo_bias = layers.Dense(64 * 3, use_bias=True, name="promo_bias_dense")(up_flat)
+    promo_logits = layers.Add(name="promo_with_bias")([up_flat, promo_bias])  # (B,192)
+
+    # concat base 4096 + promo 192 -> final logits (B,4288)
+    policy_logits = layers.Concatenate(
+        name="policy_logits")([base_flat, promo_logits])
+
+    # value head
+    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
+    v = layers.Dense(FL // 2, activation="relu", name="v_fc1")(v_pool)
+    v = layers.Dense(FL // 4, activation="relu", name="v_fc2")(v)
+    value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
+
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
+
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+    
+    loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
+
+    return model, opt, loss_weights, loss_dict
+
+
 def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).

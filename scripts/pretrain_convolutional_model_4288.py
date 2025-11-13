@@ -1,13 +1,12 @@
 from chessbot import MODEL_DIR, SF_LOC
 
 from chessbot.utils import sf_eval, random_init, mirror_move, format_time
-from chessbot.utils import GameGenerator
+from chessbot.utils import GameGenerator, batch_policy_metrics, print_validation
 
 from chessbot.review import make_fake_visits
 import chess, chess.engine
 
-import tensorflow as tf
-from tensorflow.keras import layers, Model, Input
+from chessbot.model import build_conv_64pv
 
 import pandas as pd
 import numpy as np
@@ -15,111 +14,13 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 
+MODEL_NAME = 'conv_64_token_v3'
 
-def build_conv_64pv(
-    d_model_embed=128,
-    vocab_size=21,
-    filters=288,
-    n_conv=16,
-    proj_dim=96,
-    name="conv_64pv",
-):
-    
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy('mixed_float16')
-    
-    DE, FL, VS = d_model_embed, filters, vocab_size
+model, opt, loss_weights, loss_dict = build_conv_64pv(
+    d_model_embed=128, vocab_size=21, filters=256,
+    n_conv=12, proj_dim=96, name=MODEL_NAME
+)
 
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    tok_emb = layers.Embedding(input_dim=VS, output_dim=DE, name="token_emb")(enc_in)
-    x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
-
-    x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
-    
-    # residual blocks
-    for i in range(n_conv):
-        y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
-        # light regularization
-        if i % 2 == 1:
-            y = layers.LayerNormalization(epsilon=1e-5, center=False, scale=False)(y)
-            
-        y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
-        x = layers.Add(name=f"res_{i}")([x, y])
-    
-    # expand to (B, 64, 512) then (B, 64, FL)
-    x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
-    x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
-    
-    x = layers.LayerNormalization(
-        epsilon=1e-5, center=False, scale=False,
-        dtype="float32", name="ln_x512"
-    )(x)
-    
-    x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
-
-    # feat for pairwise head: flatten 8x8 -> 64
-    feat = layers.Reshape((64, FL), name="to_64_x")(x)  # (B,64,FL)
-
-    # from/to projections and outer-product -> (B,64,64)
-    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)  # (B,64,proj)
-    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)      # (B,64,proj)
-    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # (B,64,64)
-
-    # biases and base flatten
-    b_from = layers.Dense(1, name="b_from")(from_proj)            # (B,64,1)
-    b_from = layers.Reshape((64, 1), name="b_from_reshape")(b_from)
-    b_to = layers.Dense(1, name="b_to")(to_proj)                 # (B,64,1)
-    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)     # (B,1,64)
-    pair_scores = layers.Add(name="add_biases")([pair_scores, b_from, b_to])
-    
-    # (B,4096)
-    base_flat = layers.Reshape((64 * 64,), name="policy_base_flat")(pair_scores)
-
-    # underpromo conv path: operate on 8x8 feature map x (B,8,8,FL)
-    # produce 3 channels per board square (B,8,8,3)
-    up_conv1 = layers.Conv2D(
-        FL // 2, 2, padding="same", activation="relu", name="under_promo_conv1")(x)
-    
-    # (B,8,8,3)
-    up_conv2 = layers.Conv2D(
-        3, 1, padding="same", activation=None, name="under_promo_conv2")(up_conv1)
-
-    # reshape to (B,64,3) then flatten to (B,192)
-    up_flat_64_3 = layers.Reshape((64, 3), name="promo_64_3")(up_conv2)  # (B,64,3)
-    up_flat = layers.Reshape((64 * 3,), name="promo_flat_raw")(up_flat_64_3)  # (B,192)
-
-    # add a small learned bias/offset per promo slot: create a transform and add it
-    # using Dense with zero kernel init so it's effectively a bias addition at start
-    promo_bias = layers.Dense(64 * 3, use_bias=True, name="promo_bias_dense")(up_flat)
-    promo_logits = layers.Add(name="promo_with_bias")([up_flat, promo_bias])  # (B,192)
-
-    # concat base 4096 + promo 192 -> final logits (B,4288)
-    policy_logits = layers.Concatenate(
-        name="policy_logits")([base_flat, promo_logits])
-
-    # value head
-    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
-    v = layers.Dense(FL // 2, activation="relu", name="v_fc1")(v_pool)
-    v = layers.Dense(FL // 4, activation="relu", name="v_fc2")(v)
-    value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-    
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
-
-
-MODEL_NAME = 'conv_64_token_large'
-model, opt, loss_weights, loss_dict = build_conv_64pv(name=MODEL_NAME)
 model.summary()
 model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
 #%%
@@ -129,8 +30,6 @@ eng.configure({"Threads": 1, "Hash": 64})
     
 #%%
 metrics_history = {
-    "policy_ce": [], "ce_uniform": [], "ce_gain": [],
-    "exp_prob_model": [], "exp_prob_uniform": [],
     "value_mse": [], "value_corr": [], "epoch_time": []
 }
 
@@ -148,20 +47,6 @@ weights_schedule = {
     600: {"policy_logits": 1.0, "value_out": 0.50}
 }
 
-weights_schedule = {
-    # slow start
-    3  : {"policy_logits": 0.01, "value_out": 0.10},
-    10 : {"policy_logits": 0.01, "value_out": 2.00},
-    20 : {"policy_logits": 0.01, "value_out": 2.25},
-    75 : {"policy_logits": 0.01, "value_out": 2.50},
-    150: {"policy_logits": 0.01, "value_out": 2.75},
-    300: {"policy_logits": 2.5, "value_out": 2.25},
-    400: {"policy_logits": 2.0, "value_out": 1.50},
-    500: {"policy_logits": 1.5, "value_out": 0.50},
-    # post-500 fine-tune taper (MSE maintenance mostly)
-    600: {"policy_logits": 1.0, "value_out": 0.50}
-}
-
 eps = 1e-12
 big_neg = -1e6
 
@@ -170,21 +55,6 @@ def get_sf_depth(epoch):
     for e in sorted(sf_schedule.keys()):
         if epoch < e:
             return sf_schedule[e]
-        
-
-def stable_softmax(logits):
-    # logits: (B,4096) float32
-    m = logits.max(axis=1, keepdims=True)
-    e = np.exp(logits - m)
-    s = e.sum(axis=1, keepdims=True)
-    return e / (s + 1e-20)
-
-
-def moving_average(arr, window=15):
-    if len(arr) < 1:
-        return np.array([])
-    w = np.ones(window) / window
-    return np.convolve(arr, w, mode="valid")
 
 
 def moving_average_pd(arr, window=15):
@@ -192,88 +62,16 @@ def moving_average_pd(arr, window=15):
     return s.rolling(window, center=True, min_periods=1).mean().values
 
 
-def batch_policy_metrics(logits, labels, mask):
-    masked_logits = np.where(mask > 0.5, logits, big_neg)
-    probs = stable_softmax(masked_logits)
-
-    per_ce = -np.sum(labels * np.log(probs + eps), axis=1)
-    policy_ce = per_ce.mean()
-
-    legal_counts = mask.sum(axis=1, keepdims=True)
-    uniform = mask / (legal_counts + eps)
-    per_ce_uniform = -np.sum(labels * np.log(uniform + eps), axis=1)
-    uniform_ce = per_ce_uniform.mean()
-
-    exp_prob_model = np.sum(labels * probs, axis=1).mean()
-    exp_prob_uniform = np.sum(labels * uniform, axis=1).mean()
-
-    true_best = labels.argmax(axis=1)
-    model_best = probs.argmax(axis=1)
-
-    top1_exact = (model_best == true_best).mean()
-
-    top_probs = probs[np.arange(probs.shape[0]), model_best]
-    avg_top_prob = top_probs.mean()
-
-    prob_on_true_per = probs[np.arange(probs.shape[0]), true_best]
-    prob_on_true = prob_on_true_per.mean()
-
-    support_mask = labels > 0
-    support_mask[np.arange(support_mask.shape[0]), true_best] = False
-    prob_on_others_per = (probs * support_mask).sum(axis=1)
-    prob_on_others = prob_on_others_per.mean()
-
-    top1_in_support = (labels[np.arange(labels.shape[0]), model_best] > 0).mean()
-
-    return {
-        "policy_ce": policy_ce,
-        "uniform_ce": uniform_ce,
-        "ce_gain": (uniform_ce - policy_ce),
-        "exp_prob_model": exp_prob_model,
-        "exp_prob_uniform": exp_prob_uniform,
-        "top1_in_support": top1_in_support,
-        "top1_exact": top1_exact,
-        "avg_top_prob": avg_top_prob,
-        "prob_on_true": prob_on_true,
-        "prob_on_others": prob_on_others
-    }
-
-
-def print_validation(epoch, stats):
-    keys = [
-        "val_mse", "val_corr",
-        "policy_ce", "uniform_ce", "ce_gain",
-        "top1_exact", "avg_top_prob",
-        "prob_on_true", "prob_on_others"
-    ]
-    name_w = max(len(k) for k in keys)
-    num_w = 8
-    fmt_num = f"{{value:{num_w}.4f}}"
-    def pair(k, v):
-        return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
-    ratio = stats.get("prob_on_true", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
-
-    print(f"[epoch {epoch:4d}] [validation] {pair('val_mse', stats['val_mse'])}  "
-          f"{pair('val_corr', stats['val_corr'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
-          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
-          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('prob_on_true', stats['prob_on_true'])}  "
-          f"{pair('true ratio', ratio)}")
-
 #%%
 epoch=0
 model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
 begin = time.time()
 #%%
-def mm(uci):
-    return str(mirror_move(chess.Move.from_uci(uci)))
 
 from chessbot.config import Config
 gg = GameGenerator(Config())
 
-while epoch <= 0:
+while epoch <= 5:
     for k in sorted(weights_schedule.keys()):
         if epoch < k:
             loss_weights = weights_schedule[k]
@@ -289,7 +87,7 @@ while epoch <= 0:
         else:
             moves = 2 + rep % 60
             rb = random_init(moves)
-            
+        
         x = rb.encode_64_tokens()
         mask = rb.legal_move_mask()
         
@@ -299,17 +97,14 @@ while epoch <= 0:
             continue
         
         lms = rb.legal_moves()
-        visits = make_fake_visits(best, lms, ratio_best=51)        
-        
-        if rb.side_to_move() == 'b':
-            visits = [[mm(u), c] for u, c in visits]
+        visits = make_fake_visits(best, lms, ratio_best=51)
         
         counts = np.array([x[1] for x in visits], dtype=np.float32)
         s = counts.sum()
         pi = (counts / s) if s > 0.0 else None
         
         # get indices from C++
-        indices = rb.moves_to_indices(lms)  # list of ints (0..4095)
+        indices = rb.moves_to_indices(lms)  # list of ints (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
 
         # accumulate probs into flattened policy
@@ -341,27 +136,17 @@ while epoch <= 0:
     value_mse = np.mean((value_preds - targets) ** 2)
     value_corr = np.corrcoef(value_preds, targets)[0, 1]
     
-    # append metrics (use same key names batch_policy_metrics returns)
-    metrics_history.setdefault("top1_exact", []).append(policy_stats["top1_exact"])
-    metrics_history.setdefault("avg_top_prob", []).append(policy_stats["avg_top_prob"])
-    metrics_history.setdefault("prob_on_true", []).append(policy_stats["prob_on_true"])
+    for k, v in policy_stats.items():
+        if k not in metrics_history:
+            metrics_history[k] = []
+        
+        metrics_history[k].append(v)
     
-    # policy CE / uniform CE / gains (handle old key names as fallback)
-    metrics_history.setdefault("policy_ce", []).append(policy_stats.get("policy_ce"))
-    metrics_history.setdefault("ce_uniform", []).append(policy_stats.get("uniform_ce"))
-    metrics_history.setdefault("ce_gain", []).append(policy_stats.get("ce_gain"))
-    
-    metrics_history.setdefault("exp_prob_model", []).append(
-        policy_stats.get("exp_prob_model"))
-    
-    metrics_history.setdefault("exp_prob_uniform", []).append(
-        policy_stats.get("exp_prob_uniform"))
-    
-    metrics_history.setdefault("value_mse", []).append(value_mse)
-    metrics_history.setdefault("value_corr", []).append(value_corr)
+    metrics_history['value_mse'].append(value_mse)
+    metrics_history['value_corr'].append(value_corr)
     
     # build print dict and call the printer
-    print_metrics = {"val_mse": value_mse, "val_corr": value_corr}
+    print_metrics = {"value_mse": value_mse, "value_corr": value_corr}
     print_metrics.update(policy_stats)
     print_validation(epoch, print_metrics)
 
@@ -467,6 +252,10 @@ while epoch <= 0:
     print(f"[time check] last epoch: {e_time}, avg epoch: {avg_epoch},  "
           f"total runtime: {runtime}")
     print()
+    
+model.save(MODEL_DIR + f"{MODEL_NAME}_{epoch}.h5")
+with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
+    pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)
 #%%
 from chessbot.model import make_conv_infer
 import time

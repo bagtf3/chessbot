@@ -40,9 +40,9 @@ class Config(object):
     
     move_limit = 200
     material_diff_cutoff = 10
-    material_diff_cutoff_span = 10
+    material_diff_cutoff_span = 12
 
-    play_vs_sf_prob = 1.0
+    play_vs_sf_prob = -1
     sf_depth = 2
 
     # post hoc server

@@ -7,16 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "conv_embedded_large_test"
+    run_tag = "new_conv_net_run0"
     selfplay_dir =  SP_DIR
-    init_model = MODEL_DIR + "conv_64_token_large_0.h5"
+    init_model = MODEL_DIR + "conv_64_token_12M_10.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 96
+    sims_target = 256
     sims_ceiling = 200
 
     # early stop
@@ -36,11 +36,11 @@ class Config(object):
     # Game stuff
     micro_batch_size = 4
     games_at_once = 256
-    n_training_games = 1000
+    n_training_games = 1500
     
     move_limit = 200
-    material_diff_cutoff = 10
-    material_diff_cutoff_span = 12
+    material_diff_cutoff = 12
+    material_diff_cutoff_span = 20
 
     play_vs_sf_prob = -1
     sf_depth = 2
@@ -60,16 +60,15 @@ class Config(object):
     prior_clip_min = 0.001
 
     # root noise
-    add_root_noise = False
+    add_root_noise = True
     dirichlet_eps = 0.1
-    dirichlet_alpha = 0.1
+    dirichlet_alpha = 0.4
 
     # training
-    training_queue_min = 2048
+    training_queue_min = 3000
     fwd_batch = 1024
 
-    z_blend = 0.8
-    use_z_taper = False
+    y_weights = {'z': 0.1, 'z_taper':0.7, 'vwq':0.2}
     target_loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     draw_weight = 0.2
 

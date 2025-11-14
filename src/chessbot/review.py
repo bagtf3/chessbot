@@ -819,9 +819,41 @@ def make_fake_visits(mv, lms, ratio_best=50):
         return visits
     
     ratio_not_best = 100-ratio_best
-    sup_optimal = max(1, int(ratio_not_best / (len(lms) - 1)))
+    sup_optimal = min(ratio_best-5, max(1, int(ratio_not_best / (len(lms) - 1))))
     visits += [[m, int(sup_optimal)] for m in lms if m != mv]
     return visits
+
+
+def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
+    """
+    cm: list of {'uci': ..., 'visits': ...}
+    Ensure every legal move in lms appears (min 1), set played_mv -> 1,
+    set best_mv -> (old_max + 5), keep others' counts from cm.
+    Return list of [uci, int_visits] sorted desc.
+    """
+    # build dict of existing counts (min 1)
+    d = {}
+    for c in cm:
+        u = c.get('uci')
+        v = int(c.get('visits', 1))
+        if u:
+            d[u] = max(1, v)
+
+    # ensure all legal moves exist with min 1
+    for m in lms:
+        if m not in d:
+            d[m] = 1
+
+    # compute old max
+    old_max = max(d.values()) if d else 1
+
+    # adjust
+    d[played_mv] = 1
+    d[best_mv] = old_max + 5
+
+    # build sorted list
+    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+    return [[u, int(v)] for u, v in items]
 
 
 def make_training_sample(b, v, visits):
@@ -870,28 +902,12 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             # we already have these, dont duplicate
             b.push_uci(mv)
             continue
-        
+
         lms = b.legal_moves()
         # terminals are handled elsewhere
         if not lms:
             break
-        
-        tr = tree_data.get(i, tree_data.get(str(i), {}))
-        cm = tr.get('candidate_moves', [])
-        
-        if cm:
-            visits = [[c['uci'], c['visits']] for c in cm]
-            visits = sorted(visits, key=lambda x: x[1], reverse=True)
-        
-        else:
-            # make up fake visits if we dont have any
-            visits = make_fake_visits(mv, lms, ratio_best=50)
-        
-        # if visits dont look right, skip
-        if sum([v[1] for v in visits]) <= 0:
-            b.push_uci(mv)
-            continue
-            
+
         # find the df row associated to this move
         row = df.query("played_move == @mv")
         if len(row) > 1:
@@ -899,32 +915,38 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         if len(row) == 0:
             row = df.loc[df.move_num == str(i)].query("played_move == @mv")
         if len(row) == 0:
+            b.push_uci(mv)
             continue
-        
+
         # happy path, not a blunder, no action
         if row['delta'].item() < BLUNDER_CP:
             b.push_uci(mv)
             continue
-        
-        # if a blunder, dont use actual visits (theyre wrong)
+
+        # if we are here, the move was a blunder
         best_v = cp_to_value_tanh(row['best_cp'].item())
         best_mv = row['best_move'].item()
-        best_visits = make_fake_visits(best_mv, lms)
+
+        tr = tree_data.get(i, tree_data.get(str(i), {}))
+        cm = tr.get('candidate_moves', [])
+
+        # if a blunder, dont use actual visits (theyre wrong)
+        if cm:
+            best_visits = adjust_visits_from_cm(cm, mv, best_mv, lms)
+        else:
+            best_visits = make_fake_visits(best_mv, lms)
+
+        # sanity check: best_visits must exist and sum to > 0
+        if not best_visits or sum([v[1] for v in best_visits]) <= 0:
+            print("[blunder mining] visits invalid or sum <= 0; skipping example",
+                  "move_idx=", i, "played=", mv, "best=", best_mv)
+            b.push_uci(mv)
+            continue
+
+        # make training sample and append
         ts_best = make_training_sample(b, best_v, best_visits)
         training_data.append(ts_best)
-        
-        # # show the best continuation
-        # bc = b.clone()
-        # pushed = bc.push_uci(best_mv)
-        # lms_cont = bc.legal_moves()
-        # if (not lms_cont) or (not pushed):
-        #     continue
 
-        # cont_val, cont_best = sfe(bc, engine=engine)
-        # cont_visits = make_fake_visits(cont_best, lms_cont)
-        # cont_ts = make_training_sample(bc, cont_val, cont_visits)
-        # training_data.append(cont_ts)
-            
         # push to move and let the loop roll over
         b.push_uci(mv)
 

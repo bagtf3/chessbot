@@ -1,6 +1,6 @@
 from chessbot import MODEL_DIR, SF_LOC
 
-from chessbot.utils import sf_eval, random_init, mirror_move, format_time
+from chessbot.utils import sf_eval, random_init, format_time
 from chessbot.utils import GameGenerator, batch_policy_metrics, print_validation
 
 from chessbot.review import make_fake_visits
@@ -14,10 +14,10 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 
-MODEL_NAME = 'conv_64_token_v3'
+MODEL_NAME = 'conv_64_token_12M'
 
 model, opt, loss_weights, loss_dict = build_conv_64pv(
-    d_model_embed=128, vocab_size=21, filters=256,
+    d_model_embed=128, vocab_size=21, filters=288,
     n_conv=12, proj_dim=96, name=MODEL_NAME
 )
 
@@ -71,7 +71,7 @@ begin = time.time()
 from chessbot.config import Config
 gg = GameGenerator(Config())
 
-while epoch <= 5:
+while epoch < 100:
     for k in sorted(weights_schedule.keys()):
         if epoch < k:
             loss_weights = weights_schedule[k]

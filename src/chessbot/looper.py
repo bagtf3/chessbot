@@ -1,6 +1,6 @@
 import uuid, os, pickle
 import pathlib, json
-import time
+import time, gc
 _now = time.time
 
 import numpy as np
@@ -468,7 +468,7 @@ class GameLooper(object):
                 
                 # add in more games if needed
                 self.fill_active_games()
-                    
+
         # train with whatever we got and final report (> 2000)
         if len(self.training_queue) >= 2000:
             self.trigger_retrain()
@@ -684,7 +684,7 @@ class GameLooper(object):
 
         # Unpack examples, but only accept examples that include 'policy'
         X_list = []
-        P_list = []        # flattened 4096 policy vectors
+        P_list = []        # flattened 4288 policy vectors
         mask_list = []     # derived legal-mask (0/1)
         Z_list = []
         Z_taper_list = []
@@ -702,18 +702,20 @@ class GameLooper(object):
 
         # stack arrays
         X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
-        P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4096)
-        M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4096)
+        P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
+        M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4288)
         Z = np.asarray(Z_list, dtype=np.float32)
         Vwq = np.asarray(Vwq_list, dtype=np.float32)
         Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)
         is_add = np.asarray(is_add_flag[:len(X_list)], dtype=np.bool_)
 
         # optionally blend (possibly tapered) outcome with visit-weighted Q
-        use_taper = self.config.use_z_taper
-        alpha = self.config.z_blend
-        Zstar = Z_taper_arr if use_taper else Z
-        Y_value = np.clip((1.0-alpha)*Vwq + alpha*Zstar, -1.0, 1.0)
+        wz = self.config.y_weights.get("z", 0.25)
+        wz_taper = self.config.y_weights.get("z_taper", 0.5)
+        w_vwq = self.config.y_weights.get("vwq", 0.25)
+        Y_value = wz*z + wz_taper*Z_taper_arr + w_vwq*Vwq
+        Y_value = np.clip(Y_value, -1.0, 1.0)
+
         # ensure additional samples are not blended
         if is_add.any():
             Y_value[is_add] = Vwq[is_add]
@@ -789,7 +791,8 @@ class GameLooper(object):
         self.training_queue = []
         self.n_retrains += 1
         self.clear_cache = True
-
+        gc.collect()
+    
     def maybe_log_results(self, every_sec=30.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:

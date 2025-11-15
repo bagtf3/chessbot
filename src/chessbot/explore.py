@@ -237,8 +237,11 @@ pprint(trend_check(df_trim, window=WINDOW))
 
 #%%
 cols = ['overall_best_move_rate', 'overall_cpl', 'overall_top3_rate']
-before = df_trim.iloc[:-WINDOW, ].groupby(['scenario'])[cols].mean()
-after = df_trim.iloc[WINDOW:, ].groupby(['scenario'])[cols].mean()
+b = df_trim.iloc[:-WINDOW, ]
+before = b.groupby(['scenario'])[cols].mean()
+
+a = df_trim.iloc[-WINDOW:, ]
+after = a.groupby(['scenario'])[cols].mean()
 print(f"Breakdown by scenario last {WINDOW} games")
 print(after.sort_values("overall_cpl").round(3))
 
@@ -247,6 +250,8 @@ print()
 print(f"Delta by scenario last {WINDOW} games")
 print(delta)
 print()
+
+
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -318,29 +323,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-pre_opened = [g for g in scored if g['scenario'] == 'random_middle_game']
+pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
 gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
 
-df_trim
-#%%
-sqs = [48, 49, 50, 51, 52, 53, 54, 55]
-
-[s % 8 for s in sqs]
-
-
-
-from_sq = 49
-from_file = 49 % 8
-
-to_sq = 57
-to_file = to_sq %8
-from_file + to_file*8
-
-c = 0
-for from_file in range(8):
-    for to_file in range(8):
-        c += 1
-        print(from_file + to_file*8)
-
-from_file + 8*to_file + 64 * underpromo_type

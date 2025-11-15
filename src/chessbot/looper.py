@@ -223,14 +223,14 @@ class ChessGame(object):
     
     def append_flat_policy_example(self, ucis, pi, vwq, turn):
         """
-        Snapshot inputs and a flat 4096-length policy vector for training.
+        Snapshot inputs and a flat 4288-length policy vector for training.
         - ucis: list[str] legal moves (same order as probs)
         - pi:  list/array of probs (sum ~= 1)
         - vwq: scalar value target (white-POV)
         """
         
         # get indices from C++
-        indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4095)
+        indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
         
         # accumulate probs into flattened policy
@@ -503,7 +503,7 @@ class GameLooper(object):
 
         # stack to batch
         boards_np = np.stack(boards, axis=0)   # (B,8,8,29)
-        legals_np = np.stack(legals, axis=0)   # (B,4096)
+        legals_np = np.stack(legals, axis=0)   # (B,4288)
 
         # pad up to fwd_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
@@ -646,7 +646,7 @@ class GameLooper(object):
     def trigger_retrain(self):
         """
         Build training tensors from self.training_queue and fit.
-        Supports new flattened 'policy' head (4096) stored in heads["policy"].
+        Supports new flattened 'policy' head (4288) stored in heads["policy"].
         If any legacy factorized examples are present (heads without 'policy'),
         they are skipped and a warning is printed. This keeps logic simple and
         avoids brittle reconstruction of legal masks from factorized heads.
@@ -682,7 +682,7 @@ class GameLooper(object):
         combined = list(self.training_queue) + list(additional)
         n_main = len(self.training_queue)
 
-        # Unpack examples, but only accept examples that include 'policy'
+        # Unpack examples
         X_list = []
         P_list = []        # flattened 4288 policy vectors
         mask_list = []     # derived legal-mask (0/1)
@@ -694,7 +694,7 @@ class GameLooper(object):
         for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
             X_list.append(x)
             P_list.append(policy)
-            mask_list.append((policy > 0).astype(np.int32))
+            mask_list.append(mask)
             Z_list.append(z_stm)
             Vwq_list.append(vwq)
             Z_taper_list.append(z_tapered)
@@ -703,46 +703,55 @@ class GameLooper(object):
         # stack arrays
         X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
         P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
-        M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4288)
+        M = np.stack(mask_list, axis=0).astype(np.int16)     # (N, 4288)
         Z = np.asarray(Z_list, dtype=np.float32)
         Vwq = np.asarray(Vwq_list, dtype=np.float32)
         Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)
-        is_add = np.asarray(is_add_flag[:len(X_list)], dtype=np.bool_)
+        is_add = np.asarray(is_add_flag, dtype=np.bool_)
 
         # optionally blend (possibly tapered) outcome with visit-weighted Q
-        wz = self.config.y_weights.get("z", 0.25)
-        wz_taper = self.config.y_weights.get("z_taper", 0.5)
-        w_vwq = self.config.y_weights.get("vwq", 0.25)
-        Y_value = wz*z + wz_taper*Z_taper_arr + w_vwq*Vwq
-        Y_value = np.clip(Y_value, -1.0, 1.0)
+        wz = self.config.target_y_weights.get("z", 0.25)
+        wz_taper = self.config.target_y_weights.get("z_taper", 0.5)
+        w_vwq = self.config.target_y_weights.get("vwq", 0.25)
+        Y_value = wz*Z + wz_taper*Z_taper_arr + w_vwq*Vwq
 
-        # ensure additional samples are not blended
+        # define a few masks here then ensure additional
+        # samples are not blended or downweighted
+        draw_mask = Z == 0
+        played_by_winner = Z == 1
         if is_add.any():
             Y_value[is_add] = Vwq[is_add]
+            draw_mask[is_add] = False
+            played_by_winner[is_add] = True
+        
+        Y_value = np.clip(Y_value, -1.0, 1.0)
 
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
         lw = self.config.target_loss_weights
-
-        # assemble final Y dict and sample_weight mapping for Keras fit
-        Y = {"value_out": Y_value.astype(np.float32), "policy_logits": P}
-        s_wts = {k: weights*lw.get(k, 1.0) for k in Y.keys()}
-
+        
         # downweight draws so value head doesnt collapse
-        v_wts = s_wts['value_out']
+        v_wts = lw['value_out']*weights
         wts_before = v_wts.sum()
-        draw_mask = Z == 0
         v_wts[draw_mask] *= max(self.config.draw_weight, 0.001)
         wts_after = v_wts.sum()
 
+        # redistribute to not change overall loss weight
         wt_lost = wts_before - wts_after
         n_non_draws = (~draw_mask).sum()
         if wt_lost > 0 and n_non_draws > 0:
             v_wts[~draw_mask] += wt_lost/n_non_draws
         
-        s_wts['value_out'] = v_wts
+        # policy weights vary depend on outcome
+        p_wts_win = lw['policy_winner']*weights
+        p_wts_lose = lw['policy_loser']*weights
+        p_wts = np.where(played_by_winner, p_wts_win, p_wts_lose)
+        
+        # assemble final Y dict and sample_weight mapping for Keras fit
+        Y = {"value_out": Y_value, "policy_logits": P}
+        s_wts = {'value_out': v_wts, "policy_logits": p_wts}
 
-        # evaluation and logging (reuse existing helpers) - unchanged
+        # evaluation and logging
         plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
         epoch = self.n_retrains
         eval_df = cbu.score_game_data(self.model, X, M, Y, epoch, save_path=plt_file)
@@ -770,7 +779,7 @@ class GameLooper(object):
             rows.append((name, start, end, delta, mark))
         
         name_w = max(len(r[0]) for r in rows)
-        num_w = 8   # width for numbers (including decimal point)
+        num_w = 8   # width for numbers
         fmt = (f"[epoch {epoch:4d}] [model fit]  "
             f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
             f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
@@ -787,7 +796,7 @@ class GameLooper(object):
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
 
-        # clear training queue (we consumed the in-memory queue)
+        # clear training queue
         self.training_queue = []
         self.n_retrains += 1
         self.clear_cache = True
@@ -829,7 +838,7 @@ class GameLooper(object):
         cbu.print_recent_summary(recent, window=window)
         print(
             f"Length of training queue: {len(self.training_queue)} ",
-            f"Number of retrains: {self.n_retrains}\n"
+            f"Current retrain number: {self.n_retrains}\n"
         )
         return True
 

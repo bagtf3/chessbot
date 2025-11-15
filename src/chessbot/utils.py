@@ -405,7 +405,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         else:
             epoch = len(df)
 
-    hide_first = 2
+    hide_first = 10
     if epoch < 12:
         return
 
@@ -469,13 +469,12 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
     ax.set_title("value corr")
     ax.legend()
-
     plt.tight_layout()
 
     # Second figure (1x3)
     fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
 
-    # (0) left: top1 / top3 / top5 on same plot (raw, no MA)
+    # (0) left: top1 / top3 / top5 - show only MA
     ax = axs[0]
     t1 = col_vals("top1_mass")
     t3 = col_vals("top3_mass")
@@ -485,13 +484,17 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
         ax.set_axis_off()
     else:
+        l1, l3, l5 = f"top1 MA{ma_window}", f"top3 MA{ma_window}", f"top5 MA{ma_window}"
         if len(t1):
-            ax.plot(np.arange(len(t1)), t1, label="top1", linewidth=1)
+            ma_t1 = moving_average_pd(np.array(t1), window=ma_window)
+            ax.plot(np.arange(len(ma_t1)), ma_t1, label=l1, linewidth=2)
         if len(t3):
-            ax.plot(np.arange(len(t3)), t3, label="top3", linewidth=1)
+            ma_t3 = moving_average_pd(np.array(t3), window=ma_window)
+            ax.plot(np.arange(len(ma_t3)), ma_t3, label=l3, linewidth=2)
         if len(t5):
-            ax.plot(np.arange(len(t5)), t5, label="top5", linewidth=1)
-        ax.set_title("mean top-k mass (no MA)")
+            ma_t5 = moving_average_pd(np.array(t5), window=ma_window)
+            ax.plot(np.arange(len(ma_t5)), ma_t5, label=l5, linewidth=2)
+        ax.set_title("mean top-k mass (MA shown)")
         ax.legend(fontsize=8)
 
     # (1) middle: mass_on_legal (raw + MA)
@@ -508,7 +511,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         ax.set_title("mass_on_legal")
         ax.legend(fontsize=8)
 
-    # (2) right: avg_top_prob (avg_max_prob) AND top1_exact on same axes
+    # (2) right: avg_top_prob & top1_exact
     ax = axs[2]
     avg_tp = col_vals("avg_top_prob")
     t1_exact = col_vals("top1_exact")
@@ -517,15 +520,23 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         ax.text(0.5, 0.5, "missing: avg_top_prob / top1_exact", ha="center", va="center")
         ax.set_axis_off()
     else:
+        plotted = False
         if len(avg_tp):
-            x = np.arange(len(avg_tp))
-            ax.plot(x, avg_tp, label="avg_max_prob", alpha=0.7, lw=1)
+            ma_avg = moving_average_pd(np.array(avg_tp), window=ma_window)
+            l = f"avg_max_prob MA{ma_window}"
+            ax.plot(np.arange(len(ma_avg)), ma_avg, label=l, alpha=0.9, lw=2)
+            plotted = True
         if len(t1_exact):
-            x2 = np.arange(len(t1_exact))
-            ax.plot(x2, t1_exact, label="top1_exact", alpha=0.7, lw=1)
-        ax.set_title("avg_max_prob & top1_exact")
-        ax.legend(fontsize=8)
-
+            ma_t1ex = moving_average_pd(np.array(t1_exact), window=ma_window)
+            l = f"top1_exact MA{ma_window}"
+            ax.plot(np.arange(len(ma_t1ex)), ma_t1ex, label=l, alpha=0.9, lw=2)
+            plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, "no data after smoothing", ha="center", va="center")
+            ax.set_axis_off()
+        else:
+            ax.set_title("avg_max_prob & top1_exact (MA shown)")
+            ax.legend(fontsize=8)
     plt.tight_layout()
 
     # save (primary and _extra)
@@ -552,7 +563,7 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     Args:
         intra_training_summaries: {step: {"summary": {...}, "games": [...]}, ...}
         show: if True, plt.show() the figures (ignored if save_path is given)
-        save_path: if set, save figures as f"{save_path}_cpl.png" and f"{save_path}_bmr.png"
+        save_path: if set, save figures as f"{save_path}_cpl.png", f"{save_path}_bmr.png"
 
     Prints:
         Latest step's games, CPL (overall/white/black), and best-move rates.

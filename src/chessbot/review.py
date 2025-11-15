@@ -25,7 +25,7 @@ from chessbot.utils import (
 
 POLL_INTERVAL = 20
 
-BLUNDER_CP = 80
+BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
@@ -864,7 +864,7 @@ def make_training_sample(b, v, visits):
     pi = (counts / s) if s > 0.0 else np.zeros_like(counts)
     
     # get indices from C++
-    indices = b.moves_to_indices(ucis)  # list of ints (0..4095)
+    indices = b.moves_to_indices(ucis)  # list of ints (0..4288)
     policy = np.zeros(64 * 67, dtype=np.float32)
 
     # accumulate probs into flattened policy

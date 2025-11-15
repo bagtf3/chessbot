@@ -409,7 +409,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     if epoch < 12:
         return
 
-    ma_window = max(3, int(epoch * 0.2))
+    ma_window = min(30, max(3, int(epoch * 0.2)))
     if ma_window % 2 == 0:
         ma_window += 1
 

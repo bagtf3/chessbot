@@ -10,14 +10,13 @@ class Config(object):
     run_tag = "new_conv_net_run0"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run0/new_conv_net_run0_model.h5"
-    #init_model = MODEL_DIR + "conv_64_token_12M_10.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 540
+    sims_target = 600
     sims_ceiling = 200
 
     # early stop
@@ -62,15 +61,15 @@ class Config(object):
 
     # root noise
     add_root_noise = True
-    dirichlet_eps = 0.075
+    dirichlet_eps = 0.05
     dirichlet_alpha = 0.3
 
     # training
-    training_queue_min = 3072
+    training_queue_min = 4096
     fwd_batch = 1024
 
-    target_y_weights = {'z': 0.2, 'z_taper':0.6, 'vwq':0.2}
-    target_loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
+    target_y_weights = {'z': 0.25, 'z_taper':0.55, 'vwq':0.2}
+    loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
     draw_weight = 0.2
 
     def to_dict(self):

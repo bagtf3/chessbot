@@ -325,5 +325,7 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
-gv = GameViewer(pre_opened[-2]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(pre_opened[-16]['json_file'], sf_df=d); gv.replay()
+
+
 

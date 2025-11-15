@@ -728,7 +728,7 @@ class GameLooper(object):
 
         # initial per-sample weights (ones)
         weights = np.ones_like(Y_value, dtype=np.float32)
-        lw = self.config.target_loss_weights
+        lw = self.config.loss_weights
         
         # downweight draws so value head doesnt collapse
         v_wts = lw['value_out']*weights
@@ -747,7 +747,7 @@ class GameLooper(object):
         p_wts_lose = lw['policy_loser']*weights
         p_wts = np.where(played_by_winner, p_wts_win, p_wts_lose)
         
-        # assemble final Y dict and sample_weight mapping for Keras fit
+        # assemble final Y dict and sample_weight mapping for TF fit
         Y = {"value_out": Y_value, "policy_logits": P}
         s_wts = {'value_out': v_wts, "policy_logits": p_wts}
 

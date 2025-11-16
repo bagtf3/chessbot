@@ -5,6 +5,7 @@ _now = time.time
 
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 
 import matplotlib
 matplotlib.use("Agg")
@@ -317,6 +318,7 @@ class GameLooper(object):
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
         self._last_stats_log = 0.0
+        self.prediction_times = []
 
         self.moves_played = 0
         self.sims_done_total = 0
@@ -407,22 +409,31 @@ class GameLooper(object):
                             continue
 
                     # otherwise, collect up to micro_batch_size leaves for this game
-                    # new, terminal, cached
-                    nn, nt, nc = game.tree.collect_many_leaves(mbs, max_fastpath)
+                    # CollectResults object from C++
+                    res = game.tree.collect_many_leaves(mbs, max_fastpath)
+
+                    # previous tuple mapping was (count_new, count_terminal, count_cached)
+                    nn = res.count_new
+                    nt = res.count_terminal
+                    nc = res.count_cached
+                    pl = res.total_priorless
+                    pu = res.total_puct
+
+                    # new + cached
                     lps.tick(nn + nc)
 
-                    # update sim count here
-                    game.tree.sims_completed_this_move += nn + nt + nc
+                    # update sim count
+                    game.tree.sims_completed_this_move += (nn + nt + nc)
 
                     if nn:
                         preds_batch += game.tree.pending_encoded_64_tokens()
 
                     fastpaths = nt + nc
-                    fast_stop, collect_stop = 0, 1
+                    f_stop, c_stop = 0, 1
                     if nn < mbs:
-                        fast_stop, collect_stop = 1, 0
-    
-                    counts.append([nn, fastpaths, nt, nc, fast_stop, collect_stop])
+                        f_stop, c_stop = 1, 0
+
+                    counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
                 
                 # run predictions if we have any. sends results to c++ raw cache
                 if preds_batch:
@@ -509,6 +520,7 @@ class GameLooper(object):
         # (helps XLA/static-trace shapes)
         target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
+        start = _now()
         if B < target_bs:
             # next power of 2 >= N
             new_target = 1 << ((B - 1).bit_length())
@@ -527,6 +539,8 @@ class GameLooper(object):
         else:
             probs_np, vals_np = self.infer((boards_np, legals_np))
 
+        stop = _now()
+        self.prediction_times.append(stop-start)
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
         for i, k in enumerate(keys):
@@ -778,6 +792,7 @@ class GameLooper(object):
             mark = "*" if delta < 0 else "+"
             rows.append((name, start, end, delta, mark))
         
+        del history
         name_w = max(len(r[0]) for r in rows)
         num_w = 8   # width for numbers
         fmt = (f"[epoch {epoch:4d}] [model fit]  "
@@ -787,20 +802,24 @@ class GameLooper(object):
         for name, start, end, delta, mark in rows:
             print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
 
-        self.model.save(self.config.model_path)
+        # make sure memory is clean to prevent slowdowns
+        cfg = self.config
+        self.model.save(cfg.model_path)
+
+        del self.infer
+        gc.collect()
 
         # update the fwd helper and clear queues/caches
-        cfg = self.config
+        #self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
-
+        
         # clear training queue
         self.training_queue = []
         self.n_retrains += 1
         self.clear_cache = True
-        gc.collect()
     
     def maybe_log_results(self, every_sec=30.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
@@ -848,12 +867,14 @@ class GameLooper(object):
 
         # aggregate
         n_groups = len(counts)
-        s_collected  = sum([r[0] for r in counts])
-        s_fast       = sum([r[1] for r in counts])
-        s_terminals  = sum([r[2] for r in counts])
-        s_cached     = sum([r[3] for r in counts])
-        s_fast_stops = sum([r[4] for r in counts])
+        s_collected     = sum([r[0] for r in counts])
+        s_fast          = sum([r[1] for r in counts])
+        s_terminals     = sum([r[2] for r in counts])
+        s_cached        = sum([r[3] for r in counts])
+        s_fast_stops    = sum([r[4] for r in counts])
         s_collect_stops = sum([r[5] for r in counts])
+        s_priorless     = sum([r[6] for r in counts])
+        s_puct          = sum([r[7] for r in counts])
 
         avg_new = s_collected / n_groups
 
@@ -867,40 +888,58 @@ class GameLooper(object):
 
         print("-"*72)
         left1 = f"[loop stats] groups={n_groups}  mbs={mbs}"
-        right1 = f"new: collected={s_collected}, avg={avg_new:.2f}"
+        right1 = f"new: collected={s_collected} avg={avg_new:.2f}"
 
         left2 = f"[stop stats] fastpath_breaks={s_fast_stops} ({fast_stops_pct:.2f}%)"
         right2 = f"collect_breaks={s_collect_stops} ({collect_stops_pct:.2f}%)"
 
-        left3 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
-        right3 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
+        # preds / active / finished runtime pre-compute
+        apl = np.mean(lpb) if lpb else 0.0
+        fwd_target = self.config.fwd_batch
+        fill_pct = 100.0 * apl / max(1.0, fwd_target)
+
+        pred_wait = np.mean(self.prediction_times) if self.prediction_times else 0.0
+        self.prediction_times.clear()
+        preds_per_sec = apl / pred_wait if pred_wait > 0 else 0.0
+
+        left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
+        right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
+
+        left4 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
+        right4 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
+
+        with_priors = total_overall - s_priorless
+        puct_avg = s_puct / with_priors if with_priors else 0.0
+        priorless_pct = 100.0 * s_priorless / max(1, total_overall)
+        left5 = f"[collect stats] priorless={s_priorless} ({priorless_pct:.2f}%)"
+        right5 = f"puct={int(s_puct)}  puct_per_leaf={puct_avg:.1f}"
+
+        sims = self.sims_done_total
+        moves = self.moves_played
+        sims_per_move = sims / moves if moves > 0 else 0.0
+
+        n_active = len(self.active_games)
+        avg_ply = np.mean([g.plies for g in self.active_games]) if n_active else 0.0
+        left6 = f"[active games]  n={n_active} avg ply={avg_ply:.2f}"
+        right6 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
         print(f"{left2:<{col_width}} | {right2}")
         print(f"{left3:<{col_width}} | {right3}")
+        print(f"{left4:<{col_width}} | {right4}")
+        print(f"{left5:<{col_width}} | {right5}")
+        print(f"{left6:<{col_width}} | {right6}")
 
-        if lpb:
-            print(f"Avg len of preds_batch {np.mean(lpb):.3f}")
-
-        avg_ply = np.mean([g.plies for g in self.active_games])
-        print(f"Avg ply of active_games {avg_ply:.3f}")
-        print(f"Number of active_games {len(self.active_games)}")
-
-        # avg duration of last 50 completed games
+        # show game duration if its available
         last50 = self.recent_games[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
+        avg_runtime = None
         if sum(durations) > 0:
-            avg_len_str = cbu.format_time(np.mean(durations))
-            print(f"Avg game runtime (last {len(last50)}) {avg_len_str}")
-        
-        sims = self.sims_done_total
-        moves = self.moves_played
-        sims_per_move = sims/moves if moves > 0 else 0
-        if sims_per_move:
-            print(f"Avg sims per move {sims_per_move:.3f}")
+            avg_runtime = cbu.format_time(np.mean(durations))
+            if avg_runtime:
+                print(f"[finished games] avg runtime (last 50) : {avg_runtime}")
         print("-"*72)
-
 
 def init_selfplay():
     # file structure first

@@ -326,6 +326,19 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
 
 gv = GameViewer(pre_opened[-16]['json_file'], sf_df=d); gv.replay()
+#%%
+from chessbot.config import Config
+from pyfastchess import MCTSTree, Board
+from chessbot.mcts_utils import MCTSTree
+
+b = Board()
+cfg = Config()
+
+tree = MCTSTree(b, cfg)
+res = tree.collect_many_leaves(256, 1)
+print(res.total_priorless)
+print(res.total_puct)
+
 
 
 

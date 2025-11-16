@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "new_conv_net_run0"
+    run_tag = "pyfastchess_test"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run0/new_conv_net_run0_model.h5"
 
@@ -34,8 +34,8 @@ class Config(object):
     q_override_top_k = 2
 
     # Game stuff
-    micro_batch_size = 4
-    games_at_once = 256
+    micro_batch_size = 8
+    games_at_once = 128
     n_training_games = 1000
     
     move_limit = 200
@@ -65,10 +65,10 @@ class Config(object):
     dirichlet_alpha = 0.3
 
     # training
-    training_queue_min = 4096
+    training_queue_min = 2048
     fwd_batch = 1024
 
-    target_y_weights = {'z': 0.25, 'z_taper':0.55, 'vwq':0.2}
+    target_y_weights = {'z': 0.3, 'z_taper':0.5, 'vwq':0.2}
     loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
     draw_weight = 0.2
 

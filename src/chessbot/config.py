@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "pyfastchess_test"
+    run_tag = "new_conv_selfplay_run1"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run0/new_conv_net_run0_model.h5"
 
@@ -16,13 +16,13 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 600
+    sims_target = 800
     sims_ceiling = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 24
+    es_check_every = 100
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
@@ -42,8 +42,8 @@ class Config(object):
     material_diff_cutoff = 12
     material_diff_cutoff_span = 20
 
-    play_vs_sf_prob = -1
-    sf_depth = 2
+    play_vs_sf_prob = 0.15
+    sf_depth = 12
 
     # post hoc server
     run_post_hoc = True
@@ -61,15 +61,15 @@ class Config(object):
 
     # root noise
     add_root_noise = True
-    dirichlet_eps = 0.05
+    dirichlet_eps = 0.07
     dirichlet_alpha = 0.3
 
     # training
-    training_queue_min = 2048
+    training_queue_min = 4096
     fwd_batch = 1024
 
-    target_y_weights = {'z': 0.3, 'z_taper':0.5, 'vwq':0.2}
-    loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
+    target_y_weights = {'z': 0.4, 'z_taper':0.4, 'vwq':0.2}
+    loss_weights = {"policy_winner": 1.75, "policy_loser": 1.25, "value_out": 1.5}
     draw_weight = 0.2
 
     def to_dict(self):

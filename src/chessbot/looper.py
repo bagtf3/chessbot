@@ -815,7 +815,7 @@ class GameLooper(object):
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
-        
+
         # clear training queue
         self.training_queue = []
         self.n_retrains += 1
@@ -905,22 +905,22 @@ class GameLooper(object):
         left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
 
-        left4 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
-        right4 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
-
         with_priors = total_overall - s_priorless
         puct_avg = s_puct / with_priors if with_priors else 0.0
         priorless_pct = 100.0 * s_priorless / max(1, total_overall)
-        left5 = f"[collect stats] priorless={s_priorless} ({priorless_pct:.2f}%)"
-        right5 = f"puct={int(s_puct)}  puct_per_leaf={puct_avg:.1f}"
+        left4 = f"[leaf stats] priorless={s_priorless} ({priorless_pct:.2f}%)"
+        right4 = f"puct={int(s_puct)}  puct_per_leaf={puct_avg:.1f}"
+
+        left5 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
+        right5 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
 
         sims = self.sims_done_total
         moves = self.moves_played
         sims_per_move = sims / moves if moves > 0 else 0.0
-
+        
         n_active = len(self.active_games)
         avg_ply = np.mean([g.plies for g in self.active_games]) if n_active else 0.0
-        left6 = f"[active games]  n={n_active} avg ply={avg_ply:.2f}"
+        left6 = f"[game stats] n={n_active} avg ply={avg_ply:.2f}"
         right6 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40
@@ -938,7 +938,7 @@ class GameLooper(object):
         if sum(durations) > 0:
             avg_runtime = cbu.format_time(np.mean(durations))
             if avg_runtime:
-                print(f"[finished games] avg runtime (last 50) : {avg_runtime}")
+                print(f"[game stats] avg runtime (last 50) : {avg_runtime}")
         print("-"*72)
 
 def init_selfplay():

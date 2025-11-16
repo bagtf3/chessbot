@@ -31,7 +31,7 @@ ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 11
+DEPTH = 12
 EQUIV_RANGE = 12
 
 # stops the post hoc server

@@ -1,6 +1,8 @@
 import os
 import pandas as pd
 import numpy as np
+import matplotlib
+
 import matplotlib.pyplot as plt
 plt.ion()
 
@@ -194,7 +196,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/pyfastchess_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run1"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -223,6 +225,12 @@ if 'in_top3' not in df_all.columns:
     
 df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
 t3r = df_all.groupby("game_id")["in_top3"].mean()
+
+
+df_all['blunder300'] = df_all.delta > 300
+b300 = df_all.groupby("game_id")['blunder300'].mean()
+df_all['blunder100'] = df_all.delta > 100
+b100 = df_all.groupby("game_id")['blunder100'].mean()
 
 df_trim = df_means.copy()
 df_trim['overall_best_move_rate'] = df_trim.game_id.map(bmr)
@@ -323,11 +331,29 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-pre_opened = [g for g in scored if g['scenario'] == 'pre_opened']
+pre_opened = [g for g in scored if g['scenario'] == 'random_init']
 pre_opened = [g for g in pre_opened if g['beat_sf']]
 gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
-#%%
 
+#%%
+# early run stats
+# [speed stats] mps=8.7  lps=3584.4  gph=196.45
+
+# [loop stats] groups=21597  mbs=4         | new: collected=86388 avg=4.00
+# [stop stats] fastpath_breaks=0 (0.00%)   | collect_breaks=21597 (100.00%)
+# [pred stats] fill=511.2/512 (99.8%)      | wait=0.060s preds/s=8555.3
+# [leaf stats] priorless=4894 (4.49%)      | puct=14469839  puct_per_leaf=138.9
+# [cache hits] cached=21459 (19.677%)      | terminals=1207 (1.107%)
+# [game stats] n=128 avg ply=4.98          | sims per move=761.95
+
+# [TIME CHECK] avg sf_move   0.0443
+# [TIME CHECK] avg tree_move 0.0091
+# [TIME CHECK] avg finalize  0.0080
+
+# a few logs later
+# [TIME CHECK] avg sf_move   0.0398
+# [TIME CHECK] avg tree_move 0.0120
+# [TIME CHECK] avg finalize  0.0274
 
 
 

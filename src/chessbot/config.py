@@ -7,22 +7,22 @@ class Config(object):
     """
 
     # files
-    run_tag = "new_conv_selfplay_run1"
+    run_tag = "new_conv_net_run1"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "new_conv_net_run0/new_conv_net_run0_model.h5"
+    init_model = SP_DIR + "new_conv_net_run1/new_conv_net_run1_model.h5"
 
     # MCTS
     c_puct = 2.0
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 800
+    sims_target = 960
     sims_ceiling = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 100
+    es_check_every = 60
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
@@ -34,15 +34,15 @@ class Config(object):
     q_override_top_k = 2
 
     # Game stuff
-    micro_batch_size = 8
-    games_at_once = 128
-    n_training_games = 1000
+    micro_batch_size = 4
+    games_at_once = 256
+    n_training_games = 500
     
     move_limit = 200
-    material_diff_cutoff = 12
-    material_diff_cutoff_span = 20
+    material_diff_cutoff = 25
+    material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 0.15
+    play_vs_sf_prob = 0.25
     sf_depth = 12
 
     # post hoc server
@@ -68,7 +68,7 @@ class Config(object):
     training_queue_min = 4096
     fwd_batch = 1024
 
-    target_y_weights = {'z': 0.4, 'z_taper':0.4, 'vwq':0.2}
+    target_y_weights = {'z': 0.5, 'z_taper':0.25, 'vwq':0.25}
     loss_weights = {"policy_winner": 1.75, "policy_loser": 1.25, "value_out": 1.5}
     draw_weight = 0.2
 

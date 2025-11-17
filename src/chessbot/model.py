@@ -922,12 +922,6 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
         value_f = tf.cast(value, tf.float32)
         return probs_final, value_f
 
-    # warm up traces for common batch sizes
-    if max_bs is not None:
-        for B in (max_bs, max_bs):
-            _ = graph(tf.zeros([B, 64], tf.int32),
-                    tf.zeros([B, 4288], tf.int32))
-
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):
             raise ValueError("pass (enc_np, legal_np) tuple")

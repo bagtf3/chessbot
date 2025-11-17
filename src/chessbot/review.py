@@ -25,7 +25,7 @@ from chessbot.utils import (
 
 POLL_INTERVAL = 20
 
-BLUNDER_CP = 60
+BLUNDER_CP = 100
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
@@ -1053,15 +1053,14 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                 # run analysis in-memory (do NOT persist per-game here)
                 with open(json_path, "r", encoding="utf-8") as gf:
                     game_data = json.load(gf)
-
+                
                 analysis_out = analyze_with_sf_core(game_data, eng=eng)
                 analysis_out["game_id"] = game_data.get("game_id")
                 analysis_out["ts"] = game_data.get("ts")
 
                 # accumulate for bundled saving later
                 analyzed_batch.append(analysis_out)
-
-                # create training tuples for this game (unchanged)
+                # create training tuples for this game
                 if bonus_data:
                     samples = mine_additional_training_data(
                         analysis_out, game_data, engine=eng

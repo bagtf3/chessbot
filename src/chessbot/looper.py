@@ -51,7 +51,7 @@ class ChessGame(object):
         self.sf_eval = None
     
     def turn(self, return_bool=True):
-        stm = self.tree.root().board.side_to_move()
+        stm = self.board.side_to_move()
         return stm == 'w' if return_bool else stm
     
     def is_stockfish_turn(self):
@@ -59,7 +59,7 @@ class ChessGame(object):
     
     def get_stockfish_move(self, eng):
         val_sf, best_move = cbu.sf_eval(
-            self.tree.root().board, score_fn=score_to_value_stm_pov,
+            self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, engine=eng
         )
 
@@ -160,7 +160,7 @@ class ChessGame(object):
         use_tree_visits = False
         visit_map = None
 
-        if rows and total_visits >= 20:
+        if rows and total_visits >= 100:
             # map uci -> visits for quick lookup
             visit_map = {u: n for u, n in rows}
             most_visited_uci, max_visits = rows[0]
@@ -174,7 +174,7 @@ class ChessGame(object):
             elif sf_visits >= 0.5 * max_visits:
                 use_tree_visits = True
                 # make SF strictly first by setting its visits > max_visits
-                visit_map[mv] = max_visits + 1
+                visit_map[mv] = max_visits + 10
 
         if use_tree_visits and visit_map is not None:
             visits = [max(1, visit_map.get(u, 1.0)) for u in legal]
@@ -231,7 +231,7 @@ class ChessGame(object):
         """
         
         # get indices from C++
-        indices = self.tree.root().board.moves_to_indices(ucis)  # list of int (0..4288)
+        indices = self.board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
         
         # accumulate probs into flattened policy
@@ -370,6 +370,9 @@ class GameLooper(object):
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
+        sf_move, tree_move, finalize = [], [], []
+        collect_list, collect_agg = [], []
+        pending_list, pending_agg = [], []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2, "Hash": 256})
             while self.games_finished < cfg.n_training_games:
@@ -381,11 +384,17 @@ class GameLooper(object):
                 for game in self.active_games:
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
+                        start = _now()
                         sf_terminal = game.make_move_with_stockfish(eng)
+                        stop = _now()
+                        sf_move.append(stop-start)
                         mps.tick(1)
                             
                         if sf_terminal:
+                            start = _now()
                             self.finalize_game_data(game)
+                            stop = _now()
+                            finalize.append(stop-start)
                             self.maybe_log_results()
                             finished.append(game.game_id)
                             # pass until the next turn
@@ -394,12 +403,18 @@ class GameLooper(object):
                     # if this game has reached its local sim budget, make the move
                     if game.tree.stop_simulating():
                         # bot plays from tree
+                        start = _now()
                         mcts_terminal = game.make_move_from_tree()
+                        stop = _now()
+                        tree_move.append(stop-start)
                         mps.tick(1)
                         
                         # terminal after bot move?
                         if mcts_terminal:
+                            start = _now()
                             self.finalize_game_data(game)
+                            stop = _now()
+                            finalize.append(stop-start)
                             self.maybe_log_results()
                             finished.append(game.game_id)
                             continue
@@ -410,8 +425,10 @@ class GameLooper(object):
 
                     # otherwise, collect up to micro_batch_size leaves for this game
                     # CollectResults object from C++
+                    start = _now()
                     res = game.tree.collect_many_leaves(mbs, max_fastpath)
-
+                    stop = _now()
+                    collect_agg.append(stop-start)
                     # previous tuple mapping was (count_new, count_terminal, count_cached)
                     nn = res.count_new
                     nt = res.count_terminal
@@ -426,7 +443,10 @@ class GameLooper(object):
                     game.tree.sims_completed_this_move += (nn + nt + nc)
 
                     if nn:
+                        start = _now()
                         preds_batch += game.tree.pending_encoded_64_tokens()
+                        stop = _now()
+                        pending_agg.append(stop-start)
 
                     fastpaths = nt + nc
                     f_stop, c_stop = 0, 1
@@ -436,6 +456,14 @@ class GameLooper(object):
                     counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
                 
                 # run predictions if we have any. sends results to c++ raw cache
+                if collect_agg:
+                    collect_list.append(np.sum(collect_agg))
+                    collect_agg.clear()
+
+                if pending_agg:
+                    pending_list.append(np.sum(pending_agg))
+                    pending_agg.clear()
+
                 if preds_batch:
                     self.format_and_predict(preds_batch)
                     lpb.append(len(preds_batch))
@@ -444,6 +472,22 @@ class GameLooper(object):
                     self.log_loop_stats(counts, mbs, lpb)
                     counts = []
                     lpb = []
+                    if sf_move:
+                        print(f"[TIME CHECK] avg sf_move    {np.mean(sf_move):.4f}")
+                        sf_move.clear()
+                    if tree_move:
+                        print(f"[TIME CHECK] avg tree_move  {np.mean(tree_move):.4f}")
+                        tree_move.clear()
+                    if finalize:
+                        print(f"[TIME CHECK] avg finalize   {np.mean(finalize):.4f}")
+                        print(f"[TIME CHECK] sum finalize   {np.sum(finalize):.4f}")
+                        finalize.clear()
+                    if collect_list:
+                        print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
+                        collect_list.clear()
+                    if pending_list:
+                        print(f"[TIME CHECK] avg pending    {np.mean(pending_list):.4f}")
+                        pending_list.clear()
                 
                 # resolve fresh predictions back into each game tree
                 for game in self.active_games:
@@ -518,12 +562,13 @@ class GameLooper(object):
 
         # pad up to fwd_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
+        start = _now()
         target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
-        start = _now()
         if B < target_bs:
-            # next power of 2 >= N
-            new_target = 1 << ((B - 1).bit_length())
+            for new_target in [128, 256, 512, 1024]:
+                if new_target >= B:
+                    break
             pad = new_target - B
             if pad:
                 pad_boards = np.zeros((pad, ) + boards_np.shape[1:], dtype=boards_np.dtype)
@@ -538,9 +583,7 @@ class GameLooper(object):
                 probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
             probs_np, vals_np = self.infer((boards_np, legals_np))
-
-        stop = _now()
-        self.prediction_times.append(stop-start)
+        
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
         for i, k in enumerate(keys):
@@ -550,6 +593,8 @@ class GameLooper(object):
 
         # bulk insert (C++ must be updated to accept this format)
         raw_cache_bulk_insert(to_raw_cache)
+        stop = _now()
+        self.prediction_times.append(stop-start)
 
     def finalize_game_data(self, game):
         """
@@ -780,7 +825,7 @@ class GameLooper(object):
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
         history = self.model.fit(
-            X, Y, epochs=3, batch_size=128, verbose=0,
+            X, Y, epochs=3, batch_size=256, verbose=0,
             sample_weight=s_wts, shuffle=True
         )
 
@@ -806,16 +851,14 @@ class GameLooper(object):
         cfg = self.config
         self.model.save(cfg.model_path)
 
-        del self.infer
-        gc.collect()
-
         # update the fwd helper and clear queues/caches
-        #self.model = load_model(cfg.model_path)
+        del self.infer
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
-
+        
+        gc.collect()
         # clear training queue
         self.training_queue = []
         self.n_retrains += 1
@@ -917,7 +960,7 @@ class GameLooper(object):
         sims = self.sims_done_total
         moves = self.moves_played
         sims_per_move = sims / moves if moves > 0 else 0.0
-        
+
         n_active = len(self.active_games)
         avg_ply = np.mean([g.plies for g in self.active_games]) if n_active else 0.0
         left6 = f"[game stats] n={n_active} avg ply={avg_ply:.2f}"
@@ -938,7 +981,7 @@ class GameLooper(object):
         if sum(durations) > 0:
             avg_runtime = cbu.format_time(np.mean(durations))
             if avg_runtime:
-                print(f"[game stats] avg runtime (last 50) : {avg_runtime}")
+                print(f"[game stats] runtime (last 50) : {avg_runtime}")
         print("-"*72)
 
 def init_selfplay():

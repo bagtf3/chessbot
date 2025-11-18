@@ -870,8 +870,6 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     enc_np: int32 [B,64], legal_np: int32 [B,4288].
     min_p, max_p, temp are baked into the closure.
     """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy('mixed_float16')
 
     BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
     EPS = tf.constant(1e-12, dtype=tf.float32)
@@ -921,6 +919,14 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
         # cast value to float32
         value_f = tf.cast(value, tf.float32)
         return probs_final, value_f
+    
+    # a few warmup iterations
+    sizes = (32, 128, 512, 1024)
+    for size in sizes:
+        for _ in range(3):
+            rep_mask = (np.random.rand(size, 4288) < 0.02).astype(np.int32)
+            rep_enc = (np.random.rand(size, 64) < 0.32).astype(np.int32)
+            _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):

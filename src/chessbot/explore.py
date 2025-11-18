@@ -213,7 +213,7 @@ print(len(df_means), f"games completed. Using window size {WINDOW}")
 print()
 
 # tidy up CPL
-df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+df_all['clipped_loss'] = np.clip(df_all['loss'], -500, 500)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 # BMR
@@ -268,8 +268,10 @@ df_list = []
 progress_list = []
 epoch_counter = 0
 
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
-suffixes = ["", "_phase2", "_phase3", "_phase4"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
+#suffixes = ["", "_phase2", "_phase3", "_phase4"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run"
+suffixes = ["0", "1"]
 
 for s in suffixes:
     rd = root + s
@@ -290,7 +292,7 @@ for s in suffixes:
     df_means = prev_run['df_means']
     
     # tidy up CPL
-    df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+    df_all['clipped_loss'] = np.clip(df_all['loss'], -500, 500)
     clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
     # BMR
@@ -356,4 +358,4 @@ gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
 # [TIME CHECK] avg finalize  0.0274
 
 
-
+#%%

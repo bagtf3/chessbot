@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 960
+    sims_target = 1080
     sims_ceiling = 200
 
     # early stop
@@ -42,7 +42,7 @@ class Config(object):
     material_diff_cutoff = 25
     material_diff_cutoff_span = 30
 
-    play_vs_sf_prob = 0.25
+    play_vs_sf_prob = 0.3
     sf_depth = 12
 
     # post hoc server
@@ -50,9 +50,9 @@ class Config(object):
     mine_bonus_data = True
     
     game_probs = {
-        "pre_opened": 0.175, "random_init": 0.25,
+        "pre_opened": 0.20, "random_init": 0.20,
         "random_middle_game": 0.25, "random_endgame": 0.15,
-        "piece_odds": 0.15, "piece_training": 0.025
+        "piece_odds": 0.15, "piece_training": 0.05
     }
     
     # priors
@@ -61,7 +61,7 @@ class Config(object):
 
     # root noise
     add_root_noise = True
-    dirichlet_eps = 0.07
+    dirichlet_eps = 0.10
     dirichlet_alpha = 0.3
 
     # training

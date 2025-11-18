@@ -540,6 +540,7 @@ class GameLooper(object):
         This calls self.infer on the GPU (masked softmax + clip + renorm).
         It writes into the raw policy cache as (zobrist, {"value": v, "policy": probs}).
         """
+        start = _now()
         if not preds_batch:
             return
 
@@ -562,23 +563,22 @@ class GameLooper(object):
 
         # pad up to fwd_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
-        start = _now()
         target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
         if B < target_bs:
-            for new_target in [128, 256, 512, 1024]:
+            for new_target in (32, 128, 512, 1024):
                 if new_target >= B:
                     break
             pad = new_target - B
             if pad:
-                pad_boards = np.zeros((pad, ) + boards_np.shape[1:], dtype=boards_np.dtype)
+                pad_boards = np.zeros((pad,)+boards_np.shape[1:], dtype=boards_np.dtype)
                 pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
                 boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
                 legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
                 probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
                 probs_np = probs_np_p[:B]
                 vals_np = vals_np_p[:B]
-            # might already be a smaller power of 2
+            
             else:
                 probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
@@ -825,7 +825,7 @@ class GameLooper(object):
 
         # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
         history = self.model.fit(
-            X, Y, epochs=3, batch_size=256, verbose=0,
+            X, Y, epochs=3, batch_size=128, verbose=0,
             sample_weight=s_wts, shuffle=True
         )
 
@@ -837,7 +837,6 @@ class GameLooper(object):
             mark = "*" if delta < 0 else "+"
             rows.append((name, start, end, delta, mark))
         
-        del history
         name_w = max(len(r[0]) for r in rows)
         num_w = 8   # width for numbers
         fmt = (f"[epoch {epoch:4d}] [model fit]  "
@@ -846,19 +845,26 @@ class GameLooper(object):
 
         for name, start, end, delta, mark in rows:
             print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
-
-        # make sure memory is clean to prevent slowdowns
+        
+        # checkpoint new weights
         cfg = self.config
         self.model.save(cfg.model_path)
 
+        # make sure memory is clean to prevent slowdowns
+        del self.model, self.infer, history
+        from tensorflow.keras import backend as K
+        K.clear_session()
+        gc.collect()
+
         # update the fwd helper and clear queues/caches
-        del self.infer
+        from tensorflow.keras import mixed_precision
+        mixed_precision.set_global_policy('mixed_float16')
+        self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
-        
-        gc.collect()
+
         # clear training queue
         self.training_queue = []
         self.n_retrains += 1

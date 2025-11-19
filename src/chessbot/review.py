@@ -811,16 +811,16 @@ def save_analysis_chunk_simple(run_dir, batch):
     return outp, cpl, bmr, top3
 
 
-def make_fake_visits(mv, lms, ratio_best=50):
+def make_fake_visits(mv, lms, ratio_best=60):
     visits = [[mv, int(ratio_best)]]
     
     # may only be 1 legal move
-    if len(lms) == 1:
+    if len(lms) < 2:
         return visits
     
-    ratio_not_best = 100-ratio_best
-    sup_optimal = min(ratio_best-5, max(1, int(ratio_not_best / (len(lms) - 1))))
-    visits += [[m, int(sup_optimal)] for m in lms if m != mv]
+    sub_optimal = 100 - ratio_best
+    bad_visits = 1 + min(5, int(sub_optimal / len(lms)))
+    visits += [[m, bad_visits] for m in lms if m != mv]
     return visits
 
 

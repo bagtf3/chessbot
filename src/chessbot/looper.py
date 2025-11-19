@@ -484,6 +484,7 @@ class GameLooper(object):
                         finalize.clear()
                     if collect_list:
                         print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
+                        print(f"[TIME CHECK] sum collection {np.sum(collect_list):.4f}")
                         collect_list.clear()
                     if pending_list:
                         print(f"[TIME CHECK] avg pending    {np.mean(pending_list):.4f}")
@@ -817,7 +818,7 @@ class GameLooper(object):
         self.all_evals = pd.concat([self.all_evals, eval_df])
         self.all_evals.round(5).to_csv(self.config.progress_csv_path, index=False)
 
-        if len(self.all_evals) and len(self.all_evals) % 4 == 0:
+        if len(self.all_evals) and len(self.all_evals) % 2 == 0:
             prog_plt_file = self.config.progress_plot_path
             cbu.plot_training_progress(
                 self.all_evals, epoch=epoch, save_path=prog_plt_file
@@ -1056,4 +1057,5 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    for i in range(20):
+        main()

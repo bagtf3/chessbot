@@ -196,7 +196,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run1"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/deep_sim_test"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -208,7 +208,10 @@ with open(pkl, "rb") as f:
 
 df_all = prev_run['df_all']
 df_means = prev_run['df_means']
-WINDOW = int(len(df_means) * 0.2 // 10 * 10)
+
+#df_all = df_all.query("scenario == ['random_init', 'pre_opened']").copy()
+#df_means = df_means.query("scenario == ['random_init', 'pre_opened']").copy()
+WINDOW = max(5, int(len(df_means) * 0.2 // 10 * 10))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
 print()
 
@@ -291,6 +294,9 @@ for s in suffixes:
     df_all = prev_run['df_all']
     df_means = prev_run['df_means']
     
+    #df_all = df_all.query("scenario == ['random_init', 'pre_opened']").copy()
+    #df_means = df_means.query("scenario == ['random_init', 'pre_opened']").copy()
+    
     # tidy up CPL
     df_all['clipped_loss'] = np.clip(df_all['loss'], -500, 500)
     clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
@@ -333,7 +339,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-pre_opened = [g for g in scored if g['scenario'] == 'random_init']
+pre_opened = [g for g in scored if g['scenario'] == 'random_endgame']
 pre_opened = [g for g in pre_opened if g['beat_sf']]
 gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
 

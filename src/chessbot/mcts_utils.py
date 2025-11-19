@@ -18,6 +18,7 @@ class MCTSTree(fasttree):
         super().__init__(board, self.c_puct, MCTSTree.ev)
 
         # bookkeeping
+        self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()
@@ -95,7 +96,7 @@ class MCTSTree(fasttree):
 
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
-
+        self.board = board
         # add noise to the root for exploration
         if self.config.add_root_noise:
             self.add_root_dirichlet_noise(
@@ -178,8 +179,7 @@ class MCTSTree(fasttree):
 
         # if not using the dec model, just hit the target
         if not self.config.use_sim_decision_model:
-            if sims_done >= sims_target:
-                return True
+            return sims_done >= sims_target
 
         if sims_done < self.config.sims_floor:
             return False
@@ -216,9 +216,13 @@ class MCTSTree(fasttree):
         # otherwise keep searching
         return False
 
-    def stop_simulating(self):    
+    def stop_simulating(self):
+        # do at least 1 sims to stabilize the tree
+        if self.sims_completed_this_move < 1:
+            return False
+
         # check for only 1 move
-        if len(self.root().legal_moves) < 2:
+        if len(self.board.legal_moves()) < 2:
             self.sim_stop_reason = "Only 1 legal move"
             return True
 

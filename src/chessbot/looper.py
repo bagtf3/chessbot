@@ -197,7 +197,6 @@ class ChessGame(object):
         """
         Snapshot policy targets from root visits, then play best-by-visits.
         """
-
         root = self.tree.root()
         if not root.is_expanded:
             return False
@@ -362,39 +361,33 @@ class GameLooper(object):
         Main loop. Each round: for each game either let SF move (if applicable)
         or run MCTS step (collect/predict/apply).
         """
-        # reset
-        self.games_finished = 0
 
         cfg = self.config
         mbs = cfg.micro_batch_size
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
-        sf_move, tree_move, finalize = [], [], []
         collect_list, collect_agg = [], []
-        pending_list, pending_agg = [], []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure({"Threads": 2, "Hash": 256})
             while self.games_finished < cfg.n_training_games:
                 if not self.active_games:
                     break
-        
+
+                # break to train then restart from the outside
+                if len(self.training_queue) >= cfg.training_queue_min:
+                    break
+                
                 preds_batch = []
                 finished = []
                 for game in self.active_games:
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
-                        start = _now()
                         sf_terminal = game.make_move_with_stockfish(eng)
-                        stop = _now()
-                        sf_move.append(stop-start)
                         mps.tick(1)
                             
                         if sf_terminal:
-                            start = _now()
                             self.finalize_game_data(game)
-                            stop = _now()
-                            finalize.append(stop-start)
                             self.maybe_log_results()
                             finished.append(game.game_id)
                             # pass until the next turn
@@ -403,18 +396,12 @@ class GameLooper(object):
                     # if this game has reached its local sim budget, make the move
                     if game.tree.stop_simulating():
                         # bot plays from tree
-                        start = _now()
                         mcts_terminal = game.make_move_from_tree()
-                        stop = _now()
-                        tree_move.append(stop-start)
                         mps.tick(1)
                         
                         # terminal after bot move?
                         if mcts_terminal:
-                            start = _now()
                             self.finalize_game_data(game)
-                            stop = _now()
-                            finalize.append(stop-start)
                             self.maybe_log_results()
                             finished.append(game.game_id)
                             continue
@@ -443,10 +430,7 @@ class GameLooper(object):
                     game.tree.sims_completed_this_move += (nn + nt + nc)
 
                     if nn:
-                        start = _now()
                         preds_batch += game.tree.pending_encoded_64_tokens()
-                        stop = _now()
-                        pending_agg.append(stop-start)
 
                     fastpaths = nt + nc
                     f_stop, c_stop = 0, 1
@@ -460,10 +444,6 @@ class GameLooper(object):
                     collect_list.append(np.sum(collect_agg))
                     collect_agg.clear()
 
-                if pending_agg:
-                    pending_list.append(np.sum(pending_agg))
-                    pending_agg.clear()
-
                 if preds_batch:
                     self.format_and_predict(preds_batch)
                     lpb.append(len(preds_batch))
@@ -472,23 +452,10 @@ class GameLooper(object):
                     self.log_loop_stats(counts, mbs, lpb)
                     counts = []
                     lpb = []
-                    if sf_move:
-                        print(f"[TIME CHECK] avg sf_move    {np.mean(sf_move):.4f}")
-                        sf_move.clear()
-                    if tree_move:
-                        print(f"[TIME CHECK] avg tree_move  {np.mean(tree_move):.4f}")
-                        tree_move.clear()
-                    if finalize:
-                        print(f"[TIME CHECK] avg finalize   {np.mean(finalize):.4f}")
-                        print(f"[TIME CHECK] sum finalize   {np.sum(finalize):.4f}")
-                        finalize.clear()
                     if collect_list:
                         print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
                         print(f"[TIME CHECK] sum collection {np.sum(collect_list):.4f}")
                         collect_list.clear()
-                    if pending_list:
-                        print(f"[TIME CHECK] avg pending    {np.mean(pending_list):.4f}")
-                        pending_list.clear()
                 
                 # resolve fresh predictions back into each game tree
                 for game in self.active_games:
@@ -525,8 +492,8 @@ class GameLooper(object):
                 # add in more games if needed
                 self.fill_active_games()
 
-        # train with whatever we got and final report (> 2000)
-        if len(self.training_queue) >= 2000:
+        # train with whatever we got and final report
+        if len(self.training_queue) >= min(2000, cfg.training_queue_min):
             self.trigger_retrain()
 
         self.maybe_log_results(force=True)
@@ -602,6 +569,11 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
+        # do not count extremely short games
+        if game.plies <= self.config.min_game_length:
+            game.examples = []
+            return
+
         # aggregate stats
         self.games_finished += 1
         self.total_plies += game.plies
@@ -698,10 +670,6 @@ class GameLooper(object):
             z_tapered = taper * z_stm
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
-
-        if len(self.training_queue) >= self.config.training_queue_min:
-            self.trigger_retrain()
-
 
     def trigger_retrain(self):
         """
@@ -1046,16 +1014,17 @@ def main():
             bonus_data=config.mine_bonus_data
         )
         try:
-            looper.run()
+            while looper.games_finished < config.n_training_games:
+                looper.run()
         except Exception as e:
             print("Error encountered", e)
         finally:
             stop_post_hoc_server(phs, timeout=10)
     
     else:
-        looper.run()
+        while looper.games_finished < config.n_training_games:
+            looper.run()
 
 
 if __name__ == '__main__':
-    for i in range(20):
-        main()
+    main()

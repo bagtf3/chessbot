@@ -30,8 +30,9 @@ class Config(object):
 
     # Game stuff
     micro_batch_size = 4
-    games_at_once = 256
-    n_training_games = 1000
+    games_at_once = 64
+    n_training_games = 64
+    n_passes = 20
     
     move_limit = 200
     min_game_length = 10
@@ -39,7 +40,7 @@ class Config(object):
     material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
-    sf_depth = 1
+    sf_depth = 12
 
     # post hoc server
     run_post_hoc = True
@@ -61,10 +62,10 @@ class Config(object):
     dirichlet_alpha = 0.5
 
     # training
-    training_queue_min = 4096
-    fwd_batch = 1024
+    training_queue_min = 409600
+    fwd_batch = 256
 
-    target_y_weights = {'vwq':0.2,'z': 0.3, 'z_taper':0.5, }
+    target_y_weights = {'vwq':0.2, 'z': 0.3, 'z_taper':0.5}
     loss_weights = {"policy_winner": 1.5, "policy_loser": 1.0, "value_out": 1.5}
     draw_weight = 0.2
 

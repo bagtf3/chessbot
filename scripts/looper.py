@@ -44,12 +44,18 @@ class GameLooper(object):
         cfg = self.config
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max
         )
 
         self.infer_is_warm = False
-        self.batch_candidates = set(sorted([32, 256, 512, 1024, cfg.fwd_batch]))
 
+        batch_candidates = set()
+        bs = 32
+        while bs <= cfg.fwd_batch:
+            batch_candidates.add(bs)
+            bs *= 2
+        
+        self.batch_candidates = sorted(batch_candidates)
         self.training_queue = []
         self.recent_games = []
 
@@ -281,11 +287,12 @@ class GameLooper(object):
         target_bs = self.config.fwd_batch
         # need to make sure the tf.function is warm
         if not self.infer_is_warm:
-            print("[model warmup] warming GPU")
-            for _ in range(20):
-                rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
-                rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
-                self.infer((rep_enc, rep_mask))
+            print(f"[model warmup] warming GPU for {self.batch_candidates}")
+            for bs in self.batch_candidates:
+                for _ in range(3):
+                    rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
+                    rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
+                    self.infer((rep_enc, rep_mask))
             self.infer_is_warm = True
             print("[model warmup] warm up complete")
 
@@ -432,8 +439,8 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
-        if len(self.training_queue) >= self.config.training_queue_min:
-            self.trigger_retrain()
+        #if len(self.training_queue) >= self.config.training_queue_min:
+        #    self.trigger_retrain()
 
     def trigger_retrain(self):
         """
@@ -648,7 +655,7 @@ def init_selfplay():
     Config.model_path = model_path
     
     if os.path.exists(model_path):
-        print(f"Loading {model_path}")
+        print(f"Loading {model_name}")
         model = load_model(model_path)
     else:
         print(f"Loading {config.init_model}")
@@ -670,26 +677,20 @@ def init_selfplay():
     return looper, config
 
 
-def main():
-    looper, config = init_selfplay()
-
-    # start the analysis server
-    if config.run_post_hoc:
-        phs = start_post_hoc_server(
-            looper.config.run_dir,
-            bonus_data=config.mine_bonus_data
-        )
-        try:
-            looper.run()
-        except Exception as e:
-            print("Error encountered", e)
-        finally:
-            stop_post_hoc_server(phs, timeout=10)
-    
-    else:
-        # first pass
-        looper.run()
-
-
 if __name__ == '__main__':
-    main()
+    cfg = Config()
+    phs = None
+    try:
+        for pss in range(cfg.n_passes):
+            print("[main loop] starting training loop number", pss)
+            looper, cfg = init_selfplay()
+            # look to start post hoc server on the first loop if its not yet running
+            if phs is None and cfg.run_post_hoc and cfg.run_dir:
+                phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
+
+            looper.run()
+
+    finally:
+        if phs is not None:
+            stop_post_hoc_server(phs, timeout=10)
+

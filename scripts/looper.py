@@ -655,10 +655,10 @@ def init_selfplay():
     Config.model_path = model_path
     
     if os.path.exists(model_path):
-        print(f"Loading {model_name}")
+        print(f"[init] Loading {model_name}")
         model = load_model(model_path)
     else:
-        print(f"Loading {config.init_model}")
+        print(f"[init] Loading {config.init_model}")
         model = load_model(config.init_model)
         save_model(model, model_path)
     config = Config()

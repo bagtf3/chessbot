@@ -10,9 +10,8 @@ Expectations:
 """
 
 import argparse
-import os
+import os, time
 import pickle
-import tempfile
 import sys
 
 import numpy as np
@@ -37,7 +36,8 @@ def main():
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--no-gpu", action="store_true", help="run on cpu only")
-    args = p.parse_args(argv)
+    args = p.parse_args()
+
 
     if args.no_gpu:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -128,7 +128,7 @@ def main():
     # downweight draws so value head doesnt collapse
     v_wts = lw['value_out']*weights
     wts_before = v_wts.sum()
-    v_wts[draw_mask] *= max(cfg['draw_we']ight, 0.001)
+    v_wts[draw_mask] *= max(cfg['draw_weight'], 0.001)
     wts_after = v_wts.sum()
 
     # redistribute to not change overall loss weight
@@ -152,12 +152,11 @@ def main():
 
     # previous trains
     if os.path.exists(cfg['progress_csv_path']):
-        try:
-            all_evals = pd.read_csv(cfg['progress_csv_path'])
-            n_retrains = len(all_evals)
-        except Exception as e:
-            n_retrains = 0
-            print(e)
+        all_evals = pd.read_csv(cfg['progress_csv_path'])
+        n_retrains = len(all_evals)
+    else:
+        all_evals = pd.DataFrame()
+        n_retrains = 0
 
     # evaluation and logging
     plt_file = os.path.join(cfg['run_dir'], "true_vs_pred_plot_latest.png")
@@ -195,7 +194,8 @@ def main():
     
     # checkpoint new weights
     model.save(cfg['model_path'])
-    print(f"[retrain] retraining complete for epoch {epoch}")
+    print("[retrain] retraining complete for epoch", epoch)
+    return 0
 
 
 if __name__ == "__main__":

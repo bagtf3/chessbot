@@ -444,7 +444,7 @@ class GameLooper(object):
 
         if not self.training_queue:
             return
-
+        
         # write training queue (list) to pkl
         run_dir = self.config.run_dir
         p_pending = os.path.join(run_dir, "pending_retrain.pkl")
@@ -497,8 +497,8 @@ class GameLooper(object):
         # update the fwd helper and clear queues/caches
         self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
-            self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
+          self.model, max_bs=cfg.fwd_batch,
+          min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
 
         self.infer_is_warm = False

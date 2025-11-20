@@ -94,7 +94,7 @@ def main():
     # stack arrays
     X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
     P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
-    M = np.stack(mask_list, axis=0).astype(np.int16)     # (N, 4288)
+    M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4288)
     Z = np.asarray(Z_list, dtype=np.float32)
     Vwq = np.asarray(Vwq_list, dtype=np.float32)
     Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)

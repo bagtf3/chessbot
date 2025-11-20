@@ -17,8 +17,8 @@ import pickle
 MODEL_NAME = 'conv_64_token_12M'
 
 model, opt, loss_weights, loss_dict = build_conv_64pv(
-    d_model_embed=128, vocab_size=21, filters=64,
-    n_conv=3, proj_dim=96, name=MODEL_NAME
+    d_model_embed=128, vocab_size=21, filters=196,
+    n_conv=16, proj_dim=96, name=MODEL_NAME
 )
 
 model.summary()

@@ -559,7 +559,7 @@ class GameLooper(object):
             p = np.asarray(probs_np[i], dtype=np.float32)  # (4288,)
             to_raw_cache.append((k, v, p))
 
-        # bulk insert (C++ must be updated to accept this format)
+        # bulk insert
         raw_cache_bulk_insert(to_raw_cache)
         stop = _now()
         self.prediction_times.append(stop-start)
@@ -670,6 +670,9 @@ class GameLooper(object):
             z_tapered = taper * z_stm
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
+
+        if len(self.training_queue) >= self.config.training_queue_min:
+            self.trigger_retrain()
 
     def trigger_retrain(self):
         """
@@ -990,11 +993,6 @@ def init_selfplay():
         save_model(model, model_path)
     config = Config()
     
-    return model, config
-
-
-def main():
-    model, config = init_selfplay()
     looper = GameLooper(model=model, cfg=Config())
 
     # infer the number of trainings already done from existing files
@@ -1007,6 +1005,12 @@ def main():
         except Exception as e:
             print(e)
     
+    return looper, config
+
+
+def main():
+    looper, config = init_selfplay()
+
     # start the analysis server
     if config.run_post_hoc:
         phs = start_post_hoc_server(
@@ -1014,16 +1018,15 @@ def main():
             bonus_data=config.mine_bonus_data
         )
         try:
-            while looper.games_finished < config.n_training_games:
-                looper.run()
+            looper.run()
         except Exception as e:
             print("Error encountered", e)
         finally:
             stop_post_hoc_server(phs, timeout=10)
     
     else:
-        while looper.games_finished < config.n_training_games:
-            looper.run()
+        # first pass
+        looper.run()
 
 
 if __name__ == '__main__':

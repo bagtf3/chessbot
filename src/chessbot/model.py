@@ -921,9 +921,9 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
         return probs_final, value_f
     
     # a few warmup iterations
-    sizes = (32, 256, 512, 1024)
+    sizes = (32, 512)
     for size in sizes:
-        for _ in range(3):
+        for _ in range(5):
             rep_mask = (np.random.rand(size, 4288) < 0.02).astype(np.int32)
             rep_enc = (np.random.rand(size, 64) < 0.32).astype(np.int32)
             _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))

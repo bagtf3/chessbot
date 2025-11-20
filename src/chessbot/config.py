@@ -7,16 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "deep_sim_test"
+    run_tag = "new_conv_net_run1"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run1/new_conv_net_run1_model.h5"
 
     # MCTS
-    c_puct = 1.0
+    c_puct = 1.25
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 1000
+    sims_target = 1200
     sims_ceiling = 200
 
     # early stop
@@ -35,8 +35,8 @@ class Config(object):
 
     # Game stuff
     micro_batch_size = 4
-    games_at_once = 256
-    n_training_games = 1500
+    games_at_once = 128
+    n_training_games = 1200
     
     move_limit = 200
     min_game_length = 10
@@ -50,15 +50,10 @@ class Config(object):
     run_post_hoc = True
     mine_bonus_data = True
     
-    # game_probs = {
-    #     "pre_opened": 0.20, "random_init": 0.20,
-    #     "random_middle_game": 0.25, "random_endgame": 0.15,
-    #     "piece_odds": 0.15, "piece_training": 0.05
-    # }
     game_probs = {
-        "pre_opened": 0.1, #"random_init": 0.20,
-        "random_middle_game": 0.45, "random_endgame": 0.45
-        #"piece_odds": 0.15, "piece_training": 0.05
+        "pre_opened": 0.25, "random_init": 0.25,
+        "piece_odds": 0.25, "piece_training": 0.05,
+        "random_middle_game": 0.20
     }
     
     # priors
@@ -72,9 +67,9 @@ class Config(object):
 
     # training
     training_queue_min = 4096
-    fwd_batch = 1024
+    fwd_batch = 512
 
-    target_y_weights = {'z': 0.25, 'z_taper':0.5, 'vwq':0.25}
+    target_y_weights = {'z': 0.3, 'z_taper':0.5, 'vwq':0.2}
     loss_weights = {"policy_winner": 1.75, "policy_loser": 1.25, "value_out": 1.5}
     draw_weight = 0.2
 

@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 6000
+    sims_target = 120
     sims_ceiling = 200
 
     # early stop
@@ -29,9 +29,9 @@ class Config(object):
     use_q_override = False
 
     # Game stuff
-    micro_batch_size = 128
-    games_at_once = 8
-    n_training_games = 150
+    micro_batch_size = 4
+    games_at_once = 256
+    n_training_games = 1000
     
     move_limit = 200
     min_game_length = 10
@@ -39,7 +39,7 @@ class Config(object):
     material_diff_cutoff_span = 30
 
     play_vs_sf_prob = 0.5
-    sf_depth = 12
+    sf_depth = 1
 
     # post hoc server
     run_post_hoc = True
@@ -61,7 +61,7 @@ class Config(object):
     dirichlet_alpha = 0.5
 
     # training
-    training_queue_min = 2048
+    training_queue_min = 4096
     fwd_batch = 1024
 
     target_y_weights = {'vwq':0.2,'z': 0.3, 'z_taper':0.5, }

@@ -196,7 +196,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run1"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/test"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -339,9 +339,10 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-pre_opened = [g for g in scored if g['scenario'] == 'random_endgame']
-#pre_opened = [g for g in pre_opened if g['beat_sf']]
-gv = GameViewer(pre_opened[-1]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['scenario'] == 'pre_opened']
+#games = [g for g in games if g['beat_sf']]
+games = [g for g in games if g['vs_stockfish']]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 
 #%%
 # early run stats

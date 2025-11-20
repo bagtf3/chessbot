@@ -864,6 +864,13 @@ def build_conv_64pv(
     return model, opt, loss_weights, loss_dict
 
 
+def warm_conv_infer(graph, max_bs):
+    for _ in range(100):
+        rep_mask = (np.random.rand(max_bs, 4288) < 0.02).astype(np.int32)
+        rep_enc = (np.random.rand(max_bs, 64) < 0.32).astype(np.int32)
+        _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
+
+
 def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
@@ -919,14 +926,6 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
         # cast value to float32
         value_f = tf.cast(value, tf.float32)
         return probs_final, value_f
-    
-    # a few warmup iterations
-    sizes = set([32, 512, max_bs])
-    for size in sizes:
-        for _ in range(5):
-            rep_mask = (np.random.rand(size, 4288) < 0.02).astype(np.int32)
-            rep_enc = (np.random.rand(size, 64) < 0.32).astype(np.int32)
-            _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):

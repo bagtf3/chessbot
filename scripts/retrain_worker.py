@@ -30,7 +30,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=96)
     p.add_argument("--no-gpu", action="store_true", help="run on cpu only")
     args = p.parse_args()
 
@@ -92,7 +92,7 @@ def main():
         is_add_flag.append(i >= n_main)  # True for additional samples
 
     # stack arrays
-    X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
+    X = np.asarray(X_list, dtype=np.int32)               # (N, 64) expected
     P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
     M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4288)
     Z = np.asarray(Z_list, dtype=np.float32)

@@ -18,7 +18,7 @@ from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
 from chessbot import ENDGAME_LOC, SF_LOC
-from chessbot.model import load_model, save_model, make_conv_infer
+from chessbot.model import load_model, save_model, make_conv_infer, warm_conv_infer
 from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
 
@@ -47,6 +47,7 @@ class GameLooper(object):
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
 
+        self.infer_is_warm = False
         self.batch_candidates = set(sorted([32, 256, 512, 1024, cfg.fwd_batch]))
 
         self.training_queue = []
@@ -254,7 +255,7 @@ class GameLooper(object):
         This calls self.infer on the GPU (masked softmax + clip + renorm).
         It writes into the raw policy cache as (zobrist, {"value": v, "policy": probs}).
         """
-        start = _now()
+
         if not preds_batch:
             return
 
@@ -272,12 +273,22 @@ class GameLooper(object):
             legals.append(np.asarray(legal_np, dtype=np.int32))
 
         # stack to batch
-        boards_np = np.stack(boards, axis=0)   # (B,8,8,29)
+        boards_np = np.stack(boards, axis=0)   # (B,64)
         legals_np = np.stack(legals, axis=0)   # (B,4288)
-
         # pad up to fwd_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
+
         target_bs = self.config.fwd_batch
+        # need to make sure the tf.function is warm
+        if not self.infer_is_warm:
+            print("[model warmup] warming GPU")
+            for _ in range(100):
+                rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
+                rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
+                self.infer((rep_enc, rep_mask))
+            self.infer_is_warm = True
+            print("[model warmup] warm up complete")
+
         B = boards_np.shape[0]
         if B < target_bs:
             # choose padding target safely
@@ -290,13 +301,16 @@ class GameLooper(object):
                 pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
                 boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
                 legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
+                start = _now()
                 probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
                 probs_np = probs_np_p[:B]
                 vals_np = vals_np_p[:B]
             
             else:
+                start = _now()
                 probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
+            start = _now()
             probs_np, vals_np = self.infer((boards_np, legals_np))
         
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
@@ -436,9 +450,8 @@ class GameLooper(object):
         p_pending = os.path.join(run_dir, "pending_retrain.pkl")
         tmp_pending = p_pending + ".tmp"
         with open(tmp_pending, "wb") as f:
-            pickle.dump(combined, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(self.training_queue, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_pending, p_pending)
-        print(f"[retrain] wrote pending_retrain.pkl ({len(combined)} examples)")
 
         # pickle config dict (cfg may have been updated at runtime)
         cfg_dict = self.config.to_dict()
@@ -449,15 +462,13 @@ class GameLooper(object):
         with open(tmp_cfg, "wb") as f:
             pickle.dump(cfg_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_cfg, p_cfg)
-        print("[retrain] wrote config.pkl")
 
         # find retrain_worker.py
         retrain_script = cbu.find_script("retrain_worker.py", start_file=__file__)
 
         # spawn worker and fail fast if it fails
         cmd = [sys.executable, retrain_script, "--run-dir", run_dir]
-        print("[retrain] launching worker:", " ".join(cmd))
-
+        print(f"[retrain] launching worker with {len(self.training_queue)} samples")
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         rc = proc.returncode
         if rc != 0:
@@ -471,28 +482,32 @@ class GameLooper(object):
             sys.stderr.write((proc.stderr or "") + "\n")
             # fail fast and loud
             raise RuntimeError("retrain worker failed; aborting looper")
-
+        else:
+            sys.stdout.write(proc.stdout or "")
+        
         # if here, retrain was a success. load new model and make new infer
         # make sure memory is clean to prevent slowdowns
+        cfg = self.config
         del self.model, self.infer
-        from tensorflow.keras import backend as K
-        K.clear_session()
         gc.collect()
 
+        # give the GPU a second to clear out
+        time.sleep(1.0)
+
         # update the fwd helper and clear queues/caches
-        from tensorflow.keras import mixed_precision
-        mixed_precision.set_global_policy('mixed_float16')
         self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
 
+        self.infer_is_warm = False
+
         # clear training queue
         self.training_queue = []
         self.n_retrains += 1
         self.clear_cache = True
-    
+
     def maybe_log_results(self, every_sec=30.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:

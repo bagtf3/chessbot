@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 120
+    sims_target = 6000
     sims_ceiling = 200
 
     # early stop
@@ -29,9 +29,9 @@ class Config(object):
     use_q_override = False
 
     # Game stuff
-    micro_batch_size = 4
-    games_at_once = 128
-    n_training_games = 1200
+    micro_batch_size = 128
+    games_at_once = 8
+    n_training_games = 150
     
     move_limit = 200
     min_game_length = 10
@@ -48,7 +48,7 @@ class Config(object):
     game_probs = {
         "pre_opened": 0.25, "random_init": 0.25,
         "piece_odds": 0.25, "piece_training": 0.05,
-        "random_middle_game": 0.20
+        "random_middle_game": 0.20, "random_endgame": 0.0
     }
     
     # priors
@@ -61,11 +61,11 @@ class Config(object):
     dirichlet_alpha = 0.5
 
     # training
-    training_queue_min = 1024
-    fwd_batch = 512
+    training_queue_min = 2048
+    fwd_batch = 1024
 
-    target_y_weights = {'z': 0.3, 'z_taper':0.5, 'vwq':0.2}
-    loss_weights = {"policy_winner": 1.75, "policy_loser": 1.25, "value_out": 1.5}
+    target_y_weights = {'vwq':0.2,'z': 0.3, 'z_taper':0.5, }
+    loss_weights = {"policy_winner": 1.5, "policy_loser": 1.0, "value_out": 1.5}
     draw_weight = 0.2
 
     def to_dict(self):

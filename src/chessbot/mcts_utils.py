@@ -1,16 +1,18 @@
-from time import time as _now
 import uuid
-from chessbot.psqt import build_weights
-from pyfastchess import Evaluator, MCTSTree as fasttree
-from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
-from pyfastchess import terminal_value_white_pov
-from chessbot.review import score_to_value_stm_pov, make_fake_visits
-from chessbot.utils import calc_entropy, rnd
-import chessbot.utils as cbu
+from time import time as _now
 
 import chess, chess.syzygy
 import tl2cgen as tl2
 import numpy as np
+
+from pyfastchess import Evaluator, MCTSTree as fasttree
+from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
+from pyfastchess import terminal_value_white_pov
+
+from chessbot.psqt import build_weights
+from chessbot.review import score_to_value_stm_pov, make_fake_visits
+from chessbot.utils import calc_entropy, rnd
+import chessbot.utils as cbu
 
 
 class MCTSTree(fasttree):

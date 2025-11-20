@@ -468,7 +468,7 @@ class GameLooper(object):
         Vwq_list = []
         is_add_flag = []
 
-        for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
+        for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined)all_eval:
             X_list.append(x)
             P_list.append(policy)
             mask_list.append(mask)

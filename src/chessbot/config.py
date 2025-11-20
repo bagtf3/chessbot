@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "new_conv_net_run1"
+    run_tag = "test"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run1/new_conv_net_run1_model.h5"
 
@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 1200
+    sims_target = 120
     sims_ceiling = 200
 
     # early stop
@@ -26,12 +26,7 @@ class Config(object):
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
-    
     use_q_override = False
-    q_override_vis_ratio = 0.8
-    q_override_q_margin = 0.08
-    q_override_min_vis = 800
-    q_override_top_k = 2
 
     # Game stuff
     micro_batch_size = 4
@@ -66,7 +61,7 @@ class Config(object):
     dirichlet_alpha = 0.5
 
     # training
-    training_queue_min = 4096
+    training_queue_min = 1024
     fwd_batch = 512
 
     target_y_weights = {'z': 0.3, 'z_taper':0.5, 'vwq':0.2}

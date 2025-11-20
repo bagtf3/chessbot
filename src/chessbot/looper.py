@@ -1,4 +1,4 @@
-import uuid, os, pickle
+import os, pickle
 import pathlib, json
 import time, gc
 _now = time.time
@@ -17,269 +17,12 @@ from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
 from chessbot import ENDGAME_LOC, SF_LOC
 from chessbot.model import load_model, save_model, make_conv_infer
-from chessbot.mcts_utils import MCTSTree
-
+from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
 
 import chessbot.utils as cbu
-from chessbot.utils import rnd, RateMeter, softmax, GameGenerator, score_to_value_stm_pov
-from chessbot.review import start_post_hoc_server, stop_post_hoc_server, make_fake_visits
-
-
-class ChessGame(object):
-    def __init__(self, board, meta, cfg):
-        self.game_id = str(uuid.uuid4())
-        self.config = cfg
-        self.started_at = _now()
-
-        self.board = board
-        self.starting_fen = self.board.fen()
-        self.meta = meta
-        
-        self.vs_stockfish = meta['vs_stockfish']
-        self.stockfish_is_white = meta['stockfish_is_white']
-        self.tree = MCTSTree(self.board, self.config)
-        self.tree_data = {}
-        self.moves_played = []
-        
-        self.mat_adv_counter = 0
-        self.vwq_adv_counter = 0
-        self.outcome = None
-        self.examples = []
-        self.plies = 0
-        self.vwq = None
-        self.sf_eval = None
-    
-    def turn(self, return_bool=True):
-        stm = self.board.side_to_move()
-        return stm == 'w' if return_bool else stm
-    
-    def is_stockfish_turn(self):
-        return self.vs_stockfish and (self.stockfish_is_white == self.turn())
-    
-    def get_stockfish_move(self, eng):
-        val_sf, best_move = cbu.sf_eval(
-            self.board, score_fn=score_to_value_stm_pov,
-            depth=self.config.sf_depth, engine=eng
-        )
-
-        return best_move, val_sf
-    
-    def push_move(self, mv):
-        # collect search data then push and update
-        self.collect_tree_search_data(mv)
-
-        # advance tree (pushes move) and reset
-        self.tree.advance(self.board, mv)
-        self.tree.reset_for_new_move()
-        self.moves_played.append(mv)
-        self.plies += 1
-        return self.check_for_terminal()
-    
-    def collect_tree_search_data(self, mv):
-        root = self.tree.root()
-        if not root.is_expanded:
-            return
-        
-        c_puct = self.config.c_puct
-        
-        # timing
-        start = self.tree._move_started_at
-        if start is None:
-            start = _now()
-            self.tree._move_started_at = start
-        elapsed = _now() - start
-    
-        # C++ summaries
-        avg_depth, max_depth = self.tree.depth_stats()
-        details = self.tree.root_child_details()
-        if details is None:
-            return
-        
-        sims = int(self.tree.sims_completed_this_move)
-        total_children = len(details)
-        visited_children = sum([1 for cd in details if cd.N > 0])
-
-        data = {
-            "sims": sims, "time": rnd(elapsed, 3),
-            "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
-            "children_visited": visited_children,
-            "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
-            "stop_reason": self.tree.sim_stop_reason
-        }
-        # sumN for U term
-        sumN = max(1, root.N)
-
-        candidate_moves = []
-        for cd in details:
-            U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N)
-            cm = {
-                "uci": cd.uci, "visits": cd.N,
-                "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4),
-                "is_terminal": cd.is_terminal, "vprime_visits": cd.vprime_visits
-            }
-            
-            candidate_moves.append(cm)
-        data["candidate_moves"] = candidate_moves
-
-        # fast PV via C++
-        pv = []
-        pv_items = self.tree.principal_variation(24)
-        for x in pv_items:
-            pv.append({
-                "uci": x.uci, "visits": int(x.visits),
-                "P": rnd(x.P, 4), "Q": rnd(x.Q, 4),
-            })
-        
-        # attach PV snapshot (may be empty if no deeper visited chain exists)
-        data["pv"] = pv
-        self.tree_data[self.plies] = data
-    
-    def make_move_with_stockfish(self, eng):
-        """
-        Stockfish plays one move. When the MCTS root has enough sims and the
-        tree agrees (or nearly agrees) with Stockfish, use the tree's visit
-        counts as the policy target (optionally bumping SF's visits so it's #1).
-        Otherwise fall back to the old 60/40 supervised target.
-        """
-        
-        legal = self.board.legal_moves()
-        if not legal:
-            return self.check_for_terminal()
-
-        # get SF move + signed eval (white POV)
-        mv, sf_v = self.get_stockfish_move(eng)
-        
-        self.sf_eval = sf_v
-
-        # gather root visit info from the tree (list sorted desc by visits)
-        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
-        total_visits = sum([n for _, n in rows]) if rows else 0
-
-        use_tree_visits = False
-        visit_map = None
-
-        if rows and total_visits >= 100:
-            # map uci -> visits for quick lookup
-            visit_map = {u: n for u, n in rows}
-            most_visited_uci, max_visits = rows[0]
-            sf_visits = visit_map.get(mv, 0.0)
-
-            # case A: tree already picks SF move as top choice
-            if most_visited_uci == mv:
-                use_tree_visits = True
-
-            # case B: SF move is close to top -> use tree visits but nudge SF to top
-            elif sf_visits >= 0.5 * max_visits:
-                use_tree_visits = True
-                # make SF strictly first by setting its visits > max_visits
-                visit_map[mv] = max_visits + 10
-
-        if use_tree_visits and visit_map is not None:
-            visits = [max(1, visit_map.get(u, 1.0)) for u in legal]
-            ucis = legal
-
-        else:
-            # make_fake_visits returns [[uci,count], ...]
-            raw = make_fake_visits(mv, legal, ratio_best=60)
-            ucis   = [x[0] for x in raw]
-            visits = [x[1] for x in raw]
-        
-        s = sum(visits)
-        pi = np.array([v / s for v in visits], dtype=np.float32)
-        self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
-
-        # finally play SF's move on the board and advance tree
-        return self.push_move(mv)
-
-    def make_move_from_tree(self):
-        """
-        Snapshot policy targets from root visits, then play best-by-visits.
-        """
-        root = self.tree.root()
-        if not root.is_expanded:
-            return False
-        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
-        if not rows:
-            return False
-
-        ucis   = [u for u, _ in rows]
-        visits = np.array([n for _, n in rows], dtype=np.float32)
-        s = visits.sum()
-        pi = (visits / s) if s > 0.0 else np.zeros_like(visits)
-        vwq = self.tree.visit_weighted_Q()
-
-        # tree is white POV, we want STM-POV so we flip here
-        vwq = vwq if self.turn() else -vwq
-    
-        if pi is not None:
-            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq, turn=self.turn())
-
-        mv, _ = self.tree.best()
-        if mv is None:
-            return False
-        return self.push_move(mv)
-    
-    def append_flat_policy_example(self, ucis, pi, vwq, turn):
-        """
-        Snapshot inputs and a flat 4288-length policy vector for training.
-        - ucis: list[str] legal moves (same order as probs)
-        - pi:  list/array of probs (sum ~= 1)
-        - vwq: scalar value target (white-POV)
-        """
-        
-        # get indices from C++
-        indices = self.board.moves_to_indices(ucis)  # list of int (0..4288)
-        policy = np.zeros(64 * 67, dtype=np.float32)
-        
-        # accumulate probs into flattened policy
-        for idx, p in zip(indices, pi):
-            policy[idx] += p
-
-        # snapshot inputs and push example
-        x = self.board.encode_64_tokens()
-        mask = self.board.legal_move_mask()
-        self.examples.append((x, mask, policy, vwq, self.plies, turn))
-
-    def check_for_terminal(self):
-        reason, result = self.board.is_game_over()
-        if reason != 'none':
-            self.outcome = terminal_value_white_pov(self.board)
-            return True
-    
-        mat_diff = self.board.material_count()
-        if abs(mat_diff) >= self.config.material_diff_cutoff:
-            self.mat_adv_counter += 1
-        else:
-            self.mat_adv_counter = 0
-    
-        if self.mat_adv_counter >= self.config.material_diff_cutoff_span:
-            self.outcome = 1.0 if mat_diff > 0 else -1.0
-            return True
-        
-        # Syzygy probe if few pieces
-        if self.board.piece_count() <= 5:
-            # may not work so just go as normal
-            try:
-                outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
-                with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
-                    # gotta flip back to python chess here
-                    chess_board = chess.Board(self.board.fen())
-                    table_res = tablebase.probe_wdl(chess_board)
-                    
-                table_res = table_res if chess_board.turn else -1*table_res
-                self.outcome = outcomes[table_res]
-                return True
-            except:
-                pass
-           
-        hs = self.board.history_size()
-        if hs > self.config.move_limit:
-            self.outcome = 0.0
-            return True
-        # if we made it here the game is active
-        return False
+from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
+from chessbot.review import start_post_hoc_server, stop_post_hoc_server
 
 
 class GameLooper(object):
@@ -301,6 +44,8 @@ class GameLooper(object):
             self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
         )
+
+        self.batch_candidates = set(sorted([32, 256, 512, 1024, cfg.fwd_batch]))
 
         self.training_queue = []
         self.recent_games = []
@@ -534,10 +279,11 @@ class GameLooper(object):
         target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
         if B < target_bs:
-            for new_target in (32, 128, 512, 1024):
+            # choose padding target safely
+            for new_target in self.batch_candidates:
                 if new_target >= B:
                     break
-            pad = new_target - B
+            pad = max(0, int(new_target - B))
             if pad:
                 pad_boards = np.zeros((pad,)+boards_np.shape[1:], dtype=boards_np.dtype)
                 pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)

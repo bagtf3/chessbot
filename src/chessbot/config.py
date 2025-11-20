@@ -7,7 +7,7 @@ class Config(object):
     """
 
     # files
-    run_tag = "test"
+    run_tag = "new_conv_net_run1"
     selfplay_dir =  SP_DIR
     init_model = SP_DIR + "new_conv_net_run1/new_conv_net_run1_model.h5"
 
@@ -16,7 +16,7 @@ class Config(object):
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 120
+    sims_target = 1200
     sims_ceiling = 200
 
     # early stop

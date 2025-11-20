@@ -282,7 +282,7 @@ class GameLooper(object):
         # need to make sure the tf.function is warm
         if not self.infer_is_warm:
             print("[model warmup] warming GPU")
-            for _ in range(100):
+            for _ in range(20):
                 rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
                 rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
                 self.infer((rep_enc, rep_mask))
@@ -490,9 +490,6 @@ class GameLooper(object):
         cfg = self.config
         del self.model, self.infer
         gc.collect()
-
-        # give the GPU a second to clear out
-        time.sleep(1.0)
 
         # update the fwd helper and clear queues/caches
         self.model = load_model(cfg.model_path)

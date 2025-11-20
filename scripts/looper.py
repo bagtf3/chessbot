@@ -10,7 +10,7 @@ import tensorflow as tf
 import matplotlib
 matplotlib.use("Agg")
 
-import chess, chess.syzygy
+import chess
 
 from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats

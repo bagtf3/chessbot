@@ -7,6 +7,8 @@ from pyfastchess import terminal_value_white_pov
 from chessbot.review import score_to_value_stm_pov, make_fake_visits
 from chessbot.utils import calc_entropy, rnd
 import chessbot.utils as cbu
+
+import chess, chess.syzygy
 import tl2cgen as tl2
 import numpy as np
 

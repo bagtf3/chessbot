@@ -5,6 +5,7 @@ pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
 
 import math, random, time, pickle
+from pathlib import Path
 from time import time as _now
 
 import matplotlib.pyplot as plt
@@ -687,6 +688,31 @@ def make_jsonable(obj):
 
     # other objects: leave as-is (json.dump will fail if it's unsupported)
     return obj
+
+
+def find_script(filename, start_file=None):
+    """
+    Locate filename in the same folder as start_file (or this file),
+    then fallback to the current working directory.
+    Returns the absolute path as a string.
+    Raises FileNotFoundError if not found.
+    """
+    if start_file:
+        base = Path(start_file).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
+
+    candidate = base / filename
+    if candidate.exists():
+        return str(candidate)
+
+    candidate = Path.cwd() / filename
+    if candidate.exists():
+        return str(candidate)
+
+    raise FileNotFoundError(
+        f"{filename} not found in {base} or cwd {Path.cwd()}"
+    )
 
 
 def random_init(plies=5, python_chess=False):

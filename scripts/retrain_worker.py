@@ -29,10 +29,6 @@ def load_pickle(path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
-    p.add_argument("--infile", default="pending_retrain.pkl", help="pkl training file")
-    p.add_argument("--config-file", default="config.pkl",
-                   help="pickled config dict produced by Config.to_dict()")
-
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--no-gpu", action="store_true", help="run on cpu only")
@@ -43,8 +39,8 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     run_dir = args.run_dir
-    infile = os.path.join(run_dir, args.infile)
-    config_file = os.path.join(run_dir, args.config_file)
+    infile = os.path.join(run_dir, "pending_retrain.pkl")
+    config_file = os.path.join(run_dir, "config.pkl")
 
     cfg = load_pickle(config_file)
     train = load_pickle(infile) # expect list
@@ -156,7 +152,7 @@ def main():
         n_retrains = len(all_evals)
     else:
         all_evals = pd.DataFrame()
-        n_retrains = 0
+        n_retrains = cfg['n_retrains']
 
     # evaluation and logging
     plt_file = os.path.join(cfg['run_dir'], "true_vs_pred_plot_latest.png")

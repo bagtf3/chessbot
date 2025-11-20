@@ -1,6 +1,8 @@
 import os, pickle
 import pathlib, json
 import time, gc
+import sys, subprocess
+
 _now = time.time
 
 import numpy as np
@@ -55,7 +57,6 @@ class GameLooper(object):
         self.draws = 0
         self.total_plies = 0
         self.n_retrains = 0
-        self.all_evals = pd.DataFrame()
         self.clear_cache = False
         
         self._run_start = _now()
@@ -422,154 +423,58 @@ class GameLooper(object):
 
     def trigger_retrain(self):
         """
-        Build training tensors from self.training_queue and fit.
-        Supports new flattened 'policy' head (4288) stored in heads["policy"].
-        If any legacy factorized examples are present (heads without 'policy'),
-        they are skipped and a warning is printed. This keeps logic simple and
-        avoids brittle reconstruction of legal masks from factorized heads.
+        Pickles training queue and currnet config, starts retrain_worker in
+        a subprocess to avoid memory leak and slowdowns.
+        reloads model and infer on success.
         """
+
         if not self.training_queue:
             return
 
-        # check for additional data pkl and load+remove if present
-        add_pkl = os.path.join(self.config.run_dir, "additional_training_data.pkl")
-        additional = []
-        
-        if os.path.exists(add_pkl):
-            # may hit an unlucky access deny if during a write.
-            tries = 0
-            while tries < 3:
-                try:
-                    with open(add_pkl, "rb") as f:
-                        additional = pickle.load(f)
-                    # remove immediately so nothing is re-read later
-                    os.remove(add_pkl)
-                    n_add = len(additional)
-                    print(f"[retrain] found {n_add} additional training samples")
-                    break
-                except:
-                    # if we get an error, wait a bit and try again
-                    time.sleep(0.5)
-                    tries += 1
-        
-        if not additional:
-            print("No additional data found at", add_pkl)
-        
-        # combined list: existing queue first, additional appended
-        combined = list(self.training_queue) + list(additional)
-        n_main = len(self.training_queue)
+        # write training queue (list) to pkl
+        run_dir = self.config.run_dir
+        p_pending = os.path.join(run_dir, "pending_retrain.pkl")
+        tmp_pending = p_pending + ".tmp"
+        with open(tmp_pending, "wb") as f:
+            pickle.dump(combined, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_pending, p_pending)
+        print(f"[retrain] wrote pending_retrain.pkl ({len(combined)} examples)")
 
-        # Unpack examples
-        X_list = []
-        P_list = []        # flattened 4288 policy vectors
-        mask_list = []     # derived legal-mask (0/1)
-        Z_list = []
-        Z_taper_list = []
-        Vwq_list = []
-        is_add_flag = []
+        # pickle config dict (cfg may have been updated at runtime)
+        cfg_dict = self.config.to_dict()
+        cfg_dict['n_retrains'] = self.n_retrains
+        p_cfg = os.path.join(run_dir, "config.pkl")
+        tmp_cfg = p_cfg + ".tmp"
 
-        for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined)all_eval:
-            X_list.append(x)
-            P_list.append(policy)
-            mask_list.append(mask)
-            Z_list.append(z_stm)
-            Vwq_list.append(vwq)
-            Z_taper_list.append(z_tapered)
-            is_add_flag.append(i >= n_main)  # True for additional samples
+        with open(tmp_cfg, "wb") as f:
+            pickle.dump(cfg_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_cfg, p_cfg)
+        print("[retrain] wrote config.pkl")
 
-        # stack arrays
-        X = np.asarray(X_list, dtype=np.float32)             # (N, 8,8,29) expected
-        P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
-        M = np.stack(mask_list, axis=0).astype(np.int16)     # (N, 4288)
-        Z = np.asarray(Z_list, dtype=np.float32)
-        Vwq = np.asarray(Vwq_list, dtype=np.float32)
-        Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)
-        is_add = np.asarray(is_add_flag, dtype=np.bool_)
+        # find retrain_worker.py
+        retrain_script = cbu.find_script("retrain_worker.py", start_file=__file__)
 
-        # optionally blend (possibly tapered) outcome with visit-weighted Q
-        wz = self.config.target_y_weights.get("z", 0.25)
-        wz_taper = self.config.target_y_weights.get("z_taper", 0.5)
-        w_vwq = self.config.target_y_weights.get("vwq", 0.25)
-        Y_value = wz*Z + wz_taper*Z_taper_arr + w_vwq*Vwq
+        # spawn worker and fail fast if it fails
+        cmd = [sys.executable, retrain_script, "--run-dir", run_dir]
+        print("[retrain] launching worker:", " ".join(cmd))
 
-        # define a few masks here then ensure additional
-        # samples are not blended or downweighted
-        draw_mask = Z == 0
-        played_by_winner = Z == 1
-        if is_add.any():
-            Y_value[is_add] = Vwq[is_add]
-            draw_mask[is_add] = False
-            played_by_winner[is_add] = True
-        
-        Y_value = np.clip(Y_value, -1.0, 1.0)
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        rc = proc.returncode
+        if rc != 0:
+            # print to stderr
+            sys.stderr.write("[retrain] worker failed, aborting looper\n")
+            sys.stderr.write(f"[retrain] exit_code={rc}\n")
+            sys.stderr.write(f"[retrain] log_path={log_path}\n")
+            sys.stderr.write("=== WORKER STDOUT ===\n")
+            sys.stderr.write((proc.stdout or "") + "\n")
+            sys.stderr.write("=== WORKER STDERR ===\n")
+            sys.stderr.write((proc.stderr or "") + "\n")
+            # fail fast and loud
+            raise RuntimeError("retrain worker failed; aborting looper")
 
-        # initial per-sample weights (ones)
-        weights = np.ones_like(Y_value, dtype=np.float32)
-        lw = self.config.loss_weights
-        
-        # downweight draws so value head doesnt collapse
-        v_wts = lw['value_out']*weights
-        wts_before = v_wts.sum()
-        v_wts[draw_mask] *= max(self.config.draw_weight, 0.001)
-        wts_after = v_wts.sum()
-
-        # redistribute to not change overall loss weight
-        wt_lost = wts_before - wts_after
-        n_non_draws = (~draw_mask).sum()
-        if wt_lost > 0 and n_non_draws > 0:
-            v_wts[~draw_mask] += wt_lost/n_non_draws
-        
-        # policy weights vary depend on outcome
-        p_wts_win = lw['policy_winner']*weights
-        p_wts_lose = lw['policy_loser']*weights
-        p_wts = np.where(played_by_winner, p_wts_win, p_wts_lose)
-        
-        # assemble final Y dict and sample_weight mapping for TF fit
-        Y = {"value_out": Y_value, "policy_logits": P}
-        s_wts = {'value_out': v_wts, "policy_logits": p_wts}
-
-        # evaluation and logging
-        plt_file = os.path.join(self.config.run_dir, "true_vs_pred_plot_latest.png")
-        epoch = self.n_retrains
-        eval_df = cbu.score_game_data(self.model, X, M, Y, epoch, save_path=plt_file)
-        self.all_evals = pd.concat([self.all_evals, eval_df])
-        self.all_evals.round(5).to_csv(self.config.progress_csv_path, index=False)
-
-        if len(self.all_evals) and len(self.all_evals) % 2 == 0:
-            prog_plt_file = self.config.progress_plot_path
-            cbu.plot_training_progress(
-                self.all_evals, epoch=epoch, save_path=prog_plt_file
-            )
-
-        # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
-        history = self.model.fit(
-            X, Y, epochs=3, batch_size=128, verbose=0,
-            sample_weight=s_wts, shuffle=True
-        )
-
-        rows = []
-        for m, v in history.history.items():
-            name = "total" if m == "loss" else m.replace("_loss", "")
-            start = v[0]; end = v[-1]
-            delta = start - end
-            mark = "*" if delta < 0 else "+"
-            rows.append((name, start, end, delta, mark))
-        
-        name_w = max(len(r[0]) for r in rows)
-        num_w = 8   # width for numbers
-        fmt = (f"[epoch {epoch:4d}] [model fit]  "
-            f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
-            f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
-
-        for name, start, end, delta, mark in rows:
-            print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
-        
-        # checkpoint new weights
-        cfg = self.config
-        self.model.save(cfg.model_path)
-
+        # if here, retrain was a success. load new model and make new infer
         # make sure memory is clean to prevent slowdowns
-        del self.model, self.infer, history
+        del self.model, self.infer
         from tensorflow.keras import backend as K
         K.clear_session()
         gc.collect()
@@ -747,7 +652,6 @@ def init_selfplay():
             progress_df = pd.read_csv(config.progress_csv_path)
             n_retrains = len(progress_df)
             looper.n_retrains = n_retrains
-            looper.all_evals = progress_df
         except Exception as e:
             print(e)
     

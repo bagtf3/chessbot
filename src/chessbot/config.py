@@ -15,14 +15,14 @@ class Config(object):
     c_puct = 1.5
 
     # Simulation schedule
-    sims_floor = 50
-    sims_target = 100
+    sims_floor = 100
     sims_ceiling = 200
+    target_delta = 20
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 60
+    es_check_every = 20
     es_best_move_threshold = 0.85
     bs_best_move_threshold = 0.5
     prefer_top_q = False
@@ -32,7 +32,7 @@ class Config(object):
     micro_batch_size = 4
     games_at_once = 64
     n_training_games = 64
-    n_passes = 40
+    n_passes = 10
     
     move_limit = 200
     min_game_length = 10
@@ -58,7 +58,7 @@ class Config(object):
 
     # root noise
     add_root_noise = True
-    dirichlet_eps = 0.3
+    dirichlet_eps = 0.2
     dirichlet_alpha = 0.3
 
     # training

@@ -36,6 +36,19 @@ class MCTSTree(fasttree):
         self.moves_played = 0
         self.sims_done_total = 0
 
+        # naive early stop/bonus sims based on 1-2 move visit delta
+        # interpret as ratio
+        if cfg.target_delta < 1:
+            self.target_delta = int(cfg.target_delta*cfg.sims_floor)
+
+        # otherwise use number per se
+        elif td < cfg.sims_floor:    
+            self.target_delta = cfg.target_delta
+        
+        # fallback to 10%
+        else:
+            self.target_delta = int(0.1*cfg.sims_floor)
+        
         # early-stop rolling state
         self._es_last_checked_at = 0
         self._es_tripped = False
@@ -183,43 +196,61 @@ class MCTSTree(fasttree):
             return True
                     
         sims_done = self.sims_completed_this_move
-        sims_target = self.config.sims_target
-
-        # if not using the dec model, just hit the target
-        if not self.config.use_sim_decision_model:
-            return sims_done >= sims_target
-
         if sims_done < self.config.sims_floor:
             return False
+
+        if sims_done >= self.config.sims_ceiling:
+            self.sim_stop_reason = f"Sim ceiling {self.config.sims_ceiling} reached"
+            return True
 
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
             return False
 
-        # if here, run ES check
+        # if here, determine visit delta and test for early stop
         self._es_last_checked_at = sims_done
-        probs = self.get_sim_decision_probs()
-        if probs is None:
-            return False
-
-        # best move prob
-        bmp = np.ravel(probs)[-1]
-        string = f"best move prob {bmp:.3f} sims_done {sims_done}"
-        # need to be above the es (early stop) threshold to stop here
-        if sims_done >= self.config.sims_ceiling:
-            self.sim_stop_reason = f"Sim Limit reached: {string}"
+        rows = self.root_child_visits()
+        visits = [v[1] for v in rows]
+        visit_delta = visits[0]-visits[1]
+        if visit_delta >= self.target_delta:
+            self.sim_stop_reason = f"Visit delta {visit_delta} >= {self.target_delta}"
             return True
+        return False
+        
+        # # if not using the dec model, just hit the target
+        # if not self.config.use_sim_decision_model:
+        #     return sims_done >= sims_target
 
-        if sims_done < sims_target:
-            if bmp > self.config.es_best_move_threshold:
-                self._es_tripped = True
-                self.sim_stop_reason = f"ES triggered: {string}"
-                return True
+        # if sims_done < self.config.sims_floor:
+        #     return False
 
-        if sims_done >= sims_target:
-            # need to be above the bs (bonus sims) threshold to stop here
-            if bmp > self.config.bs_best_move_threshold:
-                self.sim_stop_reason = f"Sufficient: {string}"
-                return True
+        # if sims_done - self._es_last_checked_at < self.config.es_check_every:
+        #     return False
+
+        # # if here, run ES check
+        # self._es_last_checked_at = sims_done
+        # probs = self.get_sim_decision_probs()
+        # if probs is None:
+        #     return False
+
+        # # best move prob
+        # bmp = np.ravel(probs)[-1]
+        # string = f"best move prob {bmp:.3f} sims_done {sims_done}"
+        # # need to be above the es (early stop) threshold to stop here
+        # if sims_done >= self.config.sims_ceiling:
+        #     self.sim_stop_reason = f"Sim Limit reached: {string}"
+        #     return True
+
+        # if sims_done < sims_target:
+        #     if bmp > self.config.es_best_move_threshold:
+        #         self._es_tripped = True
+        #         self.sim_stop_reason = f"ES triggered: {string}"
+        #         return True
+
+        # if sims_done >= sims_target:
+        #     # need to be above the bs (bonus sims) threshold to stop here
+        #     if bmp > self.config.bs_best_move_threshold:
+        #         self.sim_stop_reason = f"Sufficient: {string}"
+        #         return True
         
         # otherwise keep searching
         return False

@@ -342,4 +342,4 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['scenario'] == 'piece_odds']
 games = [g for g in games if g['beat_sf']]
 #games = [g for g in games if g['vs_stockfish']]
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-6]['json_file'], sf_df=d); gv.replay()

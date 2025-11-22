@@ -631,6 +631,7 @@ class GameLooper(object):
                 print(f"[game stats] runtime (last 50) : {avg_runtime}")
         print("-"*72)
 
+
 def init_selfplay():
     # file structure first
     config = Config()

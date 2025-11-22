@@ -28,7 +28,7 @@ POLL_INTERVAL = 20
 BLUNDER_CP = 100
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 30
+ANALYZE_BATCH = 20
 
 # default analysis params
 DEPTH = 12

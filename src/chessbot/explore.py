@@ -196,7 +196,7 @@ def plot_and_report(df_trim, window):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run1"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -209,14 +209,14 @@ with open(pkl, "rb") as f:
 df_all = prev_run['df_all']
 df_means = prev_run['df_means']
 
-#df_all = df_all.query("scenario == ['random_init', 'pre_opened']").copy()
-#df_means = df_means.query("scenario == ['random_init', 'pre_opened']").copy()
+df_all = df_all.query("scenario != 'random_endgame'").copy()
+df_means = df_means.query("scenario != 'random_endgame'").copy()
 WINDOW = max(5, int(len(df_means) * 0.2 // 10 * 10))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
 print()
 
 # tidy up CPL
-df_all['clipped_loss'] = np.clip(df_all['loss'], -500, 500)
+df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
 clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
 
 # BMR
@@ -339,30 +339,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'pre_opened']
-#games = [g for g in games if g['beat_sf']]
-games = [g for g in games if g['vs_stockfish']]
+games = [g for g in scored if g['scenario'] == 'piece_odds']
+games = [g for g in games if g['beat_sf']]
+#games = [g for g in games if g['vs_stockfish']]
 gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
-
-#%%
-# early run stats
-# [speed stats] mps=8.7  lps=3584.4  gph=196.45
-
-# [loop stats] groups=21597  mbs=4         | new: collected=86388 avg=4.00
-# [stop stats] fastpath_breaks=0 (0.00%)   | collect_breaks=21597 (100.00%)
-# [pred stats] fill=511.2/512 (99.8%)      | wait=0.060s preds/s=8555.3
-# [leaf stats] priorless=4894 (4.49%)      | puct=14469839  puct_per_leaf=138.9
-# [cache hits] cached=21459 (19.677%)      | terminals=1207 (1.107%)
-# [game stats] n=128 avg ply=4.98          | sims per move=761.95
-
-# [TIME CHECK] avg sf_move   0.0443
-# [TIME CHECK] avg tree_move 0.0091
-# [TIME CHECK] avg finalize  0.0080
-
-# a few logs later
-# [TIME CHECK] avg sf_move   0.0398
-# [TIME CHECK] avg tree_move 0.0120
-# [TIME CHECK] avg finalize  0.0274
-
-
-#%%

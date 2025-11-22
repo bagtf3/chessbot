@@ -482,7 +482,6 @@ class GameLooper(object):
             # print to stderr
             sys.stderr.write("[retrain] worker failed, aborting looper\n")
             sys.stderr.write(f"[retrain] exit_code={rc}\n")
-            sys.stderr.write(f"[retrain] log_path={log_path}\n")
             sys.stderr.write("=== WORKER STDOUT ===\n")
             sys.stderr.write((proc.stdout or "") + "\n")
             sys.stderr.write("=== WORKER STDERR ===\n")
@@ -502,7 +501,7 @@ class GameLooper(object):
         self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
           self.model, max_bs=cfg.fwd_batch,
-          min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max, temp=1
+          min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max
         )
 
         self.infer_is_warm = False
@@ -680,6 +679,8 @@ def init_selfplay():
 if __name__ == '__main__':
     cfg = Config()
     phs = None
+    start = _now()
+    n_games = 0
     try:
         for pss in range(cfg.n_passes):
             print("[main loop] starting training loop number", pss)
@@ -689,6 +690,12 @@ if __name__ == '__main__':
                 phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
 
             looper.run()
+            n_games += looper.games_finished
+            if n_games:
+                elapsed = _now() - start
+                rt = cbu.format_time(elapsed)
+                gph = 3600 * n_games / elapsed
+                print(f"[main loop] runtime {rt} games {n_games} ({gph:.1f} per hour)")
 
     finally:
         if phs is not None:

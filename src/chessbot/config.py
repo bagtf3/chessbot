@@ -7,16 +7,16 @@ class Config(object):
     """
 
     # files
-    run_tag = "new_conv_net_run1"
+    run_tag = "conv_net_flat_run0"
     selfplay_dir =  SP_DIR
-    init_model = SP_DIR + "new_conv_net_run1/new_conv_net_run1_model.h5"
+    init_model = MODEL_DIR + "conv_64_flat_v1_0.h5"
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
     sims_floor = 50
-    sims_target = 1350
+    sims_target = 100
     sims_ceiling = 200
 
     # early stop
@@ -36,10 +36,10 @@ class Config(object):
     
     move_limit = 200
     min_game_length = 10
-    material_diff_cutoff = 25
-    material_diff_cutoff_span = 30
+    material_diff_cutoff = 10
+    material_diff_cutoff_span = 15
 
-    play_vs_sf_prob = 0.5
+    play_vs_sf_prob = -1
     sf_depth = 12
 
     # post hoc server
@@ -47,9 +47,9 @@ class Config(object):
     mine_bonus_data = True
     
     game_probs = {
-        "pre_opened": 0.25, "random_init": 0.25,
-        "piece_odds": 0.25, "piece_training": 0.05,
-        "random_middle_game": 0.20, "random_endgame": 0.0
+        "pre_opened": 0.30, "random_init": 0.30,
+        "piece_odds": 0.30, "piece_training": 0.05,
+        "random_middle_game": 0.05, "random_endgame": 0.0
     }
     
     # priors
@@ -57,16 +57,16 @@ class Config(object):
     prior_clip_min = 0.001
 
     # root noise
-    add_root_noise = False
-    dirichlet_eps = 0.05
-    dirichlet_alpha = 0.5
+    add_root_noise = True
+    dirichlet_eps = 0.3
+    dirichlet_alpha = 0.3
 
     # training
     training_queue_min = 409600
     fwd_batch = 256
 
-    target_y_weights = {'vwq':0.2, 'z': 0.4, 'z_taper':0.4}
-    loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.5}
+    target_y_weights = {'vwq':0.25, 'z': 0.5, 'z_taper':0.25}
+    loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
     draw_weight = 0.2
 
     def to_dict(self):

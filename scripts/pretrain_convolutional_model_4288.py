@@ -6,7 +6,7 @@ from chessbot.utils import GameGenerator, batch_policy_metrics, print_validation
 from chessbot.review import make_fake_visits
 import chess, chess.engine
 
-from chessbot.model import build_conv_64pv
+from chessbot.model import build_conv_64pv, build_conv_flat_64x67
 
 import pandas as pd
 import numpy as np
@@ -14,11 +14,11 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 
-MODEL_NAME = 'conv_64_token_12M'
-
-model, opt, loss_weights, loss_dict = build_conv_64pv(
-    d_model_embed=128, vocab_size=21, filters=196,
-    n_conv=16, proj_dim=96, name=MODEL_NAME
+MODEL_NAME = 'conv_64_flat_v1'
+    
+model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
+    d_model_embed=128, vocab_size=21, filters=296,
+    n_blocks=9, name=MODEL_NAME
 )
 
 model.summary()

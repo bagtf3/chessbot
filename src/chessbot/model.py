@@ -288,6 +288,97 @@ def build_conv_64pv(
     return model, opt, loss_weights, loss_dict
 
 
+def res_block_layernorm(x, channels, leak=0.01, name=None):
+    """
+    Residual block with Conv2D -> LayerNorm -> activation -> Conv2D ->
+    LayerNorm -> add. This avoids BatchNorm and is stable for small
+    batch sizes.
+    """
+    nm = "" if name is None else name + "_"
+    conv1 = layers.Conv2D(
+        channels, 3, padding="same", use_bias=False,
+        kernel_initializer="he_normal", name=nm + "conv1"
+    )(x)
+
+    ln1 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln1")(conv1)
+    act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(ln1)
+
+    conv2 = layers.Conv2D(
+        channels, 3, padding="same", use_bias=False,
+        kernel_initializer="he_normal", name=nm + "conv2"
+    )(act1)
+
+    ln2 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln2")(conv2)
+
+    out = layers.Add(name=nm + "add")([x, ln2])
+    out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
+    return out
+
+
+def build_conv_flat_64x67(
+    d_model_embed=128,
+    vocab_size=21,
+    filters=256,
+    n_blocks=9,
+    name="conv_flat_64x67",
+):
+    """
+    Conv-heavy model that uses LayerNormalization in the trunk rather
+    than BatchNormalization. This is better for small or variable batch
+    sizes commonly seen in selfplay.
+    """
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy("mixed_float16")
+
+    de, fl, vs = d_model_embed, filters, vocab_size
+
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
+    token_emb = layers.Embedding(input_dim=vs, output_dim=de, name="token_emb")(enc_in)
+    x = layers.Reshape((8, 8, de), name="to_2d")(token_emb)
+
+    x = layers.Conv2D(
+        fl, 3, padding="same", use_bias=False,
+        kernel_initializer="he_normal", name="conv_init"
+    )(x)
+
+    # drop BatchNorm here, rely on LayerNorm inside blocks
+    x = layers.LeakyReLU(alpha=0.01, name="lrelu_init")(x)
+
+    for i in range(n_blocks):
+        x = res_block_layernorm(x, fl, leak=0.01, name=f"res{i}")
+
+    x = layers.Conv2D(fl, 1, padding="same", use_bias=False, name="conv_mix_1x1")(x)
+    x = layers.LayerNormalization(epsilon=1e-5, name="ln_mix")(x)
+    x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
+
+    policy_map = layers.Conv2D(
+        67, 1, padding="same", activation=None, name="policy_conv_67"
+    )(x)
+
+    feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
+    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(feat_64_67)
+
+    v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
+    v = layers.Dense(fl // 2, activation="relu", name="v_fc1")(v_pool)
+    v = layers.Dense(fl // 4, activation="relu", name="v_fc2")(v)
+    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
+
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
+
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+
+    loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
+
+    return model, opt, loss_weights, loss_dict
+
+
 def warm_conv_infer(graph, max_bs):
     for _ in range(100):
         rep_mask = (np.random.rand(max_bs, 4288) < 0.02).astype(np.int32)

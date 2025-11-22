@@ -339,7 +339,7 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'piece_odds']
-games = [g for g in games if g['beat_sf']]
-#games = [g for g in games if g['vs_stockfish']]
+games = [g for g in scored if g['scenario'] == 'pre_opened']
+#games = [g for g in games if g['beat_sf']]
+games = [g for g in games if g['vs_stockfish']]
 gv = GameViewer(games[-6]['json_file'], sf_df=d); gv.replay()

@@ -9,6 +9,7 @@ from pyfastchess import Evaluator, MCTSTree as fasttree
 from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
 from pyfastchess import terminal_value_white_pov
 
+from chessbot import ENDGAME_LOC
 from chessbot.psqt import build_weights
 from chessbot.review import score_to_value_stm_pov, make_fake_visits
 from chessbot.utils import calc_entropy, rnd
@@ -42,7 +43,7 @@ class MCTSTree(fasttree):
             self.target_delta = int(cfg.target_delta*cfg.sims_floor)
 
         # otherwise use number per se
-        elif td < cfg.sims_floor:    
+        elif cfg.target_delta < cfg.sims_floor:    
             self.target_delta = cfg.target_delta
         
         # fallback to 10%
@@ -313,6 +314,7 @@ class ChessGame(object):
         
         self.vs_stockfish = meta['vs_stockfish']
         self.stockfish_is_white = meta['stockfish_is_white']
+        self.sf_search_depth = []
         self.tree = MCTSTree(self.board, self.config)
         self.tree_data = {}
         self.moves_played = []
@@ -333,10 +335,17 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        val_sf, best_move = cbu.sf_eval(
+        tl = 0.075 if self.config.is_validation_run else None
+        res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
-            depth=self.config.sf_depth, engine=eng
+            depth=self.config.sf_depth, time_lim=tl, engine=eng
         )
+
+        if len(res_tup) == 2:
+            val_sf, best_move = res_tup
+        else:
+            val_sf, best_move, searched = res_tup
+            self.sf_search_depth.append(searched)
 
         return best_move, val_sf
     
@@ -534,23 +543,24 @@ class ChessGame(object):
             return True
         
         # Syzygy probe if few pieces
-        if self.board.piece_count() <= 5:
-            # may not work so just go as normal
-            try:
-                outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
-                with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
-                    # gotta flip back to python chess here
-                    chess_board = chess.Board(self.board.fen())
-                    table_res = tablebase.probe_wdl(chess_board)
-                    
-                table_res = table_res if chess_board.turn else -1*table_res
-                self.outcome = outcomes[table_res]
-                return True
-            except:
-                pass
+        if self.config.use_syzygy:
+            if self.board.piece_count() <= 5:
+                # may not work so just go as normal
+                try:
+                    outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
+                    with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
+                        # gotta flip back to python chess here
+                        chess_board = chess.Board(self.board.fen())
+                        table_res = tablebase.probe_wdl(chess_board)
+                        
+                    table_res = table_res if chess_board.turn else -1*table_res
+                    self.outcome = outcomes[table_res]
+                    return True
+                except:
+                    pass
            
         hs = self.board.history_size()
-        if hs > self.config.move_limit:
+        if hs > self.config.max_game_length:
             self.outcome = 0.0
             return True
         # if we made it here the game is active

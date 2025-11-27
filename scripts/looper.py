@@ -18,9 +18,11 @@ from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
 from chessbot import ENDGAME_LOC, SF_LOC
-from chessbot.model import load_model, save_model, make_conv_infer, warm_conv_infer
+from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
+from chessbot.validation import ValidationConfig, paired_validation_games
+from chessbot.validation import build_validation_summary, append_validation_summary
 
 import chessbot.utils as cbu
 from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
@@ -37,8 +39,15 @@ class GameLooper(object):
         self.games_finished = 0
         self.active_games = []
         self.sf_count = 0
-        self.fill_active_games()
 
+        # different game logic for training vs validation
+        if self.config.is_validation_run:
+            self.active_games = paired_validation_games(self.config)
+            self.collect_training_data = False
+        else:
+            self.fill_active_games()
+            self.collect_training_data = True
+        
         self.model = model
 
         cfg = self.config
@@ -71,6 +80,7 @@ class GameLooper(object):
         self.lps = RateMeter("leafs")
         self._last_stats_log = 0.0
         self.prediction_times = []
+        self.sf_search_depths = []
 
         self.moves_played = 0
         self.sims_done_total = 0
@@ -78,7 +88,7 @@ class GameLooper(object):
     def fill_active_games(self):
         fens_seen = set()
         cfg = self.config
-        needed = cfg.n_training_games - self.games_finished - len(self.active_games)
+        needed = cfg.n_games - self.games_finished - len(self.active_games)
         if needed <= 0:
             return
 
@@ -116,24 +126,20 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        mbs = cfg.micro_batch_size
+        mbs = cfg.micro_batch
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
         collect_list, collect_agg = [], []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            eng.configure({"Threads": 2, "Hash": 256})
-            while self.games_finished < cfg.n_training_games:
+            eng.configure(cfg.sf_config)
+            while self.games_finished < cfg.n_games:
                 if not self.active_games:
-                    break
-
-                # break to train then restart from the outside
-                if len(self.training_queue) >= cfg.training_queue_min:
                     break
                 
                 preds_batch = []
                 finished = []
-                for game in self.active_games:
+                for game in self.active_games[:cfg.games_at_once]:
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
                         sf_terminal = game.make_move_with_stockfish(eng)
@@ -163,7 +169,7 @@ class GameLooper(object):
                         if game.is_stockfish_turn():
                             continue
 
-                    # otherwise, collect up to micro_batch_size leaves for this game
+                    # otherwise, collect up to micro_batch leaves for this game
                     # CollectResults object from C++
                     start = _now()
                     res = game.tree.collect_many_leaves(mbs, max_fastpath)
@@ -209,6 +215,11 @@ class GameLooper(object):
                         print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
                         print(f"[TIME CHECK] sum collection {np.sum(collect_list):.4f}")
                         collect_list.clear()
+                    
+                    if self.sf_search_depths:
+                        sd = self.sf_search_depths
+                        m0, m1, m2 = np.mean(sd), min(sd), max(sd)
+                        print(f"[SF DEPTH] mean: {m0:.1f} min: {m1} max: {m2}")
                 
                 # resolve fresh predictions back into each game tree
                 for game in self.active_games:
@@ -246,7 +257,7 @@ class GameLooper(object):
                 self.fill_active_games()
 
         # train with whatever we got and final report
-        if len(self.training_queue) >= min(2000, cfg.training_queue_min):
+        if self.collect_training_data:
             self.trigger_retrain()
 
         self.maybe_log_results(force=True)
@@ -359,7 +370,8 @@ class GameLooper(object):
         # store for logging too
         self.moves_played += moves
         self.sims_done_total += sims_total
-        
+        self.sf_search_depths += game.sf_search_depth
+
         # cast types for JSON 
         mem_summary = {
             "ts": _now(),
@@ -423,6 +435,11 @@ class GameLooper(object):
         os.makedirs(os.path.dirname(idx_file), exist_ok=True)
         with open(idx_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
+
+        # we do not train on validation games to prevent leakage        
+        if not self.collect_training_data:
+            game.examples = []
+            return
         
         # game outcome in white POV (1 = white win, -1 = black win)
         z = game.outcome if game.outcome is not None else 0.0
@@ -439,9 +456,6 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
-        #if len(self.training_queue) >= self.config.training_queue_min:
-        #    self.trigger_retrain()
-
     def trigger_retrain(self):
         """
         Pickles training queue and currnet config, starts retrain_worker in
@@ -450,6 +464,9 @@ class GameLooper(object):
         """
 
         if not self.training_queue:
+            return
+        
+        if not self.collect_training_data:
             return
         
         # write training queue (list) to pkl
@@ -511,7 +528,7 @@ class GameLooper(object):
         self.n_retrains += 1
         self.clear_cache = True
 
-    def maybe_log_results(self, every_sec=30.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=45.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"
@@ -632,28 +649,15 @@ class GameLooper(object):
         print("-"*72)
 
 
-def init_selfplay():
-    # file structure first
-    config = Config()
-    run_dir = os.path.join(config.selfplay_dir, config.run_tag)
-    Config.run_dir = run_dir
-    
-    game_dir = os.path.join(run_dir, "game_logs")
-    Config.game_dir = game_dir
-    
-    Config.game_index_file = os.path.join(run_dir, "game_index.json")
-    Config.progress_csv_path = os.path.join(run_dir, "eval_progress.csv")
-    Config.progress_plot_path = os.path.join(run_dir, "eval_progress.png")
-    
-    for d in [run_dir, game_dir]:
-        os.makedirs(d, exist_ok=True)
-    config = Config()
-    
-    # deal with model file structure first
+def init_selfplay(validation=False):
+    # choose config type and ensure paths are initialized
+    config = Config() if not validation else ValidationConfig()
+
     model_name = config.run_tag + "_model.h5"
-    model_path = os.path.join(run_dir, model_name)
+    model_path = os.path.join(config.run_dir, model_name)
+    config.model_path = model_path
     Config.model_path = model_path
-    
+
     if os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
         model = load_model(model_path)
@@ -661,19 +665,18 @@ def init_selfplay():
         print(f"[init] Loading {config.init_model}")
         model = load_model(config.init_model)
         save_model(model, model_path)
-    config = Config()
-    
-    looper = GameLooper(model=model, cfg=Config())
 
-    # infer the number of trainings already done from existing files
+    looper = GameLooper(model=model, cfg=config)
+
+    # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
         try:
             progress_df = pd.read_csv(config.progress_csv_path)
             n_retrains = len(progress_df)
             looper.n_retrains = n_retrains
         except Exception as e:
-            print(e)
-    
+            print("[init_selfplay] failed reading progress csv:", e)
+
     return looper, config
 
 
@@ -681,16 +684,23 @@ if __name__ == '__main__':
     cfg = Config()
     phs = None
     start = _now()
-    n_games = 0
+    n_games, run_num = 0, 1
     try:
-        for pss in range(cfg.n_passes):
-            print("[main loop] starting training loop number", pss)
-            looper, cfg = init_selfplay()
+        while run_num <= cfg.n_rounds:
+            print("[main loop] starting training loop number", run_num)
+            is_validation = run_num % cfg.validation_every == 0
+            looper, cfg = init_selfplay(is_validation)
+
             # look to start post hoc server on the first loop if its not yet running
             if phs is None and cfg.run_post_hoc and cfg.run_dir:
                 phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
 
             looper.run()
+            run_num += 1
+            if is_validation:
+                summary = build_validation_summary(looper)
+                append_validation_summary(looper.config.run_dir, summary)
+            
             n_games += looper.games_finished
             if n_games:
                 elapsed = _now() - start
@@ -701,4 +711,3 @@ if __name__ == '__main__':
     finally:
         if phs is not None:
             stop_post_hoc_server(phs, timeout=10)
-

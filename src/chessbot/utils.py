@@ -37,8 +37,8 @@ def cp_to_value(cp):
         return np.clip(cp.score() / 1000, -0.95, 0.95)
 
 
-def cp_to_value_tanh(cp, mid_cp=400.0):
-    # scale so tanh(k * mid_cp) == 0.5  =>  k = atanh(0.5) / mid_cp
+def cp_to_value_tanh(cp, mid_cp=200.0):
+    # scale so tanh(k * mid_cp) == 0.5  ->  k = atanh(0.5) / mid_cp
     k = math.atanh(0.5) / mid_cp
 
     # clip so checkmates still look much better
@@ -82,10 +82,15 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
     else:
         new_eng = False
 
-    limit = chess.engine.Limit(depth=depth)
-    # optional time limit mode
-    if time_lim is not None:
+    # dynamic limit for depth, time limit or both
+    if depth is None:
         limit = chess.engine.Limit(time=time_lim)
+    
+    elif time_lim is None:
+        limit = chess.engine.Limit(depth=depth)
+
+    else:
+        limit = chess.engine.Limit(depth=depth, time=time_lim)
 
     try:
         info = engine.analyse(b, limit=limit, info=chess.engine.INFO_ALL)

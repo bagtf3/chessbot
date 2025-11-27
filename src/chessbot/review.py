@@ -28,11 +28,11 @@ POLL_INTERVAL = 20
 BLUNDER_CP = 100
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 20
+ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 12
-EQUIV_RANGE = 12
+DEPTH = 10
+EQUIV_RANGE = 15
 
 # stops the post hoc server
 POST_HOC_STOP = False
@@ -827,8 +827,8 @@ def make_fake_visits(mv, lms, ratio_best=60):
 def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
     """
     cm: list of {'uci': ..., 'visits': ...}
-    Ensure every legal move in lms appears (min 1), set played_mv -> 1,
-    set best_mv -> (old_max + 5), keep others' counts from cm.
+    Ensure every legal move in lms appears (min 1) and swap visits
+    for best and played with 10% bump. This stabilizes training.
     Return list of [uci, int_visits] sorted desc.
     """
     # build dict of existing counts (min 1)
@@ -847,9 +847,9 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
     # compute old max
     old_max = max(d.values()) if d else 1
 
-    # adjust
-    d[played_mv] = 1
-    d[best_mv] = old_max + 5
+    # adjust by swapping visits between played and best with 10% bump
+    d[played_mv] = int(np.ceil(0.9*d[best_mv]))
+    d[best_mv] = int(np.ceil(1.1*old_max))
 
     # build sorted list
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)

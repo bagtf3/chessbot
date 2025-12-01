@@ -531,7 +531,7 @@ class GameLooper(object):
         self.n_retrains += 1
         self.clear_cache = True
 
-    def maybe_log_results(self, every_sec=45.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"

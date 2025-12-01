@@ -112,10 +112,15 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         return val, str(best_move), search_depth
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000_plus.pkl"
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
 with open(uci_path_path, "rb") as f:
     PATHS = pickle.load(f)
     
+
+uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
+with open(uci_path_path_mini, "rb") as f:
+    MINI_PATHS = pickle.load(f)
+
 
 def rnd(x, n):
     return np.round(x, n)
@@ -772,8 +777,8 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
         return " ".join(fen.split(" ")[:4])
     
     start = chess.Board()
-    seed_sans = ["e4", "d4", "Nf3", "c4", "g3"]
-    replies_sans = ["e5", "d5", "c5", "e6", "d6", "c6", "Nf6", "g6"]
+    seed_sans = ["e4", "d4", "c4", "Nf3", "g3", "c3", "f4"]
+    replies_sans = ["e5", "c5", "c6", "e6", "Nf6", "d5", "d6", "g6"]
 
     paths = []
     seen = set()
@@ -790,7 +795,7 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
 
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
     eng.configure({"Threads": 2, "Hash": 256})
-    limit = chess.engine.Limit(depth=20, time=0.05)
+    limit = chess.engine.Limit(depth=20, time=0.075)
     start_time = time.time()
     last_check_in = start_time
     try:
@@ -859,21 +864,21 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     return paths
 
     
-def get_pre_opened_game(index=None):
+def get_pre_opened_game(index=None, mini=False):
     b = fastboard()
-
+    path_list = MINI_PATHS if mini else PATHS
     if index is None:
-        moves_to_play = random.choice(PATHS)
+        moves_to_play = random.choice(path_list)
     else:
         try:
-            moves_to_play = PATHS[index]
+            moves_to_play = path_list[index]
         except:
             print(
                 f"No premove path found for {index}!",
-                f"please choose 0 - {len(PATHS)-1}.",
+                f"please choose 0 - {len(path_list)-1}.",
                 "Selecting random premove path"
             )
-            moves_to_play = random.choice(PATHS)
+            moves_to_play = random.choice(path_list)
 
     for mtp in moves_to_play:
         b.push_uci(mtp)
@@ -1105,7 +1110,11 @@ class GameGenerator(object):
         if game_type == "pre_opened":
             board = get_pre_opened_game()
             meta = {"scenario": "pre_opened"}
-            
+        
+        elif game_type == "pre_opened_mini":
+            board = get_pre_opened_game(mini=True)
+            meta = {"scenario": "pre_opened_mini"}
+        
         elif game_type == "random_init":
             plies = 2*np.random.randint(0, 4)
             board = random_init(plies)

@@ -266,7 +266,8 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -320,9 +321,8 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-scored = [g for g in all_games if not g['vs_stockfish'] and g['result'] != 0]
-games = [g for g in scored if g['scenario'] == 'pre_opened']
-gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['scenario'] == 'startpos']
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 
 #%%
 ## Plot everything so far
@@ -501,28 +501,23 @@ print(f"Delta by scenario last {WINDOW} games")
 print(delta)
 print()
 
-from chessbot.utils import PATHS
 
-first_move = ['e2e4', 'd2d4', 'c2c4', 'g1f3', 'g2g3']
-second_move = ['e7e5', 'd7d5', 'c7c5', 'g8f6', 'c7c6', 'e7e6', 'd7d6']
-l = []
-l.append([])
-for i in first_move:
-    l.append([i])
-    for j in second_move:
-        l.append([i, j])
+from chessbot.utils import greedy_sf_tree_paths
+new_paths = greedy_sf_tree_paths(5000, multipv=5)
 
 
-from pyfastchess import Board
-for moves in l:
-    b = Board()
-    for move in moves:
-        b.push_uci(move)
-    
-    if moves not in PATHS:
-        print(moves)
-        PATHS.append(moves)
-
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000_plus.pkl"
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths.pkl"
 with open(uci_path_path, "wb") as f:
-    pickle.dump(PATHS, f, protocol=pickle.HIGHEST_PROTOCOL)
+    pickle.dump(new_paths, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+from collections import defaultdict
+counts = defaultdict(int)
+for p in new_paths:
+    if len(p) < 2:
+        continue
+    key = (p[0], p[1])
+    counts[key] += 1
+
+for k, v in counts.items():
+    print(k, v)
+    

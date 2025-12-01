@@ -420,60 +420,52 @@ class ChessGame(object):
     
     def make_move_with_stockfish(self, eng):
         """
-        Stockfish plays one move. When the MCTS root has enough sims and the
-        tree agrees (or nearly agrees) with Stockfish, use the tree's visit
-        counts as the policy target (optionally bumping SF's visits so it's #1).
-        Otherwise fall back to the old 60/40 supervised target.
+        Stockfish plays one move. If tree has visits:
+        - if SF move is top, use tree visits as-is
+        - otherwise swap top visited move with SF move, bump SF by 10%
+        If no visits, fall back to make_fake_visits.
         """
-        
         legal = self.board.legal_moves()
         if not legal:
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
         mv, sf_v = self.get_stockfish_move(eng)
-        
         self.sf_eval = sf_v
 
-        # gather root visit info from the tree (list sorted desc by visits)
         rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
         total_visits = sum([n for _, n in rows]) if rows else 0
 
-        use_tree_visits = False
         visit_map = None
+        use_tree_visits = False
 
-        if rows and total_visits >= 100:
-            # map uci -> visits for quick lookup
+        # make sure we have at least 10 visits for stability
+        if rows and total_visits > 10:
             visit_map = {u: n for u, n in rows}
             most_visited_uci, max_visits = rows[0]
-            sf_visits = visit_map.get(mv, 0.0)
-
-            # case A: tree already picks SF move as top choice
             if most_visited_uci == mv:
                 use_tree_visits = True
-
-            # case B: SF move is close to top -> use tree visits but nudge SF to top
-            elif sf_visits >= 0.5 * max_visits:
+            else:
+                # swap top visited with SF move
+                top_count = visit_map.get(most_visited_uci, 0)
+                sf_count = visit_map.get(mv, 0)
+                visit_map[most_visited_uci] = 1 + int(sf_count*0.9)
+                visit_map[mv] = 1 + int(top_count*1.1)
                 use_tree_visits = True
-                # make SF strictly first by setting its visits > max_visits
-                visit_map[mv] = max_visits + 10
 
         if use_tree_visits and visit_map is not None:
-            visits = [max(1, visit_map.get(u, 1.0)) for u in legal]
             ucis = legal
-
+            visits = [max(1, visit_map.get(u, 1)) for u in ucis]
         else:
-            # make_fake_visits returns [[uci,count], ...]
             raw = make_fake_visits(mv, legal, ratio_best=60)
-            ucis   = [x[0] for x in raw]
-            visits = [x[1] for x in raw]
-        
+            ucis = [x[0] for x in raw]
+            visits = [int(x[1]) for x in raw]
+
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
         self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
-
-        # finally play SF's move on the board and advance tree
         return self.push_move(mv)
+
 
     def make_move_from_tree(self):
         """

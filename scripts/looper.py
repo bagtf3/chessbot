@@ -143,15 +143,19 @@ class GameLooper(object):
                 for game in self.active_games[:cfg.games_at_once]:
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
-                        sf_terminal = game.make_move_with_stockfish(eng)
-                        mps.tick(1)
-                            
-                        if sf_terminal:
-                            self.finalize_game_data(game)
-                            self.maybe_log_results()
-                            finished.append(game.game_id)
-                            # pass until the next turn
-                            continue
+                        # still run sims of SF turn for training
+                        sims_done = game.tree.sims_completed_this_move
+                        target = int(cfg.sims_floor*0.5)
+                        if sims_done >= target:
+                            sf_terminal = game.make_move_with_stockfish(eng)
+                            mps.tick(1)
+                                
+                            if sf_terminal:
+                                self.finalize_game_data(game)
+                                self.maybe_log_results()
+                                finished.append(game.game_id)
+                                # pass until the next turn
+                                continue
         
                     # if this game has reached its local sim budget, make the move
                     if game.tree.stop_simulating():
@@ -167,8 +171,8 @@ class GameLooper(object):
                             continue
                         
                         # if its stockfish turn, dont do any sims
-                        if game.is_stockfish_turn():
-                            continue
+                        #if game.is_stockfish_turn():
+                        #    continue
 
                     # otherwise, collect up to micro_batch leaves for this game
                     # CollectResults object from C++
@@ -176,7 +180,7 @@ class GameLooper(object):
                     res = game.tree.collect_many_leaves(mbs, max_fastpath)
                     stop = _now()
                     collect_agg.append(stop-start)
-                    # previous tuple mapping was (count_new, count_terminal, count_cached)
+                    
                     nn = res.count_new
                     nt = res.count_terminal
                     nc = res.count_cached

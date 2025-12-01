@@ -41,8 +41,8 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 0
-    sf_depth = 15
+    play_vs_sf_prob = 0.5
+    sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
     # post hoc server

@@ -750,21 +750,20 @@ def random_init(plies=5, python_chess=False):
     return b
 
 
-def greedy_sf_tree_paths(n_positions=5000, multipv=4, max_depth=7, eval_thresh=150):
+def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     """
     Return a list of UCI move lists (paths) from STARTPOS via greedy BFS.
     Includes STARTPOS as [] and all intermediate paths until n_positions reached.
 
     Args:
-        n_positions : target number of positions (approx; includes STARTPOS)
+        n_pos : target number of positions (approx; includes STARTPOS)
         multipv     : how many top moves to expand per node
-        max_depth   : Stockfish search depth for analysis
-        eval_thresh : only expand moves within (best_cp - cp) <= eval_thresh
-        sf_path     : path to stockfish binary; if None, uses chess.engine default
+        thresh : only expand moves within (best_cp - cp) <= eval_thresh
+        margin : only add paths with abs(cb) within this margin
 
     Returns:
         paths : list[list[str]] such as:
-            [ [],
+            [
               ['e2e4'], ['d2d4'], ['c2c4'], ['g1f3'],
               ['e2e4','d7d5'], ... ]
     """
@@ -772,45 +771,72 @@ def greedy_sf_tree_paths(n_positions=5000, multipv=4, max_depth=7, eval_thresh=1
     def short_fen(fen):
         return " ".join(fen.split(" ")[:4])
     
-    # Seed: STARTPOS plus 5 common first moves
     start = chess.Board()
     seed_sans = ["e4", "d4", "Nf3", "c4", "g3"]
+    replies_sans = ["e5", "d5", "c5", "e6", "d6", "c6", "Nf6", "g6"]
 
-    paths = []                 # output paths
-    seen = set()               # short-FEN dedup
-    q = deque()                # queue of (board, path)
+    paths = []
+    seen = set()
+    q = deque()
 
-    # Add STARTPOS
-    paths.append([])
-    seen.add(short_fen(start.fen()))
-
-    # Enqueue seeds
     for san in seed_sans:
         mv = start.parse_san(san)
         b2 = start.copy(); b2.push(mv)
-        q.append( (b2, [mv.uci()]) )
+        q.append((b2, [mv.uci()]))
+        for rep in replies_sans:
+            mv_rep = b2.parse_san(rep)
+            b3 = b2.copy(); b3.push(mv_rep)
+            q.append((b3, [mv.uci(), mv_rep.uci()]))
 
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-
+    eng.configure({"Threads": 2, "Hash": 256})
+    limit = chess.engine.Limit(depth=20, time=0.05)
+    start_time = time.time()
+    last_check_in = start_time
     try:
-        while q and len(paths) < n_positions:
+        while q and len(paths) < n_pos:
+            now = time.time()
+            if now - last_check_in > 20:
+                rt = format_time(now - start_time)
+                nstr = f"{len(paths)}/{n_pos} completed paths"
+                pps = len(paths) / (now - start_time)
+                print("[check in]", nstr, f"{pps:.3f} paths/sec. tot run time:", rt)
+                last_check_in = now
+
             board, path = q.popleft()
             key = short_fen(board.fen())
             if key in seen:
                 continue
 
+            # For terminal boards, accept and don't expand
+            if board.is_game_over():
+                seen.add(key)
+                paths.append(path)
+                continue
+
+            # analyse once, use result both for eval_margin check and expansion
+            info = eng.analyse(board, limit=limit, multipv=multipv)
+            if not info:
+                continue
+
+            # evaluation from White's POV (absolute position eval)
+            score = info[0].get("score")
+            eval_white = None
+            if score is not None:
+                eval_white = score.pov(chess.WHITE).score(mate_score=1500)
+
+            # skip positions with mate or undefined score when using margin
+            if margin is not None:
+                if eval_white is None:
+                    continue
+                if abs(eval_white) > margin:
+                    continue
+
+            # passed margin (or margin disabled) -> accept path
             seen.add(key)
             paths.append(path)
 
-            if board.is_game_over():
-                continue
-
-            info = eng.analyse(
-                board, chess.engine.Limit(depth=max_depth), multipv=multipv
-            )
-            if not info:
-                continue
-            
+            # now expand selected multipv moves (filtered by thresh)
             best_cp = info[0]["score"].pov(board.turn).score(mate_score=1500)
             if best_cp is None:
                 best_cp = 0
@@ -819,14 +845,14 @@ def greedy_sf_tree_paths(n_positions=5000, multipv=4, max_depth=7, eval_thresh=1
                 sc = d["score"].pov(board.turn).score(mate_score=1500)
                 if sc is None:
                     continue
-                if best_cp - sc > eval_thresh:
+                if best_cp - sc > thresh:
                     continue
                 if "pv" not in d or not d["pv"]:
                     continue
                 mv = d["pv"][0]
                 b2 = board.copy()
                 b2.push(mv)
-                q.append( (b2, path + [mv.uci()]) )
+                q.append((b2, path + [mv.uci()]))
     finally:
         eng.quit()
 

@@ -386,20 +386,20 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
+def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
     enc_np: int32 [B,64], legal_np: int32 [B,4288].
-    min_p, max_p, temp are baked into the closure.
+    min_p, max_p are baked into the closure.
+    vscale scales the model value output (default 0.9 -> range ~[-0.9,0.9])
     """
 
     BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
     EPS = tf.constant(1e-12, dtype=tf.float32)
 
-    # baked float32 constants for the graph
     min_p_c = tf.constant(float(min_p), dtype=tf.float32)
     max_p_c = tf.constant(float(max_p), dtype=tf.float32)
-    temp_c = tf.constant(float(temp), dtype=tf.float32)
+    value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
 
     @tf.function(input_signature=[
         tf.TensorSpec([None, 64], tf.int32),
@@ -410,19 +410,15 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
         logits, value = model(enc, training=False)
         logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4288)
 
-        # mask as float32
         mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
-
-        # cast logits -> float32 for stable softmax under mixed precision
         logits32 = tf.cast(logits, tf.float32)
 
         # mask illegal moves with a large negative in float32
         masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
 
-        # temperature-stable softmax in float32
-        scaled = masked_logits32 / temp_c
-        row_max = tf.reduce_max(scaled, axis=1, keepdims=True)
-        exp = tf.exp(scaled - row_max) * mask
+        # softmax in float32 (temperature removed)
+        row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
+        exp = tf.exp(masked_logits32 - row_max) * mask
         sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
         has_any = sumexp > 0.0
         probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
@@ -438,8 +434,8 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
             tf.zeros_like(clipped)
         )
 
-        # cast value to float32
-        value_f = tf.cast(value, tf.float32)
+        # scale value to reduce range (helps find mate scores)
+        value_f = tf.cast(value, tf.float32) * value_scale_c
         return probs_final, value_f
 
     def base_fwd(pair):
@@ -468,7 +464,7 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, temp=1.0):
                 parts = [p_probs, p_val]
             else:
                 parts[0] = np.concatenate([parts[0], p_probs], axis=0)
-                parts[1] = np.concatenate([parts[1], p_val],  axis=0)
+                parts[1] = np.concatenate([parts[1], p_val], axis=0)
             i = j
         return parts
     return fwd

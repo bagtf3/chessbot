@@ -61,52 +61,50 @@ class MCTSTree(fasttree):
                 self.config.sim_decision_model_path, nthread=1
             )
 
-    def best(self):
-        # If not configured, delegate straight to the C++/base implementation.
+def best(self):
+    """
+    Before ply 20: sample from the top-8 moves by visits using a
+    temperature schedule that decays to near-deterministic by ply 20.
+    At/after ply 20: delegate to the base implementation.
+    Returns (uci, None) like the original.
+    """
+    # if at/after the convergence ply, just use C++/base behavior
+    if (self.n_plies >= 20) or (self.config.sample_moves == False):
         return super().best()
-        # if not self.config.use_q_override:
-        #     return super().best()
+
+    # gather root visits (desc sorted list of (uci, N))
+    rows = self.root_child_visits()
+    if not rows:
+        return super().best()
+
+    ucis = [u for u, _ in rows]
+    visits = np.array([n for _, n in rows], dtype=np.float64)
+
+    # trivial cases
+    if len(ucis) == 1 or visits.sum() <= 0.0:
+        return ucis[0], None
+
+    # force sampling only from the top 8 moves
+    top_k = min(8, len(ucis))
+    top_ucis = ucis[:top_k]
+    top_visits = visits[:top_k]
+
+    # temperature schedule: linear decay from temp_max (ply 0) to
+    # temp_min (ply 20). Small temp_min makes softmax -> argmax.
+    temp_min = self.config.move_sample_temp_range[0]
+    temp_max = self.config.move_sample_temp_range[1]
     
-        # details = self.root_child_details()
-    
-        # # build candidate list
-        # cands = []
-        # white_to_move = self.root().board.side_to_move() == 'w'
-        # mult = 1 if white_to_move else -1
-        # for d in details:
-        #     cands.append({"uci": d.uci, "visits": d.N, "Q": mult * d.Q, "P": d.prior})
-    
-        # # sort by visits descending
-        # c_sorted = sorted(cands, key=lambda x: x["visits"], reverse=True)
-        # top = c_sorted[0]
-        # top_vis = top["visits"]
-        # top_q = top["Q"]
-    
-        # # read thresholds from Config
-        # vis_ratio = self.config.q_override_vis_ratio
-        # q_margin = self.config.q_override_q_margin
-        # min_vis_cfg = self.config.q_override_min_vis
-        # top_k = self.config.q_override_top_k
-    
-        # # Compute absolute minimum visits required
-        # vis_min = max(min_vis_cfg, top_vis * vis_ratio)
-    
-        # # Eligible among top_k
-        # eligible = [c for c in c_sorted[:top_k] if c["visits"] >= vis_min]
-    
-        # if not eligible:
-        #     return top["uci"], None
-    
-        # # Pick the eligible one with highest Q
-        # best_q_c = max(eligible, key=lambda x: x["Q"])
-    
-        # if best_q_c["Q"] >= top_q + q_margin and best_q_c["uci"] != top["uci"]:
-            
-        #     print(f"[choose move] Playing non-top-Q  white to move: {white_to_move}")
-        #     print(f"[choose move] {best_q_c} vs {top}")
-        #     return best_q_c["uci"], None
-        # else:
-        #     return top["uci"], None
+    frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
+    temp = temp_min + (temp_max - temp_min) * frac
+
+    # build stable logits from visits: use log(visits) so scale is sane
+    logits = np.log(top_visits + 1e-12) / max(1e-12, temp)
+    logits = logits - np.max(logits)
+    exps = np.exp(logits)   
+    probs = exps / exps.sum()
+
+    idx = np.random.choice(len(top_ucis), p=probs)
+    return top_ucis[idx], None
 
     def advance(self, board, move_uci):
         """
@@ -335,7 +333,7 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        tl = 0.075 if self.config.is_validation_run else None
+        tl = 0.1 if self.config.is_validation_run else None
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng

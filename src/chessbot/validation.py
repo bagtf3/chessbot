@@ -30,22 +30,22 @@ class ValidationConfig(Config):
     """
 
     is_validation_run = True
-    sf_config = {"Threads": 2, "Hash": 256}
 
     n_games = 64
     games_at_once = 64
-    micro_batch = 4
-    fwd_batch = 256
+    micro_batch = 2
+    fwd_batch = 128
 
     # disable noisy exploration during validation
     add_root_noise = False
+    sample_moves = False
     dirichlet_eps = 0.0
     dirichlet_alpha = 0.0
 
     # simulation schedule: keep stable sims for evaluation
     sims_floor = 700
     sims_ceiling = 1600
-    target_delta = 200
+    target_delta = 300
     es_check_every = 50
 
     run_post_hoc = True

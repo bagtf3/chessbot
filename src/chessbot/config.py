@@ -11,69 +11,71 @@ class Config(object):
     validation_every = 10
 
     # files
-    run_tag = "conv_net_flat_run0"
+    run_tag = "val_test"
     selfplay_dir = SP_DIR
-    init_model = SP_DIR + "conv_net_flat_run0/conv_net_flat_run0_model.h5"
+    init_model = SP_DIR + "conv_net_flat_run1/conv_net_flat_run1_model.h5"
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
-    sims_floor = 225
-    sims_ceiling = 500
-    target_delta = 100
+    sims_floor = 200
+    sims_ceiling = 450
+    target_delta = 125
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 40
+    es_check_every = 50
 
     # Game stuff
     n_games = 128
     games_at_once = 64
-    n_rounds = 60
-    micro_batch = 4
-    fwd_batch = 256
+    n_rounds = 100
+    micro_batch = 2
+    fwd_batch = 128
 
     max_game_length = 250
     min_game_length = 10
-    material_diff_cutoff = 20
+    material_diff_cutoff = 25
     material_diff_cutoff_span = 25
     use_syzygy = False
 
     play_vs_sf_prob = 0
     sf_depth = 15
-    sf_config = {"Threads": 2, "Hash": 256}
+    sf_config = {"Threads": 1, "Hash": 256}
 
     # post hoc server
     run_post_hoc = True
     mine_bonus_data = True
 
     game_probs = {
-        "pre_opened": 0.30, "random_init": 0.30,
-        "piece_odds": 0.30, "piece_training": 0.025,
-        "random_middle_game": 0.075, "random_endgame": 0.0
+        "startpos":0.25, "pre_opened": 0.5,
+        "random_init": 0.15, "piece_odds": 0.05,
+        "piece_training": 0.025, "random_middle_game": 0.025
     }
 
     # priors
-    prior_clip_max = 0.65
+    prior_clip_max = 0.7
     prior_clip_min = 0.001
 
-    # root noise
+    # randomness
     add_root_noise = True
-    dirichlet_eps = 0.05
-    dirichlet_alpha = 0.3
+    dirichlet_eps = 0.10
+    dirichlet_alpha = 0.4
+    sample_moves = True
+    move_sample_temp_range = [1e-6, 1.0]
 
     target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
     loss_weights = {"policy_winner": 2.0, "policy_loser": 1.0, "value_out": 1.5}
+    vscale = 0.9
     draw_weight = 0.15
 
     def __init__(self):
         """
         Initialize runtime paths and derived config fields.
 
-        This __init__ is intentionally parameterless to preserve convention.
-        It derives run_dir, game_dir, and various path attributes from
+        Derive run_dir, game_dir, and various path attributes from
         class defaults and creates the directories.
         """
         # resolve run_dir from class attributes

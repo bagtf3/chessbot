@@ -53,7 +53,8 @@ class GameLooper(object):
         cfg = self.config
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
+            vscale=cfg.vscale
         )
 
         self.infer_is_warm = False
@@ -215,11 +216,6 @@ class GameLooper(object):
                         print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
                         print(f"[TIME CHECK] sum collection {np.sum(collect_list):.4f}")
                         collect_list.clear()
-                    
-                    if self.sf_search_depths:
-                        sd = self.sf_search_depths
-                        m0, m1, m2 = np.mean(sd), min(sd), max(sd)
-                        print(f"[SF DEPTH] mean: {m0:.1f} min: {m1} max: {m2}")
                 
                 # resolve fresh predictions back into each game tree
                 for game in self.active_games:
@@ -448,11 +444,14 @@ class GameLooper(object):
         # use g-1 as denominator only when there are >= 2 plies; otherwise taper=0
         denom = max(1, g-1)
 
+        vscale = self.config.vscale
+        vscale = vscale if vscale > 0 else 1.0
         for x, mask, policy, vwq, ply, turn in game.examples:
             # linear taper of outcome in [0, 1]
             taper = 0.0 if z == 0 else ply / denom
             z_stm = z if turn else -z # flip based on stm pov
             z_tapered = taper * z_stm
+            vwq = vwq/vscale # unscale back to [-1, 1]
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
@@ -616,7 +615,7 @@ class GameLooper(object):
         puct_avg = s_puct / with_priors if with_priors else 0.0
         priorless_pct = 100.0 * s_priorless / max(1, total_overall)
         left4 = f"[leaf stats] priorless={s_priorless} ({priorless_pct:.2f}%)"
-        right4 = f"puct={int(s_puct)}  puct_per_leaf={puct_avg:.1f}"
+        right4 = f"puct={int(s_puct)}  puct/leaf={puct_avg:.1f}"
 
         left5 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
         right5 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
@@ -645,7 +644,7 @@ class GameLooper(object):
         if sum(durations) > 0:
             avg_runtime = cbu.format_time(np.mean(durations))
             if avg_runtime:
-                print(f"[game stats] runtime (last 50) : {avg_runtime}")
+                print(f"[game stats] last 50 runtime: {avg_runtime}")
         print("-"*72)
 
 

@@ -112,7 +112,7 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         return val, str(best_move), search_depth
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000.pkl"
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000_plus.pkl"
 with open(uci_path_path, "rb") as f:
     PATHS = pickle.load(f)
     
@@ -750,7 +750,7 @@ def random_init(plies=5, python_chess=False):
     return b
 
 
-def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=150):
+def greedy_sf_tree_paths(n_positions=5000, multipv=4, max_depth=7, eval_thresh=150):
     """
     Return a list of UCI move lists (paths) from STARTPOS via greedy BFS.
     Includes STARTPOS as [] and all intermediate paths until n_positions reached.
@@ -772,16 +772,16 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
     def short_fen(fen):
         return " ".join(fen.split(" ")[:4])
     
-    # Seed: STARTPOS plus four common first moves
+    # Seed: STARTPOS plus 5 common first moves
     start = chess.Board()
-    seed_sans = ["e4", "d4", "Nf3", "c4"]
+    seed_sans = ["e4", "d4", "Nf3", "c4", "g3"]
 
     paths = []                 # output paths
     seen = set()               # short-FEN dedup
     q = deque()                # queue of (board, path)
 
     # Add STARTPOS
-    paths.append([])                       # []
+    paths.append([])
     seen.add(short_fen(start.fen()))
 
     # Enqueue seeds
@@ -1103,6 +1103,10 @@ class GameGenerator(object):
             
         elif game_type == "piece_training":
             board, meta = make_piece_training_board()
+
+        elif game_type == "startpos":
+            board = fastboard()
+            meta = {'scenario': 'startpos'}
             
         else:
             raise ValueError(f"unhandled game_type {game_type}")

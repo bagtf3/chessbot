@@ -194,9 +194,79 @@ def plot_and_report(df_trim, window):
           f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
     print()
 
+
+def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
+    """
+    CPL (left), BMR (mid-right), Model ELO (far-right green).
+    No interpolation of model_elo. X axis is game index sorted by timestamp.
+    Fails loudly if assumptions are violated.
+    """
+    # sort games by timestamp and use integer index for x-axis
+    d = df_val.sort_values("ts").reset_index(drop=True).copy()
+    x = np.arange(len(d))
+
+    # smoothed CPL and BMR (centered moving average)
+    cpl_s = d["overall_cpl"].rolling(
+        VAL_WINDOW, center=True, min_periods=1
+    ).mean()
+    bmr_s = d["overall_best_move_rate"].rolling(
+        VAL_WINDOW, center=True, min_periods=1
+    ).mean()
+
+    # smooth model_elo across checkpoints (moving average on val_df)
+    elo_window = min(50, int(len(val_df) * 0.2) + 1)
+    val_df_sorted = val_df.sort_values("ts").reset_index(drop=True).copy()
+    val_df_sorted["elo_rm"] = val_df_sorted["model_elo"].rolling(
+        elo_window, center=True, min_periods=1
+    ).mean()
+
+    # map each checkpoint to nearest game index (first game >= checkpoint ts)
+    idxs = np.searchsorted(d["ts"].values, val_df_sorted["ts"].values, side="left")
+    idxs = np.clip(idxs, 0, len(d) - 1)
+
+    # figure
+    fig, ax_l = plt.subplots(figsize=(12, 6))
+
+    # CPL raw (faint) + smoothed (bold)
+    ax_l.plot(x, d["overall_cpl"].values, color="tab:blue", alpha=0.25, linewidth=1)
+    l1, = ax_l.plot(x, cpl_s.values, color="tab:blue", linewidth=2,
+                    label="Overall CPL (smoothed)")
+    ax_l.set_xlabel("Game # (sorted by time)")
+    ax_l.set_ylabel("Overall CPL", color="tab:blue")
+    ax_l.tick_params(axis="y", labelcolor="tab:blue")
+    ax_l.grid(True, alpha=0.3)
+
+    # BMR raw (faint) + smoothed (bold) on twin axis
+    ax_r = ax_l.twinx()
+    ax_r.plot(x, d["overall_best_move_rate"].values, color="tab:orange",
+              alpha=0.25, linewidth=1)
+    l2, = ax_r.plot(x, bmr_s.values, color="tab:orange", linewidth=2,
+                    label="Best Move Rate (smoothed)")
+    ax_r.set_ylabel("Overall Best Move Rate", color="tab:orange")
+    ax_r.tick_params(axis="y", labelcolor="tab:orange")
+
+    # Model ELO plotted only at checkpoint indices (no value interpolation)
+    ax3 = ax_l.twinx()
+    ax3.spines["right"].set_position(("axes", 1.12))
+    l3, = ax3.plot(idxs, val_df_sorted["elo_rm"].values, color="green",
+                   linewidth=2, marker="o", markersize=4,
+                   label=f"Model ELO (rm{elo_window})")
+    ax3.set_ylabel("Model ELO", color="green")
+    ax3.tick_params(axis="y", labelcolor="green")
+
+    # combined legend
+    lines = [l1, l2, l3]
+    labels = ["Overall CPL (smoothed)", "Best Move Rate (smoothed)",
+              f"Model ELO (ma{elo_window})"]
+    fig.legend(lines, labels, loc="upper left")
+
+    plt.title("CPL (left), BMR (middle-right), Model ELO (far-right)")
+    plt.tight_layout()
+
+
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run0"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -212,9 +282,7 @@ df_means = prev_run['df_means']
 df_all = df_all.query("scenario != 'paired_validation'").copy()
 df_means = df_means.query("scenario != 'paired_validation'").copy()
 
-#df_all = df_all.query("scenario != 'random_endgame'").copy()
-#df_means = df_means.query("scenario != 'random_endgame'").copy()
-WINDOW = min(5000, max(5, int(len(df_means) * 0.2 // 10 * 10)))
+WINDOW = min(3000, max(5, int(len(df_means) * 0.2 // 10 * 10)))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
 print()
 
@@ -252,26 +320,9 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'paired_validation']
-games = [g for g in games if g['beat_sf']]
-#games = [g for g in games if g['vs_stockfish']]
-gv = GameViewer(games[-64*5]['json_file'], sf_df=d); gv.replay()
-#%%
-cols = ['overall_best_move_rate', 'overall_cpl', 'overall_top3_rate']
-b = df_trim.iloc[:-WINDOW, ]
-before = b.groupby(['scenario'])[cols].mean()
-
-a = df_trim.iloc[-WINDOW:, ]
-after = a.groupby(['scenario'])[cols].mean()
-print(f"Breakdown by scenario last {WINDOW} games")
-print(after.sort_values("overall_cpl").round(3))
-
-delta = (after-before).sort_values("overall_cpl", ascending=False).round(3)
-print()
-print(f"Delta by scenario last {WINDOW} games")
-print(delta)
-print()
-
+scored = [g for g in all_games if not g['vs_stockfish'] and g['result'] != 0]
+games = [g for g in scored if g['scenario'] == 'pre_opened']
+gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
 
 #%%
 ## Plot everything so far
@@ -283,11 +334,17 @@ epoch_counter = 0
 
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run"
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run"
+#suffixes = ["0", "1"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
 suffixes = ["0", "1"]
-
+val_dfs = []
 for s in suffixes:
     rd = root + s
+    jsonl = os.path.join(rd, "validation_history.jsonl")
+    if os.path.exists(jsonl):
+        val_dfs.append(pd.read_json(jsonl, lines=True))
+        
     _ = combine_analysis_staging(rd)
     all_games = load_game_index(rd)
     
@@ -303,9 +360,6 @@ for s in suffixes:
     
     df_all = prev_run['df_all']
     df_means = prev_run['df_means']
-    
-    df_all = df_all.query("scenario != 'random_endgame'").copy()
-    df_means = df_means.query("scenario != 'random_endgame'").copy()
     
     # tidy up CPL
     df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
@@ -334,32 +388,141 @@ for s in suffixes:
 
 
 df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
-WINDOW = int(len(df_trim) * 0.15 // 10 * 10)
+df_trim = df_trim.query("scenario != 'random_endgame'").copy()
+
+df_val = df_trim.query("scenario == 'paired_validation'").copy()
+df_trim = df_trim.query("scenario != 'paired_validation'").copy()
+
+WINDOW = min(3500, int(len(df_trim) * 0.15 // 10 * 10))
 print(len(df_trim), f"games completed. Using window size {WINDOW}")
 print()
 
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 
-# all_evals = pd.concat(progress_list)
-# from chessbot.utils import plot_training_progress
-# plot_training_progress(all_evals, max_cols=4, save_path=None)
+all_evals = pd.concat(progress_list)
+from chessbot.utils import plot_training_progress
+plot_training_progress(all_evals, save_path=None)
+
+val_df = pd.concat(val_dfs)
+VAL_WINDOW = min(3500, int(len(df_val) * 0.15 // 10 * 10))
+plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
 #%%
 
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'pre_opened']
-#games = [g for g in games if g['beat_sf']]
-#games = [g for g in games if g['vs_stockfish']]
-gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['beat_sf']]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+#%%
+import chess
+import chess.pgn
+
+
+def moves_to_san_list(move_uci_list):
+    """
+    Given a list of UCI move strings, return the corresponding SAN list.
+    Assumes the moves start from the standard initial position and are
+    legal when played in sequence. Fails loudly otherwise.
+    """
+    board = chess.Board()
+    san_list = []
+    for uci in move_uci_list:
+        mv = chess.Move.from_uci(uci)
+        san = board.san(mv)
+        san_list.append(san)
+        board.push(mv)
+    return san_list
+
+
+def moves_san_list_to_pgn_text(san_list, headers=None, result="*"):
+    """
+    Format a list of SAN moves into a PGN string with optional headers.
+    `headers` is a dict of header key->value (e.g., Event, White, Black).
+    `result` is the game result string (\"1-0\", \"0-1\", \"1/2-1/2\" or \"*\").
+    """
+    if headers is None:
+        headers = {}
+    lines = []
+    # write headers
+    for k, v in headers.items():
+        lines.append(f'[{k} "{v}"]')
+    # ensure Result header present
+    lines.append(f'[Result "{result}"]')
+    lines.append("")  # blank line before moves
+
+    # assemble move text with move numbers
+    parts = []
+    for i in range(0, len(san_list), 2):
+        move_no = i // 2 + 1
+        white = san_list[i]
+        if i + 1 < len(san_list):
+            black = san_list[i + 1]
+            parts.append(f"{move_no}. {white} {black}")
+        else:
+            parts.append(f"{move_no}. {white}")
+    moves_text = " ".join(parts)
+    moves_text = moves_text.strip()
+    if result:
+        moves_text = moves_text + " " + result
+    lines.append(moves_text)
+    lines.append("")  # final newline
+    return "\n".join(lines)
+
+
+def board_history_uci_to_pgn(move_uci_list, headers=None, result="*"):
+    """
+    Convenience: uci-list -> PGN text. Uses a fresh board to compute SAN.
+    """
+    san_list = moves_to_san_list(move_uci_list)
+    return moves_san_list_to_pgn_text(san_list, headers=headers, result=result)
+
+# assume gv.log['history_uci'] is a list of UCI moves for one game
+moves = gv.log["history_uci"]
+hdrs = {"Event": "XecresValidation", "White": "SF14d3", "Black": "Xerces"}
+pgn_text = board_history_uci_to_pgn(moves, headers=hdrs, result="0-1")
+print(pgn_text)
+
+
 
 #%%
-from chessbot.config import Config
-cfg = Config()
-import chessbot.utils as cbu
-from chessbot.mcts_utils import ChessGame
+cols = ['overall_best_move_rate', 'overall_cpl', 'overall_top3_rate']
+b = df_trim.iloc[:-WINDOW, ]
+before = b.groupby(['scenario'])[cols].mean()
+
+a = df_trim.iloc[-WINDOW:, ]
+after = a.groupby(['scenario'])[cols].mean()
+print(f"Breakdown by scenario last {WINDOW} games")
+print(after.sort_values("overall_cpl").round(3))
+
+delta = (after-before).sort_values("overall_cpl", ascending=False).round(3)
+print()
+print(f"Delta by scenario last {WINDOW} games")
+print(delta)
+print()
+
+from chessbot.utils import PATHS
+
+first_move = ['e2e4', 'd2d4', 'c2c4', 'g1f3', 'g2g3']
+second_move = ['e7e5', 'd7d5', 'c7c5', 'g8f6', 'c7c6', 'e7e6', 'd7d6']
+l = []
+l.append([])
+for i in first_move:
+    l.append([i])
+    for j in second_move:
+        l.append([i, j])
 
 
+from pyfastchess import Board
+for moves in l:
+    b = Board()
+    for move in moves:
+        b.push_uci(move)
+    
+    if moves not in PATHS:
+        print(moves)
+        PATHS.append(moves)
 
-
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/uci_paths3000_plus.pkl"
+with open(uci_path_path, "wb") as f:
+    pickle.dump(PATHS, f, protocol=pickle.HIGHEST_PROTOCOL)

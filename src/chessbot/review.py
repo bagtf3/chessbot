@@ -22,17 +22,15 @@ from chessbot.utils import (
     calc_entropy, cp_to_value_tanh, sf_eval
 )
 
-
 POLL_INTERVAL = 20
-
-BLUNDER_CP = 100
+BLUNDER_CP = 120
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
 DEPTH = 10
-EQUIV_RANGE = 15
+EQUIV_RANGE = 20
 
 # stops the post hoc server
 POST_HOC_STOP = False
@@ -1020,7 +1018,7 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
 
     # single engine reused across loop
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 1, "Hash": 128})
+    eng.configure({"Threads": 2, "Hash": 128})
 
     unproc_report = True
     try:
@@ -1116,10 +1114,24 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
                 time.sleep(1)
 
     finally:
+        # final flush: write any partially-accumulated analysis batch
+        try:
+            if analyzed_batch:
+                print(f"{PH} final flush: saving {len(analyzed_batch)} analyzed games")
+                # reuse existing chunk writer (writes into analysis_staging/)
+                save_analysis_chunk_simple(run_dir, analyzed_batch)
+                analyzed_batch.clear()
+        except Exception as e:
+            print(f"{PH} final flush (analyzed_batch) failed: {e}")
+        
         # ensure engine is cleanly quit
-        eng.quit()
-        print("[post_hoc] post_hoc_worker exiting cleanly")
+        try:
+            eng.quit()
+        except Exception:
+            pass
 
+        print("[post_hoc] post_hoc_worker exiting cleanly")
+    
 
 def start_post_hoc_server(run_dir, bonus_data=True):
     """Start post-hoc worker process and forward bonus_data toggle."""

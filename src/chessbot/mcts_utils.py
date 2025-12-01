@@ -61,50 +61,50 @@ class MCTSTree(fasttree):
                 self.config.sim_decision_model_path, nthread=1
             )
 
-def best(self):
-    """
-    Before ply 20: sample from the top-8 moves by visits using a
-    temperature schedule that decays to near-deterministic by ply 20.
-    At/after ply 20: delegate to the base implementation.
-    Returns (uci, None) like the original.
-    """
-    # if at/after the convergence ply, just use C++/base behavior
-    if (self.n_plies >= 20) or (self.config.sample_moves == False):
-        return super().best()
+    def best(self):
+        """
+        Before ply 20: sample from the top-8 moves by visits using a
+        temperature schedule that decays to near-deterministic by ply 20.
+        At/after ply 20: delegate to the base implementation.
+        Returns (uci, None) like the original.
+        """
+        # if at/after the convergence ply, just use C++/base behavior
+        if (self.n_plies >= 20) or (self.config.sample_moves == False):
+            return super().best()
 
-    # gather root visits (desc sorted list of (uci, N))
-    rows = self.root_child_visits()
-    if not rows:
-        return super().best()
+        # gather root visits (desc sorted list of (uci, N))
+        rows = self.root_child_visits()
+        if not rows:
+            return super().best()
 
-    ucis = [u for u, _ in rows]
-    visits = np.array([n for _, n in rows], dtype=np.float64)
+        ucis = [u for u, _ in rows]
+        visits = np.array([n for _, n in rows], dtype=np.float64)
 
-    # trivial cases
-    if len(ucis) == 1 or visits.sum() <= 0.0:
-        return ucis[0], None
+        # trivial cases
+        if len(ucis) == 1 or visits.sum() <= 0.0:
+            return ucis[0], None
 
-    # force sampling only from the top 8 moves
-    top_k = min(8, len(ucis))
-    top_ucis = ucis[:top_k]
-    top_visits = visits[:top_k]
+        # force sampling only from the top 8 moves
+        top_k = min(8, len(ucis))
+        top_ucis = ucis[:top_k]
+        top_visits = visits[:top_k]
 
-    # temperature schedule: linear decay from temp_max (ply 0) to
-    # temp_min (ply 20). Small temp_min makes softmax -> argmax.
-    temp_min = self.config.move_sample_temp_range[0]
-    temp_max = self.config.move_sample_temp_range[1]
-    
-    frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
-    temp = temp_min + (temp_max - temp_min) * frac
+        # temperature schedule: linear decay from temp_max (ply 0) to
+        # temp_min (ply 20). Small temp_min makes softmax -> argmax.
+        temp_min = self.config.move_sample_temp_range[0]
+        temp_max = self.config.move_sample_temp_range[1]
+        
+        frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
+        temp = temp_min + (temp_max - temp_min) * frac
 
-    # build stable logits from visits: use log(visits) so scale is sane
-    logits = np.log(top_visits + 1e-12) / max(1e-12, temp)
-    logits = logits - np.max(logits)
-    exps = np.exp(logits)   
-    probs = exps / exps.sum()
+        # build stable logits from visits: use log(visits) so scale is sane
+        logits = np.log(top_visits + 1e-12) / max(1e-12, temp)
+        logits = logits - np.max(logits)
+        exps = np.exp(logits)   
+        probs = exps / exps.sum()
 
-    idx = np.random.choice(len(top_ucis), p=probs)
-    return top_ucis[idx], None
+        idx = np.random.choice(len(top_ucis), p=probs)
+        return top_ucis[idx], None
 
     def advance(self, board, move_uci):
         """

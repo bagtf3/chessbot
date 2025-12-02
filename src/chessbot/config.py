@@ -11,17 +11,17 @@ class Config(object):
     validation_every = 10
 
     # files
-    run_tag = "val_test"
+    run_tag = "conv_net_flat_run1"
     selfplay_dir = SP_DIR
     init_model = SP_DIR + "conv_net_flat_run1/conv_net_flat_run1_model.h5"
 
     # MCTS
-    c_puct = 1.5
+    c_puct = 1.25
 
     # Simulation schedule
-    sims_floor = 200
-    sims_ceiling = 450
-    target_delta = 125
+    sims_floor = 400
+    sims_ceiling = 900
+    target_delta = 250
 
     # early stop
     use_sim_decision_model = False
@@ -41,7 +41,7 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 0.5
+    play_vs_sf_prob = 0
     sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
@@ -50,9 +50,9 @@ class Config(object):
     mine_bonus_data = True
 
     game_probs = {
-        "startpos":0.25, "pre_opened": 0.5,
-        "random_init": 0.15, "piece_odds": 0.05,
-        "piece_training": 0.025, "random_middle_game": 0.025
+        "startpos":0.25, "pre_opened_mini": 0.25,
+        "pre_opened": 0.25, "random_init": 0.15,
+        "piece_odds": 0.05, "piece_training": 0.05
     }
 
     # priors

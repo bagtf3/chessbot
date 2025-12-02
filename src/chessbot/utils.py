@@ -1085,7 +1085,7 @@ def make_piece_training_board():
     board = chess.Board(fens[pick])
     if np.random.uniform() < 0.5:
         board = board.mirror()
-    return fastboard(board.fen()), {"scenario": pick}
+    return fastboard(board.fen()), {"scenario": f"pt_{pick}"}
         
 
 class GameGenerator(object):

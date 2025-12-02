@@ -4,6 +4,7 @@ import os
 import time
 import numpy as np
 
+from pyfastchess import Board as fastboard
 from chessbot.config import Config
 from chessbot.mcts_utils import ChessGame
 import chessbot.utils as cbu
@@ -43,10 +44,10 @@ class ValidationConfig(Config):
     dirichlet_alpha = 0.0
 
     # simulation schedule: keep stable sims for evaluation
-    sims_floor = 700
+    sims_floor = 1000
     sims_ceiling = 1600
     target_delta = 300
-    es_check_every = 50
+    es_check_every = 60
 
     run_post_hoc = True
     mine_bonus_data = True
@@ -76,7 +77,7 @@ class ValidationConfig(Config):
             disk_table = disk['sf_table']
             disk_index = disk['sf_index']
             disk_consec = disk['consec_over_50']
-            
+
             self.sf_table = disk_table
             self.sf_index = int(disk_index)
             self.consec_over_50 = int(disk_consec)
@@ -103,6 +104,70 @@ class ValidationConfig(Config):
         self.sf_depth = entry["depth"]
         self.sf_elo = entry["elo"]
 
+        # validation report
+        # Read last history JSONL entry (if present)
+        xerces_elo_last = None
+        last_score = None
+        hist_path = os.path.join(self.run_dir, HISTORY_FILENAME)
+        if os.path.exists(hist_path):
+            last_obj = None
+            with open(hist_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    last_obj = json.loads(s)
+            if last_obj is not None:
+                xerces_elo_last = last_obj.get("model_elo")
+                last_score = last_obj.get("score")
+
+        # Next depth entry (if any)
+        if self.sf_index < (len(self.sf_table) - 1):
+            next_entry = self.sf_table[self.sf_index + 1]
+        else:
+            next_entry = None
+
+        # Determine cusp/streak states (only meaningful if there is a next depth)
+        on_cusp = (int(self.consec_over_50) == 1) and (next_entry is not None)
+        on_streak = (int(self.consec_over_50) >= 1) and (next_entry is not None)
+
+        # Format SF line
+        if next_entry is not None:
+            next_str = f"Next depth: {next_entry['depth']} ({next_entry['elo']})"
+        else:
+            next_str = "Next depth: <MAX>"
+
+        sf_line = (
+            f"[validation test] SF depth: {self.sf_depth}  SF Elo: {self.sf_elo}  "
+            f"{next_str}"
+        )
+
+        # Format Xerces/model line without using try/except
+        if xerces_elo_last is None:
+            xerces_str = "N/A"
+        elif isinstance(xerces_elo_last, (int, float)):
+            xerces_str = f"{xerces_elo_last:.1f}"
+        else:
+            xerces_str = str(xerces_elo_last)
+
+        if last_score is None:
+            score_str = "N/A"
+        elif isinstance(last_score, (int, float)):
+            score_str = f"{last_score:.3f}"
+        else:
+            score_str = str(last_score)
+
+        cusp_str = "  ON CUSP: need 1 more successful >50% run to advance" if on_cusp else ""
+        streak_str = "  ON STREAK: currently has consecutive >50% runs" if on_streak else ""
+
+        model_line = (
+            f"[validation test] Xerces Elo last test: {xerces_str}  "
+            f"Score last test: {score_str}  consec_over_50: {self.consec_over_50}"
+            f"{cusp_str}{streak_str}"
+        )
+
+        print(sf_line)
+        print(model_line)
 
 def paired_validation_games(cfg):
     """
@@ -116,14 +181,19 @@ def paired_validation_games(cfg):
     """
 
     games = []
-    n = cfg.n_games // 2    
+    n = cfg.n_games // 2
     indices = [i for i in range(len(cbu.PATHS))]
     selected = np.random.choice(indices, n, replace=False)
     
-    for s in selected:
+    for i, s in enumerate(selected):
         # get two separate fastboard instances from same premoved path
-        board_white = cbu.get_pre_opened_game(index=s)
-        board_black = cbu.get_pre_opened_game(index=s)
+        # always play 1 pair from startpos
+        if i == 0:
+            board_white = fastboard()
+            board_black = fastboard()
+        else:
+            board_white = cbu.get_pre_opened_game(index=s)
+            board_black = cbu.get_pre_opened_game(index=s)
 
         meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
                   "scenario": "paired_validation"}

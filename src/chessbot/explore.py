@@ -322,7 +322,8 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['scenario'] == 'startpos']
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['vs_stockfish']]
+gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
 
 #%%
 ## Plot everything so far
@@ -500,28 +501,3 @@ print()
 print(f"Delta by scenario last {WINDOW} games")
 print(delta)
 print()
-
-from collections import defaultdict
-from chessbot.utils import greedy_sf_tree_paths
-new_paths = greedy_sf_tree_paths(5000, multipv=5)
-
-paths_up_to_2 = []
-paths_over_2 = []
-for p in new_paths:
-    if len(p) <= 2:
-        paths_up_to_2.append(p)
-    else:
-        paths_over_2.append(p)
-    
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
-with open(uci_path_path, "wb") as f:
-    pickle.dump(paths_over_2, f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
-with open(uci_path_path, "wb") as f:
-    pickle.dump(paths_up_to_2, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-
-    

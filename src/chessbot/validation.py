@@ -15,12 +15,18 @@ HISTORY_FILENAME = "validation_history.jsonl"
 SF_TABLE_DEFAULT = [
   {"depth": 1,  "elo": 1614, "name": "SF14d1"},
   {"depth": 3,  "elo": 1783, "name": "SF14d3"},
-  {"depth": 6,  "elo": 1992, "name": "SF14d6"},
+  {"depth": 4,  "elo": 1853, "name": "SF14d4"},
+  {"depth": 5,  "elo": 1922, "name": "SF14d5"},
+  {"depth": 6,  "elo": 2002, "name": "SF14d6"},
+  {"depth": 7,  "elo": 2107, "name": "SF14d7"},
   {"depth": 9,  "elo": 2336, "name": "SF14d9"},
   {"depth": 12, "elo": 2644, "name": "SF14d12"},
+  {"depth": 14, "elo": 2727, "name": "SF14d14"},
   {"depth": 16, "elo": 2810, "name": "SF14d16"},
+  {"depth": 18, "elo": 2847, "name": "SF14d18"},
   {"depth": 21, "elo": 2903, "name": "SF14d21"},
-  {"depth": 30, "elo": 3043, "name": "SF14d30"}
+  {"depth": 25, "elo": 2965, "name": "SF14d25"},
+  {"depth": 30, "elo": 3043, "name": "SF14d30"},
 ]
 
 class ValidationConfig(Config):
@@ -157,13 +163,9 @@ class ValidationConfig(Config):
         else:
             score_str = str(last_score)
 
-        cusp_str = "  ON CUSP: need 1 more successful >50% run to advance" if on_cusp else ""
-        streak_str = "  ON STREAK: currently has consecutive >50% runs" if on_streak else ""
-
         model_line = (
             f"[validation test] Xerces Elo last test: {xerces_str}  "
             f"Score last test: {score_str}  consec_over_50: {self.consec_over_50}"
-            f"{cusp_str}{streak_str}"
         )
 
         print(sf_line)

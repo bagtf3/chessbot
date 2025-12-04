@@ -84,8 +84,8 @@ class MCTSTree(fasttree):
         if len(ucis) == 1 or visits.sum() <= 0.0:
             return ucis[0], None
 
-        # force sampling only from the top 8 moves
-        top_k = min(8, len(ucis))
+        # force sampling only from the top 5 moves
+        top_k = min(5, len(ucis))
         top_ucis = ucis[:top_k]
         top_visits = visits[:top_k]
 

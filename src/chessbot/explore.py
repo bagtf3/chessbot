@@ -12,7 +12,7 @@ from chessbot.utils import rnd
 from chessbot.review import GameViewer, load_game_index
 
 from pprint import pprint
-from chessbot.review import combine_analysis_staging, ANALYZE_PKL
+from chessbot.review import combine_analysis_staging, ANALYZE_PKL, load_json
 
 
 def plot_cpl_and_bmr(df, window=30, title=None):
@@ -159,10 +159,7 @@ def trend_check(df, window=100):
     return out
 
 
-
-def plot_and_report(df_trim, window):
-    plot_cpl_and_bmr(df_trim, window=window)
-
+def report_cpl_and_bmr(df_trim, window):
     # compute aggregates
     overall_cpl = df_trim['overall_cpl'].mean()
     overall_bmr = df_trim['overall_best_move_rate'].mean()
@@ -193,6 +190,11 @@ def plot_and_report(df_trim, window):
     print(f"{'Overall':<{label_w}}{overall_cpl:>{val_w}.3f}"
           f"{overall_bmr:>{val_w}.3f}{overall_top3:>{val_w}.3f}")
     print()
+    
+
+def plot_and_report(df_trim, window):
+    plot_cpl_and_bmr(df_trim, window=window)
+    report_cpl_and_bmr(df_trim, window)
 
 
 def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
@@ -266,8 +268,8 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -283,7 +285,7 @@ df_means = prev_run['df_means']
 df_all = df_all.query("scenario != 'paired_validation'").copy()
 df_means = df_means.query("scenario != 'paired_validation'").copy()
 
-WINDOW = min(3000, max(5, int(len(df_means) * 0.2 // 10 * 10)))
+WINDOW = min(2500, max(5, int(len(df_means) * 0.2 // 10 * 10)))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
 print()
 
@@ -322,38 +324,39 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['scenario'] == 'startpos']
-games = [g for g in scored if g['vs_stockfish']]
-gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 
 #%%
 ## Plot everything so far
 CLIP_UB = 500
 
-df_list = []
-progress_list = []
-epoch_counter = 0
-
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_conv_net_run"
-#suffixes = ["0", "1"]
 root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
 suffixes = ["0", "1"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
+#suffixes = [""]
+
+df_list = []
 val_dfs = []
+eval_df = None
 for s in suffixes:
     rd = root + s
     jsonl = os.path.join(rd, "validation_history.jsonl")
     if os.path.exists(jsonl):
         val_dfs.append(pd.read_json(jsonl, lines=True))
         
+    
+    eval_path = os.path.join(rd, "eval_progress.csv")
+    tmp_df = pd.read_csv(eval_path)
+    if eval_df is None:
+       eval_df = tmp_df
+    else:
+        tmp_df.model_epoch += eval_df.model_epoch.max()
+        eval_df = pd.concat([eval_df, tmp_df])
+    
     _ = combine_analysis_staging(rd)
     all_games = load_game_index(rd)
-    
-    eval_progress = os.path.join(rd, "eval_progress.csv")
-    progress_df = pd.read_csv(eval_progress)
-    progress_df['model_epoch'] += 1 + epoch_counter
-    epoch_counter = progress_df['model_epoch'].max()
-    progress_list.append(progress_df)
     
     pkl = os.path.join(rd, ANALYZE_PKL)
     with open(pkl, "rb") as f:
@@ -394,110 +397,66 @@ df_trim = df_trim.query("scenario != 'random_endgame'").copy()
 df_val = df_trim.query("scenario == 'paired_validation'").copy()
 df_trim = df_trim.query("scenario != 'paired_validation'").copy()
 
-WINDOW = min(3500, int(len(df_trim) * 0.15 // 10 * 10))
+WINDOW = min(2500, int(len(df_trim) * 0.15 // 10 * 10))
 print(len(df_trim), f"games completed. Using window size {WINDOW}")
 print()
 
+print("########### Report for all non validation games ############".center(60))
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 
-all_evals = pd.concat(progress_list)
-from chessbot.utils import plot_training_progress
-plot_training_progress(all_evals, save_path=None)
-
 val_df = pd.concat(val_dfs)
-VAL_WINDOW = min(3500, int(len(df_val) * 0.15 // 10 * 10))
+VAL_WINDOW = min(250, int(len(df_val) * 0.15 // 10 * 10))
 plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
+print()
+print("########### Report for SF validation games only ############".center(60))
+report_cpl_and_bmr(df_val, VAL_WINDOW)
+
+from chessbot.utils import plot_training_progress
+from warnings import catch_warnings, simplefilter
+
+with catch_warnings():
+    simplefilter("ignore")
+    plot_training_progress(eval_df)
 #%%
 
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['beat_sf']]
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
 #%%
-import chess
-import chess.pgn
+import numpy as np
 
+# single-root example: priors is 1D prob vector (sums to 1)
+rng = np.random.default_rng(42)
 
-def moves_to_san_list(move_uci_list):
-    """
-    Given a list of UCI move strings, return the corresponding SAN list.
-    Assumes the moves start from the standard initial position and are
-    legal when played in sequence. Fails loudly otherwise.
-    """
-    board = chess.Board()
-    san_list = []
-    for uci in move_uci_list:
-        mv = chess.Move.from_uci(uci)
-        san = board.san(mv)
-        san_list.append(san)
-        board.push(mv)
-    return san_list
-
-
-def moves_san_list_to_pgn_text(san_list, headers=None, result="*"):
-    """
-    Format a list of SAN moves into a PGN string with optional headers.
-    `headers` is a dict of header key->value (e.g., Event, White, Black).
-    `result` is the game result string (\"1-0\", \"0-1\", \"1/2-1/2\" or \"*\").
-    """
-    if headers is None:
-        headers = {}
-    lines = []
-    # write headers
-    for k, v in headers.items():
-        lines.append(f'[{k} "{v}"]')
-    # ensure Result header present
-    lines.append(f'[Result "{result}"]')
-    lines.append("")  # blank line before moves
-
-    # assemble move text with move numbers
-    parts = []
-    for i in range(0, len(san_list), 2):
-        move_no = i // 2 + 1
-        white = san_list[i]
-        if i + 1 < len(san_list):
-            black = san_list[i + 1]
-            parts.append(f"{move_no}. {white} {black}")
-        else:
-            parts.append(f"{move_no}. {white}")
-    moves_text = " ".join(parts)
-    moves_text = moves_text.strip()
-    if result:
-        moves_text = moves_text + " " + result
-    lines.append(moves_text)
-    lines.append("")  # final newline
-    return "\n".join(lines)
-
-
-def board_history_uci_to_pgn(move_uci_list, headers=None, result="*"):
-    """
-    Convenience: uci-list -> PGN text. Uses a fresh board to compute SAN.
-    """
-    san_list = moves_to_san_list(move_uci_list)
-    return moves_san_list_to_pgn_text(san_list, headers=headers, result=result)
-
-# assume gv.log['history_uci'] is a list of UCI moves for one game
-moves = gv.log["history_uci"]
-hdrs = {"Event": "XecresValidation", "White": "SF14d3", "Black": "Xerces"}
-pgn_text = board_history_uci_to_pgn(moves, headers=hdrs, result="0-1")
-print(pgn_text)
-
-
-
+K = 5
+eps = 0.5
+alpha = 0.3
+priors = rng.dirichlet([0.3]*K).round(4) 
+noise = rng.dirichlet([0.6] * K).round(4)
+noisy_priors = (1.0 - eps) * priors + eps * noise
+# normalize (should already sum ~=1 but keep it safe)
+noisy_priors = noisy_priors / noisy_priors.sum()
+for i in range(len(priors)):
+    print(f"{priors[i]:<.3f}", f"{noisy_priors[i]:.3f}", f"{noise[i]:.3f}")
+    
 #%%
-cols = ['overall_best_move_rate', 'overall_cpl', 'overall_top3_rate']
-b = df_trim.iloc[:-WINDOW, ]
-before = b.groupby(['scenario'])[cols].mean()
+from chessbot.utils import GameGenerator
+from chessbot.config import Config
+from collections import defaultdict
 
-a = df_trim.iloc[-WINDOW:, ]
-after = a.groupby(['scenario'])[cols].mean()
-print(f"Breakdown by scenario last {WINDOW} games")
-print(after.sort_values("overall_cpl").round(3))
+cfg = Config()
+gg = GameGenerator(cfg)
 
-delta = (after-before).sort_values("overall_cpl", ascending=False).round(3)
-print()
-print(f"Delta by scenario last {WINDOW} games")
-print(delta)
-print()
+fens_seen = defaultdict(int)
+scenarios = defaultdict(int)
+for _ in range(100):
+    b, m = gg.new_board()
+    fens_seen[b.fen()] += 1
+    scenarios[m['scenario']] += 1
+
+
+
+

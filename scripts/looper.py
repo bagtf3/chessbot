@@ -58,14 +58,7 @@ class GameLooper(object):
         )
 
         self.infer_is_warm = False
-
-        batch_candidates = set()
-        bs = 32
-        while bs <= cfg.fwd_batch:
-            batch_candidates.add(bs)
-            bs *= 2
-        
-        self.batch_candidates = sorted(batch_candidates)
+        self.batch_candidates = self.create_batch_candidates(cfg)
         self.training_queue = []
         self.recent_games = []
 
@@ -86,8 +79,22 @@ class GameLooper(object):
         self.moves_played = 0
         self.sims_done_total = 0
 
+    def create_batch_candidates(self, cfg):
+        # create sizes to warm up
+        batch_candidates = set()
+        bs = 32
+        while bs <= cfg.fwd_batch:
+            batch_candidates.add(bs)
+            bs *= 2
+        
+        # split difference between last 2
+        if len(batch_candidates) >= 2:
+            sbc = sorted(batch_candidates)
+            sbc.append(int(sbc[-1] - sbc[-2] / 2))
+            return sorted(sbc)
+        return sorted(batch_candidates)
+
     def fill_active_games(self):
-        fens_seen = set()
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
         if needed <= 0:
@@ -100,13 +107,6 @@ class GameLooper(object):
 
             # this has game probs from the config
             board, meta = self.game_gen.new_board()
-            fen = board.fen()
-            while fen in fens_seen:
-                board, meta = self.game_gen.new_board()
-                fen = board.fen()
-
-            # add new unique fen
-            fens_seen.add(fen)
 
             meta['vs_stockfish'] = False
             meta['stockfish_is_white'] = False
@@ -120,7 +120,7 @@ class GameLooper(object):
             cg = ChessGame(board=board, meta=meta, cfg=self.config)
             self.active_games.append(cg)
     
-    def run(self):
+    def run(self, run_num=None):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
         or run MCTS step (collect/predict/apply).
@@ -131,7 +131,6 @@ class GameLooper(object):
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
-        collect_list, collect_agg = [], []
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
             eng.configure(cfg.sf_config)
             while self.games_finished < cfg.n_games:
@@ -148,7 +147,6 @@ class GameLooper(object):
                             
                         if sf_terminal:
                             self.finalize_game_data(game)
-                            self.maybe_log_results()
                             finished.append(game.game_id)
                             # pass until the next turn
                             continue
@@ -162,7 +160,6 @@ class GameLooper(object):
                         # terminal after bot move?
                         if mcts_terminal:
                             self.finalize_game_data(game)
-                            self.maybe_log_results()
                             finished.append(game.game_id)
                             continue
                         
@@ -172,10 +169,7 @@ class GameLooper(object):
 
                     # otherwise, collect up to micro_batch leaves for this game
                     # CollectResults object from C++
-                    start = _now()
                     res = game.tree.collect_many_leaves(mbs, max_fastpath)
-                    stop = _now()
-                    collect_agg.append(stop-start)
                     
                     nn = res.count_new
                     nt = res.count_terminal
@@ -200,22 +194,14 @@ class GameLooper(object):
                     counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
                 
                 # run predictions if we have any. sends results to c++ raw cache
-                if collect_agg:
-                    collect_list.append(np.sum(collect_agg))
-                    collect_agg.clear()
-
                 if preds_batch:
                     self.format_and_predict(preds_batch)
                     lpb.append(len(preds_batch))
 
-                if self.maybe_log_results():
+                if self.maybe_log_results(run_num=run_num):
                     self.log_loop_stats(counts, mbs, lpb)
                     counts = []
                     lpb = []
-                    if collect_list:
-                        print(f"[TIME CHECK] avg collection {np.mean(collect_list):.4f}")
-                        print(f"[TIME CHECK] sum collection {np.sum(collect_list):.4f}")
-                        collect_list.clear()
                 
                 # resolve fresh predictions back into each game tree
                 for game in self.active_games:
@@ -230,7 +216,7 @@ class GameLooper(object):
                     p_q    = pc.get("queries", 0)
                     p_h    = pc.get("hits", 0)
                     p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
-                    p_evr = (100.0 * p_ev / p_cap) if p_cap else 0.0
+                    p_evr  = (100.0 * p_ev / p_cap) if p_cap else 0.0
 
                     print("Clearing caches after training")
                     cs = "[cache stats]"
@@ -256,7 +242,7 @@ class GameLooper(object):
         if self.collect_training_data:
             self.trigger_retrain()
 
-        self.maybe_log_results(force=True)
+        self.maybe_log_results(force=True, run_num=run_num)
         return
 
     def format_and_predict(self, preds_batch):
@@ -527,7 +513,7 @@ class GameLooper(object):
         self.n_retrains += 1
         self.clear_cache = True
 
-    def maybe_log_results(self, every_sec=60.0, window=500, force=False):
+    def maybe_log_results(self, every_sec=60.0, window=500, force=False, run_num=None):
         def sf_bucket(vs_sf, sf_is_white):
             if not vs_sf:
                 return "none"
@@ -542,7 +528,11 @@ class GameLooper(object):
         gph =  3600 * self.games_finished / (now - self._run_start)
 
         print()
-        print("~" * 72)
+        if run_num is None:
+            print("~"*72)
+        else:
+            print(f" Round {run_num} Logging ".center(72, "~"))
+        
         print(
             f"[speed stats] mps={self.mps.rate():.1f}  "
             f"lps={self.lps.rate():.1f}  gph={gph:.2f}")
@@ -686,7 +676,15 @@ if __name__ == '__main__':
     n_games, run_num = 0, 1
     try:
         while run_num <= cfg.n_rounds:
-            print("[main loop] starting training loop number", run_num)
+            if n_games:
+                elapsed = _now() - start
+                rt = cbu.format_time(elapsed)
+                gph = 3600 * n_games / elapsed
+                print(
+                    f"[main loop] Time: {rt}  | ",
+                    f"Games: {n_games} ({gph:.1f}/hr)"
+                )
+
             is_validation = run_num % cfg.validation_every == 0
             looper, cfg = init_selfplay(is_validation)
 
@@ -694,18 +692,13 @@ if __name__ == '__main__':
             if phs is None and cfg.run_post_hoc and cfg.run_dir:
                 phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
 
-            looper.run()
+            looper.run(run_num)
             run_num += 1
             if is_validation:
                 summary = build_validation_summary(looper)
                 append_validation_summary(looper.config.run_dir, summary)
             
             n_games += looper.games_finished
-            if n_games:
-                elapsed = _now() - start
-                rt = cbu.format_time(elapsed)
-                gph = 3600 * n_games / elapsed
-                print(f"[main loop] runtime {rt} games {n_games} ({gph:.1f} per hour)")
 
     finally:
         if phs is not None:

@@ -1138,6 +1138,7 @@ class GameGenerator(object):
             
         elif game_type == "piece_training":
             board, meta = make_piece_training_board()
+            meta['scenario'] = 'piece_training'
 
         elif game_type == "startpos":
             board = fastboard()

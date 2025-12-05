@@ -50,10 +50,11 @@ class ValidationConfig(Config):
     dirichlet_alpha = 0.0
 
     # simulation schedule: keep stable sims for evaluation
+    sf_move_sims = 5
     sims_floor = 1000
     sims_ceiling = 1600
     target_delta = 300
-    es_check_every = 60
+    es_check_every = 50
 
     run_post_hoc = True
     mine_bonus_data = True

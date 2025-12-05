@@ -50,6 +50,10 @@ class MCTSTree(fasttree):
         else:
             self.target_delta = int(0.1*cfg.sims_floor)
         
+        # root noise
+        self.add_root_noise = cfg.add_root_noise
+        self.root_noise_added = False
+
         # early-stop rolling state
         self._es_last_checked_at = 0
         self._es_tripped = False
@@ -63,7 +67,7 @@ class MCTSTree(fasttree):
 
     def best(self):
         """
-        Before ply 20: sample from the top-8 moves by visits using a
+        Before ply 20: sample from the top 5 moves by visits using a
         temperature schedule that decays to near-deterministic by ply 20.
         At/after ply 20: delegate to the base implementation.
         Returns (uci, None) like the original.
@@ -117,16 +121,31 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
+
         # add noise to the root for exploration
-        if self.config.add_root_noise:
-            self.add_root_dirichlet_noise(
-                eps=self.config.dirichlet_eps,
-                alpha=self.config.dirichlet_alpha
-            )
+        self.add_root_dirichlet_noise()
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
         self.piece_count = board.piece_count()
+
+    def needs_root_noise(self, check_sims=False):
+        check = self.add_root_noise and not self.root_noise_added
+        if not check:
+            return False
+
+        if not check_sims:
+            return check
+        return check and (self.sims_completed_this_move > 0)
+
+    def add_root_dirichlet_noise(self):
+        if not self.needs_root_noise():
+            return
+
+        super().add_root_dirichlet_noise(
+            eps=self.config.dirichlet_eps, alpha=self.config.dirichlet_alpha
+        )
+        self.root_noise_added = True
 
     def get_sim_decision_probs(self):
         if self.sim_decision_model is None:
@@ -465,7 +484,6 @@ class ChessGame(object):
         pi = np.array([v / s for v in visits], dtype=np.float32)
         self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
         return self.push_move(mv)
-
 
     def make_move_from_tree(self):
         """

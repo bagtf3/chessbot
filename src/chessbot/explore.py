@@ -268,8 +268,7 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run1"
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
 
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -324,7 +323,7 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['scenario'] == 'startpos']
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-4]['json_file'], sf_df=d); gv.replay()
 
 #%%
 ## Plot everything so far
@@ -333,7 +332,8 @@ CLIP_UB = 500
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1"]
+#suffixes = ["0", "1", "2"]
+suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
 #suffixes = [""]
 
@@ -419,12 +419,12 @@ with catch_warnings():
     simplefilter("ignore")
     plot_training_progress(eval_df)
 #%%
-
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['beat_sf']]
-gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
+games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 #%%
 import numpy as np
 
@@ -443,20 +443,7 @@ for i in range(len(priors)):
     print(f"{priors[i]:<.3f}", f"{noisy_priors[i]:.3f}", f"{noise[i]:.3f}")
     
 #%%
-from chessbot.utils import GameGenerator
-from chessbot.config import Config
-from collections import defaultdict
-
-cfg = Config()
-gg = GameGenerator(cfg)
-
-fens_seen = defaultdict(int)
-scenarios = defaultdict(int)
-for _ in range(100):
-    b, m = gg.new_board()
-    fens_seen[b.fen()] += 1
-    scenarios[m['scenario']] += 1
-
-
+np.sqrt(250)* 0.025/ 2
+np.sqrt(250) * 0.6/ 50
 
 

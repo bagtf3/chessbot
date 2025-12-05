@@ -1370,7 +1370,7 @@ class RateMeter(object):
 
 def summarize_recent_games(recent, result_is_bot_pov=True):
     """
-    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/L/D totals.
+    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/D/L totals.
     For the SF totals we assume `result` is WHITE-POV:
       r > 0 => white won, r < 0 => black won, r == 0 => draw
     This matches your own description for detecting bot wins vs SF.
@@ -1434,7 +1434,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
 
 def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     """
-    Pretty-print the scenario table and the bot-vs-Stockfish W/L/D line,
+    Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).
     """
     recent = recent[-window:]
@@ -1445,14 +1445,14 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     # scenario table (unchanged formatting)
     print(
         f"{'scenario':<20} {'sf':<6} {'N':>4} "
-        f"{'W':>4} {'L':>4} {'D':>4}   {'avg_plies':>10}"
+        f"{'W':>4} {'D':>4} {'L':>4}   {'avg_plies':>10}"
     )
     print("-" * 60)
     for (scenario, bucket), s in rows:
         avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
         print(
             f"{scenario:<20} {bucket:<6} {s['N']:>4} "
-            f"{s['W']:>4} {s['L']:>4} {s['D']:>4}  "
+            f"{s['W']:>4} {s['D']:>4} {s['L']:>4}  "
             f"{avg:>10.1f}"
         )
     print("-" * 60)
@@ -1460,11 +1460,11 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     # bot vs Stockfish summary (90-char lines)
     def pct(n, d): return (n / d) if d else 0.0
     total = sf_overall["N"]
-    w, l, d = sf_overall["W"], sf_overall["L"], sf_overall["D"]
+    w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]
     win = pct(w, total)
     avg = (sf_overall["plies_sum"] / total) if total else 0.0
     print(
-        f"Total SF games: {total:>4}  W/L/D={w}/{l}/{d}  ",
+        f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
         f"win_rate={win:.1%}  avg_plies={avg:.1f}"
     )
 

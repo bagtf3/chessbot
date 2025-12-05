@@ -11,18 +11,18 @@ class Config(object):
     validation_every = 10
 
     # files
-    #run_tag = "conv_net_flat_run1"
-    run_tag = "val_test"
+    run_tag = "conv_net_flat_run2"
     selfplay_dir = SP_DIR
     init_model = SP_DIR + "conv_net_flat_run1/conv_net_flat_run1_model.h5"
 
     # MCTS
-    c_puct = 1.25
+    c_puct = 2.0
 
     # Simulation schedule
-    sims_floor = 400
-    sims_ceiling = 1200
-    target_delta = 250
+    sf_move_sims = 200
+    sims_floor = 600
+    sims_ceiling = 1600
+    target_delta = 300
 
     # early stop
     use_sim_decision_model = False
@@ -30,9 +30,9 @@ class Config(object):
     es_check_every = 50
 
     # Game stuff
-    n_games = 96
+    n_games = 64
     games_at_once = 64
-    n_rounds = 100
+    n_rounds = 20
     micro_batch = 4
     fwd_batch = 256
 
@@ -42,30 +42,30 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 0
+    play_vs_sf_prob = 0.25
     sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
     # post hoc server
     run_post_hoc = True
-    mine_bonus_data = True
+    mine_bonus_data = False
 
     game_probs = {
-        "startpos":0.40, "pre_opened_mini": 0.25,
-        "pre_opened": 0.15, "random_init": 0.10,
-        "piece_odds": 0.05, "piece_training": 0.05
+        "startpos":0.5, "pre_opened_mini": 0.24,
+        "pre_opened": 0.20, "random_init": 0.03,
+        "piece_odds": 0.02, "piece_training": 0.01
     }
 
     # priors
-    prior_clip_max = 0.75
-    prior_clip_min = 0.005
+    prior_clip_max = 0.6
+    prior_clip_min = 0.025
 
     # randomness
     add_root_noise = True
     dirichlet_eps = 0.2
     dirichlet_alpha = 0.3
     sample_moves = True
-    move_sample_temp_range = [1e-6, 1.25]
+    move_sample_temp_range = [1e-6, 1.0]
 
     target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
     loss_weights = {"policy_winner": 1.5, "policy_loser": 0.75, "value_out": 1.25}

@@ -95,6 +95,8 @@ class GameLooper(object):
         return sorted(batch_candidates)
 
     def fill_active_games(self):
+        sf_games = ['startpos', 'pre_opened_mini', 'random_init', 'paired_validation']
+
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
         if needed <= 0:
@@ -110,7 +112,13 @@ class GameLooper(object):
 
             meta['vs_stockfish'] = False
             meta['stockfish_is_white'] = False
-            if np.random.uniform() <= cfg.play_vs_sf_prob:
+            meta['vs_stockfish'] = np.random.uniform() <= cfg.play_vs_sf_prob
+
+            # stockfish only plays certain scenarios
+            if meta['scenario'] not in sf_games:
+                meta['vs_stockfish'] = False
+
+            if meta['vs_stockfish']:
                 self.sf_count += 1
                 meta['vs_stockfish'] = True
             
@@ -140,19 +148,23 @@ class GameLooper(object):
                 preds_batch = []
                 finished = []
                 for game in self.active_games[:cfg.games_at_once]:
+                    if game.tree.needs_root_noise(check_sims=True):
+                        game.tree.add_root_dirichlet_noise()
+
                     # if its stockfish turn, let SF move and skip MCTS this ply
                     if game.is_stockfish_turn():
-                        sf_terminal = game.make_move_with_stockfish(eng)
-                        mps.tick(1)
-                            
-                        if sf_terminal:
-                            self.finalize_game_data(game)
-                            finished.append(game.game_id)
-                            # pass until the next turn
-                            continue
+                        if game.tree.sims_completed_this_move > cfg.sf_move_sims:
+                            sf_terminal = game.make_move_with_stockfish(eng)
+                            mps.tick(1)
+                                
+                            if sf_terminal:
+                                self.finalize_game_data(game)
+                                finished.append(game.game_id)
+                                # pass until the next turn
+                                continue
         
                     # if this game has reached its local sim budget, make the move
-                    if game.tree.stop_simulating():
+                    elif game.tree.stop_simulating():
                         # bot plays from tree
                         mcts_terminal = game.make_move_from_tree()
                         mps.tick(1)
@@ -164,8 +176,8 @@ class GameLooper(object):
                             continue
                         
                         # if its stockfish turn, dont do any sims
-                        if game.is_stockfish_turn():
-                            continue
+                        #if game.is_stockfish_turn():
+                        #    continue
 
                     # otherwise, collect up to micro_batch leaves for this game
                     # CollectResults object from C++
@@ -177,11 +189,12 @@ class GameLooper(object):
                     pl = res.total_priorless
                     pu = res.total_puct
 
-                    # new + cached
-                    lps.tick(nn + nc)
+                    # new + cached + terminal
+                    n_leafs = nn + nc + nt 
+                    lps.tick(n_leafs)
 
                     # update sim count
-                    game.tree.sims_completed_this_move += (nn + nt + nc)
+                    game.tree.sims_completed_this_move += (n_leafs)
 
                     if nn:
                         preds_batch += game.tree.pending_encoded_64_tokens()
@@ -499,13 +512,6 @@ class GameLooper(object):
         del self.model, self.infer
         gc.collect()
 
-        # update the fwd helper and clear queues/caches
-        #self.model = load_model(cfg.model_path)
-        #self.infer = make_conv_infer(
-        #  self.model, max_bs=cfg.fwd_batch,
-        #  min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max
-        #)
-
         self.infer_is_warm = False
 
         # clear training queue
@@ -681,12 +687,16 @@ if __name__ == '__main__':
                 rt = cbu.format_time(elapsed)
                 gph = 3600 * n_games / elapsed
                 print(
-                    f"[main loop] Time: {rt}  | ",
+                    f"[main loop] Time: {rt} ",
                     f"Games: {n_games} ({gph:.1f}/hr)"
                 )
 
             is_validation = run_num % cfg.validation_every == 0
             looper, cfg = init_selfplay(is_validation)
+                
+            # use endgame tables on alternating runs to balance speed and learning
+            if not is_validation:
+                cfg.use_syzygy = bool(run_num % 2)
 
             # look to start post hoc server on the first loop if its not yet running
             if phs is None and cfg.run_post_hoc and cfg.run_dir:

@@ -1373,7 +1373,6 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
     Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/D/L totals.
     For the SF totals we assume `result` is WHITE-POV:
       r > 0 => white won, r < 0 => black won, r == 0 => draw
-    This matches your own description for detecting bot wins vs SF.
     """
     def sf_bucket(vs_sf, sf_flag):
         if not vs_sf:
@@ -1382,7 +1381,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
 
     stats = defaultdict(lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
 
-    # bot vs Stockfish totals only (what you care about)
+    # bot vs Stockfish totals only
     sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
 
     for g in recent:
@@ -1426,8 +1425,9 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
                     sf_overall["L"] += 1
 
     bucket_order = {"white": 0, "black": 1, "none": 2}
-    rows = sorted(stats.items(),
-                  key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99)))
+    rows = sorted(
+        stats.items(), key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99))
+    )
 
     return stats, rows, sf_overall
 
@@ -1457,7 +1457,7 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
         )
     print("-" * 60)
 
-    # bot vs Stockfish summary (90-char lines)
+    # bot vs Stockfish summary
     def pct(n, d): return (n / d) if d else 0.0
     total = sf_overall["N"]
     w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]

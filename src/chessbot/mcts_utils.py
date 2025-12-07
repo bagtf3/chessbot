@@ -482,6 +482,9 @@ class ChessGame(object):
 
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
+        pi = np.clip(pi, self.config.prior_clip_min, self.config.prior_clip_max)
+        pi = pi / pi.sum()
+        
         self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
         return self.push_move(mv)
 
@@ -500,6 +503,9 @@ class ChessGame(object):
         visits = np.array([n for _, n in rows], dtype=np.float32)
         s = visits.sum()
         pi = (visits / s) if s > 0.0 else np.zeros_like(visits)
+
+        pi = np.clip(pi, self.config.prior_clip_min, self.config.prior_clip_max)
+        pi = pi / pi.sum()
         vwq = self.tree.visit_weighted_Q()
 
         # tree is white POV, we want STM-POV so we flip here
@@ -524,7 +530,7 @@ class ChessGame(object):
         # get indices from C++
         indices = self.board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
-        
+
         # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
             policy[idx] += p

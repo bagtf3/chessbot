@@ -23,14 +23,14 @@ from chessbot.utils import (
 )
 
 POLL_INTERVAL = 20
-BLUNDER_CP = 120
+BLUNDER_CP = 150
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
 DEPTH = 10
-EQUIV_RANGE = 20
+EQUIV_RANGE = 30
 
 # stops the post hoc server
 POST_HOC_STOP = False

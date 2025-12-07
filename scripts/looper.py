@@ -95,7 +95,7 @@ class GameLooper(object):
         return sorted(batch_candidates)
 
     def fill_active_games(self):
-        sf_games = ['startpos', 'pre_opened_mini', 'random_init', 'paired_validation']
+        sf_games = ['startpos', 'pre_opened', 'pre_opened_mini', 'random_init', 'paired_validation']
 
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
@@ -488,6 +488,10 @@ class GameLooper(object):
         # find retrain_worker.py
         retrain_script = cbu.find_script("retrain_worker.py", start_file=__file__)
 
+        # delete the model to free up GPU RAM
+        del self.model, self.infer
+        gc.collect()
+
         # spawn worker and fail fast if it fails
         cmd = [sys.executable, retrain_script, "--run-dir", run_dir]
         print(f"[retrain] launching worker with {len(self.training_queue)} samples")
@@ -508,9 +512,9 @@ class GameLooper(object):
         
         # if here, retrain was a success. load new model and make new infer
         # make sure memory is clean to prevent slowdowns
-        cfg = self.config
-        del self.model, self.infer
-        gc.collect()
+        #cfg = self.config
+        #del self.model, self.infer
+        #gc.collect()
 
         self.infer_is_warm = False
 
@@ -545,7 +549,7 @@ class GameLooper(object):
         
         print(
             f"[game stats]  finished={self.games_finished}  "
-            f"W/L/D={self.white_wins}/{self.black_wins}/{self.draws}  "
+            f"W/D/L={self.white_wins}/{self.draws}/{self.black_wins}  "
             f"avg_len={avg_moves:.1f} moves")
         print("-" * 72)
 
@@ -693,7 +697,7 @@ if __name__ == '__main__':
 
             is_validation = run_num % cfg.validation_every == 0
             looper, cfg = init_selfplay(is_validation)
-                
+            
             # use endgame tables on alternating runs to balance speed and learning
             if not is_validation:
                 cfg.use_syzygy = bool(run_num % 2)

@@ -14,11 +14,11 @@ import matplotlib.pyplot as plt
 import time
 import pickle
 
-MODEL_NAME = 'conv_64_flat_v1'
+MODEL_NAME = 'conv_64_12_blocks'
     
 model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
-    d_model_embed=128, vocab_size=21, filters=296,
-    n_blocks=9, name=MODEL_NAME
+    d_model_embed=128, vocab_size=21, filters=256,
+    n_blocks=12, name=MODEL_NAME
 )
 
 model.summary()

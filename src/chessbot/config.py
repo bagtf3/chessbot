@@ -15,28 +15,29 @@ class Config(object):
     #run_tag = "conv_net_flat_run2"
     #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
     run_tag = 'conv_net_flat_12blocks_run0'
+    previous_run_tag = None
     init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_64_12_blocks_0.h5'
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
-    sf_move_sims = 100
-    sims_floor = 200
-    sims_ceiling = 400
-    target_delta = 50
+    sf_move_sims = 200
+    sims_floor = 600
+    sims_ceiling = 1400
+    target_delta = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 100
+    es_check_every = 50
 
     # Game stuff
-    n_games = 128
-    games_at_once = 128
-    n_rounds = 20
+    n_games = 64
+    games_at_once = 64
+    n_rounds = 60
     micro_batch = 4
-    fwd_batch = 512
+    fwd_batch = 256
 
     max_game_length = 200
     min_game_length = 5
@@ -44,7 +45,7 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 1.0
+    play_vs_sf_prob = 0.8
     sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
@@ -52,10 +53,11 @@ class Config(object):
     run_post_hoc = True
     mine_bonus_data = True
 
-    game_probs = {"startpos":0.5, "pre_opened_mini": 0.25, "pre_opened": 0.25}
-        #, "random_init": 0.03,
-        #"piece_odds": 0.02, "piece_training": 0.01
-    #}
+    game_probs = {
+        "startpos":0.5, "pre_opened_mini": 0.22, "pre_opened": 0.22,
+        "random_init": 0.03,
+        "piece_odds": 0.02, "piece_training": 0.01
+    }
 
     # priors
     prior_clip_max = 0.6
@@ -63,13 +65,13 @@ class Config(object):
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.3
+    dirichlet_eps = 0.2
     dirichlet_alpha = 0.3
     sample_moves = True
     move_sample_temp_range = [1e-6, 1.0]
 
-    target_y_weights = {'vwq': 0.25, 'z': 0.5, 'z_taper': 0.25}
-    loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.5}
+    target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
+    loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.0}
     vscale = 0.9
     draw_weight = 0.1
 

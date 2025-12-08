@@ -58,7 +58,7 @@ class ValidationConfig(Config):
 
     run_post_hoc = True
     mine_bonus_data = True
-    
+
     max_game_length = 300
     min_game_length = 1
     material_diff_cutoff = 100
@@ -70,86 +70,160 @@ class ValidationConfig(Config):
         Initialize ValidationConfig and ensure validation_config.json contains the
         depth-indexed sf_table and progress counters.
 
-        This does not force UCI_LimitStrength. The engine invocation should use the
-        current depth (cfg.sf_depth) when running validation games.
+        Limit SF strength with depth and align Elo using derived estimates.
         """
         super().__init__()
 
-        path = os.path.join(self.run_dir, VALIDATION_CONFIG_FILENAME)
+        self.load_or_create_validation_config()
 
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                disk = json.load(fh)
+        # try to read the most recent validation-history entry
+        # from this run or, if missing, from previous run_tag
+        last_entry = self.find_last_history_entry()
 
-            disk_table = disk['sf_table']
-            disk_index = disk['sf_index']
-            disk_consec = disk['consec_over_50']
-
-            self.sf_table = disk_table
-            self.sf_index = int(disk_index)
-            self.consec_over_50 = int(disk_consec)
-
-        else:
-            # create initial config file using defaults
-            disk_out = {
-                "sf_table": SF_TABLE_DEFAULT,
-                "sf_index": 0,
-                "consec_over_50": 0,
-                "history": [],
-            }
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(disk_out, fh, indent=2, sort_keys=True)
-            os.replace(tmp, path)
-
-            self.sf_table = SF_TABLE_DEFAULT
-            self.sf_index = 0
-            self.consec_over_50 = 0
+        # if previous history entry exists, attempt to continue at same depth
+        self.continue_depth_from_previous(last_entry)
 
         # convenience fields for the current depth entry
         entry = self.sf_table[self.sf_index]
         self.sf_depth = entry["depth"]
         self.sf_elo = entry["elo"]
 
-        # validation report
-        # Read last history JSONL entry (if present)
-        xerces_elo_last = None
-        last_score = None
+        # print formatted status lines
+        self.format_and_print_status(last_entry)
+
+    def load_or_create_validation_config(self):
+        """
+        Ensure validation_config.json exists and populate
+        self.sf_table, self.sf_index, self.consec_over_50.
+        """
+        path = os.path.join(self.run_dir, VALIDATION_CONFIG_FILENAME)
+
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                disk = json.load(fh)
+            disk_table = disk.get("sf_table", SF_TABLE_DEFAULT)
+            disk_index = int(disk.get("sf_index", 0))
+            disk_consec = int(disk.get("consec_over_50", 0))
+
+            self.sf_table = disk_table
+            self.sf_index = disk_index
+            self.consec_over_50 = disk_consec
+            return
+
+        # create initial config file using defaults
+        disk_out = {
+            "sf_table": SF_TABLE_DEFAULT,
+            "sf_index": 0,
+            "consec_over_50": 0,
+            "history": [],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(disk_out, fh, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+
+        self.sf_table = SF_TABLE_DEFAULT
+        self.sf_index = 0
+        self.consec_over_50 = 0
+
+    def find_last_history_entry(self):
+        """
+        Return the last JSON object from validation_history.jsonl in the
+        current run_dir. If not present and a previous_run_tag is set,
+        read the last entry from that previous run's history file.
+        Do not copy any files between run dirs (would dupe history)
+        """
         hist_path = os.path.join(self.run_dir, HISTORY_FILENAME)
+        last_obj = None
         if os.path.exists(hist_path):
-            last_obj = None
             with open(hist_path, "r", encoding="utf-8") as fh:
                 for line in fh:
                     s = line.strip()
                     if not s:
                         continue
                     last_obj = json.loads(s)
-            if last_obj is not None:
-                xerces_elo_last = last_obj.get("model_elo")
-                last_score = last_obj.get("score")
+            return last_obj
 
+        prev_tag = getattr(self, "previous_run_tag", None)
+        if not prev_tag:
+            return None
+
+        prev_run_dir = os.path.abspath(os.path.join(self.selfplay_dir, prev_tag))
+        prev_hist_path = os.path.join(prev_run_dir, HISTORY_FILENAME)
+        if not os.path.exists(prev_hist_path):
+            return None
+
+        prev_last = None
+        with open(prev_hist_path, "r", encoding="utf-8") as ph:
+            for line in ph:
+                s = line.strip()
+                if not s:
+                    continue
+                prev_last = json.loads(s)
+
+        if prev_last is not None:
+            # remember where we read it from for later logic / debugging
+            self.prev_history_entry = prev_last
+            print(f"[validation] using last history from: {prev_tag}")
+        return prev_last
+
+    def continue_depth_from_previous(self, last_entry):
+        """
+        If last_entry contains a depth value, try to set sf_index so the
+        current run starts validation at that depth (or the closest
+        available later depth). Do nothing if last_entry is None.
+        """
+        if last_entry is None:
+            return
+
+        prev_depth = last_entry.get("depth")
+        if prev_depth is None:
+            return
+
+        # try exact match first
+        match_idx = None
+        for i, e in enumerate(self.sf_table):
+            if e.get("depth") == prev_depth:
+                match_idx = i
+                break
+
+        if match_idx is None:
+            # pick first entry with depth >= prev_depth, else last entry
+            match_idx = next(
+                (i for i, e in enumerate(self.sf_table)
+                if e.get("depth", 0) >= prev_depth),
+                len(self.sf_table) - 1
+            )
+
+        self.sf_index = int(match_idx)
+
+    def format_and_print_status(self, last_entry):
+        """
+        Build and print human-readable SF and Xerces status lines.
+        """
         # Next depth entry (if any)
         if self.sf_index < (len(self.sf_table) - 1):
             next_entry = self.sf_table[self.sf_index + 1]
         else:
             next_entry = None
 
-        # Determine cusp/streak states (only meaningful if there is a next depth)
-        on_cusp = (int(self.consec_over_50) == 1) and (next_entry is not None)
-        on_streak = (int(self.consec_over_50) >= 1) and (next_entry is not None)
-
-        # Format SF line
         if next_entry is not None:
             next_str = f"Next depth: {next_entry['depth']} ({next_entry['elo']})"
         else:
             next_str = "Next depth: <MAX>"
 
         sf_line = (
-            f"[validation test] SF depth: {self.sf_depth}  SF Elo: {self.sf_elo}  "
-            f"{next_str}"
+            f"[validation test] SF depth: {self.sf_depth}  "
+            f"SF Elo: {self.sf_elo}  {next_str}"
         )
 
-        # Format Xerces/model line without using try/except
+        # extract last model elo and score from provided entry
+        xerces_elo_last = None
+        last_score = None
+        if last_entry is not None:
+            xerces_elo_last = last_entry.get("model_elo")
+            last_score = last_entry.get("score")
+
         if xerces_elo_last is None:
             xerces_str = "N/A"
         elif isinstance(xerces_elo_last, (int, float)):
@@ -171,6 +245,7 @@ class ValidationConfig(Config):
 
         print(sf_line)
         print(model_line)
+
 
 def paired_validation_games(cfg):
     """

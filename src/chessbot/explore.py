@@ -331,11 +331,11 @@ CLIP_UB = 500
 
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-#suffixes = ["0", "1", "2"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+suffixes = ["0", "1"]#, "2"]
 #suffixes = ["1", "2"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
-suffixes = ["0"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
+#suffixes = ["0"]
 
 df_list = []
 val_dfs = []
@@ -390,7 +390,6 @@ for s in suffixes:
     del df_means
     del df_trim
 
-
 df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
 df_trim = df_trim.query("scenario != 'random_endgame'").copy()
 
@@ -425,122 +424,6 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 #games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
-
-
-#%%
-
-import numpy as np
-import matplotlib.pyplot as plt
-from math import sqrt
-
-p = np.random.dirichlet([alpha] * k)
-
-def simulate_u_only(p, n_sims, c_puct):
-    visits = np.zeros(k, dtype=int)
-    visits_hist = np.zeros((n_sims + 1, k), dtype=int)
-    u_hist = np.zeros((n_sims + 1, k), dtype=float)
-    visits_hist[0] = visits.copy()
-    for t in range(n_sims):
-        n_parent = max(1, int(visits.sum()))
-        u = c_puct * p * sqrt(n_parent) / (1.0 + visits)
-        u_hist[t] = u
-        sel = int(np.argmax(u))
-        visits[sel] += 1
-        visits_hist[t + 1] = visits.copy()
-    n_parent = max(1, int(visits.sum()))
-    u_hist[n_sims] = c_puct * p * sqrt(n_parent) / (1.0 + visits)
-    return p, visits_hist, u_hist
-
-def plot_visits(visits_hist, priors, title, fname=None):
-    n_sims = visits_hist.shape[0] - 1
-    x = np.arange(n_sims + 1)
-    plt.figure(figsize=(10, 4))
-    for i in range(len(priors)):
-        label = f"{i} p={priors[i]:.3f}"
-        plt.plot(x, visits_hist[:, i], label=label)
-    plt.xlabel("sim index")
-    plt.ylabel("visits")
-    plt.title(title)
-    plt.legend(loc="upper left", fontsize="small")
-    plt.tight_layout()
-    if fname:
-        plt.savefig(fname, dpi=150)
-        plt.close()
-    else:
-        plt.show()
-
-def plot_u(u_hist, priors, title, fname=None):
-    n_sims = u_hist.shape[0] - 1
-    x = np.arange(n_sims + 1)
-    plt.figure(figsize=(10, 4))
-    for i in range(len(priors)):
-        label = f"{i} p={priors[i]:.3f}"
-        plt.plot(x, u_hist[:, i], label=label)
-    plt.xlabel("sim index")
-    plt.ylabel("U value")
-    plt.title(title)
-    plt.legend(loc="upper right", fontsize="small")
-    plt.tight_layout()
-    if fname:
-        plt.savefig(fname, dpi=150)
-        plt.close()
-    else:
-        plt.show()
-
-def report_run(p, visits_hist, u_hist, c_puct):
-    n_sims = visits_hist.shape[0] - 1
-    mid = n_sims // 2
-    initial_u = u_hist[0]
-    mid_u = u_hist[mid]
-    final_u = u_hist[-1]
-    print(f"\n=== report for c_puct={c_puct} ===")
-    print("priors:", np.round(p, 4))
-    print("initial U (first step):", np.round(initial_u, 4))
-    print(f"mid U (t={mid}):", np.round(mid_u, 4))
-    print("final U:", np.round(final_u, 4))
-    print("final visits:", visits_hist[-1])
-    print("rank by final visits:", np.argsort(-visits_hist[-1]))
-
-def run_simulations(k=8,
-                    alpha=0.3,
-                    n_sims=500,
-                    c_puct_list=(1.25, 1.75, 2.0),
-                    save_plots=False):
-    results = {}
-    p = np.sort(np.random.dirichlet([alpha] * k))
-    pc = np.clip(p, 0.03, 0.6)
-    pc = pc/pc.sum()
-
-    for c in c_puct_list:
-        for i in range(2):
-            pv = pc if i == 1 else p
-            pv, visits_hist, u_hist = simulate_u_only(pv, n_sims, c)
-            results[c] = (pv, visits_hist, u_hist)
-            title_v = f"Visits (k={k} alpha={alpha} c={c})"
-            title_u = f"U scores (k={k} alpha={alpha} c={c})"
-            fname_v = f"visits_k{k}_a{alpha}_c{c}.png" if save_plots else None
-            fname_u = f"u_k{k}_a{alpha}_c{c}.png" if save_plots else None
-            plot_visits(visits_hist, pv, title_v, fname_v)
-            plot_u(u_hist, pv, title_u, fname_u)
-            report_run(pv, visits_hist, u_hist, c)
-    return results
-
-
-k = 15
-alpha = 0.1
-n_sims = 500
-c_puct_list = (1.0, 2.0)
-
-run_simulations(k=k,
-                alpha=alpha,
-                n_sims=n_sims,
-                c_puct_list=c_puct_list,
-                save_plots=False)
-    
-
-
-
-
 
 
 

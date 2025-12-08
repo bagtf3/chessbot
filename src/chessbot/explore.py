@@ -331,11 +331,11 @@ CLIP_UB = 500
 
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1"]#, "2"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+#suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
-#suffixes = ["0"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
+suffixes = ["0"]
 
 df_list = []
 val_dfs = []

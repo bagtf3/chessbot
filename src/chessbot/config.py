@@ -12,20 +12,20 @@ class Config(object):
 
     # files
     selfplay_dir = SP_DIR
-    #run_tag = "conv_net_flat_run2"
-    #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
-    run_tag = 'conv_net_flat_12blocks_run0'
+    run_tag = "conv_net_flat_run2"
+    init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
+    #run_tag = 'conv_net_flat_12blocks_run0'
+    #init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_64_12_blocks_0.h5'
     previous_run_tag = None
-    init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_64_12_blocks_0.h5'
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
     sf_move_sims = 200
-    sims_floor = 600
-    sims_ceiling = 1400
-    target_delta = 200
+    sims_floor = 750
+    sims_ceiling = 2000
+    target_delta = 300
 
     # early stop
     use_sim_decision_model = False
@@ -45,7 +45,7 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 0.8
+    play_vs_sf_prob = 0.25
     sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
@@ -68,7 +68,7 @@ class Config(object):
     dirichlet_eps = 0.2
     dirichlet_alpha = 0.3
     sample_moves = True
-    move_sample_temp_range = [1e-6, 1.0]
+    move_sample_temp_range = [1e-6, 1.2]
 
     target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
     loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.0}

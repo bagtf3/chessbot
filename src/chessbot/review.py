@@ -29,7 +29,7 @@ ANALYZE_PKL = "analyze_results_combined.pkl"
 ANALYZE_BATCH = 30
 
 # default analysis params
-DEPTH = 10
+DEPTH = 12
 EQUIV_RANGE = 30
 
 # stops the post hoc server
@@ -95,7 +95,6 @@ class GameViewer:
     def run_stockfish_topk(self, depth=16, k=3):
         """
         Return list[(uci, san, cp_white_pov, pv)] for top-k moves.
-        Let exceptions propagate so we see stack traces if SF fails.
         """
         out = []
         limit = chess.engine.Limit(depth=depth, time=10.0)
@@ -122,7 +121,7 @@ class GameViewer:
           - 'sf' -> depth 16
           - 'sfNN' -> depth NN (e.g. sf20 -> depth 20)
         Prints SF top-3 moves (white-pov cp at depth) and if the chosen move
-        isn't in top-3, prints its cp as well (forced evaluation).
+        isn't in top-3, prints its cp as well
         """
         # parse token
         if token == "sf":
@@ -224,6 +223,61 @@ class GameViewer:
     def show_board(self, flipped=False):
         clear_output(wait=True)
         display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
+
+    def show_pv(self, min_vis=1):
+        """
+        Print principal variation recorded in the tree data for the current ply.
+        Print all PV moves (subject to min_vis), marking with ' *' those moves
+        that were actually played in the game at the corresponding ply.
+        """
+        if self.ply >= len(self.moves_uci):
+            print("End of game.")
+            return
+
+        node = self.tree_data.get(self.moves_uci[self.ply]) or \
+            self.tree_data.get(str(self.ply))
+        if not node:
+            print("No PV available for this node.")
+            return
+
+        pv = node.get("pv") or []
+        if not pv:
+            print("No PV recorded.")
+            return
+
+        board_tmp = chess.Board(self.board.fen())
+        rows = []
+        for i, step in enumerate(pv):
+            visits = int(step.get("visits", 0))
+            if visits < min_vis:
+                break
+            uci = step.get("uci")
+            if not uci:
+                break
+
+            idx = self.ply + i
+            played = (idx < len(self.moves_uci) and
+                    self.moves_uci[idx] == uci)
+
+            san = board_tmp.san(chess.Move.from_uci(uci))
+            p = step.get("P", 0.0)
+            q = step.get("Q", 0.0)
+
+            rows.append((i + 1, san, uci, visits, float(p), float(q), played))
+            board_tmp.push_uci(uci)
+
+        if not rows:
+            print(f"No PV moves meet min_vis={min_vis}")
+            return
+
+        san_w = max(8, max(len(r[1]) for r in rows))
+        uci_w = max(6, max(len(r[2]) for r in rows))
+
+        for no, san, uci, visits, p, q, played in rows:
+            star = " *" if played else ""
+            line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
+                    f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
+            print(line)
 
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
@@ -391,17 +445,14 @@ class GameViewer:
             elif cmd in ("b", "back"):
                 shown = False
                 self.prev()
-            # elif cmd.startswith("pv"):
-            #     # pv or pv8
-            #     if cmd == "pv":
-            #         self.show_pv(min_vis=1)
-            #     else:
-            #         try:
-            #             n = int(cmd[2:])  # e.g. pv8
-            #             self.show_pv(min_vis=n)
-            #         except Exception:
-            #             self.show_pv(min_vis=1)
-            
+            elif cmd.startswith("pv"):
+                # pv or pvN (e.g. pv8)
+                if cmd == "pv":
+                    n = 1
+                else:
+                    s = cmd[2:]
+                    n = int(s) if s.isdigit() else 1
+                self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
             else:

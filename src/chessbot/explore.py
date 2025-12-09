@@ -268,8 +268,8 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
 
@@ -302,7 +302,6 @@ if 'in_top3' not in df_all.columns:
 df_all['in_top3'] = df_all.in_top3 | df_all.played_best_move
 t3r = df_all.groupby("game_id")["in_top3"].mean()
 
-
 df_all['blunder300'] = df_all.delta > 300
 b300 = df_all.groupby("game_id")['blunder300'].mean()
 df_all['blunder100'] = df_all.delta > 100
@@ -323,19 +322,19 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['scenario'] == 'startpos']
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
-
+games = [g for g in scored if not g['vs_stockfish']]
+gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
 #%%
 ## Plot everything so far
 CLIP_UB = 500
 
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-#suffixes = ["0", "1", "2"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
-suffixes = ["0"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
+#suffixes = ["0"]
 
 df_list = []
 val_dfs = []
@@ -422,8 +421,9 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
-#games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
-gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
+games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
+gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
+
 
 
 

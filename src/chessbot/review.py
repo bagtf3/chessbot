@@ -73,16 +73,19 @@ class GameViewer:
         self.reset()
 
     def reset(self):
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         self.ply = 0  # 0 = before first move
 
     def goto(self, ply):
         ply = max(0, min(ply, len(self.moves_uci)))
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         for u in self.moves_uci[:ply]:
             self.board.push_uci(u)
         self.ply = ply
         return self
+    
+    def turn(self):
+        return self.board.side_to_move() == 'w'
     
     def sf_row_for_ply(self, ply):
         if (not self._sf_by_ply) or (self.sf_rows is None):
@@ -99,7 +102,8 @@ class GameViewer:
         out = []
         limit = chess.engine.Limit(depth=depth, time=10.0)
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            infos = eng.analyse(self.board, limit=limit, multipv=k)
+            sf_board = chess.Board(self.board.fen())
+            infos = eng.analyse(sf_board, limit=limit, multipv=k)
             if not isinstance(infos, list):
                 infos = [infos]
             for info in infos:
@@ -107,7 +111,7 @@ class GameViewer:
                 move_uci = pv[0].uci() if pv else None
                 san = None
                 if move_uci:
-                    san = self.board.san(chess.Move.from_uci(move_uci))
+                    san = self.board.san(move_uci)
                 score_obj = info.get("score")
                 cp = None
                 if score_obj is not None:
@@ -150,14 +154,15 @@ class GameViewer:
         # check the move about to be played (selected from moves_uci[self.ply])
         if self.ply < len(self.moves_uci):
             upcoming_uci = self.moves_uci[self.ply]
-            upcoming_san = self.board.san(chess.Move.from_uci(upcoming_uci))
+            upcoming_san = self.board.san(upcoming_uci)
             if upcoming_uci not in top_ucis:
                 # get forced eval for the played move
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+                    sf_board = chess.Board(self.board.fen())
                     info = eng.analyse(
-                        self.board, limit=limit,
+                        sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
                     )
                     
@@ -202,10 +207,10 @@ class GameViewer:
     def prev(self):
         if self.ply > 0:
             self.ply -= 1
-            self.board.pop()
+            self.board.unmake()
     
     def who_moved(self):
-        mover = "White" if self.board.turn == chess.WHITE else "Black"
+        mover = "White" if self.turn() else "Black"
         
         vs_stockfish = self.log.get("vs_stockfish", False)
         if not vs_stockfish:
@@ -215,14 +220,15 @@ class GameViewer:
         if sf_color is None:
             return f"{mover} (MCTS)"
         
-        if (self.board.turn and sf_color) or \
-           (not self.board.turn and not sf_color):
+        if (self.turn() and sf_color) or \
+           (not self.turn() and not sf_color):
             return f"{mover} (stockfish)"
         return f"{mover} (MCTS)"
 
     def show_board(self, flipped=False):
         clear_output(wait=True)
-        display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
+        chess_board = chess.Board(self.board.fen())
+        display(SVG(chess.svg.board(board=chess_board, flipped=flipped)))
 
     def show_pv(self, min_vis=1):
         """
@@ -287,7 +293,7 @@ class GameViewer:
         who = self.who_moved()
         chosen = self.moves_uci[self.ply]
         try:
-            chosen_san = self.board.san(chess.Move.from_uci(chosen))
+            chosen_san = self.board.san(chosen)
         except Exception:
             chosen_san = "?"
 
@@ -337,7 +343,7 @@ class GameViewer:
                 break
 
         def print_row(c, mark=False, show_rank=False, rank_val=None):
-            san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
+            san = self.board.san(c.get("uci", ""))
             marker = "  <- SF" if mark else ""
             rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
             print(
@@ -368,7 +374,7 @@ class GameViewer:
         # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
-            stm_white = (self.board.turn == chess.WHITE)
+            stm_white = self.turn()
 
             best_uci   = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
@@ -392,7 +398,7 @@ class GameViewer:
             matched = (best_uci == played_uci) if best_uci and played_uci else False
 
             def to_san(uci):
-                return self.board.san(chess.Move.from_uci(uci))
+                return self.board.san(uci)
 
             best_san   = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"

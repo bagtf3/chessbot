@@ -415,7 +415,8 @@ class GameViewer:
         # concise CLI help for replay mode commands
         print("Commands:")
         print("  [Enter] / Space      forward one move")
-        print("  b, back              previous move")
+        print("  b<N>                 go back N moves, e.g. b5 goes back 5 moves")
+        print("  b, back              previous move (same as b1)")
         print("  q, quit, exit        quit replay")
         print("  o, options, help     show this help text")
         print("  sf                   stockfish overlay (uses default depth)")
@@ -442,9 +443,6 @@ class GameViewer:
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
                 self.show_options()
-            elif cmd in ("b", "back"):
-                shown = False
-                self.prev()
             elif cmd.startswith("pv"):
                 # pv or pvN (e.g. pv8)
                 if cmd == "pv":
@@ -455,6 +453,20 @@ class GameViewer:
                 self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
+            elif cmd.startswith("b"):
+                # b, back, b5, b 5 all supported
+                s = cmd[1:].strip()
+                if not s:
+                    n = 1
+                elif s.isdigit():
+                    n = int(s)
+                else:
+                    # fallback to single step back
+                    n = 1
+                # use goto to rebuild board safely and clamp bounds
+                target = max(0, self.ply - n)
+                shown = False
+                self.goto(target)
             else:
                 # default: forward one move
                 shown = False

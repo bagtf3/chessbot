@@ -3,10 +3,10 @@ from chessbot import MODEL_DIR, SF_LOC
 from chessbot.utils import sf_eval, random_init, format_time
 from chessbot.utils import GameGenerator, batch_policy_metrics, print_validation
 
-from chessbot.review import make_fake_visits
+from chessbot.review import make_fake_visits, load_json, GameViewer
 import chess, chess.engine
 
-from chessbot.model import build_conv_64pv, build_conv_flat_64x67
+from chessbot.model import build_conv_flat_64x67
 
 import pandas as pd
 import numpy as np
@@ -15,8 +15,8 @@ import time
 import pickle
 
 
-bl = 8
-fl = 64
+bl = 12
+fl = 256
 
 MODEL_NAME = f'conv64_{bl}x{fl}'
     
@@ -28,9 +28,76 @@ model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
 model.summary()
 #model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
 #%%
+from pyfastchess import Board as fastboard
+path = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE/game_logs/000adb6d-ba7b-458a-8625-406bdfbc9d4b_log.json"
+gv = GameViewer(path, sf_df=None)
+gv.board.fen()
 
-eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-eng.configure({"Threads": 1, "Hash": 64})
+
+
+def find_snapshot_for_ply(game_obj, ply):
+    """Return snapshot dict for a given ply if available.
+    Some logs put snapshots under numeric top-level keys (e.g. '112'),
+    some under 'tree_data' or similar. We search a few places."""
+    s = str(ply)
+    # common: top-level numeric keys (your logs have these like "112": {...})
+    if s in game_obj:
+        return game_obj[s]
+    # alternative common container
+    td = game_obj.get("tree_data") or game_obj.get("tree") or game_obj.get("tree_snapshot")
+    if td:
+        return td.get(s)
+    # fallback: many logs use a nested mapping under 'moves' index
+    # give None if not found
+    return None
+
+def build_policy_vector_from_snapshot(board, snapshot):
+    """Build flat 64*67 policy vector from snapshot candidate moves or pv.
+    Prefer 'visits' if present, else 'P' (prob)."""
+    n = 64 * 67
+    policy = np.zeros(n, dtype=np.float32)
+    if not snapshot:
+        return policy  # empty uniform fallback will be handled upstream
+
+    # prefer candidate_moves -> pv
+    moves_list = snapshot.get("candidate_moves") or snapshot.get("pv")
+    if not moves_list:
+        return policy
+
+    # extract ucis and weights
+    ucis = []
+    weights = []
+    for m in moves_list:
+        u = m.get("uci")
+        if not u:
+            continue
+        ucis.append(u)
+        # prefer integer visits if there, else probability P
+        v = m.get("visits")
+        if v is None:
+            v = m.get("P") or 0.0
+        weights.append(v)
+
+    if not ucis:
+        return policy
+
+    w = np.array(weights, dtype=np.float32)
+    # if all zeros, fallback to uniform
+    if w.sum() <= 0.0:
+        w = np.ones_like(w, dtype=np.float32)
+
+    w = w / w.sum()
+
+    # map ucis -> flat indices (uses pyfastchess C++ mapping)
+    indices = board.moves_to_indices(ucis)  # list[int]
+    for idx, prob in zip(indices, w):
+        policy[idx] += prob
+
+    return policy
+
+#%%
+#eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+#eng.configure({"Threads": 1, "Hash": 64})
     
 #%%
 metrics_history = {

@@ -82,7 +82,7 @@ class GameLooper(object):
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
         batch_candidates = set()
-        bs = 32
+        bs = 16
         while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)
             bs *= 2
@@ -91,8 +91,8 @@ class GameLooper(object):
         if len(batch_candidates) >= 2:
             sbc = sorted(batch_candidates)
             sbc.append(int(sbc[-1] - sbc[-2] / 2))
-            return sorted(sbc)
-        return sorted(batch_candidates)
+            return sorted(set(sbc))
+        return sorted(set(batch_candidates))
 
     def fill_active_games(self):
         sf_games = ['startpos', 'pre_opened', 'pre_opened_mini', 'random_init', 'paired_validation']
@@ -678,7 +678,7 @@ def init_selfplay(validation=False):
 
     return looper, config
 
-
+#%%
 if __name__ == '__main__':
     cfg = Config()
     phs = None

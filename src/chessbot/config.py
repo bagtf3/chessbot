@@ -12,36 +12,36 @@ class Config(object):
 
     # files
     selfplay_dir = SP_DIR
-    run_tag = "conv_net_flat_run2"
-    init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
-    #run_tag = 'conv_net_flat_12blocks_run0'
-    #init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_64_12_blocks_0.h5'
+    #run_tag = "conv_net_flat_run2"
+    #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
+    run_tag = 'conv_12x512SE'
+    init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_12x512SE_0.h5'
     previous_run_tag = None
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
-    sf_move_sims = 200
-    sims_floor = 750
-    sims_ceiling = 2000
-    target_delta = 300
+    sf_move_sims = 150
+    sims_floor = 600
+    sims_ceiling = 1000
+    target_delta = 200
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 50
+    es_check_every = 25
 
     # Game stuff
     n_games = 64
     games_at_once = 64
-    n_rounds = 60
-    micro_batch = 4
-    fwd_batch = 256
+    n_rounds = 51
+    micro_batch = 8
+    fwd_batch = 512
 
     max_game_length = 200
     min_game_length = 5
-    material_diff_cutoff = 15
+    material_diff_cutoff = 25
     material_diff_cutoff_span = 25
     use_syzygy = False
 
@@ -65,7 +65,7 @@ class Config(object):
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.2
+    dirichlet_eps = 0.25
     dirichlet_alpha = 0.3
     sample_moves = True
     move_sample_temp_range = [1e-6, 1.2]

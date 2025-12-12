@@ -14,6 +14,7 @@ HISTORY_FILENAME = "validation_history.jsonl"
 
 SF_TABLE_DEFAULT = [
   {"depth": 1,  "elo": 1614, "name": "SF14d1"},
+  {"depth": 2,  "elo": 1699, "name": "SF14d2"},
   {"depth": 3,  "elo": 1783, "name": "SF14d3"},
   {"depth": 4,  "elo": 1853, "name": "SF14d4"},
   {"depth": 5,  "elo": 1922, "name": "SF14d5"},
@@ -26,7 +27,7 @@ SF_TABLE_DEFAULT = [
   {"depth": 18, "elo": 2847, "name": "SF14d18"},
   {"depth": 21, "elo": 2903, "name": "SF14d21"},
   {"depth": 25, "elo": 2965, "name": "SF14d25"},
-  {"depth": 30, "elo": 3043, "name": "SF14d30"},
+  {"depth": 30, "elo": 3043, "name": "SF14d30"}
 ]
 
 class ValidationConfig(Config):
@@ -40,8 +41,8 @@ class ValidationConfig(Config):
 
     n_games = 64
     games_at_once = 64
-    micro_batch = 2
-    fwd_batch = 128
+    micro_batch = 4
+    fwd_batch = 256
 
     # disable noisy exploration during validation
     add_root_noise = False
@@ -51,9 +52,9 @@ class ValidationConfig(Config):
 
     # simulation schedule: keep stable sims for evaluation
     sf_move_sims = 5
-    sims_floor = 1000
+    sims_floor = 1200
     sims_ceiling = 1600
-    target_delta = 300
+    target_delta = 400
     es_check_every = 50
 
     run_post_hoc = True

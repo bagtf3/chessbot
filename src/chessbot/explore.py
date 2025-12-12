@@ -269,7 +269,8 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 #%%
 # plot single phase
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
 
@@ -321,9 +322,9 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'startpos']
-games = [g for g in scored if not g['vs_stockfish']]
-gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+scored = [g for g in scored if g['scenario'] != 'startpos']
+games = [g for g in scored if not g['vs_stockfish'] and g['result'] != 0.0]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -335,6 +336,8 @@ suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
+suffixes = [""]
 
 df_list = []
 val_dfs = []
@@ -357,12 +360,18 @@ for s in suffixes:
     _ = combine_analysis_staging(rd)
     all_games = load_game_index(rd)
     
-    pkl = os.path.join(rd, ANALYZE_PKL)
-    with open(pkl, "rb") as f:
-        prev_run = pickle.load(f)
+    df_all_parquet = os.path.join(rd, "df_all.parquet")
+    df_means_parquet = os.path.join(rd, "df_means.parquet")
+    if os.path.exists(df_all_parquet) and os.path.exists(df_means_parquet):
+        df_all = pd.read_parquet(df_all_parquet)
+        df_means = pd.read_parquet(df_means_parquet)
+    else:
+        pkl = os.path.join(rd, ANALYZE_PKL)
+        with open(pkl, "rb") as f:
+            prev_run = pickle.load(f)
     
-    df_all = prev_run['df_all']
-    df_means = prev_run['df_means']
+        df_all = prev_run['df_all']
+        df_means = prev_run['df_means']
     
     # tidy up CPL
     df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
@@ -423,9 +432,7 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
-
-
-
+#%%
 
 
 

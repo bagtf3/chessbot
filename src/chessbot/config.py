@@ -8,24 +8,24 @@ class Config(object):
     """
 
     is_validation_run = False
-    validation_every = 10
+    validation_every = 5
 
     # files
     selfplay_dir = SP_DIR
-    #run_tag = "conv_net_flat_run2"
-    #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
-    run_tag = 'conv_12x512SE'
-    init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_12x512SE_0.h5'
+    run_tag = "conv_net_flat_run2"
+    init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
+    #run_tag = 'conv_12x512SE'
+    #init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_12x512SE_0.h5'
     previous_run_tag = None
 
     # MCTS
     c_puct = 1.5
 
     # Simulation schedule
-    sf_move_sims = 150
-    sims_floor = 600
-    sims_ceiling = 1000
-    target_delta = 200
+    sf_move_sims = 250
+    sims_floor = 1200
+    sims_ceiling = 2000
+    target_delta = 500
 
     # early stop
     use_sim_decision_model = False
@@ -36,8 +36,8 @@ class Config(object):
     n_games = 64
     games_at_once = 64
     n_rounds = 51
-    micro_batch = 8
-    fwd_batch = 512
+    micro_batch = 4
+    fwd_batch = 256
 
     max_game_length = 200
     min_game_length = 5
@@ -65,12 +65,12 @@ class Config(object):
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.25
+    dirichlet_eps = 0.20
     dirichlet_alpha = 0.3
     sample_moves = True
     move_sample_temp_range = [1e-6, 1.2]
 
-    target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
+    target_y_weights = {'vwq': 0.4, 'z': 0.5, 'z_taper': 0.1}
     loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.0}
     vscale = 0.9
     draw_weight = 0.1

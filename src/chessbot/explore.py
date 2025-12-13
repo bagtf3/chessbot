@@ -269,8 +269,9 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 #%%
 # plot single phase
 run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
 
@@ -336,8 +337,8 @@ suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
-suffixes = [""]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
+#suffixes = [""]
 
 df_list = []
 val_dfs = []
@@ -412,19 +413,21 @@ print("########### Report for all non validation games ############".center(60))
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 
-val_df = pd.concat(val_dfs)
-VAL_WINDOW = min(250, int(len(df_val) * 0.15 // 10 * 10))
-plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
-print()
-print("########### Report for SF validation games only ############".center(60))
-report_cpl_and_bmr(df_val, VAL_WINDOW)
+if val_dfs:
+    val_df = pd.concat(val_dfs)
+    VAL_WINDOW = min(250, int(len(df_val) * 0.15 // 10 * 10))
+    plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
+    print()
+    print("########### Report for SF validation games only ############".center(60))
+    report_cpl_and_bmr(df_val, VAL_WINDOW)
 
 from chessbot.utils import plot_training_progress
 from warnings import catch_warnings, simplefilter
 
-with catch_warnings():
-    simplefilter("ignore")
-    plot_training_progress(eval_df)
+if "mass_on_legal" in eval_df.columns:
+    with catch_warnings():
+        simplefilter("ignore")
+        plot_training_progress(eval_df)
 #%%
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
@@ -433,6 +436,33 @@ games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['resu
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
 #%%
+from collections import defaultdict
+import random
+buffer = defaultdict(list)
 
+rd = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+all_games = load_game_index(rd)
+random.shuffle(all_games)
 
+thresh = 6000
+for game in all_games:
+    gv = GameViewer(game['json_file'], sf_df=None)
+    if gv.result == 0:
+        print("skipping due to draw")
+    if len(gv.moves_uci) < 10:
+        print("skipping due to short game length")
+        
+    X, M, P, Z, V, R = gv.generate_training_data(sf_skip=False)
+    if X:
+        buffer['X'] += X
+        buffer['M'] += M
+        buffer['P'] += P
+        buffer['Z'] += Z
+        buffer['V'] += V
+        buffer['R'] += R
+        
+    if len(buffer['Z']) >= thresh:
+        break
+    
+    
 

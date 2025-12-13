@@ -478,6 +478,111 @@ class GameViewer:
                 shown = False
                 self.next()
 
+    def generate_training_data(self, sf_skip=False):
+        """
+        Walk the game using self.next() and produce Xerces training examples.
+        If sf_skip is True, plies played by Stockfish (per who_moved()) are
+        skipped.
+        """
+        # X, Mask, Pi, result (Z), Vwq, moves Remaining
+        X, M, P, Z, V, R = [], [], [], [], [], []
+        result = self.result
+
+        # start from initial position
+        self.reset()
+
+        total_plies = len(self.moves_uci)
+        while self.ply < total_plies:
+            # detect whether the side to move is Stockfish
+            move_played = self.moves_uci[self.ply]
+            mover = self.who_moved().lower()
+            is_white_move = "white" in mover
+            is_sf_move = "stockfish" in mover
+
+            if sf_skip and is_sf_move:
+                # advance and skip this ply
+                self.next()
+                continue
+
+            rb = self.board
+            lms = rb.legal_moves()
+            
+            node = self.tree_data.get(str(self.ply), {})
+            if not node:
+                self.next()
+                continue
+            
+            cms = node.get("candidate_moves", {})
+            if cms:
+                visits = [[x['uci'], x['visits']] for x in cms]
+                visited = set([x[0] for x in visits])
+                
+                # add in all legal moves if missing
+                for move in [l for l in lms if l not in visited]:
+                    visited.append([[move, 1]])
+                    
+                visits = sorted(visits, key=lambda x: x[1], reverse=True)
+                
+                if is_sf_move and visits[0][0] != move_played:
+                    if sum([x[1] for x in visits]) > 100:
+                        most_visited = visits[0][0]
+                        for v in visits:
+                            if v[0] == move_played:
+                                v[0] = most_visited
+                                break
+                        visits[0][0] = move_played
+                    else:
+                        visits = make_fake_visits(move_played, lms, ratio_best=51)
+            
+            else:
+                # legal moves and synthetic visits
+                visits = make_fake_visits(move_played, lms, ratio_best=51)
+            counts = np.array([x[1] for x in visits], dtype=np.float32)
+            s = counts.sum()
+            if s > 0.0:
+                pi = counts / s
+            else:
+                # uniform fallback over legal moves
+                n_l = len(lms)
+                if n_l == 0:
+                    self.next()
+                    continue
+                pi = np.ones(n_l, dtype=np.float32) / float(n_l)
+            
+            # map legal moves -> flat xerces indices and build policy
+            
+            visited = [x[0] for x in visits]
+            indices = rb.moves_to_indices(visited)
+            policy = np.zeros(64 * 67, dtype=np.float32)
+            for idx, prob in zip(indices, pi):
+                policy[idx] += prob
+
+            # inputs and mask
+            x = rb.encode_64_tokens()
+            mask = rb.legal_move_mask()
+
+            # value target 0.5*Z + 0.5*vwq
+            vwq = node.get("visit_weighted_Q")
+            vwq_stm = vwq if is_white_move else -vwq
+            if result > 0:
+                z = 1 if is_white_move else -1
+            elif result < 0:
+                z = -1 if is_white_move else 1
+            else:
+                z = 0
+            
+            X.append(x)
+            M.append(mask)
+            P.append(policy)
+            Z.append(z)
+            V.append(vwq_stm)
+            R.append(len(self.moves_uci) - int(self.ply))
+
+            # advance to next ply using existing helper
+            self.next()
+
+        return X, M, P, Z, V, R
+
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:

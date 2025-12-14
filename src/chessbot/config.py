@@ -8,7 +8,7 @@ class Config(object):
     """
 
     is_validation_run = False
-    validation_every = 5
+    validation_every = 10
 
     # files
     selfplay_dir = SP_DIR
@@ -23,21 +23,21 @@ class Config(object):
 
     # Simulation schedule
     sf_move_sims = 250
-    sims_floor = 1200
-    sims_ceiling = 2000
+    sims_floor = 1600
+    sims_ceiling = 2200
     target_delta = 500
 
     # early stop
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 25
+    es_check_every = 50
 
     # Game stuff
     n_games = 64
     games_at_once = 64
     n_rounds = 51
-    micro_batch = 4
-    fwd_batch = 256
+    micro_batch = 8
+    fwd_batch = 512
 
     max_game_length = 200
     min_game_length = 5
@@ -70,7 +70,7 @@ class Config(object):
     sample_moves = True
     move_sample_temp_range = [1e-6, 1.2]
 
-    target_y_weights = {'vwq': 0.4, 'z': 0.5, 'z_taper': 0.1}
+    target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
     loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.0}
     vscale = 0.9
     draw_weight = 0.1

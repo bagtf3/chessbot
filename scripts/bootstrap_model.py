@@ -25,7 +25,7 @@ MODEL_NAME = f'conv64_{bl}x{fl}'
 
 # model.summary()
 #model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
-model = load_model(MODEL_DIR + "conv_12x512SE_0.h5")
+#model = load_model(MODEL_DIR + "conv_12x512SE_0.h5")
 #%%
 metrics_history = {
     "value_mse": [], "value_corr": [], "epoch_time": []
@@ -66,7 +66,12 @@ draw_rate = 0.5
 begin = time.time()
 #%%
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
-run_tags = ['conv_1000_selfplay_phase4', "conv_net_flat_run1", "conv_net_flat_run2"]
+run_tags = [
+    'conv_1000_selfplay_phase3','conv_1000_selfplay_phase4',
+    "conv_net_flat_12blocks_run0",
+    "conv_net_flat_run1", "conv_net_flat_run2"
+]
+
 all_games = []
 for rt in run_tags:
     rd = os.path.join(SP_DIR, rt)

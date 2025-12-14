@@ -332,6 +332,7 @@ CLIP_UB = 500
 
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
+#suffixes = ["_phase3", "_phase4"]
 root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
 suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
@@ -432,37 +433,9 @@ if "mass_on_legal" in eval_df.columns:
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
+#games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
-gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
 #%%
-from collections import defaultdict
-import random
-buffer = defaultdict(list)
-
-rd = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
-all_games = load_game_index(rd)
-random.shuffle(all_games)
-
-thresh = 6000
-for game in all_games:
-    gv = GameViewer(game['json_file'], sf_df=None)
-    if gv.result == 0:
-        print("skipping due to draw")
-    if len(gv.moves_uci) < 10:
-        print("skipping due to short game length")
-        
-    X, M, P, Z, V, R = gv.generate_training_data(sf_skip=False)
-    if X:
-        buffer['X'] += X
-        buffer['M'] += M
-        buffer['P'] += P
-        buffer['Z'] += Z
-        buffer['V'] += V
-        buffer['R'] += R
-        
-    if len(buffer['Z']) >= thresh:
-        break
-    
     
 

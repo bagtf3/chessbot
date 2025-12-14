@@ -1,23 +1,19 @@
-import os
+import os, pickle
 from chessbot import MODEL_DIR
 from chessbot.model import load_model
 from chessbot.utils import batch_policy_metrics, print_validation, format_time
-from chessbot.review import GameViewer, load_game_index
-
-from collections import defaultdict
+from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import random
-
-from chessbot.model import build_conv_flat_64x67
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-bl = 12
-fl = 512
-MODEL_NAME = f'conv64_{bl}x{fl}'
-    
+#bl = 12
+#fl = 512
+#MODEL_NAME = f'conv64_{bl}x{fl}'
+#from chessbot.model import build_conv_flat_64x67    
 # model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
 #     d_model_embed=128, vocab_size=21, filters=fl,
 #     n_blocks=bl, name=MODEL_NAME
@@ -25,45 +21,34 @@ MODEL_NAME = f'conv64_{bl}x{fl}'
 
 # model.summary()
 #model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
-#model = load_model(MODEL_DIR + "conv_12x512SE_0.h5")
+MODEL_NAME = "conv64_9x296"
+model = load_model("C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2/conv_net_flat_run2_model.h5")
 #%%
 metrics_history = {
     "value_mse": [], "value_corr": [], "epoch_time": []
 }
 
-weights_schedule = {
-    # slow start
-    3  : {"policy_logits": 1.0, "value_out": 1.00},
-    5  : {"policy_logits": 1.0, "value_out": 1.50},
-    20 : {"policy_logits": 1.5, "value_out": 2.00},
-    75 : {"policy_logits": 1.5, "value_out": 2.50},
-    150: {"policy_logits": 2.0, "value_out": 2.75},
-    300: {"policy_logits": 2.5, "value_out": 2.25},
-    400: {"policy_logits": 2.0, "value_out": 1.50},
-    500: {"policy_logits": 1.5, "value_out": 0.50},
-    # post-500 fine-tune taper (MSE maintenance mostly)
-    600: {"policy_logits": 1.0, "value_out": 0.50}
-}
+# weights_schedule = {
+#     # slow start
+#     3  : {"policy_logits": 1.0, "value_out": 1.00},
+#     5  : {"policy_logits": 1.0, "value_out": 1.50},
+#     20 : {"policy_logits": 1.5, "value_out": 2.00},
+#     75 : {"policy_logits": 1.5, "value_out": 2.50},
+#     150: {"policy_logits": 2.0, "value_out": 2.75},
+#     300: {"policy_logits": 2.5, "value_out": 2.25},
+#     400: {"policy_logits": 2.0, "value_out": 1.50},
+#     500: {"policy_logits": 1.5, "value_out": 0.50},
+#     # post-500 fine-tune taper (MSE maintenance mostly)
+#     600: {"policy_logits": 1.0, "value_out": 0.50}
+# }
 
 eps = 1e-12
 big_neg = -1e6
-
-def get_sf_depth(epoch):
-    sf_schedule = {100: 8, 200: 9, 400: 10, 600: 11, np.inf: 12}
-    for e in sorted(sf_schedule.keys()):
-        if epoch < e:
-            return sf_schedule[e]
-
 
 def moving_average_pd(arr, window=15):
     s = pd.Series(arr)
     return s.rolling(window, center=True, min_periods=1).mean().values
 
-
-epoch, idx = 0, 0
-MAX_EPOCH = 5000
-draw_rate = 0.5
-begin = time.time()
 #%%
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 run_tags = [
@@ -73,51 +58,158 @@ run_tags = [
 ]
 
 all_games = []
+df_list = []
 for rt in run_tags:
     rd = os.path.join(SP_DIR, rt)
     all_games += load_game_index(rd)
 
-random.shuffle(all_games)
-thresh = 10000
-while idx < len(all_games) and epoch < MAX_EPOCH:
-    for k in sorted(weights_schedule.keys()):
-        if epoch < k:
-            loss_weights = weights_schedule[k]
-            break
+    pkl = os.path.join(rd, ANALYZE_PKL)
+    with open(pkl, "rb") as f:
+        prev_run = pickle.load(f)
     
-    epoch_start = time.time()
-    buffer = defaultdict(list)
-    while len(buffer['Z']) < thresh:
-        if idx >= len(all_games):
-            break
-        
-        game = all_games[idx]
+    df_all = prev_run['df_all']
+    df_means = prev_run['df_means']
+    
+    # tidy up CPL
+    df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
+    clipped_cpl = df_all.groupby("game_id")['clipped_loss'].mean()
+
+    df_means['overall_cpl'] = df_means.game_id.map(clipped_cpl)
+    df_means['run_tag'] = rt
+    df_list.append(df_means)
+    del df_all
+    del df_means
+
+df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
+df_trim = df_trim.query("scenario != 'random_endgame'").copy()
+df_trim = df_trim.query("scenario != 'paired_validation'").copy()
+
+meta = pd.DataFrame(all_games)
+meta = meta.query("plies >= 10")
+exclude = ['random_endgame', 'paired_validation']
+meta = meta.query("scenario != @exclude")
+
+meta = meta.merge(df_trim[['game_id', 'run_tag', 'overall_cpl']], on='game_id')
+meta = meta.query("overall_cpl <= 50")
+
+training_games = meta['json_file'].to_list()
+
+random.shuffle(training_games)
+
+
+def append_to_buffer(buf, X, M, P, Z, V):
+    y = [0.5 * a + 0.5 * b for a, b in zip(Z, V)]
+    buf += list(zip(X, M, P, y))
+
+
+def top_up_sliding_buffer(
+    buf,
+    training_games,
+    idx,
+    buffer_size,
+    draw_rate=0.5,
+):
+    while len(buf) < buffer_size and idx < len(training_games):
+        game = training_games[idx]
         idx += 1
-        gv = GameViewer(game['json_file'], sf_df=None)
-        
+
+        gv = GameViewer(game, sf_df=None)
+
         if gv.result == 0:
             if np.random.random() > draw_rate:
                 continue
+
         if len(gv.moves_uci) < 10:
             continue
-            
+
         X, M, P, Z, V, R = gv.generate_training_data(sf_skip=False)
-        if X:
-            buffer['X'] += X
-            buffer['M'] += M
-            buffer['P'] += P
-            buffer['Z'] += Z
-            buffer['V'] += V
-            buffer['R'] += R
+        if not X:
+            continue
+
+        append_to_buffer(buf, X, M, P, Z, V)
+
+    return idx
+
+
+def sample_from_sliding_buffer(buf, epoch_size):
+    n = len(buf)
+    if n == 0:
+        return None
+
+    k = epoch_size if n >= epoch_size else n
+
+    Xs = []
+    Ms = []
+    Ps = []
+    Ys = []
+
+    for _ in range(k):
+        j = np.random.randint(len(buf))
+        x, m, p, y = buf[j]
+        Xs.append(x)
+        Ms.append(m)
+        Ps.append(p)
+        Ys.append(y)
+
+        buf[j] = buf[-1]
+        buf.pop()
+
+    Xb = np.stack(Xs, axis=0)
+    Mb = np.stack(Ms, axis=0)
+    Pb = np.stack(Ps, axis=0)
+    Yb = np.stack(Ys, axis=0)
+
+    return Xb, Mb, Pb, Yb
+
+
+buffer = []
+batch_size = 512
+epoch_size = 20*batch_size
+buffer_size = 5 * epoch_size
+epoch, idx = 0, 0
+MAX_EPOCH = 250
+draw_rate = 0.5
+begin = time.time()
+loss_weights = {"policy_logits": 2.0, "value_out": 2.00}
+
+idx = top_up_sliding_buffer(
+    buffer,
+    training_games,
+    idx,
+    buffer_size=buffer_size,
+    draw_rate=draw_rate
+)
+
+#%%
+while idx < len(training_games) and epoch <= MAX_EPOCH:
+    if epoch > 10:
+        loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    if epoch > 100:
+        loss_weights = {"policy_logits": 0.5, "value_out": 0.5}
+    if epoch > 150:
+        loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
+    if epoch > 200:
+        loss_weights = {"policy_logits": 0.12, "value_out": 0.12}
+        
+    epoch_start = time.time()
     
-    y = [0.5*a + 0.5*b for a, b in zip(buffer['Z'], buffer['V'])]
-    Xstack = np.stack(buffer['X'], axis=0) 
-    Mstack = np.stack(buffer['M'], axis=0)
-    Pstack = np.stack(buffer['P'], axis=0)
-    Ystack = np.stack(y, axis=0)
+    idx = top_up_sliding_buffer(
+        buffer,
+        training_games,
+        idx,
+        buffer_size=buffer_size,
+        draw_rate=draw_rate
+    )
+
+    
+    batch = sample_from_sliding_buffer(buffer, epoch_size)
+    if batch is None:
+        break
+
+    Xstack, Mstack, Pstack, Ystack = batch
     
     # pred validate and train
-    preds = model.predict(Xstack, verbose=0)
+    preds = model.predict(Xstack, verbose=0, batch_size=batch_size)
     
     value_preds = preds[1].ravel(); targets = np.asarray(Ystack).ravel()
     plt.scatter(targets, value_preds, s=6)
@@ -213,7 +305,7 @@ while idx < len(all_games) and epoch < MAX_EPOCH:
     s_wts = {k: weights*loss_weights[k] for k in Ydict.keys()}
     print("-"*100)
     history = model.fit(
-        Xstack, Ydict, epochs=2, batch_size=256, verbose=0, sample_weight=s_wts
+        Xstack, Ydict, epochs=1, batch_size=batch_size, verbose=0, sample_weight=s_wts
     )
     
     rows = []
@@ -250,7 +342,9 @@ while idx < len(all_games) and epoch < MAX_EPOCH:
     print(f"[time check] last epoch: {e_time}, avg epoch: {avg_epoch},  "
           f"total runtime: {runtime}")
     print()
-    
-model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_{epoch}.h5")
+    if epoch % 25 == 0:    
+        model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
+# when done
+model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped.h5")
 #with open(MODEL_DIR + f"{MODEL_NAME}_train_metrics_{epoch}.pkl", "wb") as f:
 #    pickle.dump(metrics_history, f, protocol=pickle.HIGHEST_PROTOCOL)

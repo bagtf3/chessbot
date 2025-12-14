@@ -1,5 +1,6 @@
 import uuid
 from time import time as _now
+from collections.abc import Iterable
 
 import chess, chess.syzygy
 import tl2cgen as tl2
@@ -22,7 +23,17 @@ class MCTSTree(fasttree):
 
     def __init__(self, board, cfg):
         self.config = cfg
-        self.c_puct = float(cfg.c_puct)
+
+        # if c_puct is given as a list, pick an option randomly
+        # otherwise assume its a float or int        
+        c = cfg.c_puct
+        if isinstance(c, (int, float)):
+            self.c_puct = float(c)
+        elif isinstance(c, Iterable):
+            self.c_puct = float(np.random.choice(c))
+        else:
+            self.c_puct = c
+
         super().__init__(board, self.c_puct, MCTSTree.ev)
 
         # bookkeeping

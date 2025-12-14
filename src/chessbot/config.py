@@ -12,19 +12,21 @@ class Config(object):
 
     # files
     selfplay_dir = SP_DIR
-    run_tag = "conv_net_flat_run2"
-    init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
+    #run_tag = "conv_net_flat_run2"
+    #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
     #run_tag = 'conv_12x512SE'
     #init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_12x512SE_0.h5'
+    run_tag = "conv_12x296_bootstrapped"
+    init_model = MODEL_DIR + 'conv64_9x296_bootstrapped.h5'
     previous_run_tag = None
 
     # MCTS
-    c_puct = 1.5
+    c_puct = 1.75
 
     # Simulation schedule
     sf_move_sims = 250
-    sims_floor = 1600
-    sims_ceiling = 2200
+    sims_floor = 1000
+    sims_ceiling = 1050
     target_delta = 500
 
     # early stop
@@ -33,19 +35,19 @@ class Config(object):
     es_check_every = 50
 
     # Game stuff
-    n_games = 64
-    games_at_once = 64
+    n_games = 128
+    games_at_once = 128
     n_rounds = 51
-    micro_batch = 8
+    micro_batch = 4
     fwd_batch = 512
 
     max_game_length = 200
     min_game_length = 5
-    material_diff_cutoff = 25
-    material_diff_cutoff_span = 25
+    material_diff_cutoff = 15
+    material_diff_cutoff_span = 20
     use_syzygy = False
 
-    play_vs_sf_prob = 0.25
+    play_vs_sf_prob = 0.33
     sf_depth = 12
     sf_config = {"Threads": 1, "Hash": 256}
 
@@ -60,18 +62,18 @@ class Config(object):
     }
 
     # priors
-    prior_clip_max = 0.6
-    prior_clip_min = 0.0125
+    prior_clip_max = 0.55
+    prior_clip_min = 0.015
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.20
+    dirichlet_eps = 0.25
     dirichlet_alpha = 0.3
     sample_moves = True
-    move_sample_temp_range = [1e-6, 1.2]
+    move_sample_temp_range = [1e-6, 1.25]
 
-    target_y_weights = {'vwq': 0.3, 'z': 0.4, 'z_taper': 0.3}
-    loss_weights = {"policy_winner": 1.5, "policy_loser": 1.5, "value_out": 1.0}
+    target_y_weights = {'vwq': 0.5, 'z': 0.5, 'z_taper': 0.0}
+    loss_weights = {"policy_winner": 0.5, "policy_loser": 0.25, "value_out": 0.25}
     vscale = 0.9
     draw_weight = 0.1
 

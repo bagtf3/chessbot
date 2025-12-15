@@ -268,9 +268,9 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
 #run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
-#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
 #run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -323,9 +323,19 @@ pprint(trend_check(df_trim, window=WINDOW))
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-scored = [g for g in scored if g['scenario'] != 'startpos']
+scored = [g for g in scored if g['scenario'] == 'startpos']
 games = [g for g in scored if not g['vs_stockfish'] and g['result'] != 0.0]
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+
+
+res = []
+for s in scored:
+    l = load_json(s['json_file'])
+    if not isinstance(l['c_puct'], list):
+        res.append([l['game_id'], l['c_puct']])
+cdf = pd.DataFrame(res, columns=['game_id', 'c_puct'])
+both = df_trim.merge(cdf, on='game_id')
+both.query("c_puct != 1.75").groupby('c_puct')['overall_cpl'].mean()
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -333,13 +343,14 @@ CLIP_UB = 500
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1", "2"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+#suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
-#suffixes = [""]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
+suffixes = [""]
 
 df_list = []
 val_dfs = []

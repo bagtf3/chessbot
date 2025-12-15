@@ -393,6 +393,7 @@ class GameLooper(object):
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
+        res['c_puct'] = game.tree.c_puct
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
@@ -414,6 +415,7 @@ class GameLooper(object):
         ]
         new_idx = {k: res[k] for k in keep}
         new_idx["json_file"] = out_file
+        new_idx['c_puct'] = game.tree.c_puct
         
         new_idx['beat_sf'] = False
         if new_idx['vs_stockfish']:

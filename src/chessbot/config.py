@@ -8,7 +8,7 @@ class Config(object):
     """
 
     is_validation_run = False
-    validation_every = 10
+    validation_every = 8
 
     # files
     selfplay_dir = SP_DIR
@@ -21,12 +21,12 @@ class Config(object):
     previous_run_tag = None
 
     # MCTS
-    c_puct = 1.75
+    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
 
     # Simulation schedule
     sf_move_sims = 250
-    sims_floor = 1000
-    sims_ceiling = 1050
+    sims_floor = 850
+    sims_ceiling = 1000
     target_delta = 500
 
     # early stop
@@ -37,7 +37,7 @@ class Config(object):
     # Game stuff
     n_games = 128
     games_at_once = 128
-    n_rounds = 51
+    n_rounds = 50
     micro_batch = 4
     fwd_batch = 512
 
@@ -56,8 +56,8 @@ class Config(object):
     mine_bonus_data = True
 
     game_probs = {
-        "startpos":0.5, "pre_opened_mini": 0.22, "pre_opened": 0.22,
-        "random_init": 0.03,
+        "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
+        "random_init": 0.08,
         "piece_odds": 0.02, "piece_training": 0.01
     }
 
@@ -67,13 +67,13 @@ class Config(object):
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.25
+    dirichlet_eps = 0.2
     dirichlet_alpha = 0.3
     sample_moves = True
     move_sample_temp_range = [1e-6, 1.25]
 
     target_y_weights = {'vwq': 0.5, 'z': 0.5, 'z_taper': 0.0}
-    loss_weights = {"policy_winner": 0.5, "policy_loser": 0.25, "value_out": 0.25}
+    loss_weights = {"policy_winner": 0.25, "policy_loser": 0.25, "value_out": 0.25}
     vscale = 0.9
     draw_weight = 0.1
 

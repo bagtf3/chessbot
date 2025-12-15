@@ -1,6 +1,5 @@
 import uuid
 from time import time as _now
-from collections.abc import Iterable
 
 import chess, chess.syzygy
 import tl2cgen as tl2
@@ -29,13 +28,13 @@ class MCTSTree(fasttree):
         c = cfg.c_puct
         if isinstance(c, (int, float)):
             self.c_puct = float(c)
-        elif isinstance(c, Iterable):
+        elif isinstance(c, (list, set)):
             self.c_puct = float(np.random.choice(c))
         else:
             self.c_puct = c
 
         super().__init__(board, self.c_puct, MCTSTree.ev)
-
+        
         # bookkeeping
         self.board = board
         self.root_board_fen = board.fen()
@@ -393,7 +392,7 @@ class ChessGame(object):
         if not root.is_expanded:
             return
         
-        c_puct = self.config.c_puct
+        c_puct = self.tree.c_puct
         
         # timing
         start = self.tree._move_started_at

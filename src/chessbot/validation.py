@@ -376,7 +376,6 @@ def build_validation_summary(looper):
     summary = {
         "ts": time.time(),
         "run_tag": cfg["run_tag"],
-        "run_dir": cfg["run_dir"],
         "n_games": n,
         "wins": wins,
         "draws": draws,

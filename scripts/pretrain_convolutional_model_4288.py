@@ -352,7 +352,7 @@ from tensorflow.keras import layers, Input, Model
 from tensorflow.keras import mixed_precision
 
 
-def squeeze_excitation(x, channels, reduction=4, name=None):
+def squeeze_excitation(x, channels, reduction=16, name=None):
     """
     Small SE: global pool -> bottleneck Dense -> sigmoid -> scale channels.
     """
@@ -365,7 +365,7 @@ def squeeze_excitation(x, channels, reduction=4, name=None):
     return layers.Multiply(name=nm + "scale")([x, se])
 
 
-def res_block_batchnorm(x, channels, leak=0.01, name=None):
+def res_block_batchnorm(x, channels, reduction, leak=0.01, name=None):
     """
     Residual block reworked to use BatchNorm and a small SE module.
     Keeps the same public name for easy replacement.
@@ -385,20 +385,24 @@ def res_block_batchnorm(x, channels, leak=0.01, name=None):
     )(act1)
 
     bn2 = layers.BatchNormalization(name=nm + "bn2")(conv2)
-
-    se_out = squeeze_excitation(bn2, channels, reduction=16, name=nm + "se")
-
-    out = layers.Add(name=nm + "add")([x, se_out])
+    
+    if reduction > 0:
+        se_out = squeeze_excitation(bn2, channels, reduction=reduction, name=nm + "se")
+        out = layers.Add(name=nm + "add")([x, se_out])
+    else:
+        out= bn2
+        
     out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
     return out
 
 
 def build_conv_flat_64x67(
+    name,
     d_model_embed=128,
     vocab_size=21,
     filters=256,
     n_blocks=9,
-    name="conv_flat_64x67",
+    reduction=16
 ):
     """
     Conv-heavy model using BatchNormalization in the trunk and a
@@ -422,7 +426,7 @@ def build_conv_flat_64x67(
     x = layers.LeakyReLU(alpha=0.01, name="lrelu_init")(x)
 
     for i in range(n_blocks):
-        x = res_block_batchnorm(x, fl, leak=0.01, name=f"res{i}")
+        x = res_block_batchnorm(x, fl, reduction=reduction, leak=0.01, name=f"res{i}")
 
     x = layers.Conv2D(fl, 1, padding="same", use_bias=False,
                       name="conv_mix_1x1")(x)
@@ -459,47 +463,13 @@ def build_conv_flat_64x67(
     return model, opt, loss_weights, loss_dict
 
 
-    
-MODEL_NAME = 'conv_12x384SE'
+bl = 10
+fl = 256
+MODEL_NAME = f'conv64_{bl}x{fl}SE'
 model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
-    d_model_embed=128, vocab_size=21, filters=320,
-    n_blocks=15, name=MODEL_NAME
+    name=MODEL_NAME, d_model_embed=96, vocab_size=21,
+    filters=fl, n_blocks=bl, reduction=16
 )
 
 model.summary()
-model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
-#Total params: 57,965,636
-#Trainable params: 57,939,012
-
-from lcztools.testing import TarTrainingFile
-from lcztools.util import tqdm
-
-
-def train_to_pgn(train_filename):
-    TarTrainingFile(train_filename).to_pgn()
-    
-f = "C:/Users/Bryan/Data/chessbot_data/lc0/training-run1--20200711-2017/training.96193352.gz"
-f = "C:/Users/Bryan/Data/chessbot_data/lc0/training-run1--20200711-2017.tar"
-
-pgn = train_to_pgn(f)
-
-
-try:
-    from lcztools._uci_to_idx import uci_to_idx as _uci_to_idx
-    _idx_to_uci_wn = {v: k for k, v in _uci_to_idx[0].items()}
-    _idx_to_uci_wc = {v: k for k, v in _uci_to_idx[1].items()}
-    _idx_to_uci_bn = {v: k for k, v in _uci_to_idx[2].items()}
-    _idx_to_uci_bc = {v: k for k, v in _uci_to_idx[3].items()}
-    IDX_TO_UCI = [
-        _idx_to_uci_wn, # White no castling
-        _idx_to_uci_wc, # White castling
-        _idx_to_uci_bn, # Black no castling
-        _idx_to_uci_bc, # Black castling
-    ]
-except:
-    print("No lcztools")
-
-
-COLUMNS = 'abcdefgh'
-INDEXED_PIECES = list(enumerate(['P', 'N', 'B', 'R', 'Q', 'K']))
-
+#model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")

@@ -82,6 +82,7 @@ class GameLooper(object):
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
         batch_candidates = set()
+        batch_candidates.add(cfg.fwd_batch)
         bs = 16
         while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)

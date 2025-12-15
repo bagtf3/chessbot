@@ -374,14 +374,14 @@ def build_validation_summary(looper):
     save_validation_config(cfg["run_dir"], cfg)
 
     summary = {
-        "ts": time.time(),
+        "ts": int(time.time()),
         "run_tag": cfg["run_tag"],
         "n_games": n,
         "wins": wins,
         "draws": draws,
-        "score": score,
+        "score": np.round(score, 4),
         "sf_elo": sf_elo,
-        "model_elo": model_elo,
+        "model_elo": np.round(model_elo, 2),
         "should_count": run_counts,
         "consec_over_50": cfg["consec_over_50"],
         "bumped": bumped,

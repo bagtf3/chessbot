@@ -449,4 +449,16 @@ games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
 #%%
     
-
+def f(fwd):
+    batch_candidates = set([fwd])
+    bs = 16
+    while bs <= fwd:
+        batch_candidates.add(bs)
+        bs *= 2
+    
+    # split difference between last 2
+    if len(batch_candidates) >= 2:
+        sbc = sorted(batch_candidates)
+        sbc.append(int(sbc[-1] - sbc[-2] / 2))
+        return sorted(set(sbc))
+    return sorted(set(batch_candidates))

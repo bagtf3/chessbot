@@ -35,11 +35,11 @@ class Config(object):
     es_check_every = 50
 
     # Game stuff
-    n_games = 128
-    games_at_once = 128
+    n_games = 96
+    games_at_once = 96
     n_rounds = 50
     micro_batch = 4
-    fwd_batch = 512
+    fwd_batch = 384
 
     max_game_length = 200
     min_game_length = 5

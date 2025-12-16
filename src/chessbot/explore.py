@@ -283,8 +283,8 @@ with open(pkl, "rb") as f:
 df_all = prev_run['df_all']
 df_means = prev_run['df_means']
 
-df_all = df_all.query("scenario != 'paired_validation'").copy()
-df_means = df_means.query("scenario != 'paired_validation'").copy()
+#df_all = df_all.query("scenario != 'paired_validation'").copy()
+#df_means = df_means.query("scenario != 'paired_validation'").copy()
 
 WINDOW = min(2500, max(5, int(len(df_means) * 0.2 // 10 * 10)))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
@@ -325,17 +325,31 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 scored = [g for g in scored if g['scenario'] == 'startpos']
 games = [g for g in scored if not g['vs_stockfish'] and g['result'] != 0.0]
-gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+games = [g for g in games if g.get('c_puct', -1) == 1.75]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 
+res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
+cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
+both = df_trim.merge(cdf.query("c_puct > 0 "), on='game_id')
 
-res = []
-for s in scored:
-    l = load_json(s['json_file'])
-    if not isinstance(l['c_puct'], list):
-        res.append([l['game_id'], l['c_puct']])
-cdf = pd.DataFrame(res, columns=['game_id', 'c_puct'])
-both = df_trim.merge(cdf, on='game_id')
-both.query("c_puct != 1.75").groupby('c_puct')['overall_cpl'].mean()
+# training game CPL by c_puct
+cpl_train = both.query(
+    "scenario != 'paired_validation'"
+).groupby('c_puct')[['overall_cpl']].mean()
+
+N_train = both.query("scenario != 'paired_validation'").c_puct.value_counts()
+cpl_train = cpl_train.join(N_train)
+
+# summary SF validations
+both['draws'] = both.result == 0.0
+both['wins'] = both.beat_sf
+both['points'] = 1*both.wins + 0.5*both.draws
+cols = ['overall_cpl', 'wins', 'draws', 'points']
+val_summary = both.query("scenario == 'paired_validation'").groupby("c_puct")[cols].mean()
+N_val = both.query("scenario == 'paired_validation'").c_puct.value_counts()
+val_summary = val_summary.join(N_val)
+val_summary
+
 #%%
 ## Plot everything so far
 CLIP_UB = 500
@@ -343,20 +357,24 @@ CLIP_UB = 500
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-#suffixes = ["0", "1", "2"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
-suffixes = [""]
+
+rd_list = []
+for s in suffixes:
+    rd_list.append(root + s)
+
+latest = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
+rd_list.append(latest)
 
 df_list = []
 val_dfs = []
 eval_df = None
-for s in suffixes:
-    rd = root + s
+for rd in rd_list:
     jsonl = os.path.join(rd, "validation_history.jsonl")
     if os.path.exists(jsonl):
         val_dfs.append(pd.read_json(jsonl, lines=True))
@@ -446,19 +464,5 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 #games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
-gv = GameViewer(games[-5]['json_file'], sf_df=d); gv.replay()
+gv = GameViewer(games[-6]['json_file'], sf_df=d); gv.replay()
 #%%
-    
-def f(fwd):
-    batch_candidates = set([fwd])
-    bs = 16
-    while bs <= fwd:
-        batch_candidates.add(bs)
-        bs *= 2
-    
-    # split difference between last 2
-    if len(batch_candidates) >= 2:
-        sbc = sorted(batch_candidates)
-        sbc.append(int(sbc[-1] - sbc[-2] / 2))
-        return sorted(set(sbc))
-    return sorted(set(batch_candidates))

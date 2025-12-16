@@ -21,7 +21,7 @@ class Config(object):
     previous_run_tag = None
 
     # MCTS
-    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    c_puct = [1.25, 1.5, 1.5, 2.0, 2.0, 2.25]
 
     # Simulation schedule
     sf_move_sims = 250

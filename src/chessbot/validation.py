@@ -45,6 +45,7 @@ class ValidationConfig(Config):
     fwd_batch = 256
 
     # disable noisy exploration during validation
+    c_puct = [1.25, 1.5, 1.5, 1.5, 2.0]
     add_root_noise = False
     sample_moves = False
     dirichlet_eps = 0.0
@@ -52,7 +53,7 @@ class ValidationConfig(Config):
 
     # simulation schedule: keep stable sims for evaluation
     sf_move_sims = 5
-    sims_floor = 1200
+    sims_floor = 1400
     sims_ceiling = 1600
     target_delta = 400
     es_check_every = 50
@@ -60,7 +61,7 @@ class ValidationConfig(Config):
     run_post_hoc = True
     mine_bonus_data = True
 
-    max_game_length = 300
+    max_game_length = 350
     min_game_length = 1
     material_diff_cutoff = 100
     material_diff_cutoff_span = 1000

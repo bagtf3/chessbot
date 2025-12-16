@@ -1,6 +1,6 @@
 from chessbot import SP_DIR, MODEL_DIR
 import os
-
+import yaml
 
 class Config(object):
     """
@@ -12,10 +12,6 @@ class Config(object):
 
     # files
     selfplay_dir = SP_DIR
-    #run_tag = "conv_net_flat_run2"
-    #init_model = SP_DIR + "conv_net_flat_run2/conv_net_flat_run2_model.h5"
-    #run_tag = 'conv_12x512SE'
-    #init_model = 'C:/Users/Bryan/Data/chessbot_data/models/conv_12x512SE_0.h5'
     run_tag = "conv_12x296_bootstrapped"
     init_model = MODEL_DIR + 'conv64_9x296_bootstrapped.h5'
     previous_run_tag = None
@@ -78,24 +74,23 @@ class Config(object):
     draw_weight = 0.1
 
     def __init__(self):
-        """
-        Initialize runtime paths and derived config fields.
+        self.init_paths()
 
-        Derive run_dir, game_dir, and various path attributes from
-        class defaults and creates the directories.
+    def init_paths(self):
         """
-        # resolve run_dir from class attributes
+        Derive run_dir, game_dir and other path attrs from class defaults.
+        Creates directories and sets class-level Config.* fields so callers
+        can update class attrs and re-run this to recompute paths.
+        """
         resolved_run_dir = os.path.join(self.selfplay_dir, self.run_tag)
         resolved_run_dir = os.path.abspath(resolved_run_dir)
         self.run_dir = resolved_run_dir
         Config.run_dir = resolved_run_dir
 
-        # game dir
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
         Config.game_dir = game_dir
 
-        # index and progress paths
         self.game_index_file = os.path.join(self.run_dir, "game_index.json")
         Config.game_index_file = self.game_index_file
 
@@ -105,17 +100,83 @@ class Config(object):
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
         Config.progress_plot_path = self.progress_plot_path
 
-        # model path default (can be overridden later)
         model_name = f"{self.run_tag}_model.h5"
         self.model_path = os.path.join(self.run_dir, model_name)
         Config.model_path = self.model_path
 
-        # make directories right away so callers can write safely
         for d in (self.run_dir, self.game_dir):
             os.makedirs(d, exist_ok=True)
 
-        # provide a small hook attribute so callers know this config was initialized
+        # public flag; keep the old name too for backward compatibility
+        self.paths_initialized = True
         self._paths_initialized = True
+
+    @classmethod
+    def from_json(cls, path, init=True):
+        """
+        Create Config from a JSON file, update fields, and optionally init paths.
+        """
+        with open(path, "r", encoding="utf-8") as fh:
+            disk = json.load(fh)
+
+        inst = cls()
+        # update existing attrs from disk (raises on unknown keys)
+        inst.update(disk)
+
+        if init:
+            # idempotent: safe to call even if __init__ already ran init_paths
+            inst.init_paths()
+        return inst
+
+    @classmethod
+    def from_yaml(cls, path, init=True):
+        """
+        Create Config from a YAML file, update fields, and optionally init paths.
+        """
+        with open(path, "r", encoding="utf-8") as fh:
+            disk = yaml.safe_load(fh) or {}
+
+        inst = cls()
+        inst.update(disk)
+
+        if init:
+            inst.init_paths()
+        return inst
+
+    @classmethod
+    def from_dict(cls, data, init=True):
+        """
+        Construct a Config from a plain dict and optionally init paths.
+        """
+        inst = cls()
+        inst.update(data)
+        if init:
+            inst.init_paths()
+        return inst
+
+    def update_via(self, path, init=True):
+        """
+        Read path (yaml|yml|json), load into a dict, and apply via update().
+        Returns self. If init True, run init_paths() after update.
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".yaml", ".yml"):
+            with open(path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        elif ext == ".json":
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        else:
+            raise ValueError(f"unsupported config file type: {ext}")
+
+        self.update(data)
+
+        if init:
+            self.init_paths()
+        return self
 
     def to_dict(self):
         return {
@@ -138,3 +199,18 @@ class Config(object):
             if not hasattr(self, k):
                 raise AttributeError(f"Unknown config key: {k}")
             setattr(self, k, v)
+
+    def copy(self, init=False):
+        """
+        Return a fresh Config instance cloned from this one.
+        By default this does not touch the filesystem; pass init=True
+        to call init_paths() on the new instance.
+        """
+        # use the existing dict/ctor path so update() validation stays active
+        cfg_dict = self.to_dict()
+        new = self.__class__.from_dict(cfg_dict, init=False)
+
+        # do not eagerly create directories unless requested
+        if init:
+            new.init_paths()
+        return new

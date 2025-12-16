@@ -319,15 +319,17 @@ df_trim = df_trim.sort_values('ts')
 
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
+
 #%%
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
+
 scored = [g for g in scored if g['scenario'] == 'startpos']
 games = [g for g in scored if not g['vs_stockfish'] and g['result'] != 0.0]
 games = [g for g in games if g.get('c_puct', -1) == 1.75]
 gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
-
+#%%
 res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
 cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
 both = df_trim.merge(cdf.query("c_puct > 0 "), on='game_id')
@@ -466,3 +468,12 @@ scored = [g for g in all_games if g['game_id'] in scored_games]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-6]['json_file'], sf_df=d); gv.replay()
 #%%
+from chessbot.config import Config
+
+cfg = Config()
+yaml_file = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_run_test/config.yaml"
+cfg = Config.from_yaml(yaml_file)  # paths initialized by default
+print(cfg.run_dir)
+
+
+

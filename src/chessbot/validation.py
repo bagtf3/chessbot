@@ -37,36 +37,6 @@ class ValidationConfig(Config):
     with validation settings.
     """
 
-    is_validation_run = True
-
-    n_games = 64
-    games_at_once = 64
-    micro_batch = 4
-    fwd_batch = 256
-
-    # disable noisy exploration during validation
-    c_puct = [1.25, 1.5, 1.5, 1.5, 2.0]
-    add_root_noise = False
-    sample_moves = False
-    dirichlet_eps = 0.0
-    dirichlet_alpha = 0.0
-
-    # simulation schedule: keep stable sims for evaluation
-    sf_move_sims = 5
-    sims_floor = 1400
-    sims_ceiling = 1600
-    target_delta = 400
-    es_check_every = 50
-
-    run_post_hoc = True
-    mine_bonus_data = True
-
-    max_game_length = 350
-    min_game_length = 1
-    material_diff_cutoff = 100
-    material_diff_cutoff_span = 1000
-    use_syzygy = True
-
     def __init__(self):
         """
         Initialize ValidationConfig and ensure validation_config.json contains the

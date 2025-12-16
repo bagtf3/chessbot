@@ -17,7 +17,7 @@ import chess
 from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
-from chessbot import ENDGAME_LOC, SF_LOC
+from chessbot import ENDGAME_LOC, SF_LOC, SP_DIR, MODEL_DIR
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
@@ -96,7 +96,10 @@ class GameLooper(object):
         return sorted(set(batch_candidates))
 
     def fill_active_games(self):
-        sf_games = ['startpos', 'pre_opened', 'pre_opened_mini', 'random_init', 'paired_validation']
+        sf_games = [
+            'startpos', 'pre_opened', 'pre_opened_mini',
+            'random_init', 'paired_validation'
+        ]
 
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
@@ -651,9 +654,12 @@ class GameLooper(object):
         print("-"*72)
 
 
-def init_selfplay(validation=False):
-    # choose config type and ensure paths are initialized
-    config = Config() if not validation else ValidationConfig()
+def init_selfplay(validation=False, config=None):
+    # allow passing a pre-built config (from yaml); otherwise fallback
+    if config is None:
+        config = Config() if not validation else ValidationConfig()
+    else:
+        config.init_paths()
 
     model_name = config.run_tag + "_model.h5"
     model_path = os.path.join(config.run_dir, model_name)
@@ -681,9 +687,35 @@ def init_selfplay(validation=False):
 
     return looper, config
 
-#%%
+
 if __name__ == '__main__':
-    cfg = Config()
+    # require run_tag arg
+    if len(sys.argv) < 2:
+        print("Usage: python looper.py <run_tag>")
+        sys.exit(1)
+
+    run_tag = sys.argv[1]
+    run_dir = os.path.join(SP_DIR, run_tag)
+
+    if not os.path.isdir(run_dir):
+        print(f"[error] run dir not found: {run_dir}")
+        sys.exit(1)
+
+    # prefer config.yaml then config.yml
+    yaml_path = None
+    for nm in ("config.yaml", "config.yml"):
+        p = os.path.join(run_dir, nm)
+        if os.path.exists(p):
+            yaml_path = p
+            break
+
+    if yaml_path is None:
+        print(f"[error] no config.yaml or config.yml found in {run_dir}")
+        sys.exit(1)
+
+    # create Config from yaml and init paths
+    cfg = Config.from_yaml(yaml_path, init=True)
+
     phs = None
     start = _now()
     n_games, run_num = 0, 1
@@ -699,13 +731,15 @@ if __name__ == '__main__':
                 )
 
             is_validation = run_num % cfg.validation_every == 0
-            looper, cfg = init_selfplay(is_validation)
-            
+
+            # pass the pre-loaded cfg into init_selfplay so it is used
+            looper, cfg = init_selfplay(is_validation, config=cfg)
+
             # use endgame tables on alternating runs to balance speed and learning
             if not is_validation:
                 cfg.use_syzygy = bool(run_num % 2)
 
-            # look to start post hoc server on the first loop if its not yet running
+            # look to start post hoc server on the first loop if not running
             if phs is None and cfg.run_post_hoc and cfg.run_dir:
                 phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
 
@@ -714,7 +748,7 @@ if __name__ == '__main__':
             if is_validation:
                 summary = build_validation_summary(looper)
                 append_validation_summary(looper.config.run_dir, summary)
-            
+
             n_games += looper.games_finished
 
     finally:

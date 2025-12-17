@@ -34,7 +34,6 @@ EQUIV_RANGE = 30
 
 # stops the post hoc server
 POST_HOC_STOP = False
-
 PH = "[post hoc]"
 
 def post_hoc_signal_handler(signum, frame):

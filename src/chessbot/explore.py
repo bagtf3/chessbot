@@ -355,12 +355,12 @@ val_summary
 #%%
 ## Plot everything so far
 CLIP_UB = 500
-
+suffixes = []
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1". "2"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+#suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
@@ -369,7 +369,7 @@ suffixes = ["0", "1". "2"]
 rd_list = []
 for s in suffixes:
     rd_list.append(root + s)
-#%%
+
 latest = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
 rd_list.append(latest)
 df_list = []
@@ -465,15 +465,7 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 #games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
-gv = GameViewer(games[-8]['json_file'], sf_df=d); gv.replay()
-
-
-#%%
-from chessbot.config import Config
-import chessbot.validation as cbv
-
-cfg = Config.from_yaml("C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_run_test/config.yaml")
-vcfg = cbv.create_validation_config(cfg)
+gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
 
 
 

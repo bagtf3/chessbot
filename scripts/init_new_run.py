@@ -18,7 +18,6 @@ import shutil
 import yaml
 
 from chessbot.config import Config
-from chessbot.validation import ValidationConfig
 
 
 def atomic_write(path, obj, fmt="json"):

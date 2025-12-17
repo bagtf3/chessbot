@@ -688,8 +688,7 @@ def init_selfplay(validation=False, config=None):
     return looper, config
 
 
-if __name__ == '__main__':
-    # require run_tag arg
+if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python looper.py <run_tag>")
         sys.exit(1)
@@ -701,7 +700,7 @@ if __name__ == '__main__':
         print(f"[error] run dir not found: {run_dir}")
         sys.exit(1)
 
-    # prefer config.yaml then config.yml
+    # find run config yaml
     yaml_path = None
     for nm in ("config.yaml", "config.yml"):
         p = os.path.join(run_dir, nm)
@@ -713,41 +712,63 @@ if __name__ == '__main__':
         print(f"[error] no config.yaml or config.yml found in {run_dir}")
         sys.exit(1)
 
-    # create Config from yaml and init paths
+    # load base config (paths initialized)
     cfg = Config.from_yaml(yaml_path, init=True)
+
+    # precompute validation yaml path (may not exist)
+    val_yaml_path = os.path.join(cfg.run_dir, "validation_config.yaml")
 
     phs = None
     start = _now()
     n_games, run_num = 0, 1
+
     try:
         while run_num <= cfg.n_rounds:
             if n_games:
                 elapsed = _now() - start
                 rt = cbu.format_time(elapsed)
                 gph = 3600 * n_games / elapsed
-                print(
-                    f"[main loop] Time: {rt} ",
-                    f"Games: {n_games} ({gph:.1f}/hr)"
+                print(f"[main loop] Time: {rt} ",
+                      f"Games: {n_games} ({gph:.1f}/hr)")
+
+            is_validation = (run_num % cfg.validation_every) == 0
+
+            # prepare a working config for this iteration
+            if is_validation:
+                if os.path.exists(val_yaml_path):
+                    working_cfg = ValidationConfig.from_yaml(val_yaml_path)
+                    print(f"[validation] running validation using local yaml")
+                else:
+                    err = f"[validation] local yaml not not found."
+                    raise Exception(err)
+            else:
+                # normal run uses base config
+                working_cfg = cfg
+
+            # keep previous behavior: toggle syzygy only on non-validation runs
+            if not is_validation:
+                working_cfg.use_syzygy = bool(run_num % 2)
+
+            # start post-hoc server if requested (use working config)
+            if phs is None and working_cfg.run_post_hoc and working_cfg.run_dir:
+                phs = start_post_hoc_server(
+                    working_cfg.run_dir, bonus_data=working_cfg.mine_bonus_data
                 )
 
-            is_validation = run_num % cfg.validation_every == 0
+            # init selfplay with the working config (returns looper + used cfg)
+            looper, used_cfg = init_selfplay(is_validation, config=working_cfg)
 
-            # pass the pre-loaded cfg into init_selfplay so it is used
-            looper, cfg = init_selfplay(is_validation, config=cfg)
-
-            # use endgame tables on alternating runs to balance speed and learning
-            if not is_validation:
-                cfg.use_syzygy = bool(run_num % 2)
-
-            # look to start post hoc server on the first loop if not running
-            if phs is None and cfg.run_post_hoc and cfg.run_dir:
-                phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
-
+            # run the games for this iteration
             looper.run(run_num)
             run_num += 1
+
+            # if it was a validation iteration, record its summary
             if is_validation:
                 summary = build_validation_summary(looper)
-                append_validation_summary(looper.config.run_dir, summary)
+
+            if is_validation and working_cfg is not cfg:
+                # fully reload the base config from disk (replaces cfg)
+                cfg = Config.from_yaml(yaml_path, init=True)
 
             n_games += looper.games_finished
 

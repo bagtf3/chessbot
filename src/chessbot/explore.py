@@ -325,10 +325,10 @@ d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 
-scored = [g for g in scored if g['scenario'] == 'startpos']
-games = [g for g in scored if not g['vs_stockfish'] and g['result'] != 0.0]
-games = [g for g in games if g.get('c_puct', -1) == 1.75]
-gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+scored = [g for g in scored if g['scenario'] != 'paired_validation']
+games = [g for g in scored if g['beat_sf']]
+#games = [g for g in games if g.get('c_puct', -1) == 1.75]
+gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
 #%%
 res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
 cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
@@ -369,10 +369,10 @@ suffixes = ["0", "1", "2"]
 rd_list = []
 for s in suffixes:
     rd_list.append(root + s)
-
+#%%
 latest = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
 rd_list.append(latest)
-
+rd_list = list(set(rd_list))
 df_list = []
 val_dfs = []
 eval_df = None
@@ -466,14 +466,11 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 #games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
-gv = GameViewer(games[-6]['json_file'], sf_df=d); gv.replay()
-#%%
-from chessbot.config import Config
+gv = GameViewer(games[-8]['json_file'], sf_df=d); gv.replay()
 
-cfg = Config()
-yaml_file = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_run_test/config.yaml"
-cfg = Config.from_yaml(yaml_file)  # paths initialized by default
-print(cfg.run_dir)
+
+#%%
+
 
 
 

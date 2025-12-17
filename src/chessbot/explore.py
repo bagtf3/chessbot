@@ -360,7 +360,7 @@ CLIP_UB = 500
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
 root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1", "2"]
+suffixes = ["0", "1". "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
@@ -372,7 +372,6 @@ for s in suffixes:
 #%%
 latest = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
 rd_list.append(latest)
-rd_list = list(set(rd_list))
 df_list = []
 val_dfs = []
 eval_df = None
@@ -470,7 +469,11 @@ gv = GameViewer(games[-8]['json_file'], sf_df=d); gv.replay()
 
 
 #%%
+from chessbot.config import Config
+import chessbot.validation as cbv
 
+cfg = Config.from_yaml("C:/Users/Bryan/Data/chessbot_data/selfplay_runs/new_run_test/config.yaml")
+vcfg = cbv.create_validation_config(cfg)
 
 
 

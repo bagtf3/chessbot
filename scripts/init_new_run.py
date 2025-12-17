@@ -1,130 +1,154 @@
-#!/usr/bin/env python3
 """
-init_run.py
+init_new_run.py
 
 Usage:
-  python init_run.py <run_tag> [--clone <existing_run_tag>]
+  python init_new_run.py <run_tag> [--clone <existing_run_tag>]
 
-Creates run_dir, game_logs, writes config.yaml and config.json, and
-initializes validation_config.json (via ValidationConfig). If --clone
-is given, copies model and validation_config from the source run dir.
+Simple: create run_dir, write config.yaml and validation_config.yaml.
+If --clone is given, copy those files from the clone run dir and set
+the new run's init_model to the cloned model (copied into the new run dir).
 """
 
 import os
 import sys
 import argparse
-import json
-import shutil
 import yaml
+import shutil
+from pathlib import Path
 
 from chessbot.config import Config
 
 
-def atomic_write(path, obj, fmt="json"):
+def write_yaml(path, obj):
     tmp = path + ".tmp"
-    if fmt == "json":
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(obj, fh, indent=2, sort_keys=False)
-    else:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(obj, fh, sort_keys=False,
-                           default_flow_style=False)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(obj, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp, path)
 
 
-def write_config(path, obj, fmt="yaml"):
-    tmp = path + ".tmp"
-    if fmt == "json":
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(obj, fh, indent=2, sort_keys=False)
-    else:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(obj, fh, sort_keys=False,
-                           default_flow_style=False)
-    os.replace(tmp, path)
+def load_yaml(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
 
 
 def find_model_in_dir(d):
-    h5s = [os.path.join(d, f) for f in os.listdir(d)
-           if f.endswith(".h5")]
+    # prefer exact-named model <tag>_model.h5 handled by caller,
+    # else pick newest .h5
+    p = Path(d)
+    h5s = sorted(p.glob("*.h5"), key=lambda x: x.stat().st_mtime, reverse=True)
     if not h5s:
         return None
-    h5s.sort(key=os.path.getmtime, reverse=True)
-    return h5s[0]
+    return str(h5s[0])
 
 
-def copy_from_clone(src_tag, dest_cfg):
-    src_dir = os.path.abspath(os.path.join(dest_cfg.selfplay_dir, src_tag))
-    if not os.path.isdir(src_dir):
-        print(f"[clone] source run not found: {src_dir}")
-        sys.exit(1)
+def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
+    lines = []
+    replaced_prev = False
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.lstrip().startswith("run_tag:"):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.append(f"{indent}run_tag: {run_tag}\n")
+            elif line.lstrip().startswith("init_model:"):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.append(f"{indent}init_model: {init_model}\n")
+            elif line.lstrip().startswith("previous_run_tag:"):
+                if prev_run_tag is not None:
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines.append(f"{indent}previous_run_tag: {prev_run_tag}\n")
+                    replaced_prev = True
+            else:
+                lines.append(line)
 
-    src_model = os.path.join(src_dir, f"{src_tag}_model.h5")
-    if not os.path.exists(src_model):
-        src_model = find_model_in_dir(src_dir)
+    if prev_run_tag is not None and not replaced_prev:
+        # append previous_run_tag if it wasn't present
+        lines.append(f"\nprevious_run_tag: {prev_run_tag}\n")
 
-    if src_model and os.path.exists(src_model):
-        dest_model = dest_cfg.model_path
-        print(f"[clone] copying model {src_model} -> {dest_model}")
-        shutil.copy2(src_model, dest_model)
-    else:
-        print("[clone] no source model found; skipping model copy")
-
-    src_val = os.path.join(src_dir, "validation_config.json")
-    if os.path.exists(src_val):
-        dst_val = os.path.join(dest_cfg.run_dir, "validation_config.json")
-        print(f"[clone] copying validation config {src_val} -> {dst_val}")
-        shutil.copy2(src_val, dst_val)
-    else:
-        print("[clone] no validation_config.json in source; skipping")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("run_tag", help="new run tag (e.g. new_run_test)")
-    p.add_argument("--clone", help="existing run tag to clone model/configs")
+    p.add_argument("run_tag")
+    p.add_argument("--clone", default=None)
     args = p.parse_args()
 
     run_tag = args.run_tag
     clone_tag = args.clone
 
+    # set run_tag so Config.init_paths will compute the right paths
     Config.run_tag = run_tag
-    if clone_tag:
-        Config.previous_run_tag = clone_tag
-
     cfg = Config()
-
-    if clone_tag:
-        cfg.previous_run_tag = clone_tag
-
     cfg.init_paths()
 
-    cfg_dict = cfg.to_dict()
-    cfg_yaml_path = os.path.join(cfg.run_dir, "config.yaml")
-    cfg_json_path = os.path.join(cfg.run_dir, "config.json")
+    dest_dir = cfg.run_dir
+    os.makedirs(dest_dir, exist_ok=True)
 
-    write_config(cfg_yaml_path, cfg_dict, fmt="yaml")
-    print(f"[init] wrote config.yaml -> {cfg_yaml_path}")
-
-    write_config(cfg_json_path, cfg_dict, fmt="json")
-    print(f"[init] wrote config.json -> {cfg_json_path}")
+    cfg_yaml_dst = os.path.join(dest_dir, "config.yaml")
+    val_yaml_dst = os.path.join(dest_dir, "validation_config.yaml")
 
     if clone_tag:
-        copy_from_clone(clone_tag, cfg)
+        src_dir = os.path.abspath(os.path.join(cfg.selfplay_dir, clone_tag))
+        if not os.path.isdir(src_dir):
+            print(f"[clone] source run not found: {src_dir}")
+            sys.exit(1)
 
-    val_cfg = ValidationConfig()
-    val_json_path = os.path.join(cfg.run_dir, "validation_config.json")
-    if os.path.exists(val_json_path):
-        print(f"[init] validation_config present -> {val_json_path}")
+        # find source model: prefer exact-named <clone_tag>_model.h5 else newest .h5
+        src_model = os.path.join(src_dir, f"{clone_tag}_model.h5")
+        if not os.path.exists(src_model):
+            src_model = find_model_in_dir(src_dir)
+
+        # if found, copy into new run_dir as <run_tag>_model.h5 and set cfg.init_model
+        if src_model and os.path.exists(src_model):
+            dest_model = os.path.join(dest_dir, f"{run_tag}_model.h5")
+            shutil.copy2(src_model, dest_model)
+            cfg.init_model = dest_model
+            print(f"[clone] copied model {src_model} -> {dest_model}")
+        else:
+            # no source model found; leave cfg.init_model as default (may be configured)
+            print("[clone] no model found in source; using default init_model in config")
+
+        # copy config.yaml if present; update run_tag and init_model in the copy
+        src_cfg = os.path.join(src_dir, "config.yaml")
+        if os.path.exists(src_cfg):
+            shutil.copy2(src_cfg, cfg_yaml_dst)
+            replace_yaml_values_inplace(
+                cfg_yaml_dst, run_tag, cfg.init_model,
+                prev_run_tag=clone_tag
+            )
+            print(f"[clone] copied config.yaml from {clone_tag}")
+        else:
+            # write minimal config (init_model already possibly set above)
+            minimal = {
+                "run_tag": run_tag,
+                "selfplay_dir": cfg.selfplay_dir,
+                "init_model": cfg.init_model
+            }
+            write_yaml(cfg_yaml_dst, minimal)
+            print("[init] wrote minimal config.yaml")
+
+        # copy validation_config.yaml if present (no modification)
+        src_val = os.path.join(src_dir, "validation_config.yaml")
+        if os.path.exists(src_val):
+            shutil.copy2(src_val, val_yaml_dst)
+            print(f"[clone] copied validation_config.yaml from {clone_tag}")
+        else:
+            write_yaml(val_yaml_dst, {"is_validation":True})
+            print("[init] wrote minimal validation_config.yaml (no src found)")
+
     else:
-        atomic_write(val_json_path, val_cfg.to_dict(), fmt="json")
-        print(f"[init] wrote fallback validation_config -> {val_json_path}")
+        # not cloning: write minimal files
+        write_yaml(cfg_yaml_dst, {
+            "run_tag": run_tag,
+            "selfplay_dir": cfg.selfplay_dir,
+            "init_model": cfg.init_model
+        })
+        write_yaml(val_yaml_dst, {"is_validation":True})
+        print("[init] wrote minimal config.yaml and validation_config.yaml")
 
-    print(f"[init] run_dir ready: {cfg.run_dir}")
-    print("Next steps:")
-    print(f"  cd {cfg.run_dir}")
-    print("  edit config.yaml and validation_config.json as desired")
-    print("  run your looper / training scripts")
+    print(f"[init] run_dir ready: {dest_dir}")
+    print(f"  edit {cfg_yaml_dst} and {val_yaml_dst} as needed")
 
 
 if __name__ == "__main__":

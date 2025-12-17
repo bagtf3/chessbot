@@ -144,12 +144,16 @@ class Config(object):
         return inst
 
     @classmethod
-    def from_dict(cls, data, init=True):
+    def from_dict(cls, data, init=True, permissive=False):
         """
         Construct a Config from a plain dict and optionally init paths.
         """
         inst = cls()
-        inst.update(data)
+        if permissive:
+            inst.update_permissive(data)
+        else:
+            inst.update(data)
+        
         if init:
             inst.init_paths()
         return inst
@@ -200,6 +204,17 @@ class Config(object):
                 raise AttributeError(f"Unknown config key: {k}")
             setattr(self, k, v)
 
+    def update_permissive(self, mapping=None, **kwargs):
+        if mapping is not None:
+            try:
+                items = mapping.items()
+            except AttributeError:
+                items = mapping
+            for k, v in items:
+                setattr(self, k, v)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
     def copy(self, init=False):
         """
         Return a fresh Config instance cloned from this one.
@@ -208,7 +223,7 @@ class Config(object):
         """
         # use the existing dict/ctor path so update() validation stays active
         cfg_dict = self.to_dict()
-        new = self.__class__.from_dict(cfg_dict, init=False)
+        new = self.__class__.from_dict(cfg_dict, init=False, permissive=True)
 
         # do not eagerly create directories unless requested
         if init:

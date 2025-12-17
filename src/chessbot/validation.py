@@ -40,27 +40,29 @@ def create_validation_config(cfg, yaml_file=None):
     vcfg.sf_depth = vcfg.sf_table[vcfg.sf_index]['depth']
     vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
     vcfg.consec_over_50 = 0
+    vcfg.init_paths()
 
     if yaml_file is None:
         v_yaml = os.path.join(vcfg.run_dir, VALIDATION_CONFIG_FILENAME)
     else:
         v_yaml = yaml_file
     
-    if os.path.exists(yaml_file):
-        vcfg.update_via(yaml_file)
+    if os.path.exists(v_yaml):
+        vcfg.update_via(v_yaml)
         print(f"{V} config updated with local yaml")
     else:
         print(f"{V} no local yaml config found.")
 
     prev_last = find_last_history_entry_for_run(
-        cfg.run_dir, selfplay_dir=cfg.selfplay_dir,
-        previous_run_tag=cfg.previous_run_tag
+        vcfg.run_dir, selfplay_dir=vcfg.selfplay_dir,
+        previous_run_tag=vcfg.previous_run_tag
     )
 
     if prev_last is not None:
-        cfg = continue_depth_from_previous_cfg(cfg, last_entry)
+        vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
     
-    format_and_print_validation_info(cfg, prev_last)
+    format_and_print_validation_info(vcfg, prev_last)
+    return vcfg
 
 
 def find_last_history_entry_for_run(run_dir, selfplay_dir=None, previous_run_tag=None):
@@ -111,7 +113,7 @@ def continue_depth_from_previous_cfg(cfg, last_entry):
     nothing usable found.
     """
 
-    prev_index = last_entry["depth_index"]
+    prev_index = last_entry.get("depth_index", 0)
     prev_bumped = last_entry["bumped"]
 
     n_rows = len(cfg.sf_table)
@@ -132,20 +134,20 @@ def format_and_print_validation_info(cfg, prev_last):
     Print the two status lines (SF line, Xerces line) using fields on cfg.
     """
     if prev_last is not None:
-        sfd = prev_last['depth']
+        sfd = prev_last.get('depth', 0)
         sfe = prev_last['sf_elo']
-        msc = prev_last['model_score']
+        msc = prev_last['score']
         melo = prev_last['model_elo']
         
         print(
-            f"{V} previous run: SF depth: {sfd} SF elo: {sfe} "
-            f"Xerces score (elo): {msc} ({elo})"
+            f"{V} prev run: SF depth: {sfd} SF elo: {sfe} | "
+            f"Xerces elo (score): {melo} ({msc})"
         )
 
     sfd = cfg.sf_depth
     sfe = cfg.sf_elo
     over50 = cfg.consec_over_50
-    print(f"{V} current run: SF depth: {sfd} SF elo: {sfe} Consec over 50: {over50}")
+    print(f"{V} curr run: SF depth: {sfd} SF elo: {sfe} | Consec over 0.5: {over50}")
 
 
 def paired_validation_games(cfg):
@@ -235,8 +237,7 @@ def build_validation_summary(looper):
 
     score = (wins + 0.5 * draws) / n
 
-
-    cfg_dict = cfg_obj.to_dict()
+    cfg_dict = looper.config.to_dict()
     sf_elo = cfg_dict['sf_elo']
     table = cfg_dict["sf_table"]
     index = cfg_dict["sf_index"]
@@ -266,8 +267,7 @@ def build_validation_summary(looper):
             action = "bumped_depth"
             consec = 0
         else:
-            # at max depth row, reset the counter but do not advance
-            consec = 0
+            # at max depth row do not advance
             action = "at_max_depth"
 
     # Do NOT persist the validation config file. Only append history.
@@ -294,7 +294,6 @@ def build_validation_summary(looper):
 
     # append to JSONL history (this will create the file if needed)
     append_validation_summary(looper.config.run_dir, summary)
-
     return summary
 
 

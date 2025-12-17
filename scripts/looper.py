@@ -21,8 +21,9 @@ from chessbot import ENDGAME_LOC, SF_LOC, SP_DIR, MODEL_DIR
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
-from chessbot.validation import ValidationConfig, paired_validation_games
-from chessbot.validation import build_validation_summary, append_validation_summary
+from chessbot.validation import (
+    build_validation_summary, paired_validation_games, create_validation_config
+)    
 
 import chessbot.utils as cbu
 from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
@@ -515,12 +516,6 @@ class GameLooper(object):
             raise RuntimeError("retrain worker failed; aborting looper")
         else:
             sys.stdout.write(proc.stdout or "")
-        
-        # if here, retrain was a success. load new model and make new infer
-        # make sure memory is clean to prevent slowdowns
-        #cfg = self.config
-        #del self.model, self.infer
-        #gc.collect()
 
         self.infer_is_warm = False
 
@@ -654,17 +649,16 @@ class GameLooper(object):
         print("-"*72)
 
 
-def init_selfplay(validation=False, config=None):
-    # allow passing a pre-built config (from yaml); otherwise fallback
-    if config is None:
-        config = Config() if not validation else ValidationConfig()
-    else:
-        config.init_paths()
-
+def init_selfplay(config):
+    # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
-    model_path = os.path.join(config.run_dir, model_name)
-    config.model_path = model_path
-    Config.model_path = model_path
+
+    if not getattr(config, "model_path", False):
+        model_path = os.path.join(config.run_dir, model_name)
+        config.model_path = model_path
+        Config.model_path = model_path
+    else:
+        model_path = config.model_path
 
     if os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
@@ -674,7 +668,7 @@ def init_selfplay(validation=False, config=None):
         model = load_model(config.init_model)
         save_model(model, model_path)
 
-    looper = GameLooper(model=model, cfg=config)
+    looper = GameLooper(model=model, cfg=config.copy())
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
@@ -685,7 +679,7 @@ def init_selfplay(validation=False, config=None):
         except Exception as e:
             print("[init_selfplay] failed reading progress csv:", e)
 
-    return looper, config
+    return looper
 
 
 if __name__ == "__main__":
@@ -712,10 +706,10 @@ if __name__ == "__main__":
         print(f"[error] no config.yaml or config.yml found in {run_dir}")
         sys.exit(1)
 
-    # load base config (paths initialized)
+    # load base config and validation configs
     cfg = Config.from_yaml(yaml_path, init=True)
 
-    # precompute validation yaml path (may not exist)
+    # validation yaml path
     val_yaml_path = os.path.join(cfg.run_dir, "validation_config.yaml")
 
     phs = None
@@ -734,19 +728,16 @@ if __name__ == "__main__":
             is_validation = (run_num % cfg.validation_every) == 0
 
             # prepare a working config for this iteration
+            working_cfg = cfg.copy()
             if is_validation:
                 if os.path.exists(val_yaml_path):
-                    working_cfg = ValidationConfig.from_yaml(val_yaml_path)
-                    print(f"[validation] running validation using local yaml")
+                    working_cfg = create_validation_config(cfg, val_yaml_path)
                 else:
                     err = f"[validation] local yaml not not found."
                     raise Exception(err)
-            else:
-                # normal run uses base config
-                working_cfg = cfg
 
-            # keep previous behavior: toggle syzygy only on non-validation runs
-            if not is_validation:
+            # toggle syzygy and other stuff on non val runs
+            else:
                 working_cfg.use_syzygy = bool(run_num % 2)
 
             # start post-hoc server if requested (use working config)
@@ -756,7 +747,7 @@ if __name__ == "__main__":
                 )
 
             # init selfplay with the working config (returns looper + used cfg)
-            looper, used_cfg = init_selfplay(is_validation, config=working_cfg)
+            looper = init_selfplay(config=working_cfg)
 
             # run the games for this iteration
             looper.run(run_num)

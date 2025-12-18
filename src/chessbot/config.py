@@ -46,6 +46,7 @@ class Config(object):
     play_vs_sf_prob = 0.5
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
+    sf_exclude = ["piece_training"]
 
     # post hoc server
     run_post_hoc = True

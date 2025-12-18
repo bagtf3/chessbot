@@ -97,11 +97,6 @@ class GameLooper(object):
         return sorted(set(batch_candidates))
 
     def fill_active_games(self):
-        sf_games = [
-            'startpos', 'pre_opened', 'pre_opened_mini',
-            'random_init', 'paired_validation'
-        ]
-
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
         if needed <= 0:
@@ -120,7 +115,7 @@ class GameLooper(object):
             meta['vs_stockfish'] = np.random.uniform() <= cfg.play_vs_sf_prob
 
             # stockfish only plays certain scenarios
-            if meta['scenario'] not in sf_games:
+            if meta['scenario'] in cfg.sf_exclude:
                 meta['vs_stockfish'] = False
 
             if meta['vs_stockfish']:

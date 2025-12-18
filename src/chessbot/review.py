@@ -1332,8 +1332,11 @@ def start_post_hoc_server(cfg):
     """Start post-hoc worker process and forward the working Config object."""
     p = Process(target=post_hoc_worker, args=(cfg,), daemon=False)
     p.start()
-    print(f"[post hoc] started server pid={p.pid} run_dir={cfg.run_dir} "
-          f"mine_bonus={cfg.mine_bonus_data}")
+    
+    parts = os.path.normpath(cfg.run_dir).split(os.path.sep)
+    tail = os.path.sep.join(parts[-2:])
+    print(f"[post hoc] started server pid={p.pid} run_dir={tail} "
+        f"mine_bonus={cfg.mine_bonus_data}")
     return p
 
 

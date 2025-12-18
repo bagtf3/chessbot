@@ -333,6 +333,7 @@ gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
 cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
 both = df_trim.merge(cdf.query("c_puct > 0 "), on='game_id')
+both = both.tail(3000)
 
 # training game CPL by c_puct
 cpl_train = both.query(
@@ -341,6 +342,7 @@ cpl_train = both.query(
 
 N_train = both.query("scenario != 'paired_validation'").c_puct.value_counts()
 cpl_train = cpl_train.join(N_train)
+cpl_train
 
 # summary SF validations
 both['draws'] = both.result == 0.0
@@ -359,8 +361,8 @@ suffixes = []
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1", "2"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+#suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]

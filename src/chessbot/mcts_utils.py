@@ -82,8 +82,11 @@ class MCTSTree(fasttree):
         At/after ply 20: delegate to the base implementation.
         Returns (uci, None) like the original.
         """
+        if self.config.sample_moves == False:
+            return super().best()
+
         # if at/after the convergence ply, just use C++/base behavior
-        if (self.n_plies >= 20) or (self.config.sample_moves == False):
+        if (self.n_plies >= 20) or (self.board.piece_count() <= 20):
             return super().best()
 
         # gather root visits (desc sorted list of (uci, N))

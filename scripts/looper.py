@@ -738,13 +738,11 @@ if __name__ == "__main__":
 
             # toggle syzygy and other stuff on non val runs
             else:
-                working_cfg.use_syzygy = bool(run_num % 2)
+                working_cfg.use_syzygy = (working_cfg.use_syzygy) & bool(run_num % 2)
 
             # start post-hoc server if requested (use working config)
             if phs is None and working_cfg.run_post_hoc and working_cfg.run_dir:
-                phs = start_post_hoc_server(
-                    working_cfg.run_dir, bonus_data=working_cfg.mine_bonus_data
-                )
+                phs = start_post_hoc_server(working_cfg)
 
             # init selfplay with the working config (returns looper + used cfg)
             looper = init_selfplay(config=working_cfg)

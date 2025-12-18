@@ -51,6 +51,13 @@ class Config(object):
     run_post_hoc = True
     mine_bonus_data = True
 
+    # overrides for the post hoc worker
+    post_hoc_poll_interval = 20
+    post_hoc_blunder_cp = 150
+    post_hoc_analyze_batch = 30
+    post_hoc_depth = 12
+    post_hoc_equiv_range = 30
+
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
         "random_init": 0.08,

@@ -17,24 +17,25 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
+from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval
 )
 
-POLL_INTERVAL = 20
-BLUNDER_CP = 150
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 30
-
-# default analysis params
-DEPTH = 12
-EQUIV_RANGE = 30
 
 # stops the post hoc server
 POST_HOC_STOP = False
 PH = "[post hoc]"
+
+# default analysis params
+POLL_INTERVAL = 20
+BLUNDER_CP = 150
+ANALYZE_BATCH = 30
+DEPTH = 12
+EQUIV_RANGE = 30
 
 def post_hoc_signal_handler(signum, frame):
     global POST_HOC_STOP
@@ -674,7 +675,9 @@ def analyze_with_rank(move, board, limit, eng):
     return res
 
 
-def analyze_with_sf_core(game_data, eng, depth=DEPTH):
+def analyze_with_sf_core(game_data, eng, depth=None):
+    if depth is None:
+        depth = DEPTH
     limit = chess.engine.Limit(depth=depth)
     board = chess.Board(game_data['start_fen'])
 
@@ -1130,7 +1133,10 @@ def report_unprocessed(entries, seen_games):
         print(f"{PH} {unproc} unprocessed game(s) currently in queue")
 
 
-def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
+def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
+    run_dir = run_cfg.run_dir
+    bonus_data = run_cfg.mine_bonus_data
+
     ## trying to deprioritize the server so it doesnt slow down main training looper
     p = psutil.Process()
 
@@ -1154,6 +1160,22 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
         cores = list(range(start, start + use_count))
         # cpu_affinity expects a list of logical/core ids; ok on Linux & Windows
         p.cpu_affinity(cores)
+
+    # apply overrides
+    POLL_INTERVAL = run_cfg.post_hoc_poll_interval
+    BLUNDER_CP = run_cfg.post_hoc_blunder_cp
+    ANALYZE_BATCH = run_cfg.post_hoc_analyze_batch
+    DEPTH = run_cfg.post_hoc_depth
+    EQUIV_RANGE = run_cfg.post_hoc_equiv_range
+
+    # also set them in globals so other functions (defined above) see them
+    globals().update({
+        "POLL_INTERVAL": POLL_INTERVAL,
+        "BLUNDER_CP": BLUNDER_CP,
+        "ANALYZE_BATCH": ANALYZE_BATCH,
+        "DEPTH": DEPTH,
+        "EQUIV_RANGE": EQUIV_RANGE
+    })
 
     # post hoc logic starts here
     idx_path = os.path.join(run_dir, "game_index.json")
@@ -1306,11 +1328,12 @@ def post_hoc_worker(run_dir, bonus_data=True, batch_games=10, batch_secs=90):
         print("[post_hoc] post_hoc_worker exiting cleanly")
     
 
-def start_post_hoc_server(run_dir, bonus_data=True):
-    """Start post-hoc worker process and forward bonus_data toggle."""
-    p = Process(target=post_hoc_worker, args=(run_dir, bonus_data), daemon=False)
+def start_post_hoc_server(cfg):
+    """Start post-hoc worker process and forward the working Config object."""
+    p = Process(target=post_hoc_worker, args=(cfg,), daemon=False)
     p.start()
-    print(f"[post hoc] started server pid={p.pid} bonus_data={bonus_data}")
+    print(f"[post hoc] started server pid={p.pid} run_dir={cfg.run_dir} "
+          f"mine_bonus={cfg.mine_bonus_data}")
     return p
 
 

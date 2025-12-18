@@ -8,43 +8,43 @@ class Config(object):
     """
 
     is_validation_run = False
-    validation_every = 8
+    validation_every = 5
 
     # files
     selfplay_dir = SP_DIR
-    run_tag = "conv_12x296_bootstrapped"
-    init_model = MODEL_DIR + 'conv64_9x296_bootstrapped.h5'
+    run_tag = "test"
+    init_model = MODEL_DIR + 'test.h5'
     previous_run_tag = None
 
-    # MCTS
-    c_puct = [1.25, 1.5, 1.5, 2.0, 2.0, 2.25]
+    # MCTS (float or list)
+    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
 
     # Simulation schedule
-    sf_move_sims = 250
-    sims_floor = 850
-    sims_ceiling = 1000
-    target_delta = 500
+    sf_move_sims = 200
+    sims_floor = 400
+    sims_ceiling = 800
+    target_delta = 200
 
     # early stop
+    es_check_every = 50
     use_sim_decision_model = False
     sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-    es_check_every = 50
 
     # Game stuff
-    n_games = 96
-    games_at_once = 96
+    n_games = 128
+    games_at_once = 128
     n_rounds = 50
     micro_batch = 4
-    fwd_batch = 384
+    fwd_batch = 512
 
     max_game_length = 200
     min_game_length = 5
-    material_diff_cutoff = 15
-    material_diff_cutoff_span = 20
+    material_diff_cutoff = 25
+    material_diff_cutoff_span = 25
     use_syzygy = False
 
-    play_vs_sf_prob = 0.33
-    sf_depth = 12
+    play_vs_sf_prob = 0.5
+    sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
 
     # post hoc server
@@ -63,10 +63,10 @@ class Config(object):
 
     # randomness
     add_root_noise = True
-    dirichlet_eps = 0.2
+    dirichlet_eps = 0.3
     dirichlet_alpha = 0.3
     sample_moves = True
-    move_sample_temp_range = [1e-6, 1.25]
+    move_sample_temp_range = [0.000001, 1.25]
 
     target_y_weights = {'vwq': 0.5, 'z': 0.5, 'z_taper': 0.0}
     loss_weights = {"policy_winner": 0.25, "policy_loser": 0.25, "value_out": 0.25}

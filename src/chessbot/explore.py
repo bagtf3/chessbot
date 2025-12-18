@@ -326,9 +326,9 @@ scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
 
 scored = [g for g in scored if g['scenario'] != 'paired_validation']
-games = [g for g in scored if g['beat_sf']]
-#games = [g for g in games if g.get('c_puct', -1) == 1.75]
-gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+#games = [g for g in scored if g['beat_sf']]
+games = [g for g in scored if g.get('c_puct', -1) == 2.5]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
 #%%
 res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
 cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
@@ -359,8 +359,8 @@ suffixes = []
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
 #suffixes = ["_phase3", "_phase4"]
-#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-#suffixes = ["0", "1", "2"]
+root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]

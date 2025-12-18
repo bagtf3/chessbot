@@ -34,7 +34,7 @@ class MCTSTree(fasttree):
             self.c_puct = c
 
         super().__init__(board, self.c_puct, MCTSTree.ev)
-        
+
         # bookkeeping
         self.board = board
         self.root_board_fen = board.fen()
@@ -362,7 +362,7 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        tl = 0.1 if self.config.is_validation_run else None
+        tl = 0.1
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng

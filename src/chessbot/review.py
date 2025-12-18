@@ -34,7 +34,6 @@ EQUIV_RANGE = 30
 
 # stops the post hoc server
 POST_HOC_STOP = False
-
 PH = "[post hoc]"
 
 def post_hoc_signal_handler(signum, frame):
@@ -73,16 +72,19 @@ class GameViewer:
         self.reset()
 
     def reset(self):
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         self.ply = 0  # 0 = before first move
 
     def goto(self, ply):
         ply = max(0, min(ply, len(self.moves_uci)))
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         for u in self.moves_uci[:ply]:
             self.board.push_uci(u)
         self.ply = ply
         return self
+    
+    def turn(self):
+        return self.board.side_to_move() == 'w'
     
     def sf_row_for_ply(self, ply):
         if (not self._sf_by_ply) or (self.sf_rows is None):
@@ -99,7 +101,8 @@ class GameViewer:
         out = []
         limit = chess.engine.Limit(depth=depth, time=10.0)
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            infos = eng.analyse(self.board, limit=limit, multipv=k)
+            sf_board = chess.Board(self.board.fen())
+            infos = eng.analyse(sf_board, limit=limit, multipv=k)
             if not isinstance(infos, list):
                 infos = [infos]
             for info in infos:
@@ -107,7 +110,7 @@ class GameViewer:
                 move_uci = pv[0].uci() if pv else None
                 san = None
                 if move_uci:
-                    san = self.board.san(chess.Move.from_uci(move_uci))
+                    san = self.board.san(move_uci)
                 score_obj = info.get("score")
                 cp = None
                 if score_obj is not None:
@@ -150,14 +153,15 @@ class GameViewer:
         # check the move about to be played (selected from moves_uci[self.ply])
         if self.ply < len(self.moves_uci):
             upcoming_uci = self.moves_uci[self.ply]
-            upcoming_san = self.board.san(chess.Move.from_uci(upcoming_uci))
+            upcoming_san = self.board.san(upcoming_uci)
             if upcoming_uci not in top_ucis:
                 # get forced eval for the played move
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+                    sf_board = chess.Board(self.board.fen())
                     info = eng.analyse(
-                        self.board, limit=limit,
+                        sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
                     )
                     
@@ -202,10 +206,10 @@ class GameViewer:
     def prev(self):
         if self.ply > 0:
             self.ply -= 1
-            self.board.pop()
+            self.board.unmake()
     
     def who_moved(self):
-        mover = "White" if self.board.turn == chess.WHITE else "Black"
+        mover = "White" if self.turn() else "Black"
         
         vs_stockfish = self.log.get("vs_stockfish", False)
         if not vs_stockfish:
@@ -215,14 +219,15 @@ class GameViewer:
         if sf_color is None:
             return f"{mover} (MCTS)"
         
-        if (self.board.turn and sf_color) or \
-           (not self.board.turn and not sf_color):
+        if (self.turn() and sf_color) or \
+           (not self.turn() and not sf_color):
             return f"{mover} (stockfish)"
         return f"{mover} (MCTS)"
 
     def show_board(self, flipped=False):
         clear_output(wait=True)
-        display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
+        chess_board = chess.Board(self.board.fen())
+        display(SVG(chess.svg.board(board=chess_board, flipped=flipped)))
 
     def show_pv(self, min_vis=1):
         """
@@ -287,7 +292,7 @@ class GameViewer:
         who = self.who_moved()
         chosen = self.moves_uci[self.ply]
         try:
-            chosen_san = self.board.san(chess.Move.from_uci(chosen))
+            chosen_san = self.board.san(chosen)
         except Exception:
             chosen_san = "?"
 
@@ -337,7 +342,7 @@ class GameViewer:
                 break
 
         def print_row(c, mark=False, show_rank=False, rank_val=None):
-            san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
+            san = self.board.san(c.get("uci", ""))
             marker = "  <- SF" if mark else ""
             rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
             print(
@@ -368,7 +373,7 @@ class GameViewer:
         # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
-            stm_white = (self.board.turn == chess.WHITE)
+            stm_white = self.turn()
 
             best_uci   = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
@@ -392,7 +397,7 @@ class GameViewer:
             matched = (best_uci == played_uci) if best_uci and played_uci else False
 
             def to_san(uci):
-                return self.board.san(chess.Move.from_uci(uci))
+                return self.board.san(uci)
 
             best_san   = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"
@@ -415,7 +420,8 @@ class GameViewer:
         # concise CLI help for replay mode commands
         print("Commands:")
         print("  [Enter] / Space      forward one move")
-        print("  b, back              previous move")
+        print("  b<N>                 go back N moves, e.g. b5 goes back 5 moves")
+        print("  b, back              previous move (same as b1)")
         print("  q, quit, exit        quit replay")
         print("  o, options, help     show this help text")
         print("  sf                   stockfish overlay (uses default depth)")
@@ -442,9 +448,6 @@ class GameViewer:
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
                 self.show_options()
-            elif cmd in ("b", "back"):
-                shown = False
-                self.prev()
             elif cmd.startswith("pv"):
                 # pv or pvN (e.g. pv8)
                 if cmd == "pv":
@@ -455,10 +458,129 @@ class GameViewer:
                 self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
+            elif cmd.startswith("b"):
+                # b, back, b5, b 5 all supported
+                s = cmd[1:].strip()
+                if not s:
+                    n = 1
+                elif s.isdigit():
+                    n = int(s)
+                else:
+                    # fallback to single step back
+                    n = 1
+                # use goto to rebuild board safely and clamp bounds
+                target = max(0, self.ply - n)
+                shown = False
+                self.goto(target)
             else:
                 # default: forward one move
                 shown = False
                 self.next()
+
+    def generate_training_data(self, sf_skip=False):
+        """
+        Walk the game using self.next() and produce Xerces training examples.
+        If sf_skip is True, plies played by Stockfish (per who_moved()) are
+        skipped.
+        """
+        # X, Mask, Pi, result (Z), Vwq, moves Remaining
+        X, M, P, Z, V, R = [], [], [], [], [], []
+        result = self.result
+
+        # start from initial position
+        self.reset()
+
+        total_plies = len(self.moves_uci)
+        while self.ply < total_plies:
+            # detect whether the side to move is Stockfish
+            move_played = self.moves_uci[self.ply]
+            mover = self.who_moved().lower()
+            is_white_move = "white" in mover
+            is_sf_move = "stockfish" in mover
+
+            if sf_skip and is_sf_move:
+                # advance and skip this ply
+                self.next()
+                continue
+
+            rb = self.board
+            lms = rb.legal_moves()
+            
+            node = self.tree_data.get(str(self.ply), {})
+            if not node:
+                self.next()
+                continue
+            
+            cms = node.get("candidate_moves", {})
+            if cms:
+                visits = [[x['uci'], x['visits']] for x in cms]
+                visited = set([x[0] for x in visits])
+                
+                # add in all legal moves if missing
+                for move in [l for l in lms if l not in visited]:
+                    visited.append([[move, 1]])
+                    
+                visits = sorted(visits, key=lambda x: x[1], reverse=True)
+                
+                if is_sf_move and visits[0][0] != move_played:
+                    if sum([x[1] for x in visits]) > 100:
+                        most_visited = visits[0][0]
+                        for v in visits:
+                            if v[0] == move_played:
+                                v[0] = most_visited
+                                break
+                        visits[0][0] = move_played
+                    else:
+                        visits = make_fake_visits(move_played, lms, ratio_best=51)
+            
+            else:
+                # legal moves and synthetic visits
+                visits = make_fake_visits(move_played, lms, ratio_best=51)
+            counts = np.array([x[1] for x in visits], dtype=np.float32)
+            s = counts.sum()
+            if s > 0.0:
+                pi = counts / s
+            else:
+                # uniform fallback over legal moves
+                n_l = len(lms)
+                if n_l == 0:
+                    self.next()
+                    continue
+                pi = np.ones(n_l, dtype=np.float32) / float(n_l)
+            
+            # map legal moves -> flat xerces indices and build policy
+            
+            visited = [x[0] for x in visits]
+            indices = rb.moves_to_indices(visited)
+            policy = np.zeros(64 * 67, dtype=np.float32)
+            for idx, prob in zip(indices, pi):
+                policy[idx] += prob
+
+            # inputs and mask
+            x = rb.encode_64_tokens()
+            mask = rb.legal_move_mask()
+
+            # value target 0.5*Z + 0.5*vwq
+            vwq = node.get("visit_weighted_Q")
+            vwq_stm = vwq if is_white_move else -vwq
+            if result > 0:
+                z = 1 if is_white_move else -1
+            elif result < 0:
+                z = -1 if is_white_move else 1
+            else:
+                z = 0
+            
+            X.append(x)
+            M.append(mask)
+            P.append(policy)
+            Z.append(z)
+            V.append(vwq_stm)
+            R.append(len(self.moves_uci) - int(self.ply))
+
+            # advance to next ply using existing helper
+            self.next()
+
+        return X, M, P, Z, V, R
 
 
 def load_json(path):

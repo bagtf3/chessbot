@@ -17,12 +17,13 @@ import chess
 from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
-from chessbot import ENDGAME_LOC, SF_LOC
+from chessbot import ENDGAME_LOC, SF_LOC, SP_DIR, MODEL_DIR
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.mcts_utils import MCTSTree, ChessGame
 from chessbot.config import Config
-from chessbot.validation import ValidationConfig, paired_validation_games
-from chessbot.validation import build_validation_summary, append_validation_summary
+from chessbot.validation import (
+    build_validation_summary, paired_validation_games, create_validation_config
+)    
 
 import chessbot.utils as cbu
 from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
@@ -82,7 +83,8 @@ class GameLooper(object):
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
         batch_candidates = set()
-        bs = 32
+        batch_candidates.add(cfg.fwd_batch)
+        bs = 16
         while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)
             bs *= 2
@@ -91,11 +93,14 @@ class GameLooper(object):
         if len(batch_candidates) >= 2:
             sbc = sorted(batch_candidates)
             sbc.append(int(sbc[-1] - sbc[-2] / 2))
-            return sorted(sbc)
-        return sorted(batch_candidates)
+            return sorted(set(sbc))
+        return sorted(set(batch_candidates))
 
     def fill_active_games(self):
-        sf_games = ['startpos', 'pre_opened', 'pre_opened_mini', 'random_init', 'paired_validation']
+        sf_games = [
+            'startpos', 'pre_opened', 'pre_opened_mini',
+            'random_init', 'paired_validation'
+        ]
 
         cfg = self.config
         needed = cfg.n_games - self.games_finished - len(self.active_games)
@@ -393,6 +398,7 @@ class GameLooper(object):
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
+        res['c_puct'] = game.tree.c_puct
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
@@ -414,6 +420,7 @@ class GameLooper(object):
         ]
         new_idx = {k: res[k] for k in keep}
         new_idx["json_file"] = out_file
+        new_idx['c_puct'] = game.tree.c_puct
         
         new_idx['beat_sf'] = False
         if new_idx['vs_stockfish']:
@@ -509,12 +516,6 @@ class GameLooper(object):
             raise RuntimeError("retrain worker failed; aborting looper")
         else:
             sys.stdout.write(proc.stdout or "")
-        
-        # if here, retrain was a success. load new model and make new infer
-        # make sure memory is clean to prevent slowdowns
-        #cfg = self.config
-        #del self.model, self.infer
-        #gc.collect()
 
         self.infer_is_warm = False
 
@@ -648,14 +649,16 @@ class GameLooper(object):
         print("-"*72)
 
 
-def init_selfplay(validation=False):
-    # choose config type and ensure paths are initialized
-    config = Config() if not validation else ValidationConfig()
-
+def init_selfplay(config):
+    # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
-    model_path = os.path.join(config.run_dir, model_name)
-    config.model_path = model_path
-    Config.model_path = model_path
+
+    if not getattr(config, "model_path", False):
+        model_path = os.path.join(config.run_dir, model_name)
+        config.model_path = model_path
+        Config.model_path = model_path
+    else:
+        model_path = config.model_path
 
     if os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
@@ -665,7 +668,7 @@ def init_selfplay(validation=False):
         model = load_model(config.init_model)
         save_model(model, model_path)
 
-    looper = GameLooper(model=model, cfg=config)
+    looper = GameLooper(model=model, cfg=config.copy())
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
@@ -676,42 +679,88 @@ def init_selfplay(validation=False):
         except Exception as e:
             print("[init_selfplay] failed reading progress csv:", e)
 
-    return looper, config
+    return looper
 
 
-if __name__ == '__main__':
-    cfg = Config()
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python looper.py <run_tag>")
+        sys.exit(1)
+
+    run_tag = sys.argv[1]
+    run_dir = os.path.join(SP_DIR, run_tag)
+
+    if not os.path.isdir(run_dir):
+        print(f"[error] run dir not found: {run_dir}")
+        sys.exit(1)
+
+    # find run config yaml
+    yaml_path = None
+    for nm in ("config.yaml", "config.yml"):
+        p = os.path.join(run_dir, nm)
+        if os.path.exists(p):
+            yaml_path = p
+            break
+
+    if yaml_path is None:
+        print(f"[error] no config.yaml or config.yml found in {run_dir}")
+        sys.exit(1)
+
+    # load base config and validation configs
+    cfg = Config.from_yaml(yaml_path, init=True)
+
+    # validation yaml path
+    val_yaml_path = os.path.join(cfg.run_dir, "validation_config.yaml")
+
     phs = None
     start = _now()
     n_games, run_num = 0, 1
+
     try:
         while run_num <= cfg.n_rounds:
             if n_games:
                 elapsed = _now() - start
                 rt = cbu.format_time(elapsed)
                 gph = 3600 * n_games / elapsed
-                print(
-                    f"[main loop] Time: {rt} ",
-                    f"Games: {n_games} ({gph:.1f}/hr)"
+                print(f"[main loop] Time: {rt} ",
+                      f"Games: {n_games} ({gph:.1f}/hr)")
+
+            is_validation = (run_num % cfg.validation_every) == 0
+
+            # prepare a working config for this iteration
+            working_cfg = cfg.copy()
+            if is_validation:
+                if os.path.exists(val_yaml_path):
+                    working_cfg = create_validation_config(cfg, val_yaml_path)
+                else:
+                    err = f"[validation] local yaml not not found."
+                    raise Exception(err)
+
+            # toggle syzygy and other stuff on non val runs
+            else:
+                working_cfg.use_syzygy = bool(run_num % 2)
+
+            # start post-hoc server if requested (use working config)
+            if phs is None and working_cfg.run_post_hoc and working_cfg.run_dir:
+                phs = start_post_hoc_server(
+                    working_cfg.run_dir, bonus_data=working_cfg.mine_bonus_data
                 )
 
-            is_validation = run_num % cfg.validation_every == 0
-            looper, cfg = init_selfplay(is_validation)
-            
-            # use endgame tables on alternating runs to balance speed and learning
-            if not is_validation:
-                cfg.use_syzygy = bool(run_num % 2)
+            # init selfplay with the working config (returns looper + used cfg)
+            looper = init_selfplay(config=working_cfg)
 
-            # look to start post hoc server on the first loop if its not yet running
-            if phs is None and cfg.run_post_hoc and cfg.run_dir:
-                phs = start_post_hoc_server(cfg.run_dir, bonus_data=cfg.mine_bonus_data)
-
+            # run the games for this iteration
             looper.run(run_num)
             run_num += 1
+
+            # if it was a validation iteration, record its summary
             if is_validation:
                 summary = build_validation_summary(looper)
-                append_validation_summary(looper.config.run_dir, summary)
-            
+
+            if is_validation and working_cfg is not cfg:
+                # fully reload the base config from disk (replaces cfg)
+                cfg = Config.from_yaml(yaml_path, init=True)
+
             n_games += looper.games_finished
 
     finally:

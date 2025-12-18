@@ -22,7 +22,17 @@ class MCTSTree(fasttree):
 
     def __init__(self, board, cfg):
         self.config = cfg
-        self.c_puct = float(cfg.c_puct)
+
+        # if c_puct is given as a list, pick an option randomly
+        # otherwise assume its a float or int        
+        c = cfg.c_puct
+        if isinstance(c, (int, float)):
+            self.c_puct = float(c)
+        elif isinstance(c, (list, set)):
+            self.c_puct = float(np.random.choice(c))
+        else:
+            self.c_puct = c
+
         super().__init__(board, self.c_puct, MCTSTree.ev)
 
         # bookkeeping
@@ -352,7 +362,7 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        tl = 0.1 if self.config.is_validation_run else None
+        tl = 0.1
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng
@@ -382,7 +392,7 @@ class ChessGame(object):
         if not root.is_expanded:
             return
         
-        c_puct = self.config.c_puct
+        c_puct = self.tree.c_puct
         
         # timing
         start = self.tree._move_started_at

@@ -268,7 +268,9 @@ def plot_validation_with_elo(df_val, val_df, VAL_WINDOW):
 
 #%%
 # plot single phase
-run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2"
+#run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
+run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
 #run_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run0"
 all_games = load_game_index(run_dir)
 CLIP_UB = 500
@@ -281,8 +283,8 @@ with open(pkl, "rb") as f:
 df_all = prev_run['df_all']
 df_means = prev_run['df_means']
 
-df_all = df_all.query("scenario != 'paired_validation'").copy()
-df_means = df_means.query("scenario != 'paired_validation'").copy()
+#df_all = df_all.query("scenario != 'paired_validation'").copy()
+#df_means = df_means.query("scenario != 'paired_validation'").copy()
 
 WINDOW = min(2500, max(5, int(len(df_means) * 0.2 // 10 * 10)))
 print(len(df_means), f"games completed. Using window size {WINDOW}")
@@ -317,30 +319,65 @@ df_trim = df_trim.sort_values('ts')
 
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
+
 #%%
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['scenario'] == 'startpos']
-games = [g for g in scored if not g['vs_stockfish']]
-gv = GameViewer(games[-2]['json_file'], sf_df=d); gv.replay()
+
+scored = [g for g in scored if g['scenario'] != 'paired_validation']
+#games = [g for g in scored if g['beat_sf']]
+games = [g for g in scored if g.get('c_puct', -1) == 2.5]
+gv = GameViewer(games[-1]['json_file'], sf_df=d); gv.replay()
+#%%
+res = [[s["game_id"], s.get("c_puct", -1), s['beat_sf'], s['result']] for s in scored]
+cdf = pd.DataFrame(res, columns=['game_id', 'c_puct', 'beat_sf', 'result'])
+both = df_trim.merge(cdf.query("c_puct > 0 "), on='game_id')
+both = both.tail(5000)
+
+# training game CPL by c_puct
+cpl_train = both.query(
+    "scenario != 'paired_validation'"
+).groupby('c_puct')[['overall_cpl']].mean()
+
+N_train = both.query("scenario != 'paired_validation'").c_puct.value_counts()
+cpl_train = cpl_train.join(N_train)
+cpl_train
+
+# summary SF validations
+both['draws'] = both.result == 0.0
+both['wins'] = both.beat_sf
+both['points'] = 1*both.wins + 0.5*both.draws
+cols = ['overall_cpl', 'wins', 'draws', 'points']
+val_summary = both.query("scenario == 'paired_validation'").groupby("c_puct")[cols].mean()
+N_val = both.query("scenario == 'paired_validation'").c_puct.value_counts()
+val_summary = val_summary.join(N_val)
+val_summary
+
 #%%
 ## Plot everything so far
 CLIP_UB = 500
-
+suffixes = []
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_selfplay"
 #suffixes = ["", "_phase2", "_phase3", "_phase4"]
-root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
-suffixes = ["0", "1", "2"]
+#suffixes = ["_phase3", "_phase4"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run"
+#suffixes = ["0", "1", "2"]
 #suffixes = ["1", "2"]
 #root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_12blocks_run"
 #suffixes = ["0"]
+#root = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x512SE"
 
+rd_list = []
+for s in suffixes:
+    rd_list.append(root + s)
+
+latest = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_12x296_bootstrapped"
+rd_list.append(latest)
 df_list = []
 val_dfs = []
 eval_df = None
-for s in suffixes:
-    rd = root + s
+for rd in rd_list:
     jsonl = os.path.join(rd, "validation_history.jsonl")
     if os.path.exists(jsonl):
         val_dfs.append(pd.read_json(jsonl, lines=True))
@@ -357,12 +394,18 @@ for s in suffixes:
     _ = combine_analysis_staging(rd)
     all_games = load_game_index(rd)
     
-    pkl = os.path.join(rd, ANALYZE_PKL)
-    with open(pkl, "rb") as f:
-        prev_run = pickle.load(f)
+    df_all_parquet = os.path.join(rd, "df_all.parquet")
+    df_means_parquet = os.path.join(rd, "df_means.parquet")
+    if os.path.exists(df_all_parquet) and os.path.exists(df_means_parquet):
+        df_all = pd.read_parquet(df_all_parquet)
+        df_means = pd.read_parquet(df_means_parquet)
+    else:
+        pkl = os.path.join(rd, ANALYZE_PKL)
+        with open(pkl, "rb") as f:
+            prev_run = pickle.load(f)
     
-    df_all = prev_run['df_all']
-    df_means = prev_run['df_means']
+        df_all = prev_run['df_all']
+        df_means = prev_run['df_means']
     
     # tidy up CPL
     df_all['clipped_loss'] = np.clip(df_all['loss'], -1000, 1000)
@@ -403,29 +446,28 @@ print("########### Report for all non validation games ############".center(60))
 plot_and_report(df_trim, WINDOW)
 pprint(trend_check(df_trim, window=WINDOW))
 
-val_df = pd.concat(val_dfs)
-VAL_WINDOW = min(250, int(len(df_val) * 0.15 // 10 * 10))
-plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
-print()
-print("########### Report for SF validation games only ############".center(60))
-report_cpl_and_bmr(df_val, VAL_WINDOW)
+if val_dfs:
+    val_df = pd.concat(val_dfs)
+    VAL_WINDOW = min(250, int(len(df_val) * 0.15 // 10 * 10))
+    plot_validation_with_elo(df_val, val_df, VAL_WINDOW)
+    print()
+    print("########### Report for SF validation games only ############".center(60))
+    report_cpl_and_bmr(df_val, VAL_WINDOW)
 
 from chessbot.utils import plot_training_progress
 from warnings import catch_warnings, simplefilter
 
-with catch_warnings():
-    simplefilter("ignore")
-    plot_training_progress(eval_df)
+if "mass_on_legal" in eval_df.columns:
+    with catch_warnings():
+        simplefilter("ignore")
+        plot_training_progress(eval_df)
 #%%
 d = prev_run['df_all']
 scored_games = set(d.game_id.unique())
 scored = [g for g in all_games if g['game_id'] in scored_games]
-games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
+#games = [g for g in scored if g['vs_stockfish'] and not g['beat_sf'] and g['result'] != 0]
 games = [g for g in scored if g['vs_stockfish'] and g['beat_sf']]
 gv = GameViewer(games[-3]['json_file'], sf_df=d); gv.replay()
-
-
-
 
 
 

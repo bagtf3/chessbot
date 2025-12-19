@@ -258,11 +258,9 @@ def build_validation_summary(looper):
 
     bumped = False
     action = "none"
-    new_index = index
 
     if consec >= 2:
         if index < (len(table) - 1):
-            new_index = index + 1
             bumped = True
             action = "bumped_depth"
             consec = 0
@@ -284,8 +282,8 @@ def build_validation_summary(looper):
         "consec_over_50": int(consec),
         "bumped": bool(bumped),
         "action": action,
-        "depth": int(table[new_index]["depth"]),
-        "depth_index": int(new_index)
+        "depth": int(table[index]["depth"]),
+        "depth_index": int(index)
     }
 
     losses = n - wins - draws

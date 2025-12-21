@@ -230,6 +230,22 @@ class GameViewer:
         chess_board = chess.Board(self.board.fen())
         display(SVG(chess.svg.board(board=chess_board, flipped=flipped)))
 
+    def node_who_chosen(self):
+        """ conveniently return node, who move, what move was chosen """
+        if self.ply >= len(self.moves_uci):
+            return None, None, None
+
+        chosen = self.moves_uci[self.ply]
+
+        # very old games use the uci to index
+        node = self.tree_data.get(chosen) or {}
+        if not node:
+            node = self.tree_data.get(str(self.ply))
+
+        who = self.who_moved()
+
+        return node, who, chosen        
+
     def show_pv(self, min_vis=1):
         """
         Print principal variation recorded in the tree data for the current ply.
@@ -240,8 +256,8 @@ class GameViewer:
             print("End of game.")
             return
 
-        node = self.tree_data.get(self.moves_uci[self.ply]) or \
-            self.tree_data.get(str(self.ply))
+        node, who, chosen = self.node_who_chosen()
+
         if not node:
             print("No PV available for this node.")
             return
@@ -262,8 +278,7 @@ class GameViewer:
                 break
 
             idx = self.ply + i
-            played = (idx < len(self.moves_uci) and
-                    self.moves_uci[idx] == uci)
+            played = (idx < len(self.moves_uci) and self.moves_uci[idx] == uci)
 
             san = board_tmp.san(chess.Move.from_uci(uci))
             p = step.get("P", 0.0)
@@ -284,14 +299,30 @@ class GameViewer:
             line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
                     f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
             print(line)
-
+    
+    def print_row(self, c, mark=False, show_rank=False, rank_val=None):
+        san = self.board.san(c.get("uci", ""))
+        marker = "  <- SF" if mark else ""
+        rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
+        Q = c.get('Q',0)
+        P = c.get('P',0)
+        U = c.get('U',0)
+        cPUCT = self.log.get('c_puct', 1.5)
+        Qrel = Q if self.board.side_to_move() == 'w' else -1*Q
+        PUCT = Qrel + cPUCT*U
+        print(
+            f"   {san:<6} visits={c.get('visits',0):<5} "
+            f"Q={Q:+.3f} P={P:.3f} U={U:+.3f} PUCT={PUCT:+.3f}"
+            f"{marker}{rank_str}"
+        )
+    
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
             print("End of game.")
             return
 
-        who = self.who_moved()
-        chosen = self.moves_uci[self.ply]
+        node, who, chosen = self.node_who_chosen()
+
         try:
             chosen_san = self.board.san(chosen)
         except Exception:
@@ -300,10 +331,6 @@ class GameViewer:
         print()
         print(f"Ply {self.ply+1}: {who} about to play {chosen_san}")
         print("=" * 60)
-
-        node = self.tree_data.get(chosen) or {}
-        if not node:
-            node = self.tree_data.get(str(self.ply))
 
         if node is None:
             print("  (no candidate_moves in log)")
@@ -342,27 +369,17 @@ class GameViewer:
                 sf_idx = i
                 break
 
-        def print_row(c, mark=False, show_rank=False, rank_val=None):
-            san = self.board.san(c.get("uci", ""))
-            marker = "  <- SF" if mark else ""
-            rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
-            print(
-                f"   {san:<6} visits={c.get('visits',0):<5} "
-                f"Q={c.get('Q',0):+.3f} P={c.get('P',0):.3f} U={c.get('U',0):+.3f}"
-                f"{marker}{rank_str}"
-            )
-
         shown_ucis = set()
         # top-N: never show ranks; just mark if SF move is in top-N
         for i, c in enumerate(cands_sorted[:top_n]):
-            print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
+            self.print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
             shown_ucis.add(c.get("uci"))
 
         # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
         if is_sf_turn and sf_idx is not None:
             if cands_sorted[sf_idx].get("uci") not in shown_ucis:
                 print("   ...")
-                print_row(
+                self.print_row(
                     cands_sorted[sf_idx], mark=True,
                     show_rank=True, rank_val=sf_idx + 1,
                 )
@@ -417,6 +434,30 @@ class GameViewer:
                 print("SF:", "  ".join(parts))
         print("=" * 60)
 
+    def show_visits(self, uci_or_san):
+        node, who, chosen = self.node_who_chosen()
+        if node is None:
+            print(f"No visit info available for {uci_or_san}")
+            return
+
+        cands = node.get("candidate_moves") or []
+        scands = sorted(cands, key=lambda x: x['visits'], reverse=True)
+        move = {}
+        rank = 0
+        for c in scands:
+            rank += 1
+            if uci_or_san in [c['uci'], self.board.san(c['uci'])]:
+                move = c
+                break
+        
+        if not move:
+            print(f"No visit info available for {uci_or_san}")
+            return
+        
+        print(f"  === Showing visit info for {uci_or_san} ===")
+        self.print_row(move)
+        print(f"   Rank: {rank}\tShare: {100*move['visits']/node['sims']:.3f}%")
+
     def show_options(self):
         # concise CLI help for replay mode commands
         print("Commands:")
@@ -427,6 +468,8 @@ class GameViewer:
         print("  o, options, help     show this help text")
         print("  sf                   stockfish overlay (uses default depth)")
         print("  sf<D>                stockfish eval to depth D, e.g. sf12")
+        print("  visits <move>        show MCTS visits for specific move")
+        print("  visits <N>           show visit info for N top moves")
         print("  pv                   show principal variation (min_vis=1)")
         print("  pv<N>                show principal variation filtered by")
         print("                       minimum visits, e.g. pv8")
@@ -444,7 +487,9 @@ class GameViewer:
                 self.show_moves()
                 shown = True
             cmd = input("[Enter]=fwd, b=back, q=quit, sf=stockfish eval, o=options > ")
-            cmd = cmd.strip().lower()
+            cmd = cmd.strip()
+            cmd_cased = cmd
+            cmd = cmd.lower()
             if cmd in ("q", "quit", "exit"):
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
@@ -473,6 +518,15 @@ class GameViewer:
                 target = max(0, self.ply - n)
                 shown = False
                 self.goto(target)
+            elif cmd.startswith("visits"):
+                split = [c.strip() for c in cmd.split(" ") if c.strip()]
+                # check to see if a int was given to show deeper visit info
+                if split[-1].isdigit():
+                    n = int(split[-1])
+                    self.show_moves(top_n=n)
+                else:
+                    move_str = cmd_cased.replace(" ", "").replace("visits", "")
+                    self.show_visits(move_str)
             else:
                 # default: forward one move
                 shown = False
@@ -1332,7 +1386,7 @@ def start_post_hoc_server(cfg):
     """Start post-hoc worker process and forward the working Config object."""
     p = Process(target=post_hoc_worker, args=(cfg,), daemon=False)
     p.start()
-    
+
     parts = os.path.normpath(cfg.run_dir).split(os.path.sep)
     tail = os.path.sep.join(parts[-2:])
     print(f"[post hoc] started server pid={p.pid} run_dir={tail} "

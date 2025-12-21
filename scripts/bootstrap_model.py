@@ -1,6 +1,6 @@
 import os, pickle
 from chessbot import MODEL_DIR
-from chessbot.model import load_model
+#from chessbot.model import load_model
 from chessbot.utils import batch_policy_metrics, print_validation, format_time
 from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import random
@@ -10,37 +10,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-#bl = 12
-#fl = 512
-#MODEL_NAME = f'conv64_{bl}x{fl}'
-#from chessbot.model import build_conv_flat_64x67    
-# model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
-#     d_model_embed=128, vocab_size=21, filters=fl,
-#     n_blocks=bl, name=MODEL_NAME
-# )
+bl = 12
+fl = 296
+MODEL_NAME = f'conv64_{bl}x{fl}'
+from chessbot.model import build_conv_flat_64x67SE
+model, opt, loss_weights, loss_dict = build_conv_flat_64x67SE(
+    d_model_embed=128, vocab_size=21, filters=fl,
+    n_blocks=bl, name=MODEL_NAME
+)
 
-# model.summary()
-#model.save(MODEL_DIR + f"{MODEL_NAME}_{0}.h5")
-MODEL_NAME = "conv64_9x296"
-model = load_model("C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_net_flat_run2/conv_net_flat_run2_model.h5")
+model.summary()
+model.save(MODEL_DIR + f"{MODEL_NAME}_init.h5")
 #%%
-metrics_history = {
-    "value_mse": [], "value_corr": [], "epoch_time": []
-}
-
-# weights_schedule = {
-#     # slow start
-#     3  : {"policy_logits": 1.0, "value_out": 1.00},
-#     5  : {"policy_logits": 1.0, "value_out": 1.50},
-#     20 : {"policy_logits": 1.5, "value_out": 2.00},
-#     75 : {"policy_logits": 1.5, "value_out": 2.50},
-#     150: {"policy_logits": 2.0, "value_out": 2.75},
-#     300: {"policy_logits": 2.5, "value_out": 2.25},
-#     400: {"policy_logits": 2.0, "value_out": 1.50},
-#     500: {"policy_logits": 1.5, "value_out": 0.50},
-#     # post-500 fine-tune taper (MSE maintenance mostly)
-#     600: {"policy_logits": 1.0, "value_out": 0.50}
-# }
+metrics_history = {"value_mse": [], "value_corr": [], "epoch_time": []}
 
 eps = 1e-12
 big_neg = -1e6

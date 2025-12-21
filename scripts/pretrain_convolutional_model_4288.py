@@ -353,9 +353,6 @@ from tensorflow.keras import mixed_precision
 
 
 def squeeze_excitation(x, channels, reduction=16, name=None):
-    """
-    Small SE: global pool -> bottleneck Dense -> sigmoid -> scale channels.
-    """
     nm = "" if name is None else name + "_"
     se = layers.GlobalAveragePooling2D(name=nm + "gap")(x)
     se = layers.Dense(channels // reduction, activation="relu",
@@ -365,38 +362,40 @@ def squeeze_excitation(x, channels, reduction=16, name=None):
     return layers.Multiply(name=nm + "scale")([x, se])
 
 
-def res_block_batchnorm(x, channels, reduction, leak=0.01, name=None):
+def res_block_layernorm(x, channels, reduction, leak=0.01, name=None):
     """
-    Residual block reworked to use BatchNorm and a small SE module.
+    Residual block reworked to use LayerNorm and a small SE module.
     Keeps the same public name for easy replacement.
     """
     nm = "" if name is None else name + "_"
+
     conv1 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
         kernel_initializer="he_normal", name=nm + "conv1"
     )(x)
 
-    bn1 = layers.BatchNormalization(name=nm + "bn1")(conv1)
-    act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(bn1)
+    ln1 = layers.LayerNormalization(axis=-1, name=nm + "ln1")(conv1)
+    act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(ln1)
 
     conv2 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
         kernel_initializer="he_normal", name=nm + "conv2"
     )(act1)
 
-    bn2 = layers.BatchNormalization(name=nm + "bn2")(conv2)
-    
+    ln2 = layers.LayerNormalization(axis=-1, name=nm + "ln2")(conv2)
+
     if reduction > 0:
-        se_out = squeeze_excitation(bn2, channels, reduction=reduction, name=nm + "se")
+        se_out = squeeze_excitation(ln2, channels, reduction=reduction,
+                                    name=nm + "se")
         out = layers.Add(name=nm + "add")([x, se_out])
     else:
-        out= bn2
-        
+        out = ln2
+
     out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
     return out
 
 
-def build_conv_flat_64x67(
+def build_conv_flat_64x67SE(
     name,
     d_model_embed=128,
     vocab_size=21,
@@ -405,8 +404,7 @@ def build_conv_flat_64x67(
     reduction=16
 ):
     """
-    Conv-heavy model using BatchNormalization in the trunk and a
-    small SE block inside each residual block.
+    Conv-heavy model using LayerNorm in the trunk and SE inside each block.
     """
     mixed_precision.set_global_policy("mixed_float16")
 
@@ -422,15 +420,15 @@ def build_conv_flat_64x67(
         kernel_initializer="he_normal", name="conv_init"
     )(x)
 
-    x = layers.BatchNormalization(name="bn_init")(x)
+    x = layers.LayerNormalization(axis=-1, name="ln_init")(x)
     x = layers.LeakyReLU(alpha=0.01, name="lrelu_init")(x)
 
     for i in range(n_blocks):
-        x = res_block_batchnorm(x, fl, reduction=reduction, leak=0.01, name=f"res{i}")
+        x = res_block_layernorm(x, fl, reduction=reduction, leak=0.01, name=f"res{i}")
 
     x = layers.Conv2D(fl, 1, padding="same", use_bias=False,
                       name="conv_mix_1x1")(x)
-    x = layers.BatchNormalization(name="bn_mix")(x)
+    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
     x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
 
     policy_map = layers.Conv2D(
@@ -438,22 +436,21 @@ def build_conv_flat_64x67(
     )(x)
 
     feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(feat_64_67)
+    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(
+        feat_64_67
+    )
 
     v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
     v = layers.Dense(128, activation="relu", name="v_fc1")(v_pool)
-    value_out = layers.Dense(1, activation="tanh", dtype="float32",
-                             name="value_out")(v)
+    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
 
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out],
-                  name=name)
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
     opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
     opt = mixed_precision.LossScaleOptimizer(opt)
 
     loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(
-            from_logits=True),
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
     }
 
@@ -463,10 +460,10 @@ def build_conv_flat_64x67(
     return model, opt, loss_weights, loss_dict
 
 
-bl = 10
-fl = 256
+bl = 12
+fl = 296
 MODEL_NAME = f'conv64_{bl}x{fl}SE'
-model, opt, loss_weights, loss_dict = build_conv_flat_64x67(
+model, opt, loss_weights, loss_dict = build_conv_flat_64x67SE(
     name=MODEL_NAME, d_model_embed=96, vocab_size=21,
     filters=fl, n_blocks=bl, reduction=16
 )

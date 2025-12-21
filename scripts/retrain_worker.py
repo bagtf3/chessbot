@@ -30,7 +30,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--no-gpu", action="store_true", help="run on cpu only")
     args = p.parse_args()
 

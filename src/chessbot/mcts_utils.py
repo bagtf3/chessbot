@@ -33,7 +33,7 @@ class MCTSTree(fasttree):
         else:
             self.c_puct = c
 
-        super().__init__(board, self.c_puct, MCTSTree.ev)
+        super().__init__(board, self.c_puct, 300, MCTSTree.ev)
 
         # bookkeeping
         self.board = board
@@ -431,6 +431,7 @@ class ChessGame(object):
             cm = {
                 "uci": cd.uci, "visits": cd.N,
                 "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4),
+                "Q_ema": rnd(cd.Q_ema, 4),
                 "is_terminal": cd.is_terminal, "vprime_visits": cd.vprime_visits
             }
             
@@ -443,7 +444,7 @@ class ChessGame(object):
         for x in pv_items:
             pv.append({
                 "uci": x.uci, "visits": int(x.visits),
-                "P": rnd(x.P, 4), "Q": rnd(x.Q, 4),
+                "P": rnd(x.P, 4), "Q": rnd(x.Q, 4)
             })
         
         # attach PV snapshot (may be empty if no deeper visited chain exists)

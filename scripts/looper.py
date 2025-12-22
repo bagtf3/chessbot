@@ -723,7 +723,8 @@ if __name__ == "__main__":
             is_validation = (run_num % cfg.validation_every) == 0
 
             # prepare a working config for this iteration
-            working_cfg = cfg.copy()
+            #working_cfg = cfg.copy()
+            working_cfg = Config.from_yaml(yaml_path, init=True)
             if is_validation:
                 if os.path.exists(val_yaml_path):
                     working_cfg = create_validation_config(cfg, val_yaml_path)

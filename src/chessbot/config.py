@@ -12,8 +12,8 @@ class Config(object):
 
     # files
     selfplay_dir = SP_DIR
-    run_tag = "test"
-    init_model = MODEL_DIR + 'test.h5'
+    run_tag = "dummy"
+    init_model = MODEL_DIR + 'dummy.h5'
     previous_run_tag = None
 
     # MCTS (float or list)
@@ -93,27 +93,20 @@ class Config(object):
         resolved_run_dir = os.path.join(self.selfplay_dir, self.run_tag)
         resolved_run_dir = os.path.abspath(resolved_run_dir)
         self.run_dir = resolved_run_dir
-        Config.run_dir = resolved_run_dir
 
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
-        Config.game_dir = game_dir
 
         self.game_index_file = os.path.join(self.run_dir, "game_index.json")
-        Config.game_index_file = self.game_index_file
-
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
-        Config.progress_csv_path = self.progress_csv_path
-
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
-        Config.progress_plot_path = self.progress_plot_path
 
         model_name = f"{self.run_tag}_model.h5"
         self.model_path = os.path.join(self.run_dir, model_name)
-        Config.model_path = self.model_path
 
-        for d in (self.run_dir, self.game_dir):
-            os.makedirs(d, exist_ok=True)
+        if 'dummy' not in self.run_dir:
+            for d in (self.run_dir, self.game_dir):
+                os.makedirs(d, exist_ok=True)
 
         # public flag; keep the old name too for backward compatibility
         self.paths_initialized = True

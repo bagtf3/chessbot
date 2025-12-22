@@ -305,6 +305,7 @@ class GameViewer:
         marker = "  <- SF" if mark else ""
         rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
         Q = c.get('Q',0)
+        Q_ema = c.get("Q_ema", 0)
         P = c.get('P',0)
         U = c.get('U',0)
         cPUCT = self.log.get('c_puct', 1.5)
@@ -312,7 +313,7 @@ class GameViewer:
         PUCT = Qrel + cPUCT*U
         print(
             f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q={Q:+.3f} P={P:.3f} U={U:+.3f} PUCT={PUCT:+.3f}"
+            f"Q={Q:+.3f} Q_ema={Q_ema:+.3f}, P={P:.3f} U={U:+.3f} PUCT={PUCT:+.3f}"
             f"{marker}{rank_str}"
         )
     

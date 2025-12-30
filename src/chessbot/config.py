@@ -18,6 +18,7 @@ class Config(object):
 
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    ema_span = 1000 # large ema_span effective turns it off
 
     # Simulation schedule
     sf_move_sims = 200
@@ -80,6 +81,8 @@ class Config(object):
     loss_weights = {"policy_winner": 0.25, "policy_loser": 0.25, "value_out": 0.25}
     vscale = 0.9
     draw_weight = 0.1
+    training_queue_thresh = 4096
+    retrain_batch_size = 512
 
     def __init__(self):
         self.init_paths()

@@ -1,4 +1,4 @@
-import os, pickle
+import os, pickle, random
 import pathlib, json
 import time, gc
 import sys, subprocess
@@ -251,9 +251,8 @@ class GameLooper(object):
                 # add in more games if needed
                 self.fill_active_games()
 
-        # train with whatever we got and final report
-        if self.collect_training_data:
-            self.trigger_retrain()
+        # train with whatever we got left and final report
+        self.trigger_retrain()
 
         self.maybe_log_results(force=True, run_num=run_num)
         return
@@ -456,66 +455,79 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
+        # if we have a big enough training queue, we can retrain and reload weights
+        if len(self.training_queue) >= self.config.training_queue_thresh:
+            self.trigger_retrain()
+
     def trigger_retrain(self):
         """
-        Pickles training queue and currnet config, starts retrain_worker in
-        a subprocess to avoid memory leak and slowdowns.
-        reloads model and infer on success.
+        Pickles training queue and current config, runs retrain_worker as a
+        subprocess, reloads model on success.
         """
 
         if not self.training_queue:
             return
-        
+
         if not self.collect_training_data:
             return
-        
-        # write training queue (list) to pkl
+
+        # compute prefix length that is a multiple of rtbs
+        rtbs = self.config.retrain_batch_size
+        keep = (len(self.training_queue) // rtbs) * rtbs
+        if keep == 0:
+            # not enough samples to form a retrain batch
+            return
+
+        random.shuffle(self.training_queue)
+        batch_list = self.training_queue[:keep]
+        remainder = self.training_queue[keep:]
+
+        # write training queue (list) to pkl atomically
         run_dir = self.config.run_dir
         p_pending = os.path.join(run_dir, "pending_retrain.pkl")
         tmp_pending = p_pending + ".tmp"
         with open(tmp_pending, "wb") as f:
-            pickle.dump(self.training_queue, f, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(batch_list, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_pending, p_pending)
 
         # pickle config dict (cfg may have been updated at runtime)
         cfg_dict = self.config.to_dict()
-        cfg_dict['n_retrains'] = self.n_retrains
+        cfg_dict["n_retrains"] = self.n_retrains
         p_cfg = os.path.join(run_dir, "config.pkl")
         tmp_cfg = p_cfg + ".tmp"
-
         with open(tmp_cfg, "wb") as f:
             pickle.dump(cfg_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_cfg, p_cfg)
 
-        # find retrain_worker.py
-        retrain_script = cbu.find_script("retrain_worker.py", start_file=__file__)
+        # find retrain_worker.py (fail fast if not found)
+        rt_script = cbu.find_script("retrain_worker.py", start_file=__file__)
+        if not rt_script:
+            raise RuntimeError("retrain_worker.py not found")
 
-        # delete the model to free up GPU RAM
-        del self.model, self.infer
-        gc.collect()
+        # spawn worker and wait for it to finish
+        cmd = [sys.executable, rt_script, "--run-dir", run_dir]
+        cmd += ["--batch-size", str(rtbs)]
 
-        # spawn worker and fail fast if it fails
-        cmd = [sys.executable, retrain_script, "--run-dir", run_dir]
-        print(f"[retrain] launching worker with {len(self.training_queue)} samples")
+        print(f"[retrain] launching worker with {len(batch_list)} samples")
         proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
         rc = proc.returncode
         if rc != 0:
-            # print to stderr
             sys.stderr.write("[retrain] worker failed, aborting looper\n")
             sys.stderr.write(f"[retrain] exit_code={rc}\n")
             sys.stderr.write("=== WORKER STDOUT ===\n")
             sys.stderr.write((proc.stdout or "") + "\n")
             sys.stderr.write("=== WORKER STDERR ===\n")
             sys.stderr.write((proc.stderr or "") + "\n")
-            # fail fast and loud
+            # fail loud and fast
             raise RuntimeError("retrain worker failed; aborting looper")
         else:
             sys.stdout.write(proc.stdout or "")
 
-        self.infer_is_warm = False
-
-        # clear training queue
-        self.training_queue = []
+        # reload weights and mark state, update new training queue with the leftovers
+        print(f"[retrain] reloading new weights from "
+            f"{os.path.basename(self.config.model_path)}")
+        self.model.load_weights(self.config.model_path)
+        self.training_queue = remainder
         self.n_retrains += 1
         self.clear_cache = True
 

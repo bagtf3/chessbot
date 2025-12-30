@@ -533,7 +533,7 @@ class GameViewer:
                 shown = False
                 self.next()
 
-    def generate_training_data(self, sf_skip=False):
+    def generate_training_data(self, sf_skip=False, **kwargs):
         """
         Walk the game using self.next() and produce Xerces training examples.
         If sf_skip is True, plies played by Stockfish (per who_moved()) are
@@ -592,6 +592,16 @@ class GameViewer:
             else:
                 # legal moves and synthetic visits
                 visits = make_fake_visits(move_played, lms, ratio_best=51)
+
+            check_boost = kwargs.get("check_boost", 0)
+            capture_boost = kwargs.get("capture_boost", 0)
+            if check_boost or capture_boost:
+                for i, (move, v) in enumerate(visits):
+                    if rb.gives_check(move):
+                        visits[i][1] += check_boost
+                    if rb.is_capture(move):
+                        visits[i][1] += capture_boost
+
             counts = np.array([x[1] for x in visits], dtype=np.float32)
             s = counts.sum()
             if s > 0.0:
@@ -1268,7 +1278,7 @@ def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
 
     # single engine reused across loop
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 2, "Hash": 128})
+    eng.configure({"Threads": 1, "Hash": 128})
 
     unproc_report = True
     try:

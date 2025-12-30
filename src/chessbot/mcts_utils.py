@@ -32,8 +32,8 @@ class MCTSTree(fasttree):
             self.c_puct = float(np.random.choice(c))
         else:
             self.c_puct = c
-
-        super().__init__(board, self.c_puct, 300, MCTSTree.ev)
+        self.ema_span = cfg.ema_span
+        super().__init__(board, self.c_puct, self.ema_span, MCTSTree.ev)
 
         # bookkeeping
         self.board = board

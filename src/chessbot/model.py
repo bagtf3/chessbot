@@ -19,6 +19,7 @@ from tensorflow import keras
 from tensorflow.keras.models import Model
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras.utils import unpack_x_y_sample_weight
+from tensorflow.keras.initializers import Zeros, Constant
 from tensorflow.keras.layers import (
     Input, Conv2D, BatchNormalization, LeakyReLU, Add,
     GlobalAveragePooling2D, Dense, Lambda
@@ -470,12 +471,20 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
     return fwd
 
 
-def squeeze_excitation(x, channels, reduction=16, name=None):
+def squeeze_excitation(x, channels, reduction=4, name=None):
     nm = "" if name is None else name + "_"
     se = layers.GlobalAveragePooling2D(name=nm + "gap")(x)
     se = layers.Dense(channels // reduction, activation="relu",
+                      kernel_initializer="he_normal",
                       name=nm + "fc1")(se)
-    se = layers.Dense(channels, activation="sigmoid", name=nm + "fc2")(se)
+                      
+    # make last dense start as near-identity
+    # zero weights, bias ~3 -> sigmoid(3)=0.95
+    se = layers.Dense(channels, activation="sigmoid",
+                      kernel_initializer=Zeros(),
+                      bias_initializer=Constant(3.0),
+                      name=nm + "fc2")(se)
+
     se = layers.Reshape((1, 1, channels), name=nm + "reshape")(se)
     return layers.Multiply(name=nm + "scale")([x, se])
 
@@ -524,6 +533,7 @@ def build_conv_flat_64x67SE(
     """
     Conv-heavy model using LayerNorm in the trunk and SE inside each block.
     """
+    from tensorflow.keras import mixed_precision
     mixed_precision.set_global_policy("mixed_float16")
 
     de, fl, vs = d_model_embed, filters, vocab_size

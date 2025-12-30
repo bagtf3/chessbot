@@ -188,8 +188,19 @@ def main():
     for name, start, end, delta, mark in rows:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
-    # checkpoint new weights
-    model.save(cfg['model_path'])
+    # checkpoint new weights, move existing model to .bak
+    model_path = cfg['model_path']
+    bak_path = model_path + ".bak"
+
+    if os.path.exists(model_path):
+        try:
+            os.replace(model_path, bak_path)
+            print(f"[retrain] backed up existing model")
+        except Exception as e:
+            print(f"[retrain] failed to backup existing model: {e}")
+
+    # save new model to model_path
+    model.save(model_path)
     print("[retrain] retraining complete for epoch", epoch)
     return 0
 

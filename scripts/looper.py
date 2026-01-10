@@ -68,6 +68,7 @@ class GameLooper(object):
         self.draws = 0
         self.total_plies = 0
         self.n_retrains = 0
+        self.retrain_procs = []
         self.clear_cache = False
         
         self._run_start = _now()
@@ -79,6 +80,17 @@ class GameLooper(object):
 
         self.moves_played = 0
         self.sims_done_total = 0
+    
+    def restart_run(self, run_num=None):
+        cfg = self.config
+        self.infer = make_conv_infer(
+            self.model, max_bs=cfg.fwd_batch,
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
+            vscale=cfg.vscale
+        )
+
+        self.infer_is_warm = False
+        return self.run(run_num=run_num)
 
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
@@ -251,11 +263,18 @@ class GameLooper(object):
                 # add in more games if needed
                 self.fill_active_games()
 
-        # train with whatever we got left and final report
-        self.trigger_retrain()
+                # check if its time to retrain
+                if len(self.training_queue) >= cfg.training_queue_thresh:
+                    self.trigger_retrain()
+                    # return False if there are still games to play
+                    return self.games_finished >= cfg.n_games
 
+        # train with whatever we have left and final report
+        if len(self.training_queue) >= min(2000, cfg.training_queue_thresh):
+            self.trigger_retrain()
+        
         self.maybe_log_results(force=True, run_num=run_num)
-        return
+        return True
 
     def format_and_predict(self, preds_batch):
         """
@@ -455,34 +474,28 @@ class GameLooper(object):
             self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
         game.examples = []
 
-        # if we have a big enough training queue, we can retrain and reload weights
-        if len(self.training_queue) >= self.config.training_queue_thresh:
-            self.trigger_retrain()
-
     def trigger_retrain(self):
         """
         Pickles training queue and current config, runs retrain_worker as a
-        subprocess, reloads model on success.
+        blocking subprocess (subprocess.run). On success reloads weights,
+        increments retrain counter, and clears caches. Returns True if a
+        retrain ran and completed, False if no retrain was needed.
         """
-
         if not self.training_queue:
-            return
+            return False
 
         if not self.collect_training_data:
-            return
+            return False
 
-        # compute prefix length that is a multiple of rtbs
         rtbs = self.config.retrain_batch_size
         keep = (len(self.training_queue) // rtbs) * rtbs
         if keep == 0:
-            # not enough samples to form a retrain batch
-            return
+            return False
 
         random.shuffle(self.training_queue)
         batch_list = self.training_queue[:keep]
         remainder = self.training_queue[keep:]
 
-        # write training queue (list) to pkl atomically
         run_dir = self.config.run_dir
         p_pending = os.path.join(run_dir, "pending_retrain.pkl")
         tmp_pending = p_pending + ".tmp"
@@ -490,7 +503,6 @@ class GameLooper(object):
             pickle.dump(batch_list, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_pending, p_pending)
 
-        # pickle config dict (cfg may have been updated at runtime)
         cfg_dict = self.config.to_dict()
         cfg_dict["n_retrains"] = self.n_retrains
         p_cfg = os.path.join(run_dir, "config.pkl")
@@ -499,37 +511,73 @@ class GameLooper(object):
             pickle.dump(cfg_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_cfg, p_cfg)
 
-        # find retrain_worker.py (fail fast if not found)
         rt_script = cbu.find_script("retrain_worker.py", start_file=__file__)
         if not rt_script:
             raise RuntimeError("retrain_worker.py not found")
 
-        # spawn worker and wait for it to finish
         cmd = [sys.executable, rt_script, "--run-dir", run_dir]
         cmd += ["--batch-size", str(rtbs)]
 
         print(f"[retrain] launching worker with {len(batch_list)} samples")
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        rc = proc.returncode
-        if rc != 0:
-            sys.stderr.write("[retrain] worker failed, aborting looper\n")
-            sys.stderr.write(f"[retrain] exit_code={rc}\n")
-            sys.stderr.write("=== WORKER STDOUT ===\n")
-            sys.stderr.write((proc.stdout or "") + "\n")
-            sys.stderr.write("=== WORKER STDERR ===\n")
-            sys.stderr.write((proc.stderr or "") + "\n")
-            # fail loud and fast
-            raise RuntimeError("retrain worker failed; aborting looper")
-        else:
-            sys.stdout.write(proc.stdout or "")
 
-        # reload weights and mark state, update new training queue with the leftovers
-        print(f"[retrain] reloading new weights from "
-            f"{os.path.basename(self.config.model_path)}")
+        # platform options
+        start_new_session = False
+        creationflags = 0
+        if os.name == "posix":
+            start_new_session = True
+        else:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        # run blocking and capture output
+        try:
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=start_new_session,
+                creationflags=creationflags,
+                check=False,
+                text=True,
+            )
+        except Exception as e:
+            # catastrophic spawn error
+            raise RuntimeError(f"[retrain] failed to start retrain worker: {e}")
+
+        # print a short summary and any captured output (if present)
+        rc = completed.returncode
+        print(f"[retrain] worker finished exit_code={rc}")
+
+        if completed.stdout:
+            stdout = completed.stdout.rstrip()
+            if stdout:
+                print("[retrain] STDOUT:")
+                for ln in stdout.splitlines():
+                    print(ln)
+
+        if completed.stderr:
+            stderr = completed.stderr.rstrip()
+            if stderr:
+                print("[retrain] STDERR:")
+                for ln in stderr.splitlines():
+                    print(ln)
+
+        if rc != 0:
+            # bubble up as runtime error so caller/looper notices
+            raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
+
+        # success: reload model weights, update counters and states
+        print(
+            f"[retrain] reloading new weights from "
+            f"{os.path.basename(self.config.model_path)}"
+        )
         self.model.load_weights(self.config.model_path)
-        self.training_queue = remainder
+        gc.collect()
         self.n_retrains += 1
         self.clear_cache = True
+
+        # commit remainder to training_queue
+        self.training_queue = remainder
+        return True
 
     def maybe_log_results(self, every_sec=60.0, window=500, force=False, run_num=None):
         def sf_bucket(vs_sf, sf_is_white):
@@ -655,6 +703,56 @@ class GameLooper(object):
                 print(f"[game stats] last 50 runtime: {avg_runtime}")
         print("-"*72)
 
+    def spawn_next_looper(self, clear_caches=True):
+        """
+        Create a fresh GameLooper using the model at config.model_path, transfer
+        runtime internals into it, and return the new looper.
+        """
+        # make sure we free TF/Keras state before loading the new model
+        print(
+            f"[spawn] reloading model from "
+            f"{os.path.basename(self.config.model_path)}"
+        )
+        tf.keras.backend.clear_session()
+
+        # load model and create fresh looper (fresh infer, fresh tf funcs)
+        new_model = load_model(self.config.model_path)
+        new_looper = GameLooper(model=new_model, cfg=self.config.copy())
+
+        # fields to transfer (lists and counters)
+        transfer_fields = [
+            "active_games", "training_queue", "recent_games",
+            "games_finished", "white_wins", "black_wins", "draws",
+            "total_plies", "n_retrains", "sf_count",
+            "moves_played", "sims_done_total", "sf_search_depths",
+        ]
+
+        for fld in transfer_fields:
+            setattr(new_looper, fld, getattr(self, fld))
+
+        # transfer meters and timing state (keep same objects so history is retained)
+        new_looper.mps = self.mps
+        new_looper.lps = self.lps
+        new_looper.prediction_times = self.prediction_times
+        new_looper._run_start = getattr(self, "_run_start", _now())
+
+        # ensure new looper starts with a fresh infer warm state
+        new_looper.infer_is_warm = False
+
+        # optionally clear shared caches (helps avoid stale C++/raw cache issues)
+        if clear_caches:
+            print("[spawn] clearing raw/prior caches to avoid leaks")
+            raw_cache_clear()
+            new_looper.clear_cache = False
+
+        # free old model object and try to force collection
+        del self.model
+        del self.infer
+        gc.collect()
+
+        print("[spawn] new looper ready; continuing with transferred games")
+        return new_looper
+
 
 def init_selfplay(config):
     # pre-built config (from yaml)
@@ -722,7 +820,7 @@ if __name__ == "__main__":
     phs = None
     start = _now()
     n_games, run_num = 0, 1
-
+    left_over_training_queue = []
     try:
         while run_num <= cfg.n_rounds:
             if n_games:
@@ -754,9 +852,20 @@ if __name__ == "__main__":
 
             # init selfplay with the working config (returns looper + used cfg)
             looper = init_selfplay(config=working_cfg)
-
+            
+            looper.training_queue += left_over_training_queue
             # run the games for this iteration
-            looper.run(run_num)
+            # looper.run() completes up to a retrain.
+            # return to clear scope due to mem leaks
+            finished = looper.run(run_num)
+            while not finished:
+                # spawn a fresh looper (fresh TF/ infer) and continue
+                looper = looper.spawn_next_looper(clear_caches=True)
+                gc.collect()
+                finished = looper.run(run_num)
+
+            # might be some positions not trained, carry them over
+            left_over_training_queue = looper.training_queue
             run_num += 1
 
             # if it was a validation iteration, record its summary

@@ -44,6 +44,11 @@ class Config(object):
     material_diff_cutoff_span = 25
     use_syzygy = False
 
+    use_eval_draw = True
+    eval_draw_min_plies = 50
+    eval_draw_thresh = 0.1
+    eval_draw_span = 15
+
     play_vs_sf_prob = 0.5
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}

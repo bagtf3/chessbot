@@ -1,21 +1,20 @@
-import os, pickle
+import os, pickle, random
 from chessbot import MODEL_DIR, SP_DIR
 from chessbot.model import load_model
 from chessbot.utils import batch_policy_metrics, print_validation, format_time
 from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import random
 
-import sys, subprocess, gc
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import time
 
-run_tag = "conv_12x296SE"
+run_tag = "conformer_10x256x5"
 run_dir = os.path.join(SP_DIR, run_tag)
 model_file = os.path.join(run_dir, run_tag + "_model.h5")
 progress_file = os.path.join(run_dir, "eval_progress.csv")
-#%%
+
 metrics_history = {"value_mse": [], "value_corr": []}
 epoch_time_list = []
 
@@ -26,18 +25,26 @@ def moving_average_pd(arr, window=15):
     s = pd.Series(arr)
     return s.rolling(window, center=True, min_periods=1).mean().values
 
+def check(a):
+    if isinstance(a['json_file'], str):
+        return os.path.exists(a['json_file'])
+    return False
+
 #%%
 run_tags = [
     'conv_1000_selfplay_phase3','conv_1000_selfplay_phase4',
     "conv_net_flat_12blocks_run0",
-    "conv_net_flat_run1", "conv_net_flat_run2", "conv_12x296_bootstrapped"
+    "conv_net_flat_run1", "conv_net_flat_run2", "conv_12x296_bootstrapped",
+    "conv_12x296SE", "conv_9x296_vs_stockfish", "conv_9x296_selfplay"
 ]
 
 all_games = []
 df_list = []
-for rt in run_tags:
+for rt in run_tags[-4:]:
     rd = os.path.join(SP_DIR, rt)
-    all_games += load_game_index(rd)
+    ag = load_game_index(rd)
+    ag = [a for a in ag if check(a)]
+    all_games += ag
 
     pkl = os.path.join(rd, ANALYZE_PKL)
     with open(pkl, "rb") as f:
@@ -59,16 +66,17 @@ for rt in run_tags:
 df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
 df_trim = df_trim.query("scenario != 'random_endgame'").copy()
 
-meta = pd.DataFrame(all_games)
+meta = pd.DataFrame(all_games).drop_duplicates("game_id")
+if "overall_cpl" in meta.columns:
+    del meta['overall_cpl']
+    
 meta = meta.query("plies >= 10")
-
 meta = meta.merge(df_trim[['game_id', 'run_tag', 'overall_cpl']], on='game_id')
-meta = meta.query("overall_cpl <= 30")
-
+meta = meta.query("overall_cpl <= 40")
+meta.sort_values("overall_cpl", ascending=False)
 training_games = meta['json_file'].to_list()
 print(len(training_games))
-random.shuffle(training_games)
-#%%
+
 
 def append_to_buffer(buf, X, M, P, Z, V):
     y = [0.5 * a + 0.5 * b for a, b in zip(Z, V)]
@@ -98,7 +106,7 @@ def top_up_sliding_buffer(
             
             # X, Mask, Pi, result (Z), Vwq, moves remaining
             X, M, P, Z, V, R = gv.generate_training_data(
-                sf_skip=False, check_boost=5, capture_boost=5
+                sf_skip=False, check_boost=0, capture_boost=0
             )
             if not X:
                 continue
@@ -111,35 +119,23 @@ def top_up_sliding_buffer(
     return idx
 
 
-def sample_from_sliding_buffer(buf, epoch_size):
+def sample_from_buffer(buf, epoch_size):
     n = len(buf)
     if n == 0:
         return None
 
     k = epoch_size if n >= epoch_size else n
-
-    Xs = []
-    Ms = []
-    Ps = []
-    Ys = []
-
-    for _ in range(k):
-        j = np.random.randint(len(buf))
-        x, m, p, y = buf[j]
-        Xs.append(x)
-        Ms.append(m)
-        Ps.append(p)
-        Ys.append(y)
-
-        buf[j] = buf[-1]
-        buf.pop()
-
+    
+    random.shuffle(buf)
+    sel = buf[:k]
+    
+    Xs, Ms, Ps, Ys = zip(*sel)
     Xb = np.stack(Xs, axis=0)
     Mb = np.stack(Ms, axis=0)
     Pb = np.stack(Ps, axis=0)
     Yb = np.stack(Ys, axis=0)
-
-    return Xb, Mb, Pb, Yb
+    
+    return Xb, Mb, Pb, Yb, buf[k:]
 
 
 buffer = []
@@ -147,11 +143,10 @@ batch_size = 512
 epoch_size = 20*batch_size
 buffer_size = 6 * epoch_size
 epoch, idx = 0, 0
-MAX_EPOCH = 100
+MAX_EPOCH = 200
 draw_rate = 0.5
 begin = time.time()
-#loss_weights = {"policy_logits": 2.0, "value_out": 2.00}
-loss_weights = {"policy_logits": 0.5, "value_out": 0.5}
+loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
 
 idx = top_up_sliding_buffer(
     buffer,
@@ -161,28 +156,16 @@ idx = top_up_sliding_buffer(
     draw_rate=draw_rate
 )
 
-def run_selfplay(model_loc):
-    if os.path.exists(model_loc):
-        os.remove(model_loc)
-        
-    cmd = [sys.executable, "-u", "looper.py", "conv_12x296SE"]
-    _ = subprocess.run(cmd, check=False)
-    model = load_model(model_loc)
-    return model
-
-#model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
-model = run_selfplay(model_file)
+model = load_model(model_file)
 eval_df = pd.read_csv(progress_file)
 #%%
-while idx < len(training_games) and epoch <= MAX_EPOCH:
-    # if epoch > 50:
-    #     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    # if epoch > 150:
-    #     loss_weights = {"policy_logits": 0.5, "value_out": 0.5}
-    # if epoch > 250:
-    #     loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
-    # if epoch > 300:
-    #     loss_weights = {"policy_logits": 0.12, "value_out": 0.12}
+PLOT_EVERY = 5
+while epoch <= MAX_EPOCH:
+    
+    # if we run out of the main buffer, re train on the best games randomly
+    if idx == len(training_games):
+        random.shuffle(training_games)
+        idx = 0
         
     epoch_start = time.time()
     
@@ -193,14 +176,12 @@ while idx < len(training_games) and epoch <= MAX_EPOCH:
         buffer_size=buffer_size,
         draw_rate=draw_rate
     )
-    
-    batch = sample_from_sliding_buffer(buffer, epoch_size)
-    if batch is None:
+    try:
+        Xstack, Mstack, Pstack, Ystack, buffer = sample_from_buffer(buffer, epoch_size)
+    except:
         break
-
-    Xstack, Mstack, Pstack, Ystack = batch
     
-    if epoch % 4 == 0:    
+    if epoch % PLOT_EVERY == 0:
         # pred validate and train
         preds = model.predict(Xstack, verbose=0, batch_size=batch_size)
         
@@ -228,12 +209,25 @@ while idx < len(training_games) and epoch <= MAX_EPOCH:
         metrics_history['value_mse'].append(value_mse)
         metrics_history['value_corr'].append(value_corr)
         
-        eval_df = pd.read_csv(progress_file)
+        # create eval_df row
         latest_row = pd.DataFrame(metrics_history).iloc[[-1], :]
-        latest_row['model_epoch'] = eval_df.tail(1)["model_epoch"].item() + 1
-        latest_row['n_samples'] = Xstack.shape[0]
-        latest_row = latest_row.reindex(columns=eval_df.columns)
-        eval_df = pd.concat([eval_df, latest_row])
+        n_samples = Xstack.shape[0]
+        if epoch > 0:
+            n_samples *= PLOT_EVERY
+        latest_row['n_samples'] = n_samples        
+        
+        # check for updates
+        if os.path.exists(progress_file):
+            eval_df = pd.read_csv(progress_file)
+            
+        if eval_df is None:
+            latest_row['model_epoch'] = 0
+            eval_df = latest_row.copy()
+        else:
+            latest_row['model_epoch'] = eval_df.tail(1)["model_epoch"].item() + 1
+            latest_row = latest_row.reindex(columns=eval_df.columns)
+            eval_df = pd.concat([eval_df, latest_row])
+        
         eval_df.to_csv(progress_file, index=False)
         
         # build print dict and call the printer
@@ -241,64 +235,64 @@ while idx < len(training_games) and epoch <= MAX_EPOCH:
         print_metrics.update(policy_stats)
         print_validation(epoch, print_metrics)
         
-    hide_first = max(int(0.1 * epoch), 5)
-    if (epoch >= 32) and (epoch % 4 == 0):
-        ma_window = min(max(3, int(epoch * 0.2)), 15)
+        retrains = eval_df.tail(1)['model_epoch'].item()
+        hide_first = max(int(0.1 * retrains), 5)
+        ma_window = min(max(3, int(retrains * 0.2)), 15)
         if ma_window % 2 == 0:
             ma_window += 1
     
         x = np.arange(len(eval_df["policy_ce"]))
         start = hide_first
         xs = x[start:]
-    
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    
-        # policy CE
-        ax = axes[0, 0]
-        raw = np.array(eval_df["policy_ce"])[start:]
-        ma = moving_average_pd(eval_df["policy_ce"], window=ma_window)[start:]
-        if raw.size:
-            ax.plot(xs, raw, label="policy_ce", alpha=0.6, lw=1)
-        if ma.size:
-            ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-        ax.set_title("policy CE (nats)")
-        ax.legend()
-    
-        # CE gain vs uniform
-        ax = axes[0, 1]
-        raw = np.array(eval_df["ce_gain"])[start:]
-        ma = moving_average_pd(eval_df["ce_gain"], window=ma_window)[start:]
-        if raw.size:
-            ax.plot(xs, raw, label="ce_gain", alpha=0.6, lw=1)
-        if ma.size:
-            ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-        ax.set_title("CE gain vs uniform")
-        ax.legend()
-    
-        # value MSE
-        ax = axes[1, 0]
-        raw = np.array(eval_df["value_mse"])[start:]
-        ma = moving_average_pd(eval_df["value_mse"], window=ma_window)[start:]
-        if raw.size:
-            ax.plot(xs, raw, label="mse", alpha=0.6, lw=1)
-        if ma.size:
-            ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-        ax.set_title("value MSE")
-        ax.legend()
-    
-        # value corr
-        ax = axes[1, 1]
-        raw = np.array(eval_df["value_corr"])[start:]
-        ma = moving_average_pd(eval_df["value_corr"], window=ma_window)[start:]
-        if raw.size:
-            ax.plot(xs, raw, label="corr", alpha=0.6, lw=1)
-        if ma.size:
-            ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-        ax.set_title("value corr")
-        ax.legend()
-    
-        plt.tight_layout()
-        plt.show()
+        if len(xs) > hide_first:
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        
+            # policy CE
+            ax = axes[0, 0]
+            raw = np.array(eval_df["policy_ce"])[start:]
+            ma = moving_average_pd(eval_df["policy_ce"], window=ma_window)[start:]
+            if raw.size:
+                ax.plot(xs, raw, label="policy_ce", alpha=0.6, lw=1)
+            if ma.size:
+                ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+            ax.set_title("policy CE (nats)")
+            ax.legend()
+        
+            # CE gain vs uniform
+            ax = axes[0, 1]
+            raw = np.array(eval_df["ce_gain"])[start:]
+            ma = moving_average_pd(eval_df["ce_gain"], window=ma_window)[start:]
+            if raw.size:
+                ax.plot(xs, raw, label="ce_gain", alpha=0.6, lw=1)
+            if ma.size:
+                ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+            ax.set_title("CE gain vs uniform")
+            ax.legend()
+        
+            # value MSE
+            ax = axes[1, 0]
+            raw = np.array(eval_df["value_mse"])[start:]
+            ma = moving_average_pd(eval_df["value_mse"], window=ma_window)[start:]
+            if raw.size:
+                ax.plot(xs, raw, label="mse", alpha=0.6, lw=1)
+            if ma.size:
+                ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+            ax.set_title("value MSE")
+            ax.legend()
+        
+            # value corr
+            ax = axes[1, 1]
+            raw = np.array(eval_df["value_corr"])[start:]
+            ma = moving_average_pd(eval_df["value_corr"], window=ma_window)[start:]
+            if raw.size:
+                ax.plot(xs, raw, label="corr", alpha=0.6, lw=1)
+            if ma.size:
+                ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+            ax.set_title("value corr")
+            ax.legend()
+        
+            plt.tight_layout()
+            plt.show()
 
     # main eval/fit on selected 1024
     Ydict = {"value_out": Ystack.astype(np.float32), "policy_logits": Pstack}
@@ -338,11 +332,9 @@ while idx < len(training_games) and epoch <= MAX_EPOCH:
     print(f"[time check] last epoch: {e_time}, avg epoch: {avg_epoch},  "
           f"total runtime: {runtime}")
     print()
-    if epoch % 25 == 0:    
-        model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
-        del model
-        gc.collect()
-        model = run_selfplay(model_file)
 
 # when done
-model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_final.h5")
+model.save(model_file)
+#%%
+
+

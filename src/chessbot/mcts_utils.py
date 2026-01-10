@@ -350,12 +350,17 @@ class ChessGame(object):
         self.moves_played = []
         
         self.mat_adv_counter = 0
-        self.vwq_adv_counter = 0
         self.outcome = None
         self.examples = []
         self.plies = 0
         self.vwq = None
         self.sf_eval = None
+
+        # set when to start checking for draw by agreement
+        if self.config.use_eval_draw:
+            self.next_eval_draw_check = self.config.eval_draw_min_plies
+        else:
+            self.next_eval_draw_check = 999
     
     def turn(self, return_bool=True):
         stm = self.board.side_to_move()
@@ -455,7 +460,7 @@ class ChessGame(object):
         """
         Stockfish plays one move. If tree has visits:
         - if SF move is top, use tree visits as-is
-        - otherwise swap top visited move with SF move, bump SF by 10%
+        - otherwise boost SF move by 125% of top visited
         If no visits, fall back to make_fake_visits.
         """
         legal = self.board.legal_moves()
@@ -479,11 +484,9 @@ class ChessGame(object):
             if most_visited_uci == mv:
                 use_tree_visits = True
             else:
-                # swap top visited with SF move
+                # boost top visited with SF move
                 top_count = visit_map.get(most_visited_uci, 0)
-                sf_count = visit_map.get(mv, 0)
-                visit_map[most_visited_uci] = 1 + int(sf_count*0.9)
-                visit_map[mv] = 1 + int(top_count*1.1)
+                visit_map[mv] = 1 + int(top_count*1.25)
                 use_tree_visits = True
 
         if use_tree_visits and visit_map is not None:
@@ -555,23 +558,24 @@ class ChessGame(object):
         self.examples.append((x, mask, policy, vwq, self.plies, turn))
 
     def check_for_terminal(self):
+        cfg = self.config
         reason, result = self.board.is_game_over()
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
             return True
     
         mat_diff = self.board.material_count()
-        if abs(mat_diff) >= self.config.material_diff_cutoff:
+        if abs(mat_diff) >= cfg.material_diff_cutoff:
             self.mat_adv_counter += 1
         else:
             self.mat_adv_counter = 0
     
-        if self.mat_adv_counter >= self.config.material_diff_cutoff_span:
+        if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
             self.outcome = 1.0 if mat_diff > 0 else -1.0
             return True
         
         # Syzygy probe if few pieces
-        if self.config.use_syzygy:
+        if cfg.use_syzygy:
             if self.board.piece_count() <= 5:
                 # may not work so just go as normal
                 try:
@@ -586,9 +590,43 @@ class ChessGame(object):
                     return True
                 except:
                     pass
-           
+
+        # check for draws based on eval or move limit
         hs = self.board.history_size()
-        if hs > self.config.max_game_length:
+        if hs >= self.next_eval_draw_check:
+            n_last = cfg.eval_draw_span
+            thresh_d = cfg.eval_draw_thresh
+            
+            # if we don't yet have a full window, schedule when we will
+            if len(self.examples) < n_last:
+                needed = n_last - len(self.examples)
+                self.next_eval_draw_check = hs + needed
+            else:
+                # look up n_last vwqs and assess vs draw threwshold
+                # vwq is 4th element in examples tuples
+                recent = [e[3] for e in self.examples[-n_last:]]
+                
+                # check and see if we've passed the test, if not when to check again
+                violated = False
+                violating_index = None
+                for i, r in enumerate(reversed(recent)):
+                    if abs(r) > thresh_d:
+                        violated = True
+                        violating_index = i
+                        break
+
+                # agree to draw
+                if not violated:
+                    self.outcome = 0.0
+                    return True
+                
+                # otherwise dont test again until its possible to have an eval_draw
+                else:
+                    needed = n_last - violating_index
+                    self.next_eval_draw_check = hs + needed
+        
+        # check for overal game_length limit
+        if hs > cfg.max_game_length:
             self.outcome = 0.0
             return True
         # if we made it here the game is active

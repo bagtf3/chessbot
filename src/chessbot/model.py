@@ -298,7 +298,7 @@ def res_block_layernorm(x, channels, leak=0.01, name=None):
     nm = "" if name is None else name + "_"
     conv1 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name=nm + "conv1"
+        kernel_initializer=HE, name=nm + "conv1"
     )(x)
 
     ln1 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln1")(conv1)
@@ -306,7 +306,7 @@ def res_block_layernorm(x, channels, leak=0.01, name=None):
 
     conv2 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name=nm + "conv2"
+        kernel_initializer=HE, name=nm + "conv2"
     )(act1)
 
     ln2 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln2")(conv2)
@@ -339,7 +339,7 @@ def build_conv_flat_64x67(
 
     x = layers.Conv2D(
         fl, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name="conv_init"
+        kernel_initializer=HE, name="conv_init"
     )(x)
 
     # drop BatchNorm here, rely on LayerNorm inside blocks
@@ -475,7 +475,7 @@ def squeeze_excitation(x, channels, reduction=4, name=None):
     nm = "" if name is None else name + "_"
     se = layers.GlobalAveragePooling2D(name=nm + "gap")(x)
     se = layers.Dense(channels // reduction, activation="relu",
-                      kernel_initializer="he_normal",
+                      kernel_initializer=HE,
                       name=nm + "fc1")(se)
                       
     # make last dense start as near-identity
@@ -498,7 +498,7 @@ def res_block_layernormSE(x, channels, reduction, leak=0.01, name=None):
 
     conv1 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name=nm + "conv1"
+        kernel_initializer=HE, name=nm + "conv1"
     )(x)
 
     ln1 = layers.LayerNormalization(axis=-1, name=nm + "ln1")(conv1)
@@ -506,7 +506,7 @@ def res_block_layernormSE(x, channels, reduction, leak=0.01, name=None):
 
     conv2 = layers.Conv2D(
         channels, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name=nm + "conv2"
+        kernel_initializer=HE, name=nm + "conv2"
     )(act1)
 
     ln2 = layers.LayerNormalization(axis=-1, name=nm + "ln2")(conv2)
@@ -544,7 +544,7 @@ def build_conv_flat_64x67SE(
 
     x = layers.Conv2D(
         fl, 3, padding="same", use_bias=False,
-        kernel_initializer="he_normal", name="conv_init"
+        kernel_initializer=HE, name="conv_init"
     )(x)
 
     x = layers.LayerNormalization(axis=-1, name="ln_init")(x)
@@ -581,6 +581,235 @@ def build_conv_flat_64x67SE(
         "value_out": "mse",
     }
 
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
+
+    return model, opt, loss_weights, loss_dict
+
+
+def build_conformer_64x67(
+    name,
+    d_model_embed=128,
+    vocab_size=21,
+    conv_filters=256,
+    conv_blocks=4,
+    transformer_layers=4,
+    num_heads=8,
+    ff_dim=1024,
+    dropout=0.05
+):
+    """
+    Conformer-like model: conv frontend -> transformer encoder stack ->
+    64x67 policy head + value head.
+    """
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy("mixed_float16")
+
+    de, vs = d_model_embed, vocab_size
+
+    # internal: residual conv block using LayerNorm (no BatchNorm)
+    def res_block_layernorm(x_in, channels, leak=0.01, name=None):
+        nm = "" if name is None else name + "_"
+
+        conv1 = layers.Conv2D(
+            channels, 3, padding="same", use_bias=False,
+            kernel_initializer=HE, name=nm + "conv1"
+        )(x_in)
+
+        act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(conv1)
+
+        conv2 = layers.Conv2D(
+            channels, 3, padding="same", use_bias=False,
+            kernel_initializer=HE, name=nm + "conv2"
+        )(act1)
+
+        ln2 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln2")(conv2)
+
+        out = layers.Add(name=nm + "add")([x_in, ln2])
+        out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
+        return out
+
+    # inputs / token embedding -> 2D conv feature map
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
+    token_emb = layers.Embedding(input_dim=vs, output_dim=de, name="token_emb")(enc_in)
+    x = layers.Reshape((8, 8, de), name="to_2d")(token_emb)
+
+    # small conv frontend stack using residual blocks
+    # project if embed depth != conv_filters in first block
+    if de != conv_filters:
+        x = layers.Conv2D(
+            conv_filters, 1, padding="same", use_bias=False,
+            kernel_initializer=HE, name="conv_proj")(x)
+        
+        x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
+        x = layers.LeakyReLU(alpha=0.01, name="lrelf_proj")(x)
+
+    for i in range(conv_blocks):
+        x = res_block_layernorm(x, conv_filters, leak=0.01, name=f"conv{i}")
+
+    # flatten spatial to sequence for transformer: (batch, 64, C)
+    seq = layers.Reshape((64, conv_filters), name="to_seq")(x)
+
+    pos = layers.Embedding(64, conv_filters, name="pos_emb")(
+        layers.Lambda(lambda _: tf.range(64), name="pos_idx")(enc_in)
+    )
+    pos = layers.Lambda(lambda z: tf.expand_dims(z, 0), name="pos_bcast")(pos)
+    seq = layers.Add(name="add_pos")([seq, pos])
+
+    # transformer encoder stack
+    def transformer_encoder_layer(src, layer_idx):
+        nm = f"t{layer_idx}_"
+        ln1 = layers.LayerNormalization(axis=-1, name=nm + "ln1")(src)
+        
+        attn = layers.MultiHeadAttention(
+            num_heads=num_heads, key_dim=conv_filters // num_heads,
+            name=nm + "mha")(ln1, ln1)
+
+        attn = layers.Dropout(dropout, name=nm + "attn_drop")(attn)
+        attn_out = layers.Add(name=nm + "attn_add")([src, attn])
+
+        ln2 = layers.LayerNormalization(axis=-1, name=nm + "ln2")(attn_out)
+        ff = layers.Dense(ff_dim, activation="gelu",
+                          kernel_initializer=HE, name=nm + "ff1")(ln2)
+
+        ff = layers.Dropout(dropout, name=nm + "ff_drop")(ff)
+        ff = layers.Dense(conv_filters, name=nm + "ff2")(ff)
+        ff_out = layers.Add(name=nm + "ff_add")([attn_out, ff])
+        return ff_out
+
+    t = seq
+    for i in range(transformer_layers):
+        t = transformer_encoder_layer(t, i)
+
+    # back to spatial map
+    x = layers.Reshape((8, 8, conv_filters), name="from_seq")(t)
+
+    # small conv mixer before heads
+    x = layers.Conv2D(
+        conv_filters, 1, padding="same", use_bias=False, name="conv_mix_1x1")(x)
+
+    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
+    x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
+
+    # policy head -> 64 x 67
+    policy_map = layers.Conv2D(
+        67, 1, padding="same", activation=None, name="policy_conv_67")(x)
+
+    feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
+    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(feat_64_67)
+
+    # value head
+    v = layers.Conv2D(
+        64, 3, padding="same", use_bias=False,
+        kernel_initializer=HE, name="v_conv1")(x)
+
+    v = layers.LayerNormalization(epsilon=1e-5, name="v_ln1")(v)
+    v = layers.LeakyReLU(alpha=0.01, name="v_lrelu1")(v)
+
+    # global descriptor
+    v = layers.GlobalAveragePooling2D(name="v_gap")(v)
+
+    # deeper MLP for value (extra dense layer for more capacity)
+    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
+    v = layers.Dropout(dropout, name="v_fc_drop")(v)
+    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
+
+    # final value output (float32 for numerical stability)
+    value_out = layers.Dense(
+        1, activation="tanh", dtype="float32", name="value_out")(v)
+
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
+
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+
+    loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
+
+    return model, opt, loss_weights, loss_dict
+
+
+def build_lowrank_res_stack_64x67(
+    name,
+    d_model=64,
+    vocab_size=21,
+    inner_dim=64,
+    num_blocks=6,
+    dropout=0.05,
+):
+    """
+    Low-rank residual stack over a flattened 8x8xC representation.
+    No conv, no transformer. Outputs:
+      - policy head: 64 x 67 logits (flattened)
+      - value head: scalar in [-1, 1]
+    """
+    from tensorflow.keras import mixed_precision
+    mixed_precision.set_global_policy("mixed_float16")
+
+    # inputs -> token embedding
+    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
+    tok = layers.Embedding(
+        input_dim=vocab_size, output_dim=d_model, name="token_emb"
+    )(enc_in)
+
+    # flatten to global vector: D = 64 * d_model
+    flat_dim = 64 * d_model
+    x = layers.Reshape((flat_dim,), name="to_flat")(tok)
+
+    def lowrank_res_block(x_in, inner_dim, idx, return_dim, final_add=True):
+        nm = f"lr{idx}_"
+
+        # pre-activation (keeps the skip path clean)
+        ln = layers.LayerNormalization(axis=-1, epsilon=1e-5, name=nm + "ln")(x_in)
+
+        # x = x + φ2(A * φ1(Bx))
+        h = layers.Dense(inner_dim, kernel_initializer=HE, name=nm + "fc_b")(ln)
+
+        h = layers.Activation("gelu", name=nm + "gelu1")(h)
+        h = layers.Dense(return_dim, kernel_initializer=HE, name=nm + "fc_a", )(h)
+        h = layers.Activation("gelu", name=nm + "gelu2")(h)
+        h = layers.Dropout(dropout, name=nm + "drop2")(h)
+        
+        if final_add:
+            out = layers.Add(name=nm + "add")([x_in, h])
+
+        return out
+
+    for i in range(num_blocks):
+        x = lowrank_res_block(x, inner_dim, i)
+
+    # back to per-square features: (batch, 64, d_model)
+    tok_out = layers.Reshape((64, d_model), name="from_flat")(x)
+
+    # policy head: per-square logits -> (64, 67) then flatten
+    pol = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="pol_ln")(tok_out)
+    pol = layers.Dense(67, name="pol_fc_67")(pol)
+    pol = layers.Reshape((64, 67), name="to_64_67")(pol)
+    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(pol)
+
+    # value head (no conv): per-token -> pooled -> MLP
+    v = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="v_ln0")(tok_out)
+    v = layers.Dense(64, activation=tf.nn.gelu, kernel_initializer=HE, name="v_fc0")(v)
+    v = layers.GlobalAveragePooling1D(name="v_gap")(v)
+    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
+    v = layers.Dropout(dropout, name="v_fc_drop")(v)
+    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
+
+    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
+
+    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
+
+    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+
+    loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
 

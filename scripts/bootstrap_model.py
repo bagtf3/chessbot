@@ -1,29 +1,62 @@
 import os, pickle
 from chessbot import MODEL_DIR, SP_DIR
-from chessbot.model import load_model
 from chessbot.utils import batch_policy_metrics, print_validation, format_time
 from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import random
 
-import sys, subprocess
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+from chessbot.model import build_lowrank_res_stack_64x67
+from chessbot.model import build_conformer_64x67
 
-bl = 12
-fl = 296
-MODEL_NAME = f'conv64_{bl}x{fl}SE'
-from chessbot.model import build_conv_flat_64x67SE
-model, opt, loss_weights, loss_dict = build_conv_flat_64x67SE(
-    d_model_embed=128, vocab_size=21, filters=fl,
-    n_blocks=bl, name=MODEL_NAME
-)
+from chessbot import MODEL_DIR, SP_DIR
 
-model.summary()
-model.save(MODEL_DIR + f"{MODEL_NAME}_init.h5")
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from tensorflow import keras
 
-run_tag = "conv_12x296SE"
+def load_model(model_loc):
+    model = keras.models.load_model(model_loc)
+    return model
+
+# inner = 256
+# nb = 16
+# MODEL_NAME = f'lowrank_{nb}x{inner}'
+
+# model, opt, loss_weights, loss_dict = build_lowrank_res_stack_64x67(
+#     MODEL_NAME,
+#     d_model=64,
+#     vocab_size=21,
+#     inner_dim=inner,
+#     num_blocks=nb,
+#     dropout=0.025
+# )
+
+# bl = 8
+# fl = 256
+# tl = 6
+# MODEL_NAME = f'conformer_{bl}x{fl}x{tl}'
+
+# model, opt, loss_weights, loss_dict = build_conformer_64x67(
+#     MODEL_NAME,
+#     d_model_embed=128,
+#     vocab_size=21,
+#     conv_filters=fl,
+#     conv_blocks=bl,
+#     transformer_layers=tl,
+#     num_heads=8,
+#     ff_dim=768,
+#     dropout=0.025
+# )
+
+# model.summary()
+# model.save(MODEL_DIR + f"{MODEL_NAME}_init.h5")
+
+model_file_init = 'C:/Users/Bryan/Data/chessbot_data/models/conv_lr_mha_642x256x3_init.h5'
+model = load_model(model_file_init)
+run_tag = "conv_lr_mha_642x256x3"
 run_dir = os.path.join(SP_DIR, run_tag)
 model_file = os.path.join(run_dir, run_tag + "_model.h5")
 progress_file = os.path.join(run_dir, "eval_progress.csv")
@@ -34,17 +67,25 @@ epoch_time_list = []
 eps = 1e-12
 big_neg = -1e6
 
-run_tags = [
-    'conv_1000_selfplay_phase3','conv_1000_selfplay_phase4',
-    "conv_net_flat_12blocks_run0",
-    "conv_net_flat_run1", "conv_net_flat_run2", "conv_12x296_bootstrapped"
-]
+run_tags = [rt for rt in os.listdir(SP_DIR) if rt != run_tag]
+all_games = []
+df_list = []
 
+def check(a):
+    if isinstance(a['json_file'], str):
+        return os.path.exists(a['json_file'])
+    return False
+
+if not os.path.exists(model_file):
+    model.save(model_file)
+#%%
 all_games = []
 df_list = []
 for rt in run_tags:
     rd = os.path.join(SP_DIR, rt)
-    all_games += load_game_index(rd)
+    ag = load_game_index(rd)
+    ag = [a for a in ag if check(a)]
+    all_games += ag
 
     pkl = os.path.join(rd, ANALYZE_PKL)
     with open(pkl, "rb") as f:
@@ -63,32 +104,21 @@ for rt in run_tags:
     del df_all
     del df_means
 
-all_games = [a for a in all_games if a['json_file'] is not None]
-def check(a):
-    if isinstance(a['json_file'], str):
-        return os.path.exists(a['json_file'])
-    return False
-
-all_games = [a for a in all_games if check(a)]
-
 df_trim = pd.concat(df_list).drop_duplicates(['game_id']).sort_values("ts")
+df_trim = df_trim.query("scenario != 'random_endgame'").copy()
 
-meta = pd.DataFrame(all_games)
-meta = meta.query("plies >= 10")
-
-#%%
-if 'overall_cpl' in meta.columns:
+meta = pd.DataFrame(all_games).drop_duplicates("game_id")
+if "overall_cpl" in meta.columns:
     del meta['overall_cpl']
     
+meta = meta.query("plies >= 10")
 meta = meta.merge(df_trim[['game_id', 'run_tag', 'overall_cpl']], on='game_id')
-meta = meta.query("overall_cpl <= 35")
-meta = meta.sort_values("overall_cpl", ascending=False)
+meta = meta.query("overall_cpl <= 40")
 
 training_games = meta['json_file'].to_list()
 print(len(training_games))
-#random.shuffle(training_games)
-under25 = meta.query("overall_cpl <= 25")
-#%%
+random.shuffle(training_games)
+
 
 def moving_average_pd(arr, window=15):
     s = pd.Series(arr)
@@ -173,7 +203,7 @@ batch_size = 512
 epoch_size = 20*batch_size
 buffer_size = 6 * epoch_size
 epoch, idx = 0, 0
-MAX_EPOCH = 300
+MAX_EPOCH = 350
 draw_rate = 0.5
 begin = time.time()
 loss_weights = {"policy_logits": 2.0, "value_out": 2.0}
@@ -187,18 +217,6 @@ idx = top_up_sliding_buffer(
 )
 
 
-def run_selfplay(model_loc, replace=False):
-    if replace:
-        if os.path.exists(model_loc):
-            os.remove(model_loc)
-        
-    cmd = [sys.executable, "-u", "looper.py", "conv_12x296SE"]
-    _ = subprocess.run(cmd, check=False)
-    model = load_model(model_loc)
-    return model
-
-#model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
-#model = run_selfplay(model_file)
 eval_df = None
 if os.path.exists(progress_file):
     eval_df = pd.read_csv(progress_file)
@@ -209,17 +227,18 @@ while epoch <= MAX_EPOCH:
     
     # if we run out of the main buffer, re train on the best games randomly
     if idx == len(training_games):
+        under25 = meta.query("overall_cpl <= 25")
         training_games = under25['json_file'].to_list()
         random.shuffle(training_games)
         idx = 0
     
     if epoch > 50:
         loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    if epoch > 200:
+    if epoch > 150:
         loss_weights = {"policy_logits": 0.5, "value_out": 0.5}
-    if epoch > 250:
+    if epoch > 225:
         loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
-    if epoch > 300:
+    if epoch > 250:
         loss_weights = {"policy_logits": 0.12, "value_out": 0.12}
         
     epoch_start = time.time()
@@ -291,9 +310,10 @@ while epoch <= MAX_EPOCH:
         print_metrics = {"value_mse": value_mse, "value_corr": value_corr}
         print_metrics.update(policy_stats)
         print_validation(epoch, print_metrics)
-            
-        hide_first = max(int(0.1 * epoch), 5)
-        ma_window = min(max(3, int(epoch * 0.2)), 15)
+        
+        retrains = eval_df.tail(1)['model_epoch'].item()
+        hide_first = max(int(0.1 * retrains), 5)
+        ma_window = min(max(3, int(retrains * 0.2)), 15)
         if ma_window % 2 == 0:
             ma_window += 1
     
@@ -390,9 +410,8 @@ while epoch <= MAX_EPOCH:
     print()
     if (epoch >= 100) & (epoch % 25 == 0):    
         model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
-        #del model
-        #gc.collect()
-        #model = run_selfplay(model_file, replace=True)
+        model.save(model_file)
 
 # when done
 model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_final.h5")
+model.save(model_file)

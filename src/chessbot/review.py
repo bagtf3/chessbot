@@ -313,7 +313,7 @@ class GameViewer:
         PUCT = Qrel + cPUCT*U
         print(
             f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q={Q:+.3f} Q_ema={Q_ema:+.3f}, P={P:.3f} U={U:+.3f} PUCT={PUCT:+.3f}"
+            f"Q={Q:+.3f} Q_ema={Q_ema:+.3f}, P={P:.3f} PUCT={PUCT:+.3f}"
             f"{marker}{rank_str}"
         )
     
@@ -593,14 +593,14 @@ class GameViewer:
                 # legal moves and synthetic visits
                 visits = make_fake_visits(move_played, lms, ratio_best=51)
 
-            check_boost = kwargs.get("check_boost", 0)
-            capture_boost = kwargs.get("capture_boost", 0)
-            if check_boost or capture_boost:
-                for i, (move, v) in enumerate(visits):
-                    if rb.gives_check(move):
-                        visits[i][1] += check_boost
-                    if rb.is_capture(move):
-                        visits[i][1] += capture_boost
+            # check_boost = kwargs.get("check_boost", 0)
+            # capture_boost = kwargs.get("capture_boost", 0)
+            # if check_boost or capture_boost:
+            #     for i, (move, v) in enumerate(visits):
+            #         if rb.gives_check(move):
+            #             visits[i][1] += check_boost
+            #         if rb.is_capture(move):
+            #             visits[i][1] += capture_boost
 
             counts = np.array([x[1] for x in visits], dtype=np.float32)
             s = counts.sum()
@@ -1067,7 +1067,7 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
     """
     cm: list of {'uci': ..., 'visits': ...}
     Ensure every legal move in lms appears (min 1) and swap visits
-    for best and played with 10% bump. This stabilizes training.
+    for best and played with 30% bump. This stabilizes training.
     Return list of [uci, int_visits] sorted desc.
     """
     # build dict of existing counts (min 1)
@@ -1086,9 +1086,9 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
     # compute old max
     old_max = max(d.values()) if d else 1
 
-    # adjust by swapping visits between played and best with 10% bump
-    d[played_mv] = int(np.ceil(0.9*d[best_mv]))
-    d[best_mv] = int(np.ceil(1.1*old_max))
+    # adjust by swapping visits between played and best with 30% bump
+    d[played_mv] = int(np.ceil(0.7*d[best_mv]))
+    d[best_mv] = int(np.ceil(1.3*old_max))
 
     # build sorted list
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)

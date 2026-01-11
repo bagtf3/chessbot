@@ -3,7 +3,6 @@ import psutil
 import uuid
 
 import pickle
-import math
 
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
@@ -18,22 +17,25 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.utils import score_cp_relative, score_cp_white_pov, rnd, calc_entropy
+from chessbot.config import Config
+from chessbot.utils import (
+    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
+    calc_entropy, cp_to_value_tanh, sf_eval
+)
 
-
-BLUNDER_CP = 60
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-ANALYZE_BATCH = 30
-
-# default analysis params
-DEPTH = 12
-EQUIV_RANGE = 10
 
 # stops the post hoc server
 POST_HOC_STOP = False
-
 PH = "[post hoc]"
+
+# default analysis params
+POLL_INTERVAL = 20
+BLUNDER_CP = 150
+ANALYZE_BATCH = 30
+DEPTH = 12
+EQUIV_RANGE = 30
 
 def post_hoc_signal_handler(signum, frame):
     global POST_HOC_STOP
@@ -71,16 +73,19 @@ class GameViewer:
         self.reset()
 
     def reset(self):
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         self.ply = 0  # 0 = before first move
 
     def goto(self, ply):
         ply = max(0, min(ply, len(self.moves_uci)))
-        self.board = chess.Board(self.start_fen)
+        self.board = Board(self.start_fen)
         for u in self.moves_uci[:ply]:
             self.board.push_uci(u)
         self.ply = ply
         return self
+    
+    def turn(self):
+        return self.board.side_to_move() == 'w'
     
     def sf_row_for_ply(self, ply):
         if (not self._sf_by_ply) or (self.sf_rows is None):
@@ -93,12 +98,12 @@ class GameViewer:
     def run_stockfish_topk(self, depth=16, k=3):
         """
         Return list[(uci, san, cp_white_pov, pv)] for top-k moves.
-        Let exceptions propagate so we see stack traces if SF fails.
         """
         out = []
         limit = chess.engine.Limit(depth=depth, time=10.0)
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            infos = eng.analyse(self.board, limit=limit, multipv=k)
+            sf_board = chess.Board(self.board.fen())
+            infos = eng.analyse(sf_board, limit=limit, multipv=k)
             if not isinstance(infos, list):
                 infos = [infos]
             for info in infos:
@@ -106,7 +111,7 @@ class GameViewer:
                 move_uci = pv[0].uci() if pv else None
                 san = None
                 if move_uci:
-                    san = self.board.san(chess.Move.from_uci(move_uci))
+                    san = self.board.san(move_uci)
                 score_obj = info.get("score")
                 cp = None
                 if score_obj is not None:
@@ -120,7 +125,7 @@ class GameViewer:
           - 'sf' -> depth 16
           - 'sfNN' -> depth NN (e.g. sf20 -> depth 20)
         Prints SF top-3 moves (white-pov cp at depth) and if the chosen move
-        isn't in top-3, prints its cp as well (forced evaluation).
+        isn't in top-3, prints its cp as well
         """
         # parse token
         if token == "sf":
@@ -149,14 +154,15 @@ class GameViewer:
         # check the move about to be played (selected from moves_uci[self.ply])
         if self.ply < len(self.moves_uci):
             upcoming_uci = self.moves_uci[self.ply]
-            upcoming_san = self.board.san(chess.Move.from_uci(upcoming_uci))
+            upcoming_san = self.board.san(upcoming_uci)
             if upcoming_uci not in top_ucis:
                 # get forced eval for the played move
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+                    sf_board = chess.Board(self.board.fen())
                     info = eng.analyse(
-                        self.board, limit=limit,
+                        sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
                     )
                     
@@ -201,10 +207,10 @@ class GameViewer:
     def prev(self):
         if self.ply > 0:
             self.ply -= 1
-            self.board.pop()
+            self.board.unmake()
     
     def who_moved(self):
-        mover = "White" if self.board.turn == chess.WHITE else "Black"
+        mover = "White" if self.turn() else "Black"
         
         vs_stockfish = self.log.get("vs_stockfish", False)
         if not vs_stockfish:
@@ -214,34 +220,118 @@ class GameViewer:
         if sf_color is None:
             return f"{mover} (MCTS)"
         
-        if (self.board.turn and sf_color) or \
-           (not self.board.turn and not sf_color):
+        if (self.turn() and sf_color) or \
+           (not self.turn() and not sf_color):
             return f"{mover} (stockfish)"
         return f"{mover} (MCTS)"
 
     def show_board(self, flipped=False):
         clear_output(wait=True)
-        display(SVG(chess.svg.board(board=self.board, flipped=flipped)))
+        chess_board = chess.Board(self.board.fen())
+        display(SVG(chess.svg.board(board=chess_board, flipped=flipped)))
 
+    def node_who_chosen(self):
+        """ conveniently return node, who move, what move was chosen """
+        if self.ply >= len(self.moves_uci):
+            return None, None, None
+
+        chosen = self.moves_uci[self.ply]
+
+        # very old games use the uci to index
+        node = self.tree_data.get(chosen) or {}
+        if not node:
+            node = self.tree_data.get(str(self.ply))
+
+        who = self.who_moved()
+
+        return node, who, chosen        
+
+    def show_pv(self, min_vis=1):
+        """
+        Print principal variation recorded in the tree data for the current ply.
+        Print all PV moves (subject to min_vis), marking with ' *' those moves
+        that were actually played in the game at the corresponding ply.
+        """
+        if self.ply >= len(self.moves_uci):
+            print("End of game.")
+            return
+
+        node, who, chosen = self.node_who_chosen()
+
+        if not node:
+            print("No PV available for this node.")
+            return
+
+        pv = node.get("pv") or []
+        if not pv:
+            print("No PV recorded.")
+            return
+
+        board_tmp = chess.Board(self.board.fen())
+        rows = []
+        for i, step in enumerate(pv):
+            visits = int(step.get("visits", 0))
+            if visits < min_vis:
+                break
+            uci = step.get("uci")
+            if not uci:
+                break
+
+            idx = self.ply + i
+            played = (idx < len(self.moves_uci) and self.moves_uci[idx] == uci)
+
+            san = board_tmp.san(chess.Move.from_uci(uci))
+            p = step.get("P", 0.0)
+            q = step.get("Q", 0.0)
+
+            rows.append((i + 1, san, uci, visits, float(p), float(q), played))
+            board_tmp.push_uci(uci)
+
+        if not rows:
+            print(f"No PV moves meet min_vis={min_vis}")
+            return
+
+        san_w = max(8, max(len(r[1]) for r in rows))
+        uci_w = max(6, max(len(r[2]) for r in rows))
+
+        for no, san, uci, visits, p, q, played in rows:
+            star = " *" if played else ""
+            line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
+                    f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
+            print(line)
+    
+    def print_row(self, c, mark=False, show_rank=False, rank_val=None):
+        san = self.board.san(c.get("uci", ""))
+        marker = "  <- SF" if mark else ""
+        rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
+        Q = c.get('Q',0)
+        Q_ema = c.get("Q_ema", 0)
+        P = c.get('P',0)
+        U = c.get('U',0)
+        cPUCT = self.log.get('c_puct', 1.5)
+        Qrel = Q if self.board.side_to_move() == 'w' else -1*Q
+        PUCT = Qrel + cPUCT*U
+        print(
+            f"   {san:<6} visits={c.get('visits',0):<5} "
+            f"Q={Q:+.3f} Q_ema={Q_ema:+.3f}, P={P:.3f} PUCT={PUCT:+.3f}"
+            f"{marker}{rank_str}"
+        )
+    
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
             print("End of game.")
             return
 
-        who = self.who_moved()
-        chosen = self.moves_uci[self.ply]
+        node, who, chosen = self.node_who_chosen()
+
         try:
-            chosen_san = self.board.san(chess.Move.from_uci(chosen))
+            chosen_san = self.board.san(chosen)
         except Exception:
             chosen_san = "?"
 
         print()
         print(f"Ply {self.ply+1}: {who} about to play {chosen_san}")
         print("=" * 60)
-
-        node = self.tree_data.get(chosen) or {}
-        if not node:
-            node = self.tree_data.get(str(self.ply))
 
         if node is None:
             print("  (no candidate_moves in log)")
@@ -280,27 +370,17 @@ class GameViewer:
                 sf_idx = i
                 break
 
-        def print_row(c, mark=False, show_rank=False, rank_val=None):
-            san = self.board.san(chess.Move.from_uci(c.get("uci", "")))
-            marker = "  <- SF" if mark else ""
-            rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
-            print(
-                f"   {san:<6} visits={c.get('visits',0):<5} "
-                f"Q={c.get('Q',0):+.3f} P={c.get('P',0):.3f} U={c.get('U',0):+.3f}"
-                f"{marker}{rank_str}"
-            )
-
         shown_ucis = set()
         # top-N: never show ranks; just mark if SF move is in top-N
         for i, c in enumerate(cands_sorted[:top_n]):
-            print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
+            self.print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
             shown_ucis.add(c.get("uci"))
 
         # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
         if is_sf_turn and sf_idx is not None:
             if cands_sorted[sf_idx].get("uci") not in shown_ucis:
                 print("   ...")
-                print_row(
+                self.print_row(
                     cands_sorted[sf_idx], mark=True,
                     show_rank=True, rank_val=sf_idx + 1,
                 )
@@ -312,7 +392,7 @@ class GameViewer:
         # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
-            stm_white = (self.board.turn == chess.WHITE)
+            stm_white = self.turn()
 
             best_uci   = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
@@ -336,7 +416,7 @@ class GameViewer:
             matched = (best_uci == played_uci) if best_uci and played_uci else False
 
             def to_san(uci):
-                return self.board.san(chess.Move.from_uci(uci))
+                return self.board.san(uci)
 
             best_san   = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"
@@ -355,15 +435,42 @@ class GameViewer:
                 print("SF:", "  ".join(parts))
         print("=" * 60)
 
+    def show_visits(self, uci_or_san):
+        node, who, chosen = self.node_who_chosen()
+        if node is None:
+            print(f"No visit info available for {uci_or_san}")
+            return
+
+        cands = node.get("candidate_moves") or []
+        scands = sorted(cands, key=lambda x: x['visits'], reverse=True)
+        move = {}
+        rank = 0
+        for c in scands:
+            rank += 1
+            if uci_or_san in [c['uci'], self.board.san(c['uci'])]:
+                move = c
+                break
+        
+        if not move:
+            print(f"No visit info available for {uci_or_san}")
+            return
+        
+        print(f"  === Showing visit info for {uci_or_san} ===")
+        self.print_row(move)
+        print(f"   Rank: {rank}\tShare: {100*move['visits']/node['sims']:.3f}%")
+
     def show_options(self):
         # concise CLI help for replay mode commands
         print("Commands:")
         print("  [Enter] / Space      forward one move")
-        print("  b, back              previous move")
+        print("  b<N>                 go back N moves, e.g. b5 goes back 5 moves")
+        print("  b, back              previous move (same as b1)")
         print("  q, quit, exit        quit replay")
         print("  o, options, help     show this help text")
         print("  sf                   stockfish overlay (uses default depth)")
         print("  sf<D>                stockfish eval to depth D, e.g. sf12")
+        print("  visits <move>        show MCTS visits for specific move")
+        print("  visits <N>           show visit info for N top moves")
         print("  pv                   show principal variation (min_vis=1)")
         print("  pv<N>                show principal variation filtered by")
         print("                       minimum visits, e.g. pv8")
@@ -381,31 +488,165 @@ class GameViewer:
                 self.show_moves()
                 shown = True
             cmd = input("[Enter]=fwd, b=back, q=quit, sf=stockfish eval, o=options > ")
-            cmd = cmd.strip().lower()
+            cmd = cmd.strip()
+            cmd_cased = cmd
+            cmd = cmd.lower()
             if cmd in ("q", "quit", "exit"):
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
                 self.show_options()
-            elif cmd in ("b", "back"):
-                shown = False
-                self.prev()
-            # elif cmd.startswith("pv"):
-            #     # pv or pv8
-            #     if cmd == "pv":
-            #         self.show_pv(min_vis=1)
-            #     else:
-            #         try:
-            #             n = int(cmd[2:])  # e.g. pv8
-            #             self.show_pv(min_vis=n)
-            #         except Exception:
-            #             self.show_pv(min_vis=1)
-            
+            elif cmd.startswith("pv"):
+                # pv or pvN (e.g. pv8)
+                if cmd == "pv":
+                    n = 1
+                else:
+                    s = cmd[2:]
+                    n = int(s) if s.isdigit() else 1
+                self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
                 self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
+            elif cmd.startswith("b"):
+                # b, back, b5, b 5 all supported
+                s = cmd[1:].strip()
+                if not s:
+                    n = 1
+                elif s.isdigit():
+                    n = int(s)
+                else:
+                    # fallback to single step back
+                    n = 1
+                # use goto to rebuild board safely and clamp bounds
+                target = max(0, self.ply - n)
+                shown = False
+                self.goto(target)
+            elif cmd.startswith("visits"):
+                split = [c.strip() for c in cmd.split(" ") if c.strip()]
+                # check to see if a int was given to show deeper visit info
+                if split[-1].isdigit():
+                    n = int(split[-1])
+                    self.show_moves(top_n=n)
+                else:
+                    move_str = cmd_cased.replace(" ", "").replace("visits", "")
+                    self.show_visits(move_str)
             else:
                 # default: forward one move
                 shown = False
                 self.next()
+
+    def generate_training_data(self, sf_skip=False, **kwargs):
+        """
+        Walk the game using self.next() and produce Xerces training examples.
+        If sf_skip is True, plies played by Stockfish (per who_moved()) are
+        skipped.
+        """
+        # X, Mask, Pi, result (Z), Vwq, moves Remaining
+        X, M, P, Z, V, R = [], [], [], [], [], []
+        result = self.result
+
+        # start from initial position
+        self.reset()
+
+        total_plies = len(self.moves_uci)
+        while self.ply < total_plies:
+            # detect whether the side to move is Stockfish
+            move_played = self.moves_uci[self.ply]
+            mover = self.who_moved().lower()
+            is_white_move = "white" in mover
+            is_sf_move = "stockfish" in mover
+
+            if sf_skip and is_sf_move:
+                # advance and skip this ply
+                self.next()
+                continue
+
+            rb = self.board
+            lms = rb.legal_moves()
+            
+            node = self.tree_data.get(str(self.ply), {})
+            if not node:
+                self.next()
+                continue
+            
+            cms = node.get("candidate_moves", {})
+            if cms:
+                visits = [[x['uci'], x['visits']] for x in cms]
+                visited = set([x[0] for x in visits])
+                
+                # add in all legal moves if missing
+                for move in [l for l in lms if l not in visited]:
+                    visited.append([[move, 1]])
+                    
+                visits = sorted(visits, key=lambda x: x[1], reverse=True)
+                
+                if is_sf_move and visits[0][0] != move_played:
+                    if sum([x[1] for x in visits]) > 100:
+                        most_visited = visits[0][0]
+                        for v in visits:
+                            if v[0] == move_played:
+                                v[0] = most_visited
+                                break
+                        visits[0][0] = move_played
+                    else:
+                        visits = make_fake_visits(move_played, lms, ratio_best=51)
+            
+            else:
+                # legal moves and synthetic visits
+                visits = make_fake_visits(move_played, lms, ratio_best=51)
+
+            # check_boost = kwargs.get("check_boost", 0)
+            # capture_boost = kwargs.get("capture_boost", 0)
+            # if check_boost or capture_boost:
+            #     for i, (move, v) in enumerate(visits):
+            #         if rb.gives_check(move):
+            #             visits[i][1] += check_boost
+            #         if rb.is_capture(move):
+            #             visits[i][1] += capture_boost
+
+            counts = np.array([x[1] for x in visits], dtype=np.float32)
+            s = counts.sum()
+            if s > 0.0:
+                pi = counts / s
+            else:
+                # uniform fallback over legal moves
+                n_l = len(lms)
+                if n_l == 0:
+                    self.next()
+                    continue
+                pi = np.ones(n_l, dtype=np.float32) / float(n_l)
+            
+            # map legal moves -> flat xerces indices and build policy
+            
+            visited = [x[0] for x in visits]
+            indices = rb.moves_to_indices(visited)
+            policy = np.zeros(64 * 67, dtype=np.float32)
+            for idx, prob in zip(indices, pi):
+                policy[idx] += prob
+
+            # inputs and mask
+            x = rb.encode_64_tokens()
+            mask = rb.legal_move_mask()
+
+            # value target 0.5*Z + 0.5*vwq
+            vwq = node.get("visit_weighted_Q")
+            vwq_stm = vwq if is_white_move else -vwq
+            if result > 0:
+                z = 1 if is_white_move else -1
+            elif result < 0:
+                z = -1 if is_white_move else 1
+            else:
+                z = 0
+            
+            X.append(x)
+            M.append(mask)
+            P.append(policy)
+            Z.append(z)
+            V.append(vwq_stm)
+            R.append(len(self.moves_uci) - int(self.ply))
+
+            # advance to next ply using existing helper
+            self.next()
+
+        return X, M, P, Z, V, R
 
 
 def load_json(path):
@@ -437,7 +678,7 @@ def analyze_with_rank(move, board, limit, eng):
     best = [t for t in top3 if t['multipv'] == 1][0]
     
     best_move = best['pv'][0]
-    best_cp   = score_cp_relative(best["score"])
+    best_cp   = score_cp_stm_pov(best["score"])
     best_abs  = score_cp_white_pov(best["score"], clipped=False)
     
     # default
@@ -466,7 +707,7 @@ def analyze_with_rank(move, board, limit, eng):
         played = played[0]
         in_top3 = True
     
-    played_cp = score_cp_relative(played['score'])
+    played_cp = score_cp_stm_pov(played['score'])
     played_abs = score_cp_white_pov(played["score"], clipped=False)
     delta = best_cp - played_cp
 
@@ -499,7 +740,9 @@ def analyze_with_rank(move, board, limit, eng):
     return res
 
 
-def analyze_with_sf_core(game_data, eng, depth=DEPTH):
+def analyze_with_sf_core(game_data, eng, depth=None):
+    if depth is None:
+        depth = DEPTH
     limit = chess.engine.Limit(depth=depth)
     board = chess.Board(game_data['start_fen'])
 
@@ -579,11 +822,18 @@ def analyze_with_sf_core(game_data, eng, depth=DEPTH):
     return out
 
 ## post hoc server
-def save_pickle_atomic(obj, path):
-    tmp = str(path) + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, str(path))
+def save_pickle_atomic(obj, path, tries=0):
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, str(path))
+    except Exception as e:
+        if tries <= 5:
+            time.sleep(0.5)
+            save_pickle_atomic(obj, path, tries=tries+1)
+        else:
+            raise e
 
 
 def safe_mean(arr):
@@ -800,23 +1050,49 @@ def save_analysis_chunk_simple(run_dir, batch):
     return outp, cpl, bmr, top3
 
 
-def cp_to_value(cp, mid_cp=400.0):
-    # scale so tanh(k * mid_cp) == 0.5  =>  k = atanh(0.5) / mid_cp
-    k = math.atanh(0.5) / mid_cp
-    return math.tanh(k * cp)
-
-
-def make_fake_visits(mv, lms, ratio_best=50):
+def make_fake_visits(mv, lms, ratio_best=60):
     visits = [[mv, int(ratio_best)]]
     
     # may only be 1 legal move
-    if len(lms) == 1:
+    if len(lms) < 2:
         return visits
     
-    ratio_not_best = 100-ratio_best
-    sup_optimal = max(1, int(ratio_not_best / (len(lms) - 1)))
-    visits += [[m, int(sup_optimal)] for m in lms if m != mv]
+    sub_optimal = 100 - ratio_best
+    bad_visits = 1 + min(5, int(sub_optimal / len(lms)))
+    visits += [[m, bad_visits] for m in lms if m != mv]
     return visits
+
+
+def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
+    """
+    cm: list of {'uci': ..., 'visits': ...}
+    Ensure every legal move in lms appears (min 1) and swap visits
+    for best and played with 30% bump. This stabilizes training.
+    Return list of [uci, int_visits] sorted desc.
+    """
+    # build dict of existing counts (min 1)
+    d = {}
+    for c in cm:
+        u = c.get('uci')
+        v = int(c.get('visits', 1))
+        if u:
+            d[u] = max(1, v)
+
+    # ensure all legal moves exist with min 1
+    for m in lms:
+        if m not in d:
+            d[m] = 1
+
+    # compute old max
+    old_max = max(d.values()) if d else 1
+
+    # adjust by swapping visits between played and best with 30% bump
+    d[played_mv] = int(np.ceil(0.7*d[best_mv]))
+    d[best_mv] = int(np.ceil(1.3*old_max))
+
+    # build sorted list
+    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+    return [[u, int(v)] for u, v in items]
 
 
 def make_training_sample(b, v, visits):
@@ -824,60 +1100,28 @@ def make_training_sample(b, v, visits):
     ucis   = [x[0] for x in visits]
     counts = np.array([x[1] for x in visits], dtype=np.float32)
     s = counts.sum()
-    pi = (counts / s) if s > 0.0 else None
+    pi = (counts / s) if s > 0.0 else np.zeros_like(counts)
     
-    # labels per-legal
-    fr, to, piece, promo = b.moves_to_labels(ucis=ucis)
+    # get indices from C++
+    indices = b.moves_to_indices(ucis)  # list of ints (0..4288)
+    policy = np.zeros(64 * 67, dtype=np.float32)
 
-    # allocate heads
-    from_m = np.zeros(64, dtype=np.float32)
-    to_m   = np.zeros(64, dtype=np.float32)
-    pc_m   = np.zeros(6, dtype=np.float32)
-    pr_m   = np.zeros(4, dtype=np.float32)
+    # accumulate probs into flattened policy
+    for idx, p in zip(indices, pi):
+        policy[idx] += p
 
-    # accumulate probs
-    for i, p in enumerate(pi):
-        from_m[fr[i]] += p
-        to_m[to[i]]   += p
-        pc_m[piece[i]]+= p
-        pr_m[promo[i]]+= p
+    x = b.encode_64_tokens()
+    mask = b.legal_move_mask()
 
-    # snapshot inputs and push example
-    x = b.stacked_planes(5)
-    policy_heads = {"from": from_m, "to": to_m, "piece": pc_m, "promo": pr_m}
-
-    # needs to match looper's training_queue: x, heads, Z (outcome), value, taper
-    tup = (x, policy_heads, 0, v, None)
+    # needs to match looper's training_queue
+    # (x, mask, policy, z_stm, vwq, z_tapered)
+    tup = (x, mask, policy, 0, v, 0)
     return tup
 
-def sf_eval(b, engine=None):
-    if not isinstance(b, chess.Board):
-        b = chess.Board(b.fen())
-        
-    if engine is None:
-        new_eng = True
-        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        engine.configure({"Threads": 1, "Hash": 128})
 
-    else:
-        new_eng = False
-
-    try:
-        info = engine.analyse(
-            b, limit=chess.engine.Limit(depth=DEPTH), info=chess.engine.INFO_ALL
-        )
-        
-        score = score_cp_white_pov(info['score'])
-        val = cp_to_value(score)
-        best_move = info['pv'][0]
-    except Exception as e:
-        print(e)
-
-    finally:
-        if new_eng:
-            engine.quit()
-    
-    return val, str(best_move)
+def sfe(b, engine):
+    """ Quick SF eval wrapper """
+    return sf_eval(b, score_fn=score_to_value_stm_pov, depth=DEPTH, engine=engine)
 
 
 def mine_additional_training_data(analysis_out, game_data, engine=None):
@@ -897,28 +1141,12 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
             # we already have these, dont duplicate
             b.push_uci(mv)
             continue
-        
+
         lms = b.legal_moves()
         # terminals are handled elsewhere
         if not lms:
             break
-        
-        tr = tree_data.get(i, tree_data.get(str(i), {}))
-        cm = tr.get('candidate_moves', [])
-        
-        if cm:
-            visits = [[c['uci'], c['visits']] for c in cm]
-            visits = sorted(visits, key=lambda x: x[1], reverse=True)
-        
-        else:
-            # make up fake visits if we dont have any
-            visits = make_fake_visits(mv, lms, ratio_best=50)
-        
-        # if visits dont look right, skip
-        if sum([v[1] for v in visits]) <= 0:
-            b.push_uci(mv)
-            continue
-            
+
         # find the df row associated to this move
         row = df.query("played_move == @mv")
         if len(row) > 1:
@@ -926,60 +1154,40 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
         if len(row) == 0:
             row = df.loc[df.move_num == str(i)].query("played_move == @mv")
         if len(row) == 0:
+            b.push_uci(mv)
             continue
-        
-        # happy path, not a blunder
+
+        # happy path, not a blunder, no action
         if row['delta'].item() < BLUNDER_CP:
-            v = cp_to_value(row['played_absolute'].item())
-            ts = make_training_sample(b, v, visits)
-            training_data.append(ts)
             b.push_uci(mv)
-        
+            continue
+
+        # if we are here, the move was a blunder
+        best_v = cp_to_value_tanh(row['best_cp'].item())
+        best_mv = row['best_move'].item()
+
+        tr = tree_data.get(i, tree_data.get(str(i), {}))
+        cm = tr.get('candidate_moves', [])
+
         # if a blunder, dont use actual visits (theyre wrong)
+        if cm:
+            best_visits = adjust_visits_from_cm(cm, mv, best_mv, lms)
         else:
-            best_v = cp_to_value(row['best_absolute'].item())
-            best_mv = row['best_move'].item()
             best_visits = make_fake_visits(best_mv, lms)
-            ts_best = make_training_sample(b, best_v, best_visits)
-            training_data.append(ts_best)
-            
-            # furthermore, show the best continuation
-            b2 = b.clone()
-            b2.push_uci(best_mv)
-            cont_moves = 1
-            while cont_moves < 2 :
-                lms2 = b2.legal_moves()
-                if not lms2:
-                    break
-                cont_val, cont_best = sf_eval(b2, engine=engine)
-                cont_visits = make_fake_visits(cont_best, lms2)
-                cont_ts = make_training_sample(b2, cont_val, cont_visits)
-                training_data.append(cont_ts)
-                b2.push_uci(cont_best)        
-                cont_moves += 1
-            
-            # and the values of its PV to learn those positions are bad
-            pv = tr.get('pv', [])
-            # if no PV, just move on
-            if not pv:
-                b.push_uci(mv)
-                continue
-            
-            # run the 2 next PV moves
-            b2 = b.clone()
-            for m in pv[:3]:
-                b2.push_uci(m['uci'])
-                lms2 = b2.legal_moves()
-                if not lms2:
-                    break
-                
-                pv_val, pv_best = sf_eval(b2, engine=engine)
-                pv_visits = make_fake_visits(pv_best, lms2)
-                pv_ts = make_training_sample(b2, pv_val, pv_visits)
-                training_data.append(pv_ts)
-            
-            # push to move and let the loop roll over
+
+        # sanity check: best_visits must exist and sum to > 0
+        if not best_visits or sum([v[1] for v in best_visits]) <= 0:
+            print("[blunder mining] visits invalid or sum <= 0; skipping example",
+                  "move_idx=", i, "played=", mv, "best=", best_mv)
             b.push_uci(mv)
+            continue
+
+        # make training sample and append
+        ts_best = make_training_sample(b, best_v, best_visits)
+        training_data.append(ts_best)
+
+        # push to move and let the loop roll over
+        b.push_uci(mv)
 
     return training_data
 
@@ -987,10 +1195,13 @@ def mine_additional_training_data(analysis_out, game_data, engine=None):
 def report_unprocessed(entries, seen_games):
     unproc = sum([1 for e in entries if e.get('game_id') not in seen_games])
     if unproc:
-        print(f"{PH} {unproc} unprocessed games currently in queue")
+        print(f"{PH} {unproc} unprocessed game(s) currently in queue")
 
 
-def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
+def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
+    run_dir = run_cfg.run_dir
+    bonus_data = run_cfg.mine_bonus_data
+
     ## trying to deprioritize the server so it doesnt slow down main training looper
     p = psutil.Process()
 
@@ -1014,6 +1225,22 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
         cores = list(range(start, start + use_count))
         # cpu_affinity expects a list of logical/core ids; ok on Linux & Windows
         p.cpu_affinity(cores)
+
+    # apply overrides
+    POLL_INTERVAL = run_cfg.post_hoc_poll_interval
+    BLUNDER_CP = run_cfg.post_hoc_blunder_cp
+    ANALYZE_BATCH = run_cfg.post_hoc_analyze_batch
+    DEPTH = run_cfg.post_hoc_depth
+    EQUIV_RANGE = run_cfg.post_hoc_equiv_range
+
+    # also set them in globals so other functions (defined above) see them
+    globals().update({
+        "POLL_INTERVAL": POLL_INTERVAL,
+        "BLUNDER_CP": BLUNDER_CP,
+        "ANALYZE_BATCH": ANALYZE_BATCH,
+        "DEPTH": DEPTH,
+        "EQUIV_RANGE": EQUIV_RANGE
+    })
 
     # post hoc logic starts here
     idx_path = os.path.join(run_dir, "game_index.json")
@@ -1051,17 +1278,17 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
 
     # single engine reused across loop
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    eng.configure({"Threads": 1, "Hash": 64})
+    eng.configure({"Threads": 1, "Hash": 128})
 
     unproc_report = True
     try:
         # see if there is a starting pkl file
         last_seen_pkl = os.path.exists(pkl_path)
-        next_threshold = 1000
+        next_threshold = 500
         while not POST_HOC_STOP:
             if not os.path.exists(idx_path):
                 # check shutdown every poll_interval
-                time.sleep(poll_interval)
+                time.sleep(POLL_INTERVAL)
                 continue
 
             idx = load_game_index(idx_path)
@@ -1084,21 +1311,21 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                 # run analysis in-memory (do NOT persist per-game here)
                 with open(json_path, "r", encoding="utf-8") as gf:
                     game_data = json.load(gf)
-
+                
                 analysis_out = analyze_with_sf_core(game_data, eng=eng)
                 analysis_out["game_id"] = game_data.get("game_id")
                 analysis_out["ts"] = game_data.get("ts")
 
                 # accumulate for bundled saving later
                 analyzed_batch.append(analysis_out)
+                # create training tuples for this game
+                if bonus_data:
+                    samples = mine_additional_training_data(
+                        analysis_out, game_data, engine=eng
+                    )
 
-                # create training tuples for this game (unchanged)
-                samples = mine_additional_training_data(
-                    analysis_out, game_data, engine=eng
-                )
-
-                if samples:
-                    batch_samples.extend(samples)
+                    if samples:
+                        batch_samples.extend(samples)
 
                 seen_games.add(gid)
                 games_since_flush += 1
@@ -1124,7 +1351,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                         curr_exists = os.path.exists(pkl_path)
                         if last_seen_pkl and not curr_exists:
                             running_list = []
-                            next_threshold = 1000
+                            next_threshold = 500
                         last_seen_pkl = curr_exists
 
                         running_list.extend(batch_samples)
@@ -1133,7 +1360,7 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                         last_seen_pkl = True
                         lrl = len(running_list)
                         if lrl >= next_threshold:
-                            next_threshold += 1000
+                            next_threshold += 500
                             print(f"{PH} pushed {lrl} training samples")
                     
                     batch_samples = []
@@ -1141,21 +1368,40 @@ def post_hoc_worker(run_dir, poll_interval=7, batch_games=10, batch_secs=90):
                     last_flush = now
 
             # sleep but wake quickly if shutdown requested
-            for _ in range(max(1, int(poll_interval))):
+            for _ in range(max(1, POLL_INTERVAL)):
                 if POST_HOC_STOP:
                     break
                 time.sleep(1)
 
     finally:
+        # final flush: write any partially-accumulated analysis batch
+        try:
+            if analyzed_batch:
+                print(f"{PH} final flush: saving {len(analyzed_batch)} analyzed games")
+                # reuse existing chunk writer (writes into analysis_staging/)
+                save_analysis_chunk_simple(run_dir, analyzed_batch)
+                analyzed_batch.clear()
+        except Exception as e:
+            print(f"{PH} final flush (analyzed_batch) failed: {e}")
+        
         # ensure engine is cleanly quit
-        eng.quit()
+        try:
+            eng.quit()
+        except Exception:
+            pass
+
         print("[post_hoc] post_hoc_worker exiting cleanly")
+    
 
-
-def start_post_hoc_server(run_dir):
-    p = Process(target=post_hoc_worker, args=(run_dir,), daemon=False)
+def start_post_hoc_server(cfg):
+    """Start post-hoc worker process and forward the working Config object."""
+    p = Process(target=post_hoc_worker, args=(cfg,), daemon=False)
     p.start()
-    print("[post hoc] started server pid=", p.pid)
+
+    parts = os.path.normpath(cfg.run_dir).split(os.path.sep)
+    tail = os.path.sep.join(parts[-2:])
+    print(f"[post hoc] started server pid={p.pid} run_dir={tail} "
+        f"mine_bonus={cfg.mine_bonus_data}")
     return p
 
 

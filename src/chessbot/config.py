@@ -20,6 +20,9 @@ class Config(object):
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
     ema_span = 1000 # large ema_span effective turns it off
 
+    use_smart_pruning = True
+    pruning_factor = 1.2
+    
     # Simulation schedule
     sf_move_sims = 200
     sims_floor = 400

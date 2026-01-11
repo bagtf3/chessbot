@@ -156,7 +156,7 @@ def main():
     all_evals = pd.concat([all_evals, eval_df])
     all_evals.round(5).to_csv(cfg['progress_csv_path'], index=False)
 
-    if len(all_evals) and len(all_evals) % 2 == 0:
+    if len(all_evals) and len(all_evals) % 5 == 0:
         prog_plt_file = cfg['progress_plot_path']
         cbu.plot_training_progress(all_evals, epoch=epoch, save_path=prog_plt_file)
 

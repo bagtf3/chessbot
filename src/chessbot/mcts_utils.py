@@ -608,7 +608,7 @@ class ChessGame(object):
 
             # scan newest->oldest. rev_i 0 == newest
             sign_check = None
-            for rev_i, ex in enumerate(reversed(window)):
+            for rev_i, ex in enumerate(reversed(self.examples[-n_last:])):
                 vwq = ex[3]
                 # magnitude must meet the lock threshold
                 if abs(vwq) < thresh:

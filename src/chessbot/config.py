@@ -40,8 +40,8 @@ class Config(object):
 
     max_game_length = 200
     min_game_length = 5
-    material_diff_cutoff = 25
-    material_diff_cutoff_span = 25
+    material_diff_cutoff = 9
+    material_diff_cutoff_span = 20
     use_syzygy = False
 
     use_eval_draw = True
@@ -49,6 +49,12 @@ class Config(object):
     eval_draw_thresh = 0.1
     eval_draw_span = 15
 
+    use_eval_collar = True
+    eval_collar_min_plies = 40
+    eval_collar_thresh = 0.75
+    eval_collar_span = 15
+    eval_collar_trigger = 0.3
+    
     play_vs_sf_prob = 0.5
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}

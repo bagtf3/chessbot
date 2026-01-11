@@ -30,8 +30,7 @@ class MCTSTree(fasttree):
             self.c_puct = c
         self.ema_span = cfg.ema_span
         self.sim_budget = cfg.sims_ceiling
-        self.pruning_factor = 0 if not cfg.use_smart_pruning else cfg.pruning_factor
-
+        self.pruning_factor = cfg.pruning_factor
         super().__init__(
             board, self.c_puct, self.ema_span,
             self.sim_budget, self.pruning_factor
@@ -67,7 +66,7 @@ class MCTSTree(fasttree):
         self.root_noise_added = False
 
         # early-stop rolling state
-        self._es_last_checked_at = 0    
+        self._es_last_checked_at = 0
         self._es_tripped = False
         self.sim_stop_reason = ""
         
@@ -352,12 +351,26 @@ class ChessGame(object):
         self.moves_played = []
         
         self.mat_adv_counter = 0
-        self.vwq_adv_counter = 0
         self.outcome = None
         self.examples = []
         self.plies = 0
         self.vwq = None
         self.sf_eval = None
+
+        # eval collar and eval draw to shorten selfplay games
+        self.collar_stop_set = False
+        self.collar_stop_eventual_outcome = None
+        self.collar_stop_lower_threshold = None
+        if self.config.use_eval_collar:
+            self.next_collar_stop_check = cfg.eval_collar_min_plies
+        else:
+            self.next_collar_stop_check = 999
+
+        # set when to start checking for draw by agreement
+        if self.config.use_eval_draw:
+            self.next_eval_draw_check = self.config.eval_draw_min_plies
+        else:
+            self.next_eval_draw_check = 999
     
     def turn(self, return_bool=True):
         stm = self.board.side_to_move()
@@ -367,7 +380,7 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        tl = 0.1
+        tl = 0.1  # time limit
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng
@@ -457,7 +470,7 @@ class ChessGame(object):
         """
         Stockfish plays one move. If tree has visits:
         - if SF move is top, use tree visits as-is
-        - otherwise swap top visited move with SF move, bump SF by 10%
+        - otherwise boost SF move by 125% of top visited
         If no visits, fall back to make_fake_visits.
         """
         legal = self.board.legal_moves()
@@ -481,11 +494,9 @@ class ChessGame(object):
             if most_visited_uci == mv:
                 use_tree_visits = True
             else:
-                # swap top visited with SF move
+                # boost top visited with SF move
                 top_count = visit_map.get(most_visited_uci, 0)
-                sf_count = visit_map.get(mv, 0)
-                visit_map[most_visited_uci] = 1 + int(sf_count*0.9)
-                visit_map[mv] = 1 + int(top_count*1.1)
+                visit_map[mv] = 1 + int(top_count*1.25)
                 use_tree_visits = True
 
         if use_tree_visits and visit_map is not None:
@@ -556,24 +567,131 @@ class ChessGame(object):
         mask = self.board.legal_move_mask()
         self.examples.append((x, mask, policy, vwq, self.plies, turn))
 
+    def check_for_eval_draw(self, cfg):
+        n_last = cfg.eval_draw_span
+        thresh_d = cfg.eval_draw_thresh
+            
+        # if we don't yet have a full window, schedule when we will
+        if len(self.examples) < n_last:
+            needed = n_last - len(self.examples)
+            self.next_eval_draw_check = self.plies + needed
+            return False
+
+        # look up n_last vwqs and assess vs draw threwshold
+        # vwq is 4th element in examples tuples
+        recent = [e[3] for e in self.examples[-n_last:]]
+        
+        # check and see if we've passed the test, if not when to check again
+        violated = False
+        violating_index = None
+        for i, r in enumerate(reversed(recent)):
+            if abs(r) > thresh_d:
+                violated = True
+                violating_index = i
+                break
+
+        # agree to draw
+        if not violated:
+            return True
+        
+        # otherwise dont test again until its possible to have an eval_draw
+        needed = n_last - violating_index
+        self.next_eval_draw_check = self.plies + needed
+        return False
+    
+    def check_for_collar_stop(self, cfg):
+        n_last = cfg.eval_collar_span
+        thresh = cfg.eval_collar_thresh
+        # first-time detection of a collar stop candidate
+        if not self.collar_stop_set:
+            if self.plies < self.next_collar_stop_check:
+                return False, None
+
+            # scan newest->oldest. rev_i 0 == newest
+            sign_check = None
+            for rev_i, ex in enumerate(reversed(self.examples[-n_last:])):
+                vwq = ex[3]
+                # magnitude must meet the lock threshold
+                if abs(vwq) < thresh:
+                    needed = n_last - rev_i
+                    self.next_collar_stop_check = self.plies + needed
+                    return False, None
+
+                # convert to white-POV signed value
+                z_white = vwq if ex[5] else -vwq
+                sign = (z_white > 0) - (z_white < 0)
+
+                if sign_check is None:
+                    sign_check = sign
+                elif sign != sign_check:
+                    # mixed signs -> wait until this newest violator is evicted
+                    needed = n_last - rev_i
+                    self.next_collar_stop_check = self.plies + needed
+                    return False, None
+
+            # all checks passed. set collar stop
+            self.collar_stop_set = True
+            self.collar_stop_eventual_outcome = sign_check  # -1 or +1
+            # keep trigger as a positive magnitude for release checks
+            self.collar_stop_trigger = cfg.eval_collar_trigger
+            return False, None
+
+        # already locked: check for release (blunder) in a short tail
+        else:
+            check_depth = 5
+            tail = self.examples[-check_depth:]
+            keep_tail = []
+            stop_game = False
+
+            for ex in tail:
+                vwq = ex[3]
+                z_white = vwq if ex[5] else -vwq
+                # positive when leader still ahead
+                sign_stability = self.collar_stop_eventual_outcome * z_white
+
+                # if sign_stability falls below the trigger, we stop and award win
+                if sign_stability < self.collar_stop_trigger:
+                    stop_game = True
+                else:
+                    keep_tail.append(ex)
+
+            if stop_game:
+                # replace only the tail portion
+                cut = len(tail)
+                self.examples = self.examples[:-check_depth] + keep_tail
+                return True, self.collar_stop_eventual_outcome
+        
+        # no stop detected
+        return False, None
+
     def check_for_terminal(self):
+        cfg = self.config
+        # check to see if a collar stop has been set
+        if cfg.use_eval_collar:
+            if self.plies >= cfg.eval_collar_min_plies:
+                collar_stop, outcome = self.check_for_collar_stop(cfg)
+                if collar_stop:
+                    self.outcome = outcome
+                    return True
+        
+        # otherwise look for conventional terminal states
         reason, result = self.board.is_game_over()
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
             return True
     
         mat_diff = self.board.material_count()
-        if abs(mat_diff) >= self.config.material_diff_cutoff:
+        if abs(mat_diff) >= cfg.material_diff_cutoff:
             self.mat_adv_counter += 1
         else:
             self.mat_adv_counter = 0
     
-        if self.mat_adv_counter >= self.config.material_diff_cutoff_span:
+        if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
             self.outcome = 1.0 if mat_diff > 0 else -1.0
             return True
         
         # Syzygy probe if few pieces
-        if self.config.use_syzygy:
+        if cfg.use_syzygy:
             if self.board.piece_count() <= 5:
                 # may not work so just go as normal
                 try:
@@ -588,9 +706,15 @@ class ChessGame(object):
                     return True
                 except:
                     pass
-           
-        hs = self.board.history_size()
-        if hs > self.config.max_game_length:
+
+        # check for draws based on eval or move limit
+        if self.plies >= self.next_eval_draw_check:
+            if self.check_for_eval_draw(cfg):
+                self.outcome = 0.0
+                return True
+
+        # check for overal game_length limit
+        if self.plies > cfg.max_game_length:
             self.outcome = 0.0
             return True
         # if we made it here the game is active

@@ -447,7 +447,7 @@ class ChessGame(object):
                 "uci": cd.uci, "visits": cd.N,
                 "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4),
                 "Q_ema": rnd(cd.Q_ema, 4),
-                "is_terminal": cd.is_terminal, "vprime_visits": cd.vprime_visits
+                "is_terminal": cd.is_terminal
             }
             
             candidate_moves.append(cm)

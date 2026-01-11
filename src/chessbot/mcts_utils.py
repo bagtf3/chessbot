@@ -16,9 +16,6 @@ import chessbot.utils as cbu
 
 
 class MCTSTree(fasttree):
-    ev = Evaluator()
-    ev.configure(build_weights(zeros=False))
-
     def __init__(self, board, cfg):
         self.config = cfg
 

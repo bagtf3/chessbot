@@ -619,7 +619,7 @@ class ChessGame(object):
 
                 # convert to white-POV signed value
                 z_white = vwq if ex[5] else -vwq
-                sign = (z_white > 0) - (z_white < 0)
+                sign = 1*(z_white > 0) - 1*(z_white < 0)
 
                 if sign_check is None:
                     sign_check = sign

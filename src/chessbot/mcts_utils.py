@@ -722,6 +722,8 @@ class ChessGame(object):
         # check for overal game_length limit
         if self.plies > cfg.max_game_length:
             self.outcome = 0.0
+            if self.collar_stop_set:
+                self.outcome = self.collar_stop_eventual_outcome
             return True
         # if we made it here the game is active
         return False

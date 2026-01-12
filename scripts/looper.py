@@ -186,12 +186,8 @@ class GameLooper(object):
                             self.finalize_game_data(game)
                             finished.append(game.game_id)
                             continue
-                        
-                        # if its stockfish turn, dont do any sims
-                        #if game.is_stockfish_turn():
-                        #    continue
 
-                    # otherwise, collect up to micro_batch leaves for this game
+                    # collect up to micro_batch leaves for this game
                     # CollectResults object from C++
                     res = game.tree.collect_many_leaves(mbs, max_fastpath)
                     
@@ -206,7 +202,7 @@ class GameLooper(object):
                     lps.tick(n_leafs)
 
                     # update sim count
-                    game.tree.sims_completed_this_move += (n_leafs)
+                    game.tree.sims_completed_this_move += n_leafs
 
                     if nn:
                         preds_batch += game.tree.pending_encoded_64_tokens()

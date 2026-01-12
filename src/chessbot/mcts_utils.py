@@ -576,12 +576,8 @@ class ChessGame(object):
             needed = n_last - len(self.examples)
             self.next_eval_draw_check = self.plies + needed
             return False
-        
-        # no eval draws with queens on the board.
-        if 'q' in self.board.fen().lower():
-            return False
 
-        # look up n_last vwqs and assess vs draw threwshold
+        # look up n_last vwqs and assess vs draw threshold
         # vwq is 4th element in examples tuples
         recent = [e[3] for e in self.examples[-n_last:]]
         
@@ -593,19 +589,26 @@ class ChessGame(object):
                 violated = True
                 violating_index = i
                 break
-
-        # agree to draw
-        if not violated:
-            return True
         
-        # otherwise dont test again until its possible to have an eval_draw
-        needed = n_last - violating_index
-        self.next_eval_draw_check = self.plies + needed
-        return False
+        # dont test again until its possible to have an eval_draw
+        if violated:            
+            needed = n_last - violating_index
+            self.next_eval_draw_check = self.plies + needed
+            return False
+
+        # no eval draws with queen(s) on the board.
+        # prefer eval check above first to push next check back
+        elif 'q' in self.board.fen().lower():
+            return False
+        
+        # if here, agree to draw
+        else:
+            return True
     
     def check_for_collar_stop(self, cfg):
         n_last = cfg.eval_collar_span
         thresh = cfg.eval_collar_thresh
+
         # first-time detection of a collar stop candidate
         if not self.collar_stop_set:
             if self.plies < self.next_collar_stop_check:
@@ -642,7 +645,7 @@ class ChessGame(object):
 
         # already locked: check for release (blunder) in a short tail
         else:
-            check_depth = 5
+            check_depth = 3
             tail = self.examples[-check_depth:]
             keep_tail = []
             stop_game = False
@@ -661,7 +664,6 @@ class ChessGame(object):
 
             if stop_game:
                 # replace only the tail portion
-                cut = len(tail)
                 self.examples = self.examples[:-check_depth] + keep_tail
                 return True, self.collar_stop_eventual_outcome
         

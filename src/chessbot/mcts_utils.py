@@ -576,6 +576,10 @@ class ChessGame(object):
             needed = n_last - len(self.examples)
             self.next_eval_draw_check = self.plies + needed
             return False
+        
+        # no eval draws with queens on the board.
+        if 'q' in self.board.fen().lower():
+            return False
 
         # look up n_last vwqs and assess vs draw threwshold
         # vwq is 4th element in examples tuples

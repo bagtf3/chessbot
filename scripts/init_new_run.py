@@ -16,6 +16,9 @@ import yaml
 import shutil
 from pathlib import Path
 
+from chessbot.config import Config
+
+
 def write_yaml(path, obj):
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -66,24 +69,21 @@ def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("run_tag")
-    parser.add_argument("--clone", dest="clone_tag", default=None)
-    parser.add_argument("--selfplay_dir", dest="selfplay_dir", default="runs")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("run_tag")
+    p.add_argument("--clone", default=None)
+    args = p.parse_args()
 
     run_tag = args.run_tag
-    clone_tag = args.clone_tag
-    cfg = argparse.Namespace()
-    cfg.selfplay_dir = args.selfplay_dir
-    cfg.init_model = None
+    clone_tag = args.clone
 
-    dest_dir = os.path.abspath(os.path.join(cfg.selfplay_dir, run_tag))
-    if os.path.exists(dest_dir):
-        print(f"[init] run_dir already exists: {dest_dir}")
-        sys.exit(1)
+    # set run_tag so Config.init_paths will compute the right paths
+    Config.run_tag = run_tag
+    cfg = Config()
+    cfg.init_paths()
 
-    os.makedirs(dest_dir, exist_ok=False)
+    dest_dir = cfg.run_dir
+    os.makedirs(dest_dir, exist_ok=True)
 
     cfg_yaml_dst = os.path.join(dest_dir, "config.yaml")
     val_yaml_dst = os.path.join(dest_dir, "validation_config.yaml")
@@ -126,23 +126,19 @@ def main():
                 "init_model": cfg.init_model
             }
             write_yaml(cfg_yaml_dst, minimal)
-            write_yaml(val_yaml_dst, {"is_validation": True})
-            print("[clone] wrote minimal config and validation_config")
+            print("[init] wrote minimal config.yaml")
 
-        # copy training_config.yaml if present; update run_tag and init_model in the copy
-        src_train_cfg = os.path.join(src_dir, "training_config.yaml")
-        if os.path.exists(src_train_cfg):
-            train_cfg_dst = os.path.join(dest_dir, "training_config.yaml")
-            shutil.copy2(src_train_cfg, train_cfg_dst)
-            # mirror the same inplace replacement behavior as for config.yaml
-            replace_yaml_values_inplace(
-                train_cfg_dst, run_tag, cfg.init_model,
-                prev_run_tag=clone_tag
-            )
-            print(f"[clone] copied training_config.yaml from {clone_tag}")
+        # copy validation_config.yaml if present (no modification)
+        src_val = os.path.join(src_dir, "validation_config.yaml")
+        if os.path.exists(src_val):
+            shutil.copy2(src_val, val_yaml_dst)
+            print(f"[clone] copied validation_config.yaml from {clone_tag}")
+        else:
+            write_yaml(val_yaml_dst, {"is_validation":True})
+            print("[init] wrote minimal validation_config.yaml (no src found)")
 
     else:
-        # no clone: write minimal config + validation config
+        # not cloning: write minimal files
         write_yaml(cfg_yaml_dst, {
             "run_tag": run_tag,
             "selfplay_dir": cfg.selfplay_dir,

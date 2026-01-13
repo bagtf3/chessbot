@@ -28,6 +28,7 @@ class MCTSTree(fasttree):
             self.c_puct = float(np.random.choice(c))
         else:
             self.c_puct = c
+        
         self.ema_span = cfg.ema_span
 
         # set floor and ceiling (ceiling can be a list for varied gameplay)

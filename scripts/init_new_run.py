@@ -87,6 +87,7 @@ def main():
 
     cfg_yaml_dst = os.path.join(dest_dir, "config.yaml")
     val_yaml_dst = os.path.join(dest_dir, "validation_config.yaml")
+    train_yaml_dst = os.path.join(dest_dir, "training_config.yaml")
 
     if clone_tag:
         src_dir = os.path.abspath(os.path.join(cfg.selfplay_dir, clone_tag))
@@ -137,6 +138,11 @@ def main():
             write_yaml(val_yaml_dst, {"is_validation":True})
             print("[init] wrote minimal validation_config.yaml (no src found)")
 
+        # copy training_config.yaml if present (no modification)
+        src_val = os.path.join(src_dir, "training_config.yaml")
+        if os.path.exists(src_val):
+            shutil.copy2(src_val, train_yaml_dst)
+            print(f"[clone] copied training_config.yaml from {clone_tag}")
     else:
         # not cloning: write minimal files
         write_yaml(cfg_yaml_dst, {

@@ -29,11 +29,18 @@ class MCTSTree(fasttree):
         else:
             self.c_puct = c
         self.ema_span = cfg.ema_span
-        self.sim_budget = cfg.sims_ceiling
+
+        # set floor and ceiling (ceiling can be a list for varied gameplay)
+        self.sims_floor = cfg.sims_floor
+        if isinstance(cfg.sims_ceiling, (list, set)):
+            self.sims_ceiling = np.random.choice(cfg.sims_ceiling)
+        else:
+            self.sims_ceiling = cfg.sims_ceiling
+
         self.pruning_factor = cfg.pruning_factor
         super().__init__(
             board, self.c_puct, self.ema_span,
-            self.sim_budget, self.pruning_factor
+            self.sims_ceiling, self.pruning_factor
         )
 
         # bookkeeping
@@ -231,8 +238,8 @@ class MCTSTree(fasttree):
         if sims_done < self.config.sims_floor:
             return False
 
-        if sims_done >= self.config.sims_ceiling:
-            self.sim_stop_reason = f"Sim ceiling {self.config.sims_ceiling} reached"
+        if sims_done >= self.sims_ceiling:
+            self.sim_stop_reason = f"Sim ceiling {self.sims_ceiling} reached"
             return True
 
         if sims_done - self._es_last_checked_at < self.config.es_check_every:
@@ -268,7 +275,7 @@ class MCTSTree(fasttree):
         # bmp = np.ravel(probs)[-1]
         # string = f"best move prob {bmp:.3f} sims_done {sims_done}"
         # # need to be above the es (early stop) threshold to stop here
-        # if sims_done >= self.config.sims_ceiling:
+        # if sims_done >= self.sims_ceiling:
         #     self.sim_stop_reason = f"Sim Limit reached: {string}"
         #     return True
 

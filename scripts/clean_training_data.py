@@ -7,16 +7,12 @@ from chessbot.review import ANALYZE_PKL
 import json
 
 
-CPL_MIN = 90
+CPL_MIN = 60
 screened_dir = "C:/Users/Bryan/Data/chessbot_data/training_data/screened_games"
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 
-run_tags = [
-    'conv_1000_selfplay', 'conv_1000_selfplay_phase2',
-    'conv_1000_selfplay_phase3', 'conv_1000_selfplay_phase4',
-    'conv_12x512SE', 'conv_net_flat_12blocks_run0', 'conv_net_flat_run0',
-    'conv_net_flat_run1', 'conv_net_flat_run2'
-]
+skip = ['cf_10x256x5_lc0_training', 'cf_10x256x5_low_sims']
+run_tags = [rt for rt in os.listdir(SP_DIR) if rt not in skip]
 
 total_deleted = 0
 for rt in run_tags:

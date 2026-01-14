@@ -78,6 +78,9 @@ def main():
     is_add_flag = []
 
     for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
+        # avoid potential nans in vwq
+        if vwq != vwq:
+            continue
         X_list.append(x)
         P_list.append(policy)
         mask_list.append(mask)

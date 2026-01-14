@@ -353,10 +353,18 @@ class GameViewer:
             line += f"  unique={uniq} ({frac:.0%})"
         print(line)
 
-        # entropy 
+        # entropy: show normed entropy for visits and priors + KL/JS
         visits_list = [c.get("visits", 0) for c in cands]
-        ent, norm = calc_entropy(visits_list)
-        print(f"  entropy: raw={ent:.3f} bits  norm={norm:.3f}")
+        priors_list = [c.get("P", 0.0) for c in cands]
+
+        norm_vis, p_vis = self.compute_norm_entropy(visits_list)
+        norm_pri, p_pri = self.compute_norm_entropy(priors_list)
+        kl = self.kl_divergence_bits(p_vis, p_pri)
+
+        print(
+            f"  entropy (norm'd): visits={norm_vis:.3f} "
+            f"priors={norm_pri:.3f} KL(vis||pr)={kl:.3f} bits"
+        )
 
         cands_sorted = sorted(
             cands, key=lambda x: x.get("visits", 0), reverse=True
@@ -532,6 +540,39 @@ class GameViewer:
                 # default: forward one move
                 shown = False
                 self.next()
+
+    def compute_norm_entropy(self, arr):
+        """Return (normalized_entropy_bits, prob_vector)."""
+        a = np.asarray(arr, dtype=np.float64)
+        if a.size == 0:
+            return 0.0, np.array([], dtype=np.float64)
+        s = a.sum()
+        if s <= 0.0:
+            p = np.ones(a.size, dtype=np.float64) / a.size
+        else:
+            p = a / s
+        nz = p > 0.0
+        ent = -np.sum(p[nz] * np.log2(p[nz])) if nz.any() else 0.0
+        norm = ent / np.log2(p.size) if p.size > 1 else 0.0
+        return norm, p
+
+
+    def kl_divergence_bits(self, p, q, eps=1e-12):
+        """KL(p || q) in bits."""
+        p = np.asarray(p, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64)
+        if p.sum() <= 0.0:
+            p = np.ones_like(p, dtype=np.float64) / p.size
+        else:
+            p = p / p.sum()
+        if q.sum() <= 0.0:
+            q = np.ones_like(q, dtype=np.float64) / q.size
+        else:
+            q = q / q.sum()
+        p = np.clip(p, eps, 1.0)
+        q = np.clip(q, eps, 1.0)
+        return np.sum(p * np.log2(p / q))
+
 
     def generate_training_data(self, sf_skip=False, **kwargs):
         """

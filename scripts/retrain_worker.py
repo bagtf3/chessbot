@@ -80,6 +80,7 @@ def main():
     for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
         # avoid potential nans in vwq
         if vwq != vwq:
+            print("[retrain] nan value found in vwq (removed)")
             continue
         X_list.append(x)
         P_list.append(policy)

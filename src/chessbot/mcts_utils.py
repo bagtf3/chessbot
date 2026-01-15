@@ -388,7 +388,7 @@ class ChessGame(object):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
     def get_stockfish_move(self, eng):
-        tl = 0.1  # time limit
+        tl = 0.25  # time limit
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng

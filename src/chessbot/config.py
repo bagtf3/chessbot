@@ -91,11 +91,12 @@ class Config(object):
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
 
-    target_y_weights = {'vwq': 0.5, 'z': 0.5, 'z_taper': 0.0}
-    loss_weights = {"policy_winner": 0.25, "policy_loser": 0.25, "value_out": 0.25}
+    target_y_weights = {'vwq': 0.5, 'z': 0.5}
+    loss_weights = {"policy": 0.25, "value_out": 0.25}
+
     vscale = 0.9
     draw_weight = 0.1
-    training_queue_thresh = 4096
+
     retrain_batch_size = 512
 
     def __init__(self):
@@ -111,6 +112,8 @@ class Config(object):
         resolved_run_dir = os.path.abspath(resolved_run_dir)
         self.run_dir = resolved_run_dir
 
+        self.pending_training_dir = os.path.join(self.run_dir, "pending_training")
+        
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
 

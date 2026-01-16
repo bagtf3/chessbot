@@ -445,6 +445,14 @@ class ChessGame(object):
             "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
             "stop_reason": self.tree.sim_stop_reason
         }
+
+        # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
+        if self.is_stockfish_turn():
+            data['Q_stm'] = self.sf_eval
+        else:
+            vwq = data['visit_weighted_Q']
+            data['Q_stm'] = vwq if self.turn() else -1*vwq
+
         # sumN for U term
         sumN = max(1, root.N)
 

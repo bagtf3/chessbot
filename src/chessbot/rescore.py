@@ -20,218 +20,291 @@ from chessbot import SF_LOC
 from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, sf_eval
+    calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
 )
 
-TRAINING_PKL = "additional_training_data.pkl"
-ANALYZE_PKL = "analyze_results_combined.pkl"
-
-# stops the post hoc server
-POST_HOC_STOP = False
-PH = "[post hoc]"
-
-# default analysis params
-POLL_INTERVAL = 20
-BLUNDER_CP = 150
-ANALYZE_BATCH = 30
-DEPTH = 12
-EQUIV_RANGE = 30
-
-def post_hoc_signal_handler(signum, frame):
-    global POST_HOC_STOP
-    POST_HOC_STOP = True
+import chessbot.review as rv
 
 
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-
-    # First, try regular JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: parse line-by-line (JSONL / concatenated objects)
-        items = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
-        return items
-    
-
-def load_game_index(path=None):
-    if not path.endswith("game_index.json"):
-        path = os.path.join(path, "game_index.json")
-    return load_json(path)
+pkl = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_vs_stockfish/pkl_game_logs/00d42f10-c451-4ef4-bf33-7c2d0252574b_log.pkl"
+with open(pkl, "rb") as f:
+    game_data = pickle.load(f)
 
 
-def analyze_with_rank(move, board, limit, eng):
-    # Get Stockfish root best at this depth (white-POV score included in info)
-    top3 = eng.analyse(board, limit=limit, info=chess.engine.INFO_ALL, multipv=3)
-    best = [t for t in top3 if t['multipv'] == 1][0]
-    
-    best_move = best['pv'][0]
-    best_cp   = score_cp_stm_pov(best["score"])
-    best_abs  = score_cp_white_pov(best["score"], clipped=False)
-    
-    # default
-    res = {}
-    res['best_move'] = best_move
-    res['best_cp'] = best_cp
-    res['best_absolute'] = best_abs
-    
-    if move == best_move:
-        res['played_cp'] = best_cp
-        res['played_absolute'] = best_abs
-        res['delta_signed'] = 0
-        res['sf_rank'] = 1
-        res['in_top3'] = True
-        return res
-    
-    played = [t for t in top3 if t['pv'][0] == move]
-    # if played move not in top3, need to check again
-    if not played:
-        in_top3 = False
-        played = eng.analyse(
-            board, limit=limit, root_moves=[move], info=chess.engine.INFO_ALL
-        )
+class Rescorer():
+    def __init__(self, cfg):
+        self.config = cfg
+        self.training_data = []
+
+    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
+        """
+        Snapshot inputs and a flat 4288-length policy vector for training.
+        - ucis: list[str] legal moves (same order as probs)
+        - pi:  list/array of probs (sum ~= 1)
+        - Y: target for value head
+        """
         
-    else:
-        played = played[0]
-        in_top3 = True
-    
-    played_cp = score_cp_stm_pov(played['score'])
-    played_abs = score_cp_white_pov(played["score"], clipped=False)
-    delta = best_cp - played_cp
+        # get indices from C++
+        indices = board.moves_to_indices(ucis)  # list of int (0..4288)
+        policy = np.zeros(64 * 67, dtype=np.float32)
 
-    # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
-    if abs(delta) <= EQUIV_RANGE:
-        res['best_move'] = move # our move is also best
-        res['played_cp'] = best_cp
-        res['played_absolute'] = best_abs
-        res['delta_signed'] = 0
-        res['in_top3'] = True
-        return res
+        # normalize visits -> pi
+        s = sum(visits)
+        pi = np.array([v / s for v in visits], dtype=np.float32)
+        pi = np.clip(pi, cfg.prior_clip_min, cfg.prior_clip_max)
+        pi = pi / pi.sum()
 
-    # If the played move appears better (delta negative beyond EQUIV_RANGE),
-    # treat the played move as the best move (but keep delta_signed negative).
-    if delta <= -EQUIV_RANGE:
-        res['best_move'] = move
-        res['best_cp'] = played_cp
-        res['played_cp'] = played_cp
-        res['best_absolute'] = played_abs
-        res['played_absolute'] = played_abs
-        res['delta_signed'] = delta
-        res['in_top3'] = True
-        return res
-    
-    # otherwise, our move is worse
-    res['played_cp'] = played_cp
-    res['played_absolute'] = played_abs
-    res['delta_signed'] = delta
-    res['in_top3'] = in_top3
-    return res
+        # accumulate probs into flattened policy
+        for idx, p in zip(indices, pi):
+            policy[idx] += p
+
+        # snapshot inputs and push example
+        x = board.encode_64_tokens()
+        mask = board.legal_move_mask()
+
+        self.training_data.append((x, mask, policy, Y, vwht, pwht))
+        
+        if len(self.training_data) >= self.config.training_data_chunk_size:
+            out_dir = pathlib.Path(self.config.pending_training_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            chunk_size = self.config.training_data_chunk_size
+            chunk = self.training_data[:chunk_size]
+            remainder = self.training_data[chunk_size:]
+
+            filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
+            out_path = out_dir / filename
+
+            with open(out_path, "wb") as f:
+                pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            self.training_data = remainder
+            print(f"[rescorer] saved {len(chunk)} training samples to {filename}")
 
 
-def analyze_with_sf_core(game_data, eng, depth=None):
-    if depth is None:
-        depth = DEPTH
-    limit = chess.engine.Limit(depth=depth)
-    board = chess.Board(game_data['start_fen'])
+    def training_data_from_sf(self, board, mv, cm, Y):
+        cfg = self.config
 
-    vs_stockfish = game_data['vs_stockfish']
-    sf_color = game_data['stockfish_is_white']
+        rows = [(c['uci'], c['visits']) for c in cm]
+        total_visits = sum([n for _, n in rows]) if rows else 0
 
-    cpl_s = cpl_w = cpl_b = 0.0
-    nw = nb = 0
-    rows = []
+        visit_map = None
+        use_tree_visits = False
 
-    for i, mv in enumerate(game_data['moves_played']):
-        move = chess.Move.from_uci(mv)
+        # make sure we have at least 10 visits for stability
+        if rows and total_visits > 10:
+            visit_map = {u: n for u, n in rows}
+            most_visited_uci, max_visits = max(rows, key=lambda x: x[1])
 
-        # skip SF plies
-        if vs_stockfish and (board.turn == sf_color):
-            board.push(move)
-            continue
+            if most_visited_uci == mv:
+                use_tree_visits = True
+            else:
+                # boost top visited with SF move
+                top_count = visit_map[most_visited_uci]
+                visit_map[mv] = 1 + int(top_count*1.25)
+                use_tree_visits = True
 
-        res = analyze_with_rank(move, board, limit, eng)
-
-        loss_this = res['delta_signed']
-        cpl_s += loss_this
-        if board.turn:
-            cpl_w += loss_this; nw += 1
+        if use_tree_visits and visit_map is not None:
+            ucis = board.legal_moves()
+            visits = [max(1, visit_map.get(u, 1)) for u in ucis]
         else:
-            cpl_b += loss_this; nb += 1
+            raw = make_fake_visits(mv, board.legal_moves(), ratio_best=60)
+            ucis = [x[0] for x in raw]
+            visits = [int(x[1]) for x in raw]
 
-        # append in_top3 flag into the row so it propagates into df
-        rows.append([
-            i, mv, str(res['best_move']), res['best_cp'], loss_this,
-            res['played_cp'],
-            res.get('in_top3', False),
-            res['best_absolute'], res['played_absolute'],
-            board.turn, loss_this
-        ])
-        board.push(move)
+        # calc KL divergence after adjustments
+        priors_map = {c['uci']: c['P'] for c in cm}
+        priors = [priors_map[u] for u in ucis]
+        kl = kl_divergence(priors, visits)
 
-    cols = [
-        'move_num','played_move','best_move','best_cp',
-        'delta','played_cp','in_top3',
-        'best_absolute','played_absolute','stm','loss'
-    ]
-    out_df = pd.DataFrame(rows, columns=cols)
-    out_df["played_best_move"] = out_df["played_move"] == out_df["best_move"]
-    
-    # replace the three rate lines with this robust version
-    mask_w = out_df["stm"] == True
-    mask_b = out_df["stm"] == False
-    
-    overall_bmr = out_df["played_best_move"].mean() if len(out_df) else np.nan
-    white_bmr = out_df.loc[mask_w, "played_best_move"].mean() if mask_w.any() else np.nan
-    black_bmr = out_df.loc[mask_b, "played_best_move"].mean() if mask_b.any() else np.nan
+        vwht = cfg.loss_weights['value_out']
+        pwht = cfg.loss_weights['policy']
+        if kl > cfg.KL_boost_threshold:
+            pwht *= cfg.KL_weight_boost
 
-    # compute in_top3 aggregate counts and rate for this game
-    top3_cnt = int(out_df["in_top3"].sum())
-    total_plies = len(out_df)
-    not_in_top3_cnt = int(total_plies - top3_cnt)
-    top3_rate = out_df["in_top3"].mean() if total_plies else np.nan
-    
-    out = {
-        "plies": nw + nb,
-        "overall_cpl": rnd(cpl_s/(nw+nb), 3) if (nw+nb) else np.nan,
-        "white_cpl":   rnd(cpl_w/nw, 3)      if nw else np.nan,
-        "black_cpl":   rnd(cpl_b/nb, 3)      if nb else np.nan,
-        "overall_best_move_rate": overall_bmr,
-        "best_move_rate_white":    white_bmr,
-        "best_move_rate_black":    black_bmr,
-        "plays_in_top3_cnt": top3_cnt,
-        "not_in_top3_cnt": not_in_top3_cnt,
-        "plays_in_top3_rate": top3_rate,
-    }
-    
-    for key in ['game_id','scenario','stockfish_color','ts']:
-        out[key] = game_data.get(key)
-        out_df[key] = game_data.get(key)
-    out['df'] = out_df
-    return out
+        self.append_flat_policy_example(board, ucis, visits, Y, vwht, pwht)
+        
 
-## post hoc server
-def save_pickle_atomic(obj, path, tries=0):
-    try:
-        tmp = str(path) + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, str(path))
-    except Exception as e:
-        if tries <= 5:
-            time.sleep(0.5)
-            save_pickle_atomic(obj, path, tries=tries+1)
-        else:
-            raise e
+    def analyze_and_mine(self, game_data, eng):
+        """
+        Single-pass analyze + rescore training-data maker.
 
+        - train_on_stockfish: include plies played by SF in training if True.
+        - base_weight: default sample weight used as 'weight' in returned sample.
+        """
 
-def safe_mean(arr):
-    a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
-    return np.nanmean(a) if a.size else float("nan")
+        # allow passing a filepath (str or Path) to a pkl/json game record
+        if isinstance(game_data, (str, pathlib.Path)):
+            path = str(game_data)
+            if path.lower().endswith(('.pkl', '.json')) and os.path.exists(path):
+                if path.lower().endswith('.pkl'):
+                    with open(path, 'rb') as f:
+                        game_data = pickle.load(f)
+                else:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        game_data = json.load(f)
+
+        # must be a dict from here on
+        if not isinstance(game_data, dict):
+            raise TypeError("game_data must be a dict or path to .pkl/.json")
+
+        cfg = self.config
+        limit = chess.engine.Limit(depth=cfg.post_hoc_depth)
+
+        board_ch = chess.Board(game_data['start_fen'])
+        b_fast = Board(game_data['start_fen'])
+
+        tree_data = game_data.get('tree_search_data', {})
+        vs_stockfish = game_data.get('vs_stockfish', False)
+        sf_color = game_data.get('stockfish_is_white')
+        result = game_data['result']
+
+        cpl_s = cpl_w = cpl_b = 0.0
+        nw = nb = 0
+        rows = []
+        
+        for i, mv in enumerate(game_data.get('moves_played', [])):
+            move_ch = chess.Move.from_uci(mv)
+            is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
+            turn = board_ch.turn
+            
+            # handle sf-played plies
+            if is_sf_move and not self.train_on_stockfish:
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
+            # tree data for this move
+            tr = tree_data.get(i, tree_data.get(str(i), {}))
+            cm = tr.get('candidate_moves', [])
+            if not cm:
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
+            # calculate Y value
+            Z_stm = result if turn else -1*result
+            if 'Q_stm' in tr.keys():
+                Q = tr['Q_stm']
+            else:
+                Q = tr['visit_weighted_Q'] if turn else -1*tr['visit_weighted_Q']
+            Y = np.clip(0.5*Z_stm + 0.5*Q, -1.0, 1.0)
+
+            # if sf_move, gather training data, push moves, continue
+            if is_sf_move:
+                self.training_data_from_sf(b_fast, mv, cm, Y)
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
+            # if here, its MCTS move
+            res = analyze_with_rank(move_ch, board_ch, limit, eng)
+            loss_this = res['delta_signed']
+            cpl_s += loss_this
+            if board_ch.turn:
+                cpl_w += loss_this
+                nw += 1
+            else:
+                cpl_b += loss_this
+                nb += 1
+
+            rows.append([
+                i, mv, str(res['best_move']), res['best_cp'], loss_this,
+                res['played_cp'], res.get('in_top3', False),
+                res['best_absolute'], res['played_absolute'],
+                board_ch.turn, loss_this
+            ])
+
+            # screen training data, adjust if needed and append
+            lms = b_fast.legal_moves()
+            cpl = loss_this
+
+            # these moves are fine, no changes            
+            if cpl <= 60:
+                best_mv = mv
+                visits = [(c['uci'], c['visits']) for c in cm]
+                visits = sorted(visits, key=lambda x: x[1], reverse=True)
+            
+            # for mild blunders adjust visits
+            elif cpl < cfg.blunder_cp
+                best_mv = str(res.get('best_move'))
+                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
+
+            # everything else is a blunder
+            else:
+                best_mv = str(res.get('best_move'))
+                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=True)
+                # use the SF value here since its a blunder
+                best_cp = res.get('best_cp')
+                Y = cp_to_value_tanh(best_cp) if best_cp is not None else 0.0
+
+            if not visits or sum([v[1] for v in visits]) <= 0:
+                print("[rescorer] visits invalid or sum <= 0; skipping sample",
+                    "move_idx=", i, "played=", mv, "best=", best_mv)
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
+            mvs = [v[0] for v in visits]
+            vis = [v[1] for v in visits]
+
+            priors_map = {c['uci']: c['P'] for c in cm}
+            priors = [priors_map[m] for m in mvs]
+            
+            # adjust training weights based on KL
+            kl = kl_divergence(priors, vis)
+            vwht = cfg.loss_weights['value_out']
+            pwht = cfg.loss_weights['policy']
+
+            if kl >= cfg.KL_boost_threshold:
+                pwht *= cfg.KL_weight_boost
+            
+            self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
+
+            board_ch.push(move_ch)
+            b_fast.push_uci(mv)
+
+        # assemble df and summary
+        cols = [
+            'move_num', 'played_move', 'best_move', 'best_cp',
+            'delta', 'played_cp', 'in_top3',
+            'best_absolute', 'played_absolute', 'stm', 'loss'
+        ]
+
+        out_df = pd.DataFrame(rows, columns=cols)
+        out_df['played_best_move'] = out_df['played_move'] == out_df['best_move']
+
+        mask_w = out_df['stm'] == True
+        mask_b = out_df['stm'] == False
+
+        overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
+        white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
+        black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
+
+        top3_cnt = int(out_df['in_top3'].sum()) if len(out_df) else 0
+        total_plies = len(out_df)
+        not_in_top3_cnt = int(total_plies - top3_cnt)
+        top3_rate = out_df['in_top3'].mean() if total_plies else np.nan
+
+        out = {
+            'plies': nw + nb,
+            'overall_cpl': rnd(cpl_s / (nw + nb), 3) if (nw + nb) else np.nan,
+            'white_cpl': rnd(cpl_w / nw, 3) if nw else np.nan,
+            'black_cpl': rnd(cpl_b / nb, 3) if nb else np.nan,
+            'overall_best_move_rate': overall_bmr,
+            'best_move_rate_white': white_bmr,
+            'best_move_rate_black': black_bmr,
+            'plays_in_top3_cnt': top3_cnt,
+            'not_in_top3_cnt': not_in_top3_cnt,
+            'plays_in_top3_rate': top3_rate,
+        }
+
+        for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
+            out[key] = game_data.get(key)
+            out_df[key] = game_data.get(key)
+
+        out['df'] = out_df
+        return out
 
 
 def lightweight_summary(results):
@@ -456,7 +529,7 @@ def make_fake_visits(mv, lms, ratio_best=60):
     return visits
 
 
-def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
+def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
     """
     cm: list of {'uci': ..., 'visits': ...}
     Ensure every legal move in lms appears (min 1) and swap visits
@@ -478,10 +551,14 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms):
 
     # compute old max
     old_max = max(d.values()) if d else 1
+    old_min = min(d.values()) if d else 1
 
     # adjust by swapping visits between played and best with 30% bump
     d[played_mv] = int(np.ceil(0.7*d[best_mv]))
-    d[best_mv] = int(np.ceil(1.3*old_max))
+    if was_blunder:
+        d[best_mv] = old_min
+    else:
+        d[best_mv] = int(np.ceil(1.3*old_max))
 
     # build sorted list
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)
@@ -515,75 +592,6 @@ def make_training_sample(b, v, visits):
 def sfe(b, engine):
     """ Quick SF eval wrapper """
     return sf_eval(b, score_fn=score_to_value_stm_pov, depth=DEPTH, engine=engine)
-
-
-def mine_additional_training_data(analysis_out, game_data, engine=None):
-    def stm(b):
-        return b.side_to_move() == 'w'
-
-    df = analysis_out['df']
-
-    tree_data = game_data['tree_search_data']
-    vs_stockfish = game_data['vs_stockfish']
-    sf_color = game_data['stockfish_is_white']
-
-    b = Board(game_data['start_fen'])
-    training_data = []
-    for i, mv in enumerate(game_data['moves_played']):
-        if vs_stockfish and (sf_color == stm(b)):
-            # we already have these, dont duplicate
-            b.push_uci(mv)
-            continue
-
-        lms = b.legal_moves()
-        # terminals are handled elsewhere
-        if not lms:
-            break
-
-        # find the df row associated to this move
-        row = df.query("played_move == @mv")
-        if len(row) > 1:
-            row = df.query("played_move == @mv").query("move_num == @i")
-        if len(row) == 0:
-            row = df.loc[df.move_num == str(i)].query("played_move == @mv")
-        if len(row) == 0:
-            b.push_uci(mv)
-            continue
-
-        # happy path, not a blunder, no action
-        if row['delta'].item() < BLUNDER_CP:
-            b.push_uci(mv)
-            continue
-
-        # if we are here, the move was a blunder
-        best_v = cp_to_value_tanh(row['best_cp'].item())
-        best_mv = row['best_move'].item()
-
-        tr = tree_data.get(i, tree_data.get(str(i), {}))
-        cm = tr.get('candidate_moves', [])
-
-        # if a blunder, dont use actual visits (theyre wrong)
-        if cm:
-            best_visits = adjust_visits_from_cm(cm, mv, best_mv, lms)
-        else:
-            best_visits = make_fake_visits(best_mv, lms)
-
-        # sanity check: best_visits must exist and sum to > 0
-        if not best_visits or sum([v[1] for v in best_visits]) <= 0:
-            print("[blunder mining] visits invalid or sum <= 0; skipping example",
-                  "move_idx=", i, "played=", mv, "best=", best_mv)
-            b.push_uci(mv)
-            continue
-
-        # make training sample and append
-        ts_best = make_training_sample(b, best_v, best_visits)
-        training_data.append(ts_best)
-
-        # push to move and let the loop roll over
-        b.push_uci(mv)
-
-    return training_data
-
 
 def report_unprocessed(entries, seen_games):
     unproc = sum([1 for e in entries if e.get('game_id') not in seen_games])
@@ -784,39 +792,3 @@ def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
             pass
 
         print("[post_hoc] post_hoc_worker exiting cleanly")
-    
-
-def start_post_hoc_server(cfg):
-    """Start post-hoc worker process and forward the working Config object."""
-    p = Process(target=post_hoc_worker, args=(cfg,), daemon=False)
-    p.start()
-
-    parts = os.path.normpath(cfg.run_dir).split(os.path.sep)
-    tail = os.path.sep.join(parts[-2:])
-    print(f"[post hoc] started server pid={p.pid} run_dir={tail} "
-        f"mine_bonus={cfg.mine_bonus_data}")
-    return p
-
-
-def stop_post_hoc_server(p, timeout=10):
-    if p is None:
-        return
-
-    # prefer polite SIGINT on POSIX so worker can flush and quitEngine
-    if os.name == "posix":
-        os.kill(p.pid, signal.SIGINT)
-    else:
-        p.terminate()
-
-    start = time.time()
-    p.join(timeout)
-    if p.is_alive():
-        # escalate to terminate/kill
-        p.terminate()
-        p.join(3)
-
-    if p.is_alive():
-        print("post_hoc_server did not exit cleanly; process still alive")
-    else:
-        print("post_hoc_server stopped")
-        del p

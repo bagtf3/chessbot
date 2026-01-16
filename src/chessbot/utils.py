@@ -205,6 +205,16 @@ def calc_entropy(visits):
     return ent, norm
 
 
+def kl_divergence(p_list, q_list):
+    # p and q must be same length lists or arrays
+    eps = 1e-12
+    p = np.asarray(p_list, dtype=float) + eps
+    q = np.asarray(q_list, dtype=float) + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    return np.sum(p * np.log(p / q))
+
+
 def ensure_df(df_or_dicts):
     if isinstance(df_or_dicts, pd.DataFrame):
         return df_or_dicts.copy()

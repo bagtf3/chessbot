@@ -14,20 +14,17 @@ matplotlib.use("Agg")
 
 import chess
 
-from pyfastchess import terminal_value_white_pov, raw_cache_bulk_insert
+from pyfastchess import raw_cache_bulk_insert
 from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
 
-from chessbot import ENDGAME_LOC, SF_LOC, SP_DIR, MODEL_DIR
+from chessbot import SF_LOC
+
 from chessbot.model import load_model, save_model, make_conv_infer
-from chessbot.mcts_utils import MCTSTree, ChessGame
-from chessbot.config import Config
-from chessbot.validation import (
-    build_validation_summary, paired_validation_games, create_validation_config
-)    
+from chessbot.validation import paired_validation_games
+from chessbot.mcts_utils import ChessGame
 
 import chessbot.utils as cbu
-from chessbot.utils import rnd, RateMeter, softmax, GameGenerator
-from chessbot.review import start_post_hoc_server, stop_post_hoc_server
+from chessbot.utils import RateMeter, GameGenerator
 
 
 class GameLooper(object):
@@ -35,7 +32,7 @@ class GameLooper(object):
     Orchestrates N games concurrently, central batching, caches, and training.
     """
     def __init__(self, model, cfg):
-        self.config = cfg or Config()
+        self.config = cfg
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
@@ -258,16 +255,6 @@ class GameLooper(object):
                 
                 # add in more games if needed
                 self.fill_active_games()
-
-                # check if its time to retrain
-                if len(self.training_queue) >= cfg.training_queue_thresh:
-                    self.trigger_retrain()
-                    # return False if there are still games to play
-                    return self.games_finished >= cfg.n_games
-
-        # train with whatever we have left and final report
-        if len(self.training_queue) >= min(2000, cfg.training_queue_thresh):
-            self.trigger_retrain()
         
         self.maybe_log_results(force=True, run_num=run_num)
         return True
@@ -393,7 +380,8 @@ class GameLooper(object):
             "duration": _now() - game.started_at,
             "sims_per_move": round(avg_sims, 3)
         }
-        # small in-memory record for recent prints only
+        
+        # this is small, push it to parent process via Queue instead on appending
         self.recent_games.append(mem_summary)
 
         # on-disk record (full)
@@ -412,168 +400,18 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
 
-        # make json safe
+        # make json/pickle safe
         res = cbu.make_jsonable(res)
-        
-        # save per-game JSON
-        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.json")
+        #
+        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            json.dump(res, f, indent=2)
-
-        # update JSONL index (small)
-        keep = [
-            "game_id", "ts", "n_retrains", "scenario", "plies",
-            "vs_stockfish", "stockfish_color", "result"
-        ]
-        new_idx = {k: res[k] for k in keep}
-        new_idx["json_file"] = out_file
-        new_idx['c_puct'] = game.tree.c_puct
+        with open(out_path, "wb") as f:
+            pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        new_idx['beat_sf'] = False
-        if new_idx['vs_stockfish']:
-            game_result = new_idx['result']
-            if game_result > 0 and not game.stockfish_is_white:
-                new_idx['beat_sf'] = True
-            elif game_result < 0 and game.stockfish_is_white:
-                new_idx['beat_sf'] = True
-            else:
-                new_idx['beat_sf'] = False
-        
-        # append to JSONL index (create parent dirs if needed)
-        idx_file = self.config.game_index_file
-        os.makedirs(os.path.dirname(idx_file), exist_ok=True)
-        with open(idx_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(new_idx, ensure_ascii=False) + "\n")
-
-        # we do not train on validation games to prevent leakage        
-        if not self.collect_training_data:
-            game.examples = []
-            return
-        
-        # game outcome in white POV (1 = white win, -1 = black win)
-        z = game.outcome if game.outcome is not None else 0.0
-        g = game.plies or 0  # game length
-
-        # use g-1 as denominator only when there are >= 2 plies; otherwise taper=0
-        denom = max(1, g-1)
-
-        vscale = self.config.vscale
-        vscale = vscale if vscale > 0 else 1.0
-        for x, mask, policy, vwq, ply, turn in game.examples:
-            # linear taper of outcome in [0, 1]
-            taper = 0.0 if z == 0 else ply / denom
-            z_stm = z if turn else -z # flip based on stm pov
-            z_tapered = taper * z_stm
-            vwq = vwq/vscale # unscale back to [-1, 1]
-            self.training_queue.append((x, mask, policy, z_stm, vwq, z_tapered))
+        # clear the game examples to prevent mem leaks
         game.examples = []
-
-    def trigger_retrain(self):
-        """
-        Pickles training queue and current config, runs retrain_worker as a
-        blocking subprocess (subprocess.run). On success reloads weights,
-        increments retrain counter, and clears caches. Returns True if a
-        retrain ran and completed, False if no retrain was needed.
-        """
-        if not self.training_queue:
-            return False
-
-        if not self.collect_training_data:
-            return False
-
-        rtbs = self.config.retrain_batch_size
-        keep = (len(self.training_queue) // rtbs) * rtbs
-        if keep == 0:
-            return False
-
-        random.shuffle(self.training_queue)
-        batch_list = self.training_queue[:keep]
-        remainder = self.training_queue[keep:]
-
-        run_dir = self.config.run_dir
-        p_pending = os.path.join(run_dir, "pending_retrain.pkl")
-        tmp_pending = p_pending + ".tmp"
-        with open(tmp_pending, "wb") as f:
-            pickle.dump(batch_list, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_pending, p_pending)
-
-        cfg_dict = self.config.to_dict()
-        cfg_dict["n_retrains"] = self.n_retrains
-        p_cfg = os.path.join(run_dir, "config.pkl")
-        tmp_cfg = p_cfg + ".tmp"
-        with open(tmp_cfg, "wb") as f:
-            pickle.dump(cfg_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_cfg, p_cfg)
-
-        rt_script = cbu.find_script("retrain_worker.py", start_file=__file__)
-        if not rt_script:
-            raise RuntimeError("retrain_worker.py not found")
-
-        cmd = [sys.executable, rt_script, "--run-dir", run_dir]
-        cmd += ["--batch-size", str(rtbs)]
-
-        print(f"[retrain] launching worker with {len(batch_list)} samples")
-
-        # platform options
-        start_new_session = False
-        creationflags = 0
-        if os.name == "posix":
-            start_new_session = True
-        else:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
-        # run blocking and capture output
-        try:
-            completed = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=start_new_session,
-                creationflags=creationflags,
-                check=False,
-                text=True,
-            )
-        except Exception as e:
-            # catastrophic spawn error
-            raise RuntimeError(f"[retrain] failed to start retrain worker: {e}")
-
-        # print a short summary and any captured output (if present)
-        rc = completed.returncode
-        print(f"[retrain] worker finished exit_code={rc}")
-
-        if completed.stdout:
-            stdout = completed.stdout.rstrip()
-            if stdout:
-                print("[retrain] STDOUT:")
-                for ln in stdout.splitlines():
-                    print(ln)
-
-        if completed.stderr:
-            stderr = completed.stderr.rstrip()
-            if stderr:
-                print("[retrain] STDERR:")
-                for ln in stderr.splitlines():
-                    print(ln)
-
-        if rc != 0:
-            # bubble up as runtime error so caller/looper notices
-            raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
-
-        # success: reload model weights, update counters and states
-        print(
-            f"[retrain] reloading new weights from "
-            f"{os.path.basename(self.config.model_path)}"
-        )
-        self.model.load_weights(self.config.model_path)
-        gc.collect()
-        self.n_retrains += 1
-        self.clear_cache = True
-
-        # commit remainder to training_queue
-        self.training_queue = remainder
-        return True
+        return
 
     def maybe_log_results(self, every_sec=60.0, window=500, force=False, run_num=None):
         def sf_bucket(vs_sf, sf_is_white):
@@ -757,7 +595,6 @@ def init_selfplay(config):
     if not getattr(config, "model_path", False):
         model_path = os.path.join(config.run_dir, model_name)
         config.model_path = model_path
-        Config.model_path = model_path
     else:
         model_path = config.model_path
 
@@ -781,99 +618,7 @@ def init_selfplay(config):
             print("[init_selfplay] failed reading progress csv:", e)
 
     return looper
+#%%%
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python looper.py <run_tag>")
-        sys.exit(1)
 
-    run_tag = sys.argv[1]
-    run_dir = os.path.join(SP_DIR, run_tag)
-
-    if not os.path.isdir(run_dir):
-        print(f"[error] run dir not found: {run_dir}")
-        sys.exit(1)
-
-    # find run config yaml
-    yaml_path = None
-    for nm in ("config.yaml", "config.yml"):
-        p = os.path.join(run_dir, nm)
-        if os.path.exists(p):
-            yaml_path = p
-            break
-
-    if yaml_path is None:
-        print(f"[error] no config.yaml or config.yml found in {run_dir}")
-        sys.exit(1)
-
-    # load base config and validation configs
-    cfg = Config.from_yaml(yaml_path, init=True)
-
-    # validation yaml path
-    val_yaml_path = os.path.join(cfg.run_dir, "validation_config.yaml")
-
-    phs = None
-    start = _now()
-    n_games, run_num = 0, 1
-    left_over_training_queue = []
-    try:
-        while run_num <= cfg.n_rounds:
-            if n_games:
-                elapsed = _now() - start
-                rt = cbu.format_time(elapsed)
-                gph = 3600 * n_games / elapsed
-                print(f"[main loop] Time: {rt} ",
-                      f"Games: {n_games} ({gph:.1f}/hr)")
-
-            is_validation = (run_num % cfg.validation_every) == 0
-
-            # prepare a working config for this iteration
-            #working_cfg = cfg.copy()
-            working_cfg = Config.from_yaml(yaml_path, init=True)
-            if is_validation:
-                if os.path.exists(val_yaml_path):
-                    working_cfg = create_validation_config(cfg, val_yaml_path)
-                else:
-                    err = f"[validation] local yaml not not found."
-                    raise Exception(err)
-
-            # toggle syzygy and other stuff on non val runs
-            else:
-                working_cfg.use_syzygy = (working_cfg.use_syzygy) & bool(run_num % 2)
-
-            # start post-hoc server if requested (use working config)
-            if phs is None and working_cfg.run_post_hoc and working_cfg.run_dir:
-                phs = start_post_hoc_server(working_cfg)
-
-            # init selfplay with the working config (returns looper + used cfg)
-            looper = init_selfplay(config=working_cfg)
-            
-            looper.training_queue += left_over_training_queue
-            # run the games for this iteration
-            # looper.run() completes up to a retrain.
-            # return to clear scope due to mem leaks
-            finished = looper.run(run_num)
-            while not finished:
-                # spawn a fresh looper (fresh TF/ infer) and continue
-                looper = looper.spawn_next_looper(clear_caches=True)
-                gc.collect()
-                finished = looper.run(run_num)
-
-            # might be some positions not trained, carry them over
-            left_over_training_queue = looper.training_queue
-            run_num += 1
-
-            # if it was a validation iteration, record its summary
-            if is_validation:
-                summary = build_validation_summary(looper)
-
-            if is_validation and working_cfg is not cfg:
-                # fully reload the base config from disk (replaces cfg)
-                cfg = Config.from_yaml(yaml_path, init=True)
-
-            n_games += looper.games_finished
-
-    finally:
-        if phs is not None:
-            stop_post_hoc_server(phs, timeout=10)

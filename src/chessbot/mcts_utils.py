@@ -145,6 +145,7 @@ class MCTSTree(fasttree):
         self.board = board
 
         # add noise to the root for exploration
+        self.root_noise_added = False
         self.add_root_dirichlet_noise()
 
         self.root_board_fen = board.fen()

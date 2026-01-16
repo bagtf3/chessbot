@@ -387,21 +387,6 @@ class ChessGame(object):
     def is_stockfish_turn(self):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
-    def get_stockfish_move(self, eng):
-        tl = 0.25  # time limit
-        res_tup = cbu.sf_eval(
-            self.board, score_fn=score_to_value_stm_pov,
-            depth=self.config.sf_depth, time_lim=tl, engine=eng
-        )
-
-        if len(res_tup) == 2:
-            val_sf, best_move = res_tup
-        else:
-            val_sf, best_move, searched = res_tup
-            self.sf_search_depth.append(searched)
-
-        return best_move, val_sf
-    
     def push_move(self, mv):
         # collect search data then push and update
         self.collect_tree_search_data(mv)
@@ -483,105 +468,38 @@ class ChessGame(object):
         self.tree_data[self.plies] = data
     
     def make_move_with_stockfish(self, eng):
-        """
-        Stockfish plays one move. If tree has visits:
-        - if SF move is top, use tree visits as-is
-        - otherwise boost SF move by 125% of top visited
-        If no visits, fall back to make_fake_visits.
-        """
+        """ Stockfish plays one move. Record depth if not using depth limit """
         legal = self.board.legal_moves()
         if not legal:
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
-        mv, sf_v = self.get_stockfish_move(eng)
-        self.sf_eval = sf_v
+        tl = 0.25  # time limit
+        res_tup = cbu.sf_eval(
+            self.board, score_fn=score_to_value_stm_pov,
+            depth=self.config.sf_depth, time_lim=tl, engine=eng
+        )
 
-        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
-        total_visits = sum([n for _, n in rows]) if rows else 0
-
-        visit_map = None
-        use_tree_visits = False
-
-        # make sure we have at least 10 visits for stability
-        if rows and total_visits > 10:
-            visit_map = {u: n for u, n in rows}
-            most_visited_uci, max_visits = rows[0]
-            if most_visited_uci == mv:
-                use_tree_visits = True
-            else:
-                # boost top visited with SF move
-                top_count = visit_map.get(most_visited_uci, 0)
-                visit_map[mv] = 1 + int(top_count*1.25)
-                use_tree_visits = True
-
-        if use_tree_visits and visit_map is not None:
-            ucis = legal
-            visits = [max(1, visit_map.get(u, 1)) for u in ucis]
+        if len(res_tup) == 2:
+            sf_v, best_move = res_tup
         else:
-            raw = make_fake_visits(mv, legal, ratio_best=60)
-            ucis = [x[0] for x in raw]
-            visits = [int(x[1]) for x in raw]
+            sf_v, best_move, searched = res_tup
+            self.sf_search_depth.append(searched)
 
-        s = sum(visits)
-        pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, self.config.prior_clip_min, self.config.prior_clip_max)
-        pi = pi / pi.sum()
-        
-        self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=sf_v, turn=self.turn())
-        return self.push_move(mv)
+        self.sf_eval = sf_v
+        return self.push_move(best_move)
 
     def make_move_from_tree(self):
-        """
-        Snapshot policy targets from root visits, then play best-by-visits.
-        """
+        """ Play best-by-visits  """
         root = self.tree.root()
         if not root.is_expanded:
             return False
-        rows = self.tree.root_child_visits()  # [(uci, N)] sorted desc
-        if not rows:
-            return False
-
-        ucis   = [u for u, _ in rows]
-        visits = np.array([n for _, n in rows], dtype=np.float32)
-        s = visits.sum()
-        pi = (visits / s) if s > 0.0 else np.zeros_like(visits)
-
-        pi = np.clip(pi, self.config.prior_clip_min, self.config.prior_clip_max)
-        pi = pi / pi.sum()
-        vwq = self.tree.visit_weighted_Q()
-
-        # tree is white POV, we want STM-POV so we flip here
-        vwq = vwq if self.turn() else -vwq
-    
-        if pi is not None:
-            self.append_flat_policy_example(ucis=ucis, pi=pi, vwq=vwq, turn=self.turn())
 
         mv, _ = self.tree.best()
         if mv is None:
             return False
-        return self.push_move(mv)
-    
-    def append_flat_policy_example(self, ucis, pi, vwq, turn):
-        """
-        Snapshot inputs and a flat 4288-length policy vector for training.
-        - ucis: list[str] legal moves (same order as probs)
-        - pi:  list/array of probs (sum ~= 1)
-        - vwq: scalar value target (white-POV)
-        """
         
-        # get indices from C++
-        indices = self.board.moves_to_indices(ucis)  # list of int (0..4288)
-        policy = np.zeros(64 * 67, dtype=np.float32)
-
-        # accumulate probs into flattened policy
-        for idx, p in zip(indices, pi):
-            policy[idx] += p
-
-        # snapshot inputs and push example
-        x = self.board.encode_64_tokens()
-        mask = self.board.legal_move_mask()
-        self.examples.append((x, mask, policy, vwq, self.plies, turn))
+        return self.push_move(mv)
 
     def check_for_eval_draw(self, cfg):
         n_last = cfg.eval_draw_span

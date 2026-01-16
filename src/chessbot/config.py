@@ -73,6 +73,8 @@ class Config(object):
     post_hoc_analyze_batch = 30
     post_hoc_depth = 12
     post_hoc_equiv_range = 30
+    KL_boost_threshold = 1.75
+    KL_weight_boost = 1.5
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,

@@ -23,16 +23,9 @@ from chessbot.utils import (
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
 )
 
-import chessbot.review as rv
+from chessbot.review import ANALYZE_PKL, save_pickle_atomic, analyze_with_rank
 
 
-pkl = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_vs_stockfish/pkl_game_logs/00d42f10-c451-4ef4-bf33-7c2d0252574b_log.pkl"
-with open(pkl, "rb") as f:
-    game_data = pickle.load(f)
-
-
-from chessbot.config import Config
-cfg = Config()
 #%%
 class Rescorer():
     def __init__(self, cfg):
@@ -202,7 +195,7 @@ class Rescorer():
                 continue
 
             # if here, its MCTS move
-            res = rv.analyze_with_rank(move_ch, board_ch, limit, eng)
+            res = analyze_with_rank(move_ch, board_ch, limit, eng)
             loss_this = res['delta_signed']
             cpl_s += loss_this
             if board_ch.turn:
@@ -304,8 +297,12 @@ class Rescorer():
         }
 
         for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
-            out[key] = game_data.get(key)
-            out_df[key] = game_data.get(key)
+            val = game_data.get(key)
+            if key == 'ts':
+                val = int(val)
+                
+            out[key] = val
+            out_df[key] = val
 
         out['df'] = out_df
         return out
@@ -567,3 +564,21 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
     # build sorted list
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)
     return [[u, int(v)] for u, v in items]
+
+
+if __name__ == '__main__':
+    pkl_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_vs_stockfish/pkl_game_logs/"
+    pkls = os.listdir(pkl_dir)
+    all_outs = []
+    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+        eng.configure({"Threads": 1, "Hash": 128})
+        cfg = Config()
+        rs = Rescorer(cfg)
+        for pkl in pkls[:10]:
+            with open(os.path.join(pkl_dir, pkl), "rb") as f:
+                game_data = pickle.load(f)
+                
+            out = rs.analyze_and_mine(game_data, eng)
+            all_outs.append(out)
+    
+

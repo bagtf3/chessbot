@@ -409,8 +409,8 @@ class GameLooper(object):
         with open(out_path, "wb") as f:
             pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        # clear the game examples to prevent mem leaks
-        game.examples = []
+        # clear the game recents to prevent mem leaks
+        game.recents.clear()
         return
 
     def maybe_log_results(self, every_sec=60.0, window=500, force=False, run_num=None):

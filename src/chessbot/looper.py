@@ -9,9 +9,6 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-import matplotlib
-matplotlib.use("Agg")
-
 import chess
 
 from pyfastchess import raw_cache_bulk_insert

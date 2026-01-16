@@ -31,10 +31,14 @@ with open(pkl, "rb") as f:
     game_data = pickle.load(f)
 
 
+from chessbot.config import Config
+cfg = Config()
+#%%
 class Rescorer():
     def __init__(self, cfg):
         self.config = cfg
         self.training_data = []
+        self.train_on_stockfish = True
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
@@ -198,7 +202,7 @@ class Rescorer():
                 continue
 
             # if here, its MCTS move
-            res = analyze_with_rank(move_ch, board_ch, limit, eng)
+            res = rv.analyze_with_rank(move_ch, board_ch, limit, eng)
             loss_this = res['delta_signed']
             cpl_s += loss_this
             if board_ch.turn:
@@ -226,7 +230,7 @@ class Rescorer():
                 visits = sorted(visits, key=lambda x: x[1], reverse=True)
             
             # for mild blunders adjust visits
-            elif cpl < cfg.blunder_cp
+            elif cpl < cfg.post_hoc_blunder_cp:
                 best_mv = str(res.get('best_move'))
                 visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
 

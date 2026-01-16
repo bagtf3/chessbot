@@ -402,7 +402,7 @@ class GameLooper(object):
 
         # make json/pickle safe
         res = cbu.make_jsonable(res)
-        #
+        
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         out_path.parent.mkdir(parents=True, exist_ok=True)

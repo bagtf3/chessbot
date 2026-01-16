@@ -358,18 +358,16 @@ class ChessGame(object):
         self.tree = MCTSTree(self.board, self.config)
         self.tree_data = {}
         self.moves_played = []
+        self.recents = []
         
         self.mat_adv_counter = 0
         self.outcome = None
-        self.examples = []
         self.plies = 0
-        self.vwq = None
         self.sf_eval = None
 
         # eval collar and eval draw to shorten selfplay games
         self.collar_stop_set = False
         self.collar_stop_eventual_outcome = None
-        self.collar_stop_lower_threshold = None
         if self.config.use_eval_collar:
             self.next_collar_stop_check = cfg.eval_collar_min_plies
         else:
@@ -423,21 +421,29 @@ class ChessGame(object):
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
 
+        turn = self.turn() # STM
         data = {
             "sims": sims, "time": rnd(elapsed, 3),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
             "total_children": total_children,
-            "visit_weighted_Q": rnd(self.tree.visit_weighted_Q(), 4),
-            "stop_reason": self.tree.sim_stop_reason
+            "stop_reason": self.tree.sim_stop_reason, "stm": turn
         }
-
+        
         # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
+        vwq = rnd(self.tree.visit_weighted_Q(), 4)
+        Q_white = vwq
+        Q_stm = Q_white if turn else -Q_white
         if self.is_stockfish_turn():
-            data['Q_stm'] = self.sf_eval
-        else:
-            vwq = data['visit_weighted_Q']
-            data['Q_stm'] = vwq if self.turn() else -1*vwq
+            Q_stm = self.sf_eval
+            Q_white = Q_stm if turn else -Q_stm
+
+        data["visit_weighted_Q"] = vwq
+        data['Q_stm'] = Q_stm
+        data['Q_white'] = Q_white
+
+        # keep a small list of items for gameplay checking
+        self.recents.append((mv, Q_stm, Q_white, vwq, turn))
 
         # sumN for U term
         sumN = max(1, root.N)
@@ -507,20 +513,17 @@ class ChessGame(object):
         thresh_d = cfg.eval_draw_thresh
             
         # if we don't yet have a full window, schedule when we will
-        if len(self.examples) < n_last:
-            needed = n_last - len(self.examples)
+        if len(self.recents) < n_last:
+            needed = n_last - len(self.recents)
             self.next_eval_draw_check = self.plies + needed
             return False
-
-        # look up n_last vwqs and assess vs draw threshold
-        # vwq is 4th element in examples tuples
-        recent = [e[3] for e in self.examples[-n_last:]]
         
         # check and see if we've passed the test, if not when to check again
         violated = False
         violating_index = None
-        for i, r in enumerate(reversed(recent)):
-            if abs(r) > thresh_d:
+        for i, r in enumerate(reversed(self.recents[-n_last:])):
+            # r is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+            if abs(r[1]) > thresh_d:
                 violated = True
                 violating_index = i
                 break
@@ -551,7 +554,8 @@ class ChessGame(object):
 
             # scan newest->oldest. rev_i 0 == newest
             sign_check = None
-            for rev_i, ex in enumerate(reversed(self.examples[-n_last:])):
+            for rev_i, ex in enumerate(reversed(self.recents[-n_last:])):
+                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
                 vwq = ex[3]
                 # magnitude must meet the lock threshold
                 if abs(vwq) < thresh:
@@ -559,9 +563,9 @@ class ChessGame(object):
                     self.next_collar_stop_check = self.plies + needed
                     return False, None
 
-                # convert to white-POV signed value
-                z_white = vwq if ex[5] else -vwq
-                sign = 1*(z_white > 0) - 1*(z_white < 0)
+                # use white-POV signed value here
+                q_white = ex[2]
+                sign = 1*(q_white > 0) - 1*(q_white < 0)
 
                 if sign_check is None:
                     sign_check = sign
@@ -581,26 +585,17 @@ class ChessGame(object):
         # already locked: check for release (blunder) in a short tail
         else:
             check_depth = 3
-            tail = self.examples[-check_depth:]
-            keep_tail = []
-            stop_game = False
+            tail = self.recents[-check_depth:]
 
             for ex in tail:
-                vwq = ex[3]
-                z_white = vwq if ex[5] else -vwq
+                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+                q_white = ex[2]
                 # positive when leader still ahead
-                sign_stability = self.collar_stop_eventual_outcome * z_white
+                sign_stability = self.collar_stop_eventual_outcome * q_white
 
                 # if sign_stability falls below the trigger, we stop and award win
                 if sign_stability < self.collar_stop_trigger:
-                    stop_game = True
-                else:
-                    keep_tail.append(ex)
-
-            if stop_game:
-                # replace only the tail portion
-                self.examples = self.examples[:-check_depth] + keep_tail
-                return True, self.collar_stop_eventual_outcome
+                    return True, self.collar_stop_eventual_outcome
         
         # no stop detected
         return False, None

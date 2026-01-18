@@ -29,6 +29,7 @@ class GameLooper(object):
     Orchestrates N games concurrently, central batching, caches, and training.
     """
     def __init__(self, model, cfg, recent_games_q, telemetry_q):
+        self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_games_q
         self.telemetry_q = telemetry_q
@@ -92,27 +93,18 @@ class GameLooper(object):
         self.close()
         return False
 
-    def warmup_infer(self):    
-        if not self.infer_is_warm:
-            print(f"[model warmup] warming GPU for {self.batch_candidates}")
-            for bs in self.batch_candidates:
-                for _ in range(3):
-                    rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
-                    rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
-                    self.infer((rep_enc, rep_mask))
-            self.infer_is_warm = True
-            print("[model warmup] warm up complete")
+    def warmup_infer(self):
+        if self.infer_is_warm:
+            return
+        print(f"[model warmup] warming GPU for {self.batch_candidates}")
+        for bs in self.batch_candidates:
+            for _ in range(3):
+                rep_mask = (np.random.rand(bs, 4288) < 0.02).astype(np.int32)
+                rep_enc = (np.random.rand(bs, 64) < 0.32).astype(np.int32)
+                self.infer((rep_enc, rep_mask))
 
-    def restart_run(self, run_num=None):
-        cfg = self.config
-        self.infer = make_conv_infer(
-            self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
-            vscale=cfg.vscale
-        )
-
-        self.infer_is_warm = False
-        return self.run(run_num=run_num)
+        self.infer_is_warm = True
+        print("[model warmup] warm up complete")
 
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
@@ -394,14 +386,6 @@ class GameLooper(object):
             "duration": _now() - game.started_at,
             "sims_per_move": round(avg_sims, 3)
         }
-        
-        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
-        out_path = pathlib.Path(out_file)
-
-        mem_summary['pkl_file'] = outpath
-        # this is small, push it to parent process via Queue instead on appending
-        if self.game
-        self.recent_games.append(mem_summary)
 
         # on-disk record (full)
         res = {
@@ -411,6 +395,7 @@ class GameLooper(object):
             "model_epoch": self.n_retrains,
             "n_retrains": self.n_retrains
         }
+
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
@@ -421,13 +406,18 @@ class GameLooper(object):
 
         # make json/pickle safe
         res = cbu.make_jsonable(res)
-        
+
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
+        mem_summary['pkl_file'] = str(out_path)
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "wb") as f:
             pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
         
+        # this is small, push it to parent process via Queue instead on appending
+        self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
+
         # clear the game recents to prevent mem leaks
         game.recents.clear()
         return
@@ -556,58 +546,7 @@ class GameLooper(object):
                 print(f"[game stats] last 50 runtime: {avg_runtime}")
         print("-"*72)
 
-    def spawn_next_looper(self, clear_caches=True):
-        """
-        Create a fresh GameLooper using the model at config.model_path, transfer
-        runtime internals into it, and return the new looper.
-        """
-        # make sure we free TF/Keras state before loading the new model
-        print(
-            f"[spawn] reloading model from "
-            f"{os.path.basename(self.config.model_path)}"
-        )
-        tf.keras.backend.clear_session()
-
-        # load model and create fresh looper (fresh infer, fresh tf funcs)
-        new_model = load_model(self.config.model_path)
-        new_looper = GameLooper(model=new_model, cfg=self.config.copy())
-
-        # fields to transfer (lists and counters)
-        transfer_fields = [
-            "active_games", "training_queue", "recent_games",
-            "games_finished", "white_wins", "black_wins", "draws",
-            "total_plies", "n_retrains", "sf_count",
-            "moves_played", "sims_done_total", "sf_search_depths",
-        ]
-
-        for fld in transfer_fields:
-            setattr(new_looper, fld, getattr(self, fld))
-
-        # transfer meters and timing state (keep same objects so history is retained)
-        new_looper.mps = self.mps
-        new_looper.lps = self.lps
-        new_looper.prediction_times = self.prediction_times
-        new_looper._run_start = getattr(self, "_run_start", _now())
-
-        # ensure new looper starts with a fresh infer warm state
-        new_looper.infer_is_warm = False
-
-        # optionally clear shared caches (helps avoid stale C++/raw cache issues)
-        if clear_caches:
-            print("[spawn] clearing raw/prior caches to avoid leaks")
-            raw_cache_clear()
-            new_looper.clear_cache = False
-
-        # free old model object and try to force collection
-        del self.model
-        del self.infer
-        gc.collect()
-
-        print("[spawn] new looper ready; continuing with transferred games")
-        return new_looper
-
-
-def init_selfplay(config, gameplay_q, telemetry_q):
+def init_selfplay(config, recent_games_q, telemetry_q):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -625,7 +564,10 @@ def init_selfplay(config, gameplay_q, telemetry_q):
         model = load_model(config.init_model)
         save_model(model, model_path)
 
-    looper = GameLooper(model=model, cfg=config.copy(), gameplay_q, telemetry_q)
+    looper = GameLooper(
+        model=model, cfg=config.copy(),
+        recent_games_q=recent_games_q, telemetry_q=telemetry_q
+    )
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):

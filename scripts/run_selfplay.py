@@ -10,11 +10,10 @@ from chessbot.rescore import Rescorer
 from chessbot.config import Config
 
 
-def child_looper(cfg, gameplay_q, telemetry_q):
-    with init_selfplay(config=cfg, gameplay_q, telemetry_q) as looper:
+def child_looper(cfg, recent_games_q, telemetry_q):
+    with init_selfplay(cfg, recent_games_q, telemetry_q) as looper:
         looper.run()
-    
-    
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

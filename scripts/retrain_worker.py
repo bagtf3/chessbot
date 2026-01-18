@@ -1,29 +1,77 @@
 """
 retrain_worker.py
 
-Expectations:
 - run_dir contains:
-  - pending_retrain.pkl   (list of (x, mask, policy, z_stm, vwq, z_tapered))
-  - config.pkl           (a pickled dict produced by Config.to_dict())
-- model path is taken from the config dict (cfg['model_path'])
-- script writes model to same path atomically
+  - pending_training/  (directory containing shard .pkl files)
+  - config.yaml        (the run config, loaded via Config.from_yaml)
+- each shard is a list of tuples:
+  (x, mask, policy, Y, vwht, pwht)
+- model path is taken from the loaded config
+- after successful retrain+save, delete shard files that were loaded
 """
 
 import argparse
-import os, time
-import pickle
+import os
+import time
+import pickle, yaml
 import sys
 
 import numpy as np
 import pandas as pd
 
-from chessbot.model import load_model, save_model
+from chessbot.model import load_model
+from chessbot.config import Config
 import chessbot.utils as cbu
 
 
 def load_pickle(path):
     with open(path, "rb") as fh:
         return pickle.load(fh)
+
+
+def list_pending_shards(pending_dir):
+    if not os.path.isdir(pending_dir):
+        return []
+
+    fns = [fn for fn in os.listdir(pending_dir) if fn.endswith(".pkl")]
+    fns = [fn for fn in fns if not fn.endswith(".tmp.pkl")]
+    fns.sort()
+    return [os.path.join(pending_dir, fn) for fn in fns]
+
+
+def load_shards(paths, tries=3, sleep_s=0.25):
+    combined = []
+    loaded = []
+
+    for path in paths:
+        ok = False
+        for _ in range(tries):
+            try:
+                items = load_pickle(path)
+                if items:
+                    combined += list(items)
+                loaded.append(path)
+                ok = True
+                break
+            except Exception:
+                time.sleep(sleep_s)
+
+        if not ok:
+            print("[retrain] failed reading shard (skipped):", path)
+
+    return combined, loaded
+
+
+def delete_files(paths):
+    removed = 0
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed += 1
+        except Exception as e:
+            print("[retrain] failed deleting:", path, "err:", e)
+    return removed
 
 
 def main():
@@ -34,177 +82,117 @@ def main():
     args = p.parse_args()
 
     run_dir = args.run_dir
-    infile = os.path.join(run_dir, "pending_retrain.pkl")
-    config_file = os.path.join(run_dir, "config.pkl")
 
-    cfg = load_pickle(config_file)
-    train = load_pickle(infile) # expect list
-    
-    # check for additional data pkl and load+remove if present
-    add_pkl = os.path.join(cfg['run_dir'], "additional_training_data.pkl")
-    additional = []
-    
-    if cfg.get("mine_bonus_data", False):
-        if os.path.exists(add_pkl):
-            # may hit an unlucky access deny if during a write.
-            tries = 0
-            while tries < 3:
-                try:
-                    additional = load_pickle(add_pkl)
-                    # remove immediately so nothing is re-read later
-                    os.remove(add_pkl)
-                    n_add = len(additional)
-                    print(f"[retrain] found {n_add} additional training samples")
-                    break
-                except:
-                    # if we get an error, wait a bit and try again
-                    time.sleep(0.5)
-                    tries += 1
-        
-        if not additional:
-            print("[retrain] no additional data found at", add_pkl)
-    
-    # combined list: existing queue first, additional appended
-    combined = train + additional
-    n_main = len(train)
+    # load config from yaml and start looking for training shards
+    config_file = os.path.join(run_dir, "config.yaml")
+    cfg = Config.from_yaml(config_file)
 
-    # Unpack examples
+    pending_dir = os.path.join(run_dir, "pending_training")
+    shard_paths = list_pending_shards(pending_dir)
+    if not shard_paths:
+        print("[retrain] no shards found in:", pending_dir)
+        return 0
+
+    combined, loaded_shards = load_shards(shard_paths)
+    print(f"[retrain] loaded {len(loaded_shards)} shards, samples={len(combined)}")
+
+    if not combined:
+        print("[retrain] no training samples after loading shards")
+        return 0
+
+    idx = np.random.permutation(len(combined))
+    combined = [combined[i] for i in idx]
+
     X_list = []
-    P_list = []        # flattened 4288 policy vectors
-    mask_list = []     # derived legal-mask (0/1)
-    Z_list = []
-    Z_taper_list = []
-    Vwq_list = []
-    is_add_flag = []
+    P_list = []
+    mask_list = []
+    Y_list = []
+    vwht_list = []
+    pwht_list = []
 
-    for i, (x, mask, policy, z_stm, vwq, z_tapered) in enumerate(combined):
-        # avoid potential nans in vwq
-        if vwq != vwq:
-            print("[retrain] nan value found in vwq (removed)")
+    for x, mask, policy, y, vwht, pwht in combined:
+        # quick nan check, should never happen
+        if np.isnan(y):
             continue
+
         X_list.append(x)
         P_list.append(policy)
         mask_list.append(mask)
-        Z_list.append(z_stm)
-        Vwq_list.append(vwq)
-        Z_taper_list.append(z_tapered)
-        is_add_flag.append(i >= n_main)  # True for additional samples
+        Y_list.append(y)
+        vwht_list.append(vwht)
+        pwht_list.append(pwht)
 
-    # stack arrays
-    X = np.asarray(X_list, dtype=np.int32)               # (N, 64) expected
-    P = np.stack(P_list, axis=0).astype(np.float32)      # (N, 4288)
-    M = np.stack(mask_list, axis=0).astype(np.int32)     # (N, 4288)
-    Z = np.asarray(Z_list, dtype=np.float32)
-    Vwq = np.asarray(Vwq_list, dtype=np.float32)
-    Z_taper_arr = np.asarray(Z_taper_list, dtype=np.float32)
-    is_add = np.asarray(is_add_flag, dtype=np.bool_)
+    X = np.asarray(X_list, dtype=np.int32)
+    P = np.stack(P_list, axis=0).astype(np.float32)
+    M = np.stack(mask_list, axis=0).astype(np.int32)
+    Y_value = np.asarray(Y_list, dtype=np.float32)
+    vwht = np.asarray(vwht_list, dtype=np.float32)
+    pwht = np.asarray(pwht_list, dtype=np.float32)
 
-    # optionally blend (possibly tapered) outcome with visit-weighted Q
-    wz = cfg['target_y_weights'].get("z", 0.25)
-    wz_taper = cfg['target_y_weights'].get("z_taper", 0.5)
-    w_vwq = cfg['target_y_weights'].get("vwq", 0.25)
-    Y_value = wz*Z + wz_taper*Z_taper_arr + w_vwq*Vwq
-
-    # define a few masks here then ensure additional
-    # samples are not blended or downweighted
-    draw_mask = Z == 0
-    played_by_winner = Z == 1
-    if is_add.any():
-        Y_value[is_add] = Vwq[is_add]
-        draw_mask[is_add] = False
-        played_by_winner[is_add] = True
+    # weight name, weight
+    for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
+        print(
+            f"[retrain] {n} min/mean/max: {w.min():.3f} {w.mean():.3f} {w.max():.3f}"
+    )
     
-    Y_value = np.clip(Y_value, -1.0, 1.0)
-
-    # initial per-sample weights (ones)
-    weights = np.ones_like(Y_value, dtype=np.float32)
-    lw = cfg['loss_weights']
-    
-    # downweight draws so value head doesnt collapse
-    v_wts = lw['value_out']*weights
-    wts_before = v_wts.sum()
-    v_wts[draw_mask] *= max(cfg['draw_weight'], 0.001)
-    wts_after = v_wts.sum()
-
-    # redistribute to not change overall loss weight
-    wt_lost = wts_before - wts_after
-    n_non_draws = (~draw_mask).sum()
-    if wt_lost > 0 and n_non_draws > 0:
-        v_wts[~draw_mask] += wt_lost/n_non_draws
-    
-    # policy weights vary depend on outcome
-    p_wts_win = lw['policy_winner']*weights
-    p_wts_lose = lw['policy_loser']*weights
-    p_wts = np.where(played_by_winner, p_wts_win, p_wts_lose)
-    
-    # assemble final Y dict and sample_weight mapping for TF fit
     Y = {"value_out": Y_value, "policy_logits": P}
-    s_wts = {'value_out': v_wts, "policy_logits": p_wts}
+    s_wts = {"value_out": vwht, "policy_logits": pwht}
 
-    # untrained model
-    model_path = cfg.get("model_path")
+    model_path = cfg.model_path
     model = load_model(model_path)
 
-    # previous trains
-    if os.path.exists(cfg['progress_csv_path']):
-        all_evals = pd.read_csv(cfg['progress_csv_path'])
+    if os.path.exists(cfg.progress_csv_path):
+        all_evals = pd.read_csv(cfg.progress_csv_path)
         n_retrains = len(all_evals)
     else:
         all_evals = pd.DataFrame()
-        n_retrains = cfg['n_retrains']
+        n_retrains = cfg.n_retrains
 
-    # evaluation and logging
-    plt_file = os.path.join(cfg['run_dir'], "true_vs_pred_plot_latest.png")
+    plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
     epoch = n_retrains
     eval_df = cbu.score_game_data(model, X, M, Y, epoch, save_path=plt_file)
     all_evals = pd.concat([all_evals, eval_df])
-    all_evals.round(5).to_csv(cfg['progress_csv_path'], index=False)
+    all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
 
     if len(all_evals) and len(all_evals) % 5 == 0:
-        prog_plt_file = cfg['progress_plot_path']
-        cbu.plot_training_progress(all_evals, epoch=epoch, save_path=prog_plt_file)
-
-    # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
-    history = model.fit(
-        X, Y, epochs=args.epochs, batch_size=args.batch_size,
-        verbose=0, sample_weight=s_wts, shuffle=True
-    )
+        cbu.plot_training_progress(
+            all_evals, epoch=epoch, save_path=cfg.progress_plot_path
+        )
 
     rows = []
     for m, v in history.history.items():
         name = "total" if m == "loss" else m.replace("_loss", "")
-        start = v[0]; end = v[-1]
+        start = v[0]
+        end = v[-1]
         delta = start - end
         mark = "*" if delta < 0 else "+"
         rows.append((name, start, end, delta, mark))
-    
-    name_w = max(len(r[0]) for r in rows)
-    num_w = 8   # width for numbers
-    fmt = (f"[epoch {epoch:4d}] [model fit]  "
-        f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
-        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
 
+    name_w = max([len(r[0]) for r in rows])
+    num_w = 8
+    fmt = (
+        f"[epoch {epoch:4d}] [model fit]  "
+        f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
+        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}"
+    )
     for name, start, end, delta, mark in rows:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
-    
-    # checkpoint new weights, move existing model to .bak
-    model_path = cfg['model_path']
-    bak_path = model_path + ".bak"
 
+    bak_path = model_path + ".bak"
     if os.path.exists(model_path):
         try:
             os.replace(model_path, bak_path)
-            print(f"[retrain] backed up existing model")
+            print("[retrain] backed up existing model")
         except Exception as e:
-            print(f"[retrain] failed to backup existing model: {e}")
+            print("[retrain] failed to backup existing model:", e)
 
-    # save new model to model_path
     model.save(model_path)
     print("[retrain] retraining complete for epoch", epoch)
+
+    removed = delete_files(loaded_shards)
+    print(f"[retrain] deleted {removed} shard files")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

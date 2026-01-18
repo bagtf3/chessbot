@@ -28,8 +28,10 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg):
+    def __init__(self, model, cfg, recent_games_q, telemetry_q):
         self.config = cfg
+        self.recent_games_q = recent_games_q
+        self.telemetry_q = telemetry_q
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
@@ -45,6 +47,11 @@ class GameLooper(object):
         
         self.model = model
 
+        self.eng = None
+        if cfg.play_vs_sf_prob > 0.0:
+            self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+            self.eng.configure(cfg.sf_config)
+
         cfg = self.config
         self.infer = make_conv_infer(
             self.model, max_bs=cfg.fwd_batch,
@@ -54,8 +61,6 @@ class GameLooper(object):
 
         self.infer_is_warm = False
         self.batch_candidates = self.create_batch_candidates(cfg)
-        self.training_queue = []
-        self.recent_games = []
 
         self.white_wins = 0
         self.black_wins = 0
@@ -75,6 +80,29 @@ class GameLooper(object):
         self.moves_played = 0
         self.sims_done_total = 0
     
+    def close(self):
+        if self.eng is not None:
+            self.eng.quit()
+            self.eng = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def warmup_infer(self):    
+        if not self.infer_is_warm:
+            print(f"[model warmup] warming GPU for {self.batch_candidates}")
+            for bs in self.batch_candidates:
+                for _ in range(3):
+                    rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
+                    rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
+                    self.infer((rep_enc, rep_mask))
+            self.infer_is_warm = True
+            print("[model warmup] warm up complete")
+
     def restart_run(self, run_num=None):
         cfg = self.config
         self.infer = make_conv_infer(
@@ -141,117 +169,117 @@ class GameLooper(object):
         """
 
         cfg = self.config
+        eng = self.eng
+        self.warmup_infer()
         mbs = cfg.micro_batch
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
-        with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            eng.configure(cfg.sf_config)
-            while self.games_finished < cfg.n_games:
-                if not self.active_games:
-                    break
-                
-                preds_batch = []
-                finished = []
-                for game in self.active_games[:cfg.games_at_once]:
-                    if game.tree.needs_root_noise(check_sims=True):
-                        game.tree.add_root_dirichlet_noise()
+        while self.games_finished < cfg.n_games:
+            if not self.active_games:
+                break
+            
+            preds_batch = []
+            finished = []
+            for game in self.active_games[:cfg.games_at_once]:
+                if game.tree.needs_root_noise(check_sims=True):
+                    game.tree.add_root_dirichlet_noise()
 
-                    # if its stockfish turn, let SF move and skip MCTS this ply
-                    if game.is_stockfish_turn():
-                        if game.tree.sims_completed_this_move > cfg.sf_move_sims:
-                            sf_terminal = game.make_move_with_stockfish(eng)
-                            mps.tick(1)
-                                
-                            if sf_terminal:
-                                self.finalize_game_data(game)
-                                finished.append(game.game_id)
-                                # pass until the next turn
-                                continue
-        
-                    # if this game has reached its local sim budget, make the move
-                    elif game.tree.stop_simulating():
-                        # bot plays from tree
-                        mcts_terminal = game.make_move_from_tree()
+                # if its stockfish turn, let SF move and skip MCTS this ply
+                if game.is_stockfish_turn():
+                    if game.tree.sims_completed_this_move > cfg.sf_move_sims:
+                        sf_terminal = game.make_move_with_stockfish(eng)
                         mps.tick(1)
-                        
-                        # terminal after bot move?
-                        if mcts_terminal:
+                            
+                        if sf_terminal:
                             self.finalize_game_data(game)
                             finished.append(game.game_id)
+                            # pass until the next turn
                             continue
-
-                    # collect up to micro_batch leaves for this game
-                    # CollectResults object from C++
-                    res = game.tree.collect_many_leaves(mbs, max_fastpath)
+    
+                # if this game has reached its local sim budget, make the move
+                elif game.tree.stop_simulating():
+                    # bot plays from tree
+                    mcts_terminal = game.make_move_from_tree()
+                    mps.tick(1)
                     
-                    nn = res.count_new
-                    nt = res.count_terminal
-                    nc = res.count_cached
-                    pl = res.total_priorless
-                    pu = res.total_puct
+                    # terminal after bot move?
+                    if mcts_terminal:
+                        self.finalize_game_data(game)
+                        finished.append(game.game_id)
+                        continue
 
-                    # new + cached + terminal
-                    n_leafs = nn + nc + nt 
-                    lps.tick(n_leafs)
-
-                    # update sim count
-                    game.tree.sims_completed_this_move += n_leafs
-
-                    if nn:
-                        preds_batch += game.tree.pending_encoded_64_tokens()
-
-                    fastpaths = nt + nc
-                    f_stop, c_stop = 0, 1
-                    if nn < mbs:
-                        f_stop, c_stop = 1, 0
-
-                    counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
+                # collect up to micro_batch leaves for this game
+                # CollectResults object from C++
+                res = game.tree.collect_many_leaves(mbs, max_fastpath)
                 
-                # run predictions if we have any. sends results to c++ raw cache
-                if preds_batch:
-                    self.format_and_predict(preds_batch)
-                    lpb.append(len(preds_batch))
+                nn = res.count_new
+                nt = res.count_terminal
+                nc = res.count_cached
+                pl = res.total_priorless
+                pu = res.total_puct
 
-                if self.maybe_log_results(run_num=run_num):
-                    self.log_loop_stats(counts, mbs, lpb)
-                    counts = []
-                    lpb = []
-                
-                # resolve fresh predictions back into each game tree
-                for game in self.active_games:
-                   game.tree.resolve_pending()
-                
-                # clear caches after model training and the last round of moves
-                if self.clear_cache:
-                    pc = priors_cache_stats()
-                    p_size = pc.get("size", 0)
-                    p_cap  = pc.get("capacity", 1)
-                    p_ev   = pc.get("evictions", 0)
-                    p_q    = pc.get("queries", 0)
-                    p_h    = pc.get("hits", 0)
-                    p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
-                    p_evr  = (100.0 * p_ev / p_cap) if p_cap else 0.0
+                # new + cached + terminal
+                n_leafs = nn + nc + nt 
+                lps.tick(n_leafs)
 
-                    print("Clearing caches after training")
-                    cs = "[cache stats]"
-                    print(f"{cs} size: {p_size}/{p_cap} evictions: {p_ev} queries: {p_q}")
-                    print(
-                        f"{cs} hits: {p_h} hit_rate: {p_hit:.2f}% evict_rate: {p_evr:.2f}%"
-                    )
+                # update sim count
+                game.tree.sims_completed_this_move += n_leafs
 
-                    # finally clear them
-                    raw_cache_clear()
-                    priors_cache_clear()
-                    self.clear_cache = False
+                if nn:
+                    preds_batch += game.tree.pending_encoded_64_tokens()
 
-                # remove any finished games
-                self.active_games = [
-                    g for g in self.active_games if g.game_id not in finished
-                ]
-                
-                # add in more games if needed
-                self.fill_active_games()
+                fastpaths = nt + nc
+                f_stop, c_stop = 0, 1
+                if nn < mbs:
+                    f_stop, c_stop = 1, 0
+
+                counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
+            
+            # run predictions if we have any. sends results to c++ raw cache
+            if preds_batch:
+                self.format_and_predict(preds_batch)
+                lpb.append(len(preds_batch))
+
+            if self.maybe_log_results(run_num=run_num):
+                self.log_loop_stats(counts, mbs, lpb)
+                counts = []
+                lpb = []
+            
+            # resolve fresh predictions back into each game tree
+            for game in self.active_games:
+                game.tree.resolve_pending()
+            
+            # clear caches after model training and the last round of moves
+            if self.clear_cache:
+                pc = priors_cache_stats()
+                p_size = pc.get("size", 0)
+                p_cap  = pc.get("capacity", 1)
+                p_ev   = pc.get("evictions", 0)
+                p_q    = pc.get("queries", 0)
+                p_h    = pc.get("hits", 0)
+                p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
+                p_evr  = (100.0 * p_ev / p_cap) if p_cap else 0.0
+
+                print("Clearing caches after training")
+                cs = "[cache stats]"
+                print(f"{cs} size: {p_size}/{p_cap} evictions: {p_ev} queries: {p_q}")
+                print(
+                    f"{cs} hits: {p_h} hit_rate: {p_hit:.2f}% evict_rate: {p_evr:.2f}%"
+                )
+
+                # finally clear them
+                raw_cache_clear()
+                priors_cache_clear()
+                self.clear_cache = False
+
+            # remove any finished games
+            self.active_games = [
+                g for g in self.active_games if g.game_id not in finished
+            ]
+            
+            # add in more games if needed
+            self.fill_active_games()
         
         self.maybe_log_results(force=True, run_num=run_num)
         return True
@@ -289,17 +317,6 @@ class GameLooper(object):
         # (helps XLA/static-trace shapes)
 
         target_bs = self.config.fwd_batch
-        # need to make sure the tf.function is warm
-        if not self.infer_is_warm:
-            print(f"[model warmup] warming GPU for {self.batch_candidates}")
-            for bs in self.batch_candidates:
-                for _ in range(3):
-                    rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
-                    rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
-                    self.infer((rep_enc, rep_mask))
-            self.infer_is_warm = True
-            print("[model warmup] warm up complete")
-
         B = boards_np.shape[0]
         if B < target_bs:
             # choose padding target safely
@@ -378,7 +395,12 @@ class GameLooper(object):
             "sims_per_move": round(avg_sims, 3)
         }
         
+        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
+        out_path = pathlib.Path(out_file)
+
+        mem_summary['pkl_file'] = outpath
         # this is small, push it to parent process via Queue instead on appending
+        if self.game
         self.recent_games.append(mem_summary)
 
         # on-disk record (full)
@@ -585,7 +607,7 @@ class GameLooper(object):
         return new_looper
 
 
-def init_selfplay(config):
+def init_selfplay(config, gameplay_q, telemetry_q):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -603,7 +625,7 @@ def init_selfplay(config):
         model = load_model(config.init_model)
         save_model(model, model_path)
 
-    looper = GameLooper(model=model, cfg=config.copy())
+    looper = GameLooper(model=model, cfg=config.copy(), gameplay_q, telemetry_q)
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
@@ -615,7 +637,3 @@ def init_selfplay(config):
             print("[init_selfplay] failed reading progress csv:", e)
 
     return looper
-#%%%
-
-
-

@@ -7,21 +7,24 @@ class Config(object):
     Central knobs. Keep simple; override from a dict or flags as needed.
     """
 
-    is_validation_run = False
-    validation_every = 5
-
     # files
     selfplay_dir = SP_DIR
     run_tag = "dummy"
     init_model = MODEL_DIR + 'dummy.h5'
     previous_run_tag = None
 
+    # highest level params
+    is_validation_run = False
+    validation_every = 5
+    n_workers = 2
+    n_rounds = 51
+
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
     ema_span = 1000 # large ema_span effective turns it off
 
     use_smart_pruning = True
-    pruning_factor = 1.2
+    pruning_factor = 1.33
     
     # Simulation schedule
     sf_move_sims = 200
@@ -37,7 +40,6 @@ class Config(object):
     # Game stuff
     n_games = 128
     games_at_once = 128
-    n_rounds = 50
     micro_batch = 4
     fwd_batch = 512
 
@@ -63,18 +65,16 @@ class Config(object):
     sf_config = {"Threads": 1, "Hash": 256}
     sf_exclude = ["piece_training"]
 
-    # post hoc server
-    run_post_hoc = True
-    mine_bonus_data = True
-
     # overrides for the post hoc worker
-    post_hoc_poll_interval = 20
     post_hoc_blunder_cp = 150
     post_hoc_analyze_batch = 30
     post_hoc_depth = 12
     post_hoc_equiv_range = 30
+    train_on_stockfish = True
+    train_on_validation = False
+
     KL_boost_threshold = 1.75
-    KL_weight_boost = 1.5
+    KL_weight_boost = 1.0
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
@@ -92,13 +92,11 @@ class Config(object):
     dirichlet_alpha = 0.3
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
-
-    target_y_weights = {'vwq': 0.5, 'z': 0.5}
-    loss_weights = {"policy": 0.25, "value_out": 0.25}
-
+    
+    policy_loss_weight = 0.25
+    value_loss_weight = 0.25
     vscale = 0.9
     draw_weight = 0.1
-
     retrain_batch_size = 512
 
     def __init__(self):

@@ -23,15 +23,35 @@ from chessbot.utils import (
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
 )
 
-from chessbot.review import ANALYZE_PKL, save_pickle_atomic, analyze_with_rank
+from chessbot.review import ANALYZE_PKL, save_pickle_atomic
 
 
-#%%
-class Rescorer():
+class Rescorer(object):
+    eng = None
+
     def __init__(self, cfg):
         self.config = cfg
         self.training_data = []
-        self.train_on_stockfish = True
+        self.train_on_stockfish = cfg.train_on_stockfish
+        self.train_on_validation = cfg.train_on_validation
+
+        self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+
+        self.start_time = time.time()
+        self.games_processed = 0
+        
+
+    def close(self):
+        if self.eng is not None:
+            self.eng.quit()
+            self.eng = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
@@ -120,9 +140,79 @@ class Rescorer():
             pwht *= cfg.KL_weight_boost
 
         self.append_flat_policy_example(board, ucis, visits, Y, vwht, pwht)
-        
+    
+    def analyze_with_rank(self, move, board):
+        # Get Stockfish root best at this depth (white-POV score included in info)
+        cfg = self.config
+        eng = self.eng
+        limit = self.sf_depth_limit
+        info_all = chess.engine.INFO_ALL
 
-    def analyze_and_mine(self, game_data, eng):
+        top3 = eng.analyse(board, limit=limit, info=info_all, multipv=3)
+        best = [t for t in top3 if t['multipv'] == 1][0]
+        
+        best_move = best['pv'][0]
+        best_cp   = score_cp_stm_pov(best["score"])
+        best_abs  = score_cp_white_pov(best["score"], clipped=False)
+        
+        # default
+        res = {}
+        res['best_move'] = best_move
+        res['best_cp'] = best_cp
+        res['best_absolute'] = best_abs
+        
+        if move == best_move:
+            res['played_cp'] = best_cp
+            res['played_absolute'] = best_abs
+            res['delta_signed'] = 0
+            res['sf_rank'] = 1
+            res['in_top3'] = True
+            return res
+        
+        played = [t for t in top3 if t['pv'][0] == move]
+        # if played move not in top3, need to check again
+        if not played:
+            in_top3 = False
+            played = eng.analyse(board, limit=limit, root_moves=[move], info=info_all)
+            
+        else:
+            played = played[0]
+            in_top3 = True
+        
+        played_cp = score_cp_stm_pov(played['score'])
+        played_abs = score_cp_white_pov(played["score"], clipped=False)
+        delta = best_cp - played_cp
+
+        # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
+        EQUIV_RANGE = cfg.post_hoc_equiv_range
+        if abs(delta) <= EQUIV_RANGE:
+            res['best_move'] = move # our move is also best
+            res['played_cp'] = best_cp
+            res['played_absolute'] = best_abs
+            res['delta_signed'] = 0
+            res['in_top3'] = True
+            return res
+
+        # If the played move appears better (delta negative beyond EQUIV_RANGE),
+        # treat the played move as the best move (but keep delta_signed negative).
+        if delta <= -EQUIV_RANGE:
+            res['best_move'] = move
+            res['best_cp'] = played_cp
+            res['played_cp'] = played_cp
+            res['best_absolute'] = played_abs
+            res['played_absolute'] = played_abs
+            res['delta_signed'] = delta
+            res['in_top3'] = True
+            return res
+        
+        # otherwise, our move is worse
+        res['played_cp'] = played_cp
+        res['played_absolute'] = played_abs
+        res['delta_signed'] = delta
+        res['in_top3'] = in_top3
+        return res
+
+    def analyze_and_rescore(self, game_data):
         """
         Single-pass analyze + rescore training-data maker.
 
@@ -145,9 +235,6 @@ class Rescorer():
         if not isinstance(game_data, dict):
             raise TypeError("game_data must be a dict or path to .pkl/.json")
 
-        cfg = self.config
-        limit = chess.engine.Limit(depth=cfg.post_hoc_depth)
-
         board_ch = chess.Board(game_data['start_fen'])
         b_fast = Board(game_data['start_fen'])
 
@@ -160,13 +247,22 @@ class Rescorer():
         nw = nb = 0
         rows = []
         
+        # set a flag in case we want to skip all training data
+        skip_all_training = False
+        if not self.train_on_validation:
+            if 'validation' in game_data['scenario'].lower():
+                skip_all_training = True
+        
+        KL_coef = cfg.KL_weight_boost
+        do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
+        
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
             
             # handle sf-played plies
-            if is_sf_move and not self.train_on_stockfish:
+            if is_sf_move and ((not self.train_on_stockfish) or (skip_all_training)):
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
@@ -187,6 +283,12 @@ class Rescorer():
                 Q = tr['visit_weighted_Q'] if turn else -1*tr['visit_weighted_Q']
             Y = np.clip(0.5*Z_stm + 0.5*Q, -1.0, 1.0)
 
+            if Y != Y:
+                print("[rescore] nan value detected for Y")
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
             # if sf_move, gather training data, push moves, continue
             if is_sf_move:
                 self.training_data_from_sf(b_fast, mv, cm, Y)
@@ -195,7 +297,7 @@ class Rescorer():
                 continue
 
             # if here, its MCTS move
-            res = analyze_with_rank(move_ch, board_ch, limit, eng)
+            res = self.analyze_with_rank(move_ch, board_ch)
             loss_this = res['delta_signed']
             cpl_s += loss_this
             if board_ch.turn:
@@ -212,18 +314,22 @@ class Rescorer():
                 board_ch.turn, loss_this
             ])
 
+            if skip_all_training:
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
             # screen training data, adjust if needed and append
             lms = b_fast.legal_moves()
-            cpl = loss_this
 
             # these moves are fine, no changes            
-            if cpl <= 60:
+            if loss_this <= 60:
                 best_mv = mv
                 visits = [(c['uci'], c['visits']) for c in cm]
                 visits = sorted(visits, key=lambda x: x[1], reverse=True)
             
             # for mild blunders adjust visits
-            elif cpl < cfg.post_hoc_blunder_cp:
+            elif loss_this < cfg.post_hoc_blunder_cp:
                 best_mv = str(res.get('best_move'))
                 visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
 
@@ -249,12 +355,13 @@ class Rescorer():
             priors = [priors_map[m] for m in mvs]
             
             # adjust training weights based on KL
-            kl = kl_divergence(priors, vis)
-            vwht = cfg.loss_weights['value_out']
-            pwht = cfg.loss_weights['policy']
+            if do_KL_boost:
+                kl = kl_divergence(priors, vis)
+                vwht = cfg.value_loss_weight
+                pwht = cfg.policy_loss_weight
 
-            if kl >= cfg.KL_boost_threshold:
-                pwht *= cfg.KL_weight_boost
+                if kl >= cfg.KL_boost_threshold:
+                    pwht *= KL_coef
             
             self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
 

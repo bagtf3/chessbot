@@ -310,8 +310,8 @@ class GameLooper(object):
             print(f"[model warmup] warming GPU for {self.batch_candidates}")
             for bs in self.batch_candidates:
                 for _ in range(3):
-                    rep_mask = (np.random.rand(target_bs, 4288) < 0.02).astype(np.int32)
-                    rep_enc = (np.random.rand(target_bs, 64) < 0.32).astype(np.int32)
+                    rep_mask = (np.random.rand(bs, 4288) < 0.02).astype(np.int32)
+                    rep_enc = (np.random.rand(bs, 64) < 0.32).astype(np.int32)
                     self.infer((rep_enc, rep_mask))
             self.infer_is_warm = True
             print("[model warmup] warm up complete")

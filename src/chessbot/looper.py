@@ -339,7 +339,7 @@ class GameLooper(object):
             self.draws += 1
         
         sims_total = game.tree.sims_done_total 
-        moves = game.tree.moves_played
+        moves = game.tree.n_moves_played
         avg_sims = sims_total/moves if moves > 0 else 0
 
         # cast types for JSON 
@@ -353,7 +353,7 @@ class GameLooper(object):
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,
             "sims_done_total": sims_total,
-            "moves_played": moves,
+            "n_moves_played": moves,
             "start_fen": game.starting_fen,
             "n_retrains": self.n_retrains
         }

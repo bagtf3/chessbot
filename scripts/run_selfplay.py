@@ -40,6 +40,11 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(cfg.n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
+        
+        # allow only the one work to play vs stockfish
+        if (not cfg.is_validation_run) and (i > 0):
+            c.play_vs_sf_prob = 0.0
+
         p = ctx.Process(target=child_looper, args=(c, recent_q, telemetry_q))
         p.start()
         procs.append((p, c.id))
@@ -97,7 +102,7 @@ class RecordKeeper(object):
         self.games_finished += 1
         self.total_plies += meta['plies']
         self.sims_done_total += meta['sims_done_total']
-        self.moves_played += meta['moves_played']
+        self.moves_played += meta['n_moves_played']
 
         if meta['result'] > 0:
             self.white_wins += 1
@@ -148,13 +153,18 @@ class RecordKeeper(object):
     def maybe_log_results(self, window=500, force=False, run_num=None):
         now = _now()
         if not force and (now - self._last_stats_log < self.every_sec):
-            return False
-        self._last_stats_log = now
+            return
 
+        # pull stats
+        summed, avged = self.get_agg_metrics()
+        n_groups = summed.get("n_groups", 0)
+        if n_groups == 0:
+            return
+        
+        self._last_stats_log = now
         avg_moves = (self.total_plies / max(1, self.games_finished))
         gph =  3600 * self.games_finished / (now - self._run_start)
-
-        summed, avged = self.get_agg_metrics()
+        
         print()
         if run_num is None:
             print("~"*72)
@@ -174,7 +184,8 @@ class RecordKeeper(object):
         if not recent:
             print("(no recent games to break down)")
             print("~" * 72)
-            return True
+            self.log_loop_stats(summed, avged)
+            return
 
         # pretty printer
         print_recent_summary(recent, window=window)
@@ -183,14 +194,11 @@ class RecordKeeper(object):
             f"Current retrain number: {self.n_retrains}\n"
         )
         # chain log_loop_stats here as well
-        self.log_loop_stats(sm)
+        self.log_loop_stats(summed, avged)
         return
 
     def log_loop_stats(self, summed, avged):
-        n_groups = summed.get("n_groups", 0)
-        if n_groups == 0:
-            return
-        
+        n_groups = summed.get("n_groups", 0)        
         s_collected     = summed.get("s_collected", 0)
         s_fast          = summed.get("s_fast", 0)
         s_terminals     = summed.get("s_terminals", 0)
@@ -260,7 +268,7 @@ class RecordKeeper(object):
         durations = [g.get("duration", 0.0) for g in last50]
         avg_runtime = None
         if sum(durations) > 0:
-            avg_runtime = cbu.format_time(np.mean(durations))
+            avg_runtime = format_time(np.mean(durations))
             if avg_runtime:
                 print(f"[game stats] last 50 runtime: {avg_runtime}")
         print("-"*72)

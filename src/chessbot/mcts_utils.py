@@ -53,7 +53,7 @@ class MCTSTree(fasttree):
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
 
-        self.moves_played = 0
+        self.n_moves_played = 0
         self.sims_done_total = 0
 
         # naive early stop/bonus sims based on 1-2 move visit delta
@@ -313,7 +313,7 @@ class MCTSTree(fasttree):
         Resets everything, counts visits from previous trees.
         """
 
-        self.moves_played += 1
+        self.n_moves_played += 1
         self.sims_done_total += self.sims_completed_this_move
 
         existing = 0

@@ -68,7 +68,6 @@ class GameLooper(object):
         self.white_wins = 0
         self.black_wins = 0
         self.draws = 0
-        self.total_plies = 0
         self.n_retrains = 0
         self.clear_cache = False
         
@@ -78,9 +77,6 @@ class GameLooper(object):
         self._last_stats_log = 0.0
         self.prediction_times = []
         self.sf_search_depths = []
-
-        self.moves_played = 0
-        self.sims_done_total = 0
     
     def close(self):
         if self.eng is not None:
@@ -235,6 +231,7 @@ class GameLooper(object):
                 lpb.append(len(preds_batch))
 
             if self.maybe_push_telemetry(counts, lpb, force=False):
+                self.prediction_times.clear()
                 counts = []
                 lpb = []
             
@@ -334,7 +331,6 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
-        self.total_plies += game.plies
         if game.outcome > 0:
             self.white_wins += 1
         elif game.outcome < 0:
@@ -361,7 +357,8 @@ class GameLooper(object):
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,
-            "sims_per_move": round(avg_sims, 3),
+            "sims_done_total": sims_total,
+            "moves_played": moves,
             "start_fen": game.starting_fen,
             "n_retrains": self.n_retrains
         }
@@ -411,12 +408,31 @@ class GameLooper(object):
             "ts": now,
             "mps": self.mps.rate(),
             "lps": self.lps.rate(),
-            "counts": counts
             "mbs": self.config.micro_batch,
-            "apl": np.mean(lpb) if lpb else 0.0, # avg pred batch
-            "fwd_batch": self.config.fwd_batch
+            "apl": np.mean(lpb) if lpb else 0.0,
+            "pred_wait": 0.0,
+            "preds_per_second": 0.0,
+            "fwd_batch": self.config.fwd_batch,
+            "n_active": len(self.active_games),
+            "avg_ply": 0.0,
+            "n_groups": len(counts),
+            "s_collected": sum([r[0] for r in counts]),
+            "s_fast": sum([r[1] for r in counts]),
+            "s_terminals": sum([r[2] for r in counts]),
+            "s_cached": sum([r[3] for r in counts]),
+            "s_fast_stops": sum([r[4] for r in counts]),
+            "s_collect_stops": sum([r[5] for r in counts]),
+            "s_priorless": sum([r[6] for r in counts]),
+            "s_puct": sum([r[7] for r in counts]),
         }
 
+        if self.active_games:
+            telemetry['avg_ply'] = np.mean([g.plies for g in self.active_games])
+
+        if self.prediction_times:
+            telemetry['pred_wait'] np.mean(self.prediction_times)
+            telemetry['preds_per_second'] = telemetry['apl'] / telemetry['pred_wait']
+        
         # put telemetry on the queue and return True to clear counts and lpb
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
         return True

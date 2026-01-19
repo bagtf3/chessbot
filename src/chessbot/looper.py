@@ -32,6 +32,8 @@ class GameLooper(object):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_games_q
+        self.recent_games = []
+        self.training_queue = []
         self.telemetry_q = telemetry_q
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
@@ -68,7 +70,6 @@ class GameLooper(object):
         self.draws = 0
         self.total_plies = 0
         self.n_retrains = 0
-        self.retrain_procs = []
         self.clear_cache = False
         
         self._run_start = _now()
@@ -384,16 +385,16 @@ class GameLooper(object):
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,
-            "sims_per_move": round(avg_sims, 3)
+            "sims_per_move": round(avg_sims, 3),
+            "start_fen": game.starting_fen,
+            "n_retrains": self.n_retrains
         }
 
         # on-disk record (full)
         res = {
-            "start_fen": game.starting_fen,
             "history_uci": game.board.history_uci(),
             "moves_played": game.moves_played,
-            "model_epoch": self.n_retrains,
-            "n_retrains": self.n_retrains
+            "model_epoch": self.n_retrains
         }
 
         res.update(mem_summary)
@@ -417,6 +418,7 @@ class GameLooper(object):
         
         # this is small, push it to parent process via Queue instead on appending
         self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
+        self.recent_games.append(mem_summary)
 
         # clear the game recents to prevent mem leaks
         game.recents.clear()

@@ -3,16 +3,68 @@ import os
 import time
 import queue as py_queue
 import multiprocessing as mp
+import sys
+import json
+from collections import defaultdict, deque
+import pathlib
 
 from chessbot import SF_LOC, SP_DIR
 from chessbot.looper import GameLooper, init_selfplay
 from chessbot.rescore import Rescorer
 from chessbot.config import Config
 
+PRINT_EVERY = 60.0
+PROCESS_TIME = 10.0
+ANALYSIS_BATCH = 30
+
+
+def make_parent_queues():
+    """
+    Create mp queues in parent and return them.
+    Create them from default ctx (platform default).
+    """
+    ctx = mp.get_context()
+    recent_q = ctx.Queue()
+    telemetry_q = ctx.Queue()
+    return recent_q, telemetry_q
+
+
+def spawn_workers(cfg, recent_q, telemetry_q):
+    procs = []
+    ctx = mp.get_context()
+    n_workers = min(1, int(cfg.n_workers))
+    for i in range(cfg.n_workers):
+        c = cfg.copy()
+        c.id = f"w{i}"
+        p = ctx.Process(target=child_looper, args=(c, recent_q, telemetry_q))
+        p.start()
+        procs.append((p, c.id))
+    return procs
+
 
 def child_looper(cfg, recent_games_q, telemetry_q):
     with init_selfplay(cfg, recent_games_q, telemetry_q) as looper:
         looper.run()
+
+
+def update_game_index(game, base_cfg):
+    # update JSONL index (small)
+
+    game['beat_sf'] = False
+    if game['vs_stockfish']:
+        game_result = game['result']
+        if game_result > 0 and not game['stockfish_color']:
+            game['beat_sf'] = True
+        elif game_result < 0 and game['stockfish_color']:
+            game['beat_sf'] = True
+        else:
+            game['beat_sf'] = False
+    
+    # append to JSONL index (create parent dirs if needed)
+    idx_file = base_cfg.game_index_file
+    os.makedirs(os.path.dirname(idx_file), exist_ok=True)
+    with open(idx_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(game, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
@@ -40,74 +92,76 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # load base config and validation configs
-    cfg = Config.from_yaml(yaml_path, init=True)
+    base_cfg = Config.from_yaml(yaml_path, init=True)
 
     # validation yaml path
-    val_yaml_path = os.path.join(cfg.run_dir, "validation_config.yaml")
+    val_yaml_path = os.path.join(base_cfg.run_dir, "validation_config.yaml")
 
     # init the rescorer
-    rescorer = Rescorer(cfg)
+    rescorer = Rescorer(base_cfg)
 
-    start = _now()
+    start = time.time()
     n_games, run_num = 0, 1
 
-    try:
-        while run_num <= cfg.n_rounds:
-            if n_games:
-                elapsed = _now() - start
-                rt = cbu.format_time(elapsed)
-                gph = 3600 * n_games / elapsed
-                print(f"[main loop] Time: {rt} ",
-                      f"Games: {n_games} ({gph:.1f}/hr)")
+    finished_games = []
+    analyzed_games = []
+    for selfplay_round in range(base_cfg.n_rounds):
+        is_validation = False
+        if selfplay_round > 0 & selfplay_round % base_cfg.validation_every == 0:
+            is_validation = True
 
-            is_validation = (run_num % cfg.validation_every) == 0
-
-            # prepare a working config for this iteration
-            #working_cfg = cfg.copy()
+        if is_validation:
+            working_cfg = Config.from_yaml(val_yaml_path, init=True)
+        else:
             working_cfg = Config.from_yaml(yaml_path, init=True)
-            if is_validation:
-                if os.path.exists(val_yaml_path):
-                    working_cfg = create_validation_config(cfg, val_yaml_path)
-                else:
-                    err = f"[validation] local yaml not not found."
-                    raise Exception(err)
+        
+        recent_q, telemetry_q = make_parent_queues()
+        procs = spawn_workers(working_cfg, recent_q, telemetry_q)
 
-            # toggle syzygy and other stuff on non val runs
-            else:
-                working_cfg.use_syzygy = (working_cfg.use_syzygy) & bool(run_num % 2)
+        def alive(procs):
+            return any([p.is_alive() for (p, cid) in procs])
+        
+        def keep_running(procs, training_samples):
+            need_more = training_samples < working_cfg.training_queue_thresh
+            return alive(procs) or need_more
 
-            # start post-hoc server if requested (use working config)
-            if phs is None and working_cfg.run_post_hoc and working_cfg.run_dir:
-                phs = start_post_hoc_server(working_cfg)
+        training_samples = 0
+        while keep_running(procs, training_samples):
+            # break here if no workers and no finished games
+            if not alive(procs) and len(finished_games) == 0:
+                break
 
-            # init selfplay with the working config (returns looper + used cfg)
-            looper = init_selfplay(config=working_cfg)
+            # check telemetry
+            try:
+                msg = telemetry_q.get_nowait()
+                print("telemetry:", msg)
+            except py_queue.Empty:
+                pass
+
+            # drain recent_q into batch (non-blocking)
+            while True:
+                try:
+                    game = recent_q.get_nowait()
+                    update_game_index(game['meta'], base_cfg)
+                    finished_games.append(game)
+                except py_queue.Empty:
+                    break
             
-            looper.training_queue += left_over_training_queue
-            # run the games for this iteration
-            # looper.run() completes up to a retrain.
-            # return to clear scope due to mem leaks
-            finished = looper.run(run_num)
-            while not finished:
-                # spawn a fresh looper (fresh TF/ infer) and continue
-                looper = looper.spawn_next_looper(clear_caches=True)
-                gc.collect()
-                finished = looper.run(run_num)
+            process_start = time.time()
+            # process games for a little bit then keep checking
+            while time.time() < process_start + PROCESS_TIME:
+                if not len(finished_games):
+                    time.sleep(2.0)
+                    break
+                
+                to_process = finished_games.pop(0)
+                pkl_file = to_process['meta']['pkl_file']
+                print(f"[rescorer] processing {pkl_file}")
+                out = rescorer.analyze_and_rescore(pkl_file)
+                analyzed_games.append(out)
+                training_samples = rescorer.written_so_far
 
-            # might be some positions not trained, carry them over
-            left_over_training_queue = looper.training_queue
-            run_num += 1
+                if len(analyzed_games) >= ANALYZE_BATCH:
+                    pass
+                    # need to write this out to pkl
 
-            # if it was a validation iteration, record its summary
-            if is_validation:
-                summary = build_validation_summary(looper)
-
-            if is_validation and working_cfg is not cfg:
-                # fully reload the base config from disk (replaces cfg)
-                cfg = Config.from_yaml(yaml_path, init=True)
-
-            n_games += looper.games_finished
-
-    finally:
-        if phs is not None:
-            stop_post_hoc_server(phs, timeout=10)

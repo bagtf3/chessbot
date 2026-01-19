@@ -98,6 +98,7 @@ class Config(object):
     vscale = 0.9
     draw_weight = 0.1
     retrain_batch_size = 512
+    training_queue_thresh = 10240
 
     def __init__(self):
         self.init_paths()

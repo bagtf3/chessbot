@@ -39,7 +39,7 @@ class Rescorer(object):
 
         self.start_time = time.time()
         self.games_processed = 0
-        
+        self.written_so_far = 0
 
     def close(self):
         if self.eng is not None:
@@ -53,6 +53,9 @@ class Rescorer(object):
         self.close()
         return False
 
+    def reset_writer(self):
+        self.written_so_far = 0
+    
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
         Snapshot inputs and a flat 4288-length policy vector for training.
@@ -60,7 +63,7 @@ class Rescorer(object):
         - pi:  list/array of probs (sum ~= 1)
         - Y: target for value head
         """
-        
+        cfg = self.config
         # get indices from C++
         indices = board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
@@ -81,11 +84,11 @@ class Rescorer(object):
 
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
         
-        if len(self.training_data) >= self.config.retrain_batch_size:
-            out_dir = pathlib.Path(self.config.pending_training_dir)
+        if len(self.training_data) >= cfg.retrain_batch_size:
+            out_dir = pathlib.Path(cfg.pending_training_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            chunk_size = self.config.retrain_batch_size
+            chunk_size = cfg.retrain_batch_size
             chunk = self.training_data[:chunk_size]
             remainder = self.training_data[chunk_size:]
 
@@ -97,6 +100,7 @@ class Rescorer(object):
 
             self.training_data = remainder
             print(f"[rescorer] saved {len(chunk)} training samples to {filename}")
+            self.written_so_far += len(chunk)
 
 
     def training_data_from_sf(self, board, mv, cm, Y):
@@ -134,8 +138,8 @@ class Rescorer(object):
         priors = [priors_map[u] for u in ucis]
         kl = kl_divergence(priors, visits)
 
-        vwht = cfg.loss_weights['value_out']
-        pwht = cfg.loss_weights['policy']
+        vwht = cfg.value_loss_weight
+        pwht = cfg.policy_loss_weight
         if kl > cfg.KL_boost_threshold:
             pwht *= cfg.KL_weight_boost
 
@@ -145,7 +149,7 @@ class Rescorer(object):
         # Get Stockfish root best at this depth (white-POV score included in info)
         cfg = self.config
         eng = self.eng
-        limit = self.sf_depth_limit
+        limit = chess.engine.Limit(depth=cfg.post_hoc_depth)
         info_all = chess.engine.INFO_ALL
 
         top3 = eng.analyse(board, limit=limit, info=info_all, multipv=3)
@@ -219,6 +223,7 @@ class Rescorer(object):
         - train_on_stockfish: include plies played by SF in training if True.
         - base_weight: default sample weight used as 'weight' in returned sample.
         """
+        cfg = self.config
 
         # allow passing a filepath (str or Path) to a pkl/json game record
         if isinstance(game_data, (str, pathlib.Path)):
@@ -253,7 +258,7 @@ class Rescorer(object):
             if 'validation' in game_data['scenario'].lower():
                 skip_all_training = True
         
-        KL_coef = cfg.KL_weight_boost
+        KL_coef = self.config.KL_weight_boost
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         
         for i, mv in enumerate(game_data.get('moves_played', [])):
@@ -353,18 +358,18 @@ class Rescorer(object):
 
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map[m] for m in mvs]
-            
+
+            vwht = cfg.value_loss_weight
+            pwht = cfg.policy_loss_weight
+
             # adjust training weights based on KL
             if do_KL_boost:
                 kl = kl_divergence(priors, vis)
-                vwht = cfg.value_loss_weight
-                pwht = cfg.policy_loss_weight
-
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
             
             self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
-
+            
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
 
@@ -677,15 +682,13 @@ if __name__ == '__main__':
     pkl_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_vs_stockfish/pkl_game_logs/"
     pkls = os.listdir(pkl_dir)
     all_outs = []
-    with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-        eng.configure({"Threads": 1, "Hash": 128})
-        cfg = Config()
-        rs = Rescorer(cfg)
-        for pkl in pkls[:10]:
-            with open(os.path.join(pkl_dir, pkl), "rb") as f:
-                game_data = pickle.load(f)
-                
-            out = rs.analyze_and_mine(game_data, eng)
-            all_outs.append(out)
+    cfg = Config()
+    rs = Rescorer(cfg)
+    for pkl in pkls[:10]:
+        with open(os.path.join(pkl_dir, pkl), "rb") as f:
+            game_data = pickle.load(f)
+            
+        out = rs.analyze_and_rescore(game_data)
+        all_outs.append(out)
     
 

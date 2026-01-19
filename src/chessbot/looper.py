@@ -342,11 +342,6 @@ class GameLooper(object):
         moves = game.tree.moves_played
         avg_sims = sims_total/moves if moves > 0 else 0
 
-        # store for logging too
-        self.moves_played += moves
-        self.sims_done_total += sims_total
-        self.sf_search_depths += game.sf_search_depth
-
         # cast types for JSON 
         mem_summary = {
             "ts": _now(),
@@ -412,7 +407,7 @@ class GameLooper(object):
             "apl": np.mean(lpb) if lpb else 0.0,
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
-            "fwd_batch": self.config.fwd_batch,
+            "fwd_target": self.config.fwd_batch,
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
             "n_groups": len(counts),
@@ -430,7 +425,7 @@ class GameLooper(object):
             telemetry['avg_ply'] = np.mean([g.plies for g in self.active_games])
 
         if self.prediction_times:
-            telemetry['pred_wait'] np.mean(self.prediction_times)
+            telemetry['pred_wait'] = np.mean(self.prediction_times)
             telemetry['preds_per_second'] = telemetry['apl'] / telemetry['pred_wait']
         
         # put telemetry on the queue and return True to clear counts and lpb

@@ -366,10 +366,9 @@ if __name__ == "__main__":
                 
                 to_process = finished_games.pop(0)
                 pkl_file = to_process['meta']['pkl_file']
-                print(f"[rescorer] processing {pkl_file}")
                 out = rescorer.analyze_and_rescore(pkl_file)
                 analyzed_games.append(out)
-                training_samples = rescorer.written_so_far
+                recorder.training_queue = rescorer.written_so_far
                 if len(analyzed_games) >= 10:
                     print(f"[main loop] {training_samples} training samples saved so far")
                     print(f"[main loop] {len(finished_games)} games remaining to be processed")

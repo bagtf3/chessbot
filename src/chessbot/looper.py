@@ -234,37 +234,13 @@ class GameLooper(object):
                 self.format_and_predict(preds_batch)
                 lpb.append(len(preds_batch))
 
-            if self.maybe_log_results(run_num=run_num):
-                self.log_loop_stats(counts, mbs, lpb)
+            if self.maybe_push_telemetry(counts, lpb, force=False):
                 counts = []
                 lpb = []
             
             # resolve fresh predictions back into each game tree
             for game in self.active_games:
                 game.tree.resolve_pending()
-            
-            # clear caches after model training and the last round of moves
-            if self.clear_cache:
-                pc = priors_cache_stats()
-                p_size = pc.get("size", 0)
-                p_cap  = pc.get("capacity", 1)
-                p_ev   = pc.get("evictions", 0)
-                p_q    = pc.get("queries", 0)
-                p_h    = pc.get("hits", 0)
-                p_hit  = (100.0 * p_h / p_q) if p_q else 0.0
-                p_evr  = (100.0 * p_ev / p_cap) if p_cap else 0.0
-
-                print("Clearing caches after training")
-                cs = "[cache stats]"
-                print(f"{cs} size: {p_size}/{p_cap} evictions: {p_ev} queries: {p_q}")
-                print(
-                    f"{cs} hits: {p_h} hit_rate: {p_hit:.2f}% evict_rate: {p_evr:.2f}%"
-                )
-
-                # finally clear them
-                raw_cache_clear()
-                priors_cache_clear()
-                self.clear_cache = False
 
             # remove any finished games
             self.active_games = [
@@ -274,8 +250,8 @@ class GameLooper(object):
             # add in more games if needed
             self.fill_active_games()
         
-        self.maybe_log_results(force=True, run_num=run_num)
-        return True
+        self.maybe_push_telemetry(counts, lpb, force=True)
+        return 0
 
     def format_and_predict(self, preds_batch):
         """
@@ -423,130 +399,27 @@ class GameLooper(object):
         # clear the game recents to prevent mem leaks
         game.recents.clear()
         return
-
-    def maybe_log_results(self, every_sec=60.0, window=500, force=False, run_num=None):
-        def sf_bucket(vs_sf, sf_is_white):
-            if not vs_sf:
-                return "none"
-            return "white" if sf_is_white else "black"
-
+    
+    def maybe_push_telemetry(self, counts, lpb, every_sec=45.0, force=False):
         now = _now()
         if not force and (now - self._last_stats_log < every_sec):
             return False
+
         self._last_stats_log = now
 
-        avg_moves = (self.total_plies / max(1, self.games_finished))
-        gph =  3600 * self.games_finished / (now - self._run_start)
+        telemetry = {
+            "ts": now,
+            "mps": self.mps.rate(),
+            "lps": self.lps.rate(),
+            "counts": counts
+            "mbs": self.config.micro_batch,
+            "apl": np.mean(lpb) if lpb else 0.0, # avg pred batch
+            "fwd_batch": self.config.fwd_batch
+        }
 
-        print()
-        if run_num is None:
-            print("~"*72)
-        else:
-            print(f" Round {run_num} Logging ".center(72, "~"))
-        
-        print(
-            f"[speed stats] mps={self.mps.rate():.1f}  "
-            f"lps={self.lps.rate():.1f}  gph={gph:.2f}")
-        
-        print(
-            f"[game stats]  finished={self.games_finished}  "
-            f"W/D/L={self.white_wins}/{self.draws}/{self.black_wins}  "
-            f"avg_len={avg_moves:.1f} moves")
-        print("-" * 72)
-
-        recent = list(self.recent_games)[-min(window, len(self.recent_games)):]
-        if not recent:
-            print("(no recent games to break down)")
-            print("~" * 72)
-            return True
-
-        # pretty printer
-        cbu.print_recent_summary(recent, window=window)
-        print(
-            f"Length of training queue: {len(self.training_queue)} ",
-            f"Current retrain number: {self.n_retrains}\n"
-        )
+        # put telemetry on the queue and return True to clear counts and lpb
+        self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
         return True
-
-    def log_loop_stats(self, counts, mbs, lpb):
-        if not counts:
-            return
-
-        # aggregate
-        n_groups = len(counts)
-        s_collected     = sum([r[0] for r in counts])
-        s_fast          = sum([r[1] for r in counts])
-        s_terminals     = sum([r[2] for r in counts])
-        s_cached        = sum([r[3] for r in counts])
-        s_fast_stops    = sum([r[4] for r in counts])
-        s_collect_stops = sum([r[5] for r in counts])
-        s_priorless     = sum([r[6] for r in counts])
-        s_puct          = sum([r[7] for r in counts])
-
-        avg_new = s_collected / n_groups
-
-        total_overall = s_collected + s_terminals + s_cached
-        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
-        pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
-        pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
-
-        fast_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
-        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
-
-        print("-"*72)
-        left1 = f"[loop stats] groups={n_groups}  mbs={mbs}"
-        right1 = f"new: collected={s_collected} avg={avg_new:.2f}"
-
-        left2 = f"[stop stats] fastpath_breaks={s_fast_stops} ({fast_stops_pct:.2f}%)"
-        right2 = f"collect_breaks={s_collect_stops} ({collect_stops_pct:.2f}%)"
-
-        # preds / active / finished runtime pre-compute
-        apl = np.mean(lpb) if lpb else 0.0
-        fwd_target = self.config.fwd_batch
-        fill_pct = 100.0 * apl / max(1.0, fwd_target)
-
-        pred_wait = np.mean(self.prediction_times) if self.prediction_times else 0.0
-        self.prediction_times.clear()
-        preds_per_sec = apl / pred_wait if pred_wait > 0 else 0.0
-
-        left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
-        right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
-
-        with_priors = total_overall - s_priorless
-        puct_avg = s_puct / with_priors if with_priors else 0.0
-        priorless_pct = 100.0 * s_priorless / max(1, total_overall)
-        left4 = f"[leaf stats] priorless={s_priorless} ({priorless_pct:.2f}%)"
-        right4 = f"puct={int(s_puct)}  puct/leaf={puct_avg:.1f}"
-
-        left5 = f"[cache hits] cached={s_cached} ({pct_cached_overall:.3f}%)"
-        right5 = f"terminals={s_terminals} ({pct_term_overall:.3f}%)"
-
-        sims = self.sims_done_total
-        moves = self.moves_played
-        sims_per_move = sims / moves if moves > 0 else 0.0
-
-        n_active = len(self.active_games)
-        avg_ply = np.mean([g.plies for g in self.active_games]) if n_active else 0.0
-        left6 = f"[game stats] n={n_active} avg ply={avg_ply:.2f}"
-        right6 = f"sims per move={sims_per_move:.2f}"
-
-        col_width = 40
-        print(f"{left1:<{col_width}} | {right1}")
-        print(f"{left2:<{col_width}} | {right2}")
-        print(f"{left3:<{col_width}} | {right3}")
-        print(f"{left4:<{col_width}} | {right4}")
-        print(f"{left5:<{col_width}} | {right5}")
-        print(f"{left6:<{col_width}} | {right6}")
-
-        # show game duration if its available
-        last50 = self.recent_games[-50:]
-        durations = [g.get("duration", 0.0) for g in last50]
-        avg_runtime = None
-        if sum(durations) > 0:
-            avg_runtime = cbu.format_time(np.mean(durations))
-            if avg_runtime:
-                print(f"[game stats] last 50 runtime: {avg_runtime}")
-        print("-"*72)
 
 def init_selfplay(config, recent_games_q, telemetry_q):
     # pre-built config (from yaml)

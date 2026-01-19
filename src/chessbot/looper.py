@@ -32,8 +32,6 @@ class GameLooper(object):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_games_q
-        self.recent_games = []
-        self.training_queue = []
         self.telemetry_q = telemetry_q
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
@@ -43,10 +41,8 @@ class GameLooper(object):
         # different game logic for training vs validation
         if self.config.is_validation_run:
             self.active_games = paired_validation_games(self.config)
-            self.collect_training_data = False
         else:
             self.fill_active_games()
-            self.collect_training_data = True
         
         self.model = model
 
@@ -368,6 +364,7 @@ class GameLooper(object):
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
+        # this is the specific c_puct, not the list of options
         res['c_puct'] = game.tree.c_puct
 
         # attach tree search data to disk record
@@ -386,7 +383,8 @@ class GameLooper(object):
         
         # this is small, push it to parent process via Queue instead on appending
         self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
-        self.recent_games.append(mem_summary)
+        mem_summary = make_jsonable(mem_summary)
+        self.maybe_push_telemetry(force=True)
 
         # clear the game recents to prevent mem leaks
         game.recents.clear()

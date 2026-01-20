@@ -1,10 +1,11 @@
 import os, json, pathlib, time
+from pathlib import Path
 import psutil
 import uuid
 import sys
 import subprocess
 from collections import deque
-from chessbot.review import ANALYZE_PKL, save_pickle_atomic
+
 import pickle
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
@@ -19,6 +20,7 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
+from chessbot.review import ANALYZE_PKL, save_pickle_atomic
 from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
@@ -49,6 +51,8 @@ class Rescorer(object):
         self.tbmr = 0
         self.ttop3 = 0
 
+        self.init_analyzer()
+
     def close(self):
         if self.eng is not None:
             self.eng.quit()
@@ -60,6 +64,45 @@ class Rescorer(object):
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
+
+    def init_analyzer(self):
+        run_dir = self.config.run_dir
+        idx_path = os.path.join(run_dir, "game_index.json")
+
+        # first merge any existing analysis
+        _ = combine_analysis_staging(run_dir)
+
+        # seen games from existing analyze pkl
+        self.games_seen = set()
+        analyze_pkl_path = os.path.join(run_dir, ANALYZE_PKL)
+
+        if os.path.exists(analyze_pkl_path):
+            with open(analyze_pkl_path, "rb") as f:
+                combined = pickle.load(f)
+            if "df_means" in combined and combined["df_means"] is not None:
+                seen_games = set(
+                    combined["df_means"]["game_id"].astype(str).tolist()
+                )
+
+    def get_unprocessed(self):
+        run_dir = self.config.run_dir
+        idx_path = os.path.join(run_dir, "game_index.json")
+        entries = [idx] if isinstance(idx, dict) else idx
+        unprocessed = deque()
+        for rec in entries:
+            gid = str(rec.get("game_id"))
+            pkl_path = rec.get("pkl_file")
+            if not pkl_path or not os.path.exists(pkl_path):
+                continue
+            if gid in seen_games:
+                continue
+            unprocessed.append(rec)
+        
+        if len(unprocessed):
+            n = len(unprocessed)
+            print(f"[rescore] {n} unprocessed game(s) currently in queue")
+        
+        return unprocessed
 
     def reset_writer(self):
         self.written_this_round = 0
@@ -605,14 +648,14 @@ def combine_analysis_staging(run_dir):
 
     # persist atomically using existing helper
     save_pickle_atomic(combined_new, out_pkl)
-    print(f"[combine] wrote combined ANALYZE_PKL -> {out_pkl} "
+    print(f"[combine] wrote combined ANALYZE_PKL -> {Path(out_pkl).name} "
           f"({len(merged_results)} games)")
 
     # delete the chunk files that we just combined
     for fn in fns:
         path = os.path.join(staging, fn)
         os.remove(path)
-    print(f"[combine] removed {len(fns)} chunk files from {staging}")
+    print(f"[combine] removed {len(fns)} chunk files from {Path(staging).name}")
 
     return combined_new
 

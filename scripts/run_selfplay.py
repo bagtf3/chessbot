@@ -254,7 +254,8 @@ def main(run_tag):
 
     # init the rescorer
     rescorer = Rescorer(base_cfg)
-
+    finished_games = rescorer.get_unprocessed()
+    
     start = time.time()
     n_games, run_num = 0, 1
 

@@ -13,7 +13,8 @@ from chessbot import SF_LOC, SP_DIR
 from chessbot.looper import GameLooper, init_selfplay
 from chessbot.rescore import Rescorer
 from chessbot.config import Config
-from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
+from chessbot.utils import print_recent_summary, summarize_recent_games
+from chessbot.utils import make_jsonable, format_time
 
 _now = time.time
 
@@ -40,7 +41,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(cfg.n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-        
+
         # allow only the one work to play vs stockfish
         if (not cfg.is_validation_run) and (i > 0):
             c.play_vs_sf_prob = 0.0
@@ -68,7 +69,10 @@ def update_game_index(game, base_cfg):
             game['beat_sf'] = True
         else:
             game['beat_sf'] = False
-    
+
+    # just to be safe
+    game = make_jsonable(game)
+
     # append to JSONL index (create parent dirs if needed)
     idx_file = base_cfg.game_index_file
     os.makedirs(os.path.dirname(idx_file), exist_ok=True)
@@ -155,13 +159,10 @@ class RecordKeeper(object):
         if not force and (now - self._last_stats_log < self.every_sec):
             return
 
+        self._last_stats_log = _now()
+
         # pull stats
         summed, avged = self.get_agg_metrics()
-        n_groups = summed.get("n_groups", 0)
-        if n_groups == 0:
-            return
-        
-        self._last_stats_log = now
         avg_moves = (self.total_plies / max(1, self.games_finished))
         gph =  3600 * self.games_finished / (now - self._run_start)
         
@@ -198,7 +199,10 @@ class RecordKeeper(object):
         return
 
     def log_loop_stats(self, summed, avged):
-        n_groups = summed.get("n_groups", 0)        
+        n_groups = summed.get("n_groups", 0)
+        if n_groups == 0:
+            return
+        
         s_collected     = summed.get("s_collected", 0)
         s_fast          = summed.get("s_fast", 0)
         s_terminals     = summed.get("s_terminals", 0)

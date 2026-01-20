@@ -70,7 +70,7 @@ class GameLooper(object):
         self._run_start = _now()
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
-        self._last_stats_log = 0.0
+        self._last_stats_log = _now()
         self.prediction_times = []
         self.sf_search_depths = []
     
@@ -370,9 +370,6 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
 
-        # make json/pickle safe
-        res = cbu.make_jsonable(res)
-
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
@@ -383,8 +380,6 @@ class GameLooper(object):
         
         # this is small, push it to parent process via Queue instead on appending
         self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
-        mem_summary = make_jsonable(mem_summary)
-        self.maybe_push_telemetry(force=True)
 
         # clear the game recents to prevent mem leaks
         game.recents.clear()
@@ -392,7 +387,11 @@ class GameLooper(object):
     
     def maybe_push_telemetry(self, counts, lpb, every_sec=45.0, force=False):
         now = _now()
-        if not force and (now - self._last_stats_log < every_sec):
+        if not force:
+            if now - self._last_stats_log < every_sec:
+                return False
+
+        if not len(counts):
             return False
 
         self._last_stats_log = now

@@ -13,10 +13,10 @@ import pandas as pd
 
 from chessbot import SF_LOC, SP_DIR
 from chessbot.looper import GameLooper, init_selfplay
-from chessbot.rescore import Rescorer
+from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
-from chessbot.utils import make_jsonable, format_time
+from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
 
 
@@ -161,17 +161,49 @@ def drain_queue(q):
     return out
 
 
-def shutdown_round(procs, recent_q, telemetry_q, max_wait_s=10.0):
-    start = time.monotonic()
+def shutdown_round(procs, recent_q, telemetry_q, max_wait_s=15.0):
+    deadline = time.monotonic() + max_wait_s
 
-    if procs:
-        procs = check_and_reap_procs(procs, request_stop=True)
+    # Ask nicely first and start escalation timers
+    procs = check_and_reap_procs(procs, request_stop=True)
 
-    while procs and (time.monotonic() - start) < max_wait_s:
+    while procs and time.monotonic() < deadline:
         procs = check_and_reap_procs(procs, request_stop=True)
         time.sleep(0.05)
 
-    # Even if some are still alive, close queues after we’ve tried; but ideally procs empty.
+    # Hard guarantee: if anything survived, kill it and reap it now.
+    if procs:
+        for w in procs:
+            p = w["p"]
+            if p.is_alive():
+                p.terminate()
+
+        # Give terminate a moment, then kill anything still alive.
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            procs = check_and_reap_procs(procs, request_stop=False)
+            if not procs:
+                break
+            time.sleep(0.05)
+
+        for w in procs:
+            p = w["p"]
+            if p.is_alive():
+                if hasattr(p, "kill"):
+                    p.kill()
+                else:
+                    p.terminate()
+
+        # Final reap pass (blocking join is OK here; they're supposed to be dead)
+        for w in list(procs):
+            p = w["p"]
+            p.join(timeout=2.0)
+            if not p.is_alive():
+                p.close()
+
+        procs = [w for w in procs if w["p"].is_alive()]
+
+    # Close queues at the very end (after children are gone)
     if recent_q is not None:
         recent_q.close()
         recent_q.join_thread()
@@ -179,6 +211,8 @@ def shutdown_round(procs, recent_q, telemetry_q, max_wait_s=10.0):
     if telemetry_q is not None:
         telemetry_q.close()
         telemetry_q.join_thread()
+
+    return procs
 
 
 def parse_paths(run_tag):
@@ -206,6 +240,14 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
+def launch_retrain(run_tag, working_cfg, n_samples):
+    rt_script = find_script("retrain_worker.py", start_file=__file__)
+    if not rt_script:
+        raise RuntimeError("retrain_worker.py not found")
+
+    return launch_retrain_async(run_tag, rt_script, working_cfg, n_samples)
+
+
 def main(run_tag):
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
@@ -222,10 +264,12 @@ def main(run_tag):
     cpl_list = []
     recent_q = None
     telemetry_q = None
+    retrain = None
 
     try:
         for selfplay_round in range(base_cfg.n_rounds):
             n_processed = 0
+            next_print = 10
             if STOP_REQUESTED.is_set():
                 break
             
@@ -274,8 +318,6 @@ def main(run_tag):
                 for game in pulled_games:
                     recorder.ingest_recents(game)
                     update_game_index(game['meta'], base_cfg)
-                    if game['meta']['plies'] != game['meta']['n_moves_played']:
-                        print("[meta mismatch]", game['meta']['plies'], game['meta']['n_moves_played'])
                     finished_games.append(game)
                 
                 recorder.maybe_log_results(run_num=run_num)
@@ -296,7 +338,8 @@ def main(run_tag):
                     recorder.training_queue = rescorer.written_so_far
                     # need to write this out to pkl
 
-                if len(cpl_list) and (n_processed % 10 == 0):
+                if len(cpl_list) and (n_processed >= next_print):
+                    next_print += 10
                     print(f"[rescorer] avg CPL so far ({len(cpl_list)} games): {np.mean(cpl_list):.3f}")
                     print(
                         f"[rescorer] {n_processed} games processed this round | "
@@ -306,12 +349,13 @@ def main(run_tag):
                     print(f"[main loop] n procs: {len(procs)}: needed: {needed}, have: {recorder.training_queue}")
             
             # when done, close the queues
-            shutdown_round(procs, recent_q, telemetry_q)
+            procs = shutdown_round(procs, recent_q, telemetry_q)
+            if procs:
+                print(f"[warn] {len(procs)} workers still alive after shutdown")
+            
             procs = []
             recent_q = None
             telemetry_q = None
-            recorder.training_queue = 0
-            rescorer.written_so_far = 0
 
             # selfplay round report
             recorder.maybe_log_results(force=True, run_num=run_num)
@@ -319,8 +363,39 @@ def main(run_tag):
             if is_validation:
                 recorder.config = working_cfg
                 build_validation_summary(recorder)
-        
-        # capture to return situation
+                # we do not train after validation currently
+                continue
+            
+            # check if we have enough to run retraining
+            n_samples = recorder.training_queue
+            if n_samples >= needed:
+                if retrain is None:
+                    retrain = launch_retrain(run_tag, working_cfg, n_samples)
+                    rescorer.reset_writer()
+                while retrain is not None:
+                    done, rc = poll_retrain(retrain, print_output=True)
+                    if done:
+                        retrain = None
+                    
+                    if len(finished_games):
+                        to_process = finished_games.popleft()
+                        pkl_file = to_process['meta']['pkl_file']
+                        out = rescorer.analyze_and_rescore(pkl_file)
+                        n_processed += 1
+                        cpl_list.append(out['overall_cpl'])
+                        analyzed_games.append(out)
+                    else:
+                        time.sleep(0.05)
+            
+            print(f"end of loop {run_num}")
+        print("for loop complete (line 387)")
+        # capture the return situation
+        rescorer.close()
+        print("rescorer closed")
+        alive = mp.active_children()
+        if alive:
+            print("[warn] active children at end:", [p.pid for p in alive])
+
         return 0 if not STOP_REQUESTED.is_set() else 1
     
     except KeyboardInterrupt:

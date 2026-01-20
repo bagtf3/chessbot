@@ -113,6 +113,7 @@ def main():
     for x, mask, policy, y, vwht, pwht in combined:
         # quick nan check, should never happen
         if np.isnan(y):
+            print("[retrain] nan found in y value")
             continue
 
         X_list.append(x)
@@ -146,7 +147,7 @@ def main():
         n_retrains = len(all_evals)
     else:
         all_evals = pd.DataFrame()
-        n_retrains = cfg.n_retrains
+        n_retrains = 0
 
     plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
     epoch = n_retrains
@@ -158,26 +159,30 @@ def main():
         cbu.plot_training_progress(
             all_evals, epoch=epoch, save_path=cfg.progress_plot_path
         )
+    
+    # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
+    history = model.fit(
+        X, Y, epochs=args.epochs, batch_size=args.batch_size,
+        verbose=0, sample_weight=s_wts, shuffle=True
+    )
 
     rows = []
     for m, v in history.history.items():
         name = "total" if m == "loss" else m.replace("_loss", "")
-        start = v[0]
-        end = v[-1]
+        start = v[0]; end = v[-1]
         delta = start - end
         mark = "*" if delta < 0 else "+"
         rows.append((name, start, end, delta, mark))
-
-    name_w = max([len(r[0]) for r in rows])
-    num_w = 8
-    fmt = (
-        f"[epoch {epoch:4d}] [model fit]  "
+    
+    name_w = max(len(r[0]) for r in rows)
+    num_w = 8   # width for numbers
+    fmt = (f"[epoch {epoch:4d}] [model fit]  "
         f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
-        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}"
-    )
+        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
+
     for name, start, end, delta, mark in rows:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
-
+    
     bak_path = model_path + ".bak"
     if os.path.exists(model_path):
         try:

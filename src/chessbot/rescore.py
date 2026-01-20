@@ -1,9 +1,11 @@
 import os, json, pathlib, time
 import psutil
 import uuid
-
+import sys
+import subprocess
+from collections import deque
+from chessbot.review import ANALYZE_PKL, save_pickle_atomic
 import pickle
-
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
 import chess.engine
@@ -22,8 +24,6 @@ from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
 )
-
-from chessbot.review import ANALYZE_PKL, save_pickle_atomic
 
 
 class Rescorer(object):
@@ -678,17 +678,101 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
     return [[u, int(v)] for u, v in items]
 
 
-if __name__ == '__main__':
-    pkl_dir = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_vs_stockfish/pkl_game_logs/"
-    pkls = os.listdir(pkl_dir)
-    all_outs = []
-    cfg = Config()
-    rs = Rescorer(cfg)
-    for pkl in pkls[:10]:
-        with open(os.path.join(pkl_dir, pkl), "rb") as f:
-            game_data = pickle.load(f)
-            
-        out = rs.analyze_and_rescore(game_data)
-        all_outs.append(out)
-    
+def launch_retrain_async(run_tag, rt_script, working_cfg, n_samples):
+    cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
+    cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
 
+    print(f"[retrain] launching worker with {n_samples} samples")
+
+    start_new_session = False
+    creationflags = 0
+    if os.name == "posix":
+        start_new_session = True
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=start_new_session,
+            creationflags=creationflags,
+            text=True,
+            bufsize=1,   # line buffered
+        )
+    
+    except Exception as e:
+        raise RuntimeError(f"[retrain] failed to start retrain worker: {e}")
+
+    return {
+        "p": p,
+        "cmd": cmd,
+        "stdout_buf": deque(),
+        "stderr_buf": deque(),
+        "done": False,
+        "rc": None,
+    }
+
+
+def drain_pipe_lines(pipe, buf, max_lines=200):
+    n = 0
+    if pipe is None:
+        return 0
+
+    # Use readline() in a bounded loop; it may block if no newline is available.
+    # To keep this non-blocking, only call it when poll() indicates process ended,
+    # OR keep max_lines small and accept that it can block if the worker writes
+    # partial lines without '\n'. Most scripts print lines, so this is usually fine.
+    while n < max_lines:
+        ln = pipe.readline()
+        if not ln:
+            break
+        buf.append(ln.rstrip("\n"))
+        n += 1
+    return n
+
+
+def poll_retrain(handle, print_output=True):
+    """
+    Call frequently from your main loop.
+    Returns: (done: bool, rc: int | None)
+    """
+    p = handle["p"]
+
+    rc = p.poll()
+    handle["rc"] = rc
+
+    # If you want "live" output while running, you need non-blocking IO (selectors)
+    # or a reader thread. The simple safe option: only drain once it's done.
+    if rc is None:
+        return False, None
+
+    # Process ended: drain remaining output fully
+    drain_pipe_lines(p.stdout, handle["stdout_buf"], max_lines=10_000)
+    drain_pipe_lines(p.stderr, handle["stderr_buf"], max_lines=10_000)
+
+    if print_output:
+        if handle["stdout_buf"]:
+            print("[retrain] STDOUT:")
+            while handle["stdout_buf"]:
+                print(handle["stdout_buf"].popleft())
+
+        if handle["stderr_buf"]:
+            print("[retrain] STDERR:")
+            while handle["stderr_buf"]:
+                print(handle["stderr_buf"].popleft())
+
+    handle["done"] = True
+    print(f"[retrain] worker finished exit_code={rc}")
+
+    # Close pipes to release resources
+    if p.stdout is not None:
+        p.stdout.close()
+    if p.stderr is not None:
+        p.stderr.close()
+
+    if rc != 0:
+        raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
+
+    return True, rc

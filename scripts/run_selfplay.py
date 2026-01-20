@@ -331,22 +331,9 @@ def main(run_tag):
                     
                     to_process = finished_games.popleft()
                     pkl_file = to_process['meta']['pkl_file']
-                    out = rescorer.analyze_and_rescore(pkl_file)
-                    n_processed += 1
-                    cpl_list.append(out['overall_cpl'])
-                    analyzed_games.append(out)
+                    rescorer.analyze_and_rescore(pkl_file)
                     recorder.training_queue = rescorer.written_so_far
                     # need to write this out to pkl
-
-                if len(cpl_list) and (n_processed >= next_print):
-                    next_print += 10
-                    print(f"[rescorer] avg CPL so far ({len(cpl_list)} games): {np.mean(cpl_list):.3f}")
-                    print(
-                        f"[rescorer] {n_processed} games processed this round | "
-                        f"{len(finished_games)} waiting in queue"
-                    )
-
-                    print(f"[main loop] n procs: {len(procs)}: needed: {needed}, have: {recorder.training_queue}")
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)
@@ -380,14 +367,13 @@ def main(run_tag):
                     if len(finished_games):
                         to_process = finished_games.popleft()
                         pkl_file = to_process['meta']['pkl_file']
-                        out = rescorer.analyze_and_rescore(pkl_file)
-                        n_processed += 1
-                        cpl_list.append(out['overall_cpl'])
-                        analyzed_games.append(out)
+                        rescorer.analyze_and_rescore(pkl_file)
+                    
                     else:
                         time.sleep(0.05)
 
         # capture the return situation
+        rescorer.push_analyzed(report=True)
         rescorer.close()
         alive = mp.active_children()
         if alive:
@@ -400,6 +386,7 @@ def main(run_tag):
     
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
+        rescorer.push_analyzed(report=True)
         rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 

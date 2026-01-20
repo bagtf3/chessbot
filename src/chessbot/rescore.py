@@ -32,14 +32,22 @@ class Rescorer(object):
     def __init__(self, cfg):
         self.config = cfg
         self.training_data = []
+        self.analyzed_results = []
+
         self.train_on_stockfish = cfg.train_on_stockfish
         self.train_on_validation = cfg.train_on_validation
 
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
 
         self.start_time = time.time()
+        self.games_seen = set()
         self.games_processed = 0
-        self.written_so_far = 0
+        self.written_total = 0
+        self.written_this_round = 0
+        self.n_saved = 0
+        self.tcpl = 0
+        self.tbmr = 0
+        self.ttop3 = 0
 
     def close(self):
         if self.eng is not None:
@@ -54,7 +62,7 @@ class Rescorer(object):
         return False
 
     def reset_writer(self):
-        self.written_so_far = 0
+        self.written_this_round = 0
     
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
@@ -99,9 +107,8 @@ class Rescorer(object):
                 pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
 
             self.training_data = remainder
-            print(f"[rescorer] saved {len(chunk)} training samples to {filename}")
-            self.written_so_far += len(chunk)
-
+            self.written_this_round += len(chunk)
+            self.written_total += len(chunk)
 
     def training_data_from_sf(self, board, mv, cm, Y):
         cfg = self.config
@@ -240,6 +247,7 @@ class Rescorer(object):
         if not isinstance(game_data, dict):
             raise TypeError("game_data must be a dict or path to .pkl/.json")
 
+        gid = rec.get("game_id")
         board_ch = chess.Board(game_data['start_fen'])
         b_fast = Board(game_data['start_fen'])
 
@@ -417,7 +425,44 @@ class Rescorer(object):
             out_df[key] = val
 
         out['df'] = out_df
-        return out
+        self.analyzed_results.append(out)
+        self.games_processed += 1
+        self.games_seen.add(gid)
+        if len(self.analyzed_results) >= self.config.post_hoc_analyze_batch:
+            self.push_analyzed(report=True)
+        
+    def push_analyzed(self, report=True):
+        run_dir = self.config.run_dir
+        outp, c, b, t = save_analysis_chunk_simple(run_dir, self.analyzed_results)
+        self.n_saved += 1    
+        self.tcpl += c; self.tbmr += b; self.ttop3 += t
+
+        if report:
+            n_this = len(self.analyzed_results)
+            n_tot = self.games_processed
+            rate = n_tot / (time.time() - self.start_time)
+            print(
+                f"[rescore] saving {n_this} analyzed games. "
+                f"{n_tot} processed games ({rate:.3f} / sec)"
+                )
+
+            w_this = self.written_this_round
+            w_tot = self.written_total
+            print(
+                "[rescore] training samples written "
+                f"(this round, total): {w_this}, {w_tot}"
+            )
+
+            if self.n_saved >= 2:
+                cpl_mean = self.tcpl/self.n_saved
+                tmbr_mean = self.tbmr/self.n_saved 
+                ttop3_mean = self.ttop3/self.n_saved
+                print(
+                    f"[rescore] {'Overall stats:':<16} CPL {cpl_mean:.3f}",
+                    f"BMR {tmbr_mean:.3f} TOP3 {ttop3_mean:.3f}"
+                )
+        
+        self.analyzed_results.clear()
 
 
 def lightweight_summary(results):

@@ -60,12 +60,7 @@ class GameLooper(object):
 
         self.infer_is_warm = False
         self.batch_candidates = self.create_batch_candidates(cfg)
-
-        self.white_wins = 0
-        self.black_wins = 0
-        self.draws = 0
         self.n_retrains = 0
-        self.clear_cache = False
         
         self._run_start = _now()
         self.mps = RateMeter("moves")
@@ -147,7 +142,7 @@ class GameLooper(object):
             cg = ChessGame(board=board, meta=meta, cfg=self.config)
             self.active_games.append(cg)
     
-    def run(self, run_num=None):
+    def run(self, stop_event=None):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
         or run MCTS step (collect/predict/apply).
@@ -155,12 +150,16 @@ class GameLooper(object):
 
         cfg = self.config
         eng = self.eng
-        self.warmup_infer()
         mbs = cfg.micro_batch
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
         while self.games_finished < cfg.n_games:
+            # check the stop event
+            if stop_event is not None:
+                if stop_event.is_set():
+                    return
+            
             if not self.active_games:
                 break
             
@@ -327,12 +326,6 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
-        if game.outcome > 0:
-            self.white_wins += 1
-        elif game.outcome < 0:
-            self.black_wins += 1
-        else:
-            self.draws += 1
         
         sims_total = game.tree.sims_done_total 
         moves = game.tree.n_moves_played
@@ -364,6 +357,7 @@ class GameLooper(object):
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
+
         # this is the specific c_puct, not the list of options
         res['c_puct'] = game.tree.c_puct
 
@@ -381,6 +375,9 @@ class GameLooper(object):
         # this is small, push it to parent process via Queue instead on appending
         self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
 
+        # this keeps games and plies in sync for logging
+        self.update_partial_telemetry()
+        
         # clear the game recents to prevent mem leaks
         game.recents.clear()
         return
@@ -390,9 +387,6 @@ class GameLooper(object):
         if not force:
             if now - self._last_stats_log < every_sec:
                 return False
-
-        if not len(counts):
-            return False
 
         self._last_stats_log = now
 
@@ -428,6 +422,20 @@ class GameLooper(object):
         # put telemetry on the queue and return True to clear counts and lpb
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
         return True
+    
+    def update_partial_telemetry(self):
+        """send a partial update to the telemetry for more time sensitive metrics"""
+        partial_telem = {
+            "ts": time.time(),
+            "n_active": len(self.active_games),
+            "avg_ply": 0.0
+        }
+
+        if self.active_games:
+            partial_telem['avg_ply'] = np.mean([g.plies for g in self.active_games])
+
+        self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
+
 
 def init_selfplay(config, recent_games_q, telemetry_q):
     # pre-built config (from yaml)

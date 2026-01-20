@@ -1,15 +1,12 @@
 import os, json, pathlib, time
 from pathlib import Path
-import psutil
 import uuid
 import sys
 import subprocess
 from collections import deque
 
 import pickle
-import chess, chess.svg
-from IPython.display import SVG, display, clear_output
-import chess.engine
+import chess, chess.svg, chess.engine
 
 import signal
 from multiprocessing import Process
@@ -20,13 +17,14 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.review import ANALYZE_PKL, save_pickle_atomic
 from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
 )
 
+RS = "[rescore]"
+ANALYZE_PKL = "analyze_results_combined.pkl"
 
 class Rescorer(object):
     eng = None
@@ -80,21 +78,23 @@ class Rescorer(object):
             with open(analyze_pkl_path, "rb") as f:
                 combined = pickle.load(f)
             if "df_means" in combined and combined["df_means"] is not None:
-                seen_games = set(
+                self.games_seen = set(
                     combined["df_means"]["game_id"].astype(str).tolist()
                 )
 
     def get_unprocessed(self):
         run_dir = self.config.run_dir
         idx_path = os.path.join(run_dir, "game_index.json")
+        idx = load_game_index(idx_path)
         entries = [idx] if isinstance(idx, dict) else idx
+
         unprocessed = deque()
         for rec in entries:
             gid = str(rec.get("game_id"))
             pkl_path = rec.get("pkl_file")
             if not pkl_path or not os.path.exists(pkl_path):
                 continue
-            if gid in seen_games:
+            if gid in self.games_seen:
                 continue
             unprocessed.append(rec)
         
@@ -290,7 +290,7 @@ class Rescorer(object):
         if not isinstance(game_data, dict):
             raise TypeError("game_data must be a dict or path to .pkl/.json")
 
-        gid = rec.get("game_id")
+        gid = game_data.get("game_id")
         board_ch = chess.Board(game_data['start_fen'])
         b_fast = Board(game_data['start_fen'])
 
@@ -481,21 +481,6 @@ class Rescorer(object):
         self.tcpl += c; self.tbmr += b; self.ttop3 += t
 
         if report:
-            n_this = len(self.analyzed_results)
-            n_tot = self.games_processed
-            rate = n_tot / (time.time() - self.start_time)
-            print(
-                f"[rescore] saving {n_this} analyzed games. "
-                f"{n_tot} processed games ({rate:.3f} / sec)"
-                )
-
-            w_this = self.written_this_round
-            w_tot = self.written_total
-            print(
-                "[rescore] training samples written "
-                f"(this round, total): {w_this}, {w_tot}"
-            )
-
             if self.n_saved >= 2:
                 cpl_mean = self.tcpl/self.n_saved
                 tmbr_mean = self.tbmr/self.n_saved 
@@ -504,8 +489,72 @@ class Rescorer(object):
                     f"[rescore] {'Overall stats:':<16} CPL {cpl_mean:.3f}",
                     f"BMR {tmbr_mean:.3f} TOP3 {ttop3_mean:.3f}"
                 )
+            
+            n_this = len(self.analyzed_results)
+            n_tot = self.games_processed
+            rate = n_tot / (time.time() - self.start_time)
+            print(f"{RS} {n_tot} processed games ({rate:.3f}/sec)")
+
+            w_this = self.written_this_round
+            w_tot = self.written_total
+            print(
+                "[rescore] Training samples written "
+                f"this round: {w_this} | total: {w_tot}"
+            )
         
         self.analyzed_results.clear()
+
+# helpers
+def save_pickle_atomic(obj, path, tries=0):
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, str(path))
+    except Exception as e:
+        if tries <= 5:
+            time.sleep(0.5)
+            save_pickle_atomic(obj, path, tries=tries+1)
+        else:
+            raise e
+
+
+def safe_mean(arr):
+    a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
+    return np.nanmean(a) if a.size else float("nan")
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+
+    # First, try regular JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: parse line-by-line (JSONL / concatenated objects)
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                items.append(json.loads(line))
+        return items
+    
+
+def load_game_index(path=None):
+    if not path.endswith("game_index.json"):
+        path = os.path.join(path, "game_index.json")
+    return load_json(path)
+
+
+def dedupe_results(results):
+    df = pd.DataFrame(results)
+    df = df.drop_duplicates(subset='game_id', keep='first')
+    # dont want the raw key, its just extra data
+    if 'raw' in df.columns:
+        df = df.drop(columns=['raw'])
+    
+    return df.to_dict(orient='records')
 
 
 def lightweight_summary(results):
@@ -531,16 +580,6 @@ def lightweight_summary(results):
         "avg_overall_best_move_rate": round(safe_mean(ob), 3),
         "avg_played_in_top3_rate": round(safe_mean(t3), 3),
     }
-
-
-def dedupe_results(results):
-    df = pd.DataFrame(results)
-    df = df.drop_duplicates(subset='game_id', keep='first')
-    # dont want the raw key, its just extra data
-    if 'raw' in df.columns:
-        df = df.drop(columns=['raw'])
-    
-    return df.to_dict(orient='records')
 
 
 def combine_analysis_staging(run_dir):
@@ -704,9 +743,9 @@ def save_analysis_chunk_simple(run_dir, batch):
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
     top3 = df_all.in_top3.mean()
-
-    print(f"{PH} Saving {len(batch)} analyzed games")
-    print(f"{PH} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f} TOP3 {top3:.3f}")
+    
+    print(f"{RS} Saving {len(batch)} analyzed games")
+    print(f"{RS} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f} TOP3 {top3:.3f}")
 
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)

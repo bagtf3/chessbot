@@ -255,26 +255,35 @@ def main(run_tag):
     # init the rescorer
     rescorer = Rescorer(base_cfg)
     finished_games = rescorer.get_unprocessed()
-    
+
     start = time.time()
-    n_games, run_num = 0, 1
 
     finished_games = deque()
-    analyzed_games = []
     procs = []
     cpl_list = []
     recent_q = None
     telemetry_q = None
     retrain = None
-
-    try:
+    total_games = 0
+    try:    
         for selfplay_round in range(base_cfg.n_rounds):
+            run_num = 1 + selfplay_round
+
             n_processed = 0
             next_print = 10
             if STOP_REQUESTED.is_set():
                 break
+
+            print("#"*72)
+            print(f"   Starting Round {run_num}   ".center(72, "#"))
+            print("#"*72)
+            if run_num > 1:
+                run_time = time.time() - start
+                gph = 3600 * total_games / run_time
+                print(f"[main loop] Run Time: {format_time(run_time)}")
+                print(f"[main loop] Games Completed {total_games} ({gph:.2f} per hour)")
+                print(f"[main loop] {len(finished_games)} unprocessed games in the queue")
             
-            run_num = 1 + selfplay_round
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
                 working_cfg = create_validation_config(base_cfg, val_yaml_path)
@@ -333,7 +342,7 @@ def main(run_tag):
                     to_process = finished_games.popleft()
                     pkl_file = to_process['meta']['pkl_file']
                     rescorer.analyze_and_rescore(pkl_file)
-                    recorder.training_queue = rescorer.written_so_far
+                    recorder.training_queue = rescorer.written_this_round
                     # need to write this out to pkl
             
             # when done, close the queues
@@ -355,7 +364,7 @@ def main(run_tag):
                 continue
             
             # check if we have enough to run retraining
-            n_samples = recorder.training_queue
+            n_samples = rescorer.written_this_round
             if n_samples >= needed:
                 if retrain is None:
                     retrain = launch_retrain(run_tag, working_cfg, n_samples)

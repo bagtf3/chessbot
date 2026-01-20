@@ -682,7 +682,7 @@ def launch_retrain_async(run_tag, rt_script, working_cfg, n_samples):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
 
-    print(f"[retrain] launching worker with {n_samples} samples")
+    print(f"[retrain] launching worker")
 
     start_new_session = False
     creationflags = 0

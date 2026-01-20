@@ -386,12 +386,9 @@ def main(run_tag):
                         analyzed_games.append(out)
                     else:
                         time.sleep(0.05)
-            
-            print(f"end of loop {run_num}")
-        print("for loop complete (line 387)")
+
         # capture the return situation
         rescorer.close()
-        print("rescorer closed")
         alive = mp.active_children()
         if alive:
             print("[warn] active children at end:", [p.pid for p in alive])
@@ -403,6 +400,7 @@ def main(run_tag):
     
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
+        rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 
 

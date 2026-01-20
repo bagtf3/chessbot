@@ -183,7 +183,7 @@ def main():
     for name, start, end, delta, mark in rows:
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
-    bak_path = model_path + ".bak"
+    bak_path = model_path.replace(".h5", "_backup.h5")
     if os.path.exists(model_path):
         try:
             os.replace(model_path, bak_path)

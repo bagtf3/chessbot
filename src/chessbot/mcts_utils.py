@@ -163,7 +163,7 @@ class MCTSTree(fasttree):
         # check the sims schedule, update if applicapable
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
-                new_ceiling = self.sims_ceiling_schedule[self.plies]
+                new_ceiling = self.sims_ceiling_schedule[self.n_plies]
                 self.sims_ceiling = new_ceiling
                 # this updates the c++ tree so e.g. smart pruning knows the new budget
                 self.set_sim_budget(float(new_ceiling))

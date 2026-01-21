@@ -103,8 +103,8 @@ class GameLooper(object):
             batch_candidates.add(bs)
             bs *= 2
         
-        # split difference between last 2
-        if len(batch_candidates) >= 2:
+        # split difference between last 2 if large
+        if len(batch_candidates) >= 2 and cfg.fwd_batch >= 128:
             sbc = sorted(batch_candidates)
             sbc.append(int(sbc[-1] - sbc[-2] / 2))
             return sorted(set(sbc))

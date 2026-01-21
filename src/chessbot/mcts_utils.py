@@ -31,10 +31,15 @@ class MCTSTree(fasttree):
         
         self.ema_span = cfg.ema_span
 
-        # set floor and ceiling (ceiling can be a list for varied gameplay)
+        # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
+        self.sims_ceiling_schedule = {}
+        #ceiling can be a list for varied gameplay
         if isinstance(cfg.sims_ceiling, (list, set)):
             self.sims_ceiling = np.random.choice(cfg.sims_ceiling)
+        # can also be a dict, interpreted as a sims schedule
+        elif isinstance(cfg.sims_ceiling, dict):
+            pass
         else:
             self.sims_ceiling = cfg.sims_ceiling
 

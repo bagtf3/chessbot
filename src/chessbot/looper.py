@@ -331,6 +331,16 @@ class GameLooper(object):
         moves = game.tree.n_moves_played
         avg_sims = sims_total/moves if moves > 0 else 0
 
+        # read adjudicator flags (direct attrs; they always exist)
+        mat = self.config.use_material_diff
+        tb = self.config.use_syzygy
+        dr = self.config.use_eval_draw
+        cl = self.config.use_eval_collar
+
+        # encode into 0..15 index: bit0=material, bit1=syzygy, bit2=eval_draw,
+        # bit3=eval_collar
+        adjudication_index = (mat) | (tb << 1) | (dr << 2) | (cl << 3)
+
         # cast types for JSON 
         mem_summary = {
             "ts": _now(),
@@ -342,9 +352,9 @@ class GameLooper(object):
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,
             "sims_done_total": sims_total,
-            "n_moves_played": moves,
             "start_fen": game.starting_fen,
-            "n_retrains": self.n_retrains
+            "n_retrains": self.n_retrains,
+            "adjudication_index": adjudication_index
         }
 
         # on-disk record (full)

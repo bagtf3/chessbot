@@ -1482,7 +1482,6 @@ class RecordKeeper(object):
         self._run_start = time.time()
 
         self.sims_done_total = 0
-        self.moves_played = 0
         self.total_plies = 0
         self.games_finished = 0
         self.white_wins = 0
@@ -1500,7 +1499,6 @@ class RecordKeeper(object):
         self.games_finished += 1
         self.total_plies += meta['plies']
         self.sims_done_total += meta['sims_done_total']
-        self.moves_played += meta['n_moves_played']
 
         if meta['result'] > 0:
             self.white_wins += 1
@@ -1650,7 +1648,7 @@ class RecordKeeper(object):
         right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
         sims = self.sims_done_total
-        moves = self.moves_played
+        moves = self.total_plies
         sims_per_move = sims / moves if moves > 0 else 0.0
 
         n_active = summed['n_active']

@@ -165,23 +165,6 @@ def main():
         X, Y, epochs=args.epochs, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
-
-    rows = []
-    for m, v in history.history.items():
-        name = "total" if m == "loss" else m.replace("_loss", "")
-        start = v[0]; end = v[-1]
-        delta = start - end
-        mark = "*" if delta < 0 else "+"
-        rows.append((name, start, end, delta, mark))
-    
-    name_w = max(len(r[0]) for r in rows)
-    num_w = 8   # width for numbers
-    fmt = (f"[epoch {epoch:4d}] [model fit]  "
-        f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
-        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}")
-
-    for name, start, end, delta, mark in rows:
-        print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
     
     bak_path = model_path.replace(".h5", "_backup.h5")
     if os.path.exists(model_path):

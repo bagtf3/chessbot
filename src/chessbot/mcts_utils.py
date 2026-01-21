@@ -39,7 +39,11 @@ class MCTSTree(fasttree):
             self.sims_ceiling = np.random.choice(cfg.sims_ceiling)
         # can also be a dict, interpreted as a sims schedule
         elif isinstance(cfg.sims_ceiling, dict):
-            pass
+            # start with the lowest, update at each interval
+            sc = cfg.sims_ceiling.copy()
+            lowest = min(sc.keys())
+            self.sims_ceiling = sc.pop(lowest)
+            self.sims_ceiling_schedule = sc
         else:
             self.sims_ceiling = cfg.sims_ceiling
 
@@ -53,7 +57,7 @@ class MCTSTree(fasttree):
         self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        self.piece_count = board.piece_count()
+        #self.piece_count = board.piece_count()
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -155,7 +159,14 @@ class MCTSTree(fasttree):
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        self.piece_count = board.piece_count()
+
+        # check the sims schedule, update if applicapable
+        if self.sims_ceiling_schedule:
+            if self.n_plies in self.sims_ceiling_schedule.keys():
+                new_ceiling = self.sims_ceiling_schedule[self.plies]
+                self.sims_ceiling = new_ceiling
+                # this updates the c++ tree so e.g. smart pruning knows the new budget
+                self.set_sim_budget(float(new_ceiling))
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added

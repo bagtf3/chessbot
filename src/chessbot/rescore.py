@@ -52,7 +52,7 @@ class Rescorer(object):
 
         self.sf_checked = 0
         self.best_move_actual = 0
-        self.top_3_actual = 0
+        self.top3_actual = 0
 
         self.init_analyzer()
 
@@ -239,7 +239,7 @@ class Rescorer(object):
         else:
             played = played[0]
             in_top3 = True
-            self.top_3_actual += 1
+            self.top3_actual += 1
         
         played_cp = score_cp_stm_pov(played['score'])
         played_abs = score_cp_white_pov(played["score"], clipped=False)

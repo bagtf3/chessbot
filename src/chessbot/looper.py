@@ -353,7 +353,9 @@ class GameLooper(object):
             "duration": _now() - game.started_at,
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
-            "adjudication_index": adjudication_index
+            "adjudication_index": adjudication_index,
+            # this is the specific c_puct, not the list of options
+            "c_puct": game.tree.c_puct
         }
 
         # on-disk record (full)
@@ -366,9 +368,6 @@ class GameLooper(object):
         res.update(mem_summary)
         res.update(self.config.to_dict())
         res.update(game.meta)
-
-        # this is the specific c_puct, not the list of options
-        res['c_puct'] = game.tree.c_puct
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data

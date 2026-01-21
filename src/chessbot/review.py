@@ -48,9 +48,19 @@ def post_hoc_signal_handler(signum, frame):
 class GameViewer:
     def __init__(self, log_path, sf_df=None):
         self.path = pathlib.Path(log_path)
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.log = json.load(f)
-    
+        if not self.path.exists():
+            raise FileNotFoundError(f"log file not found: {self.path}")
+
+        suffix = self.path.suffix.lower()
+        if suffix == ".json":
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.log = json.load(f)
+        elif suffix in (".pkl", ".pickle"):
+            with open(self.path, "rb") as f:
+                self.log = pickle.load(f)
+        else:
+            raise Exception("log_path must be json or pickle")
+        
         self.start_fen = self.log.get("start_fen")
         self.moves_uci = self.log.get("moves_played", [])
         self.tree_data = self.log.get("tree_search_data", {})
@@ -243,7 +253,12 @@ class GameViewer:
         # very old games use the uci to index
         node = self.tree_data.get(chosen) or {}
         if not node:
+            # try string
             node = self.tree_data.get(str(self.ply))
+            
+            # then int
+        if not node:
+            node = self.tree_data.get(self.ply)
 
         who = self.who_moved()
 

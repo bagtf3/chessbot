@@ -303,7 +303,7 @@ def main(run_tag):
             else:
                 n_retrains = 0
             
-            recorder = RecordKeeper(n_retrains, run_num, every_sec=30.0)
+            recorder = RecordKeeper(n_retrains, run_num, every_sec=45.0)
 
             procs = check_and_reap_procs(procs)
             needed = working_cfg.training_queue_thresh

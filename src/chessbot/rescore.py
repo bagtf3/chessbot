@@ -48,11 +48,13 @@ class Rescorer(object):
         self.n_saved = 0
         self.tcpl = 0
         self.tbmr = 0
-        self.ttop3 = 0
 
-        self.sf_checked = 0
-        self.best_move_actual = 0
-        self.top3_actual = 0
+        # stockfish time keeping
+        self.n_sf_best = 0
+        self.sf_best_time = 0
+
+        self.n_sf_played = 0
+        self.sf_played_time = 0
 
         self.init_analyzer()
 
@@ -111,6 +113,10 @@ class Rescorer(object):
 
     def reset_writer(self):
         self.written_this_round = 0
+        self.sf_best_time = 0
+        self.n_sf_best = 0
+        self.sf_played_time = 0
+        self.n_sf_played = 0
     
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
@@ -207,13 +213,14 @@ class Rescorer(object):
         limit = chess.engine.Limit(depth=cfg.post_hoc_depth)
         info_all = chess.engine.INFO_ALL
 
-        top3 = eng.analyse(board, limit=limit, info=info_all, multipv=3)
-        self.sf_checked += 1
-        best = [t for t in top3 if t['multipv'] == 1][0]
-        
-        best_move = best['pv'][0]
-        best_cp   = score_cp_stm_pov(best["score"])
-        best_abs  = score_cp_white_pov(best["score"], clipped=False)
+        t0 = time.perf_counter()
+        top1 = eng.analyse(board, limit=limit, info=info_all)
+        self.sf_best_time += time.perf_counter() - t0
+        self.n_sf_best += 1
+
+        best_move = top1['pv'][0]
+        best_cp   = score_cp_stm_pov(top1["score"])
+        best_abs  = score_cp_white_pov(top1["score"], clipped=False)
         
         # default
         res = {}
@@ -222,29 +229,21 @@ class Rescorer(object):
         res['best_absolute'] = best_abs
 
         if move == best_move:
-            self.best_move_actual += 1
             res['played_cp'] = best_cp
             res['played_absolute'] = best_abs
             res['delta_signed'] = 0
             res['sf_rank'] = 1
-            res['in_top3'] = True
             return res
-        
-        played = [t for t in top3 if t['pv'][0] == move]
-        # if played move not in top3, need to check again
-        if not played:
-            in_top3 = False
-            played = eng.analyse(board, limit=limit, root_moves=[move], info=info_all)
-            
-        else:
-            played = played[0]
-            in_top3 = True
-            self.top3_actual += 1
-        
+
+        t0 = time.perf_counter()
+        played = eng.analyse(board, limit=limit, root_moves=[move], info=info_all)
+        self.sf_played_time += time.perf_counter() - t0
+        self.n_sf_played += 1
+
         played_cp = score_cp_stm_pov(played['score'])
         played_abs = score_cp_white_pov(played["score"], clipped=False)
         delta = best_cp - played_cp
-
+        
         # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
         EQUIV_RANGE = cfg.post_hoc_equiv_range
         if abs(delta) <= EQUIV_RANGE:
@@ -252,7 +251,6 @@ class Rescorer(object):
             res['played_cp'] = best_cp
             res['played_absolute'] = best_abs
             res['delta_signed'] = 0
-            res['in_top3'] = True
             return res
 
         # If the played move appears better (delta negative beyond EQUIV_RANGE),
@@ -264,14 +262,12 @@ class Rescorer(object):
             res['best_absolute'] = played_abs
             res['played_absolute'] = played_abs
             res['delta_signed'] = delta
-            res['in_top3'] = True
             return res
         
         # otherwise, our move is worse
         res['played_cp'] = played_cp
         res['played_absolute'] = played_abs
         res['delta_signed'] = delta
-        res['in_top3'] = in_top3
         return res
 
     def analyze_and_rescore(self, game_data):
@@ -375,8 +371,8 @@ class Rescorer(object):
                 nb += 1
 
             rows.append([
-                i, mv, str(res['best_move']), res['best_cp'], loss_this,
-                res['played_cp'], res.get('in_top3', False),
+                i, mv, str(res['best_move']), res['best_cp'],
+                loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
                 board_ch.turn, loss_this
             ])
@@ -438,7 +434,7 @@ class Rescorer(object):
         # assemble df and summary
         cols = [
             'move_num', 'played_move', 'best_move', 'best_cp',
-            'delta', 'played_cp', 'in_top3',
+            'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss'
         ]
 
@@ -452,10 +448,7 @@ class Rescorer(object):
         white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
         black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
 
-        top3_cnt = int(out_df['in_top3'].sum()) if len(out_df) else 0
         total_plies = len(out_df)
-        not_in_top3_cnt = int(total_plies - top3_cnt)
-        top3_rate = out_df['in_top3'].mean() if total_plies else np.nan
 
         out = {
             'plies': nw + nb,
@@ -464,10 +457,7 @@ class Rescorer(object):
             'black_cpl': rnd(cpl_b / nb, 3) if nb else np.nan,
             'overall_best_move_rate': overall_bmr,
             'best_move_rate_white': white_bmr,
-            'best_move_rate_black': black_bmr,
-            'plays_in_top3_cnt': top3_cnt,
-            'not_in_top3_cnt': not_in_top3_cnt,
-            'plays_in_top3_rate': top3_rate,
+            'best_move_rate_black': black_bmr
         }
 
         for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
@@ -491,29 +481,41 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b, t = save_analysis_chunk_simple(run_dir, self.analyzed_results)
+        outp, c, b = save_analysis_chunk_simple(run_dir, self.analyzed_results)
         self.n_saved += 1    
-        self.tcpl += c; self.tbmr += b; self.ttop3 += t
+        self.tcpl += c; self.tbmr += b
 
         if report:
             if self.n_saved >= 2:
                 cpl_mean = self.tcpl/self.n_saved
                 tmbr_mean = self.tbmr/self.n_saved 
-                ttop3_mean = self.ttop3/self.n_saved
                 print(
                     f"{RS} {'Overall stats:':<16} CPL {cpl_mean:.3f}",
-                    f"BMR {tmbr_mean:.3f} TOP3 {ttop3_mean:.3f}"
+                    f"BMR {tmbr_mean:.3f}"
                 )
-
-            n_checked = self.sf_checked
-            bm_actual = self.best_move_actual / n_checked if n_checked else 0.0
-            top3_actual = self.top3_actual / n_checked if n_checked else 0.0
-            print(f"{RS} Actuals: Best Move={bm_actual:.3f} | Top 3={top3_actual:.3f}")
 
             n_tot = self.games_processed
             if n_tot > self.config.post_hoc_analyze_batch:
                 rate = n_tot / (time.time() - self.start_time)
                 print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
+            
+            # SF timing summary
+            if self.n_sf_best > 0:
+                avg_first = self.sf_best_time / self.n_sf_best
+                if self.n_sf_played > 0:
+                    avg_rerun = self.sf_played_time / self.n_sf_played
+                else:
+                    avg_rerun = 0.0
+
+                total = int(self.n_sf_played + self.n_sf_best)
+                rerun_rate = (self.n_sf_played / self.n_sf_best)
+                expected = avg_first + rerun_rate * avg_rerun
+                
+                print(f"{RS} SF timing: Total {total} | rerun rate {rerun_rate:.3f}")
+                print(
+                    f"{RS} SF timing: avg_first {avg_first:.3f}s "
+                    f"avg_rerun {avg_rerun:.3f}s exp {expected:.3f}s"
+                )
             
             w_this = self.written_this_round
             wtot = self.written_total
@@ -587,7 +589,6 @@ def lightweight_summary(results):
     wb = [r.get("best_move_rate_white", np.nan) for r in results]
     bb = [r.get("best_move_rate_black", np.nan) for r in results]
     ob = [r.get("overall_best_move_rate", np.nan) for r in results]
-    t3 = [r.get("plays_in_top3_rate", np.nan) for r in results]
 
     return {
         "games": len(results),
@@ -596,8 +597,7 @@ def lightweight_summary(results):
         "avg_overall_mean_cpl": round(safe_mean(om), 3),
         "avg_best_move_rate_white": round(safe_mean(wb), 3),
         "avg_best_move_rate_black": round(safe_mean(bb), 3),
-        "avg_overall_best_move_rate": round(safe_mean(ob), 3),
-        "avg_played_in_top3_rate": round(safe_mean(t3), 3),
+        "avg_overall_best_move_rate": round(safe_mean(ob), 3)
     }
 
 
@@ -739,8 +739,7 @@ def save_analysis_chunk_simple(run_dir, batch):
             "overall_cpl": analysis_out.get("overall_cpl"),
             "best_move_rate_white": analysis_out.get("best_move_rate_white"),
             "best_move_rate_black": analysis_out.get("best_move_rate_black"),
-            "overall_best_move_rate": analysis_out.get("overall_best_move_rate"),
-            "plays_in_top3_rate": analysis_out.get("plays_in_top3_rate")
+            "overall_best_move_rate": analysis_out.get("overall_best_move_rate")
         }
         results.append(row)
         df = analysis_out.get("df")
@@ -761,10 +760,9 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
-    top3 = df_all.in_top3.mean()
     
     print(f"{RS} Saving {len(batch)} analyzed games")
-    print(f"{RS} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f} TOP3 {top3:.3f}")
+    print(f"{RS} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f}")
 
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)
@@ -772,7 +770,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr, top3
+    return outp, cpl, bmr
 
 
 def make_fake_visits(mv, lms, ratio_best=60):

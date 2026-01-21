@@ -86,9 +86,6 @@ def spawn_workers(cfg, recent_q, telemetry_q):
             if i > 0:
                 c.play_vs_sf_prob = 0.0
 
-            # alternate syzygy for speed
-            c.use_syzygy = c.use_syzygy and (i % 2 == 1)
-
         stop_ev = ctx.Event()
         p = ctx.Process(
             target=child_looper,
@@ -295,6 +292,8 @@ def main(run_tag):
             else:
                 is_validation = False
                 working_cfg = Config.from_yaml(yaml_path, init=True)
+                # alternate syzygy for speed
+                working_cfg.use_syzygy = working_cfg.use_syzygy and (run_num % 2 == 0)
             
             recent_q, telemetry_q = make_parent_queues()
             procs = spawn_workers(working_cfg, recent_q, telemetry_q)

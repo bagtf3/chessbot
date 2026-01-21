@@ -257,8 +257,6 @@ def main(run_tag):
     finished_games = rescorer.get_unprocessed()
 
     start = time.time()
-
-    finished_games = deque()
     procs = []
     cpl_list = []
     recent_q = None
@@ -302,7 +300,7 @@ def main(run_tag):
             else:
                 n_retrains = 0
             
-            recorder = RecordKeeper(n_retrains=n_retrains, every_sec=60.0)
+            recorder = RecordKeeper(n_retrains, run_num, every_sec=30.0)
 
             procs = check_and_reap_procs(procs)
             needed = working_cfg.training_queue_thresh
@@ -330,7 +328,7 @@ def main(run_tag):
                     update_game_index(game['meta'], base_cfg)
                     finished_games.append(game)
                 
-                recorder.maybe_log_results(run_num=run_num)
+                recorder.maybe_log_results()
 
                 process_start = time.time()
                 # process games for a little bit then keep checking
@@ -340,7 +338,11 @@ def main(run_tag):
                         break
                     
                     to_process = finished_games.popleft()
-                    pkl_file = to_process['meta']['pkl_file']
+                    # might be nested or flat depending on where it came from
+                    if 'meta' in to_process.keys():
+                        pkl_file = to_process['meta']['pkl_file']
+                    else:
+                        pkl_file = to_process['pkl_file']
                     rescorer.analyze_and_rescore(pkl_file)
                     recorder.training_queue = rescorer.written_this_round
                     # need to write this out to pkl
@@ -355,7 +357,8 @@ def main(run_tag):
             telemetry_q = None
 
             # selfplay round report
-            recorder.maybe_log_results(force=True, run_num=run_num)
+            recorder.maybe_log_results(force=True)
+            total_games += recorder.games_finished
 
             if is_validation:
                 recorder.config = working_cfg
@@ -376,7 +379,11 @@ def main(run_tag):
                     
                     if len(finished_games):
                         to_process = finished_games.popleft()
-                        pkl_file = to_process['meta']['pkl_file']
+                        # might be nested or flat depending on where it came from
+                        if 'meta' in to_process.keys():
+                            pkl_file = to_process['meta']['pkl_file']
+                        else:
+                            pkl_file = to_process['pkl_file']
                         rescorer.analyze_and_rescore(pkl_file)
                     
                     else:

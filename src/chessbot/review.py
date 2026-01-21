@@ -1474,8 +1474,9 @@ def stop_post_hoc_server(p, timeout=10):
 
 
 class RecordKeeper(object):    
-    def __init__(self, n_retrains, every_sec=60):
+    def __init__(self, n_retrains, run_num, every_sec=60):
         self.n_retrains = n_retrains
+        self.run_num = run_num
         self.every_sec = every_sec
         self._last_stats_log = time.time()
         self._run_start = time.time()
@@ -1544,18 +1545,18 @@ class RecordKeeper(object):
                 continue
             
             for tosum in to_sum:
-                summed[tosum] += info[tosum]
+                summed[tosum] += info.get(tosum, 0)
                 sum_seen.add(tosum)
 
             for ta in to_avg:
-                avged[ta].append(info[ta])
+                avged[ta].append(info.get(ta, 0))
                 avg_seen.add(ta)
 
         summed_out = {k: summed[k] for k in sorted(sum_seen)}
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
         return summed_out, avg_out
 
-    def maybe_log_results(self, window=500, force=False, run_num=None):
+    def maybe_log_results(self, window=500, force=False):
         now = time.time()
         if not force and (now - self._last_stats_log < self.every_sec):
             return
@@ -1568,10 +1569,7 @@ class RecordKeeper(object):
         gph =  3600 * self.games_finished / (now - self._run_start)
         
         print()
-        if run_num is None:
-            print("~"*72)
-        else:
-            print(f" Round {run_num} Logging ".center(72, "~"))
+        print(f" Round {self.run_num} Logging ".center(72, "~"))
         
         mps, lps = summed.get("mps", 0), summed.get("lps", 0)
         print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}")

@@ -38,6 +38,7 @@ class Rescorer(object):
         self.train_on_validation = cfg.train_on_validation
 
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        self.eng.configure(cfg.sf_config)
 
         self.start_time = time.time()
         self.games_seen = set()
@@ -291,6 +292,9 @@ class Rescorer(object):
             raise TypeError("game_data must be a dict or path to .pkl/.json")
 
         gid = game_data.get("game_id")
+        if gid in self.games_seen:
+            return
+        
         board_ch = chess.Board(game_data['start_fen'])
         b_fast = Board(game_data['start_fen'])
 
@@ -475,6 +479,10 @@ class Rescorer(object):
             self.push_analyzed(report=True)
         
     def push_analyzed(self, report=True):
+        # safeguard here
+        if not len(self.analyzed_results):
+            return
+        
         run_dir = self.config.run_dir
         outp, c, b, t = save_analysis_chunk_simple(run_dir, self.analyzed_results)
         self.n_saved += 1    
@@ -490,19 +498,17 @@ class Rescorer(object):
                     f"BMR {tmbr_mean:.3f} TOP3 {ttop3_mean:.3f}"
                 )
             
-            n_this = len(self.analyzed_results)
-            n_tot = self.games_processed
-            rate = n_tot / (time.time() - self.start_time)
-            print(f"{RS} {n_tot} processed games ({rate:.3f}/sec)")
+                n_tot = self.games_processed
+                if n_tot > self.config.post_hoc_analyze_batch:
+                    rate = n_tot / (time.time() - self.start_time)
+                    print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
 
+            
             w_this = self.written_this_round
-            w_tot = self.written_total
-            print(
-                "[rescore] Training samples written "
-                f"this round: {w_this} | total: {w_tot}"
-            )
+            wtot = self.written_total
+            print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
         
-        self.analyzed_results.clear()
+        self.analyzed_results = []
 
 # helpers
 def save_pickle_atomic(obj, path, tries=0):
@@ -544,6 +550,8 @@ def load_json(path):
 def load_game_index(path=None):
     if not path.endswith("game_index.json"):
         path = os.path.join(path, "game_index.json")
+    if not os.path.exists(path):
+        return []
     return load_json(path)
 
 

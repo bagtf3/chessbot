@@ -345,8 +345,17 @@ class MCTSTree(fasttree):
 class ChessGame(object):
     def __init__(self, board, meta, cfg):
         self.game_id = str(uuid.uuid4())
-        self.config = cfg
         self.started_at = _now()
+
+        # we may sample adjudicators to vary gameplay
+        if cfg.sample_adjudicators:
+            cfg = cfg.copy()
+            cfg.use_material_diff = bool(np.random.random() > 0.5)
+            cfg.use_syzygy = bool(np.random.random() > 0.5)
+            cfg.use_eval_draw = bool(np.random.random() > 0.5)
+            cfg.use_eval_collar = bool(np.random.random() > 0.5)
+            
+        self.config = cfg
 
         self.board = board
         self.starting_fen = self.board.fen()
@@ -615,16 +624,18 @@ class ChessGame(object):
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
             return True
-    
-        mat_diff = self.board.material_count()
-        if abs(mat_diff) >= cfg.material_diff_cutoff:
-            self.mat_adv_counter += 1
-        else:
-            self.mat_adv_counter = 0
-    
-        if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
-            self.outcome = 1.0 if mat_diff > 0 else -1.0
-            return True
+
+        # raw material difference
+        if cfg.use_material_diff:
+            mat_diff = self.board.material_count()
+            if abs(mat_diff) >= cfg.material_diff_cutoff:
+                self.mat_adv_counter += 1
+            else:
+                self.mat_adv_counter = 0
+        
+            if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
+                self.outcome = 1.0 if mat_diff > 0 else -1.0
+                return True
         
         # Syzygy probe if few pieces
         if cfg.use_syzygy:
@@ -636,10 +647,12 @@ class ChessGame(object):
                         # gotta flip back to python chess here
                         chess_board = chess.Board(self.board.fen())
                         table_res = tablebase.probe_wdl(chess_board)
-                        
-                    table_res = table_res if chess_board.turn else -1*table_res
-                    self.outcome = outcomes[table_res]
-                    return True
+
+                    # -1 and 1 are not guaranteed winners
+                    if table_res in [-2, 0, 2]:
+                        table_res = table_res if chess_board.turn else -1*table_res
+                        self.outcome = outcomes[table_res]
+                        return True
                 except:
                     pass
 

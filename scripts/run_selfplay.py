@@ -292,8 +292,6 @@ def main(run_tag):
             else:
                 is_validation = False
                 working_cfg = Config.from_yaml(yaml_path, init=True)
-                # alternate syzygy for speed
-                working_cfg.use_syzygy = working_cfg.use_syzygy and (run_num % 2 == 0)
             
             recent_q, telemetry_q = make_parent_queues()
             procs = spawn_workers(working_cfg, recent_q, telemetry_q)

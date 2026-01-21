@@ -43,11 +43,14 @@ class Config(object):
     micro_batch = 4
     fwd_batch = 512
 
+    sample_adjudicators = True
+    
     max_game_length = 200
     min_game_length = 5
+    use_syzygy = False
+    use_material_diff = True
     material_diff_cutoff = 9
     material_diff_cutoff_span = 20
-    use_syzygy = False
 
     use_eval_draw = True
     eval_draw_min_plies = 50

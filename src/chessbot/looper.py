@@ -353,7 +353,6 @@ class GameLooper(object):
             "duration": _now() - game.started_at,
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
-            "n_retrains": self.n_retrains,
             "adjudication_index": adjudication_index
         }
 

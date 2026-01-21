@@ -80,8 +80,14 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         c = cfg.copy()
         c.id = f"w{i}"
 
-        if (not cfg.is_validation_run) and (i > 0):
-            c.play_vs_sf_prob = 0.0
+        # customize workers
+        if not cfg.is_validation_run:
+            # only SF on first worker (saves CPU)
+            if i > 0:
+                c.play_vs_sf_prob = 0.0
+
+            # alternate syzygy for speed
+            c.use_syzygy = c.use_syzygy and (i % 2 == 1)
 
         stop_ev = ctx.Event()
         p = ctx.Process(

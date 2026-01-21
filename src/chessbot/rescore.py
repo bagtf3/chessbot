@@ -6,7 +6,7 @@ import subprocess
 from collections import deque
 
 import pickle
-import chess, chess.svg, chess.engine
+import chess, chess.engine
 
 import signal
 from multiprocessing import Process
@@ -20,7 +20,7 @@ from chessbot import SF_LOC
 from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence
+    calc_entropy, cp_to_value_tanh, kl_divergence
 )
 
 RS = "[rescore]"
@@ -49,6 +49,10 @@ class Rescorer(object):
         self.tcpl = 0
         self.tbmr = 0
         self.ttop3 = 0
+
+        self.sf_checked = 0
+        self.best_move_actual = 0
+        self.top_3_actual = 0
 
         self.init_analyzer()
 
@@ -204,6 +208,7 @@ class Rescorer(object):
         info_all = chess.engine.INFO_ALL
 
         top3 = eng.analyse(board, limit=limit, info=info_all, multipv=3)
+        self.sf_checked += 1
         best = [t for t in top3 if t['multipv'] == 1][0]
         
         best_move = best['pv'][0]
@@ -215,8 +220,9 @@ class Rescorer(object):
         res['best_move'] = best_move
         res['best_cp'] = best_cp
         res['best_absolute'] = best_abs
-        
+
         if move == best_move:
+            self.best_move_actual += 1
             res['played_cp'] = best_cp
             res['played_absolute'] = best_abs
             res['delta_signed'] = 0
@@ -233,6 +239,7 @@ class Rescorer(object):
         else:
             played = played[0]
             in_top3 = True
+            self.top_3_actual += 1
         
         played_cp = score_cp_stm_pov(played['score'])
         played_abs = score_cp_white_pov(played["score"], clipped=False)
@@ -494,15 +501,19 @@ class Rescorer(object):
                 tmbr_mean = self.tbmr/self.n_saved 
                 ttop3_mean = self.ttop3/self.n_saved
                 print(
-                    f"[rescore] {'Overall stats:':<16} CPL {cpl_mean:.3f}",
+                    f"{RS} {'Overall stats:':<16} CPL {cpl_mean:.3f}",
                     f"BMR {tmbr_mean:.3f} TOP3 {ttop3_mean:.3f}"
                 )
-            
-                n_tot = self.games_processed
-                if n_tot > self.config.post_hoc_analyze_batch:
-                    rate = n_tot / (time.time() - self.start_time)
-                    print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
 
+            n_checked = self.sf_checked
+            bm_actual = self.best_move_actual / n_checked if n_checked else 0.0
+            top3_actual = self.top3_actual / n_checked if n_checked else 0.0
+            print(f"{RS} Actuals: Best Move={bm_actual:.3f} | Top 3={top3_actual:.3f}")
+
+            n_tot = self.games_processed
+            if n_tot > self.config.post_hoc_analyze_batch:
+                rate = n_tot / (time.time() - self.start_time)
+                print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
             
             w_this = self.written_this_round
             wtot = self.written_total

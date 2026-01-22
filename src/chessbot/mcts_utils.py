@@ -264,9 +264,13 @@ class MCTSTree(fasttree):
         rows = self.root_child_visits()
         visits = [v[1] for v in rows]
         visit_delta = visits[0]-visits[1]
-        if visit_delta >= self.target_delta:
-            self.sim_stop_reason = f"Visit delta {visit_delta} >= {self.target_delta}"
+
+        remaining = self.sims_ceiling - sims_done
+        stop_condition = min(remaining, self.target_delta)
+        if visit_delta >= stop_condition:
+            self.sim_stop_reason = f"Visit delta {visit_delta} >= {stop_condition}"
             return True
+
         return False
         
         # # if not using the dec model, just hit the target
@@ -306,7 +310,7 @@ class MCTSTree(fasttree):
         #         return True
         
         # otherwise keep searching
-        return False
+        #return False
 
     def stop_simulating(self):
         # do at least 1 sims to stabilize the tree

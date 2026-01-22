@@ -215,6 +215,23 @@ def kl_divergence(p_list, q_list):
     return np.sum(p * np.log(p / q))
 
 
+def kl_divergence_bits(p, q, eps=1e-12):
+    """KL(p || q) in bits."""
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    if p.sum() <= 0.0:
+        p = np.ones_like(p, dtype=np.float64) / p.size
+    else:
+        p = p / p.sum()
+    if q.sum() <= 0.0:
+        q = np.ones_like(q, dtype=np.float64) / q.size
+    else:
+        q = q / q.sum()
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    return np.sum(p * np.log2(p / q))
+
+
 def ensure_df(df_or_dicts):
     if isinstance(df_or_dicts, pd.DataFrame):
         return df_or_dicts.copy()

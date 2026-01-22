@@ -22,7 +22,7 @@ from chessbot.config import Config
 from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, sf_eval
+    calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence_bits
 )
 
 
@@ -330,7 +330,7 @@ class GameViewer:
         PUCT = Qrel + cPUCT*U
         print(
             f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q: {Q:+.3f} P: {P:.3f} PUCT: {PUCT:+.3f}"
+            f"Q: {Q:+.3f}  P: {P:.3f}  PUCT: {PUCT:+.3f}"
             f"{marker}{rank_str}"
         )
     
@@ -376,7 +376,7 @@ class GameViewer:
 
         norm_vis, p_vis = self.compute_norm_entropy(visits_list)
         norm_pri, p_pri = self.compute_norm_entropy(priors_list)
-        kl = self.kl_divergence_bits(p_vis, p_pri)
+        kl = kl_divergence_bits(p_vis, p_pri)
 
         print(
             f"  entropy (norm'd): visits={norm_vis:.3f} "
@@ -568,28 +568,9 @@ class GameViewer:
             p = np.ones(a.size, dtype=np.float64) / a.size
         else:
             p = a / s
-        nz = p > 0.0
-        ent = -np.sum(p[nz] * np.log2(p[nz])) if nz.any() else 0.0
-        norm = ent / np.log2(p.size) if p.size > 1 else 0.0
+        
+        ent, norm = calc_entropy(p)
         return norm, p
-
-
-    def kl_divergence_bits(self, p, q, eps=1e-12):
-        """KL(p || q) in bits."""
-        p = np.asarray(p, dtype=np.float64)
-        q = np.asarray(q, dtype=np.float64)
-        if p.sum() <= 0.0:
-            p = np.ones_like(p, dtype=np.float64) / p.size
-        else:
-            p = p / p.sum()
-        if q.sum() <= 0.0:
-            q = np.ones_like(q, dtype=np.float64) / q.size
-        else:
-            q = q / q.sum()
-        p = np.clip(p, eps, 1.0)
-        q = np.clip(q, eps, 1.0)
-        return np.sum(p * np.log2(p / q))
-
 
     def generate_training_data(self, sf_skip=False, **kwargs):
         """

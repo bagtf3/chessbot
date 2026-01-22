@@ -47,6 +47,15 @@ class MCTSTree(fasttree):
         else:
             self.sims_ceiling = cfg.sims_ceiling
 
+        # naive early stop/bonus sims based on 1-2 move visit delta
+        # interpret as ratio
+        if cfg.target_delta < 1:
+            self.target_delta = np.floor(cfg.target_delta*self.sims_ceiling)
+
+        # otherwise use number per se
+        else:
+            self.target_delta = int(cfg.target_delta)
+
         self.pruning_factor = cfg.pruning_factor
         super().__init__(
             board, self.c_puct, self.ema_span,
@@ -64,19 +73,6 @@ class MCTSTree(fasttree):
 
         self.n_moves_played = 0
         self.sims_done_total = 0
-
-        # naive early stop/bonus sims based on 1-2 move visit delta
-        # interpret as ratio
-        if cfg.target_delta < 1:
-            self.target_delta = int(cfg.target_delta*cfg.sims_floor)
-
-        # otherwise use number per se
-        elif cfg.target_delta < cfg.sims_floor:    
-            self.target_delta = cfg.target_delta
-        
-        # fallback to 10%
-        else:
-            self.target_delta = int(0.1*cfg.sims_floor)
         
         # root noise
         self.add_root_noise = cfg.add_root_noise
@@ -167,6 +163,11 @@ class MCTSTree(fasttree):
                 self.sims_ceiling = new_ceiling
                 # this updates the c++ tree so e.g. smart pruning knows the new budget
                 self.set_sim_budget(float(new_ceiling))
+
+                # if a ratio is used, update that
+                if self.config.target_delta < 1:
+                    self.target_delta = np.floor(self.config.target_delta*new_ceiling)
+
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added

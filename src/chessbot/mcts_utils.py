@@ -28,8 +28,6 @@ class MCTSTree(fasttree):
             self.c_puct = float(np.random.choice(c))
         else:
             self.c_puct = c
-        
-        self.ema_span = cfg.ema_span
 
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
@@ -57,10 +55,7 @@ class MCTSTree(fasttree):
             self.target_delta = int(cfg.target_delta)
 
         self.pruning_factor = cfg.pruning_factor
-        super().__init__(
-            board, self.c_puct, self.ema_span,
-            self.sims_ceiling, self.pruning_factor
-        )
+        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor)
 
         # bookkeeping
         self.board = board
@@ -480,7 +475,6 @@ class ChessGame(object):
             cm = {
                 "uci": cd.uci, "visits": cd.N,
                 "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4),
-                "Q_ema": rnd(cd.Q_ema, 4),
                 "is_terminal": cd.is_terminal
             }
             

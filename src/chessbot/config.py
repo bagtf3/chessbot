@@ -21,7 +21,6 @@ class Config(object):
 
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
-    ema_span = 1000 # large ema_span effective turns it off
 
     use_smart_pruning = True
     pruning_factor = 1.33

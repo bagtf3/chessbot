@@ -3,6 +3,7 @@ import psutil
 import uuid
 
 import pickle
+from collections import defaultdict
 
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
@@ -18,10 +19,12 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.config import Config
+from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, sf_eval
+    calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence_bits
 )
+
 
 TRAINING_PKL = "additional_training_data.pkl"
 ANALYZE_PKL = "analyze_results_combined.pkl"
@@ -45,9 +48,19 @@ def post_hoc_signal_handler(signum, frame):
 class GameViewer:
     def __init__(self, log_path, sf_df=None):
         self.path = pathlib.Path(log_path)
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.log = json.load(f)
-    
+        if not self.path.exists():
+            raise FileNotFoundError(f"log file not found: {self.path}")
+
+        suffix = self.path.suffix.lower()
+        if suffix == ".json":
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.log = json.load(f)
+        elif suffix in (".pkl", ".pickle"):
+            with open(self.path, "rb") as f:
+                self.log = pickle.load(f)
+        else:
+            raise Exception("log_path must be json or pickle")
+        
         self.start_fen = self.log.get("start_fen")
         self.moves_uci = self.log.get("moves_played", [])
         self.tree_data = self.log.get("tree_search_data", {})
@@ -240,7 +253,12 @@ class GameViewer:
         # very old games use the uci to index
         node = self.tree_data.get(chosen) or {}
         if not node:
+            # try string
             node = self.tree_data.get(str(self.ply))
+            
+            # then int
+        if not node:
+            node = self.tree_data.get(self.ply)
 
         who = self.who_moved()
 
@@ -305,7 +323,6 @@ class GameViewer:
         marker = "  <- SF" if mark else ""
         rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
         Q = c.get('Q',0)
-        Q_ema = c.get("Q_ema", 0)
         P = c.get('P',0)
         U = c.get('U',0)
         cPUCT = self.log.get('c_puct', 1.5)
@@ -313,7 +330,7 @@ class GameViewer:
         PUCT = Qrel + cPUCT*U
         print(
             f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q={Q:+.3f} Q_ema={Q_ema:+.3f}, P={P:.3f} PUCT={PUCT:+.3f}"
+            f"Q: {Q:+.3f}  P: {P:.3f}  PUCT: {PUCT:+.3f}"
             f"{marker}{rank_str}"
         )
     
@@ -359,7 +376,7 @@ class GameViewer:
 
         norm_vis, p_vis = self.compute_norm_entropy(visits_list)
         norm_pri, p_pri = self.compute_norm_entropy(priors_list)
-        kl = self.kl_divergence_bits(p_vis, p_pri)
+        kl = kl_divergence_bits(p_vis, p_pri)
 
         print(
             f"  entropy (norm'd): visits={norm_vis:.3f} "
@@ -551,28 +568,9 @@ class GameViewer:
             p = np.ones(a.size, dtype=np.float64) / a.size
         else:
             p = a / s
-        nz = p > 0.0
-        ent = -np.sum(p[nz] * np.log2(p[nz])) if nz.any() else 0.0
-        norm = ent / np.log2(p.size) if p.size > 1 else 0.0
+        
+        ent, norm = calc_entropy(p)
         return norm, p
-
-
-    def kl_divergence_bits(self, p, q, eps=1e-12):
-        """KL(p || q) in bits."""
-        p = np.asarray(p, dtype=np.float64)
-        q = np.asarray(q, dtype=np.float64)
-        if p.sum() <= 0.0:
-            p = np.ones_like(p, dtype=np.float64) / p.size
-        else:
-            p = p / p.sum()
-        if q.sum() <= 0.0:
-            q = np.ones_like(q, dtype=np.float64) / q.size
-        else:
-            q = q / q.sum()
-        p = np.clip(p, eps, 1.0)
-        q = np.clip(q, eps, 1.0)
-        return np.sum(p * np.log2(p / q))
-
 
     def generate_training_data(self, sf_skip=False, **kwargs):
         """
@@ -1468,3 +1466,205 @@ def stop_post_hoc_server(p, timeout=10):
     else:
         print("post_hoc_server stopped")
         del p
+
+
+class RecordKeeper(object):    
+    def __init__(self, n_retrains, run_num, every_sec=60):
+        self.n_retrains = n_retrains
+        self.run_num = run_num
+        self.every_sec = every_sec
+        self._last_stats_log = time.time()
+        self._run_start = time.time()
+
+        self.sims_done_total = 0
+        self.total_plies = 0
+        self.games_finished = 0
+        self.white_wins = 0
+        self.black_wins = 0
+        self.draws = 0
+        self.training_queue = 0
+
+        self.recent_games = []
+        self.telemetry = {}
+
+    def ingest_recents(self, recent):
+        looper_id = recent['looper_id']
+        meta = recent['meta']
+
+        self.games_finished += 1
+        self.total_plies += meta['plies']
+        self.sims_done_total += meta['sims_done_total']
+
+        if meta['result'] > 0:
+            self.white_wins += 1
+        elif meta['result'] < 0:
+            self.black_wins += 1
+        else:
+            self.draws += 1
+        
+        self.recent_games.append(meta)
+
+    def ingest_telemetry(self, telemetry):
+        # store the latest from each only.
+        looper_id = telemetry['looper_id']
+        info = telemetry['telemetry']
+
+        # update if existing, else create entry
+        if looper_id in self.telemetry.keys():
+            self.telemetry[looper_id].update(info)
+        else:
+            self.telemetry[looper_id] = info
+
+        self.maybe_log_results()
+
+    def get_agg_metrics(self):
+        time_delta = time.time() - 120
+        to_sum = [
+            "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
+            "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
+            "s_priorless", "s_puct", "preds_per_second"
+        ]
+
+        summed = defaultdict(float)
+        sum_seen = set()
+
+        to_avg = ['mbs', 'fwd_target', 'apl', "pred_wait", 'avg_ply']
+        avged = defaultdict(list)
+        avg_seen = set()
+        valid = []
+        for looper_id, info in self.telemetry.items():
+            # if telemetry is timed out, skip it
+            if info['ts'] < time_delta:
+                continue
+            
+            for tosum in to_sum:
+                summed[tosum] += info.get(tosum, 0)
+                sum_seen.add(tosum)
+
+            for ta in to_avg:
+                avged[ta].append(info.get(ta, 0))
+                avg_seen.add(ta)
+
+        summed_out = {k: summed[k] for k in sorted(sum_seen)}
+        avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
+        return summed_out, avg_out
+
+    def maybe_log_results(self, window=500, force=False):
+        now = time.time()
+        if not force and (now - self._last_stats_log < self.every_sec):
+            return
+
+        self._last_stats_log = now
+
+        # pull stats
+        summed, avged = self.get_agg_metrics()
+        avg_moves = (self.total_plies / max(1, self.games_finished))
+        gph =  3600 * self.games_finished / (now - self._run_start)
+        
+        print()
+        print(f" Round {self.run_num} Logging ".center(72, "~"))
+        
+        mps, lps = summed.get("mps", 0), summed.get("lps", 0)
+        print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}")
+        
+        print(
+            f"[game stats]  finished={self.games_finished}  "
+            f"W/D/L={self.white_wins}/{self.draws}/{self.black_wins}  "
+            f"avg_len={avg_moves:.1f} moves")
+        print("-" * 72)
+
+        recent = self.recent_games[-500:]
+        if not recent:
+            print("(no recent games to break down)")
+            print("~" * 72)
+            self.log_loop_stats(summed, avged)
+            return
+
+        # pretty printer
+        print_recent_summary(recent, window=window)
+        print(
+            f"Length of training queue: {self.training_queue} ",
+            f"Current retrain number: {self.n_retrains}\n"
+        )
+        # chain log_loop_stats here as well
+        self.log_loop_stats(summed, avged)
+        return
+
+    def log_loop_stats(self, summed, avged):
+        n_groups = summed.get("n_groups", 0)
+        if n_groups == 0:
+            return
+        
+        s_collected     = summed.get("s_collected", 0)
+        s_fast          = summed.get("s_fast", 0)
+        s_terminals     = summed.get("s_terminals", 0)
+        s_cached        = summed.get("s_cached", 0)
+        s_fast_stops    = summed.get("s_fast_stops", 0)
+        s_collect_stops = summed.get("s_collect_stops", 0)
+        s_priorless     = summed.get("s_priorless", 0)
+        s_puct          = summed.get("s_puct", 0)
+
+        avg_new = s_collected / n_groups
+
+        total_overall = s_collected + s_terminals + s_cached
+        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
+        pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
+        pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
+
+        f_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
+        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
+
+        mbs = avged['mbs']
+        print("-"*72)
+        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.0f}"
+        right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
+
+        left2 = f"[stop stats] fastpath_breaks={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
+        right2 = f"collect_breaks={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
+
+        # preds / active / finished runtime pre-compute
+        apl = avged['apl']
+        fwd_target = avged['fwd_target']
+        fill_pct = 100.0 * apl / max(1.0, fwd_target)
+
+        pred_wait = avged['pred_wait']
+        preds_per_sec = summed['preds_per_second']
+
+        left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
+        right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
+
+        with_priors = total_overall - s_priorless
+        puct_avg = s_puct / with_priors if with_priors else 0.0
+        priorless_pct = 100.0 * s_priorless / max(1, total_overall)
+        left4 = f"[leaf stats] priorless={s_priorless:.0f} ({priorless_pct:.2f}%)"
+        right4 = f"puct={s_puct:.0f}  puct/leaf={puct_avg:.1f}"
+
+        left5 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
+        right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+
+        sims = self.sims_done_total
+        moves = self.total_plies
+        sims_per_move = sims / moves if moves > 0 else 0.0
+
+        n_active = summed['n_active']
+        avg_ply = avged['avg_ply']
+        left6 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
+        right6 = f"sims per move={sims_per_move:.2f}"
+
+        col_width = 40
+        print(f"{left1:<{col_width}} | {right1}")
+        print(f"{left2:<{col_width}} | {right2}")
+        print(f"{left3:<{col_width}} | {right3}")
+        print(f"{left4:<{col_width}} | {right4}")
+        print(f"{left5:<{col_width}} | {right5}")
+        print(f"{left6:<{col_width}} | {right6}")
+
+        # show game duration if its available
+        last50 = self.recent_games[-50:]
+        durations = [g.get("duration", 0.0) for g in last50]
+        avg_runtime = None
+        if sum(durations) > 0:
+            avg_runtime = format_time(np.mean(durations))
+            if avg_runtime:
+                print(f"[game stats] last 50 runtime: {avg_runtime}")
+        print("-"*72)

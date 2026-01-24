@@ -9,7 +9,7 @@ from chessbot.rescore import load_game_index
 from chessbot.rescore import ANALYZE_PKL
 
 
-CPL_MIN = 50
+CPL_MIN = 5000
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 
 
@@ -210,7 +210,7 @@ def process_run(run_dir, cpl_min, dry_run):
 
 
 def main(dry_run=True):
-    skip = ["cf_10x256x5_low_sims3", "cf_10x256x5_low_sims2"]
+    skip = ["cf_10x256x5_low_sims3"]
     run_tags = [rt for rt in os.listdir(SP_DIR) if rt not in skip]
 
     total_deleted = 0
@@ -252,4 +252,4 @@ def main(dry_run=True):
     print(f"total missing          : {total_missing}")
 
 
-main(dry_run=True)
+main(dry_run=False)

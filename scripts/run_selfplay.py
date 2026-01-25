@@ -293,6 +293,8 @@ def main(run_tag):
                 is_validation = False
                 working_cfg = Config.from_yaml(yaml_path, init=True)
             
+            # update the rescorer config
+            rescorer.config = working_cfg
             recent_q, telemetry_q = make_parent_queues()
             procs = spawn_workers(working_cfg, recent_q, telemetry_q)
 

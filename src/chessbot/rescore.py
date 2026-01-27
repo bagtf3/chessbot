@@ -55,6 +55,8 @@ class Rescorer(object):
 
         self.n_sf_played = 0
         self.sf_played_time = 0
+        # sf max will store the 10 longest sf search times, to reduce outliers
+        self.sf_max = [0.0]*10
 
         self.init_analyzer()
 
@@ -117,6 +119,7 @@ class Rescorer(object):
         self.n_sf_best = 0
         self.sf_played_time = 0
         self.n_sf_played = 0
+        self.sf_max = [0.0]*10
     
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         """
@@ -215,8 +218,14 @@ class Rescorer(object):
 
         t0 = time.perf_counter()
         top1 = eng.analyse(board, limit=limit, info=info_all)
-        self.sf_best_time += time.perf_counter() - t0
+        sf_time = time.perf_counter() - t0
+        self.sf_best_time += sf_time
         self.n_sf_best += 1
+
+        # collect the max time 
+        if sf_time > self.sf_max[0]:
+            self.sf_max.append(sf_time)
+            self.sf_max = sorted(self.sf_max)[-10:]
 
         best_move = top1['pv'][0]
         best_cp   = score_cp_stm_pov(top1["score"])
@@ -237,8 +246,15 @@ class Rescorer(object):
 
         t0 = time.perf_counter()
         played = eng.analyse(board, limit=limit, root_moves=[move], info=info_all)
-        self.sf_played_time += time.perf_counter() - t0
+        
+        sf_time = time.perf_counter() - t0
+        self.sf_played_time += sf_time
         self.n_sf_played += 1
+
+        # collect the max time 
+        if sf_time > self.sf_max[0]:
+            self.sf_max.append(sf_time)
+            self.sf_max = sorted(self.sf_max)[-10:]
 
         played_cp = score_cp_stm_pov(played['score'])
         played_abs = score_cp_white_pov(played["score"], clipped=False)
@@ -513,8 +529,9 @@ class Rescorer(object):
                 
                 print(f"{RS} SF timing: Total {total} | rerun rate {rerun_rate:.3f}")
                 print(
-                    f"{RS} SF timing: avg_first {avg_first:.3f}s "
-                    f"avg_rerun {avg_rerun:.3f}s exp {expected:.3f}s"
+                    f"{RS} SF timing: avg_first {avg_first:.3f} "
+                    f"avg_rerun {avg_rerun:.3f} exp {expected:.3f} "
+                    f"max {self.sf_max[-1]:.3f}"
                 )
             
             w_this = self.written_this_round

@@ -162,7 +162,10 @@ class MCTSTree(fasttree):
                 # if a ratio is used, update that
                 if self.config.target_delta < 1:
                     self.target_delta = np.floor(self.config.target_delta*new_ceiling)
-
+        
+        # tighten search for late/endgames
+        if self.n_plies == 100:
+            self.set_cpuct(1.25)
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added
@@ -505,7 +508,7 @@ class ChessGame(object):
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
-        tl = 0.25  # time limit
+        tl = 0.5  # time limit
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng

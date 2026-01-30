@@ -167,14 +167,8 @@ def paired_validation_games(cfg):
     selected = np.random.choice(indices, n, replace=False)
     
     for i, s in enumerate(selected):
-        # get two separate fastboard instances from same premoved path
-        # always play 1 pair from startpos
-        if i == 0:
-            board_white = fastboard()
-            board_black = fastboard()
-        else:
-            board_white = cbu.get_pre_opened_game(index=s)
-            board_black = cbu.get_pre_opened_game(index=s)
+        board_white = cbu.get_pre_opened_game(index=s)
+        board_black = cbu.get_pre_opened_game(index=s)
 
         meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
                   "scenario": "paired_validation"}

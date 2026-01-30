@@ -95,7 +95,7 @@ class MCTSTree(fasttree):
             return super().best()
 
         # if at/after the convergence ply, just use C++/base behavior
-        if (self.n_plies >= 20) or (self.board.piece_count() <= 20):
+        if (self.n_plies >= 25) or (self.board.piece_count() <= 20):
             return super().best()
 
         # gather root visits (desc sorted list of (uci, N))
@@ -120,7 +120,7 @@ class MCTSTree(fasttree):
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
         
-        frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
+        frac = max(0.0, min(1.0, (25.0 - self.n_plies) / 25.0))
         temp = temp_min + (temp_max - temp_min) * frac
 
         # build stable logits from visits: use log(visits) so scale is sane
@@ -162,10 +162,6 @@ class MCTSTree(fasttree):
                 # if a ratio is used, update that
                 if self.config.target_delta < 1:
                     self.target_delta = np.floor(self.config.target_delta*new_ceiling)
-        
-        # tighten search for late/endgames
-        if self.n_plies == 100:
-            self.set_cpuct(1.25)
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added
@@ -508,7 +504,7 @@ class ChessGame(object):
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
-        tl = 0.5  # time limit
+        tl = 0.75  # time limit
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, time_lim=tl, engine=eng
@@ -609,7 +605,11 @@ class ChessGame(object):
             self.collar_stop_trigger = cfg.eval_collar_trigger
             return False, None
 
-        # already locked: check for release (blunder) in a short tail
+        # already locked, check to see if max game length is approaching
+        elif self.plies >= cfg.max_game_length:
+            return True, self.collar_stop_eventual_outcome
+        
+        # otherwise check to see if a blunder has lowered the score
         else:
             check_depth = 3
             tail = self.recents[-check_depth:]
@@ -656,7 +656,8 @@ class ChessGame(object):
                 return True
         
         # Syzygy probe if few pieces
-        if cfg.use_syzygy:
+        # flip syzygy on if about to end due to length
+        if cfg.use_syzygy or (self.plies >= cfg.max_game_length):
             if self.board.piece_count() <= 5:
                 # may not work so just go as normal
                 try:

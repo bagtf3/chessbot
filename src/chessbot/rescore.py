@@ -8,16 +8,12 @@ from collections import deque
 import pickle
 import chess, chess.engine
 
-import signal
-from multiprocessing import Process
-
 import pandas as pd
 import numpy as np
 
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.config import Config
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, kl_divergence
@@ -199,7 +195,7 @@ class Rescorer(object):
 
         # calc KL divergence after adjustments
         priors_map = {c['uci']: c['P'] for c in cm}
-        priors = [priors_map[u] for u in ucis]
+        priors = [priors_map.get(u, 0.0) for u in ucis]
         kl = kl_divergence(priors, visits)
 
         vwht = cfg.value_loss_weight
@@ -376,7 +372,15 @@ class Rescorer(object):
                 continue
 
             # if here, its MCTS move
-            res = self.analyze_with_rank(move_ch, board_ch)
+            # move_played may not be most visited due to temp sampling
+            # so inspect visits
+            visits = [(c['uci'], max(1, c['visits'])) for c in cm]
+            visits = sorted(visits, key=lambda x: x[1], reverse=True)
+
+            most_visited_uci = visits[0][0]
+            most_visited_ch = chess.Move.from_uci(most_visited_uci)
+            res = self.analyze_with_rank(most_visited_ch, board_ch)
+
             loss_this = res['delta_signed']
             cpl_s += loss_this
             if board_ch.turn:
@@ -385,10 +389,16 @@ class Rescorer(object):
             else:
                 cpl_b += loss_this
                 nb += 1
-
+            
+            # we penalize missed mates but still winning less harshly
+            missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
+            if missed_mate:
+                # cap loss_this at 300, we are still winning here
+                loss_this = min(300, loss_this)
+            
             rows.append([
-                i, mv, str(res['best_move']), res['best_cp'],
-                loss_this, res['played_cp'],
+                i, mv, most_visited_uci, str(res['best_move']),
+                res['best_cp'], loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
                 board_ch.turn, loss_this
             ])
@@ -404,11 +414,10 @@ class Rescorer(object):
             # these moves are fine, no changes            
             if loss_this <= 60:
                 best_mv = mv
-                visits = [(c['uci'], c['visits']) for c in cm]
-                visits = sorted(visits, key=lambda x: x[1], reverse=True)
+                visits = ensure_all_legal_moves_have_visits(visits, lms)
             
-            # for mild blunders adjust visits
-            elif loss_this < cfg.post_hoc_blunder_cp:
+            # for mild blunders or missed mates but still winning adjust visits
+            elif (loss_this < cfg.post_hoc_blunder_cp) or missed_mate:
                 best_mv = str(res.get('best_move'))
                 visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
 
@@ -431,7 +440,7 @@ class Rescorer(object):
             vis = [v[1] for v in visits]
 
             priors_map = {c['uci']: c['P'] for c in cm}
-            priors = [priors_map[m] for m in mvs]
+            priors = [priors_map.get(u, 0.0) for u in mvs]
 
             vwht = cfg.value_loss_weight
             pwht = cfg.policy_loss_weight
@@ -449,13 +458,13 @@ class Rescorer(object):
 
         # assemble df and summary
         cols = [
-            'move_num', 'played_move', 'best_move', 'best_cp',
-            'delta', 'played_cp',
+            'move_num', 'played_move', 'most_visited_move', 'best_move',
+            'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss'
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
-        out_df['played_best_move'] = out_df['played_move'] == out_df['best_move']
+        out_df['played_best_move'] = out_df['most_visited_move'] == out_df['best_move']
 
         mask_w = out_df['stm'] == True
         mask_b = out_df['stm'] == False
@@ -541,6 +550,27 @@ class Rescorer(object):
         self.analyzed_results = []
 
 # helpers
+def ensure_all_legal_moves_have_visits(visit_pairs, lms):
+    """
+    visit_pairs: list of (uci, visits) or [uci, visits]
+    lms: list of legal move UCIs
+    Ensures every legal move appears with visits >= 1.
+    Returns list of [uci, int_visits] sorted desc.
+    """
+    d = {}
+    for u, v in visit_pairs:
+        if not u:
+            continue
+        d[u] = max(1, int(v))
+
+    for m in lms:
+        if m not in d:
+            d[m] = 1
+
+    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+    return [[u, int(v)] for u, v in items]
+
+
 def save_pickle_atomic(obj, path, tries=0):
     try:
         tmp = str(path) + ".tmp"

@@ -82,8 +82,8 @@ def spawn_workers(cfg, recent_q, telemetry_q):
 
         # customize workers
         if not cfg.is_validation_run:
-            # only SF on first worker (saves CPU)
-            if i > 0:
+            # only SF on first 2 workers (saves CPU)
+            if i > 1:
                 c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()

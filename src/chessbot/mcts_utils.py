@@ -29,6 +29,14 @@ class MCTSTree(fasttree):
         else:
             self.c_puct = c
 
+        ce = cfg.c_puct_endgame
+        if isinstance(ce, (int, float)):
+            self.c_puct_endgame = float(ce)
+        elif isinstance(ce, (list, set)):
+            self.c_puct_endgame = float(np.random.choice(ce))
+        else:
+            self.c_puct_endgame = ce
+
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
         self.sims_ceiling_schedule = {}
@@ -143,7 +151,7 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
-
+            
         # add noise to the root for exploration
         self.root_noise_added = False
         self.add_root_dirichlet_noise()
@@ -164,8 +172,8 @@ class MCTSTree(fasttree):
                     self.target_delta = np.floor(self.config.target_delta*new_ceiling)
         
         # lower c_puct in the end game to narrow search
-        #if self.n_plies == 120:
-        #    self.set_cpuct(1.25)
+        if self.n_plies == 120:
+           self.set_cpuct(self.c_puct_endgame)
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added
@@ -334,7 +342,7 @@ class MCTSTree(fasttree):
 
         self.n_moves_played += 1
         self.sims_done_total += self.sims_completed_this_move
-
+        
         existing = 0
         try:
             r = self.root()
@@ -349,6 +357,7 @@ class MCTSTree(fasttree):
         except Exception as e:
             print(f"error encountered calculating sims: {e}")
             existing = 0
+        
         # carry the existing visit count forward
         self.sims_completed_this_move = existing
 
@@ -459,7 +468,8 @@ class ChessGame(object):
         }
         
         # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
-        vwq = rnd(self.tree.visit_weighted_Q(), 4)
+        #vwq = rnd(self.tree.visit_weighted_Q(), 4)
+        vwq = rnd(details[0].Q, 4) # best Q
         Q_white = vwq
         Q_stm = Q_white if turn else -Q_white
         if self.is_stockfish_turn():

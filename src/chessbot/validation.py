@@ -167,8 +167,10 @@ def paired_validation_games(cfg):
     selected = np.random.choice(indices, n, replace=False)
     
     for i, s in enumerate(selected):
-        board_white = cbu.get_pre_opened_game(index=s)
-        board_black = cbu.get_pre_opened_game(index=s)
+        #board_white = cbu.get_pre_opened_game(index=s)
+        #board_black = cbu.get_pre_opened_game(index=s)
+        board_white = cbu.create_UHO_PGN_game()
+        board_black = board_white.clone()
 
         meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
                   "scenario": "paired_validation"}

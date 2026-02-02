@@ -1,6 +1,6 @@
 from chessbot import SP_DIR, MODEL_DIR
 import os
-import yaml
+import yaml, json
 
 class Config(object):
     """
@@ -21,6 +21,7 @@ class Config(object):
 
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    c_puct_endgame = 1.5
 
     use_smart_pruning = True
     pruning_factor = 1.33

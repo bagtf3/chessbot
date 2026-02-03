@@ -29,14 +29,6 @@ class MCTSTree(fasttree):
         else:
             self.c_puct = c
 
-        ce = cfg.c_puct_endgame
-        if isinstance(ce, (int, float)):
-            self.c_puct_endgame = float(ce)
-        elif isinstance(ce, (list, set)):
-            self.c_puct_endgame = float(np.random.choice(ce))
-        else:
-            self.c_puct_endgame = ce
-
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
         self.sims_ceiling_schedule = {}

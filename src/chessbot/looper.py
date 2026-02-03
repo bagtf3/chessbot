@@ -355,8 +355,7 @@ class GameLooper(object):
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
             # this is the specific c_puct, not the list of options
-            "c_puct": game.tree.c_puct,
-            "c_puct_endgame": game.tree.c_puct_endgame
+            "c_puct": game.tree.c_puct
         }
 
         # on-disk record (full)
@@ -373,7 +372,6 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
-        res["c_puct_endgame"] = game.tree.c_puct_endgame
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)

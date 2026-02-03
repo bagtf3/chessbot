@@ -69,12 +69,12 @@ class MCTSTree(fasttree):
         self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        
+
         # make sure we're starting at the correct sim schedule entry
         if self.sims_ceiling_schedule:
             for i in range(self.n_plies):
                 if i in self.sims_ceiling_schedule:
-                    self.set_new_sims_ceiling(self, n_plies=i)
+                    self.set_new_sims_ceiling(n_plies=i)
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0

@@ -1,6 +1,6 @@
 from chessbot import SP_DIR, MODEL_DIR
 import os
-import yaml
+import yaml, json
 
 class Config(object):
     """

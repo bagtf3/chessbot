@@ -9,10 +9,10 @@ from pathlib import Path
 from time import time as _now
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import chess
 import chess.engine
 import chess.svg
+import chess.pgn
 from IPython.display import SVG, display, clear_output
 
 from pyfastchess import Board as fastboard
@@ -22,6 +22,9 @@ from chessbot import features as ft
 
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import re
+import io
 
 
 MATE_CP = 2500
@@ -120,6 +123,10 @@ with open(uci_path_path, "rb") as f:
 uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
 with open(uci_path_path_mini, "rb") as f:
     MINI_PATHS = pickle.load(f)
+
+pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
+with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
+    PGN_TEXT = f.read()
 
 
 def rnd(x, n):
@@ -912,6 +919,41 @@ def get_pre_opened_game(index=None, mini=False):
     return b
 
 
+def create_UHO_PGN_game():
+    """
+    Sample a game from PGN_TEXT (already loaded in memory), push mainline moves
+    onto a fastboard(), and return the resulting board.
+
+    index: 0-based game index, or None for random
+    max_plies: cap number of half-moves played (None = all)
+    """
+    UHO_EVENT_START_RE = re.compile(r'(?m)^\[Event "')
+
+    starts = [m.start() for m in UHO_EVENT_START_RE.finditer(PGN_TEXT)]
+    if not starts:
+        raise ValueError("No games found (no [Event at line start).")
+
+    k = random.randrange(len(starts))
+    a = starts[k]
+    b = starts[k + 1] if k + 1 < len(starts) else len(PGN_TEXT)
+    chunk = PGN_TEXT[a:b]
+
+    blank = chunk.find("\n\n")
+    moves_blob = chunk if blank == -1 else chunk[blank + 2:]
+
+    game = chess.pgn.read_game(io.StringIO(moves_blob))
+    if game is None:
+        return fastboard()
+
+    fb = fastboard()
+    n = 0
+    for mv in game.mainline_moves():
+        fb.push_uci(mv.uci())
+        n += 1
+
+    return fb
+
+
 def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
     """
     Make a legal endgame-like position with exactly `pieces` total pieces.
@@ -1140,6 +1182,10 @@ class GameGenerator(object):
         elif game_type == "pre_opened_mini":
             board = get_pre_opened_game(mini=True)
             meta = {"scenario": "pre_opened_mini"}
+
+        elif game_type == "UHO":
+            board = create_UHO_PGN_game()
+            meta = {"scenario": "UHO"}
         
         elif game_type == "random_init":
             plies = 2*np.random.randint(0, 4)

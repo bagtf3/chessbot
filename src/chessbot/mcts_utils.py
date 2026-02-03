@@ -61,7 +61,12 @@ class MCTSTree(fasttree):
         self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        #self.piece_count = board.piece_count()
+
+        # make sure we're starting at the correct sim schedule entry
+        if self.sims_ceiling_schedule:
+            for i in range(self.n_plies):
+                if i in self.sims_ceiling_schedule:
+                    self.set_new_sims_ceiling(n_plies=i)
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -86,9 +91,9 @@ class MCTSTree(fasttree):
 
     def best(self):
         """
-        Before ply 20: sample from the top 5 moves by visits using a
-        temperature schedule that decays to near-deterministic by ply 20.
-        At/after ply 20: delegate to the base implementation.
+        Before ply 25: sample from the top 5 moves by visits using a
+        temperature schedule that decays to near-deterministic by ply 25.
+        At/after ply 25: delegate to the base implementation.
         Returns (uci, None) like the original.
         """
         if self.config.sample_moves == False:
@@ -116,7 +121,7 @@ class MCTSTree(fasttree):
         top_visits = visits[:top_k]
 
         # temperature schedule: linear decay from temp_max (ply 0) to
-        # temp_min (ply 20). Small temp_min makes softmax -> argmax.
+        # temp_min (ply 25). Small temp_min makes softmax -> argmax.
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
         
@@ -143,7 +148,7 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
-
+            
         # add noise to the root for exploration
         self.root_noise_added = False
         self.add_root_dirichlet_noise()
@@ -154,14 +159,24 @@ class MCTSTree(fasttree):
         # check the sims schedule, update if applicapable
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
-                new_ceiling = self.sims_ceiling_schedule[self.n_plies]
-                self.sims_ceiling = new_ceiling
-                # this updates the c++ tree so e.g. smart pruning knows the new budget
-                self.set_sim_budget(float(new_ceiling))
+                self.set_new_sims_ceiling()
 
-                # if a ratio is used, update that
-                if self.config.target_delta < 1:
-                    self.target_delta = np.floor(self.config.target_delta*new_ceiling)
+    def set_new_sims_ceiling(self, n_plies=None):
+        if n_plies is None:
+            n_plies = self.n_plies
+
+        new_ceiling = self.sims_ceiling_schedule.get(n_plies, None)
+        if new_ceiling is None:
+            return
+        
+        self.sims_ceiling = new_ceiling
+        # this updates the c++ tree so e.g. smart pruning knows the new budget
+        self.set_sim_budget(float(new_ceiling))
+
+        # if a ratio is used, update that
+        if self.config.target_delta < 1:
+            self.target_delta = np.floor(self.config.target_delta*new_ceiling)
+        
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added
@@ -330,7 +345,7 @@ class MCTSTree(fasttree):
 
         self.n_moves_played += 1
         self.sims_done_total += self.sims_completed_this_move
-
+        
         existing = 0
         try:
             r = self.root()
@@ -345,6 +360,7 @@ class MCTSTree(fasttree):
         except Exception as e:
             print(f"error encountered calculating sims: {e}")
             existing = 0
+        
         # carry the existing visit count forward
         self.sims_completed_this_move = existing
 
@@ -456,18 +472,20 @@ class ChessGame(object):
         
         # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
         vwq = rnd(self.tree.visit_weighted_Q(), 4)
-        Q_white = vwq
+        best_q = rnd(details[0].Q, 4)
+        Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
         if self.is_stockfish_turn():
             Q_stm = self.sf_eval
             Q_white = Q_stm if turn else -Q_stm
 
         data["visit_weighted_Q"] = vwq
+        data['best_Q'] = best_q
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
 
         # keep a small list of items for gameplay checking
-        self.recents.append((mv, Q_stm, Q_white, vwq, turn))
+        self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 
         # sumN for U term
         sumN = max(1, root.N)
@@ -504,10 +522,9 @@ class ChessGame(object):
             return self.check_for_terminal()
 
         # get SF move + signed eval (white POV)
-        tl = 0.75  # time limit
         res_tup = cbu.sf_eval(
             self.board, score_fn=score_to_value_stm_pov,
-            depth=self.config.sf_depth, time_lim=tl, engine=eng
+            depth=self.config.sf_depth, engine=eng
         )
 
         if len(res_tup) == 2:
@@ -545,7 +562,7 @@ class ChessGame(object):
         violated = False
         violating_index = None
         for i, r in enumerate(reversed(self.recents[-n_last:])):
-            # r is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+            # r is a tuple: (mv, Q_stm, Q_white, best_q, turn)
             if abs(r[1]) > thresh_d:
                 violated = True
                 violating_index = i
@@ -578,10 +595,10 @@ class ChessGame(object):
             # scan newest->oldest. rev_i 0 == newest
             sign_check = None
             for rev_i, ex in enumerate(reversed(self.recents[-n_last:])):
-                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
-                vwq = ex[3]
+                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
+                best_q = ex[3]
                 # magnitude must meet the lock threshold
-                if abs(vwq) < thresh:
+                if abs(best_q) < thresh:
                     needed = n_last - rev_i
                     self.next_collar_stop_check = self.plies + needed
                     return False, None
@@ -615,7 +632,7 @@ class ChessGame(object):
             tail = self.recents[-check_depth:]
 
             for ex in tail:
-                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
                 q_white = ex[2]
                 # positive when leader still ahead
                 sign_stability = self.collar_stop_eventual_outcome * q_white

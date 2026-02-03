@@ -410,9 +410,13 @@ class GameViewer:
                     show_rank=True, rank_val=sf_idx + 1,
                 )
 
-        vwq = node.get("visit_weighted_Q")
-        if vwq is not None:
-            print(f"\nvisit-weighted Q={vwq}")
+        this_q = node.get("best_Q")
+        if this_q is None:
+            this_q = node.get("visit_weighted_Q")
+            if this_q is not None:
+                print(f"\nvisit-weighted Q={this_q}")
+        else:
+            print(f"\nmost-visted Q={this_q}")
 
         # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
@@ -578,7 +582,7 @@ class GameViewer:
         If sf_skip is True, plies played by Stockfish (per who_moved()) are
         skipped.
         """
-        # X, Mask, Pi, result (Z), Vwq, moves Remaining
+        # X, Mask, Pi, result (Z), this_Q, moves Remaining
         X, M, P, Z, V, R = [], [], [], [], [], []
         result = self.result
 
@@ -665,9 +669,9 @@ class GameViewer:
             x = rb.encode_64_tokens()
             mask = rb.legal_move_mask()
 
-            # value target 0.5*Z + 0.5*vwq
-            vwq = node.get("visit_weighted_Q")
-            vwq_stm = vwq if is_white_move else -vwq
+            # value target 0.5*Z + 0.5*best_q (q of most visited child)
+            this_q = node.get("best_Q", node.get("visit_weighted_Q"))
+            this_q_stm = this_q if is_white_move else -this_q
             if result > 0:
                 z = 1 if is_white_move else -1
             elif result < 0:
@@ -679,7 +683,7 @@ class GameViewer:
             M.append(mask)
             P.append(policy)
             Z.append(z)
-            V.append(vwq_stm)
+            V.append(this_q_stm)
             R.append(len(self.moves_uci) - int(self.ply))
 
             # advance to next ply using existing helper
@@ -1153,7 +1157,7 @@ def make_training_sample(b, v, visits):
     mask = b.legal_move_mask()
 
     # needs to match looper's training_queue
-    # (x, mask, policy, z_stm, vwq, z_tapered)
+    # (x, mask, policy, z_stm, best_q, z_tapered)
     tup = (x, mask, policy, 0, v, 0)
     return tup
 

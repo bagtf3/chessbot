@@ -1,5 +1,26 @@
+# try to get ahead of TF GPU mem management
+import os
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["XLA_FLAGS"] = '--xla_gpu_cuda_data_dir="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"'
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
+
+# global mixed precision policy
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy('mixed_float16')
+
+try:
+    import tensorflow as tf
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        for g in gpus:
+            tf.config.experimental.set_memory_growth(g, True)
+except Exception as e:
+    print(f"Error setting TF GPU mem: {e}")
+    
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
 ENDGAME_LOC = "C:/Users/Bryan/Data/chessbot_data/endgame_tables"
+SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
+MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models/"
 
 import chess
 WHITE_WINNING_WHITE_MOVE = chess.Board("rn5N/p2p3p/b2k3n/5p2/1p2P3/8/PPPP1PPP/RNBQKB1R w KQ - 1 12")

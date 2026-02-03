@@ -635,22 +635,6 @@ if __name__ == "__main__":
             f"{c['lifetime_wins_with_black']:4d} {c['lifetime_games_played']:6d}"
         )
 
-#%%
-from chessbot.utils import random_init
-
-ev = Evaluator()
-ev.configure(build_weights())
-qopts = {'max_qply': 3, 'qcaptures':5}
-
-mn, mx = 0, 0
-for _ in range(20000):
-    b = random_init(25)
-    s, qs = b.qsearch(-32_000, 32_000, ev, qopts)
-    if s < mn:
-        mn = s
-    if s > mx:
-        mx = s
-print(mn, mx)
 
 
 

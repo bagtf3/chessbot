@@ -1,18 +1,19 @@
+import os
 import numpy as np
 import pandas as pd
 pd.set_option('display.width', None)
 pd.set_option('display.max_columns', None)
 
 import math, random, time, pickle
+from pathlib import Path
 from time import time as _now
 from pathlib import Path
 
-import tensorflow as tf
 import matplotlib.pyplot as plt
-
 import chess
 import chess.engine
 import chess.svg
+import chess.pgn
 from IPython.display import SVG, display, clear_output
 
 from pyfastchess import Board as fastboard
@@ -23,10 +24,111 @@ from chessbot import features as ft
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-uci_path_path =  Path(__file__).resolve().parents[2] / "data" / "uci_paths3000.pkl"
-with open(uci_path_path, "rb") as f:
-    paths = pickle.load(f)
+import re
+import io
+
+
+MATE_CP = 2500
+CLIP_MAX = 1200
+EPS = 1e-12
+
+def cp_to_value(cp):
+    #check for mates
+    if cp.score() is None:
+        return np.clip(cp.score(mate_score=16), -10, 10) / 10
+        
+    else:
+        return np.clip(cp.score() / 1000, -0.95, 0.95)
+
+
+def cp_to_value_tanh(cp, mid_cp=200.0):
+    # scale so tanh(k * mid_cp) == 0.5  ->  k = atanh(0.5) / mid_cp
+    k = math.atanh(0.5) / mid_cp
+
+    # clip so checkmates still look much better
+    return np.clip(math.tanh(k * cp), -0.97, 0.97)
+
+
+def score_to_value_white(board_score):
+    # always look from whites perspective
+    from_white = board_score.white()
+    return cp_to_value(from_white)
+
+
+def score_to_value_stm_pov(board_score):
+    # always look from whites perspective
+    rel_score = board_score.relative
+    return cp_to_value(rel_score)
+
+# another method of converting scores
+def score_clipped(x, clip_max=CLIP_MAX):
+    return np.clip(x.score(mate_score=MATE_CP), -clip_max, clip_max)
+
+
+def score_cp_white_pov(pov_score, clipped=True, mate_cp=MATE_CP):
+    scr = pov_score.white()
+    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+
+
+def score_cp_stm_pov(pov_score, clipped=True, mate_cp=MATE_CP):
+    scr = pov_score.relative
+    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+
+
+def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=None):
+    if not isinstance(b, chess.Board):
+        b = chess.Board(b.fen())
+        
+    if engine is None:
+        new_eng = True
+        engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        engine.configure({"Threads": 1, "Hash": 128})
+    else:
+        new_eng = False
+
+    # dynamic limit for depth, time limit or both
+    if depth is None:
+        limit = chess.engine.Limit(time=time_lim)
     
+    elif time_lim is None:
+        limit = chess.engine.Limit(depth=depth)
+
+    else:
+        limit = chess.engine.Limit(depth=depth, time=time_lim)
+
+    try:
+        info = engine.analyse(b, limit=limit, info=chess.engine.INFO_ALL)
+
+        val = score_fn(info['score'])
+        best_move = info.get("pv", [""])[0]
+        search_depth = info['depth']
+    except Exception as e:
+        print(e)
+
+    finally:
+        if new_eng:
+            engine.quit()
+    
+    # if time given, return search depth
+    if time_lim is None:
+        return val, str(best_move)
+    else:
+        return val, str(best_move), search_depth
+
+
+uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
+with open(uci_path_path, "rb") as f:
+    PATHS = pickle.load(f)
+    
+
+uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
+with open(uci_path_path_mini, "rb") as f:
+    MINI_PATHS = pickle.load(f)
+
+pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
+with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
+    PGN_TEXT = f.read()
+
 
 def rnd(x, n):
     return np.round(x, n)
@@ -77,8 +179,65 @@ def softmax(x):
     x = np.asarray(x, dtype=np.float32)
     x = x - np.max(x)
     y = np.exp(x)
-    s = float(np.sum(y))
+    s = np.sum(y)
     return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
+
+
+def calc_entropy(visits):
+    # visits: sequence or ndarray of nonneg weights/probs
+    if isinstance(visits, list):
+        a = np.array(visits, dtype=float, copy=False)
+    else:
+        a = visits
+
+    if a.size == 0:
+        return 0.0, 0.0
+
+    # force negatives to zero (defensive)
+    a = np.where(a > 0.0, a, 0.0)
+
+    total = a.sum()
+    if total <= 0.0:
+        return 0.0, 0.0
+
+    p = a / total
+    mask = p > 0.0
+    p_mask = p[mask]
+
+    # compute entropy only on positive probs to avoid log2(0)
+    ent = - (p_mask * np.log2(p_mask)).sum()
+
+    n = p.size
+    norm = ent / np.log2(n) if n > 1 else 0.0
+
+    return ent, norm
+
+
+def kl_divergence(p_list, q_list):
+    # p and q must be same length lists or arrays
+    eps = 1e-12
+    p = np.asarray(p_list, dtype=float) + eps
+    q = np.asarray(q_list, dtype=float) + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    return np.sum(p * np.log(p / q))
+
+
+def kl_divergence_bits(p, q, eps=1e-12):
+    """KL(p || q) in bits."""
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    if p.sum() <= 0.0:
+        p = np.ones_like(p, dtype=np.float64) / p.size
+    else:
+        p = p / p.sum()
+    if q.sum() <= 0.0:
+        q = np.ones_like(q, dtype=np.float64) / q.size
+    else:
+        q = q / q.sum()
+    p = np.clip(p, eps, 1.0)
+    q = np.clip(q, eps, 1.0)
+    return np.sum(p * np.log2(p / q))
 
 
 def ensure_df(df_or_dicts):
@@ -125,203 +284,329 @@ def plot_sf_simple(df):
     plt.title("SF600 exhibitions: wins/draws and avg game length")
     plt.tight_layout()
     plt.show()
+
+
+def stable_softmax(logits):
+    # logits: (B,4096) float32
+    m = logits.max(axis=1, keepdims=True)
+    e = np.exp(logits - m)
+    s = e.sum(axis=1, keepdims=True)
+    return e / (s + 1e-9)
+
+
+def batch_policy_metrics(logits, labels, mask):
+    eps = 1e-12
+    big_neg = -1e6
+
+    # mask logits, compute stable softmax
+    masked_logits = np.where(mask > 0.5, logits, big_neg)
+    probs = stable_softmax(masked_logits)
+
+    # CE vs labels and vs uniform on legal set
+    per_ce = -np.sum(labels * np.log(probs + eps), axis=1)
+    policy_ce = per_ce.mean()
+
+    legal_counts = mask.sum(axis=1, keepdims=True)
+    uniform = mask / (legal_counts + eps)
+    per_ce_uniform = -np.sum(labels * np.log(uniform + eps), axis=1)
+    uniform_ce = per_ce_uniform.mean()
+
+    exp_prob_model = np.sum(labels * probs, axis=1).mean()
+    exp_prob_uniform = np.sum(labels * uniform, axis=1).mean()
+
+    # best indices
+    true_best = labels.argmax(axis=1)
+    model_best = probs.argmax(axis=1)
+
+    # top1 exact (model picks same argmax as labels)
+    top1_exact = (model_best == true_best).mean()
+
+    # avg prob of model's chosen best (keeps backward compat)
+    top_probs = probs[np.arange(probs.shape[0]), model_best]
+    avg_top_prob = top_probs.mean()
+
+    # mass on label-defined top-1 / top-3 / top-5 (per-sample then batch mean)
+    top1_per = probs[np.arange(probs.shape[0]), true_best]
+
+    # get top-k indices by label (unsorted within the k)
+    top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :3]
+    top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :5]
+
+    top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
+    top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
+
+    top1_mass = top1_per.mean()
+    top3_mass = top3_per.mean()
+    top5_mass = top5_per.mean()
+
+    # other support / distribution metrics
+    support_mask = labels > 0
+    support_mask[np.arange(support_mask.shape[0]), true_best] = False
+    prob_on_others_per = (probs * support_mask).sum(axis=1)
+    prob_on_others = prob_on_others_per.mean()
+
+    # fraction of raw (unmasked) softmax mass that lie on legal moves
+    raw_probs = stable_softmax(logits)       # do not apply mask here
+    mass_on_legal_per = np.sum(raw_probs * mask, axis=1)
+    mass_on_legal = mass_on_legal_per.mean()
+
+    return {
+        "policy_ce": policy_ce,
+        "uniform_ce": uniform_ce,
+        "ce_gain": (uniform_ce - policy_ce),
+        "exp_prob_model": exp_prob_model,
+        "exp_prob_uniform": exp_prob_uniform,
+        "top1_exact": top1_exact,
+        "avg_top_prob": avg_top_prob,
+        "top1_mass": top1_mass,
+        "top3_mass": top3_mass,
+        "top5_mass": top5_mass,
+        "prob_on_others": prob_on_others,
+        "mass_on_legal": mass_on_legal
+    }
+
+
+def print_validation(epoch, stats):
+    eps = 1e-12
+
+    keys = [
+        "val_mse", "val_corr",
+        "policy_ce", "uniform_ce", "ce_gain",
+        "top1_exact", "avg_top_prob",
+        "top1_mass", "prob_on_others"
+    ]
+    name_w = max(len(k) for k in keys)
+    num_w = 8
+    fmt_num = f"{{value:{num_w}.4f}}"
+    def pair(k, v):
+        return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
+    ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
+
+    print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
+          f"{pair('value_corr', stats['value_corr'])}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
+          f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
+          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
+    print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "
+          f"{pair('true ratio', ratio)}")
+
+
+def score_game_data(model, X, M, Y, epoch, save_path=None):
+    """ Run model.predict -> plot -> metrics -> return a single-row """
+    preds = model.predict(X, verbose=0, batch_size=128)
+    value_preds = preds[1].ravel()
+
+    value_preds = preds[1].ravel()  # (B,)
+    targets = Y['value_out'].ravel()
+    value_mse = np.mean((value_preds - targets) ** 2)
+    value_corr = np.corrcoef(value_preds, targets)[0, 1]
     
-
-def plot_training_progress(all_evals, max_cols=4, save_path=None):
-    """
-    Plots training/eval metrics for each model output in a grid.
-    Adapts rows/cols automatically, up to max_cols wide.
-
-    Parameters
-    ----------
-    all_evals : pd.DataFrame
-        DataFrame containing eval metrics with columns as outputs.
-    max_cols : int, optional
-        Max number of columns in the plot grid (default 4).
-    save_path : str or Path, optional
-        If provided, saves the plot image to this file location.
-    """
-    cols = list(all_evals.columns)
-
-    # Always keep "value" last for consistency
-    important = ['value']
-    cols = [c for c in cols if c not in important] + important
-
-    n_plots = len(cols)
-    n_cols = min(max_cols, n_plots)
-    n_rows = math.ceil(n_plots / n_cols)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
-    axes = axes.flatten() if n_plots > 1 else [axes]
-
-    for i, col in enumerate(cols):
-        ax = axes[i]
-        y = all_evals[col].values
-        ax.plot(y, label=col)
-        # moving average (MA15)
-        ma = pd.Series(y).rolling(15, min_periods=1).mean().values
-        ax.plot(ma, lw=2, alpha=0.6, label=f"{col} (MA15)")
-        ax.set_title(col)
-        ax.legend()
-
-    # Hide unused axes
-    for j in range(len(cols), len(axes)):
-        axes[j].axis("off")
-
+    plt.scatter(targets, value_preds, s=6)
+    plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
+    plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
+    plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target")
     plt.tight_layout()
     if save_path is not None:
-        plt.savefig(save_path, dpi=150)
-        plt.close(fig)
-    else:
-        plt.show()
-    
+        plt.savefig(save_path)
+    plt.close()
 
-def plot_pred_vs_true_grid(model, preds, y_true_dict, save_path=None):
-    names = list(model.output_names)
+    policy_logits = preds[0]  # (B,4096)
+    policy_true = Y['policy_logits']
+    policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
 
-    chunk_size = 9
-    n_chunks = math.ceil(len(names) / chunk_size)
+    # build print dict and call the printer
+    print_metrics = {"value_mse": value_mse, "value_corr": value_corr}
+    print_metrics.update(policy_stats)
+    print_validation(epoch, print_metrics)
 
-    for chunk_idx in range(n_chunks):
-        start = chunk_idx * chunk_size
-        end = start + chunk_size
-        chunk_names = names[start:end]
-
-        fig, axes = plt.subplots(3, 3, figsize=(14, 8))
-        axes = axes.flatten()
-
-        for ax, name in zip(axes, chunk_names):
-            if name not in y_true_dict:
-                ax.set_visible(False)
-                continue
-
-            y_pred = np.asarray(preds[name])
-            y_true = np.asarray(y_true_dict[name])
-
-            # squeeze singleton dims
-            if y_pred.ndim > 1 and y_pred.shape[-1] == 1:
-                y_pred = y_pred.reshape(-1)
-            if y_true.ndim > 1 and y_true.shape[-1] == 1 and name == "value":
-                y_true = y_true.reshape(-1)
-
-            if name == "value":
-                # regression scatter
-                yp = y_pred.reshape(-1)
-                yt = y_true.reshape(-1)
-                n = min(len(yp), len(yt))
-                yp, yt = yp[:n], yt[:n]
-                ax.scatter(yt, yp, s=8, alpha=0.5)
-                lo = float(min(yt.min(), yp.min()))
-                hi = float(max(yt.max(), yp.max()))
-                ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1)
-                ax.set_title("value")
-                ax.set_xlabel("True")
-                ax.set_ylabel("Pred")
-                ax.grid(True, alpha=0.3)
-                continue
-
-            # classification heads: handle soft or sparse y_true
-            pred_classes = y_pred.argmax(axis=1)
-
-            if y_true.ndim == 2:
-                true_classes = y_true.argmax(axis=1)
-            else:
-                true_classes = y_true.reshape(-1)
-
-            pred_classes = pred_classes.reshape(-1)
-            true_classes = true_classes.reshape(-1)
-
-            n = min(len(true_classes), len(pred_classes))
-            ax.scatter(true_classes[:n], pred_classes[:n], s=5, alpha=0.5)
-            ax.set_title(name)
-            ax.set_xlabel("True class")
-            ax.set_ylabel("Pred class")
-            ax.grid(True, alpha=0.3)
-
-        for i in range(len(chunk_names), len(axes)):
-            axes[i].set_visible(False)
-
-        plt.tight_layout()
-        # optional: name the window per chunk
-        try:
-            fig.canvas.manager.set_window_title(f"Pred vs True [{start}:{end}]")
-        except Exception:
-            pass
-        if save_path is not None:
-            plt.savefig(save_path, dpi=150)
-            plt.close(fig)
-        else:
-            plt.show(block=False)
-
-
-def top_k_accuracy(y_true, y_pred, k=3):
-    """
-    Computes Top-K accuracy for classification heads.
-    y_true : (N,) int labels
-    y_pred : (N, C) logits or probs
-    k      : how many top guesses to consider
-    """
-    # convert logits -> probs
-    probs = tf.nn.softmax(y_pred, axis=-1).numpy()
-    # indices of top-k per sample
-    topk = np.argpartition(-probs, k, axis=1)[:, :k]
-    # check if true label is in top-k
-    correct = [y_true[i] in topk[i] for i in range(len(y_true))]
-    return np.mean(correct)
-
-
-def _to_sparse_labels(y):
-    y = np.asarray(y)
-    if y.ndim == 2:  # one-hot / soft
-        return y.argmax(axis=1).astype(np.int64)
-    return y.reshape(-1).astype(np.int64)
-
-
-def _topk_from_logits(y_true_sparse, y_pred_logits, k=1):
-    y_pred = np.asarray(y_pred_logits)
-    topk = np.argpartition(-y_pred, kth=min(k, y_pred.shape[1]-1), axis=1)[:, :k]
-    # count hits
-    hits = (topk == y_true_sparse[:, None]).any(axis=1)
-    return float(hits.mean())
-
-
-def score_game_data(model, X, Y_batch, save_path=None):
-    raw_preds = model.predict(X, batch_size=256, verbose=0)
-    preds = {name: raw_preds[i] for i, name in enumerate(model.output_names)}
-
-    # Plot overview grid
-    plot_pred_vs_true_grid(model, preds, Y_batch, save_path=save_path)
-
-    # Keras evaluate -> dataframe row
-    cols = ['total_loss'] + model.output_names
-    eval_df = pd.DataFrame(model.evaluate(X, Y_batch, verbose=0), index=cols).T
-
-    # ----- Value head metrics -----
-    yt_val = np.asarray(Y_batch['value']).reshape(-1)
-    yp_val = np.asarray(preds['value']).reshape(-1)
-
-    val_mse = float(np.mean((yt_val - yp_val) ** 2))
-
-    # safe correlation (avoid NaNs if std=0)
-    yt_std = yt_val.std()
-    yp_std = yp_val.std()
-    if yt_val.size > 1 and yt_std > 0 and yp_std > 0:
-        corr = float(np.corrcoef(yt_val, yp_val)[0, 1])
-    else:
-        corr = 0.0
-
-    # ----- Classification metrics -----
-    cls_metrics = {}
-    for head in [n for n in model.output_names if n != "value"]:
-        y_true_sparse = _to_sparse_labels(Y_batch[head])
-        y_pred_sparse = np.asarray(preds[head]).argmax(axis=1)
-        acc = float((y_true_sparse == y_pred_sparse).mean())
-        cls_metrics[head] = acc
-
-    print("\n=== Extra Metrics ===")
-    print(f"Value : MSE={val_mse:.4f}, Corr={corr:.3f}")
+    # create DF and return
+    eval_df = pd.DataFrame([print_metrics])
+    eval_df['model_epoch'] = epoch
+    eval_df['n_samples'] = int(np.asarray(targets).shape[0])
 
     return eval_df
+
+
+def moving_average_pd(arr, window=15):
+    s = pd.Series(arr)
+    return s.rolling(window, center=True, min_periods=1).mean().values
+
+
+def plot_training_progress(metrics_history, epoch=None, save_path=None):
+    """
+    metrics_history: pd.DataFrame or dict-like with columns used below.
+    If epoch is None, try to infer from metrics_history['model_epoch'].max(),
+    otherwise use number of rows.
+    Produces two figures and either shows them or writes:
+      save_path           -> primary (2x2)
+      save_path + "_extra"-> extra (1x3)
+    """
+
+    df = metrics_history.copy()
+
+    # helper to safely extract column arrays (or empty list)
+    def col_vals(name):
+        if name in df.columns:
+            return df[name].tolist()
+        return []
+
+    # infer epoch if needed
+    if epoch is None:
+        if "model_epoch" in df.columns and len(df):
+            epoch = int(max(df["model_epoch"]))
+        else:
+            epoch = len(df)
+
+    hide_first = 10
+    if epoch < 12:
+        return
+
+    ma_window = min(30, max(3, int(epoch * 0.2)))
+    if ma_window % 2 == 0:
+        ma_window += 1
+
+    # prepare x-axis baseline
+    N = len(df)
+    x_full = np.arange(N)
+    start = hide_first
+    xs = x_full[start:]
+
+    # first figure (2x2)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # policy CE
+    ax = axes[0, 0]
+    raw = np.array(col_vals("policy_ce") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="policy_ce", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("policy CE (nats)")
+    ax.legend()
+
+    # CE gain vs uniform
+    ax = axes[0, 1]
+    raw = np.array(col_vals("ce_gain") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="ce_gain", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("CE gain vs uniform")
+    ax.legend()
+
+    # value MSE
+    ax = axes[1, 0]
+    raw = np.array(col_vals("value_mse") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="mse", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("value MSE")
+    ax.legend()
+
+    # value corr
+    ax = axes[1, 1]
+    raw = np.array(col_vals("value_corr") or [])
+    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
+    raw_seg = raw[start:] if raw.size else np.array([])
+    if raw_seg.size:
+        ax.plot(xs, raw_seg, label="corr", alpha=0.6, lw=1)
+    if ma.size:
+        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+    ax.set_title("value corr")
+    ax.legend()
+    plt.tight_layout()
+
+    # Second figure (1x3)
+    fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
+
+    # (0) left: top1 / top3 / top5 - show only MA
+    ax = axs[0]
+    t1 = col_vals("top1_mass")
+    t3 = col_vals("top3_mass")
+    t5 = col_vals("top5_mass")
+    any_top = any(len(arr) for arr in (t1, t3, t5))
+    if not any_top:
+        ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        l1, l3, l5 = f"top1 MA{ma_window}", f"top3 MA{ma_window}", f"top5 MA{ma_window}"
+        if len(t1):
+            ma_t1 = moving_average_pd(np.array(t1), window=ma_window)
+            ax.plot(np.arange(len(ma_t1)), ma_t1, label=l1, linewidth=2)
+        if len(t3):
+            ma_t3 = moving_average_pd(np.array(t3), window=ma_window)
+            ax.plot(np.arange(len(ma_t3)), ma_t3, label=l3, linewidth=2)
+        if len(t5):
+            ma_t5 = moving_average_pd(np.array(t5), window=ma_window)
+            ax.plot(np.arange(len(ma_t5)), ma_t5, label=l5, linewidth=2)
+        ax.set_title("mean top-k mass (MA shown)")
+        ax.legend(fontsize=8)
+
+    # (1) middle: mass_on_legal (raw + MA)
+    ax = axs[1]
+    mol = col_vals("mass_on_legal")
+    if not len(mol):
+        ax.text(0.5, 0.5, "missing: mass_on_legal", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(mol))
+        ax.plot(x, mol, label="mass_on_legal", alpha=0.6, lw=1)
+        ma_mol = moving_average_pd(np.array(mol), window=ma_window)
+        ax.plot(x, ma_mol, lw=2, alpha=0.7, label=f"MA{ma_window}")
+        ax.set_title("mass_on_legal")
+        ax.legend(fontsize=8)
+
+    # (2) right: avg_top_prob & top1_exact
+    ax = axs[2]
+    avg_tp = col_vals("avg_top_prob")
+    t1_exact = col_vals("top1_exact")
+    have_any = len(avg_tp) or len(t1_exact)
+    if not have_any:
+        ax.text(0.5, 0.5, "missing: avg_top_prob / top1_exact", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        plotted = False
+        if len(avg_tp):
+            ma_avg = moving_average_pd(np.array(avg_tp), window=ma_window)
+            l = f"avg_max_prob MA{ma_window}"
+            ax.plot(np.arange(len(ma_avg)), ma_avg, label=l, alpha=0.9, lw=2)
+            plotted = True
+        if len(t1_exact):
+            ma_t1ex = moving_average_pd(np.array(t1_exact), window=ma_window)
+            l = f"top1_exact MA{ma_window}"
+            ax.plot(np.arange(len(ma_t1ex)), ma_t1ex, label=l, alpha=0.9, lw=2)
+            plotted = True
+        if not plotted:
+            ax.text(0.5, 0.5, "no data after smoothing", ha="center", va="center")
+            ax.set_axis_off()
+        else:
+            ax.set_title("avg_max_prob & top1_exact (MA shown)")
+            ax.legend(fontsize=8)
+    plt.tight_layout()
+
+    # save (primary and _extra)
+    if save_path is not None:
+        root, ext = os.path.splitext(save_path)
+        if ext == "":
+            ext = ".png"
+            root = save_path
+        out1 = root + ext
+        out2 = root + "_extra" + ext
+        fig.savefig(out1, dpi=150)
+        plt.close(fig)
+        fig2.savefig(out2, dpi=150)
+        plt.close(fig2)
+    else:
+        fig.show()
+        fig2.show()
 
 
 def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
@@ -331,7 +616,7 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     Args:
         intra_training_summaries: {step: {"summary": {...}, "games": [...]}, ...}
         show: if True, plt.show() the figures (ignored if save_path is given)
-        save_path: if set, save figures as f"{save_path}_cpl.png" and f"{save_path}_bmr.png"
+        save_path: if set, save figures as f"{save_path}_cpl.png", f"{save_path}_bmr.png"
 
     Prints:
         Latest step's games, CPL (overall/white/black), and best-move rates.
@@ -412,113 +697,67 @@ def format_time(seconds):
         m, s = divmod(rem, 60)
         return f"{int(h)}h {int(m)}m {s:.2f}s"
 
-##    
-## board/ position generation
-##
 
-OPENING_BOOK = {
-    "Ruy Lopez, Morphy Defense": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6"
-    ],
-    "Italian Game (Giuoco Piano)": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "f8c5", "c2c3", "g8f6"
-    ],
-    "Scotch Game": [
-        "e2e4", "e7e5", "g1f3", "b8c6", "d2d4", "e5d4", "f3d4", "g8f6"
-    ],
-    "Sicilian Defense, Najdorf": [
-        "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6"
-    ],
-    "Sicilian Defense, Dragon": [
-        "e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "g7g6"
-    ],
-    "French Defense, Classical": [
-        "e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6", "e4e5", "f6d7"
-    ],
-    "Caro-Kann, Advance": [
-        "e2e4", "c7c6", "d2d4", "d7d5", "e4e5", "c8f5", "c2c4", "e7e6"
-    ],
-    "Caro-Kann, Classical": [
-        "e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4", "c3e4", "c8f5"
-    ],
-    "Queen's Gambit Declined": [
-        "d2d4", "d7d5", "c2c4", "e7e6", "g1f3", "g8f6", "b1c3", "c7c6"
-    ],
-    "Queen's Gambit Accepted": [
-        "d2d4", "d7d5", "c2c4", "d5c4", "g1f3", "g8f6", "e2e3", "e7e6"
-    ],
-    "Slav Defense": [
-        "d2d4", "d7d5", "c2c4", "c7c6", "g1f3", "g8f6", "b1c3", "d5c4"
-    ],
-    "Nimzo-Indian Defense": [
-        "d2d4", "g8f6", "c2c4", "e7e6", "b1c3", "f8b4"
-    ],
-    "King's Indian Defense": [
-        "d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7", "e2e4", "d7d6"
-    ],
-    "Grünfeld Defense": [
-        "d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5"
-    ],
-    "London System": [
-        "d2d4", "d7d5", "c1f4", "g8f6", "e2e3", "c7c5", "c2c3", "b8c6"
-    ],
-    "English Opening, Four Knights": [
-        "c2c4", "e7e5", "g1f3", "b8c6", "g2g3", "g8f6", "f1g2", "f8c5"
-    ],
-    "English Opening, Symmetrical": [
-        "c2c4", "c7c5", "g1f3", "g8f6", "d2d4", "c5d4", "f3d4", "b8c6"
-    ],
-    "Scandinavian Defense": [
-        "e2e4", "d7d5", "e4d5", "d8d5", "g1f3", "c8g4", "f1e2", "g4f3"
-    ],
-    "Pirc Defense": [
-        "e2e4", "d7d6", "d2d4", "g8f6", "b1c3", "g7g6", "f2f4", "f8g7"
-    ],
-    "Modern Defense": [
-        "e2e4", "g7g6", "d2d4", "f8g7", "b1c3", "d7d6", "f2f4", "c7c5"
-    ],
-    # Ultra-canonical stubs
-    "Double King Pawn (e4 e5)": ["e2e4", "e7e5"],
-    "Double Queen Pawn (d4 d5)": ["d2d4", "d7d5"],
-    "Sicilian Defense Stub (e4 c5)": ["e2e4", "c7c5"],
-    "French Defense Stub (e4 e6)": ["e2e4", "e7e6"],
-    "Caro-Kann Stub (e4 c6)": ["e2e4", "c7c6"],
-    "Pirc Stub (e4 d6)": ["e2e4", "d7d6"],
-    "Modern Stub (e4 g6)": ["e2e4", "g7g6"],
-    "English Opening Stub (c4)": ["c2c4"],
-    "Reti Stub (Nf3)": ["g1f3"],
-    "Indian Defense Stub (d4 Nf6)": ["d2d4", "g8f6"],
-    "Dutch Stub (d4 f5)": ["d2d4", "f7f5"],
-    "Benoni Stub (d4 c5)": ["d2d4", "c7c5"],
-    "Catalan Stub (d4 Nf6 c4 e6 g3)": ["d2d4", "g8f6", "c2c4", "e7e6", "g2g3"],
-    "London Stub (d4 d5 Bf4)": ["d2d4", "d7d5", "c1f4"],
-    "King’s Indian Stub (d4 Nf6 c4 g6)": ["d2d4", "g8f6", "c2c4"],
-    "Grünfeld Stub (d4 Nf6 c4 g6 Nc3 d5)": ["d2d4", "g8f6", "c2c4", "g7g6"]
-}
-
-
-def get_opening(name=None):
+def make_jsonable(obj):
+    """Recursively convert numpy types to built-in Python types so json.dump works.
+    - ndarray -> list (obj.tolist())
+    - numpy scalar -> int/float/bool via .item()
+    - dict/list/tuple -> recurse
+    Leaves normal Python objects untouched.
     """
-    Return a board set up in a chosen or random opening.
+    # numpy array
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    # numpy scalar (int32, float64, bool_, ...)
+    if isinstance(obj, (np.generic,)):
+        try:
+            return obj.item()
+        except Exception:
+            # fallback: cast with Python builtins
+            if np.issubdtype(obj.dtype, np.integer):
+                return int(obj)
+            if np.issubdtype(obj.dtype, np.floating):
+                return float(obj)
+            if np.issubdtype(obj.dtype, np.bool_):
+                return bool(obj)
+            return str(obj)
+
+    # dict: recurse
+    if isinstance(obj, dict):
+        return {k: make_jsonable(v) for k, v in obj.items()}
+
+    # list/tuple: recurse and keep type as list
+    if isinstance(obj, (list, tuple)):
+        return [make_jsonable(v) for v in obj]
+
+    # other objects: leave as-is (json.dump will fail if it's unsupported)
+    return obj
+
+
+def find_script(filename, start_file=None):
     """
-    if name is None:
-        name = random.choice(list(OPENING_BOOK.keys()))
-    moves = OPENING_BOOK[name]
-    
-    board = chess.Board()
-    for uci in moves:
-        board.push(chess.Move.from_uci(uci))
-    return name, board
+    Locate filename in the same folder as start_file (or this file),
+    then fallback to the current working directory.
+    Returns the absolute path as a string.
+    Raises FileNotFoundError if not found.
+    """
+    if start_file:
+        base = Path(start_file).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
 
+    candidate = base / filename
+    if candidate.exists():
+        return str(candidate)
 
-def get_all_openings():
-    names, boards = [], []
-    for O in OPENING_BOOK.keys():
-        names.append(O)
-        n, b = get_opening(O)
-        boards.append(b)
-    
-    return names, boards
+    candidate = Path.cwd() / filename
+    if candidate.exists():
+        return str(candidate)
+
+    raise FileNotFoundError(
+        f"{filename} not found in {base} or cwd {Path.cwd()}"
+    )
 
 
 def random_init(plies=5, python_chess=False):
@@ -551,21 +790,20 @@ def random_init(plies=5, python_chess=False):
     return b
 
 
-def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=150):
+def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     """
     Return a list of UCI move lists (paths) from STARTPOS via greedy BFS.
     Includes STARTPOS as [] and all intermediate paths until n_positions reached.
 
     Args:
-        n_positions : target number of positions (approx; includes STARTPOS)
+        n_pos : target number of positions (approx; includes STARTPOS)
         multipv     : how many top moves to expand per node
-        max_depth   : Stockfish search depth for analysis
-        eval_thresh : only expand moves within (best_cp - cp) <= eval_thresh
-        sf_path     : path to stockfish binary; if None, uses chess.engine default
+        thresh : only expand moves within (best_cp - cp) <= eval_thresh
+        margin : only add paths with abs(cb) within this margin
 
     Returns:
         paths : list[list[str]] such as:
-            [ [],
+            [
               ['e2e4'], ['d2d4'], ['c2c4'], ['g1f3'],
               ['e2e4','d7d5'], ... ]
     """
@@ -573,45 +811,72 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
     def short_fen(fen):
         return " ".join(fen.split(" ")[:4])
     
-    # Seed: STARTPOS plus four common first moves
     start = chess.Board()
-    seed_sans = ["e4", "d4", "Nf3", "c4"]
+    seed_sans = ["e4", "d4", "c4", "Nf3", "g3", "c3", "f4"]
+    replies_sans = ["e5", "c5", "c6", "e6", "Nf6", "d5", "d6", "g6"]
 
-    paths = []                 # output paths
-    seen = set()               # short-FEN dedup
-    q = deque()                # queue of (board, path)
+    paths = []
+    seen = set()
+    q = deque()
 
-    # Add STARTPOS
-    paths.append([])                       # []
-    seen.add(short_fen(start.fen()))
-
-    # Enqueue seeds
     for san in seed_sans:
         mv = start.parse_san(san)
         b2 = start.copy(); b2.push(mv)
-        q.append( (b2, [mv.uci()]) )
+        q.append((b2, [mv.uci()]))
+        for rep in replies_sans:
+            mv_rep = b2.parse_san(rep)
+            b3 = b2.copy(); b3.push(mv_rep)
+            q.append((b3, [mv.uci(), mv_rep.uci()]))
 
     eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-
+    eng.configure({"Threads": 2, "Hash": 256})
+    limit = chess.engine.Limit(depth=20, time=0.075)
+    start_time = time.time()
+    last_check_in = start_time
     try:
-        while q and len(paths) < n_positions:
+        while q and len(paths) < n_pos:
+            now = time.time()
+            if now - last_check_in > 20:
+                rt = format_time(now - start_time)
+                nstr = f"{len(paths)}/{n_pos} completed paths"
+                pps = len(paths) / (now - start_time)
+                print("[check in]", nstr, f"{pps:.3f} paths/sec. tot run time:", rt)
+                last_check_in = now
+
             board, path = q.popleft()
             key = short_fen(board.fen())
             if key in seen:
                 continue
 
+            # For terminal boards, accept and don't expand
+            if board.is_game_over():
+                seen.add(key)
+                paths.append(path)
+                continue
+
+            # analyse once, use result both for eval_margin check and expansion
+            info = eng.analyse(board, limit=limit, multipv=multipv)
+            if not info:
+                continue
+
+            # evaluation from White's POV (absolute position eval)
+            score = info[0].get("score")
+            eval_white = None
+            if score is not None:
+                eval_white = score.pov(chess.WHITE).score(mate_score=1500)
+
+            # skip positions with mate or undefined score when using margin
+            if margin is not None:
+                if eval_white is None:
+                    continue
+                if abs(eval_white) > margin:
+                    continue
+
+            # passed margin (or margin disabled) -> accept path
             seen.add(key)
             paths.append(path)
 
-            if board.is_game_over():
-                continue
-
-            info = eng.analyse(
-                board, chess.engine.Limit(depth=max_depth), multipv=multipv
-            )
-            if not info:
-                continue
-            
+            # now expand selected multipv moves (filtered by thresh)
             best_cp = info[0]["score"].pov(board.turn).score(mate_score=1500)
             if best_cp is None:
                 best_cp = 0
@@ -620,26 +885,74 @@ def greedy_sf_tree_paths(n_positions=2000, multipv=4, max_depth=7, eval_thresh=1
                 sc = d["score"].pov(board.turn).score(mate_score=1500)
                 if sc is None:
                     continue
-                if best_cp - sc > eval_thresh:
+                if best_cp - sc > thresh:
                     continue
                 if "pv" not in d or not d["pv"]:
                     continue
                 mv = d["pv"][0]
                 b2 = board.copy()
                 b2.push(mv)
-                q.append( (b2, path + [mv.uci()]) )
+                q.append((b2, path + [mv.uci()]))
     finally:
         eng.quit()
 
     return paths
 
     
-def get_pre_opened_game():
+def get_pre_opened_game(index=None, mini=False):
     b = fastboard()
-    moves_to_play = random.choice(paths)
+    path_list = MINI_PATHS if mini else PATHS
+    if index is None:
+        moves_to_play = random.choice(path_list)
+    else:
+        try:
+            moves_to_play = path_list[index]
+        except:
+            print(
+                f"No premove path found for {index}!",
+                f"please choose 0 - {len(path_list)-1}.",
+                "Selecting random premove path"
+            )
+            moves_to_play = random.choice(path_list)
+
     for mtp in moves_to_play:
         b.push_uci(mtp)
     return b
+
+
+def create_UHO_PGN_game():
+    """
+    Sample a game from PGN_TEXT (already loaded in memory), push mainline moves
+    onto a fastboard(), and return the resulting board.
+
+    index: 0-based game index, or None for random
+    max_plies: cap number of half-moves played (None = all)
+    """
+    UHO_EVENT_START_RE = re.compile(r'(?m)^\[Event "')
+
+    starts = [m.start() for m in UHO_EVENT_START_RE.finditer(PGN_TEXT)]
+    if not starts:
+        raise ValueError("No games found (no [Event at line start).")
+
+    k = random.randrange(len(starts))
+    a = starts[k]
+    b = starts[k + 1] if k + 1 < len(starts) else len(PGN_TEXT)
+    chunk = PGN_TEXT[a:b]
+
+    blank = chunk.find("\n\n")
+    moves_blob = chunk if blank == -1 else chunk[blank + 2:]
+
+    game = chess.pgn.read_game(io.StringIO(moves_blob))
+    if game is None:
+        return fastboard()
+
+    fb = fastboard()
+    n = 0
+    for mv in game.mainline_moves():
+        fb.push_uci(mv.uci())
+        n += 1
+
+    return fb
 
 
 def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
@@ -812,29 +1125,114 @@ def make_piece_odds_board():
     return fastboard(b.fen()), meta
 
 
+def random_backrow_fen():
+    pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
+
+    # shuffle to get a random white backrank
+    random.shuffle(pieces)
+    white_back = "".join(pieces)
+
+    random.shuffle(pieces)
+    black_back = "".join(pieces).lower()
+
+    # pawns and empty ranks standard; castling field '-' disables castling
+    fen = f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
+    return fen
+
+
 def make_piece_training_board():
     fens = {
         "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
         "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
         "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "only_pawns": "4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
         "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1'
+        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1',
+        "random_backrow": random_backrow_fen()
     }
     
     pick = random.choice(list(fens.keys()))
     board = chess.Board(fens[pick])
     if np.random.uniform() < 0.5:
         board = board.mirror()
-    return fastboard(board.fen()), {"scenario": pick}
+    return fastboard(board.fen()), {"scenario": f"pt_{pick}"}
         
 
-def score_pov_cp(pov_score, white_to_move, mate_cp):
-    s = pov_score.white() if white_to_move else pov_score.black()
-    return float(s.score(mate_score=mate_cp))
+class GameGenerator(object):
+    """ Curriculum game generator """
+    def __init__(self, cfg):
+        self.config = cfg
+        self.game_types = list(self.config.game_probs.keys())
+
+    def new_board(self, game_type=None):
+        # sanity check
+        if game_type is not None and game_type not in self.game_types:
+            raise ValueError(
+                f"Unknown game type {game_type}. "
+                f"Pick one of {self.game_types}")
+
+        # sample if not given
+        if game_type is None:
+            types, probs = zip(*self.config.game_probs.items())
+            game_type = random.choices(types, weights=probs, k=1)[0]
+
+        # dispatch
+        if game_type == "pre_opened":
+            board = get_pre_opened_game()
+            meta = {"scenario": "pre_opened"}
+        
+        elif game_type == "pre_opened_mini":
+            board = get_pre_opened_game(mini=True)
+            meta = {"scenario": "pre_opened_mini"}
+
+        elif game_type == "UHO":
+            board = create_UHO_PGN_game()
+            meta = {"scenario": "UHO"}
+        
+        elif game_type == "random_init":
+            plies = 2*np.random.randint(0, 4)
+            board = random_init(plies)
+            meta = {"scenario": "random_init", "start_plies": plies}
+            
+        elif game_type == "random_middle_game":
+            # just more plies of random_init to land mid-game
+            plies = np.random.randint(20, 31)
+            board = random_init(plies)
+            meta = {"scenario": "random_middle_game", "start_plies": plies}
+            
+        elif game_type == "random_endgame":
+            pieces = np.random.randint(8, 14)
+            wk = np.random.randint(0, 33)
+            bk = np.random.randint(33, 64)
+            board = random_board_setup(pieces, wk, bk, queens=False)
+            meta = {"scenario": "random_endgame", "pieces": pieces}
+            
+        elif game_type == "piece_odds":
+            board, meta = make_piece_odds_board()
+            
+        elif game_type == "piece_training":
+            board, meta = make_piece_training_board()
+            meta['scenario'] = 'piece_training'
+
+        elif game_type == "startpos":
+            board = fastboard()
+            meta = {'scenario': 'startpos'}
+            
+        else:
+            raise ValueError(f"unhandled game_type {game_type}")
+        
+        # quick check to make sure there are legal moves
+        if board.legal_moves():
+            return board, meta
+        # otherwise look for a new board
+        else:
+            return self.new_board(game_type=game_type)
 
 
 def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
+    def _score_pov_cp(pov_score, white_to_move, mate_cp):
+        s = pov_score.white() if white_to_move else pov_score.black()
+        return float(s.score(mate_score=mate_cp))
+
     board = chess.Board() if start_fen is None else chess.Board(start_fen)
     white_cpl, black_cpl = [], []
     best_moves = [0, 0]
@@ -872,7 +1270,7 @@ def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
                     info=chess.engine.INFO_SCORE
                 )
                 best_sc = best_info.get("score")
-                best_cp = score_pov_cp(best_sc, white_to_move, mate_cp)
+                best_cp = _score_pov_cp(best_sc, white_to_move, mate_cp)
 
                 played_cp = None
                 if mv is not None and mv in root_for_play.legal_moves:
@@ -881,7 +1279,7 @@ def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
                         root_moves=[mv], info=chess.engine.INFO_SCORE
                     )
                     played_sc = played_info.get("score")
-                    played_cp = score_pov_cp(played_sc, white_to_move, mate_cp)
+                    played_cp = _score_pov_cp(played_sc, white_to_move, mate_cp)
                 else:
                     drops["mv_illegal"] += 1
 
@@ -1006,7 +1404,7 @@ def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
 class RateMeter(object):
     def __init__(self, name, interval_s=120.0):
         self.name = name
-        self.interval_s = float(interval_s)
+        self.interval_s = interval_s
         self.t0 = _now()
         self.t_last = self.t0
         self.total = 0
@@ -1045,10 +1443,9 @@ class RateMeter(object):
 
 def summarize_recent_games(recent, result_is_bot_pov=True):
     """
-    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/L/D totals.
+    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/D/L totals.
     For the SF totals we assume `result` is WHITE-POV:
       r > 0 => white won, r < 0 => black won, r == 0 => draw
-    This matches your own description for detecting bot wins vs SF.
     """
     def sf_bucket(vs_sf, sf_flag):
         if not vs_sf:
@@ -1057,7 +1454,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
 
     stats = defaultdict(lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
 
-    # bot vs Stockfish totals only (what you care about)
+    # bot vs Stockfish totals only
     sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
 
     for g in recent:
@@ -1101,15 +1498,16 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
                     sf_overall["L"] += 1
 
     bucket_order = {"white": 0, "black": 1, "none": 2}
-    rows = sorted(stats.items(),
-                  key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99)))
+    rows = sorted(
+        stats.items(), key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99))
+    )
 
     return stats, rows, sf_overall
 
 
 def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     """
-    Pretty-print the scenario table and the bot-vs-Stockfish W/L/D line,
+    Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).
     """
     recent = recent[-window:]
@@ -1120,26 +1518,26 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
     # scenario table (unchanged formatting)
     print(
         f"{'scenario':<20} {'sf':<6} {'N':>4} "
-        f"{'W':>4} {'L':>4} {'D':>4}   {'avg_plies':>10}"
+        f"{'W':>4} {'D':>4} {'L':>4}   {'avg_plies':>10}"
     )
     print("-" * 60)
     for (scenario, bucket), s in rows:
         avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
         print(
             f"{scenario:<20} {bucket:<6} {s['N']:>4} "
-            f"{s['W']:>4} {s['L']:>4} {s['D']:>4}  "
+            f"{s['W']:>4} {s['D']:>4} {s['L']:>4}  "
             f"{avg:>10.1f}"
         )
     print("-" * 60)
 
-    # bot vs Stockfish summary (90-char lines)
+    # bot vs Stockfish summary
     def pct(n, d): return (n / d) if d else 0.0
     total = sf_overall["N"]
-    w, l, d = sf_overall["W"], sf_overall["L"], sf_overall["D"]
+    w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]
     win = pct(w, total)
     avg = (sf_overall["plies_sum"] / total) if total else 0.0
     print(
-        f"Total SF games: {total:>4}  W/L/D={w}/{l}/{d}  ",
+        f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
         f"win_rate={win:.1%}  avg_plies={avg:.1f}"
     )
 

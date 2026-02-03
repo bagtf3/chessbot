@@ -69,7 +69,12 @@ class MCTSTree(fasttree):
         self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
-        #self.piece_count = board.piece_count()
+        
+        # make sure we're starting at the correct sim schedule entry
+        if self.sims_ceiling_schedule:
+            for i in range(self.n_plies):
+                if i in self.sims_ceiling_schedule:
+                    self.set_new_sims_ceiling(self, n_plies=i)
 
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
@@ -162,18 +167,24 @@ class MCTSTree(fasttree):
         # check the sims schedule, update if applicapable
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
-                new_ceiling = self.sims_ceiling_schedule[self.n_plies]
-                self.sims_ceiling = new_ceiling
-                # this updates the c++ tree so e.g. smart pruning knows the new budget
-                self.set_sim_budget(float(new_ceiling))
+                self.set_new_sims_ceiling()
 
-                # if a ratio is used, update that
-                if self.config.target_delta < 1:
-                    self.target_delta = np.floor(self.config.target_delta*new_ceiling)
+    def set_new_sims_ceiling(self, n_plies=None):
+        if n_plies is None:
+            n_plies = self.n_plies
+
+        new_ceiling = self.sims_ceiling_schedule.get(n_plies, None)
+        if new_ceiling is None:
+            return
         
-        # lower c_puct in the end game to narrow search
-        if self.n_plies == 120:
-           self.set_cpuct(self.c_puct_endgame)
+        self.sims_ceiling = new_ceiling
+        # this updates the c++ tree so e.g. smart pruning knows the new budget
+        self.set_sim_budget(float(new_ceiling))
+
+        # if a ratio is used, update that
+        if self.config.target_delta < 1:
+            self.target_delta = np.floor(self.config.target_delta*new_ceiling)
+        
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added

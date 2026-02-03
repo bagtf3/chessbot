@@ -155,7 +155,7 @@ def paired_validation_games(cfg):
     Return paired ChessGame instances for Stockfish validation.
 
     For each i in range(n):
-      - pick a random pre-opened premove path index
+      - pick a random UHO premove path index
       - build two identical fastboard positions from that index
       - create two ChessGame objects where stockfish plays one as white
         and the other as black
@@ -163,12 +163,7 @@ def paired_validation_games(cfg):
 
     games = []
     n = cfg.n_games // 2
-    indices = [i for i in range(len(cbu.PATHS))]
-    selected = np.random.choice(indices, n, replace=False)
-    
-    for i, s in enumerate(selected):
-        #board_white = cbu.get_pre_opened_game(index=s)
-        #board_black = cbu.get_pre_opened_game(index=s)
+    for i in range(n):
         board_white = cbu.create_UHO_PGN_game()
         board_black = board_white.clone()
 

@@ -1,0 +1,6 @@
+pandas
+matplotlib
+chess
+tensorflow
+IPython
+git+https://github.com/bagtf3/pyfastchess.git

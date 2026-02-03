@@ -7,6 +7,7 @@ pd.set_option('display.max_columns', None)
 import math, random, time, pickle
 from pathlib import Path
 from time import time as _now
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import chess

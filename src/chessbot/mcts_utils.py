@@ -91,9 +91,9 @@ class MCTSTree(fasttree):
 
     def best(self):
         """
-        Before ply 20: sample from the top 5 moves by visits using a
-        temperature schedule that decays to near-deterministic by ply 20.
-        At/after ply 20: delegate to the base implementation.
+        Before ply 25: sample from the top 5 moves by visits using a
+        temperature schedule that decays to near-deterministic by ply 25.
+        At/after ply 25: delegate to the base implementation.
         Returns (uci, None) like the original.
         """
         if self.config.sample_moves == False:
@@ -121,7 +121,7 @@ class MCTSTree(fasttree):
         top_visits = visits[:top_k]
 
         # temperature schedule: linear decay from temp_max (ply 0) to
-        # temp_min (ply 20). Small temp_min makes softmax -> argmax.
+        # temp_min (ply 25). Small temp_min makes softmax -> argmax.
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
         
@@ -471,20 +471,21 @@ class ChessGame(object):
         }
         
         # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
-        #vwq = rnd(self.tree.visit_weighted_Q(), 4)
-        vwq = rnd(details[0].Q, 4) # best Q
-        Q_white = vwq
+        vwq = rnd(self.tree.visit_weighted_Q(), 4)
+        best_q = rnd(details[0].Q, 4)
+        Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
         if self.is_stockfish_turn():
             Q_stm = self.sf_eval
             Q_white = Q_stm if turn else -Q_stm
 
         data["visit_weighted_Q"] = vwq
+        data['best_Q'] = best_q
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
 
         # keep a small list of items for gameplay checking
-        self.recents.append((mv, Q_stm, Q_white, vwq, turn))
+        self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 
         # sumN for U term
         sumN = max(1, root.N)
@@ -561,7 +562,7 @@ class ChessGame(object):
         violated = False
         violating_index = None
         for i, r in enumerate(reversed(self.recents[-n_last:])):
-            # r is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+            # r is a tuple: (mv, Q_stm, Q_white, best_q, turn)
             if abs(r[1]) > thresh_d:
                 violated = True
                 violating_index = i
@@ -594,10 +595,10 @@ class ChessGame(object):
             # scan newest->oldest. rev_i 0 == newest
             sign_check = None
             for rev_i, ex in enumerate(reversed(self.recents[-n_last:])):
-                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
-                vwq = ex[3]
+                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
+                best_q = ex[3]
                 # magnitude must meet the lock threshold
-                if abs(vwq) < thresh:
+                if abs(best_q) < thresh:
                     needed = n_last - rev_i
                     self.next_collar_stop_check = self.plies + needed
                     return False, None
@@ -631,7 +632,7 @@ class ChessGame(object):
             tail = self.recents[-check_depth:]
 
             for ex in tail:
-                # ex is a tuple: (mv, Q_stm, Q_white, vwq, turn)
+                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
                 q_white = ex[2]
                 # positive when leader still ahead
                 sign_stability = self.collar_stop_eventual_outcome * q_white

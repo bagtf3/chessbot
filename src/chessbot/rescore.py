@@ -2,6 +2,7 @@ import os, json, pathlib, time
 from pathlib import Path
 import uuid
 import sys
+import random
 import subprocess
 from collections import deque
 
@@ -144,24 +145,30 @@ class Rescorer(object):
         mask = board.legal_move_mask()
 
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
+    
+    def write_training_data_pkl(self, size=None, randomize=True):
+        cfg = self.config
+        out_dir = pathlib.Path(cfg.pending_training_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if randomize:
+            random.shuffle(self.training_data)
         
-        if len(self.training_data) >= cfg.retrain_batch_size:
-            out_dir = pathlib.Path(cfg.pending_training_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
+        if size is None:
+            size = cfg.get_retrain_size
 
-            chunk_size = cfg.retrain_batch_size
-            chunk = self.training_data[:chunk_size]
-            remainder = self.training_data[chunk_size:]
+        chunk = self.training_data[:size]
+        remainder = self.training_data[size:]
 
-            filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
-            out_path = out_dir / filename
+        filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
+        out_path = out_dir / filename
 
-            with open(out_path, "wb") as f:
-                pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(out_path, "wb") as f:
+            pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            self.training_data = remainder
-            self.written_this_round += len(chunk)
-            self.written_total += len(chunk)
+        self.training_data = remainder
+        self.written_this_round += len(chunk)
+        self.written_total += len(chunk)
 
     def training_data_from_sf(self, board, mv, cm, Y):
         cfg = self.config
@@ -870,7 +877,7 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
     return [[u, int(v)] for u, v in items]
 
 
-def launch_retrain_async(run_tag, rt_script, working_cfg, n_samples):
+def launch_retrain_async(run_tag, rt_script, working_cfg):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
 

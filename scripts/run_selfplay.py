@@ -19,7 +19,6 @@ from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
 
-
 import signal
 import threading
 
@@ -32,9 +31,7 @@ def request_stop(signum=None, frame=None):
 
 _now = time.time
 
-PRINT_EVERY = 60.0
-PROCESS_TIME = 20.0
-ANALYSIS_BATCH = 30
+PROCESS_TIME = 30.0
 
 
 def update_game_index(game, base_cfg):
@@ -243,12 +240,12 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
-def launch_retrain(run_tag, working_cfg, n_samples):
+def launch_retrain(run_tag, working_cfg):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
 
-    return launch_retrain_async(run_tag, rt_script, working_cfg, n_samples)
+    return launch_retrain_async(run_tag, rt_script, working_cfg)
 
 
 def main(run_tag):
@@ -308,8 +305,8 @@ def main(run_tag):
             recorder = RecordKeeper(n_retrains, run_num, every_sec=45.0)
 
             procs = check_and_reap_procs(procs)
-            needed = working_cfg.training_queue_thresh
-            while len(procs) or (recorder.training_queue < needed):
+            needed_to_retrain = working_cfg.training_queue_buffer
+            while len(procs) or (recorder.training_queue < needed_to_retrain):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
@@ -348,9 +345,44 @@ def main(run_tag):
                         pkl_file = to_process['meta']['pkl_file']
                     else:
                         pkl_file = to_process['pkl_file']
+                    
                     rescorer.analyze_and_rescore(pkl_file)
-                    recorder.training_queue = rescorer.written_this_round
-                    # need to write this out to pkl
+                    recorder.training_queue = len(rescorer.training_data)
+
+                # check for a retrain
+                if recorder.training_queue >= needed_to_retrain:
+                    # TODO pause workers
+                    
+                    # sample and write training data, update training_queue for logging
+                    rescorer.write_training_data_pkl(
+                        size=working_cfg.retrain_size, randomize=True)
+
+                    recorder.training_queue = len(rescorer.training_data)
+
+                    if retrain is None:
+                        retrain = launch_retrain(run_tag, working_cfg)
+                        rescorer.reset_writer()
+                    
+                    while retrain is not None:
+                        done, rc = poll_retrain(retrain, print_output=True)
+                        if done:
+                            retrain = None
+                        
+                        # can process games during retraining
+                        if len(finished_games):
+                            to_process = finished_games.popleft()
+                            # might be nested or flat depending on where it came from
+                            if 'meta' in to_process.keys():
+                                pkl_file = to_process['meta']['pkl_file']
+                            else:
+                                pkl_file = to_process['pkl_file']
+                            rescorer.analyze_and_rescore(pkl_file)
+                            recorder.training_queue = len(rescorer.training_data)
+                        
+                        else:
+                            time.sleep(0.05)
+                    
+                    # TODO unpause workers
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)
@@ -370,29 +402,6 @@ def main(run_tag):
                 build_validation_summary(recorder)
                 # we do not train after validation currently
                 continue
-            
-            # check if we have enough to run retraining
-            n_samples = rescorer.written_this_round
-            if n_samples >= needed:
-                if retrain is None:
-                    retrain = launch_retrain(run_tag, working_cfg, n_samples)
-                    rescorer.reset_writer()
-                while retrain is not None:
-                    done, rc = poll_retrain(retrain, print_output=True)
-                    if done:
-                        retrain = None
-                    
-                    if len(finished_games):
-                        to_process = finished_games.popleft()
-                        # might be nested or flat depending on where it came from
-                        if 'meta' in to_process.keys():
-                            pkl_file = to_process['meta']['pkl_file']
-                        else:
-                            pkl_file = to_process['pkl_file']
-                        rescorer.analyze_and_rescore(pkl_file)
-                    
-                    else:
-                        time.sleep(0.05)
 
         # capture the return situation
         rescorer.push_analyzed(report=True)
@@ -409,6 +418,7 @@ def main(run_tag):
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.push_analyzed(report=True)
+        rescorer.write_training_data_pkl(size=9999999, randomize=False)
         rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 

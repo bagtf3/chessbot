@@ -3,6 +3,8 @@ import pathlib, json
 import time, gc
 import sys, subprocess
 
+from queue import Empty
+
 _now = time.time
 
 import numpy as np
@@ -11,16 +13,13 @@ import tensorflow as tf
 
 import chess
 
-from pyfastchess import raw_cache_bulk_insert
-from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
+from pyfastchess import raw_cache_bulk_insert, raw_cache_clear
 
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
-
-import chessbot.utils as cbu
 from chessbot.utils import RateMeter, GameGenerator
 
 
@@ -28,11 +27,12 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_games_q, telemetry_q):
+    def __init__(self, model, cfg, recent_games_q, telemetry_q, msg_q):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_games_q
         self.telemetry_q = telemetry_q
+        self.msg_q = msg_q
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
@@ -50,16 +50,12 @@ class GameLooper(object):
         if cfg.play_vs_sf_prob > 0.0:
             self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
             self.eng.configure(cfg.sf_config)
-
-        cfg = self.config
-        self.infer = make_conv_infer(
-            self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
-            vscale=cfg.vscale
-        )
+        
+        # pulls in model from config and XLA compilers inferencer
+        self.load_reload_model()
 
         self.infer_is_warm = False
-        self.batch_candidates = self.create_batch_candidates(cfg)
+        self.batch_candidates = self.create_batch_candidates(self.config)
         self.n_retrains = 0
         
         self._run_start = _now()
@@ -94,11 +90,67 @@ class GameLooper(object):
         self.infer_is_warm = True
         print("[model warmup] warm up complete")
 
+    def load_reload_model(self):
+        cfg = self.config
+        self.model = load_model(cfg.model_path)
+        self.infer = make_conv_infer(
+            self.model, max_bs=cfg.fwd_batch,
+            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
+            vscale=cfg.vscale)
+    
+    def check_for_pause(self):
+        """
+        Drain msg_q (non-blocking). Return True if a pause was requested.
+        """
+        while True:
+            try:
+                msg = self.msg_q.get_nowait()
+            except Empty:
+                return False
+
+            if isinstance(msg, str):
+                if msg == "pause":
+                    return True
+                continue
+
+            if isinstance(msg, dict):
+                if msg.get("cmd") == "pause":
+                    return True
+                continue
+
+    def pause_wait_and_reload(self):
+        """
+        Pause hard: clear caches, tear down GPU objects, then block until "unpause".
+        After "unpause", reload model + infer and return.
+        """
+        del self.infer
+        self.infer = None
+
+        del self.model
+        self.model = None
+
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        raw_cache_clear()
+
+        while True:
+            msg = self.msg_q.get()
+            cmd = msg.get("cmd") if isinstance(msg, dict) else msg
+            if cmd == "unpause":
+                break
+            if cmd == "pause":
+                continue
+        
+        # reload model (refreshed) and build inferer
+        self.load_reload_model()
+        self.n_retrains += 1
+
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
         batch_candidates = set()
         batch_candidates.add(cfg.fwd_batch)
-        bs = 16
+        bs = 8
         while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)
             bs *= 2
@@ -106,7 +158,10 @@ class GameLooper(object):
         # split difference between last 2 if large
         if len(batch_candidates) >= 2 and cfg.fwd_batch >= 128:
             sbc = sorted(batch_candidates)
-            sbc.append(int(sbc[-1] - sbc[-2] / 2))
+            lo = sbc[-2]
+            hi = sbc[-1]
+            mid = lo + (hi - lo) // 2
+            sbc.append(mid)
             return sorted(set(sbc))
         return sorted(set(batch_candidates))
 
@@ -155,7 +210,7 @@ class GameLooper(object):
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
         while self.games_finished < cfg.n_games:
-            # check the stop event
+            # check a few stopping conditions 
             if stop_event is not None:
                 if stop_event.is_set():
                     return
@@ -163,6 +218,10 @@ class GameLooper(object):
             if not self.active_games:
                 break
             
+            if self.check_for_pause():
+                self.pause_wait_and_reload()
+
+            # selfplay loop starts here
             preds_batch = []
             finished = []
             for game in self.active_games[:cfg.games_at_once]:
@@ -183,11 +242,11 @@ class GameLooper(object):
     
                 # if this game has reached its local sim budget, make the move
                 elif game.tree.stop_simulating():
-                    # bot plays from tree
+                    # xerces plays from tree
                     mcts_terminal = game.make_move_from_tree()
                     mps.tick(1)
                     
-                    # terminal after bot move?
+                    # terminal after xerces move?
                     if mcts_terminal:
                         self.finalize_game_data(game)
                         finished.append(game.game_id)
@@ -445,7 +504,7 @@ class GameLooper(object):
         self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
 
 
-def init_selfplay(config, recent_games_q, telemetry_q):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -465,16 +524,13 @@ def init_selfplay(config, recent_games_q, telemetry_q):
 
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_games_q=recent_games_q, telemetry_q=telemetry_q
+        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q
     )
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
-        try:
-            progress_df = pd.read_csv(config.progress_csv_path)
-            n_retrains = len(progress_df)
-            looper.n_retrains = n_retrains
-        except Exception as e:
-            print("[init_selfplay] failed reading progress csv:", e)
+        progress_df = pd.read_csv(config.progress_csv_path)
+        n_retrains = len(progress_df)
+        looper.n_retrains = n_retrains
 
     return looper

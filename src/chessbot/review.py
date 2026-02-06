@@ -496,6 +496,7 @@ class GameViewer:
         print("  b, back              previous move (same as b1)")
         print("  q, quit, exit        quit replay")
         print("  o, options, help     show this help text")
+        print("  fen                  print FEN for current position")
         print("  sf                   stockfish overlay (uses default depth)")
         print("  sf<D>                stockfish eval to depth D, e.g. sf12")
         print("  visits <move>        show MCTS visits for specific move")
@@ -524,6 +525,8 @@ class GameViewer:
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
                 self.show_options()
+            elif cmd == "fen":
+                print(self.board.fen())
             elif cmd.startswith("pv"):
                 # pv or pvN (e.g. pv8)
                 if cmd == "pv":

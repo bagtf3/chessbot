@@ -35,8 +35,7 @@ PROCESS_TIME = 30.0
 
 
 def update_game_index(game, base_cfg):
-    # update JSONL index (small)
-
+    # update JSONL index
     game['beat_sf'] = False
     if game['vs_stockfish']:
         game_result = game['result']
@@ -58,10 +57,6 @@ def update_game_index(game, base_cfg):
 
 
 def make_parent_queues():
-    """
-    Create mp queues in parent and return them.
-    Create them from default ctx (platform default).
-    """
     ctx = mp.get_context()
     recent_q = ctx.Queue()
     telemetry_q = ctx.Queue()
@@ -77,16 +72,16 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         c = cfg.copy()
         c.id = f"w{i}"
 
-        # customize workers
         if not cfg.is_validation_run:
-            # only SF on first 2 workers (saves CPU)
             if i > 1:
                 c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()
+        msg_q = ctx.Queue()
+
         p = ctx.Process(
             target=child_looper,
-            args=(c, stop_ev, recent_q, telemetry_q),
+            args=(c, stop_ev, recent_q, telemetry_q, msg_q),
         )
         p.start()
 
@@ -94,6 +89,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
             "id": c.id,
             "p": p,
             "stop_ev": stop_ev,
+            "msg_q": msg_q,
             "stop_sent_at": None,
             "term_sent_at": None,
             "kill_sent_at": None,
@@ -102,8 +98,8 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     return procs
 
 
-def child_looper(cfg, stop_ev, recent_games_q, telemetry_q):
-    with init_selfplay(cfg, recent_games_q, telemetry_q) as looper:
+def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q):
+    with init_selfplay(cfg, recent_games_q, telemetry_q, msg_q) as looper:
         looper.run(stop_ev)
 
 
@@ -248,6 +244,14 @@ def launch_retrain(run_tag, working_cfg):
     return launch_retrain_async(run_tag, rt_script, working_cfg)
 
 
+def pull_pkl(to_process):
+    # might be nested or flat depending on where it came from
+    if 'meta' in to_process.keys():
+        return to_process['meta']['pkl_file']
+    else:
+        return to_process['pkl_file']
+
+
 def main(run_tag):
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
@@ -258,7 +262,6 @@ def main(run_tag):
 
     start = time.time()
     procs = []
-    cpl_list = []
     recent_q = None
     telemetry_q = None
     retrain = None
@@ -266,9 +269,7 @@ def main(run_tag):
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
-
-            n_processed = 0
-            next_print = 10
+            
             if STOP_REQUESTED.is_set():
                 break
 
@@ -340,18 +341,16 @@ def main(run_tag):
                         break
                     
                     to_process = finished_games.popleft()
-                    # might be nested or flat depending on where it came from
-                    if 'meta' in to_process.keys():
-                        pkl_file = to_process['meta']['pkl_file']
-                    else:
-                        pkl_file = to_process['pkl_file']
+                    pkl_file = pull_pkl(to_process)
                     
                     rescorer.analyze_and_rescore(pkl_file)
                     recorder.training_queue = len(rescorer.training_data)
 
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
-                    # TODO pause workers
+                    # pause workers
+                    for p in procs:
+                        p["msg_q"].put("pause")
                     
                     # sample and write training data, update training_queue for logging
                     rescorer.write_training_data_pkl(
@@ -368,21 +367,19 @@ def main(run_tag):
                         if done:
                             retrain = None
                         
-                        # can process games during retraining
+                        # can still process games during retraining
                         if len(finished_games):
                             to_process = finished_games.popleft()
-                            # might be nested or flat depending on where it came from
-                            if 'meta' in to_process.keys():
-                                pkl_file = to_process['meta']['pkl_file']
-                            else:
-                                pkl_file = to_process['pkl_file']
+                            pkl_file = pull_pkl(to_process)
                             rescorer.analyze_and_rescore(pkl_file)
                             recorder.training_queue = len(rescorer.training_data)
                         
                         else:
                             time.sleep(0.05)
                     
-                    # TODO unpause workers
+                    # unpause workers
+                    for p in procs:
+                        p["msg_q"].put("unpause")
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)

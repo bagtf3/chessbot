@@ -33,6 +33,7 @@ class GameLooper(object):
         self.recent_games_q = recent_games_q
         self.telemetry_q = telemetry_q
         self.msg_q = msg_q
+        self.unpause_queued = False
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
@@ -101,6 +102,10 @@ class GameLooper(object):
     def check_for_pause(self):
         """
         Drain msg_q (non-blocking). Return True if a pause was requested.
+
+        Important: do NOT discard "unpause" if it arrives early. Buffer it so a later
+        pause_wait_and_reload() will not deadlock waiting for an unpause that was
+        already consumed.
         """
         while True:
             try:
@@ -108,20 +113,24 @@ class GameLooper(object):
             except Empty:
                 return False
 
-            if isinstance(msg, str):
-                if msg == "pause":
-                    return True
+            cmd = msg.get("cmd") if isinstance(msg, dict) else msg
+
+            if cmd == "pause":
+                return True
+
+            if cmd == "unpause":
+                self.unpause_queued = True
                 continue
 
-            if isinstance(msg, dict):
-                if msg.get("cmd") == "pause":
-                    return True
-                continue
+            # ignore everything else
+            continue
 
     def pause_wait_and_reload(self):
         """
-        Pause hard: clear caches, tear down GPU objects, then block until "unpause".
+        Pause hard: clear caches, tear down GPU objects, then wait until "unpause".
         After "unpause", reload model + infer and return.
+
+        If "unpause" arrived early and was buffered, do not block.
         """
         del self.infer
         self.infer = None
@@ -134,15 +143,22 @@ class GameLooper(object):
 
         raw_cache_clear()
 
-        while True:
-            msg = self.msg_q.get()
-            cmd = msg.get("cmd") if isinstance(msg, dict) else msg
-            if cmd == "unpause":
-                break
-            if cmd == "pause":
+        if self.unpause_queued:
+            self.unpause_queued = False
+        else:
+            while True:
+                msg = self.msg_q.get()
+                cmd = msg.get("cmd") if isinstance(msg, dict) else msg
+
+                if cmd == "unpause":
+                    break
+
+                if cmd == "pause":
+                    continue
+
+                # ignore everything else
                 continue
-        
-        # reload model (refreshed) and build inferer
+
         self.load_reload_model()
         self.n_retrains += 1
 

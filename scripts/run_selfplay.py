@@ -260,6 +260,15 @@ def main(run_tag):
     rescorer = Rescorer(base_cfg)
     finished_games = rescorer.get_unprocessed()
 
+    # infer n_retrains
+    if os.path.exists(base_cfg.progress_csv_path):
+        progress_df = pd.read_csv(base_cfg.progress_csv_path)
+        n_retrains = len(progress_df)
+    else:
+        n_retrains = 0
+    
+    recorder = RecordKeeper(n_retrains, run_num=0, every_sec=45.0)
+
     start = time.time()
     procs = []
     recent_q = None
@@ -269,7 +278,9 @@ def main(run_tag):
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
-            
+            recorder = RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
+            recorder.training_queue = len(rescorer.training_data)
+
             if STOP_REQUESTED.is_set():
                 break
 
@@ -302,8 +313,6 @@ def main(run_tag):
                 n_retrains = len(progress_df)
             else:
                 n_retrains = 0
-            
-            recorder = RecordKeeper(n_retrains, run_num, every_sec=45.0)
 
             procs = check_and_reap_procs(procs)
             needed_to_retrain = working_cfg.training_queue_buffer
@@ -366,6 +375,7 @@ def main(run_tag):
                         done, rc = poll_retrain(retrain, print_output=True)
                         if done:
                             retrain = None
+                            recorder.n_retrains += 1
                         
                         # can still process games during retraining
                         if len(finished_games):

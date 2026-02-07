@@ -1476,7 +1476,7 @@ def stop_post_hoc_server(p, timeout=10):
 
 
 class RecordKeeper(object):    
-    def __init__(self, n_retrains, run_num, every_sec=60):
+    def __init__(self, n_retrains, run_num=None, every_sec=60):
         self.n_retrains = n_retrains
         self.run_num = run_num
         self.every_sec = every_sec
@@ -1556,7 +1556,7 @@ class RecordKeeper(object):
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
         return summed_out, avg_out
 
-    def maybe_log_results(self, window=500, force=False):
+    def maybe_log_results(self, window=1500, force=False):
         now = time.time()
         if not force and (now - self._last_stats_log < self.every_sec):
             return

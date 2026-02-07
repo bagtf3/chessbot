@@ -13,7 +13,7 @@ import tensorflow as tf
 
 import chess
 
-from pyfastchess import raw_cache_bulk_insert, raw_cache_clear
+from pyfastchess import raw_cache_bulk_insert, raw_cache_clear, priors_cache_clear
 
 from chessbot import SF_LOC
 
@@ -142,6 +142,7 @@ class GameLooper(object):
         gc.collect()
 
         raw_cache_clear()
+        priors_cache_clear()
 
         if self.unpause_queued:
             self.unpause_queued = False

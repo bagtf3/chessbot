@@ -5,8 +5,6 @@ import time
 import numpy as np
 import yaml
 
-from pyfastchess import Board as fastboard
-from chessbot.config import Config
 from chessbot.mcts_utils import ChessGame
 import chessbot.utils as cbu
 
@@ -155,23 +153,30 @@ def paired_validation_games(cfg):
     Return paired ChessGame instances for Stockfish validation.
 
     For each i in range(n):
-      - pick a random UHO premove path index
-      - build two identical fastboard positions from that index
+      - sample a UHO board using GameGenerator
+      - clone it
       - create two ChessGame objects where stockfish plays one as white
         and the other as black
     """
+    gen = cbu.GameGenerator(cfg)
 
     games = []
     n = cfg.n_games // 2
     for i in range(n):
-        board_white = cbu.create_UHO_PGN_game()
+        board_white, _ = gen.new_board(game_type="UHO")
         board_black = board_white.clone()
 
-        meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
-                  "scenario": "paired_validation"}
-        
-        meta_b = {"vs_stockfish": True, "stockfish_is_white": False,
-                  "scenario": "paired_validation"}
+        meta_w = {
+            "vs_stockfish": True,
+            "stockfish_is_white": True,
+            "scenario": "paired_validation"
+        }
+
+        meta_b = {
+            "vs_stockfish": True,
+            "stockfish_is_white": False,
+            "scenario": "paired_validation"
+        }
 
         cg_w = ChessGame(board=board_white, meta=meta_w, cfg=cfg)
         cg_b = ChessGame(board=board_black, meta=meta_b, cfg=cfg)

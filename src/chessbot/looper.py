@@ -13,7 +13,8 @@ import tensorflow as tf
 
 import chess
 
-from pyfastchess import raw_cache_bulk_insert, raw_cache_clear, priors_cache_clear
+from pyfastchess import (
+    raw_cache_bulk_insert, raw_cache_clear, priors_cache_clear, priors_cache_stats)
 
 from chessbot import SF_LOC
 
@@ -303,8 +304,8 @@ class GameLooper(object):
 
             if self.maybe_push_telemetry(counts, lpb, force=False):
                 self.prediction_times.clear()
-                counts = []
-                lpb = []
+                counts.clear()
+                lpb.clear()
             
             # resolve fresh predictions back into each game tree
             for game in self.active_games:
@@ -405,7 +406,6 @@ class GameLooper(object):
         
         sims_total = game.tree.sims_done_total 
         moves = game.tree.n_moves_played
-        avg_sims = sims_total/moves if moves > 0 else 0
 
         # read adjudicator flags (direct attrs; they always exist)
         mat = self.config.use_material_diff
@@ -430,8 +430,9 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            # this is the specific c_puct, not the list of options
-            "c_puct": game.tree.c_puct
+            # this is the specific c_puct and dirichlet eps, not the list of options
+            "c_puct": game.tree.c_puct,
+            "dirichlet_eps": game.tree.dirichlet_eps
         }
 
         # on-disk record (full)
@@ -448,6 +449,7 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
+        res["dirichlet_eps"] = game.tree.dirichlet_eps
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
@@ -502,6 +504,12 @@ class GameLooper(object):
         if self.prediction_times:
             telemetry['pred_wait'] = np.mean(self.prediction_times)
             telemetry['preds_per_second'] = telemetry['apl'] / telemetry['pred_wait']
+        
+        # adds cache stats to telemetry update
+        #pcs = {'size': 0, 'capacity': 600000, 'evictions': 0, 'queries': 0, 'hits': 0}
+        pcs = priors_cache_stats()
+        for k, v in pcs.items():
+            telemetry[f'cache_{k}'] = v
         
         # put telemetry on the queue and return True to clear counts and lpb
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})

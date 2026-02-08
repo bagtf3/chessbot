@@ -431,7 +431,7 @@ def main(run_tag):
 
 
 if __name__ == "__main__":
-    # build in gracefully exits
+    # build in graceful exits
     signal.signal(signal.SIGINT, request_stop)
 
     if hasattr(signal, "SIGTERM"):

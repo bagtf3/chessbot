@@ -18,7 +18,6 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.config import Config
 from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
@@ -1526,31 +1525,34 @@ class RecordKeeper(object):
 
     def get_agg_metrics(self):
         time_delta = time.time() - 120
+
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
             "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
-            "s_priorless", "s_puct", "preds_per_second"
+            "s_priorless", "s_puct", "preds_per_second",
+            # priors cache (per-worker) telemetry, aggregate across workers
+            "cache_fill", "cache_cap", "queries", "hits",
         ]
 
         summed = defaultdict(float)
         sum_seen = set()
 
-        to_avg = ['mbs', 'fwd_target', 'apl', "pred_wait", 'avg_ply']
+        to_avg = ["mbs", "fwd_target", "apl", "pred_wait", "avg_ply"]
         avged = defaultdict(list)
         avg_seen = set()
-        valid = []
+
         for looper_id, info in self.telemetry.items():
             # if telemetry is timed out, skip it
-            if info['ts'] < time_delta:
+            if info.get("ts", 0) < time_delta:
                 continue
-            
-            for tosum in to_sum:
-                summed[tosum] += info.get(tosum, 0)
-                sum_seen.add(tosum)
 
-            for ta in to_avg:
-                avged[ta].append(info.get(ta, 0))
-                avg_seen.add(ta)
+            for k in to_sum:
+                summed[k] += info.get(k, 0)
+                sum_seen.add(k)
+
+            for k in to_avg:
+                avged[k].append(info.get(k, 0))
+                avg_seen.add(k)
 
         summed_out = {k: summed[k] for k in sorted(sum_seen)}
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
@@ -1603,7 +1605,6 @@ class RecordKeeper(object):
             return
         
         s_collected     = summed.get("s_collected", 0)
-        s_fast          = summed.get("s_fast", 0)
         s_terminals     = summed.get("s_terminals", 0)
         s_cached        = summed.get("s_cached", 0)
         s_fast_stops    = summed.get("s_fast_stops", 0)
@@ -1614,7 +1615,6 @@ class RecordKeeper(object):
         avg_new = s_collected / n_groups
 
         total_overall = s_collected + s_terminals + s_cached
-        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
         pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
         pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
 
@@ -1649,14 +1649,32 @@ class RecordKeeper(object):
         left5 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
         right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
+        # priors-cache info (aggregated across workers)
+        cache_fill = summed.get("cache_fill", 0)
+        cache_cap = summed.get("cache_cap", 0)
+        cache_queries = summed.get("queries", 0)
+        cache_hits = summed.get("hits", 0)
+
+        cache_fill_pct = 100.0 * cache_fill / max(1.0, cache_cap)
+        hit_rate = cache_hits / max(1.0, cache_queries)
+
+        left6 = (
+            f"[cache info] fill={cache_fill:.0f}/{cache_cap:.0f} "
+            f"({cache_fill_pct:.1f}%)"
+        )
+        right6 = (
+            f"hit_rate={100.0 * hit_rate:.1f}% "
+            f"(hits={cache_hits:.0f} q={cache_queries:.0f})"
+        )
+
         sims = self.sims_done_total
         moves = self.total_plies
         sims_per_move = sims / moves if moves > 0 else 0.0
 
         n_active = summed['n_active']
         avg_ply = avged['avg_ply']
-        left6 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
-        right6 = f"sims per move={sims_per_move:.2f}"
+        left7 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
+        right7 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
@@ -1665,6 +1683,7 @@ class RecordKeeper(object):
         print(f"{left4:<{col_width}} | {right4}")
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")
+        print(f"{left7:<{col_width}} | {right7}")
 
         # show game duration if its available
         last50 = self.recent_games[-50:]

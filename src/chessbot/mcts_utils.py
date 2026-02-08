@@ -6,11 +6,10 @@ import tl2cgen as tl2
 import numpy as np
 
 from pyfastchess import MCTSTree as fasttree
-from pyfastchess import create_prior_engine, configure_prior_engine, prior_engine_build
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
-from chessbot.review import score_to_value_stm_pov, make_fake_visits
+from chessbot.review import score_to_value_stm_pov
 from chessbot.utils import calc_entropy, rnd
 import chessbot.utils as cbu
 
@@ -20,23 +19,18 @@ class MCTSTree(fasttree):
         self.config = cfg
 
         # if c_puct is given as a list, pick an option randomly
-        # otherwise assume its a float or int        
-        c = cfg.c_puct
-        if isinstance(c, (int, float)):
-            self.c_puct = float(c)
-        elif isinstance(c, (list, set)):
-            self.c_puct = float(np.random.choice(c))
-        else:
-            self.c_puct = c
+        # must be float for c++
+        self.c_puct = float(cbu.maybe_random_from_list(cfg.c_puct))
 
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
         self.sims_ceiling_schedule = {}
-        #ceiling can be a list for varied gameplay
-        if isinstance(cfg.sims_ceiling, (list, set)):
-            self.sims_ceiling = np.random.choice(cfg.sims_ceiling)
+        
+        # ceiling can be a list for varied gameplay
+        self.sims_ceiling = cbu.maybe_random_from_list(cfg.sims_ceiling)
+
         # can also be a dict, interpreted as a sims schedule
-        elif isinstance(cfg.sims_ceiling, dict):
+        if isinstance(cfg.sims_ceiling, dict):
             # start with the lowest, update at each interval
             sc = cfg.sims_ceiling.copy()
             lowest = min(sc.keys())
@@ -77,6 +71,12 @@ class MCTSTree(fasttree):
         # root noise
         self.add_root_noise = cfg.add_root_noise
         self.root_noise_added = False
+
+        # epsilon may be sampled
+        if self.add_root_noise:
+            self.dirichlet_eps = float(cbu.maybe_random_from_list(cfg.dirichlet_eps))
+        else:
+            self.dirichlet_eps = 0.0
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -192,8 +192,8 @@ class MCTSTree(fasttree):
             return
 
         super().add_root_dirichlet_noise(
-            eps=self.config.dirichlet_eps, alpha=self.config.dirichlet_alpha
-        )
+            eps=self.dirichlet_eps, alpha=self.config.dirichlet_alpha)
+        
         self.root_noise_added = True
 
     def get_sim_decision_probs(self):

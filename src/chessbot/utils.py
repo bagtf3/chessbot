@@ -125,6 +125,7 @@ uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_u
 with open(uci_path_path_mini, "rb") as f:
     MINI_PATHS = pickle.load(f)
 
+
 pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
 with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
     PGN_TEXT = f.read()
@@ -132,6 +133,12 @@ with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
 
 def rnd(x, n):
     return np.round(x, n)
+
+
+def maybe_random_from_list(item):
+    if isinstance(item, (list, set)):
+        return np.random.choice(item)
+    return item
 
 
 def show_board(board, flipped=False, sleep=0.1):
@@ -1157,75 +1164,105 @@ def make_piece_training_board():
     return fastboard(board.fen()), {"scenario": f"pt_{pick}"}
         
 
+class UhoPgnSampler:
+    def __init__(self, pgn_text):
+        self.pgn_text = pgn_text
+        self.uho_event_start_re = re.compile(r'(?m)^\[Event "')
+        self.starts = [
+            m.start()
+            for m in self.uho_event_start_re.finditer(pgn_text)
+        ]
+        if not self.starts:
+            raise ValueError("No games found (no [Event at line start).")
+
+    def sample_fastboard(self):
+        k = random.randrange(len(self.starts))
+        a = self.starts[k]
+        b = self.starts[k + 1] if k + 1 < len(self.starts) else len(self.pgn_text)
+        chunk = self.pgn_text[a:b]
+
+        blank = chunk.find("\n\n")
+        moves_blob = chunk if blank == -1 else chunk[blank + 2:]
+
+        game = chess.pgn.read_game(io.StringIO(moves_blob))
+        if game is None:
+            return fastboard()
+
+        fb = fastboard()
+        for mv in game.mainline_moves():
+            fb.push_uci(mv.uci())
+
+        return fb
+
+
 class GameGenerator(object):
     """ Curriculum game generator """
     def __init__(self, cfg):
         self.config = cfg
         self.game_types = list(self.config.game_probs.keys())
 
+        self.uho_sampler = None
+        if "UHO" in self.game_types:
+            self.uho_sampler = UhoPgnSampler(PGN_TEXT)
+
     def new_board(self, game_type=None):
-        # sanity check
         if game_type is not None and game_type not in self.game_types:
             raise ValueError(
                 f"Unknown game type {game_type}. "
-                f"Pick one of {self.game_types}")
+                f"Pick one of {self.game_types}"
+            )
 
-        # sample if not given
         if game_type is None:
             types, probs = zip(*self.config.game_probs.items())
             game_type = random.choices(types, weights=probs, k=1)[0]
 
-        # dispatch
         if game_type == "pre_opened":
             board = get_pre_opened_game()
             meta = {"scenario": "pre_opened"}
-        
+
         elif game_type == "pre_opened_mini":
             board = get_pre_opened_game(mini=True)
             meta = {"scenario": "pre_opened_mini"}
 
         elif game_type == "UHO":
-            board = create_UHO_PGN_game()
+            board = self.uho_sampler.sample_fastboard()
             meta = {"scenario": "UHO"}
-        
+
         elif game_type == "random_init":
-            plies = 2*np.random.randint(0, 4)
+            plies = 2 * np.random.randint(1, 5)
             board = random_init(plies)
             meta = {"scenario": "random_init", "start_plies": plies}
-            
+
         elif game_type == "random_middle_game":
-            # just more plies of random_init to land mid-game
             plies = np.random.randint(20, 31)
             board = random_init(plies)
             meta = {"scenario": "random_middle_game", "start_plies": plies}
-            
+
         elif game_type == "random_endgame":
             pieces = np.random.randint(8, 14)
             wk = np.random.randint(0, 33)
             bk = np.random.randint(33, 64)
             board = random_board_setup(pieces, wk, bk, queens=False)
             meta = {"scenario": "random_endgame", "pieces": pieces}
-            
+
         elif game_type == "piece_odds":
             board, meta = make_piece_odds_board()
-            
+
         elif game_type == "piece_training":
             board, meta = make_piece_training_board()
-            meta['scenario'] = 'piece_training'
+            meta["scenario"] = "piece_training"
 
         elif game_type == "startpos":
             board = fastboard()
-            meta = {'scenario': 'startpos'}
-            
+            meta = {"scenario": "startpos"}
+
         else:
             raise ValueError(f"unhandled game_type {game_type}")
-        
-        # quick check to make sure there are legal moves
+
         if board.legal_moves():
             return board, meta
-        # otherwise look for a new board
-        else:
-            return self.new_board(game_type=game_type)
+
+        return self.new_board(game_type=game_type)
 
 
 def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):

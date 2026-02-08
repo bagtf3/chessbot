@@ -1542,7 +1542,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
     return stats, rows, sf_overall
 
 
-def print_recent_summary(recent, window=500, result_is_bot_pov=True):
+def print_recent_summary(recent, window=1500, result_is_bot_pov=True):
     """
     Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).

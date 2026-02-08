@@ -18,7 +18,7 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
+from chessbot.utils import print_recent_summary, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence_bits

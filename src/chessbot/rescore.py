@@ -54,6 +54,8 @@ class Rescorer(object):
         self.sf_played_time = 0
         # sf max will store the 10 longest sf search times, to reduce outliers
         self.sf_max = [0.0]*10
+        self.last_10_cpls = []
+        self.last_10_bmrs = []
 
         self.init_analyzer()
 
@@ -481,8 +483,6 @@ class Rescorer(object):
         white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
         black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
 
-        total_plies = len(out_df)
-
         out = {
             'plies': nw + nb,
             'overall_cpl': rnd(cpl_s / (nw + nb), 3) if (nw + nb) else np.nan,
@@ -518,7 +518,21 @@ class Rescorer(object):
         self.n_saved += 1    
         self.tcpl += c; self.tbmr += b
 
+        # update the rolling windows
+        self.last_10_cpls.append(c)
+        self.last_10_cpls = self.last_10_cpls[-10:]
+        self.last_10_bmrs.append(b)
+        self.last_10_bmrs = self.last_10_bmrs[-10:]
+
         if report:
+            if len(self.last_10_cpls) >= 10:
+                last_10_avg_c = np.mean(self.last_10_cpls)
+                last_10_avg_b = np.mean(self.last_10_bmrs)
+                print(
+                    f"{RS} {'Last 10 avg:':<16} CPL {last_10_avg_c:.3f}",
+                    f"BMR {last_10_avg_b:.3f}"
+                )
+
             if self.n_saved >= 2:
                 cpl_mean = self.tcpl/self.n_saved
                 tmbr_mean = self.tbmr/self.n_saved 

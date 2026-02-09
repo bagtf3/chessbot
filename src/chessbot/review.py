@@ -1582,7 +1582,7 @@ class RecordKeeper(object):
             f"avg_len={avg_moves:.1f} moves")
         print("-" * 72)
 
-        recent = self.recent_games[-500:]
+        recent = self.recent_games[-window:]
         if not recent:
             print("(no recent games to break down)")
             print("~" * 72)

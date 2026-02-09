@@ -393,6 +393,12 @@ class ChessGame(object):
         self.meta = meta
         
         self.vs_stockfish = meta['vs_stockfish']
+
+        # if vs stockfish, we need to maintain a python-chess boardas well
+        self.python_chess_board = None
+        if self.vs_stockfish:
+            self.python_chess_board = chess.Board(self.board.fen())
+        
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
         self.tree = MCTSTree(self.board, self.config)
@@ -432,6 +438,11 @@ class ChessGame(object):
 
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
+
+        # keep python chess board sync'd too
+        if self.python_chess_board is not None:
+            self.python_chess_board.push(chess.Move.from_uci(mv))
+                                             
         self.tree.reset_for_new_move()
         self.moves_played.append(mv)
         self.plies += 1
@@ -523,7 +534,7 @@ class ChessGame(object):
 
         # get SF move + signed eval (white POV)
         res_tup = cbu.sf_eval(
-            self.board, score_fn=score_to_value_stm_pov,
+            self.python_chess_board, score_fn=score_to_value_stm_pov,
             depth=self.config.sf_depth, engine=eng
         )
 

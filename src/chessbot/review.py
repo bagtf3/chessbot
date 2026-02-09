@@ -1531,7 +1531,7 @@ class RecordKeeper(object):
             "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
             "s_priorless", "s_puct", "preds_per_second",
             # priors cache (per-worker) telemetry, aggregate across workers
-            "cache_fill", "cache_cap", "queries", "hits",
+            "cache_size", "cache_capacity", "cache_queries", "cache_hits"
         ]
 
         summed = defaultdict(float)
@@ -1649,32 +1649,14 @@ class RecordKeeper(object):
         left5 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
         right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
-        # priors-cache info (aggregated across workers)
-        cache_fill = summed.get("cache_fill", 0)
-        cache_cap = summed.get("cache_cap", 0)
-        cache_queries = summed.get("queries", 0)
-        cache_hits = summed.get("hits", 0)
-
-        cache_fill_pct = 100.0 * cache_fill / max(1.0, cache_cap)
-        hit_rate = cache_hits / max(1.0, cache_queries)
-
-        left6 = (
-            f"[cache info] fill={cache_fill:.0f}/{cache_cap:.0f} "
-            f"({cache_fill_pct:.1f}%)"
-        )
-        right6 = (
-            f"hit_rate={100.0 * hit_rate:.1f}% "
-            f"(hits={cache_hits:.0f} q={cache_queries:.0f})"
-        )
-
         sims = self.sims_done_total
         moves = self.total_plies
         sims_per_move = sims / moves if moves > 0 else 0.0
 
         n_active = summed['n_active']
         avg_ply = avged['avg_ply']
-        left7 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
-        right7 = f"sims per move={sims_per_move:.2f}"
+        left6 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
+        right6 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
@@ -1683,7 +1665,6 @@ class RecordKeeper(object):
         print(f"{left4:<{col_width}} | {right4}")
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")
-        print(f"{left7:<{col_width}} | {right7}")
 
         # show game duration if its available
         last50 = self.recent_games[-50:]

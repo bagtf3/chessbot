@@ -410,6 +410,10 @@ class ChessGame(object):
         self.outcome = None
         self.plies = 0
         self.sf_eval = None
+        
+        self.sf_pending = False
+        self.sf_ready = False
+        self.sf_res_tup = None
 
         # eval collar and eval draw to shorten selfplay games
         self.collar_stop_set = False
@@ -545,6 +549,23 @@ class ChessGame(object):
             self.sf_search_depth.append(searched)
 
         self.sf_eval = sf_v
+        return self.push_move(best_move)
+    
+    def set_stockfish_result(self, res_tup):
+        self.sf_res_tup = res_tup
+        self.sf_ready = True
+
+    def apply_stockfish_result(self, res_tup):
+        if len(res_tup) == 2:
+            sf_v, best_move = res_tup
+        else:
+            sf_v, best_move, searched = res_tup
+            self.sf_search_depth.append(searched)
+
+        self.sf_eval = sf_v
+        self.sf_res_tup = None
+        self.sf_ready = False
+        self.sf_pending = False
         return self.push_move(best_move)
 
     def make_move_from_tree(self):

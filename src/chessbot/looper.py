@@ -3,7 +3,13 @@ import pathlib, json
 import time, gc
 import sys, subprocess
 
-from queue import Empty
+import threading
+from queue import Queue, Empty
+
+import chess
+import chess.engine
+
+from chessbot.review import score_to_value_stm_pov
 
 _now = time.time
 
@@ -11,17 +17,14 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-import chess
-
-from pyfastchess import (
-    raw_cache_bulk_insert, raw_cache_clear, priors_cache_clear, priors_cache_stats)
+from pyfastchess import raw_cache_bulk_insert, priors_cache_clear, priors_cache_stats
 
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
-from chessbot.utils import RateMeter, GameGenerator
+from chessbot.utils import RateMeter, GameGenerator, sf_eval
 
 
 class GameLooper(object):
@@ -48,10 +51,10 @@ class GameLooper(object):
         
         self.model = model
 
-        self.eng = None
+        self.sf_thread = None
         if cfg.play_vs_sf_prob > 0.0:
-            self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-            self.eng.configure(cfg.sf_config)
+            self.sf_thread = StockfishThread(cfg.sf_config, cfg.sf_depth)
+            self.sf_thread.start()
         
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()
@@ -68,9 +71,9 @@ class GameLooper(object):
         self.sf_search_depths = []
     
     def close(self):
-        if self.eng is not None:
-            self.eng.quit()
-            self.eng = None
+        if self.sf_thread is not None:
+            self.sf_thread.close()
+            self.sf_thread = None
 
     def __enter__(self):
         return self
@@ -142,7 +145,6 @@ class GameLooper(object):
         tf.keras.backend.clear_session()
         gc.collect()
 
-        raw_cache_clear()
         priors_cache_clear()
 
         if self.unpause_queued:
@@ -222,63 +224,100 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        eng = self.eng
         mbs = cfg.micro_batch
         max_fastpath = max(200, int(2.5 * mbs))
         lpb, counts = [], []
         mps, lps = self.mps, self.lps
+        finished_ids = set()
         while self.games_finished < cfg.n_games:
             # check a few stopping conditions 
             if stop_event is not None:
                 if stop_event.is_set():
                     return
             
+            # remove any finished games
+            if finished_ids:
+                self.active_games = [
+                    g for g in self.active_games if g.game_id not in finished_ids
+                ]
+            
+            # add in more games if needed
+            self.fill_active_games()
+
             if not self.active_games:
                 break
             
             if self.check_for_pause():
                 self.pause_wait_and_reload()
 
+            # drain sf thread queue
+            if self.sf_thread is not None:
+                sf_results = self.sf_thread.drain()
+                if sf_results:
+                    game_lookup = {
+                        g.game_id: g
+                        for g in self.active_games
+                        if g.sf_pending
+                    }
+
+                    for tup in sf_results:
+                        if tup[0] == "__error__":
+                            raise tup[1]
+
+                        game_id, res_tup = tup
+                        g = game_lookup.get(game_id)
+
+                        if g is None:
+                            continue
+
+                        g.set_stockfish_result(res_tup)
+            
             # selfplay loop starts here
             preds_batch = []
             finished = []
             for game in self.active_games[:cfg.games_at_once]:
+                # catch any stragglers here
+                game.tree.resolve_pending()
+
+                sf_terminal, mcts_terminal = False, False
                 if game.tree.needs_root_noise(check_sims=True):
                     game.tree.add_root_dirichlet_noise()
 
-                # if its stockfish turn, let SF move and skip MCTS this ply
+                # if its stockfish turn, check if the move is ready
+                # otherwise do not block and move on
                 if game.is_stockfish_turn():
-                    if game.tree.sims_completed_this_move > cfg.sf_move_sims:
-                        sf_terminal = game.make_move_with_stockfish(eng)
-                        mps.tick(1)
-                            
-                        if sf_terminal:
-                            self.finalize_game_data(game)
-                            finished.append(game.game_id)
-                            # pass until the next turn
-                            continue
-    
+                    if not game.sf_pending:
+                        # submit move to sf queue here
+                        self.sf_thread.submit(game.game_id, game.python_chess_board)
+                        game.sf_pending = True
+                    
+                    if game.tree.sims_completed_this_move >= cfg.sf_move_sims:
+                        if game.sf_pending and game.sf_ready:
+                            # sets pending, ready, res_tup to False, False, None
+                            sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
+                            mps.tick(1)
+                
                 # if this game has reached its local sim budget, make the move
                 elif game.tree.stop_simulating():
                     # xerces plays from tree
                     mcts_terminal = game.make_move_from_tree()
                     mps.tick(1)
-                    
-                    # terminal after xerces move?
-                    if mcts_terminal:
-                        self.finalize_game_data(game)
-                        finished.append(game.game_id)
-                        continue
+
+                # terminal check. do not sim on a finished game
+                if sf_terminal or mcts_terminal:
+                    self.finalize_game_data(game)
+                    finished.append(game.game_id)
+                    continue
+                
+                # last chance to catch stragglers
+                game.tree.resolve_pending()
 
                 # collect up to micro_batch leaves for this game
                 # CollectResults object from C++
                 res = game.tree.collect_many_leaves(mbs, max_fastpath)
                 
-                nn = res.count_new
-                nt = res.count_terminal
-                nc = res.count_cached
-                pl = res.total_priorless
-                pu = res.total_puct
+                nn, nt, nc = res.count_new, res.count_terminal, res.count_cached
+                pl, pu = res.total_priorless, res.total_puct
 
                 # new + cached + terminal
                 n_leafs = nn + nc + nt 
@@ -311,14 +350,9 @@ class GameLooper(object):
             for game in self.active_games:
                 game.tree.resolve_pending()
 
-            # remove any finished games
-            self.active_games = [
-                g for g in self.active_games if g.game_id not in finished
-            ]
+            if finished:
+                finished_ids.update(finished)
             
-            # add in more games if needed
-            self.fill_active_games()
-        
         self.maybe_push_telemetry(counts, lpb, force=True)
         return 0
 
@@ -559,3 +593,72 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
         looper.n_retrains = n_retrains
 
     return looper
+
+
+class StockfishThread(object):
+    def __init__(self, sf_config, depth):
+        self.sf_loc = SF_LOC
+        self.sf_config = sf_config
+        self.depth = depth
+
+        self.req_q = Queue()
+        self.res_q = Queue()
+        self.stop_ev = threading.Event()
+        self.t = None
+
+        self.eng = None
+        self.err = None
+
+    def start(self):
+        if self.t is not None:
+            return
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def close(self):
+        self.stop_ev.set()
+        if self.t is not None:
+            self.t.join()
+        if self.eng is not None:
+            self.eng.quit()
+        self.t = None
+        self.eng = None
+
+        if self.err is not None:
+            raise self.err
+
+    def submit(self, game_id, board):
+        b = board.copy(stack=True)
+        self.req_q.put((game_id, b))
+
+    def drain(self, max_items=9999):
+        out = []
+        for _ in range(max_items):
+            try:
+                out.append(self.res_q.get_nowait())
+            except Empty:
+                break
+        return out
+
+    def run(self):
+        self.eng = chess.engine.SimpleEngine.popen_uci(self.sf_loc)
+        self.eng.configure(self.sf_config)
+
+        while not self.stop_ev.is_set():
+            try:
+                game_id, board = self.req_q.get(timeout=0.05)
+            except Empty:
+                continue
+
+            try:
+                res_tup = sf_eval(
+                    board, score_fn=score_to_value_stm_pov,
+                    depth=self.depth, engine=self.eng
+                )
+
+                self.res_q.put((game_id, res_tup))
+            except Exception as e:
+                self.err = e
+                self.res_q.put(("__error__", e))
+                self.stop_ev.set()
+                return

@@ -69,6 +69,7 @@ class GameLooper(object):
         self._last_stats_log = _now()
         self.prediction_times = []
         self.sf_search_depths = []
+        self.run_loop_times = []
     
     def close(self):
         if self.sf_thread is not None:
@@ -230,6 +231,7 @@ class GameLooper(object):
         mps, lps = self.mps, self.lps
         finished_ids = set()
         while self.games_finished < cfg.n_games:
+            run_start = _now()
             # check a few stopping conditions 
             if stop_event is not None:
                 if stop_event.is_set():
@@ -276,9 +278,6 @@ class GameLooper(object):
             preds_batch = []
             finished = []
             for game in self.active_games[:cfg.games_at_once]:
-                # catch any stragglers here
-                game.tree.resolve_pending()
-
                 sf_terminal, mcts_terminal = False, False
                 if game.tree.needs_root_noise(check_sims=True):
                     game.tree.add_root_dirichlet_noise()
@@ -296,6 +295,8 @@ class GameLooper(object):
                             # sets pending, ready, res_tup to False, False, None
                             sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
                             mps.tick(1)
+                        else:
+                            continue
                 
                 # if this game has reached its local sim budget, make the move
                 elif game.tree.stop_simulating():
@@ -308,9 +309,9 @@ class GameLooper(object):
                     self.finalize_game_data(game)
                     finished.append(game.game_id)
                     continue
-                
-                # last chance to catch stragglers
-                game.tree.resolve_pending()
+
+                # catch any stragglers here
+                #game.tree.resolve_pending()
 
                 # collect up to micro_batch leaves for this game
                 # CollectResults object from C++
@@ -345,6 +346,15 @@ class GameLooper(object):
                 self.prediction_times.clear()
                 counts.clear()
                 lpb.clear()
+                # TEMP
+                rlt = self.run_loop_times
+                if rlt:
+                    rltavg = np.mean(rlt)
+                    n_games = len(self.active_games[:cfg.games_at_once])
+                    pg = rltavg/n_games
+                    print(f"[loop timer {self.id}] n={len(rlt)}, avg={rltavg:.4f}, per game={pg:.5f}")
+                self.run_loop_times.clear()
+                # END TEMP
             
             # resolve fresh predictions back into each game tree
             for game in self.active_games:
@@ -352,6 +362,7 @@ class GameLooper(object):
 
             if finished:
                 finished_ids.update(finished)
+            self.run_loop_times.append(_now() - run_start)
             
         self.maybe_push_telemetry(counts, lpb, force=True)
         return 0
@@ -437,9 +448,8 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
-        
-        sims_total = game.tree.sims_done_total 
-        moves = game.tree.n_moves_played
+
+        sims_total = game.tree.sims_done_total
 
         # read adjudicator flags (direct attrs; they always exist)
         mat = self.config.use_material_diff
@@ -466,7 +476,8 @@ class GameLooper(object):
             "adjudication_index": adjudication_index,
             # this is the specific c_puct and dirichlet eps, not the list of options
             "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps
+            "dirichlet_eps": game.tree.dirichlet_eps,
+            "cooldown_threshold": game.tree.cooldown_thresh()
         }
 
         # on-disk record (full)
@@ -484,6 +495,8 @@ class GameLooper(object):
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
         res["dirichlet_eps"] = game.tree.dirichlet_eps
+        res["cooldown_threshold"] = game.tree.cooldown_thresh()
+        
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
@@ -646,7 +659,7 @@ class StockfishThread(object):
 
         while not self.stop_ev.is_set():
             try:
-                game_id, board = self.req_q.get(timeout=0.05)
+                game_id, board = self.req_q.get(timeout=0.01)
             except Empty:
                 continue
 

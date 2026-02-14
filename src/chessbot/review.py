@@ -1494,7 +1494,6 @@ class RecordKeeper(object):
         self.telemetry = {}
 
     def ingest_recents(self, recent):
-        looper_id = recent['looper_id']
         meta = recent['meta']
 
         self.games_finished += 1
@@ -1530,6 +1529,10 @@ class RecordKeeper(object):
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
             "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
             "s_priorless", "s_puct", "preds_per_second",
+
+            "s_must_visit", "s_with_priors",
+            "s_skipped", "s_pruned", "s_penalty",
+
             # priors cache (per-worker) telemetry, aggregate across workers
             "cache_size", "cache_capacity", "cache_queries", "cache_hits"
         ]
@@ -1537,12 +1540,15 @@ class RecordKeeper(object):
         summed = defaultdict(float)
         sum_seen = set()
 
-        to_avg = ["mbs", "fwd_target", "apl", "pred_wait", "avg_ply"]
+        to_avg = ["mbs", "batch_target", "apl", "pred_wait", "avg_ply"]
         avged = defaultdict(list)
         avg_seen = set()
 
+        # special weighted avg: priorless_parentN_avg weighted by s_priorless
+        pl_wsum = 0.0
+        pl_w = 0.0
+
         for looper_id, info in self.telemetry.items():
-            # if telemetry is timed out, skip it
             if info.get("ts", 0) < time_delta:
                 continue
 
@@ -1554,8 +1560,20 @@ class RecordKeeper(object):
                 avged[k].append(info.get(k, 0))
                 avg_seen.add(k)
 
+            w = info.get("s_priorless", 0)
+            v = info.get("s_priorless_parentN_avg", 0.0)
+            if w > 0:
+                pl_wsum += v * w
+                pl_w += w
+
         summed_out = {k: summed[k] for k in sorted(sum_seen)}
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
+
+        if pl_w > 0:
+            summed_out["s_priorless_parentN_avg"] = pl_wsum / pl_w
+        else:
+            summed_out["s_priorless_parentN_avg"] = 0.0
+
         return summed_out, avg_out
 
     def maybe_log_results(self, window=1500, force=False):
@@ -1603,14 +1621,22 @@ class RecordKeeper(object):
         n_groups = summed.get("n_groups", 0)
         if n_groups == 0:
             return
-        
-        s_collected     = summed.get("s_collected", 0)
-        s_terminals     = summed.get("s_terminals", 0)
-        s_cached        = summed.get("s_cached", 0)
-        s_fast_stops    = summed.get("s_fast_stops", 0)
+
+        s_collected = summed.get("s_collected", 0)
+        s_terminals = summed.get("s_terminals", 0)
+        s_cached = summed.get("s_cached", 0)
+        s_fast_stops = summed.get("s_fast_stops", 0)
         s_collect_stops = summed.get("s_collect_stops", 0)
-        s_priorless     = summed.get("s_priorless", 0)
-        s_puct          = summed.get("s_puct", 0)
+        s_priorless = summed.get("s_priorless", 0)
+        s_puct = summed.get("s_puct", 0)
+
+        s_must_visit = summed.get("s_must_visit", 0)
+        s_with_priors = summed.get("s_with_priors", 0)
+        s_priorless_parentN_avg = summed.get("s_priorless_parentN_avg", 0.0)
+
+        s_skipped = summed.get("s_skipped", 0)
+        s_pruned = summed.get("s_pruned", 0)
+        s_penalty = summed.get("s_penalty", 0)
 
         avg_new = s_collected / n_groups
 
@@ -1621,42 +1647,48 @@ class RecordKeeper(object):
         f_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
         collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
 
-        mbs = avged['mbs']
-        print("-"*72)
+        mbs = avged["mbs"]
+        print("-" * 72)
         left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.0f}"
         right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
 
         left2 = f"[stop stats] fastpath_breaks={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
         right2 = f"collect_breaks={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
 
-        # preds / active / finished runtime pre-compute
-        apl = avged['apl']
-        fwd_target = avged['fwd_target']
-        fill_pct = 100.0 * apl / max(1.0, fwd_target)
+        apl = avged["apl"]
+        batch_target = avged["batch_target"]
+        fill_pct = 100.0 * apl / max(1.0, batch_target)
 
-        pred_wait = avged['pred_wait']
-        preds_per_sec = summed['preds_per_second']
+        pred_wait = avged["pred_wait"]
+        preds_per_sec = summed["preds_per_second"]
 
-        left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
+        left3 = f"[pred stats] fill={apl:.1f}/{batch_target} ({fill_pct:.1f}%)"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
 
-        with_priors = total_overall - s_priorless
-        puct_avg = s_puct / with_priors if with_priors else 0.0
+        with_priors_overall = total_overall - s_priorless
+        puct_avg = s_puct / with_priors_overall if with_priors_overall else 0.0
         priorless_pct = 100.0 * s_priorless / max(1, total_overall)
         left4 = f"[leaf stats] priorless={s_priorless:.0f} ({priorless_pct:.2f}%)"
         right4 = f"puct={s_puct:.0f}  puct/leaf={puct_avg:.1f}"
 
-        left5 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+        left5 = f"[priorless N] avg_parentN={s_priorless_parentN_avg:.1f}"
+        right5 = f"must_visit={s_must_visit:.0f}  penalty={s_penalty:.0f}"
+
+        left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
+        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
         sims = self.sims_done_total
         moves = self.total_plies
         sims_per_move = sims / moves if moves > 0 else 0.0
 
-        n_active = summed['n_active']
-        avg_ply = avged['avg_ply']
-        left6 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
-        right6 = f"sims per move={sims_per_move:.2f}"
+        n_active = summed["n_active"]
+        avg_ply = avged["avg_ply"]
+        left7 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
+        right7 = f"sims per move={sims_per_move:.2f}"
+
+        pruned_per_leaf = s_pruned / max(1, total_overall)
+        left8 = f"[leafs stats] skipped={s_skipped:.0f}  pruned={s_pruned:.0f}"
+        right8 = f"pruned/leaf={pruned_per_leaf:.3f}  with_priors={s_with_priors:.0f}"
 
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
@@ -1665,8 +1697,9 @@ class RecordKeeper(object):
         print(f"{left4:<{col_width}} | {right4}")
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")
+        print(f"{left7:<{col_width}} | {right7}")
+        print(f"{left8:<{col_width}} | {right8}")
 
-        # show game duration if its available
         last50 = self.recent_games[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
         avg_runtime = None
@@ -1674,4 +1707,4 @@ class RecordKeeper(object):
             avg_runtime = format_time(np.mean(durations))
             if avg_runtime:
                 print(f"[game stats] last 50 runtime: {avg_runtime}")
-        print("-"*72)
+        print("-" * 72)

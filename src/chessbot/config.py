@@ -40,7 +40,8 @@ class Config(object):
     n_games = 128
     games_at_once = 128
     micro_batch = 4
-    fwd_batch = 512
+    min_batch = 4
+    max_batch = 512
 
     sample_adjudicators = True
     
@@ -66,6 +67,10 @@ class Config(object):
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
     sf_exclude = ["piece_training"]
+
+    # TF thread worker
+    max_tf_inflight = 2
+    max_triggerless_loops = 2
 
     # overrides for the post hoc worker
     post_hoc_blunder_cp = 150

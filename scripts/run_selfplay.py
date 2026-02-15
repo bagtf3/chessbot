@@ -73,7 +73,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         c.id = f"w{i}"
 
         if not cfg.is_validation_run:
-            if i > 0:
+            if i > 1:
                 c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()

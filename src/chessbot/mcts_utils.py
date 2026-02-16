@@ -276,6 +276,7 @@ class MCTSTree(fasttree):
         # if here, determine visit delta and test for early stop
         self._es_last_checked_at = sims_done
         rows = self.root_child_visits()
+        
         visits = [v[1] for v in rows]
         visit_delta = visits[0]-visits[1]
 

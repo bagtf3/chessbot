@@ -1544,11 +1544,7 @@ class RecordKeeper(object):
         avged = defaultdict(list)
         avg_seen = set()
 
-        # special weighted avg: priorless_parentN_avg weighted by s_priorless
-        pl_wsum = 0.0
-        pl_w = 0.0
-
-        for looper_id, info in self.telemetry.items():
+        for _, info in self.telemetry.items():
             if info.get("ts", 0) < time_delta:
                 continue
 
@@ -1560,19 +1556,8 @@ class RecordKeeper(object):
                 avged[k].append(info.get(k, 0))
                 avg_seen.add(k)
 
-            w = info.get("s_priorless", 0)
-            v = info.get("s_priorless_parentN_avg", 0.0)
-            if w > 0:
-                pl_wsum += v * w
-                pl_w += w
-
         summed_out = {k: summed[k] for k in sorted(sum_seen)}
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
-
-        if pl_w > 0:
-            summed_out["s_priorless_parentN_avg"] = pl_wsum / pl_w
-        else:
-            summed_out["s_priorless_parentN_avg"] = 0.0
 
         return summed_out, avg_out
 
@@ -1635,7 +1620,6 @@ class RecordKeeper(object):
 
         s_skipped = summed.get("s_skipped", 0)
         s_pruned = summed.get("s_pruned", 0)
-        s_penalty = summed.get("s_penalty", 0)
 
         avg_new = s_collected / n_groups
 
@@ -1663,21 +1647,22 @@ class RecordKeeper(object):
 
         left3 = f"[pred stats] fill={apl:.1f}/{batch_target:.1f} ({fill_pct:.1f}%)"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
-        
-        left4 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right4 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
+        tot = s_priorless + s_with_priors + s_must_visit
+        wo_priors = 100.0 * s_priorless / tot if tot > 0.0 else 0.0
         puct_per_leaf = s_puct / total_overall if total_overall else 0.0
-        wo_priors = 100.0 * s_priorless / total_overall if total_overall > 0.0 else 0.0
-        left5 = f"[puct stats] priorless={s_priorless:.0f} ({wo_priors:.2f}%)"
-        right5 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
+        left4 = f"[puct stats] priorless={s_priorless:.0f} ({wo_priors:.3f}%)"
+        right4 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
 
         tot_skip = s_skipped + s_pruned
         avoided_r = tot_skip / s_puct if s_puct else 0.0
-        prune_to_skip = s_pruned / s_skipped if s_skipped else 0.0
+        skip_to_prune = s_skipped / s_pruned if s_pruned else 0.0
         avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
-        left6 = f"[puct stats] avoidance={avoided_r:.3f} p/s={prune_to_skip:.3f}"
-        right6 = f"must_visit={s_must_visit:.0f}  avoid/leaf={avoid_per_leaf:.1f}"
+        left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.2f}"
+        right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
+
+        left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
+        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
         sims = self.sims_done_total
         moves = self.total_plies
@@ -1685,7 +1670,7 @@ class RecordKeeper(object):
 
         n_active = summed["n_active"]
         avg_ply = avged["avg_ply"]
-        left7 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
+        left7 = f"[game stats] n={n_active:.0f}  avg ply={avg_ply:.2f}"
         right7 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40

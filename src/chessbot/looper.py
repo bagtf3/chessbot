@@ -405,7 +405,6 @@ class GameLooper(object):
 
         mv = res.total_must_visit
         wp = res.total_with_priors
-        plpn = res.total_priorless_parentN
 
         sk = res.total_skipped
         pr = res.total_pruned
@@ -422,7 +421,7 @@ class GameLooper(object):
         counts.append([
             nn, fastpaths, nt, nc, f_stop, c_stop,
             pl, pu,
-            mv, wp, plpn,
+            mv, wp,
             sk, pr, pen
         ])
         return nn, n_leafs
@@ -599,15 +598,9 @@ class GameLooper(object):
         s_must_visit = sum([r[8] for r in counts])
         s_with_priors = sum([r[9] for r in counts])
 
-        priorless_parentN_sum = sum([r[10] for r in counts])
-        if s_priorless > 0:
-            s_priorless_parentN_avg = priorless_parentN_sum / s_priorless
-        else:
-            s_priorless_parentN_avg = 0.0
-
-        s_skipped = sum([r[11] for r in counts])
-        s_pruned = sum([r[12] for r in counts])
-        s_penalty = sum([r[13] for r in counts])
+        s_skipped = sum([r[10] for r in counts])
+        s_pruned = sum([r[11] for r in counts])
+        s_penalty = sum([r[12] for r in counts])
 
         telemetry = {
             "ts": now,
@@ -634,7 +627,6 @@ class GameLooper(object):
 
             "s_must_visit": s_must_visit,
             "s_with_priors": s_with_priors,
-            "s_priorless_parentN_avg": s_priorless_parentN_avg,
 
             "s_skipped": s_skipped,
             "s_pruned": s_pruned,

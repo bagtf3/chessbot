@@ -288,7 +288,7 @@ class GameLooper(object):
 
             # dynamic batcher target            
             n_at_once = min(cfg.games_at_once, len(self.active_games))
-            target = max(1, (n_at_once * mbs))
+            target = max(1, (n_at_once * 2))
 
             cands = self.batch_candidates
             if target <= cands[0]:
@@ -343,29 +343,35 @@ class GameLooper(object):
                     continue
                 
                 # check to see if anything needs to be resolved (safely)
-                with self.tf_thread.preds_lock:
-                    target = self.tf_thread.last_preds_cached
+                #with self.tf_thread.preds_lock:
+                #    target = self.tf_thread.last_preds_cached
                 
-                if game.tf_last_resolved < target:
-                    game.tree.resolve_inflight()
-                    game.tf_last_resolved = target
+                #if game.tf_last_resolved < target:
+                #    game.tree.resolve_inflight()
+                #    game.tf_last_resolved = target
                 
                 # collect up to micro_batch leaves for this game
                 # CollectResults object from C++
-                res = game.tree.collect_many_leaves(mbs, max_fastpath)
-                nn, n_leafs = self.process_results(res, counts, mbs)
+                game.tree.resolve_inflight()
+                n_unresolved = game.tree.count_unresolved()
+                this_mbs = max(0, mbs - n_unresolved)
+                if this_mbs:
+                    res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
+                    nn, n_leafs = self.process_results(res, counts, this_mbs)
 
-                # update sim count
-                game.tree.sims_completed_this_move += n_leafs
-
+                    # update sim count
+                    game.tree.sims_completed_this_move += n_leafs
+                else:
+                    res, nn = None, None
+                
                 # send inputs to batch, maybe to GPU
-                submit_preds = passes_since_trigger >= cfg.max_triggerless_loops
                 if nn:
                     micro_batch = game.tree.pending_encoded_64_tokens()
                     batcher.submit(micro_batch)
                     if len(batcher) >= batcher_target:
                         submit_preds = True
                 
+                submit_preds = passes_since_trigger >= cfg.max_triggerless_loops
                 # must have leaves available to submit
                 if submit_preds and len(batcher):
                     this_batch = batcher.pop_batch()
@@ -375,7 +381,7 @@ class GameLooper(object):
                         triggered_this_pass = True
                         passes_since_trigger = 0
                         pred_fill.append((len(this_batch[0]), batcher_target))
-            
+
             if not triggered_this_pass:
                 passes_since_trigger += 1
 

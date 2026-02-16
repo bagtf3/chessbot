@@ -71,7 +71,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-
+        
         if not cfg.is_validation_run:
             if i > 1:
                 c.play_vs_sf_prob = 0.0

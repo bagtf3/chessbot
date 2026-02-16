@@ -1632,7 +1632,6 @@ class RecordKeeper(object):
 
         s_must_visit = summed.get("s_must_visit", 0)
         s_with_priors = summed.get("s_with_priors", 0)
-        s_priorless_parentN_avg = summed.get("s_priorless_parentN_avg", 0.0)
 
         s_skipped = summed.get("s_skipped", 0)
         s_pruned = summed.get("s_pruned", 0)
@@ -1662,20 +1661,23 @@ class RecordKeeper(object):
         pred_wait = avged["pred_wait"]
         preds_per_sec = summed["preds_per_second"]
 
-        left3 = f"[pred stats] fill={apl:.1f}/{batch_target} ({fill_pct:.1f}%)"
+        left3 = f"[pred stats] fill={apl:.1f}/{batch_target:.1f} ({fill_pct:.1f}%)"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
+        
+        left4 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
+        right4 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
-        with_priors_overall = total_overall - s_priorless
-        puct_avg = s_puct / with_priors_overall if with_priors_overall else 0.0
-        priorless_pct = 100.0 * s_priorless / max(1, total_overall)
-        left4 = f"[leaf stats] priorless={s_priorless:.0f} ({priorless_pct:.2f}%)"
-        right4 = f"puct={s_puct:.0f}  puct/leaf={puct_avg:.1f}"
+        puct_per_leaf = s_puct / total_overall if total_overall else 0.0
+        wo_priors = 100.0 * s_priorless / total_overall if total_overall > 0.0 else 0.0
+        left5 = f"[puct stats] priorless={s_priorless:.0f} ({wo_priors:.2f}%)"
+        right5 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
 
-        left5 = f"[priorless N] avg_parentN={s_priorless_parentN_avg:.1f}"
-        right5 = f"must_visit={s_must_visit:.0f}  penalty={s_penalty:.0f}"
-
-        left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+        tot_skip = s_skipped + s_pruned
+        avoided_r = tot_skip / s_puct if s_puct else 0.0
+        prune_to_skip = s_pruned / s_skipped if s_skipped else 0.0
+        avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
+        left6 = f"[puct stats] avoidance={avoided_r:.3f} p/s={prune_to_skip:.3f}"
+        right6 = f"must_visit={s_must_visit:.0f}  avoid/leaf={avoid_per_leaf:.1f}"
 
         sims = self.sims_done_total
         moves = self.total_plies
@@ -1686,10 +1688,6 @@ class RecordKeeper(object):
         left7 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
         right7 = f"sims per move={sims_per_move:.2f}"
 
-        pruned_per_leaf = s_pruned / max(1, total_overall)
-        left8 = f"[leafs stats] skipped={s_skipped:.0f}  pruned={s_pruned:.0f}"
-        right8 = f"pruned/leaf={pruned_per_leaf:.3f}  with_priors={s_with_priors:.0f}"
-
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
         print(f"{left2:<{col_width}} | {right2}")
@@ -1698,7 +1696,6 @@ class RecordKeeper(object):
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")
         print(f"{left7:<{col_width}} | {right7}")
-        print(f"{left8:<{col_width}} | {right8}")
 
         last50 = self.recent_games[-50:]
         durations = [g.get("duration", 0.0) for g in last50]

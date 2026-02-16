@@ -402,7 +402,7 @@ class ChessGame(object):
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
         self.tree = MCTSTree(self.board, self.config)
-        self.tree.set_cooldown_thresh(np.random.choice([0.0, 0.05, 0.10, 0.15, 0.2, 0.25, 0.5]))
+        self.tree.set_cooldown_thresh(np.random.choice([0.0, 0.1, 0.2, 0.5]))
         self.tree_data = {}
         self.moves_played = []
         self.recents = []

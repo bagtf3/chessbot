@@ -485,7 +485,8 @@ class ChessGame(object):
     
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
-        rcs, details = self.tree.robust_selection_criteria(5, 100)
+        rsc, details = self.tree.robust_selection_criteria(5, 100)
+        rsc = {} if not rsc else rsc
         if details is None:
             return
         
@@ -530,7 +531,7 @@ class ChessGame(object):
                 "visit_share": cd.visit_share, "last_visit": cd.last_visit,
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4),"Qdelta_sign": rnd(cd.Qdelta_sign, 4),
-                "is_terminal": cd.is_terminal, "rcs": rnd(rcs.get(cd.uci, 0.0), 4)
+                "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }
             
             candidate_moves.append(cm)

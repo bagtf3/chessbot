@@ -10,7 +10,7 @@ from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
 from chessbot.review import score_to_value_stm_pov
-from chessbot.utils import calc_entropy, rnd
+from chessbot.utils import rnd
 import chessbot.utils as cbu
 
 
@@ -82,12 +82,11 @@ class MCTSTree(fasttree):
         self._es_last_checked_at = 0
         self._es_tripped = False
         self.sim_stop_reason = ""
-        
-        self.sim_decision_model = None
-        if self.config.use_sim_decision_model:
-            self.sim_decision_model = tl2.Predictor(
-                self.config.sim_decision_model_path, nthread=1
-            )
+
+        # for early stop
+        self.most_visited = []
+        self.runner_up = []
+        self.visit_delta = []
 
     def best(self):
         """
@@ -156,10 +155,21 @@ class MCTSTree(fasttree):
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
+        # sims budget may have been adjusted with bonuses, so reset
+        self.set_sim_budget(float(self.sims_ceiling))
+
+        # if a ratio is used, update that
+        if self.config.target_delta < 1:
+            self.target_delta = np.floor(self.config.target_delta*self.sims_ceiling)
+        
         # check the sims schedule, update if applicapable
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
+        
+        self.most_visited.clear()
+        self.runner_up.clear()
+        self.visit_delta.clear()
 
     def set_new_sims_ceiling(self, n_plies=None):
         if n_plies is None:
@@ -197,135 +207,109 @@ class MCTSTree(fasttree):
         self.root_noise_added = True
 
     def get_sim_decision_probs(self):
-        if self.sim_decision_model is None:
-            return None
-        
-        vec = []
-        root = self.root()
-        deets = self.root_child_details()
-        rows = self.root_child_visits()
-
-        # n_cands, top share, visit_margin, visit norm
-        vec.append(len(root.legal_moves))
-        visits = [v[1] for v in rows]
-
-        # not sure how this happens, but return None
-        if len(visits) < 2:
-            print("len(visists) < 2 somehow")
-            return None
-        
-        vec.append(visits[0] / max(1.0, root.N))
-        vec.append(visits[0]-visits[1])
-
-        _, norm_vis = calc_entropy(visits)
-        vec.append(norm_vis)
-
-        # P norm,  Q norm, # U norm
-        c_puct = self.c_puct
-        S = root.N
-        Ps, Qs, Us = [], [], []
-        mult = 1 if root.board.side_to_move() == 'w' else -1
-        for c in deets:
-            Ps.append(c.prior)
-            Qs.append(mult * c.Q)
-            Us.append(c_puct * c.prior * (S ** 0.5) / (1 + c.N))
-
-        # prefer selected Q to be the best Q at stop
-        # i.e. do not stop unless the top move is best Q, independent of everything else
-        q_margin = Qs[0] - max(Qs)
-        if self.config.prefer_top_q:
-            if q_margin < 0:
-                return np.array([1.0, 0.0])
-
-        _, norm_p = calc_entropy(Ps)
-        _, norm_q = calc_entropy(Qs)
-        _, norm_u = calc_entropy(Us)
-
-        vec.append(norm_p)
-        vec.append(norm_q)
-        vec.append(norm_u)
-
-        # top_p, q_margin, q_delta
-        vec.append(Ps[0])
-        vec.append(Qs[0] - Qs[1])
-        vec.append(q_margin)
-
-        # is_middlegame, is endgame
-        vec.append(1*((self.n_plies < 20) and (self.piece_count > 12)))
-        vec.append(1*((self.n_plies > 60) or (self.piece_count < 12)))
-
-        dmat = tl2.DMatrix(np.array(vec, dtype=np.float32, ndmin=2))
-        probs = self.sim_decision_model.predict(dmat)
-        return probs.ravel()
+        # not implemented right now
+        return None
 
     def maybe_early_stop(self):
         if self._es_tripped:
             return True
-                    
+
+        cfg = self.config
         sims_done = self.sims_completed_this_move
-        if sims_done < self.config.sims_floor:
+
+        # check on absolute delta
+        sac = cfg.sims_absolute_ceiling
+        if sims_done >= sac:
+            self.sim_stop_reason = f"Sim ceiling {sac} reached"
+            self._es_tripped = True
+            return True 
+        
+         # everything else is gated
+        if sims_done - self._es_last_checked_at < cfg.es_check_every:
             return False
-
-        if sims_done >= self.sims_ceiling:
-            self.sim_stop_reason = f"Sim ceiling {self.sims_ceiling} reached"
-            return True
-
-        if sims_done - self._es_last_checked_at < self.config.es_check_every:
-            return False
-
-        # if here, determine visit delta and test for early stop
+        
+        # register this check
         self._es_last_checked_at = sims_done
-        rows = self.root_child_visits()
-        
-        visits = [v[1] for v in rows]
-        visit_delta = visits[0]-visits[1]
 
-        remaining = self.sims_ceiling - sims_done
-        stop_condition = min(remaining, self.target_delta)
-        if visit_delta >= stop_condition:
-            self.sim_stop_reason = f"Visit delta {visit_delta} >= {stop_condition}"
+        # start recording leader/runner up stats 3 checks ahead
+        if sims_done + 3.5*cfg.es_check_every > cfg.sims_floor:
+            details = self.root_child_details()
+            if not details or len(details) < 2:
+                return False
+
+            d0 = details[0]
+            d1 = details[1]
+
+            visits0 = d0.N
+            visits1 = d1.N
+            visit_delta = visits0 - visits1
+
+            self.most_visited.append(d0.uci)
+            self.runner_up.append(d1.uci)
+            self.visit_delta.append(visit_delta)
+
+        # if not at the floor, stop here
+        if sims_done < cfg.sims_floor:
+            return False
+        
+        # more precise check on absolute ceiling
+        curr_budget = self.sim_budget()
+        absolute_remaining = sac - sims_done
+        if visit_delta >= absolute_remaining:
+            self.sim_stop_reason = f"Visit Delta {visit_delta} Insurmountable"
+            self._es_tripped = True
             return True
 
-        return False
-        
-        # # if not using the dec model, just hit the target
-        # if not self.config.use_sim_decision_model:
-        #     return sims_done >= sims_target
+        # If min_delta is impossible even if #1 gets all remaining sims, extend now.
+        remaining = curr_budget - sims_done
+        if visit_delta + remaining < cfg.min_delta:
+            new_budget = min(sac, curr_budget + cfg.bonus_sim_increment)
 
-        # if sims_done < self.config.sims_floor:
-        #     return False
+            # safety check
+            if new_budget > curr_budget:
+                self.set_sim_budget(new_budget)
 
-        # if sims_done - self._es_last_checked_at < self.config.es_check_every:
-        #     return False
+            return False
 
-        # # if here, run ES check
-        # self._es_last_checked_at = sims_done
-        # probs = self.get_sim_decision_probs()
-        # if probs is None:
-        #     return False
+        stop_condition = min(remaining, self.target_delta)
 
-        # # best move prob
-        # bmp = np.ravel(probs)[-1]
-        # string = f"best move prob {bmp:.3f} sims_done {sims_done}"
-        # # need to be above the es (early stop) threshold to stop here
-        # if sims_done >= self.sims_ceiling:
-        #     self.sim_stop_reason = f"Sim Limit reached: {string}"
-        #     return True
+        # Not separated enough yet, keep simming.
+        if visit_delta < stop_condition or visit_delta < cfg.min_delta:
+            return False
 
-        # if sims_done < sims_target:
-        #     if bmp > self.config.es_best_move_threshold:
-        #         self._es_tripped = True
-        #         self.sim_stop_reason = f"ES triggered: {string}"
-        #         return True
+        # We hit low min_delta, now do sanity checks
+        vs0 = d0.visit_share
+        vs1 = d1.visit_share
+        ds0 = d0.Qdelta_sign
 
-        # if sims_done >= sims_target:
-        #     # need to be above the bs (bonus sims) threshold to stop here
-        #     if bmp > self.config.bs_best_move_threshold:
-        #         self.sim_stop_reason = f"Sufficient: {string}"
-        #         return True
-        
-        # otherwise keep searching
-        #return False
+        conf_ok = True
+        # visit share and delta sign checks
+        if vs0 < cfg.es_vs_floor or ds0 < cfg.es_dS_floor or vs1 > vs0:
+            conf_ok = False
+
+        if conf_ok and len(self.most_visited) >= 3:
+            # if leader is flipping
+            if len(set(self.most_visited[-3:])) > 1:
+                conf_ok = False
+
+            # runner up is catching
+            a, b, c = self.visit_delta[-3:]
+            delta_shrinking = (c < b) and (b < a)
+            if len(set(self.runner_up[-3:])) == 1 and delta_shrinking:
+                conf_ok = False
+
+        if not conf_ok:
+            # Looks weird, buy more sims.
+            curr_ceiling = self.sim_budget()
+            new_ceiling = min(sac, curr_ceiling + cfg.bonus_sim_increment)
+            if new_ceiling > curr_ceiling:
+                self.set_sim_budget(new_ceiling)
+            return False
+
+        # true early stop here
+        self.sim_stop_reason = f"Visit delta {visit_delta} >= {stop_condition}"
+        self._es_tripped = True
+        return True
 
     def stop_simulating(self):
         # do at least 1 sims to stabilize the tree
@@ -403,7 +387,6 @@ class ChessGame(object):
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
         self.tree = MCTSTree(self.board, self.config)
-        self.tree.set_cooldown_thresh(np.random.choice([0.0, 0.1, 0.2, 0.5]))
         self.tree_data = {}
         self.moves_played = []
         self.recents = []
@@ -513,8 +496,10 @@ class ChessGame(object):
             U = c_puct * cd.prior * (sumN ** 0.5) / (1 + cd.N)
             cm = {
                 "uci": cd.uci, "visits": cd.N,
-                "P": rnd(cd.prior, 4), "Q": rnd(cd.Q, 4), "U": rnd(U, 4),
-                "is_terminal": cd.is_terminal
+                "visit_share": cd.visit_share, "last_visit": cd.last_visit,
+                "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
+                "Qema": rnd(cd.Qema, 4),"Qdelta_sign": rnd(cd.Qdelta_sign, 4),
+                "is_terminal": cd.is_terminal, "visit_share": cd.visit_share
             }
             
             candidate_moves.append(cm)

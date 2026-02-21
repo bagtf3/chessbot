@@ -71,7 +71,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-        
+
         if not cfg.is_validation_run:
             if i > 1:
                 c.play_vs_sf_prob = 0.0
@@ -240,7 +240,9 @@ def launch_retrain(run_tag, working_cfg):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
-
+    
+    # wait a few seconds for everything to wind down
+    time.sleep(5.0)
     return launch_retrain_async(run_tag, rt_script, working_cfg)
 
 

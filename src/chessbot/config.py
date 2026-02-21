@@ -29,19 +29,23 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
+    sims_absolute_ceiling = 5000
+    bonus_sim_increment = 250
+
     target_delta = 200
+    min_delta = 200
 
     # early stop
-    es_check_every = 50
-    use_sim_decision_model = False
-    sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
+    es_check_every = 100
+    es_vs_floor = 0.3
+    es_dS_floor = -0.2
 
     # Game stuff
     n_games = 128
     games_at_once = 128
     micro_batch = 4
     min_batch = 4
-    max_batch = 512
+    fwd_batch = 256
 
     sample_adjudicators = True
     
@@ -67,10 +71,6 @@ class Config(object):
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
     sf_exclude = ["piece_training"]
-
-    # TF thread worker
-    max_tf_inflight = 2
-    max_triggerless_loops = 2
 
     # overrides for the post hoc worker
     post_hoc_blunder_cp = 150

@@ -81,7 +81,7 @@ class GameViewer:
             except Exception:
                 self.sf_rows = None
                 self._sf_by_ply = {}
-    
+
         self.reset()
 
     def reset(self):
@@ -317,21 +317,69 @@ class GameViewer:
                     f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
             print(line)
     
+    def print_header(self, show_rank=False):
+        cols = [
+            ("SAN", 7), ("N", 6), ("vs", 7),
+            ("|", 1),
+            ("Q", 7), ("Qe", 7), ("dS", 7),
+            ("|", 1),
+            ("P", 7), ("U", 7), ("PUCT", 8), ("flags", 9),
+        ]
+
+        if show_rank:
+            cols.append(("rank", 7))
+
+        hdr_body = " ".join([f"{n:^{w}}" for n, w in cols])
+        sep_body = " ".join(["-" * w if w > 1 else "|" for _, w in cols])
+
+        indent = "  "
+        hdr = indent + hdr_body
+        sep = indent + sep_body
+
+        full_width = len(hdr)
+
+        print(indent + "-" * (full_width - len(indent)))
+        print(hdr)
+        print(sep)
+
     def print_row(self, c, mark=False, show_rank=False, rank_val=None):
-        san = self.board.san(c.get("uci", ""))
-        marker = "  <- SF" if mark else ""
-        rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
-        Q = c.get('Q',0)
-        P = c.get('P',0)
-        U = c.get('U',0)
-        cPUCT = self.log.get('c_puct', 1.5)
-        Qrel = Q if self.board.side_to_move() == 'w' else -1*Q
-        PUCT = Qrel + cPUCT*U
-        print(
-            f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q: {Q:+.3f}  P: {P:.3f}  PUCT: {PUCT:+.3f}"
-            f"{marker}{rank_str}"
-        )
+        uci = c.get("uci", "")
+        san = self.board.san(uci) if uci else "?"
+
+        visits = c.get("visits", 0)
+        visit_share = c.get("visit_share", 0.0)
+
+        q = c.get("Q", 0.0)
+        qema = c.get("Qema", 0.0)
+        ds = c.get("Qdelta_sign", 0.0)
+
+        p = c.get("P", 0.0)
+        u = c.get("U", 0.0)
+
+        qrel = q if self.board.side_to_move() == "w" else -q
+        puct = qrel + u + 0.1*np.clip(ds, -0.25, 0.25)
+
+        flags = []
+        if mark:
+            flags.append("<-SF")
+        if c.get("is_terminal", False):
+            flags.append("T")
+        flags = ",".join(flags)
+
+        parts = [
+            f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
+            "|",
+            f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}",
+            "|",
+            f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
+            f"{flags:^9}",
+        ]
+
+        if show_rank:
+            r = rank_val if rank_val is not None else ""
+            parts.append(f"{r!s:<7}")
+
+        print("  " + " ".join(parts))
     
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
@@ -378,8 +426,8 @@ class GameViewer:
         kl = kl_divergence_bits(p_vis, p_pri)
 
         print(
-            f"  entropy (norm'd): visits={norm_vis:.3f} "
-            f"priors={norm_pri:.3f} KL(vis||pr)={kl:.3f} bits"
+            f"  entropy (norm'd): visits = {norm_vis:.3f} "
+            f" priors = {norm_pri:.3f}  KL(vis||pr) = {kl:.3f} bits"
         )
 
         cands_sorted = sorted(
@@ -395,13 +443,22 @@ class GameViewer:
                 break
 
         shown_ucis = set()
+
+        need_rank = False
+        if is_sf_turn and sf_idx is not None:
+            need_rank = (sf_idx >= top_n)
+
+        self.print_header(show_rank=need_rank)
         # top-N: never show ranks; just mark if SF move is in top-N
-        for i, c in enumerate(cands_sorted[:top_n]):
-            self.print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
+        for c in cands_sorted[:top_n]:
+            self.print_row(
+                c, mark=is_sf_turn and (c.get("uci") == chosen),
+                show_rank=need_rank, rank_val=None
+            )
             shown_ucis.add(c.get("uci"))
 
         # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
-        if is_sf_turn and sf_idx is not None:
+        if need_rank:
             if cands_sorted[sf_idx].get("uci") not in shown_ucis:
                 print("   ...")
                 self.print_row(
@@ -470,22 +527,24 @@ class GameViewer:
             return
 
         cands = node.get("candidate_moves") or []
-        scands = sorted(cands, key=lambda x: x['visits'], reverse=True)
-        move = {}
+        scands = sorted(cands, key=lambda x: x["visits"], reverse=True)
+
+        move = None
         rank = 0
         for c in scands:
             rank += 1
-            if uci_or_san in [c['uci'], self.board.san(c['uci'])]:
+            if uci_or_san in [c["uci"], self.board.san(c["uci"])]:
                 move = c
                 break
-        
-        if not move:
+
+        if move is None:
             print(f"No visit info available for {uci_or_san}")
             return
-        
+
         print(f"  === Showing visit info for {uci_or_san} ===")
-        self.print_row(move)
-        print(f"   Rank: {rank}\tShare: {100*move['visits']/node['sims']:.3f}%")
+        self.print_header(show_rank=True)
+        self.print_row(move, show_rank=True, rank_val=rank)
+        print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 
     def show_options(self):
         # concise CLI help for replay mode commands
@@ -1632,7 +1691,7 @@ class RecordKeeper(object):
 
         mbs = avged["mbs"]
         print("-" * 72)
-        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.0f}"
+        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.1f}"
         right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
 
         left2 = f"[stop stats] fastpath_breaks={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"

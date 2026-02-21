@@ -25,7 +25,7 @@ from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
 from chessbot.utils import RateMeter, GameGenerator, sf_eval
-from chessbot.tf_thread import Batcher, TensorFlowThread
+#from chessbot.tf_thread import Batcher, TensorFlowThread
 
 
 class GameLooper(object):
@@ -71,20 +71,20 @@ class GameLooper(object):
         self._last_stats_log = _now()
         self.prediction_times = []
 
-        self.batcher = Batcher(cfg, self.batch_candidates)
-        self.tf_thread = TensorFlowThread(
-            cfg, self.infer, max_inflight=cfg.max_tf_inflight)
+        # self.batcher = Batcher(cfg, self.batch_candidates)
+        # self.tf_thread = TensorFlowThread(
+        #     cfg, self.infer, max_inflight=cfg.max_tf_inflight)
         
-        self.tf_thread.start()
+        # self.tf_thread.start()
     
     def close(self):
         if self.sf_thread is not None:
             self.sf_thread.close()
             self.sf_thread = None
         
-        if self.tf_thread is not None:
-            self.tf_thread.close()
-            self.tf_thread = None
+        # if self.tf_thread is not None:
+        #     self.tf_thread.close()
+        #     self.tf_thread = None
 
     def __enter__(self):
         return self
@@ -110,7 +110,7 @@ class GameLooper(object):
         cfg = self.config
         self.model = load_model(cfg.model_path)
         self.infer = make_conv_infer(
-            self.model, max_bs=cfg.max_batch,
+            self.model, max_bs=cfg.fwd_batch,
             min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
             vscale=cfg.vscale)
     
@@ -147,11 +147,11 @@ class GameLooper(object):
 
         If "unpause" arrived early and was buffered, do not block.
         """
-        if self.tf_thread is not None:
-            self.tf_thread.pause(blocking=True)
-            with self.tf_thread.infer_lock:
-                self.tf_thread.infer = None
-
+        # if self.tf_thread is not None:
+        #     self.tf_thread.pause(blocking=True)
+        #     with self.tf_thread.infer_lock:
+        #         self.tf_thread.infer = None
+        
         del self.infer
         self.infer = None
 
@@ -180,23 +180,23 @@ class GameLooper(object):
 
         self.load_reload_model()
 
-        if self.tf_thread is not None:
-            with self.tf_thread.infer_lock:
-                self.tf_thread.infer = self.infer
-            self.tf_thread.unpause()
+        # if self.tf_thread is not None:
+        #     with self.tf_thread.infer_lock:
+        #         self.tf_thread.infer = self.infer
+        #     self.tf_thread.unpause()
 
         self.n_retrains += 1
 
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
-        batch_candidates = set([cfg.min_batch, cfg.max_batch])
+        batch_candidates = set([cfg.min_batch, cfg.fwd_batch])
         bs = cfg.min_batch
-        while bs <= cfg.max_batch:
+        while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)
             bs *= 2
         
         # split difference between last 2 if large
-        if len(batch_candidates) >= 2 and cfg.max_batch >= 128:
+        if len(batch_candidates) >= 2 and cfg.fwd_batch >= 128:
             sbc = sorted(batch_candidates)
             lo = sbc[-2]
             hi = sbc[-1]
@@ -244,15 +244,16 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        batcher = self.batcher
+        #batcher = self.batcher
         mbs = cfg.micro_batch
+        fwd = cfg.fwd_batch
         max_fastpath = max(256, int(2.5 * mbs))
-        mps, lps = self.mps, self.lps
+        mps = self.mps
 
         #(batch size, target), counts returned
         pred_fill, counts = [], []
         finished_ids = set()
-        passes_since_trigger = 0
+        #passes_since_trigger = 0
         while self.games_finished < cfg.n_games:
             # check a few stopping conditions 
             if stop_event is not None:
@@ -286,26 +287,24 @@ class GameLooper(object):
                         g = self.sf_games[game_id]
                         g.set_stockfish_result(res_tup)
 
-            # dynamic batcher target            
-            n_at_once = min(cfg.games_at_once, len(self.active_games))
-            target = max(1, (n_at_once * 2))
-
-            cands = self.batch_candidates
-            if target <= cands[0]:
-                batcher_target = cands[0]
-            elif target >= cands[-1]:
-                batcher_target = cands[-1]
-            else:
-                for c in cands:
-                    if c >= target:
-                        batcher_target = c
-                        break
+            # usually we will have perfectly filled batches, but some games
+            # may fill less than mbs, leaving room to pick extra leaves from other games
+            likely_fill = min(fwd, mbs * min(len(self.active_games), cfg.games_at_once))
+            batch_target = fwd
+            for candidate in self.batch_candidates:
+                if candidate >= likely_fill:
+                    batch_target = candidate
+                    break
             
-            # selfplay loop starts here
+            bonus = max(0, batch_target - likely_fill)
             finished = []
-            triggered_this_pass = False
+            preds_batch = []
+            # selfplay loop starts here
             for game in self.active_games[:cfg.games_at_once]:
                 sf_terminal, mcts_terminal = False, False
+                # first resolve any recent preds
+                game.tree.resolve_inflight()
+
                 if game.tree.needs_root_noise(check_sims=True):
                     game.tree.add_root_dirichlet_noise()
                 
@@ -326,6 +325,7 @@ class GameLooper(object):
                             sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
                             mps.tick(1)
                         else:
+                            bonus += mbs
                             continue
                 
                 # if this game has reached its local sim budget, make the move
@@ -340,50 +340,25 @@ class GameLooper(object):
                     finished.append(game.game_id)
                     if game.game_id in self.sf_games:
                         del self.sf_games[game.game_id]
+                    bonus += mbs
                     continue
-                
-                # check to see if anything needs to be resolved (safely)
-                #with self.tf_thread.preds_lock:
-                #    target = self.tf_thread.last_preds_cached
-                
-                #if game.tf_last_resolved < target:
-                #    game.tree.resolve_inflight()
-                #    game.tf_last_resolved = target
-                
-                # collect up to micro_batch leaves for this game
-                # CollectResults object from C++
-                game.tree.resolve_inflight()
-                n_unresolved = game.tree.count_unresolved()
-                this_mbs = max(0, mbs - n_unresolved)
-                if this_mbs:
-                    res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
-                    nn, n_leafs = self.process_results(res, counts, this_mbs)
 
-                    # update sim count
-                    game.tree.sims_completed_this_move += n_leafs
-                else:
-                    res, nn = None, None
+                # if bonus available we can bump our microbatch up to 2x
+                this_mbs = mbs + min(bonus, mbs) if bonus > 0 else mbs
+                res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
+                nn, n_leafs = self.process_results(res, counts, this_mbs)
                 
-                # send inputs to batch, maybe to GPU
+                # update bonus, could go up or down
+                bonus += mbs - nn
+                
+                # update sim count
+                game.tree.sims_completed_this_move += n_leafs
                 if nn:
-                    micro_batch = game.tree.pending_encoded_64_tokens()
-                    batcher.submit(micro_batch)
-                    if len(batcher) >= batcher_target:
-                        submit_preds = True
-                
-                submit_preds = passes_since_trigger >= cfg.max_triggerless_loops
-                # must have leaves available to submit
-                if submit_preds and len(batcher):
-                    this_batch = batcher.pop_batch()
-                    if this_batch is not None:
-                        # submit to TF worker (async)
-                        self.tf_thread.submit(this_batch)
-                        triggered_this_pass = True
-                        passes_since_trigger = 0
-                        pred_fill.append((len(this_batch[0]), batcher_target))
+                    preds_batch += game.tree.pending_encoded_64_tokens()
 
-            if not triggered_this_pass:
-                passes_since_trigger += 1
+            if preds_batch:
+                batch_target, batch_size = self.format_and_predict(preds_batch)
+                pred_fill.append((batch_size, batch_target))
 
             if self.maybe_push_telemetry(counts, pred_fill, force=False):
                 self.prediction_times.clear()
@@ -458,7 +433,7 @@ class GameLooper(object):
         # pad up to max_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
 
-        target_bs = self.config.max_batch
+        target_bs = self.config.fwd_batch
         B = boards_np.shape[0]
         if B < target_bs:
             # choose padding target safely
@@ -480,6 +455,7 @@ class GameLooper(object):
                 start = _now()
                 probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
+            new_target = target_bs
             start = _now()
             probs_np, vals_np = self.infer((boards_np, legals_np))
         
@@ -494,6 +470,7 @@ class GameLooper(object):
         raw_cache_bulk_insert(to_raw_cache)
         stop = _now()
         self.prediction_times.append(stop-start)
+        return new_target, B
 
     def finalize_game_data(self, game):
         """
@@ -535,8 +512,7 @@ class GameLooper(object):
             "adjudication_index": adjudication_index,
             # this is the specific c_puct and dirichlet eps, not the list of options
             "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps,
-            "cooldown_threshold": game.tree.cooldown_thresh()
+            "dirichlet_eps": game.tree.dirichlet_eps
         }
 
         # on-disk record (full)
@@ -554,7 +530,6 @@ class GameLooper(object):
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
         res["dirichlet_eps"] = game.tree.dirichlet_eps
-        res["cooldown_threshold"] = game.tree.cooldown_thresh()
 
         out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
@@ -636,10 +611,12 @@ class GameLooper(object):
         if self.active_games:
             telemetry["avg_ply"] = np.mean([g.plies for g in self.active_games])
 
-        if self.tf_thread:
-            tf_stats = self.tf_thread.stats()
-            telemetry["pred_wait"] = tf_stats["mean_pred_s"]
-            telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
+        # if self.tf_thread:
+        #     tf_stats = self.tf_thread.stats()
+        #     telemetry["pred_wait"] = tf_stats["mean_pred_s"]
+        #     telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
+        telemetry["pred_wait"] = np.mean(self.prediction_times)
+        telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
 
         pcs = priors_cache_stats()
         for k, v in pcs.items():

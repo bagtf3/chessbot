@@ -11,13 +11,15 @@ retrain_worker.py
 """
 
 import argparse
-import os
+import os, sys
 import time
-import pickle, yaml
-import sys
+import pickle
+import gc
 
 import numpy as np
 import pandas as pd
+
+import tensorflow as tf
 
 from chessbot.model import load_model
 from chessbot.config import Config
@@ -59,6 +61,13 @@ def load_shards(paths, tries=3, sleep_s=0.25):
         if not ok:
             print("[retrain] failed reading shard (skipped):", path)
 
+            if path.lower().endswith(".pkl"):
+                try:
+                    os.remove(path)
+                    print("[retrain] deleted bad shard:", path)
+                except Exception as e:
+                    print("[retrain] failed deleting bad shard:", path, e)
+
     return combined, loaded
 
 
@@ -74,12 +83,75 @@ def delete_files(paths):
     return removed
 
 
+def print_fit_history(history, epoch):
+    if history is None:
+        return
+
+    h = getattr(history, "history", None)
+    if not h:
+        return
+
+    rows = []
+    for m, v in h.items():
+        if not v:
+            continue
+
+        name = "total" if m == "loss" else m.replace("_loss", "")
+        start = v[0]
+        end = v[-1]
+        delta = start - end
+        mark = "*" if delta < 0 else "+"
+
+        rows.append((name, start, end, delta, mark))
+
+    if not rows:
+        return
+
+    name_w = max([len(r[0]) for r in rows])
+    num_w = 8
+    etag = f"[epoch {epoch:4d}]"
+    fmt = (
+        f"{etag} [model fit] "
+        f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
+        f"{{end:{num_w}.4f}}  delta: {{delta:{num_w}.4f}} {{mark}}"
+    )
+
+    for name, start, end, delta, mark in rows:
+        print(fmt.format(
+            name=name, start=start, end=end, delta=delta, mark=mark
+        ))
+
+
+def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
+    tries = 0
+    gpus = []
+    while tries < max_tries:
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            break
+        time.sleep(sleep_s)
+        tries += 1
+
+    if not gpus:
+        raise RuntimeError("TensorFlow sees no GPU. Refusing to run on CPU.")
+
+    gpu = gpus[0]
+    tf.config.set_visible_devices(gpu, "GPU")
+
+    logical = tf.config.list_logical_devices("GPU")
+    if not logical:
+        raise RuntimeError("GPU was present but no logical GPU is active.")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
     args = p.parse_args()
+
+    # make sure we are running on the GPU not CPU
+    enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
 
     run_dir = args.run_dir
 
@@ -165,7 +237,9 @@ def main():
         X, Y, epochs=args.epochs, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
-    
+
+    print_fit_history(history, epoch)
+
     bak_path = model_path.replace(".h5", "_backup.h5")
     if os.path.exists(model_path):
         try:
@@ -179,6 +253,12 @@ def main():
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")
+
+    # do some clean up to help the other procs with RAM    
+    del model
+    tf.keras.backend.clear_session()
+    gc.collect()
+    time.sleep(1.0)
     return 0
 
 

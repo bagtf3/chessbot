@@ -316,15 +316,76 @@ class GameViewer:
             line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
                     f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
             print(line)
-    
-    def print_header(self, show_rank=False):
+
+    def compute_rsc_top5(self, children):
+        if not children:
+            return {}
+
+        items = list(children)
+        items.sort(key=lambda x: x.get("visits", 0), reverse=True)
+
+        k = min(5, len(items))
+        top = items[:k]
+
+        if k == 1:
+            uci = top[0].get("uci", "")
+            return {uci: 1.0}
+
+        flip = 1.0 if self.board.side_to_move() == "w" else -1.0
+
+        def minmax(vals):
+            lo = min(vals)
+            hi = max(vals)
+            if hi <= lo:
+                return [0.5 for _ in vals]
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        def to_prob(vals01):
+            s = sum(vals01)
+            if s <= 0.0:
+                kk = len(vals01)
+                return [1.0 / kk for _ in vals01]
+            return [v / s for v in vals01]
+
+        visits = [c.get("visits", 0) for c in top]
+        vs = [c.get("visit_share", 0.0) for c in top]
+        q = [flip * c.get("Q", 0.0) for c in top]
+        qe = [flip * c.get("Qema", 0.0) for c in top]
+        ds = [c.get("Qdelta_sign", 0.0) for c in top]
+
+        p_vis = to_prob(minmax(visits))
+        p_vs = to_prob(minmax(vs))
+        p_q = to_prob(minmax(q))
+        p_qe = to_prob(minmax(qe))
+        p_ds = to_prob(minmax(ds))
+
+        w = 0.2
+        out = {}
+        for i in range(k):
+            score = (
+                w * p_vis[i]
+                + w * p_vs[i]
+                + w * p_q[i]
+                + w * p_qe[i]
+                + w * p_ds[i]
+            )
+            out[top[i].get("uci", "")] = score
+
+        return out
+
+    def print_header(self, show_rank=False, show_rsc=False):
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
             ("|", 1),
             ("Q", 7), ("Qe", 7), ("dS", 7),
             ("|", 1),
-            ("P", 7), ("U", 7), ("PUCT", 8), ("flags", 9),
+            ("P", 7), ("U", 7), ("PUCT", 8),
+            ("|", 1),
+            ("flags", 9),
         ]
+
+        if show_rsc:
+            cols.append(("rsc", 7))
 
         if show_rank:
             cols.append(("rank", 7))
@@ -342,7 +403,16 @@ class GameViewer:
         print(hdr)
         print(sep)
 
-    def print_row(self, c, mark=False, show_rank=False, rank_val=None):
+
+    def print_row(
+        self,
+        c,
+        mark=False,
+        show_rank=False,
+        rank_val=None,
+        show_rsc=False,
+        rsc_val=None,
+    ):
         uci = c.get("uci", "")
         san = self.board.san(uci) if uci else "?"
 
@@ -357,7 +427,7 @@ class GameViewer:
         u = c.get("U", 0.0)
 
         qrel = q if self.board.side_to_move() == "w" else -q
-        puct = qrel + u + 0.1*np.clip(ds, -0.25, 0.25)
+        puct = qrel + u + 0.1 * np.clip(ds, -0.25, 0.25)
 
         flags = []
         if mark:
@@ -372,8 +442,13 @@ class GameViewer:
             f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}",
             "|",
             f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
+            "|",
             f"{flags:^9}",
         ]
+
+        if show_rsc:
+            rv = "" if rsc_val is None else f"{rsc_val:0.3f}"
+            parts.append(f"{rv:^7}")
 
         if show_rank:
             r = rank_val if rank_val is not None else ""
@@ -448,12 +523,14 @@ class GameViewer:
         if is_sf_turn and sf_idx is not None:
             need_rank = (sf_idx >= top_n)
 
-        self.print_header(show_rank=need_rank)
+        self.print_header(show_rank=need_rank, show_rsc=True)
         # top-N: never show ranks; just mark if SF move is in top-N
+        rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
         for c in cands_sorted[:top_n]:
             self.print_row(
                 c, mark=is_sf_turn and (c.get("uci") == chosen),
-                show_rank=need_rank, rank_val=None
+                show_rank=need_rank, rank_val=None, show_rsc=True,
+                rsc_val=rsc_map.get(c.get("uci"))
             )
             shown_ucis.add(c.get("uci"))
 
@@ -463,7 +540,7 @@ class GameViewer:
                 print("   ...")
                 self.print_row(
                     cands_sorted[sf_idx], mark=True,
-                    show_rank=True, rank_val=sf_idx + 1,
+                    show_rank=True, rank_val=sf_idx + 1, show_rsc=False
                 )
 
         this_q = node.get("best_Q")
@@ -542,8 +619,8 @@ class GameViewer:
             return
 
         print(f"  === Showing visit info for {uci_or_san} ===")
-        self.print_header(show_rank=True)
-        self.print_row(move, show_rank=True, rank_val=rank)
+        self.print_header(show_rank=True, show_rsc=False)
+        self.print_row(move, show_rank=True, rank_val=rank, show_rsc=False)
         print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 
     def show_options(self):

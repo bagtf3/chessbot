@@ -29,12 +29,15 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    target_delta = 200
+    sims_absolute_ceiling = 1600
 
     # early stop
     es_check_every = 100
-    use_robust_above = 2400
-
+    target_delta = 200
+    min_delta = 100
+    use_robust = True
+    robust_only_above = 2400
+    
     # Game stuff
     n_games = 128
     games_at_once = 128

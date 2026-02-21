@@ -16,8 +16,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, kl_divergence
+    score_cp_stm_pov, score_cp_white_pov, rnd, cp_to_value_tanh, kl_divergence
 )
 
 RS = "[rescore]"
@@ -1005,3 +1004,17 @@ def poll_retrain(handle, print_output=True):
         raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
 
     return True, rc
+
+
+def reclaim_vram(mb):
+    import tensorflow as tf
+
+    bytes_target = mb * 1024 * 1024
+    n = max(1, bytes_target // 4)
+
+    with tf.device("/GPU:0"):
+        x = tf.ones([n], dtype=tf.float32)
+        y = tf.reduce_sum(x)
+
+    _ = y.numpy()
+    return True

@@ -13,7 +13,7 @@ import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain
+from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain, reclaim_vram
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
@@ -236,13 +236,44 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
+def reclaim_vram_worker(mb):
+    reclaim_vram(mb)
+
+
 def launch_retrain(run_tag, working_cfg):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
+
+    # wait a tick for gameplay workers to wind down
+    time.sleep(0.5)
+
+    # need to try to pull back GPU VRAM for training
+    ctx = mp.get_context("spawn")
+    success = []
+    stop = False
+    for mb in [500, 1000, 2000, 4000]:
+        if stop:
+            break
+
+        for attempt in range(2):
+            p = ctx.Process(target=reclaim_vram_worker, args=(mb,))
+            p.start()
+            p.join()
+            ok = (p.exitcode == 0)
+
+            if ok:
+                success.append(mb)
+                break
+
+            if not ok and attempt > 0:
+                print(f"[reclaim_vram] failed {mb} MB, stopping reclaim")
+                stop = True
+                break
     
-    # wait a few seconds for everything to wind down
-    time.sleep(5.0)
+    if success:
+        print(f"[reclaim_vram] ok levels: {success}")
+
     return launch_retrain_async(run_tag, rt_script, working_cfg)
 
 

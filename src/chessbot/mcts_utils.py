@@ -107,8 +107,8 @@ class MCTSTree(fasttree):
             sample = True
         
         if not sample:
-            if self.sims_completed_this_move >= self.config.use_robust_above:
-                return self.pick_robust_from_details()
+            if self.sims_completed_this_move >= self.config.robust_only_above:
+                return self.select_using_robust()
             else:
                 return super().best()
         
@@ -146,64 +146,31 @@ class MCTSTree(fasttree):
 
         idx = np.random.choice(len(top_ucis), p=probs)
         return top_ucis[idx], None
-    
-    def pick_robust_from_details(self):
-        details = self.root_child_details()
-        if not details:
+
+    def select_using_robust(self):
+        """Needs to match (uci, None) return signature of best()."""
+        rsc, details = self.robust_selection_criteria(5, 100)
+        if not rsc or not details or len(details) < 2:
             return super().best()
 
-        total = sum([d.N for d in details])
-        if total <= 0:
+        most_visits = details[0].N
+        visit_threshold = min(max(200, most_visits * 0.7), 2000)
+
+        best_rsc = -np.inf
+        best_uci = None
+
+        for d in details:
+            if (d.uci in rsc) and (d.N >= visit_threshold):
+                this_rsc = rsc[d.uci]
+                if this_rsc > best_rsc:
+                    best_rsc = this_rsc
+                    best_uci = d.uci
+
+        if best_uci is None:
             return super().best()
 
-        thresh = max(int(0.125 * total), 300)
-        cand = [d for d in details if d.N >= thresh]
-        if not cand:
-            return super().best()
-
-        flip = 1.0 if self.board.side_to_move().lower() == "w" else -1.0
-
-        def minmax(vals):
-            lo = min(vals)
-            hi = max(vals)
-            if hi <= lo:
-                return [0.5 for _ in vals]
-            return [(v - lo) / (hi - lo) for v in vals]
-
-        def to_prob(vals01):
-            s = sum(vals01)
-            if s <= 0.0:
-                k = len(vals01)
-                return [1.0 / k for _ in vals01]
-            return [v / s for v in vals01]
-
-        visits = [d.N for d in cand]
-        qs = [flip * d.Q for d in cand]
-        qemas = [flip * d.Qema for d in cand]
-        vss = [d.visit_share for d in cand]
-        ds = [d.Qdelta_sign for d in cand]
-
-        p_vis = to_prob(minmax(visits))
-        p_q = to_prob(minmax(qs))
-        p_qe = to_prob(minmax(qemas))
-        p_vs = to_prob(minmax(vss))
-        p_ds = to_prob(minmax(ds))
-
-        w = 0.2
-        scores = []
-        for i in range(len(cand)):
-            s = (
-                w * p_vis[i]
-                + w * p_q[i]
-                + w * p_qe[i]
-                + w * p_vs[i]
-                + w * p_ds[i]
-            )
-            scores.append(s)
-
-        best_i = max(range(len(scores)), key=lambda i: scores[i])
-        return cand[best_i].uci, None
-
+        return best_uci, None
+        
     def advance(self, board, move_uci):
         """
         Safe root advance: mutate the C++ tree, then sync Python-side bookeeping.
@@ -254,7 +221,6 @@ class MCTSTree(fasttree):
         # if a ratio is used, update that
         if self.config.target_delta < 1:
             self.target_delta = np.floor(self.config.target_delta*new_ceiling)
-        
 
     def needs_root_noise(self, check_sims=False):
         check = self.add_root_noise and not self.root_noise_added
@@ -285,8 +251,13 @@ class MCTSTree(fasttree):
         # upper limit check
         cfg = self.config
         sims_done = self.sims_completed_this_move
-        curr_budget = self.sim_budget()
-        if sims_done > curr_budget:
+
+        # if not at the floor, stop here
+        if sims_done < cfg.sims_floor:
+            return False
+        
+        # upper limit check
+        if sims_done >= cfg.sims_absolute_ceiling:
             self._es_tripped = True
             return True
         
@@ -297,30 +268,78 @@ class MCTSTree(fasttree):
         # register this check
         self._es_last_checked_at = sims_done
         
-        rows = self.root_child_visits()
-        if not rows or len(rows) < 2:
-            return False
+        # evenly weighted visits, vs, Q, Qema, dS
+        rsc, details = self.robust_selection_criteria(5, 100)
 
-        r0, r1 = rows[0], rows[1]
-        visits0, visits1 = r0[1], r1[1]
+        # would only see this if the tree isnt very far along or is in transition
+        if not details or len(details) < 2 or not rsc:
+            return False
+        
+        # some book keeping
+        d0, d1 = details[0], details[1]
+        visits0, visits1 = d0.N, d1.N
         visit_delta = visits0 - visits1
 
-        self.most_visited.append(r0[0])
-        self.runner_up.append(r1[0])
+        self.most_visited.append(d0.uci)
+        self.runner_up.append(d1.uci)
         self.visit_delta.append(visit_delta)
 
-        # if not at the floor, stop here
-        if sims_done < cfg.sims_floor:
-            return False
+        # early stop: if min_delta and most-visited also has best rsc
+        if visit_delta >= cfg.min_delta and cfg.use_robust:
+            best_rsc_uci = max(rsc, key=rsc.get)
+            if best_rsc_uci == d0.uci:
+                self._es_tripped = True
+                return True
         
-        remaining = curr_budget - sims_done
+        # next check: visit gap criteria
+        curr_budget = self.sim_budget()
+        remaining = max(0, curr_budget - sims_done)
         stop_condition = min(remaining, self.target_delta)
 
-        # if impossible to change leading move, stop now
-        if visit_delta > stop_condition:
-            self._es_tripped = True
-            return True
-        
+        # if stopping condition reached, stop unless we have reason to extend
+        stop_triggered = False
+        should_extend = False
+        if visit_delta >= stop_condition:
+            stop_triggered = True
+
+            # check for extensions only if not maxed
+            if curr_budget < cfg.sims_absolute_ceiling:
+                # if top move is not in the top 2 UCI
+                top2_uci = sorted(rsc, key=rsc.get, reverse=True)[:2]
+                if d0.uci not in top2_uci:
+                    should_extend = True
+
+                # if the same #2 move has been improving
+                if (not should_extend) and (len(self.runner_up) >= 3):
+                    if len(set(self.runner_up[-3:])) == 1:
+                        a, b, c = self.visit_delta[-3:]
+                        if (c < b) and (b < a):
+                            should_extend = True
+
+                # if low visit share and another move has better dS    
+                low_vs = d0.visit_share < 0.3
+                for d in details:
+                    if should_extend:
+                        break
+
+                    if d.uci not in rsc or d.uci == d0.uci:
+                        continue
+                    
+                    if low_vs and d.Qdelta_sign > d0.Qdelta_sign:
+                        should_extend = True
+
+        if stop_triggered:
+            if should_extend:
+                new_ceiling = min(cfg.sims_absolute_ceiling, curr_budget + cfg.es_check_every)
+                self.set_sim_budget(new_ceiling)
+                return False
+            
+            # stop here if budget reached and no reason to extend
+            else:
+                self._es_tripped = True
+                return True
+            
+        # everything else is a no stop
         return False
 
     def stop_simulating(self):
@@ -466,7 +485,7 @@ class ChessGame(object):
     
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
-        details = self.tree.root_child_details()
+        rcs, details = self.tree.robust_selection_criteria(5, 100)
         if details is None:
             return
         
@@ -511,7 +530,7 @@ class ChessGame(object):
                 "visit_share": cd.visit_share, "last_visit": cd.last_visit,
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4),"Qdelta_sign": rnd(cd.Qdelta_sign, 4),
-                "is_terminal": cd.is_terminal, "visit_share": cd.visit_share
+                "is_terminal": cd.is_terminal, "rcs": rnd(rcs.get(cd.uci, 0.0), 4)
             }
             
             candidate_moves.append(cm)
@@ -607,8 +626,8 @@ class ChessGame(object):
             return False
 
         # no eval draws with queen(s) on the board.
-        # prefer eval check above first to push next check back
-        elif 'q' in self.board.fen().lower():
+        piece_part = self.board.fen().split(" ")[0]
+        if "q" in piece_part.lower():
             return False
         
         # if here, agree to draw

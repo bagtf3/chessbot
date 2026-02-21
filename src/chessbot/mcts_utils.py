@@ -95,13 +95,24 @@ class MCTSTree(fasttree):
         At/after ply 25: delegate to the base implementation.
         Returns (uci, None) like the original.
         """
+        # determine if we need to sample or not
         if self.config.sample_moves == False:
-            return super().best()
+            sample = False
 
-        # if at/after the convergence ply, just use C++/base behavior
-        if (self.n_plies >= 25) or (self.board.piece_count() <= 20):
-            return super().best()
+        # at/after the convergence ply, just use C++/base behavior
+        elif (self.n_plies >= 25) or (self.board.piece_count() <= 20):
+            sample = False
 
+        else:
+            sample = True
+        
+        if not sample:
+            if self.sims_completed_this_move >= self.config.use_robust_above:
+                return self.pick_robust_from_details()
+            else:
+                return super().best()
+        
+        # if here we are sampling
         # gather root visits (desc sorted list of (uci, N))
         rows = self.root_child_visits()
         if not rows:
@@ -135,6 +146,63 @@ class MCTSTree(fasttree):
 
         idx = np.random.choice(len(top_ucis), p=probs)
         return top_ucis[idx], None
+    
+    def pick_robust_from_details(self):
+        details = self.root_child_details()
+        if not details:
+            return super().best()
+
+        total = sum([d.N for d in details])
+        if total <= 0:
+            return super().best()
+
+        thresh = max(int(0.125 * total), 300)
+        cand = [d for d in details if d.N >= thresh]
+        if not cand:
+            return super().best()
+
+        flip = 1.0 if self.board.side_to_move().lower() == "w" else -1.0
+
+        def minmax(vals):
+            lo = min(vals)
+            hi = max(vals)
+            if hi <= lo:
+                return [0.5 for _ in vals]
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        def to_prob(vals01):
+            s = sum(vals01)
+            if s <= 0.0:
+                k = len(vals01)
+                return [1.0 / k for _ in vals01]
+            return [v / s for v in vals01]
+
+        visits = [d.N for d in cand]
+        qs = [flip * d.Q for d in cand]
+        qemas = [flip * d.Qema for d in cand]
+        vss = [d.visit_share for d in cand]
+        ds = [d.Qdelta_sign for d in cand]
+
+        p_vis = to_prob(minmax(visits))
+        p_q = to_prob(minmax(qs))
+        p_qe = to_prob(minmax(qemas))
+        p_vs = to_prob(minmax(vss))
+        p_ds = to_prob(minmax(ds))
+
+        w = 0.2
+        scores = []
+        for i in range(len(cand)):
+            s = (
+                w * p_vis[i]
+                + w * p_q[i]
+                + w * p_qe[i]
+                + w * p_vs[i]
+                + w * p_ds[i]
+            )
+            scores.append(s)
+
+        best_i = max(range(len(scores)), key=lambda i: scores[i])
+        return cand[best_i].uci, None
 
     def advance(self, board, move_uci):
         """
@@ -214,102 +282,46 @@ class MCTSTree(fasttree):
         if self._es_tripped:
             return True
 
+        # upper limit check
         cfg = self.config
         sims_done = self.sims_completed_this_move
-
-        # check on absolute delta
-        sac = cfg.sims_absolute_ceiling
-        if sims_done >= sac:
-            self.sim_stop_reason = f"Sim ceiling {sac} reached"
+        curr_budget = self.sim_budget()
+        if sims_done > curr_budget:
             self._es_tripped = True
-            return True 
+            return True
         
-         # everything else is gated
+        # everything else is gated
         if sims_done - self._es_last_checked_at < cfg.es_check_every:
             return False
         
         # register this check
         self._es_last_checked_at = sims_done
+        
+        rows = self.root_child_visits()
+        if not rows or len(rows) < 2:
+            return False
 
-        # start recording leader/runner up stats 3 checks ahead
-        if sims_done + 3.5*cfg.es_check_every > cfg.sims_floor:
-            details = self.root_child_details()
-            if not details or len(details) < 2:
-                return False
+        r0, r1 = rows[0], rows[1]
+        visits0, visits1 = r0[1], r1[1]
+        visit_delta = visits0 - visits1
 
-            d0 = details[0]
-            d1 = details[1]
-
-            visits0 = d0.N
-            visits1 = d1.N
-            visit_delta = visits0 - visits1
-
-            self.most_visited.append(d0.uci)
-            self.runner_up.append(d1.uci)
-            self.visit_delta.append(visit_delta)
+        self.most_visited.append(r0[0])
+        self.runner_up.append(r1[0])
+        self.visit_delta.append(visit_delta)
 
         # if not at the floor, stop here
         if sims_done < cfg.sims_floor:
             return False
         
-        # more precise check on absolute ceiling
-        curr_budget = self.sim_budget()
-        absolute_remaining = sac - sims_done
-        if visit_delta >= absolute_remaining:
-            self.sim_stop_reason = f"Visit Delta {visit_delta} Insurmountable"
-            self._es_tripped = True
-            return True
-
-        # If min_delta is impossible even if #1 gets all remaining sims, extend now.
         remaining = curr_budget - sims_done
-        if visit_delta + remaining < cfg.min_delta:
-            new_budget = min(sac, curr_budget + cfg.bonus_sim_increment)
-
-            # safety check
-            if new_budget > curr_budget:
-                self.set_sim_budget(new_budget)
-
-            return False
-
         stop_condition = min(remaining, self.target_delta)
 
-        # Not separated enough yet, keep simming.
-        if visit_delta < stop_condition or visit_delta < cfg.min_delta:
-            return False
-
-        # We hit low min_delta, now do sanity checks
-        vs0 = d0.visit_share
-        vs1 = d1.visit_share
-        ds0 = d0.Qdelta_sign
-
-        conf_ok = True
-        # visit share and delta sign checks
-        if vs0 < cfg.es_vs_floor or ds0 < cfg.es_dS_floor or vs1 > vs0:
-            conf_ok = False
-
-        if conf_ok and len(self.most_visited) >= 3:
-            # if leader is flipping
-            if len(set(self.most_visited[-3:])) > 1:
-                conf_ok = False
-
-            # runner up is catching
-            a, b, c = self.visit_delta[-3:]
-            delta_shrinking = (c < b) and (b < a)
-            if len(set(self.runner_up[-3:])) == 1 and delta_shrinking:
-                conf_ok = False
-
-        if not conf_ok:
-            # Looks weird, buy more sims.
-            curr_ceiling = self.sim_budget()
-            new_ceiling = min(sac, curr_ceiling + cfg.bonus_sim_increment)
-            if new_ceiling > curr_ceiling:
-                self.set_sim_budget(new_ceiling)
-            return False
-
-        # true early stop here
-        self.sim_stop_reason = f"Visit delta {visit_delta} >= {stop_condition}"
-        self._es_tripped = True
-        return True
+        # if impossible to change leading move, stop now
+        if visit_delta > stop_condition:
+            self._es_tripped = True
+            return True
+        
+        return False
 
     def stop_simulating(self):
         # do at least 1 sims to stabilize the tree

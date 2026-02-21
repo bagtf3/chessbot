@@ -11,8 +11,8 @@ import pathlib
 import numpy as np
 import pandas as pd
 
-from chessbot import SF_LOC, SP_DIR
-from chessbot.looper import GameLooper, init_selfplay
+from chessbot import SP_DIR
+from chessbot.looper import init_selfplay
 from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain
 from chessbot.review import RecordKeeper
 from chessbot.config import Config

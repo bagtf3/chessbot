@@ -153,9 +153,23 @@ class Rescorer(object):
         out_dir = pathlib.Path(cfg.pending_training_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # we need to clear out any existing pkls because theyre probably corrupted
+        deleted = []
+        for p in out_dir.iterdir():
+            if not p.is_file():
+                continue
+
+            suf = p.suffix.lower()
+            if suf in [".pkl", ".pickle"]:
+                p.unlink()
+                deleted.append(p.name)
+
+        if deleted:
+            print(f"{RS} deleted {len(deleted)} stale pkls in {out_dir}")
+
         if randomize:
             random.shuffle(self.training_data)
-        
+
         if size is None:
             size = cfg.get_retrain_size
 

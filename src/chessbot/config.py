@@ -29,16 +29,11 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    sims_absolute_ceiling = 5000
-    bonus_sim_increment = 250
-
     target_delta = 200
-    min_delta = 200
 
     # early stop
     es_check_every = 100
-    es_vs_floor = 0.3
-    es_dS_floor = -0.2
+    use_robust_above = 2400
 
     # Game stuff
     n_games = 128

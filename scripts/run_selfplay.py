@@ -245,14 +245,11 @@ def launch_retrain(run_tag, working_cfg):
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
 
-    # wait a tick for gameplay workers to wind down
-    time.sleep(0.5)
-
     # need to try to pull back GPU VRAM for training
     ctx = mp.get_context("spawn")
     success = []
     stop = False
-    for mb in [500, 1000, 2000, 4000]:
+    for mb in [500, 1000, 2000, 4000, 6000]:
         if stop:
             break
 
@@ -272,7 +269,7 @@ def launch_retrain(run_tag, working_cfg):
                 break
     
     if success:
-        print(f"[reclaim_vram] ok levels: {success}")
+        print(f"[reclaim vram] ok levels: {success}")
 
     return launch_retrain_async(run_tag, rt_script, working_cfg)
 

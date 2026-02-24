@@ -415,7 +415,7 @@ class Rescorer(object):
                 cpl_b += loss_this
                 nb += 1
             
-            # we penalize missed mates but still winning less harshly
+            # we penalize missed-mate-but-still-winning less harshly
             missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
             if missed_mate:
                 # cap loss_this at 300, we are still winning here
@@ -436,13 +436,18 @@ class Rescorer(object):
             # screen training data, adjust if needed and append
             lms = b_fast.legal_moves()
 
+            # determine correct cp threshold
+            blunder_cp = cfg.post_hoc_blunder_cp_loser
+            if Z_stm > 0.0:
+                blunder_cp = cfg.post_hoc_blunder_cp_winner
+
             # these moves are fine, no changes            
-            if loss_this <= 60:
+            if loss_this <= min(60, blunder_cp):
                 best_mv = mv
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
             
-            # for mild blunders or missed mates but still winning adjust visits
-            elif (loss_this < cfg.post_hoc_blunder_cp) or missed_mate:
+            # for mild blunders or missed-mate-but-still-winning, adjust visits
+            elif (loss_this < blunder_cp) or missed_mate:
                 best_mv = str(res.get('best_move'))
                 visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
 

@@ -258,7 +258,6 @@ def main():
     del model
     tf.keras.backend.clear_session()
     gc.collect()
-    time.sleep(1.0)
     return 0
 
 

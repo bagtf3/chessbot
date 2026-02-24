@@ -34,6 +34,7 @@ class Config(object):
     # early stop
     es_check_every = 100
     target_delta = 200
+    min_top_visits = 300
     min_delta = 100
     use_robust = True
     robust_only_above = 2400
@@ -72,6 +73,8 @@ class Config(object):
 
     # overrides for the post hoc worker
     post_hoc_blunder_cp = 150
+    post_hoc_blunder_cp_loser = 90
+    post_hoc_blunder_cp_winner = 200
     post_hoc_analyze_batch = 30
     post_hoc_depth = 12
     post_hoc_equiv_range = 30

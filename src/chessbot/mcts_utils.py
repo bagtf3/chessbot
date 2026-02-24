@@ -12,6 +12,7 @@ from chessbot import ENDGAME_LOC
 from chessbot.review import score_to_value_stm_pov
 from chessbot.utils import rnd
 import chessbot.utils as cbu
+from collections import defaultdict
 
 
 class MCTSTree(fasttree):
@@ -88,11 +89,15 @@ class MCTSTree(fasttree):
         self.runner_up = []
         self.visit_delta = []
 
+        self.es_fails = defaultdict(int)
+        self.extension_reasons = defaultdict(int)
+        self.es_times = []
+
     def best(self):
         """
-        Before ply 25: sample from the top 5 moves by visits using a
-        temperature schedule that decays to near-deterministic by ply 25.
-        At/after ply 25: delegate to the base implementation.
+        Before ply 30: sample from the top 5 moves by visits using a
+        temperature schedule that decays to near-deterministic by ply 30.
+        At/after ply 30: delegate to the base implementation.
         Returns (uci, None) like the original.
         """
         # determine if we need to sample or not
@@ -100,7 +105,7 @@ class MCTSTree(fasttree):
             sample = False
 
         # at/after the convergence ply, just use C++/base behavior
-        elif (self.n_plies >= 25) or (self.board.piece_count() <= 20):
+        elif (self.n_plies >= 30) or (self.board.piece_count() <= 20):
             sample = False
 
         else:
@@ -135,7 +140,7 @@ class MCTSTree(fasttree):
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
         
-        frac = max(0.0, min(1.0, (25.0 - self.n_plies) / 25.0))
+        frac = max(0.0, min(1.0, (30.0 - self.n_plies) / 30.0))
         temp = temp_min + (temp_max - temp_min) * frac
 
         # build stable logits from visits: use log(visits) so scale is sane
@@ -150,15 +155,16 @@ class MCTSTree(fasttree):
     def select_using_robust(self):
         """Needs to match (uci, None) return signature of best()."""
         rsc, details = self.robust_selection_criteria(5, 100)
-        if not rsc or not details or len(details) < 2:
+        if (not rsc) or (not details) or (len(details) == 1):
             return super().best()
 
         most_visits = details[0].N
-        visit_threshold = min(max(200, most_visits * 0.7), 2000)
+        sims_done = self.sims_completed_this_move
+        floor = 500 + 0.1*sims_done
+        visit_threshold = min(max(200, most_visits * 0.7), floor)
 
         best_rsc = -np.inf
         best_uci = None
-
         for d in details:
             if (d.uci in rsc) and (d.N >= visit_threshold):
                 this_rsc = rsc[d.uci]
@@ -268,13 +274,15 @@ class MCTSTree(fasttree):
         # register this check
         self._es_last_checked_at = sims_done
         
+        es_time_start = _now()
+
         # evenly weighted visits, vs, Q, Qema, dS
         rsc, details = self.robust_selection_criteria(5, 100)
 
         # would only see this if the tree isnt very far along or is in transition
-        if not details or len(details) < 2 or not rsc:
+        if not details or len(details) < 2:
             return False
-        
+
         # some book keeping
         d0, d1 = details[0], details[1]
         visits0, visits1 = d0.N, d1.N
@@ -283,13 +291,19 @@ class MCTSTree(fasttree):
         self.most_visited.append(d0.uci)
         self.runner_up.append(d1.uci)
         self.visit_delta.append(visit_delta)
-
+        
         # early stop: if min_delta and most-visited also has best rsc
         if visit_delta >= cfg.min_delta and cfg.use_robust:
-            best_rsc_uci = max(rsc, key=rsc.get)
-            if best_rsc_uci == d0.uci:
-                self._es_tripped = True
-                return True
+            if visits0 >= cfg.min_top_visits:
+                if self.should_early_stop(rsc, details):
+                    self._es_tripped = True
+                    self.es_times.append(_now() - es_time_start)
+                    return True
+            else:
+                self.es_fails['min_top_visits_not_met'] += 1
+
+        else:
+            self.es_fails['visit_delta_too_small'] += 1
         
         # next check: visit gap criteria
         curr_budget = self.sim_budget()
@@ -298,48 +312,120 @@ class MCTSTree(fasttree):
 
         # if stopping condition reached, stop unless we have reason to extend
         stop_triggered = False
-        should_extend = False
         if visit_delta >= stop_condition:
             stop_triggered = True
 
             # check for extensions only if not maxed
             if curr_budget < cfg.sims_absolute_ceiling:
-                # if top move is not in the top 2 UCI
-                top2_uci = sorted(rsc, key=rsc.get, reverse=True)[:2]
-                if d0.uci not in top2_uci:
-                    should_extend = True
-
-                # if the same #2 move has been improving
-                if (not should_extend) and (len(self.runner_up) >= 3):
-                    if len(set(self.runner_up[-3:])) == 1:
-                        a, b, c = self.visit_delta[-3:]
-                        if (c < b) and (b < a):
-                            should_extend = True
-
-                # if low visit share and another move has better dS    
-                low_vs = d0.visit_share < 0.3
-                for d in details:
-                    if should_extend:
-                        break
-
-                    if d.uci not in rsc or d.uci == d0.uci:
-                        continue
-                    
-                    if low_vs and d.Qdelta_sign > d0.Qdelta_sign:
-                        should_extend = True
-
+                if self.should_extend_sims(rsc, details):
+                    stop_triggered = False
+                    new_ceiling = curr_budget + cfg.es_check_every
+                    new_ceiling = min(cfg.sims_absolute_ceiling, new_ceiling)
+                    self.set_sim_budget(new_ceiling)
+                    self.es_times.append(_now() - es_time_start)
+                    return False
+                
+        # stop here if budget reached and no reason to extend
         if stop_triggered:
-            if should_extend:
-                new_ceiling = min(cfg.sims_absolute_ceiling, curr_budget + cfg.es_check_every)
-                self.set_sim_budget(new_ceiling)
-                return False
-            
-            # stop here if budget reached and no reason to extend
-            else:
-                self._es_tripped = True
-                return True
-            
+            self._es_tripped = True
+            self.es_times.append(_now() - es_time_start)
+            return True
+        else:
+            self.extension_reasons['stop_condition_not_met'] += 1
+        
         # everything else is a no stop
+        self.es_times.append(_now() - es_time_start)
+        return False
+
+    def should_early_stop(self, rsc, details):
+        # if only one move with > 100 visits...
+        if not rsc or len(rsc) < 2:
+            self.es_fails['es_granted'] += 1
+            return True
+            
+        d0 = details[0]
+        best_rsc_uci = max(rsc, key=rsc.get)
+        # best rsc 
+        if best_rsc_uci != d0.uci:
+            self.es_fails['not_best_rsc'] += 1
+            return False
+        
+        # 15% visit_share
+        if d0.visit_share < 0.15:
+            self.es_fails['vs_under_15'] += 1
+            return False
+        
+        # make sure rsc delta and dS are sufficient
+        vals = sorted(rsc.values(), reverse=True)
+        rsc_delta = vals[0] - vals[1]
+        if rsc_delta < 0.05:
+            self.es_fails['rsc_delta_under_05'] += 1
+            return False
+        
+        dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
+        if d0.Qdelta_sign < 0.0 and len(dS_dict) >= 3:
+            worst_dS_uci = sorted(dS_dict, key=dS_dict.get)  # ascending
+            if d0.uci in worst_dS_uci[:2]:
+                self.es_fails['dS_in_bottom_2'] += 1
+                return False
+        
+        # if any move has better visit_share and dS, it might be able to catch or pass
+        vs_dict = {d.uci: d.visit_share for d in details if d.uci in rsc}
+        for uci, visit_share in vs_dict.items():
+            if uci == d0.uci:
+                continue
+            if visit_share > d0.visit_share:
+                if dS_dict[uci] > d0.Qdelta_sign:
+                    self.es_fails['move_with_better_vs_and_dS'] += 1
+                    return False
+        
+        # if here, all checks passed
+        self.es_fails['es_granted'] += 1
+        return True
+
+    def should_extend_sims(self, rsc, details):
+        d0 = details[0]
+        if d0.N < self.config.min_top_visits:
+            self.extension_reasons['min_top_visits_not_met'] += 1
+            return True
+
+        # if the same #2 move has been improving
+        if len(self.runner_up) >= 3:
+            if len(set(self.runner_up[-3:])) == 1:
+                a, b, c = self.visit_delta[-3:]
+                if (c < b) and (b < a):
+                    self.extension_reasons['runner_up_move_trending'] += 1
+                    return True
+        
+        # if most visited not in top 2 rsc
+        top2_uci = sorted(rsc, key=rsc.get, reverse=True)[:2]
+        if d0.uci not in top2_uci:
+            self.extension_reasons['not_in_top2_rsc'] += 1
+            return True
+            
+        # if low visit share and another move has better dS    
+        if d0.visit_share < 0.2:
+            for d in details:
+                if d.uci not in rsc or d.uci == d0.uci:
+                    continue
+                
+                if d.Qdelta_sign > d0.Qdelta_sign:
+                    self.extension_reasons['low_vs_and_not_top_dS'] += 1
+                    return True
+        
+        # dont want dS in bottom 
+        d1 = details[1]
+        visit_delta = d0.N - d1.N
+        if d0.Qdelta_sign < 0.0 and visit_delta < 500:
+            dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
+            if len(dS_dict) >= 3:
+                worst_dS_uci = sorted(dS_dict, key=dS_dict.get)  # ascending
+                worst_k = 2
+                if d0.uci in worst_dS_uci[:worst_k]:
+                    self.extension_reasons['dS_in_bottom_2'] += 1
+                    return False
+        
+        self.extension_reasons['no_extension'] += 1
         return False
 
     def stop_simulating(self):

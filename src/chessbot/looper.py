@@ -363,7 +363,73 @@ class GameLooper(object):
             if self.maybe_push_telemetry(counts, pred_fill, force=False):
                 self.prediction_times.clear()
                 counts.clear(); pred_fill.clear()
+                # TEMP
+                # if np.random.random() < 0.33:
+                #     from collections import defaultdict
+                #     es_fails = defaultdict(int)
+                #     ex_reasons = defaultdict(int)
+                #     es_times = []
+                #     for g in self.active_games[:cfg.games_at_once]:
+                #         es_times += g.tree.es_times
+                #         g.tree.es_times.clear()
+                #         for k, v in g.tree.es_fails.items():
+                #             es_fails[k] += v
+                #         g.tree.es_fails.clear()
+                #         for k, v in g.tree.extension_reasons.items():
+                #             ex_reasons[k] += v
+                #         g.tree.extension_reasons.clear()
+                    
+                #     max_rows = 12
+                #     print("~" * 60)
 
+                #     items = sorted(es_fails.items(), key=lambda kv: (-kv[1], kv[0]))
+                #     total = sum([v for _, v in items])
+                #     print(f"\nearly_stop_fails  total={total}")
+                #     if not items:
+                #         print("  (none)")
+                #     else:
+                #         head = items[:max_rows]
+                #         for k, v in head:
+                #             pct = (v / total) if total else 0.0
+                #             print(f"  {k:<26} {v:>6}  ({pct:>5.1%})")
+                #         if len(items) > max_rows:
+                #             rest = items[max_rows:]
+                #             rest_total = sum([v for _, v in rest])
+                #             pct = (rest_total / total) if total else 0.0
+                #             print(f"  {'(other)':<26} {rest_total:>6}  ({pct:>5.1%})")
+
+                #     items = sorted(ex_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+                #     total = sum([v for _, v in items])
+                #     print(f"\nextension_reasons  total={total}")
+                #     if not items:
+                #         print("  (none)")
+                #     else:
+                #         head = items[:max_rows]
+                #         for k, v in head:
+                #             pct = (v / total) if total else 0.0
+                #             print(f"  {k:<26} {v:>6}  ({pct:>5.1%})")
+                #         if len(items) > max_rows:
+                #             rest = items[max_rows:]
+                #             rest_total = sum([v for _, v in rest])
+                #             pct = (rest_total / total) if total else 0.0
+                #             print(f"  {'(other)':<26} {rest_total:>6}  ({pct:>5.1%})")
+
+                #     print("~" * 60)
+                #     es_n = len(es_times)
+                #     if es_n:
+                #         xs = sorted(es_times)
+                #         cut = max(1, int(0.9 * es_n))  # start index of slowest 10%
+                #         tail = xs[cut:]
+                #         mean_slowest10 = sum(tail) / len(tail)
+                #         print(
+                #             f"\nes_times  N={es_n} mean={np.mean(es_times):.6f} "
+                #             f"mean_slowest10%={mean_slowest10:.6f}  "
+                #             f"max={xs[-1]:.6f}"
+                #         )
+                #     else:
+                #         print("\nes_times  N=0")
+                    # END TEMP
+            
             if finished:
                 finished_ids.update(finished)
             

@@ -424,10 +424,10 @@ class GameViewer:
         ds = c.get("Qdelta_sign", 0.0)
 
         p = c.get("P", 0.0)
-        u = c.get("U", 0.0)
+        u = c.get("U", 0.0) * (1.0 + 0.5*np.clip(ds, -0.5, 0.5))
 
         qrel = q if self.board.side_to_move() == "w" else -q
-        puct = qrel + u + 0.1 * np.clip(ds, -0.25, 0.25)
+        puct = qrel + u 
 
         flags = []
         if mark:
@@ -1771,8 +1771,8 @@ class RecordKeeper(object):
         left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.1f}"
         right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
 
-        left2 = f"[stop stats] fastpath_breaks={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
-        right2 = f"collect_breaks={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
+        left2 = f"[stop stats] fastpath_stops={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
+        right2 = f"collect_stops={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
 
         apl = avged["apl"]
         batch_target = avged["batch_target"]

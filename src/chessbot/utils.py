@@ -1542,7 +1542,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
     return stats, rows, sf_overall
 
 
-def print_recent_summary(recent, window=1500, result_is_bot_pov=True):
+def print_recent_summary(recent, window=2000, result_is_bot_pov=True):
     """
     Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).
@@ -1567,15 +1567,17 @@ def print_recent_summary(recent, window=1500, result_is_bot_pov=True):
         )
     print("-" * 60)
 
-    # bot vs Stockfish summary
-    def pct(n, d): return (n / d) if d else 0.0
+    # bot vs Stockfish summary (score: W=1, D=0.5, L=0)
     total = sf_overall["N"]
     w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]
-    win = pct(w, total)
     avg = (sf_overall["plies_sum"] / total) if total else 0.0
+
+    score_pts = w + 0.5 * d
+    score = (score_pts / total) if total else 0.0
+
     print(
         f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
-        f"win_rate={win:.1%}  avg_plies={avg:.1f}"
+        f"score={score:.3f}  avg_plies={avg:.1f}"
     )
 
     # compute counts: scenario -> wins (combine colors)
@@ -1594,7 +1596,9 @@ def print_recent_summary(recent, window=1500, result_is_bot_pov=True):
 
     if wins_by_scenario:
         print("\nWins by scenario (SF games only):")
-        # sort by descending wins, then alphabetically
-        for s, c in sorted(wins_by_scenario.items(), key=lambda kv: (-kv[1], kv[0])):
+        for s, c in sorted(
+            wins_by_scenario.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        ):
             print(f"  {s:<30} {c}")
     print("~" * 60)

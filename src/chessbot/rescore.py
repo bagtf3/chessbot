@@ -379,7 +379,6 @@ class Rescorer(object):
             else:
                 this_q = tr.get("best_Q", tr.get("visit_weighted_Q"))
                 Q = this_q if turn else -1*this_q
-            
 
             Y = np.clip(0.5*Z_stm + 0.5*Q, -1.0, 1.0)
 
@@ -397,14 +396,36 @@ class Rescorer(object):
                 continue
 
             # if here, its MCTS move
-            # move_played may not be most visited due to temp sampling
-            # so inspect visits
+            # want CPL to reflect what Xerces would have played (robust/most_visited)
+            # not what was actually played when sampling is enabled.
             visits = [(c['uci'], max(1, c['visits'])) for c in cm]
             visits = sorted(visits, key=lambda x: x[1], reverse=True)
 
-            most_visited_uci = visits[0][0]
-            most_visited_ch = chess.Move.from_uci(most_visited_uci)
-            res = self.analyze_with_rank(most_visited_ch, board_ch)
+            if not visits:
+                continue
+
+            sel_method = tr.get("selection_method")
+            xc0_move = tr.get("xc0_move")
+
+            xerces_uci_for_cpl = mv
+            if xc0_move and xc0_move != mv:
+                xerces_uci_for_cpl = xc0_move
+                # if xc0 selected move isnt most visited, swap visits to make it so
+                top_uci = visits[0][0]
+                if xerces_uci_for_cpl != top_uci:
+                    vmap = {u: n for u, n in visits}
+                    top_n = vmap.get(top_uci, 1)
+                    xc0_n = vmap.get(xc0_move, 1)
+                    vmap[top_uci] = max(1, xc0_n)
+                    vmap[xc0_move] = max(1, top_n)
+                    visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            
+            elif not sel_method:
+                # backward-compat for older pkls that dont store method/xc0_move
+                xerces_uci_for_cpl = visits[0][0]
+
+            xerces_ch = chess.Move.from_uci(xerces_uci_for_cpl)
+            res = self.analyze_with_rank(xerces_ch, board_ch)
 
             loss_this = res['delta_signed']
             cpl_s += loss_this
@@ -414,15 +435,14 @@ class Rescorer(object):
             else:
                 cpl_b += loss_this
                 nb += 1
-            
+
             # we penalize missed-mate-but-still-winning less harshly
             missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
             if missed_mate:
-                # cap loss_this at 300, we are still winning here
                 loss_this = min(300, loss_this)
-            
+
             rows.append([
-                i, mv, most_visited_uci, str(res['best_move']),
+                i, mv, xerces_uci_for_cpl, str(res['best_move']),
                 res['best_cp'], loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
                 board_ch.turn, loss_this

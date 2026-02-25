@@ -645,12 +645,12 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     print("\n=== Stockfish Analysis (latest) ===")
     print(f"Retrain step: {latest_step}")
     print(f"Games analyzed: {int(s['games'])}")
-    print(f"Overall mean CPL: {float(s['avg_overall_mean_cpl']):.3f}")
-    print(f"  - White mean CPL: {float(s['avg_white_mean_cpl']):.3f}")
-    print(f"  - Black mean CPL: {float(s['avg_black_mean_cpl']):.3f}")
-    print(f"Overall best-move rate: {float(s['avg_overall_best_move_rate'])*100:.1f}%")
-    print(f"  - White best-move rate: {float(s['avg_best_move_rate_white'])*100:.1f}%")
-    print(f"  - Black best-move rate: {float(s['avg_best_move_rate_black'])*100:.1f}%")
+    print(f"Overall mean CPL: {s['avg_overall_mean_cpl']:.3f}")
+    print(f"  - White mean CPL: {s['avg_white_mean_cpl']:.3f}")
+    print(f"  - Black mean CPL: {s['avg_black_mean_cpl']:.3f}")
+    print(f"Overall best-move rate: {s['avg_overall_best_move_rate']*100:.1f}%")
+    print(f"  - White best-move rate: {s['avg_best_move_rate_white']*100:.1f}%")
+    print(f"  - Black best-move rate: {s['avg_best_move_rate_black']*100:.1f}%")
     print("===================================\n")
 
     # Need >=2 points to plot a trend

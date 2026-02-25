@@ -95,11 +95,14 @@ class MCTSTree(fasttree):
 
     def best(self):
         """
-        Before ply 30: sample from the top 5 moves by visits using a
-        temperature schedule that decays to near-deterministic by ply 30.
-        At/after ply 30: delegate to the base implementation.
-        Returns (uci, None) like the original.
+        Returns a 3-tuple:
+        (move_uci_to_play, selection_method, xerces_top_move_if_diff_else_none)
+
+        xerces_top_move_if_diff_else_none is set only when we sampled a different
+        move than Xerces would have played deterministically.
         """
+        xerces_move, xerces_method = self.select_xerces_top_move()
+
         # determine if we need to sample or not
         if self.config.sample_moves == False:
             sample = False
@@ -110,57 +113,73 @@ class MCTSTree(fasttree):
 
         else:
             sample = True
-        
+
         if not sample:
-            if self.sims_completed_this_move >= self.config.robust_only_above:
-                return self.select_using_robust()
-            else:
-                return super().best()
-        
+            return xerces_move, xerces_method, None
+
         # if here we are sampling
-        # gather root visits (desc sorted list of (uci, N))
         rows = self.root_child_visits()
         if not rows:
-            return super().best()
+            return xerces_move, xerces_method, None
 
         ucis = [u for u, _ in rows]
         visits = np.array([n for _, n in rows], dtype=np.float64)
 
         # trivial cases
         if len(ucis) == 1 or visits.sum() <= 0.0:
-            return ucis[0], None
+            move = ucis[0]
+            other = xerces_move if move != xerces_move else None
+            return move, "most_visited", other
 
         # force sampling only from the top 5 moves
         top_k = min(5, len(ucis))
         top_ucis = ucis[:top_k]
         top_visits = visits[:top_k]
 
-        # temperature schedule: linear decay from temp_max (ply 0) to
-        # temp_min (ply 25). Small temp_min makes softmax -> argmax.
+        # temperature schedule: linear decay from temp_max (ply 0) to temp_min (ply 30)
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
-        
+
         frac = max(0.0, min(1.0, (30.0 - self.n_plies) / 30.0))
         temp = temp_min + (temp_max - temp_min) * frac
 
-        # build stable logits from visits: use log(visits) so scale is sane
+        # build stable logits from visits: log(visits) keeps scale sane
         logits = np.log(top_visits + 1e-12) / max(1e-12, temp)
         logits = logits - np.max(logits)
-        exps = np.exp(logits)   
+        exps = np.exp(logits)
         probs = exps / exps.sum()
 
         idx = np.random.choice(len(top_ucis), p=probs)
-        return top_ucis[idx], None
+        move = top_ucis[idx]
+        other = xerces_move if move != xerces_move else None
+        return move, "sampled", other
+
+    def select_xerces_top_move(self):
+        """
+        Deterministic Xerces choice (no sampling), returning:
+        (uci, method) where method is "robust" or "most_visited".
+        """
+        if self.sims_completed_this_move >= self.config.robust_only_above:
+            uci = self.select_using_robust()
+            return uci, "robust"
+
+        uci, _ = super().best()
+        return uci, "most_visited"
+
 
     def select_using_robust(self):
-        """Needs to match (uci, None) return signature of best()."""
+        """
+        Deterministic robust selector.
+        Returns just the uci (so callers can label it however they want).
+        """
         rsc, details = self.robust_selection_criteria(5, 100)
         if (not rsc) or (not details) or (len(details) == 1):
-            return super().best()
+            uci, _ = super().best()
+            return uci
 
         most_visits = details[0].N
         sims_done = self.sims_completed_this_move
-        floor = 500 + 0.1*sims_done
+        floor = 500 + 0.1 * sims_done
         visit_threshold = min(max(200, most_visits * 0.7), floor)
 
         best_rsc = -np.inf
@@ -173,9 +192,10 @@ class MCTSTree(fasttree):
                     best_uci = d.uci
 
         if best_uci is None:
-            return super().best()
+            uci, _ = super().best()
+            return uci
 
-        return best_uci, None
+        return best_uci
         
     def advance(self, board, move_uci):
         """
@@ -539,9 +559,9 @@ class ChessGame(object):
     def is_stockfish_turn(self):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
-    def push_move(self, mv):
+    def push_move(self, mv, method, xc0_move):
         # collect search data then push and update
-        self.collect_tree_search_data(mv)
+        self.collect_tree_search_data(mv, method, xc0_move)
 
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)
@@ -555,7 +575,7 @@ class ChessGame(object):
         self.plies += 1
         return self.check_for_terminal()
     
-    def collect_tree_search_data(self, mv):
+    def collect_tree_search_data(self, mv, method, xc0_move):
         root = self.tree.root()
         if not root.is_expanded:
             return
@@ -582,6 +602,7 @@ class ChessGame(object):
 
         turn = self.turn() # STM
         data = {
+            "move_played": mv, "selection_method":method, "xc0_move": xc0_move,
             "sims": sims, "time": rnd(elapsed, 3),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,
@@ -655,7 +676,7 @@ class ChessGame(object):
             self.sf_search_depth.append(searched)
 
         self.sf_eval = sf_v
-        return self.push_move(best_move)
+        return self.push_move(best_move, "stockfish", None)
     
     def set_stockfish_result(self, res_tup):
         self.sf_res_tup = res_tup
@@ -672,7 +693,7 @@ class ChessGame(object):
         self.sf_res_tup = None
         self.sf_ready = False
         self.sf_pending = False
-        return self.push_move(best_move)
+        return self.push_move(best_move, "stockfish", None)
 
     def make_move_from_tree(self):
         """ Play best-by-visits  """
@@ -680,11 +701,11 @@ class ChessGame(object):
         if not root.is_expanded:
             return False
 
-        mv, _ = self.tree.best()
+        mv, method, xc0_mv = self.tree.best()
         if mv is None:
             return False
         
-        return self.push_move(mv)
+        return self.push_move(mv, method, xc0_mv)
 
     def check_for_eval_draw(self, cfg):
         n_last = cfg.eval_draw_span

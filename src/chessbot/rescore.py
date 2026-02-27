@@ -134,7 +134,9 @@ class Rescorer(object):
         # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, cfg.prior_clip_min, cfg.prior_clip_max)
+        #pi = np.clip(pi, cfg.prior_clip_min, cfg.prior_clip_max)
+        # less severe clipping here
+        pi = np.clip(pi, 0.0005, 0.8)
         pi = pi / pi.sum()
 
         # accumulate probs into flattened policy

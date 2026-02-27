@@ -550,14 +550,14 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
-
         sims_total = game.tree.sims_done_total
+        cfg = self.config
 
         # read adjudicator flags (direct attrs; they always exist)
-        mat = self.config.use_material_diff
-        tb = self.config.use_syzygy
-        dr = self.config.use_eval_draw
-        cl = self.config.use_eval_collar
+        mat = cfg.use_material_diff
+        tb = cfg.use_syzygy
+        dr = cfg.use_eval_draw
+        cl = cfg.use_eval_collar
 
         # encode into 0..15 index: bit0=material, bit1=syzygy, bit2=eval_draw,
         # bit3=eval_collar
@@ -578,7 +578,9 @@ class GameLooper(object):
             "adjudication_index": adjudication_index,
             # this is the specific c_puct and dirichlet eps, not the list of options
             "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps
+            "dirichlet_eps": game.tree.dirichlet_eps,
+            "prior_clip_min": cfg.prior_clip_min,
+            "prior_clip_max": cfg.prior_clip_max
         }
 
         # on-disk record (full)
@@ -589,7 +591,7 @@ class GameLooper(object):
         }
 
         res.update(mem_summary)
-        res.update(self.config.to_dict())
+        res.update(cfg.to_dict())
         res.update(game.meta)
 
         # attach tree search data to disk record
@@ -597,7 +599,7 @@ class GameLooper(object):
         res['c_puct'] = game.tree.c_puct
         res["dirichlet_eps"] = game.tree.dirichlet_eps
 
-        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
+        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
 

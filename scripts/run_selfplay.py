@@ -23,15 +23,12 @@ import signal
 import threading
 
 STOP_REQUESTED = threading.Event()
+PROCESS_TIME = 30.0
+_now = time.time
 
 
 def request_stop(signum=None, frame=None):
     STOP_REQUESTED.set()
-
-
-_now = time.time
-
-PROCESS_TIME = 30.0
 
 
 def update_game_index(game, base_cfg):
@@ -71,10 +68,19 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
+        if i == 1:
+            c.prior_clip_max = 0.65
+        
+        if i == 2:
+            c.prior_clip_max = 0.70
+            c.prior_clip_min = 0.005
+            
+        if i == 3:
+            c.prior_clip_max = 0.75
+            c.prior_clip_min = 0.001
 
-        if not cfg.is_validation_run:
-            if i > 1:
-                c.play_vs_sf_prob = 0.0
+        if not cfg.is_validation_run and i > 1:
+            c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()
         msg_q = ctx.Queue()

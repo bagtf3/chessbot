@@ -166,7 +166,6 @@ class MCTSTree(fasttree):
         uci, _ = super().best()
         return uci, "most_visited"
 
-
     def select_using_robust(self):
         """
         Deterministic robust selector.

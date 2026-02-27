@@ -403,7 +403,6 @@ class GameViewer:
         print(hdr)
         print(sep)
 
-
     def print_row(
         self,
         c,
@@ -412,6 +411,7 @@ class GameViewer:
         rank_val=None,
         show_rsc=False,
         rsc_val=None,
+        extra_flags=None,
     ):
         uci = c.get("uci", "")
         san = self.board.san(uci) if uci else "?"
@@ -424,17 +424,20 @@ class GameViewer:
         ds = c.get("Qdelta_sign", 0.0)
 
         p = c.get("P", 0.0)
-        u = c.get("U", 0.0) * (1.0 + 0.5*np.clip(ds, -0.5, 0.5))
+        u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
 
         qrel = q if self.board.side_to_move() == "w" else -q
-        puct = qrel + u 
+        puct = qrel + u
 
         flags = []
         if mark:
             flags.append("<-SF")
+        if extra_flags:
+            flags += list(extra_flags)
         if c.get("is_terminal", False):
             flags.append("T")
-        flags = ",".join(flags)
+
+        flags_txt = ", ".join([f for f in flags if f])
 
         parts = [
             f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
@@ -443,7 +446,7 @@ class GameViewer:
             "|",
             f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
             "|",
-            f"{flags:^9}",
+            f"{flags_txt:^9}",
         ]
 
         if show_rsc:
@@ -455,7 +458,7 @@ class GameViewer:
             parts.append(f"{r!s:<7}")
 
         print("  " + " ".join(parts))
-    
+
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
             print("End of game.")
@@ -483,16 +486,13 @@ class GameViewer:
         max_d = node.get("max_depth", 0)
         cv = node.get("children_visited", 0)
         tc = node.get("total_children", 0)
-        
-        uniq = node.get("unique_sims", None)
-        line = (f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
-                f"max_depth={max_d} children visited={cv}/{tc}")
-        if uniq is not None and sims:
-            frac = uniq / max(1, sims)
-            line += f"  unique={uniq} ({frac:.0%})"
+
+        line = (
+            f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
+            f"max_depth={max_d} children visited={cv}/{tc}"
+        )
         print(line)
 
-        # entropy: show normed entropy for visits and priors + KL/JS
         visits_list = [c.get("visits", 0) for c in cands]
         priors_list = [c.get("P", 0.0) for c in cands]
 
@@ -508,39 +508,130 @@ class GameViewer:
         cands_sorted = sorted(
             cands, key=lambda x: x.get("visits", 0), reverse=True
         )
+
         is_sf_turn = ("stockfish" in str(who).lower())
 
-        # index of SF's actual move among candidates (or None)
-        sf_idx = None
-        for i, c in enumerate(cands_sorted):
-            if c.get("uci") == chosen:
-                sf_idx = i
-                break
+        r_sf = self.sf_row_for_ply(self.ply)
+        sf_best_uci = None
+        if r_sf is not None:
+            sf_best_uci = str(r_sf.get("best_move", "") or "")
+
+        raw_xc0 = node.get("xc0_move")
+        if (not is_sf_turn) and (not raw_xc0):
+            xc0_move = chosen
+        else:
+            xc0_move = raw_xc0
+
+        sampled = bool((not is_sf_turn) and raw_xc0 and (raw_xc0 != chosen))
+
+        xc0_idx = None
+        if xc0_move:
+            for i, c in enumerate(cands_sorted):
+                if c.get("uci") == xc0_move:
+                    xc0_idx = i
+                    break
+
+        sf_best_idx = None
+        if sf_best_uci:
+            for i, c in enumerate(cands_sorted):
+                if c.get("uci") == sf_best_uci:
+                    sf_best_idx = i
+                    break
+
+        need_rank = False
+        if is_sf_turn and sf_best_idx is not None:
+            need_rank = (sf_best_idx >= top_n)
+
+        if (not is_sf_turn) and sf_best_idx is not None:
+            need_rank = need_rank or (sf_best_idx >= top_n)
+
+        if (not is_sf_turn) and xc0_idx is not None:
+            need_rank = need_rank or (xc0_idx >= top_n)
+
+        self.print_header(show_rank=need_rank, show_rsc=True)
+        rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
 
         shown_ucis = set()
 
-        need_rank = False
-        if is_sf_turn and sf_idx is not None:
-            need_rank = (sf_idx >= top_n)
+        for i, c in enumerate(cands_sorted[:top_n]):
+            uci = c.get("uci")
+            extra = []
 
-        self.print_header(show_rank=need_rank, show_rsc=True)
-        # top-N: never show ranks; just mark if SF move is in top-N
-        rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
-        for c in cands_sorted[:top_n]:
+            if not is_sf_turn:
+                if xc0_move and (uci == xc0_move):
+                    if sf_best_uci and (uci == sf_best_uci):
+                        extra.append("<-Xc0, SF")
+                    else:
+                        extra.append("<-Xc0")
+
+                if sampled and (uci == chosen) and (chosen != xc0_move):
+                    if sf_best_uci and (chosen == sf_best_uci):
+                        extra.append("<-SF,samp")
+                    else:
+                        extra.append("<-sampled")
+
+            mark = False
+            if is_sf_turn:
+                mark = (uci == chosen)
+            else:
+                if sf_best_uci and (uci == sf_best_uci):
+                    is_xc0_sf = bool(xc0_move and (uci == xc0_move))
+                    is_samp_sf = bool(
+                        sampled and (chosen == sf_best_uci) and (uci == chosen)
+                        and (chosen != xc0_move)
+                    )
+                    if (not is_xc0_sf) and (not is_samp_sf):
+                        mark = True
+
             self.print_row(
-                c, mark=is_sf_turn and (c.get("uci") == chosen),
-                show_rank=need_rank, rank_val=None, show_rsc=True,
-                rsc_val=rsc_map.get(c.get("uci"))
+                c,
+                mark=mark,
+                show_rank=need_rank,
+                rank_val=(i + 1) if need_rank else None,
+                show_rsc=True,
+                rsc_val=rsc_map.get(uci),
+                extra_flags=extra,
             )
-            shown_ucis.add(c.get("uci"))
+            shown_ucis.add(uci)
 
-        # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
-        if need_rank:
-            if cands_sorted[sf_idx].get("uci") not in shown_ucis:
+        if (not is_sf_turn) and xc0_move and (xc0_move not in shown_ucis):
+            if xc0_idx is not None:
                 print("   ...")
+                extra = []
+                if sf_best_uci and (xc0_move == sf_best_uci):
+                    extra.append("<-Xc0, SF")
+                else:
+                    extra.append("<-Xc0")
+
                 self.print_row(
-                    cands_sorted[sf_idx], mark=True,
-                    show_rank=True, rank_val=sf_idx + 1, show_rsc=False
+                    cands_sorted[xc0_idx],
+                    mark=False,
+                    show_rank=True,
+                    rank_val=xc0_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=extra
+                )
+                shown_ucis.add(xc0_move)
+
+        if (not is_sf_turn) and sf_best_uci and (sf_best_uci not in shown_ucis):
+            if sf_best_idx is not None:
+                print("   ...")
+                extra = []
+                mark = True
+
+                if sampled and (sf_best_uci == chosen) and (chosen != xc0_move):
+                    extra.append("<-SF,samp")
+                    mark = False
+
+                self.print_row(
+                    cands_sorted[sf_best_idx],
+                    mark=mark,
+                    show_rank=True,
+                    rank_val=sf_best_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=extra
                 )
 
         this_q = node.get("best_Q")
@@ -549,17 +640,16 @@ class GameViewer:
             if this_q is not None:
                 print(f"\nvisit-weighted Q={this_q}")
         else:
-            print(f"\nmost-visted Q={this_q}")
+            print(f"\nBest Q={this_q}")
 
-        # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
             stm_white = self.turn()
 
-            best_uci   = str(r.get("best_move", "") or "")
+            best_uci = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
 
-            best_cp_raw   = r.get("best_cp", None)
+            best_cp_raw = r.get("best_cp", None)
             played_cp_raw = r.get("played_cp", None)
 
             def pov(cp):
@@ -567,34 +657,45 @@ class GameViewer:
                     return None
                 return int(cp if stm_white else -cp)
 
-            best_cp_pov   = pov(best_cp_raw)
+            best_cp_pov = pov(best_cp_raw)
             played_cp_pov = pov(played_cp_raw)
 
             loss = r.get("clipped_loss", r.get("loss", None))
             if loss is None and best_cp_pov is not None and played_cp_pov is not None:
                 loss = max(0, best_cp_pov - played_cp_pov)
 
-            # recompute match flag from UCIs to avoid DF drift
-            matched = (best_uci == played_uci) if best_uci and played_uci else False
+            xc0_uci = node.get("xc0_move") if node else None
+            cmp_uci = xc0_uci if (xc0_uci and xc0_uci != chosen) else chosen
+            matched = ((best_uci == cmp_uci) if best_uci and cmp_uci else False)
 
             def to_san(uci):
                 return self.board.san(uci)
 
-            best_san   = to_san(best_uci) if best_uci else "?"
+            best_san = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"
+            xc0_san = to_san(xc0_uci) if xc0_uci else "?"
 
             parts = []
             if loss is not None:
                 parts.append(f"CPL={int(loss)}")
+
             if played_san != "?":
-                parts.append(f"played={played_san} ({'✓' if matched else '×'})")
+                parts.append(f"played={played_san}")
+
+            if xc0_uci and xc0_san != "?":
+                parts.append(f"Xc0={xc0_san} ({'✓' if matched else '×'})")
+            elif played_san != "?":
+                parts.append(f"({'✓' if matched else '×'})")
+
             if best_san != "?":
                 parts.append(f"SF best={best_san}")
+
             if (best_cp_pov is not None) and (played_cp_pov is not None):
                 parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
 
             if parts:
                 print("SF:", "  ".join(parts))
+
         print("=" * 60)
 
     def show_visits(self, uci_or_san):
@@ -618,9 +719,50 @@ class GameViewer:
             print(f"No visit info available for {uci_or_san}")
             return
 
+        is_sf_turn = ("stockfish" in str(who).lower())
+        xc0_move = node.get("xc0_move") if node else None
+
+        r = self.sf_row_for_ply(self.ply)
+        sf_best_uci = None
+        if r is not None:
+            sf_best_uci = str(r.get("best_move", "") or "")
+
+        uci = move.get("uci")
+
+        sampled = bool(xc0_move and (xc0_move != chosen) and (not is_sf_turn))
+
+        extra = []
+        mark = False
+
+        if is_sf_turn:
+            if uci == chosen:
+                mark = True
+        else:
+            if xc0_move and uci == xc0_move:
+                if sf_best_uci and (uci == sf_best_uci):
+                    extra.append("<-Xc0, SF")
+                else:
+                    extra.append("<-Xc0")
+
+            if sampled and (uci == chosen) and (chosen != xc0_move):
+                if sf_best_uci and (chosen == sf_best_uci):
+                    extra.append("<-SF,samp")
+                else:
+                    extra.append("<-sampled")
+
+            if sf_best_uci and (uci == sf_best_uci):
+                mark = True
+
         print(f"  === Showing visit info for {uci_or_san} ===")
         self.print_header(show_rank=True, show_rsc=False)
-        self.print_row(move, show_rank=True, rank_val=rank, show_rsc=False)
+        self.print_row(
+            move,
+            mark=mark,
+            show_rank=True,
+            rank_val=rank,
+            show_rsc=False,
+            extra_flags=extra,
+        )
         print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 
     def show_options(self):

@@ -126,7 +126,7 @@ class Rescorer(object):
         - pi:  list/array of probs (sum ~= 1)
         - Y: target for value head
         """
-        cfg = self.config
+        
         # get indices from C++
         indices = board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
@@ -134,9 +134,7 @@ class Rescorer(object):
         # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        #pi = np.clip(pi, cfg.prior_clip_min, cfg.prior_clip_max)
-        # less severe clipping here
-        pi = np.clip(pi, 0.0005, 0.8)
+        pi = np.clip(pi, 0.0005, 0.9)
         pi = pi / pi.sum()
 
         # accumulate probs into flattened policy

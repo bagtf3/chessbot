@@ -91,8 +91,8 @@ class Config(object):
     }
 
     # priors
-    prior_clip_max = 0.55
-    prior_clip_min = 0.015
+    uniform_eps = 0.25
+    prior_clip_max = 0.75
 
     # randomness
     add_root_noise = True

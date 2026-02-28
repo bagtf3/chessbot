@@ -109,10 +109,14 @@ class GameLooper(object):
     def load_reload_model(self):
         cfg = self.config
         self.model = load_model(cfg.model_path)
+
         self.infer = make_conv_infer(
-            self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
-            vscale=cfg.vscale)
+            self.model,
+            max_bs=cfg.fwd_batch,
+            uniform_eps=cfg.uniform_eps,
+            prior_clip_max=cfg.prior_clip_max,
+            vscale=cfg.vscale
+        )
     
     def check_for_pause(self):
         """
@@ -579,7 +583,7 @@ class GameLooper(object):
             # this is the specific c_puct and dirichlet eps, not the list of options
             "c_puct": game.tree.c_puct,
             "dirichlet_eps": game.tree.dirichlet_eps,
-            "prior_clip_min": cfg.prior_clip_min,
+            "uniform_eps": cfg.uniform_eps,
             "prior_clip_max": cfg.prior_clip_max
         }
 

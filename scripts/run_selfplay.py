@@ -69,15 +69,13 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         c = cfg.copy()
         c.id = f"w{i}"
         if i == 1:
-            c.prior_clip_max = 0.65
+            c.uniform_eps = 0.1
         
         if i == 2:
-            c.prior_clip_max = 0.70
-            c.prior_clip_min = 0.005
+            c.uniform_eps = 0.15
             
         if i == 3:
-            c.prior_clip_max = 0.75
-            c.prior_clip_min = 0.001
+            c.uniform_eps = 0.2
 
         if not cfg.is_validation_run and i > 1:
             c.play_vs_sf_prob = 0.0

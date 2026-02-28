@@ -78,38 +78,6 @@ def build_conv_trunk(input_shape=(8, 8, 70), width=256, n_blocks=8, leak=0.05):
     return Model(inputs, [trunk_feat, trunk_vec], name="conv_trunk")
 
 
-def make_conv_model(name, input_shape=(8, 8, 70), width=256, n_blocks=8):
-    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
-    inputs = trunk.input
-    trunk_feat, trunk_vec = trunk.output
-
-    # Heads
-    val_out, _ = value_head(trunk_vec, hidden=512)
-    best_outputs = policy_factor_head(trunk_vec, prefix="best", hidden=512)
-
-    model = Model(inputs, [val_out] + best_outputs, name=name)
-
-    losses = {
-        "value": tf.keras.losses.MeanSquaredError(),
-        "best_from": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_to":   tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_piece":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_promo":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-    }
-
-    loss_weights = {
-        "value": 0.5,
-        "best_from": 0.5,
-        "best_to": 0.5,
-        "best_piece": 0.5,
-        "best_promo": 0.1,
-    }
-
-    opt = tf.keras.optimizers.Adam(1e-4)
-    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
-    return model
-
-
 def make_fwd(model, warm_shapes=(64, 256)):
     """
     Returns a callable fwd(X_np) that:
@@ -387,19 +355,30 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
+def make_conv_infer(
+    model,
+    max_bs=1024,
+    uniform_eps=0.0,
+    prior_clip_max=1.0,
+    vscale=0.9,
+):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-    enc_np: int32 [B,64], legal_np: int32 [B,4288].
-    min_p, max_p are baked into the closure.
-    vscale scales the model value output (default 0.9 -> range ~[-0.9,0.9])
+
+    uniform_eps mixes uniform mass over legal moves:
+        probs = (1 - eps) * probs + eps * uniform_legal
+
+    prior_clip_max caps peaks after mixing (no floor clipping):
+        probs = min(probs, clip_max), then renorm
     """
 
-    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-    EPS = tf.constant(1e-12, dtype=tf.float32)
+    big_neg = tf.constant(-1e9, dtype=tf.float32)
+    eps_small = tf.constant(1e-12, dtype=tf.float32)
 
-    min_p_c = tf.constant(float(min_p), dtype=tf.float32)
-    max_p_c = tf.constant(float(max_p), dtype=tf.float32)
+    ue = tf.constant(float(uniform_eps), dtype=tf.float32)
+    ue = tf.clip_by_value(ue, 0.0, 1.0)
+
+    pcm = tf.constant(float(prior_clip_max), dtype=tf.float32)
     value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
 
     @tf.function(input_signature=[
@@ -407,37 +386,39 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
         tf.TensorSpec([None, 4288], tf.int32),
     ], experimental_compile=True)
     def graph(enc, legal):
-        # model returns (policy_logits, value)
         logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4288)
+        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
 
         mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
         logits32 = tf.cast(logits, tf.float32)
 
-        # mask illegal moves with a large negative in float32
-        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
+        masked_logits32 = tf.where(mask > 0.5, logits32, big_neg)
 
-        # softmax in float32 (temperature removed)
         row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
         exp = tf.exp(masked_logits32 - row_max) * mask
         sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
+
         has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
+        probs = tf.where(has_any, exp / (sumexp + eps_small), tf.zeros_like(exp))
 
-        # clipping on legal slots and renormalize (float32)
-        clipped = tf.where(mask > 0.5,
-                           tf.clip_by_value(probs, min_p_c, max_p_c),
-                           tf.zeros_like(probs))
-        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
-        valid = s > EPS
-        probs_final = tf.where(
-            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
-            tf.zeros_like(clipped)
-        )
+        if uniform_eps != 0.0:
+            legal_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
+            uni = tf.where(
+                legal_sum > 0.0,
+                mask / (legal_sum + eps_small),
+                tf.zeros_like(mask),
+            )
+            probs = (1.0 - ue) * probs + ue * uni
 
-        # scale value to reduce range (helps find mate scores)
+        if prior_clip_max < 1.0:
+            probs = tf.minimum(probs, pcm) * mask
+
+        s = tf.reduce_sum(probs, axis=1, keepdims=True)
+        probs = tf.where(s > eps_small, probs / (s + eps_small),
+                         tf.zeros_like(probs))
+
         value_f = tf.cast(value, tf.float32) * value_scale_c
-        return probs_final, value_f
+        return probs, value_f
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):
@@ -456,6 +437,7 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
         B = int(enc_np.shape[0])
         if B <= max_bs:
             return base_fwd((enc_np, legal_np))
+
         parts = None
         i = 0
         while i < B:
@@ -467,7 +449,9 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
                 parts[0] = np.concatenate([parts[0], p_probs], axis=0)
                 parts[1] = np.concatenate([parts[1], p_val], axis=0)
             i = j
+
         return parts
+
     return fwd
 
 

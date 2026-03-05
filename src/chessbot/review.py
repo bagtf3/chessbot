@@ -538,9 +538,15 @@ class GameViewer:
                     sf_best_idx = i
                     break
 
+        chosen_idx = None
+        for i, c in enumerate(cands_sorted):
+            if c.get("uci") == chosen:
+                chosen_idx = i
+                break
+
         need_rank = False
-        if is_sf_turn and sf_best_idx is not None:
-            need_rank = (sf_best_idx >= top_n)
+        if is_sf_turn and chosen_idx is not None:
+            need_rank = (chosen_idx >= top_n)
 
         if (not is_sf_turn) and sf_best_idx is not None:
             need_rank = need_rank or (sf_best_idx >= top_n)
@@ -633,6 +639,19 @@ class GameViewer:
                     rsc_val=None,
                     extra_flags=extra
                 )
+        if is_sf_turn and chosen and (chosen not in shown_ucis):
+            if chosen_idx is not None:
+                print("   ...")
+                self.print_row(
+                    cands_sorted[chosen_idx],
+                    mark=True,
+                    show_rank=True,
+                    rank_val=chosen_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=None,
+                )
+                shown_ucis.add(chosen)
 
         this_q = node.get("best_Q")
         if this_q is None:

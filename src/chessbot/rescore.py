@@ -134,7 +134,7 @@ class Rescorer(object):
         # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, 0.0005, 0.9)
+        pi = np.clip(pi, 0.0002, 0.9)
         pi = pi / pi.sum()
 
         # accumulate probs into flattened policy
@@ -185,16 +185,15 @@ class Rescorer(object):
         self.written_this_round += len(chunk)
         self.written_total += len(chunk)
 
-    def training_data_from_sf(self, board, mv, cm, Y):
+    def training_data_from_sf(self, board, mv, cm, Y, is_draw):
         cfg = self.config
 
-        rows = [(c['uci'], c['visits']) for c in cm]
+        rows = [(c["uci"], c["visits"]) for c in cm]
         total_visits = sum([n for _, n in rows]) if rows else 0
 
         visit_map = None
         use_tree_visits = False
 
-        # make sure we have at least 10 visits for stability
         if rows and total_visits > 10:
             visit_map = {u: n for u, n in rows}
             most_visited_uci, max_visits = max(rows, key=lambda x: x[1])
@@ -202,9 +201,8 @@ class Rescorer(object):
             if most_visited_uci == mv:
                 use_tree_visits = True
             else:
-                # boost top visited with SF move
                 top_count = visit_map[most_visited_uci]
-                visit_map[mv] = 1 + int(top_count*1.25)
+                visit_map[mv] = 1 + int(top_count * 1.25)
                 use_tree_visits = True
 
         if use_tree_visits and visit_map is not None:
@@ -215,12 +213,11 @@ class Rescorer(object):
             ucis = [x[0] for x in raw]
             visits = [int(x[1]) for x in raw]
 
-        # calc KL divergence after adjustments
-        priors_map = {c['uci']: c['P'] for c in cm}
+        priors_map = {c["uci"]: c["P"] for c in cm}
         priors = [priors_map.get(u, 0.0) for u in ucis]
         kl = kl_divergence(priors, visits)
 
-        vwht = cfg.value_loss_weight
+        vwht = value_weight_for_game(cfg, is_draw)
         pwht = cfg.policy_loss_weight
         if kl > cfg.KL_boost_threshold:
             pwht *= cfg.KL_weight_boost
@@ -339,7 +336,7 @@ class Rescorer(object):
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
         result = game_data['result']
-
+        is_draw = (result == 0) or (result == 0.0)
         cpl_s = cpl_w = cpl_b = 0.0
         nw = nb = 0
         rows = []
@@ -390,7 +387,7 @@ class Rescorer(object):
 
             # if sf_move, gather training data, push moves, continue
             if is_sf_move:
-                self.training_data_from_sf(b_fast, mv, cm, Y)
+                self.training_data_from_sf(b_fast, mv, cm, Y, is_draw)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
@@ -492,7 +489,7 @@ class Rescorer(object):
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
-            vwht = cfg.value_loss_weight
+            vwht = value_weight_for_game(cfg, is_draw)
             pwht = cfg.policy_loss_weight
 
             # adjust training weights based on KL
@@ -612,6 +609,13 @@ class Rescorer(object):
         self.analyzed_results = []
 
 # helpers
+def value_weight_for_game(cfg, is_draw):
+    vwht = cfg.value_loss_weight
+    if is_draw:
+        vwht *= cfg.draw_weight
+    return vwht
+
+
 def ensure_all_legal_moves_have_visits(visit_pairs, lms):
     """
     visit_pairs: list of (uci, visits) or [uci, visits]

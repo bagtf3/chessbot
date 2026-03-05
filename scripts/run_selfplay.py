@@ -5,8 +5,6 @@ import queue as py_queue
 import multiprocessing as mp
 import sys
 import json
-from collections import deque
-import pathlib
 
 import numpy as np
 import pandas as pd
@@ -68,15 +66,6 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-        if i == 1:
-            c.uniform_eps = 0.1
-        
-        if i == 2:
-            c.uniform_eps = 0.15
-            
-        if i == 3:
-            c.uniform_eps = 0.2
-
         if not cfg.is_validation_run and i > 1:
             c.play_vs_sf_prob = 0.0
 

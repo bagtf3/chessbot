@@ -18,6 +18,7 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
+from chessbot.engines import lc0_analyze
 from chessbot.utils import print_recent_summary, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
@@ -186,7 +187,121 @@ class GameViewer:
                         print("  played move eval not available")
             else:
                 print(f"\nPlayed move {upcoming_san} is in SF top-3.")
-    
+
+    def run_lc0_topk(self, nodes=4000, k=5, engine_cfg=None):
+        """Return top-k rows from lc0 (sorted by N) for the current position."""
+        sf_board = chess.Board(self.board.fen())
+        rows = lc0_analyze(sf_board, nodes=nodes, engine_cfg=engine_cfg)
+        return rows[:k]
+
+    def show_lc0_overlay(self, token="lc0"):
+        """Parse 'lc0' or 'lc0 N' and print lc0 top-5 vs xc0 comparison."""
+        nodes = 4000
+        parts = token.split()
+        if len(parts) >= 2:
+            try:
+                nodes = int(parts[1])
+            except ValueError:
+                pass
+
+        print(f"Running lc0 ({nodes} nodes)...")
+        sf_board = chess.Board(self.board.fen())
+        all_rows = lc0_analyze(sf_board, nodes=nodes)
+        if not all_rows:
+            print("No lc0 data returned.")
+            return
+
+        # xc0 candidate lookup: uci -> candidate dict
+        node, _, _ = self.node_who_chosen()
+        cands = (node.get("candidate_moves") or []) if node else []
+        xc0_map = {c["uci"]: c for c in cands}
+
+        white_to_move = self.board.side_to_move() == "w"
+        sign = 1 if white_to_move else -1
+
+        # stats over all rows using the union of lc0 and xc0 moves
+        all_ucis = list({r["move"] for r in all_rows} | set(xc0_map))
+        lc0_visit_map = {r["move"]: r.get("N", 0) for r in all_rows}
+        lc0_prior_map = {r["move"]: r.get("P_pct", 0.0) / 100.0 for r in all_rows}
+        xc0_visit_map = {c["uci"]: c.get("visits", 0) for c in cands}
+        xc0_prior_map = {c["uci"]: c.get("P", 0.0) for c in cands}
+
+        lc0_vis_vec  = np.array([lc0_visit_map.get(u, 0)   for u in all_ucis],
+                                dtype=np.float64)
+        lc0_pri_vec  = np.array([lc0_prior_map.get(u, 0.0) for u in all_ucis],
+                                dtype=np.float64)
+        xc0_vis_vec  = np.array([xc0_visit_map.get(u, 0)   for u in all_ucis],
+                                dtype=np.float64)
+        xc0_pri_vec  = np.array([xc0_prior_map.get(u, 0.0) for u in all_ucis],
+                                dtype=np.float64)
+
+        lc0_ent_vis, lc0_pvis = self.compute_norm_entropy(lc0_vis_vec)
+        lc0_ent_pri, lc0_ppri = self.compute_norm_entropy(lc0_pri_vec)
+        xc0_ent_vis, xc0_pvis = self.compute_norm_entropy(xc0_vis_vec)
+        xc0_ent_pri, xc0_ppri = self.compute_norm_entropy(xc0_pri_vec)
+        lc0_kl_vp    = kl_divergence_bits(lc0_pvis, lc0_ppri)
+        kl_xpri_lpri = kl_divergence_bits(xc0_ppri, lc0_ppri)
+        kl_xvis_lvis = kl_divergence_bits(xc0_pvis, lc0_pvis)
+
+        hdr = (
+            f"  {'SAN':<7}  {'N':>6}  {'P(lc0)':>7}  {'P(xc0)':>7}"
+            f"  |  {'Q(lc0)':>7}  {'Q(xc0)':>7}  |  {'D':>5}"
+        )
+        sep = "  " + "-" * (len(hdr) - 2)
+        print(f"\n  lc0 top moves ({nodes} nodes, Q=white-pov):")
+        print(hdr)
+        print(sep)
+
+        top_ucis = set()
+        for r in all_rows[:5]:
+            mv  = r["move"]
+            san = self.board.san(mv)
+            n     = r.get("N", 0)
+            p_lc0 = r.get("P_pct", 0.0) / 100.0
+            q_lc0 = r.get("Q", 0.0) * sign
+            d     = r.get("D", 0.0)
+
+            xc0   = xc0_map.get(mv)
+            p_xc0 = xc0["P"] if xc0 else float("nan")
+            q_xc0 = xc0["Q"] if xc0 else float("nan")
+
+            print(
+                f"  {san:<7}  {n:>6}  {p_lc0:>7.3f}  {p_xc0:>7.3f}"
+                f"  |  {q_lc0:>+7.3f}  {q_xc0:>+7.3f}  |  {d:>5.3f}"
+            )
+            top_ucis.add(mv)
+
+        print(sep)
+        print(
+            f"  {'ent (norm):':<16}  {'vis':>5}  {'pri':>5}  KL(vis||pri)"
+        )
+        print(
+            f"  {'lc0':<16}  {lc0_ent_vis:>5.3f}  {lc0_ent_pri:>5.3f}"
+            f"  {lc0_kl_vp:.3f} bits"
+        )
+        print(
+            f"  {'cross KL:':<16}"
+            f"  xc0_p||lc0_p={kl_xpri_lpri:.3f}"
+            f"   xc0_v||lc0_v={kl_xvis_lvis:.3f} bits"
+        )
+
+        if self.ply < len(self.moves_uci):
+            upcoming_uci = self.moves_uci[self.ply]
+            upcoming_san = self.board.san(upcoming_uci)
+            if upcoming_uci not in top_ucis:
+                match = next((r for r in all_rows if r["move"] == upcoming_uci), None)
+                if match:
+                    q_lc0 = match.get("Q", 0.0) * sign
+                    n     = match.get("N", 0)
+                    print(
+                        f"\nPlayed {upcoming_san} not in top-5:"
+                        f"  N={n}  Q(lc0)={q_lc0:+.3f}"
+                    )
+                else:
+                    print(f"\nPlayed {upcoming_san} not visited by lc0.")
+            else:
+                print(f"\nPlayed {upcoming_san} is in lc0 top-5.")
+
     def align_sf_rows_to_json(self):
         self._sf_by_ply = {}
         if self.sf_rows is None:
@@ -795,6 +910,8 @@ class GameViewer:
         print("  fen                  print FEN for current position")
         print("  sf                   stockfish overlay (uses default depth)")
         print("  sf<D>                stockfish eval to depth D, e.g. sf12")
+        print("  lc0                  lc0 overlay (default 4000 nodes)")
+        print("  lc0 <N>              lc0 eval with N nodes, e.g. lc0 8000")
         print("  visits <move>        show MCTS visits for specific move")
         print("  visits <N>           show visit info for N top moves")
         print("  pv                   show principal variation (min_vis=1)")
@@ -832,7 +949,9 @@ class GameViewer:
                     n = int(s) if s.isdigit() else 1
                 self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
-                self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
+                self.show_sf_overlay(cmd)
+            elif cmd.startswith("lc0"):
+                self.show_lc0_overlay(cmd)
             elif cmd.startswith("b"):
                 # b, back, b5, b 5 all supported
                 s = cmd[1:].strip()

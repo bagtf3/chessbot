@@ -63,7 +63,7 @@ class GameViewer:
         
         self.start_fen = self.log.get("start_fen")
         self.moves_uci = self.log.get("moves_played", [])
-        self.tree_data = self.log.get("tree_search_data", {})
+        self.tree_data = {int(k): v for k, v in self.log.get("tree_search_data", {}).items()}
         self.result = self.log.get("result")
         self.game_id = self.log.get("game_id")
     
@@ -211,6 +211,12 @@ class GameViewer:
             print("No lc0 data returned.")
             return
 
+        # lc0 reports castling in Chess960 UCI (e.g. e8h8 = king captures rook).
+        # Normalize to standard king-destination UCI so san() and xc0 lookup work.
+        castle_norm = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+        for r in all_rows:
+            r["move"] = castle_norm.get(r["move"], r["move"])
+
         # xc0 candidate lookup: uci -> candidate dict
         node, _, _ = self.node_who_chosen()
         cands = (node.get("candidate_moves") or []) if node else []
@@ -248,7 +254,8 @@ class GameViewer:
             f"  |  {'Q(lc0)':>7}  {'Q(xc0)':>7}  |  {'D':>5}"
         )
         sep = "  " + "-" * (len(hdr) - 2)
-        print(f"\n  lc0 top moves ({nodes} nodes, Q=white-pov):")
+        to_move = "White" if white_to_move else "Black"
+        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=white-pov):")
         print(hdr)
         print(sep)
 
@@ -1023,7 +1030,7 @@ class GameViewer:
             rb = self.board
             lms = rb.legal_moves()
             
-            node = self.tree_data.get(str(self.ply), {})
+            node = self.tree_data.get(self.ply, {})
             if not node:
                 self.next()
                 continue
@@ -1035,7 +1042,8 @@ class GameViewer:
                 
                 # add in all legal moves if missing
                 for move in [l for l in lms if l not in visited]:
-                    visited.append([[move, 1]])
+                    visited.add(move)
+                    visits.append([move, 1])
                     
                 visits = sorted(visits, key=lambda x: x[1], reverse=True)
                 

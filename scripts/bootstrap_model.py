@@ -21,42 +21,9 @@ def load_model(model_loc):
     model = keras.models.load_model(model_loc)
     return model
 
-# inner = 256
-# nb = 16
-# MODEL_NAME = f'lowrank_{nb}x{inner}'
-
-# model, opt, loss_weights, loss_dict = build_lowrank_res_stack_64x67(
-#     MODEL_NAME,
-#     d_model=64,
-#     vocab_size=21,
-#     inner_dim=inner,
-#     num_blocks=nb,
-#     dropout=0.025
-# )
-
-# bl = 8
-# fl = 256
-# tl = 6
-# MODEL_NAME = f'conformer_{bl}x{fl}x{tl}'
-
-# model, opt, loss_weights, loss_dict = build_conformer_64x67(
-#     MODEL_NAME,
-#     d_model_embed=128,
-#     vocab_size=21,
-#     conv_filters=fl,
-#     conv_blocks=bl,
-#     transformer_layers=tl,
-#     num_heads=8,
-#     ff_dim=768,
-#     dropout=0.025
-# )
-
-# model.summary()
-# model.save(MODEL_DIR + f"{MODEL_NAME}_init.h5")
-
-model_file_init = 'C:/Users/Bryan/Data/chessbot_data/models/conv_lr_mha_642x256x3_init.h5'
+model_file_init = 'C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/val_test_model.h5'
 model = load_model(model_file_init)
-run_tag = "conv_lr_mha_642x256x3"
+run_tag = "val_test"
 run_dir = os.path.join(SP_DIR, run_tag)
 model_file = os.path.join(run_dir, run_tag + "_model.h5")
 progress_file = os.path.join(run_dir, "eval_progress.csv")
@@ -68,17 +35,18 @@ eps = 1e-12
 big_neg = -1e6
 
 run_tags = [rt for rt in os.listdir(SP_DIR) if rt != run_tag]
+run_tags = ["cf_10x256x5_full_sims3", "cf_10x256x5_full_sims4", "cf_10x256x5_deep_sims1"]
 all_games = []
 df_list = []
 
 def check(a):
-    if isinstance(a['json_file'], str):
-        return os.path.exists(a['json_file'])
+    if isinstance(a['pkl_file'], str):
+        return os.path.exists(a['pkl_file'])
     return False
 
 if not os.path.exists(model_file):
     model.save(model_file)
-#%%
+
 all_games = []
 df_list = []
 for rt in run_tags:
@@ -113,9 +81,9 @@ if "overall_cpl" in meta.columns:
     
 meta = meta.query("plies >= 10")
 meta = meta.merge(df_trim[['game_id', 'run_tag', 'overall_cpl']], on='game_id')
-meta = meta.query("overall_cpl <= 40")
+meta = meta.query("overall_cpl <= 30")
 
-training_games = meta['json_file'].to_list()
+training_games = meta['pkl_file'].to_list()
 print(len(training_games))
 random.shuffle(training_games)
 
@@ -126,7 +94,7 @@ def moving_average_pd(arr, window=15):
 
 
 def append_to_buffer(buf, X, M, P, Z, V):
-    y = [0.5 * a + 0.5 * b for a, b in zip(Z, V)]
+    y = [0.99 * a + 0.1 * b for a, b in zip(Z, V)]
     buf += list(zip(X, M, P, y))
 
 
@@ -136,34 +104,46 @@ def top_up_sliding_buffer(
     idx,
     buffer_size,
     draw_rate=0.5,
-    boost=True
+    boost=False
 ):
+    t0 = time.time()
+    n_loaded = 0
+    n_skipped_draw = 0
+    n_skipped_short = 0
+    n_skipped_empty = 0
+    t_load = 0.0
+    t_gen = 0.0
+
     while len(buf) < buffer_size and idx < len(training_games):
         game = training_games[idx]
         idx += 1
-        
-        try:
-            gv = GameViewer(game, sf_df=None)
-    
-            if gv.result == 0:
-                if np.random.random() > draw_rate:
-                    continue
-    
-            if len(gv.moves_uci) < 10:
+
+        _t = time.time()
+        gv = GameViewer(game, sf_df=None)
+        t_load += time.time() - _t
+
+        if gv.result == 0:
+            if np.random.random() > draw_rate:
+                n_skipped_draw += 1
                 continue
-            
-            # X, Mask, Pi, result (Z), Vwq, moves remaining
-            X, M, P, Z, V, R = gv.generate_training_data(
-                sf_skip=False, check_boost=0, capture_boost=0
-            )
-            if not X:
-                continue
-    
-            append_to_buffer(buf, X, M, P, Z, V)
-        except Exception as e:
-            print(e)
+
+        if len(gv.moves_uci) < 10:
+            n_skipped_short += 1
             continue
 
+        _t = time.time()
+        X, M, P, Z, V, R = gv.generate_training_data(
+            sf_skip=False, check_boost=0, capture_boost=0
+        )
+        t_gen += time.time() - _t
+
+        if not X:
+            n_skipped_empty += 1
+            continue
+
+        n_loaded += 1
+        append_to_buffer(buf, X, M, P, Z, V)
+        
     return idx
 
 
@@ -203,11 +183,11 @@ batch_size = 512
 epoch_size = 20*batch_size
 buffer_size = 6 * epoch_size
 epoch, idx = 0, 0
-MAX_EPOCH = 350
+MAX_EPOCH = 400
 draw_rate = 0.5
 begin = time.time()
-loss_weights = {"policy_logits": 2.0, "value_out": 2.0}
-
+loss_weights = {"policy_logits": 0.5, "value_out": 0.65}
+#%%
 idx = top_up_sliding_buffer(
     buffer,
     training_games,
@@ -228,18 +208,16 @@ while epoch <= MAX_EPOCH:
     # if we run out of the main buffer, re train on the best games randomly
     if idx == len(training_games):
         under25 = meta.query("overall_cpl <= 25")
-        training_games = under25['json_file'].to_list()
+        training_games = under25['pkl_file'].to_list()
         random.shuffle(training_games)
         idx = 0
     
-    if epoch > 50:
-        loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     if epoch > 150:
-        loss_weights = {"policy_logits": 0.5, "value_out": 0.5}
+        loss_weights = {"policy_logits": 0.45, "value_out": 0.45}
     if epoch > 225:
-        loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
+        loss_weights = {"policy_logits": 0.35, "value_out": 0.35}
     if epoch > 250:
-        loss_weights = {"policy_logits": 0.12, "value_out": 0.12}
+        loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
         
     epoch_start = time.time()
     
@@ -409,9 +387,9 @@ while epoch <= MAX_EPOCH:
           f"total runtime: {runtime}")
     print()
     if (epoch >= 100) & (epoch % 25 == 0):    
-        model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
+        #model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_latest.h5")
         model.save(model_file)
 
 # when done
-model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_final.h5")
+#model.save(MODEL_DIR + f"{MODEL_NAME}_bootstrapped_final.h5")
 model.save(model_file)

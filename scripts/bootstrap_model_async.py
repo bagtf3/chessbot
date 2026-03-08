@@ -6,7 +6,6 @@ from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from chessbot.model import build_lowrank_res_stack_64x67
 from chessbot.model import build_conformer_64x67
 from tensorflow import keras
 
@@ -16,9 +15,9 @@ from tensorflow import keras
 def load_model(model_loc):
     return keras.models.load_model(model_loc)
 
-model_file_init = 'C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/val_test_model.h5'
+model_file_init = 'C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_transformer/val_test_transformer_model.h5'
 model    = load_model(model_file_init)
-run_tag  = "val_test"
+run_tag  = "val_test_transformer"
 run_dir  = os.path.join(SP_DIR, run_tag)
 model_file    = os.path.join(run_dir, run_tag + "_model.h5")
 progress_file = os.path.join(run_dir, "eval_progress.csv")
@@ -31,7 +30,7 @@ big_neg = -1e6
 
 if not os.path.exists(model_file):
     model.save(model_file)
-
+#%%
 # ── game metadata ─────────────────────────────────────────────────────────────
 
 run_tags = ["cf_10x256x5_full_sims3", "cf_10x256x5_full_sims4", "cf_10x256x5_deep_sims1"]
@@ -189,14 +188,14 @@ def moving_average_pd(arr, window=15):
 
 # ── training setup ────────────────────────────────────────────────────────────
 
-batch_size  = 512
+batch_size  = 256
 epoch_size  = 20 * batch_size
 buffer_size = 8  * epoch_size
-MAX_EPOCH   = 400
+MAX_EPOCH   = 1000
 draw_rate   = 0.25
 PLOT_EVERY  = 5
 
-loss_weights = {"policy_logits": 0.25, "value_out": 0.30}
+loss_weights = {"policy_logits": 2.0, "value_out": 2.0}
 eval_df = pd.read_csv(progress_file) if os.path.exists(progress_file) else None
 
 filler = BufferFiller(training_games, recycle_games, buffer_size, draw_rate)
@@ -211,23 +210,29 @@ print()
 filler.report()
 
 # ── training loop ─────────────────────────────────────────────────────────────
-
 begin = time.time()
 epoch = 0
 
 try:
     while epoch <= MAX_EPOCH:
-        if epoch > 100:
-            loss_weights = {"policy_logits": 0.25, "value_out": 0.30}
-        if epoch > 150:
-            loss_weights = {"policy_logits": 0.25, "value_out": 0.30}
-        if epoch > 225:
-            loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
-        if epoch > 250:
-            loss_weights = {"policy_logits": 0.25, "value_out": 0.25}
+        if epoch > 75:
+            loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
+        if epoch > 200:
+            loss_weights = {"policy_logits": 0.8, "value_out": 0.8}
+        if epoch > 450:
+            loss_weights = {"policy_logits": 0.65, "value_out": 0.65}
+        if epoch > 600:
+            loss_weights = {"policy_logits": 0.45, "value_out": 0.45}
+        if epoch > 750:
+            loss_weights = {"policy_logits": 0.35, "value_out": 0.35}
 
         epoch_start = time.time()
-
+        
+        if filler.buf_len() < 3*epoch_size:
+            print("[bootstrap] Buffer low, waiting for filler...")
+            time.sleep(1.0)
+            continue
+            
         # if filler hasn't caught up yet, wait
         batch = filler.sample(epoch_size)
         if batch is None:

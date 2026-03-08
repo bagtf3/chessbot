@@ -76,4 +76,3 @@ for model_file in models:
     del model, fwd
     import gc; gc.collect()
     tf.keras.backend.clear_session()
-

@@ -202,17 +202,52 @@ def main():
     vwht = np.asarray(vwht_list, dtype=np.float32)
     pwht = np.asarray(pwht_list, dtype=np.float32)
 
-    # weight name, weight
-    for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
-        print(
-            f"[retrain] {n} min/mean/max: {w.min():.3f} {w.mean():.3f} {w.max():.3f}"
-    )
-    
     Y = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht, "policy_logits": pwht}
 
     model_path = cfg.model_path
     model = load_model(model_path)
+
+    # ── recompile: explicit head weights + fresh LR ───────────────────────────
+    # Always force Keras head weights to 1.0 so the only active weights are the
+    # per-sample vwht/pwht arrays.  This prevents silent weight inheritance from
+    # whatever was baked into the model when it was last saved.
+    _opt_src = getattr(model, '_default_opt', None)
+    if isinstance(_opt_src, tf.keras.mixed_precision.LossScaleOptimizer):
+        _base_cls = type(_opt_src.inner_optimizer)
+        _base_cfg = _opt_src.inner_optimizer.get_config()
+    elif _opt_src is not None:
+        _base_cls = type(_opt_src)
+        _base_cfg = _opt_src.get_config()
+    else:
+        _base_cls = tf.keras.optimizers.Adam
+        _base_cfg = {}
+
+    _base_cfg['learning_rate'] = cfg.learning_rate
+    _inner = _base_cls.from_config(_base_cfg)
+    _opt = tf.keras.mixed_precision.LossScaleOptimizer(_inner)
+
+    _loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+    _head_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=_opt, loss=_loss_dict, loss_weights=_head_weights)
+    model._default_opt = _opt
+    model._default_loss_dict = _loss_dict
+
+    # ── weight summary ────────────────────────────────────────────────────────
+    draw_vwht = cfg.value_loss_weight * cfg.draw_value_scale
+    kl_str = (
+        f"KL boost ×{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
+        if cfg.KL_weight_boost != 1.0 else "KL boost disabled"
+    )
+    print(f"[retrain] weights  lr={cfg.learning_rate}  head policy=1.0  head value=1.0")
+    print(f"[retrain] weights  sample policy={cfg.policy_loss_weight}  "
+          f"sample value={cfg.value_loss_weight} (draw: {draw_vwht:.4f})")
+    print(f"[retrain] weights  {kl_str}")
+    for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
+        print(f"[retrain] {n}  min={w.min():.4f}  mean={w.mean():.4f}  max={w.max():.4f}")
 
     if os.path.exists(cfg.progress_csv_path):
         all_evals = pd.read_csv(cfg.progress_csv_path)

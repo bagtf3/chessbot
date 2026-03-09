@@ -612,7 +612,7 @@ class Rescorer(object):
 def value_weight_for_game(cfg, is_draw):
     vwht = cfg.value_loss_weight
     if is_draw:
-        vwht *= cfg.draw_weight
+        vwht *= cfg.draw_value_scale
     return vwht
 
 

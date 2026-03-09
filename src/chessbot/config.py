@@ -101,10 +101,11 @@ class Config(object):
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
     
-    policy_loss_weight = 0.25
-    value_loss_weight = 0.25
+    learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    policy_loss_weight = 0.25     # per-sample weight for policy head
+    value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
+    draw_value_scale = 0.5        # multiplies value_loss_weight for drawn games
     vscale = 0.9
-    draw_weight = 0.1
     retrain_batch_size = 512
     retrain_size = 10240
     training_queue_buffer = 30720

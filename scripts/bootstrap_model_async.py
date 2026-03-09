@@ -6,8 +6,9 @@ from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from chessbot.model import build_conformer_64x67
+from chessbot.model import set_loss_weights
 from tensorflow import keras
+import tensorflow as tf
 
 
 # ── model + paths ─────────────────────────────────────────────────────────────
@@ -15,9 +16,18 @@ from tensorflow import keras
 def load_model(model_loc):
     return keras.models.load_model(model_loc)
 
-model_file_init = 'C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_transformer/val_test_transformer_model.h5'
-model    = load_model(model_file_init)
-run_tag  = "val_test_transformer"
+model_file_init = (
+    'C:/Users/Bryan/Data/chessbot_data/selfplay_runs'
+    '/val_test_film/val_test_film_model.h5'
+)
+model = load_model(model_file_init)
+# set attrs required by set_loss_weights (not saved by speed-test script)
+model._default_opt = model.optimizer
+model._default_loss_dict = {
+    "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+    "value_out":     tf.keras.losses.MeanSquaredError(),
+}
+run_tag  = "val_test_film"
 run_dir  = os.path.join(SP_DIR, run_tag)
 model_file    = os.path.join(run_dir, run_tag + "_model.h5")
 progress_file = os.path.join(run_dir, "eval_progress.csv")
@@ -25,9 +35,8 @@ progress_file = os.path.join(run_dir, "eval_progress.csv")
 metrics_history = {"value_mse": [], "value_corr": []}
 epoch_time_list = []
 
-eps     = 1e-12
-big_neg = -1e6
 
+os.makedirs(run_dir, exist_ok=True)
 if not os.path.exists(model_file):
     model.save(model_file)
 #%%
@@ -71,7 +80,8 @@ meta = meta.query("overall_cpl <= 30")
 
 training_games = meta['pkl_file'].to_list()
 recycle_games  = meta.query("overall_cpl <= 25")['pkl_file'].to_list()
-print(f"[bootstrap] {len(training_games)} training games, {len(recycle_games)} recycle games")
+print(f"[bootstrap] {len(training_games)} training games, "
+      f"{len(recycle_games)} recycle games")
 random.shuffle(training_games)
 
 
@@ -168,7 +178,8 @@ class BufferFiller:
             self.buffer  = self.buffer[k:]
 
         Xs, Ms, Ps, Ys, Ws = zip(*sel)
-        return np.stack(Xs), np.stack(Ms), np.stack(Ps), np.stack(Ys), np.array(Ws, dtype=np.float32)
+        return (np.stack(Xs), np.stack(Ms), np.stack(Ps),
+                np.stack(Ys), np.array(Ws, dtype=np.float32))
 
     def report(self):
         print(
@@ -188,14 +199,25 @@ def moving_average_pd(arr, window=15):
 
 # ── training setup ────────────────────────────────────────────────────────────
 
-batch_size  = 256
-epoch_size  = 20 * batch_size
-buffer_size = 8  * epoch_size
+batch_size  = 512
+epoch_size  = 10240
+buffer_size = 6 * epoch_size
 MAX_EPOCH   = 1000
 draw_rate   = 0.25
 PLOT_EVERY  = 5
 
-loss_weights = {"policy_logits": 2.0, "value_out": 2.0}
+# loss weight schedule — acts as a hacky LR decay via effective loss scale
+# keyed by epoch at which the new weights take effect
+LW_SCHEDULE = {
+    0:   {"policy_logits": 1.5,  "value_out": 2.25},
+    100: {"policy_logits": 1.0,  "value_out": 1.5},
+    200: {"policy_logits": 0.8,  "value_out": 1.2},
+    400: {"policy_logits": 0.65, "value_out": 0.975},
+    600: {"policy_logits": 0.45, "value_out": 0.675},
+    800: {"policy_logits": 0.35, "value_out": 0.525},
+}
+_current_lw = None   # track applied weights to avoid redundant recompiles
+
 eval_df = pd.read_csv(progress_file) if os.path.exists(progress_file) else None
 
 filler = BufferFiller(training_games, recycle_games, buffer_size, draw_rate)
@@ -205,26 +227,24 @@ filler.start()
 print(f"[bootstrap] Filling buffer ({buffer_size:,} samples)...")
 while filler.buf_len() < buffer_size:
     time.sleep(1.0)
-    print(f"\r[bootstrap] Buffer: {filler.buf_len():,} / {buffer_size:,}", end="", flush=True)
+    print(f"\r[bootstrap] Buffer: {filler.buf_len():,} / {buffer_size:,}",
+          end="", flush=True)
 print()
 filler.report()
 
 # ── training loop ─────────────────────────────────────────────────────────────
 begin = time.time()
 epoch = 0
-
+#%%
 try:
     while epoch <= MAX_EPOCH:
-        if epoch > 75:
-            loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-        if epoch > 200:
-            loss_weights = {"policy_logits": 0.8, "value_out": 0.8}
-        if epoch > 450:
-            loss_weights = {"policy_logits": 0.65, "value_out": 0.65}
-        if epoch > 600:
-            loss_weights = {"policy_logits": 0.45, "value_out": 0.45}
-        if epoch > 750:
-            loss_weights = {"policy_logits": 0.35, "value_out": 0.35}
+        # apply loss weight schedule — recompile only on transitions
+        target_lw = LW_SCHEDULE[max(k for k in LW_SCHEDULE if k <= epoch)]
+        if target_lw is not _current_lw:
+            set_loss_weights(model, target_lw)
+            _current_lw = target_lw
+            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
+            print(f"[lw update  ] epoch {epoch}: {lw_str}")
 
         epoch_start = time.time()
         
@@ -250,7 +270,8 @@ try:
             plt.scatter(targets, value_preds, s=6)
             plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
             plt.xlim(-1, 1); plt.ylim(-1, 1)
-            plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target"); plt.show()
+            plt.xlabel("target"); plt.ylabel("pred")
+            plt.title("pred vs target"); plt.show()
 
             policy_logits = preds[0]
             value_preds   = preds[1].ravel()
@@ -315,33 +336,29 @@ try:
 
                 plt.tight_layout(); plt.show()
 
-        # ── model fit (filler runs concurrently here) ─────────────────────────
-        Ydict = {"value_out": Ystack.astype(np.float32), "policy_logits": Pstack}
-        s_wts = {k: Wstack * loss_weights[k] for k in Ydict}
-        print("-" * 100)
-        history = model.fit(
-            Xstack, Ydict, epochs=1, batch_size=batch_size, verbose=0, sample_weight=s_wts
+        # ── train ─────────────────────────────────────────────────────────────
+        print("-" * 89)
+        hist = model.fit(
+            Xstack,
+            [Pstack, Ystack.astype(np.float32).reshape(-1, 1)],
+            sample_weight=Wstack,
+            batch_size=batch_size,
+            epochs=1,
+            verbose=0,
         )
-
-        rows = []
-        for m, v in history.history.items():
-            name  = "total" if m == "loss" else m.replace("_loss", "")
-            s, e  = v[0], v[-1]
-            delta = s - e
-            mark  = "*" if delta < 0 else "+"
-            rows.append((name, s, e, delta, mark))
-
-        name_w = max(len(r[0]) for r in rows)
-        ETAG   = f"[epoch {epoch:4d}]"
-        fmt    = (f"{ETAG} [model fit] {{name:<{name_w}}} : "
-                  f"value: {{s:8.4f}} -> {{e:8.4f}}  delta: {{delta:8.4f}} {{mark}}")
-        for name, s, e, delta, mark in rows:
-            print(fmt.format(name=name, s=s, e=e, delta=delta, mark=mark))
+        h      = hist.history
+        p_loss = h.get("policy_logits_loss", [float("nan")])[0]
+        v_loss = h.get("value_out_loss",     [float("nan")])[0]
+        t_loss = h.get("loss",               [float("nan")])[0]
+        print(f"[epoch {epoch:4d}] "
+              f"policy_loss: {p_loss:.4f}  "
+              f"value_loss: {v_loss:.4f}  "
+              f"total: {t_loss:.4f}")
 
         epoch += 1
         epoch_time = time.time() - epoch_start
         epoch_time_list.append(epoch_time)
-        print("-" * 100)
+        print("-" * 89)
         print(f"[time check] last: {format_time(epoch_time)}  "
               f"avg: {format_time(np.mean(epoch_time_list))}  "
               f"total: {format_time(time.time() - begin)}  "

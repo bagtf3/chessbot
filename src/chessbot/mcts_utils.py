@@ -177,9 +177,8 @@ class MCTSTree(fasttree):
             return uci
 
         most_visits = details[0].N
-        sims_done = self.sims_completed_this_move
-        floor = 500 + 0.1 * sims_done
-        visit_threshold = min(max(200, most_visits * 0.7), floor)
+        # anything > 2k visits is well-searched
+        visit_threshold = min(most_visits * 0.7, 2000) 
 
         best_rsc = -np.inf
         best_uci = None
@@ -254,7 +253,8 @@ class MCTSTree(fasttree):
 
         if not check_sims:
             return check
-        return check and (self.sims_completed_this_move > 0)
+        # make sure some sims have been completed already
+        return check and (self.sims_completed_this_move > 10)
 
     def add_root_dirichlet_noise(self):
         if not self.needs_root_noise():

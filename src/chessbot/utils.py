@@ -416,6 +416,8 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path)
+        csv_path = os.path.splitext(save_path)[0] + ".csv"
+        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(csv_path, index=False)
     plt.close()
 
     policy_logits = preds[0]  # (B,4096)

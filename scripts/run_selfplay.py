@@ -22,6 +22,7 @@ import threading
 
 STOP_REQUESTED = threading.Event()
 PROCESS_TIME = 30.0
+MAX_BACKLOG = 200
 _now = time.time
 
 
@@ -347,8 +348,8 @@ def main(run_tag):
                 # check for finished procs
                 procs = check_and_reap_procs(procs)
 
-                # break here if no workers and no finished games
-                if not procs and len(finished_games) == 0:
+                # break if no workers and backlog is small enough to carry into next round
+                if not procs and len(finished_games) < MAX_BACKLOG:
                     break
 
                 # check telemetry

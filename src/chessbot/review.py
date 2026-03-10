@@ -18,8 +18,8 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
-from chessbot.config import Config
-from chessbot.utils import print_recent_summary, summarize_recent_games, format_time
+from chessbot.engines import lc0_analyze
+from chessbot.utils import print_recent_summary, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
     calc_entropy, cp_to_value_tanh, sf_eval, kl_divergence_bits
@@ -63,7 +63,7 @@ class GameViewer:
         
         self.start_fen = self.log.get("start_fen")
         self.moves_uci = self.log.get("moves_played", [])
-        self.tree_data = self.log.get("tree_search_data", {})
+        self.tree_data = {int(k): v for k, v in self.log.get("tree_search_data", {}).items()}
         self.result = self.log.get("result")
         self.game_id = self.log.get("game_id")
     
@@ -82,7 +82,7 @@ class GameViewer:
             except Exception:
                 self.sf_rows = None
                 self._sf_by_ply = {}
-    
+
         self.reset()
 
     def reset(self):
@@ -187,7 +187,128 @@ class GameViewer:
                         print("  played move eval not available")
             else:
                 print(f"\nPlayed move {upcoming_san} is in SF top-3.")
-    
+
+    def run_lc0_topk(self, nodes=4000, k=5, engine_cfg=None):
+        """Return top-k rows from lc0 (sorted by N) for the current position."""
+        sf_board = chess.Board(self.board.fen())
+        rows = lc0_analyze(sf_board, nodes=nodes, engine_cfg=engine_cfg)
+        return rows[:k]
+
+    def show_lc0_overlay(self, token="lc0"):
+        """Parse 'lc0' or 'lc0 N' and print lc0 top-5 vs xc0 comparison."""
+        nodes = 4000
+        parts = token.split()
+        if len(parts) >= 2:
+            try:
+                nodes = int(parts[1])
+            except ValueError:
+                pass
+
+        print(f"Running lc0 ({nodes} nodes)...")
+        sf_board = chess.Board(self.board.fen())
+        all_rows = lc0_analyze(sf_board, nodes=nodes)
+        if not all_rows:
+            print("No lc0 data returned.")
+            return
+
+        # lc0 reports castling in Chess960 UCI (e.g. e8h8 = king captures rook).
+        # Normalize to standard king-destination UCI so san() and xc0 lookup work.
+        castle_norm = {"e1h1": "e1g1", "e1a1": "e1c1", "e8h8": "e8g8", "e8a8": "e8c8"}
+        for r in all_rows:
+            r["move"] = castle_norm.get(r["move"], r["move"])
+
+        # xc0 candidate lookup: uci -> candidate dict
+        node, _, _ = self.node_who_chosen()
+        cands = (node.get("candidate_moves") or []) if node else []
+        xc0_map = {c["uci"]: c for c in cands}
+
+        white_to_move = self.board.side_to_move() == "w"
+        sign = 1 if white_to_move else -1
+
+        # stats over all rows using the union of lc0 and xc0 moves
+        all_ucis = list({r["move"] for r in all_rows} | set(xc0_map))
+        lc0_visit_map = {r["move"]: r.get("N", 0) for r in all_rows}
+        lc0_prior_map = {r["move"]: r.get("P_pct", 0.0) / 100.0 for r in all_rows}
+        xc0_visit_map = {c["uci"]: c.get("visits", 0) for c in cands}
+        xc0_prior_map = {c["uci"]: c.get("P", 0.0) for c in cands}
+
+        lc0_vis_vec  = np.array([lc0_visit_map.get(u, 0)   for u in all_ucis],
+                                dtype=np.float64)
+        lc0_pri_vec  = np.array([lc0_prior_map.get(u, 0.0) for u in all_ucis],
+                                dtype=np.float64)
+        xc0_vis_vec  = np.array([xc0_visit_map.get(u, 0)   for u in all_ucis],
+                                dtype=np.float64)
+        xc0_pri_vec  = np.array([xc0_prior_map.get(u, 0.0) for u in all_ucis],
+                                dtype=np.float64)
+
+        lc0_ent_vis, lc0_pvis = self.compute_norm_entropy(lc0_vis_vec)
+        lc0_ent_pri, lc0_ppri = self.compute_norm_entropy(lc0_pri_vec)
+        xc0_ent_vis, xc0_pvis = self.compute_norm_entropy(xc0_vis_vec)
+        xc0_ent_pri, xc0_ppri = self.compute_norm_entropy(xc0_pri_vec)
+        lc0_kl_vp    = kl_divergence_bits(lc0_pvis, lc0_ppri)
+        kl_xpri_lpri = kl_divergence_bits(xc0_ppri, lc0_ppri)
+        kl_xvis_lvis = kl_divergence_bits(xc0_pvis, lc0_pvis)
+
+        hdr = (
+            f"  {'SAN':<7}  {'N':>6}  {'P(lc0)':>7}  {'P(xc0)':>7}"
+            f"  |  {'Q(lc0)':>7}  {'Q(xc0)':>7}  |  {'D':>5}"
+        )
+        sep = "  " + "-" * (len(hdr) - 2)
+        to_move = "White" if white_to_move else "Black"
+        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=white-pov):")
+        print(hdr)
+        print(sep)
+
+        top_ucis = set()
+        for r in all_rows[:5]:
+            mv  = r["move"]
+            san = self.board.san(mv)
+            n     = r.get("N", 0)
+            p_lc0 = r.get("P_pct", 0.0) / 100.0
+            q_lc0 = r.get("Q", 0.0) * sign
+            d     = r.get("D", 0.0)
+
+            xc0   = xc0_map.get(mv)
+            p_xc0 = xc0["P"] if xc0 else float("nan")
+            q_xc0 = xc0["Q"] if xc0 else float("nan")
+
+            print(
+                f"  {san:<7}  {n:>6}  {p_lc0:>7.3f}  {p_xc0:>7.3f}"
+                f"  |  {q_lc0:>+7.3f}  {q_xc0:>+7.3f}  |  {d:>5.3f}"
+            )
+            top_ucis.add(mv)
+
+        print(sep)
+        print(
+            f"  {'ent (norm):':<16}  {'vis':>5}  {'pri':>5}  KL(vis||pri)"
+        )
+        print(
+            f"  {'lc0':<16}  {lc0_ent_vis:>5.3f}  {lc0_ent_pri:>5.3f}"
+            f"  {lc0_kl_vp:.3f} bits"
+        )
+        print(
+            f"  {'cross KL:':<16}"
+            f"  xc0_p||lc0_p={kl_xpri_lpri:.3f}"
+            f"   xc0_v||lc0_v={kl_xvis_lvis:.3f} bits"
+        )
+
+        if self.ply < len(self.moves_uci):
+            upcoming_uci = self.moves_uci[self.ply]
+            upcoming_san = self.board.san(upcoming_uci)
+            if upcoming_uci not in top_ucis:
+                match = next((r for r in all_rows if r["move"] == upcoming_uci), None)
+                if match:
+                    q_lc0 = match.get("Q", 0.0) * sign
+                    n     = match.get("N", 0)
+                    print(
+                        f"\nPlayed {upcoming_san} not in top-5:"
+                        f"  N={n}  Q(lc0)={q_lc0:+.3f}"
+                    )
+                else:
+                    print(f"\nPlayed {upcoming_san} not visited by lc0.")
+            else:
+                print(f"\nPlayed {upcoming_san} is in lc0 top-5.")
+
     def align_sf_rows_to_json(self):
         self._sf_by_ply = {}
         if self.sf_rows is None:
@@ -317,23 +438,149 @@ class GameViewer:
             line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
                     f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
             print(line)
-    
-    def print_row(self, c, mark=False, show_rank=False, rank_val=None):
-        san = self.board.san(c.get("uci", ""))
-        marker = "  <- SF" if mark else ""
-        rank_str = f"  (rank #{rank_val})" if (show_rank and rank_val) else ""
-        Q = c.get('Q',0)
-        P = c.get('P',0)
-        U = c.get('U',0)
-        cPUCT = self.log.get('c_puct', 1.5)
-        Qrel = Q if self.board.side_to_move() == 'w' else -1*Q
-        PUCT = Qrel + cPUCT*U
-        print(
-            f"   {san:<6} visits={c.get('visits',0):<5} "
-            f"Q: {Q:+.3f}  P: {P:.3f}  PUCT: {PUCT:+.3f}"
-            f"{marker}{rank_str}"
-        )
-    
+
+    def compute_rsc_top5(self, children):
+        if not children:
+            return {}
+
+        items = list(children)
+        items.sort(key=lambda x: x.get("visits", 0), reverse=True)
+
+        k = min(5, len(items))
+        top = items[:k]
+
+        if k == 1:
+            uci = top[0].get("uci", "")
+            return {uci: 1.0}
+
+        flip = 1.0 if self.board.side_to_move() == "w" else -1.0
+
+        def minmax(vals):
+            lo = min(vals)
+            hi = max(vals)
+            if hi <= lo:
+                return [0.5 for _ in vals]
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        def to_prob(vals01):
+            s = sum(vals01)
+            if s <= 0.0:
+                kk = len(vals01)
+                return [1.0 / kk for _ in vals01]
+            return [v / s for v in vals01]
+
+        visits = [c.get("visits", 0) for c in top]
+        vs = [c.get("visit_share", 0.0) for c in top]
+        q = [flip * c.get("Q", 0.0) for c in top]
+        qe = [flip * c.get("Qema", 0.0) for c in top]
+        ds = [c.get("Qdelta_sign", 0.0) for c in top]
+
+        p_vis = to_prob(minmax(visits))
+        p_vs = to_prob(minmax(vs))
+        p_q = to_prob(minmax(q))
+        p_qe = to_prob(minmax(qe))
+        p_ds = to_prob(minmax(ds))
+
+        w = 0.2
+        out = {}
+        for i in range(k):
+            score = (
+                w * p_vis[i]
+                + w * p_vs[i]
+                + w * p_q[i]
+                + w * p_qe[i]
+                + w * p_ds[i]
+            )
+            out[top[i].get("uci", "")] = score
+
+        return out
+
+    def print_header(self, show_rank=False, show_rsc=False):
+        cols = [
+            ("SAN", 7), ("N", 6), ("vs", 7),
+            ("|", 1),
+            ("Q", 7), ("Qe", 7), ("dS", 7),
+            ("|", 1),
+            ("P", 7), ("U", 7), ("PUCT", 8),
+            ("|", 1),
+            ("flags", 9),
+        ]
+
+        if show_rsc:
+            cols.append(("rsc", 7))
+
+        if show_rank:
+            cols.append(("rank", 7))
+
+        hdr_body = " ".join([f"{n:^{w}}" for n, w in cols])
+        sep_body = " ".join(["-" * w if w > 1 else "|" for _, w in cols])
+
+        indent = "  "
+        hdr = indent + hdr_body
+        sep = indent + sep_body
+
+        full_width = len(hdr)
+
+        print(indent + "-" * (full_width - len(indent)))
+        print(hdr)
+        print(sep)
+
+    def print_row(
+        self,
+        c,
+        mark=False,
+        show_rank=False,
+        rank_val=None,
+        show_rsc=False,
+        rsc_val=None,
+        extra_flags=None,
+    ):
+        uci = c.get("uci", "")
+        san = self.board.san(uci) if uci else "?"
+
+        visits = c.get("visits", 0)
+        visit_share = c.get("visit_share", 0.0)
+
+        q = c.get("Q", 0.0)
+        qema = c.get("Qema", 0.0)
+        ds = c.get("Qdelta_sign", 0.0)
+
+        p = c.get("P", 0.0)
+        u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
+
+        qrel = q if self.board.side_to_move() == "w" else -q
+        puct = qrel + u
+
+        flags = []
+        if mark:
+            flags.append("<-SF")
+        if extra_flags:
+            flags += list(extra_flags)
+        if c.get("is_terminal", False):
+            flags.append("T")
+
+        flags_txt = ", ".join([f for f in flags if f])
+
+        parts = [
+            f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
+            "|",
+            f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}",
+            "|",
+            f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
+            "|",
+            f"{flags_txt:^9}",
+        ]
+
+        if show_rsc:
+            rv = "" if rsc_val is None else f"{rsc_val:0.3f}"
+            parts.append(f"{rv:^7}")
+
+        if show_rank:
+            r = rank_val if rank_val is not None else ""
+            parts.append(f"{r!s:<7}")
+
+        print("  " + " ".join(parts))
+
     def show_moves(self, top_n=5):
         if self.ply >= len(self.moves_uci):
             print("End of game.")
@@ -361,16 +608,13 @@ class GameViewer:
         max_d = node.get("max_depth", 0)
         cv = node.get("children_visited", 0)
         tc = node.get("total_children", 0)
-        
-        uniq = node.get("unique_sims", None)
-        line = (f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
-                f"max_depth={max_d} children visited={cv}/{tc}")
-        if uniq is not None and sims:
-            frac = uniq / max(1, sims)
-            line += f"  unique={uniq} ({frac:.0%})"
+
+        line = (
+            f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
+            f"max_depth={max_d} children visited={cv}/{tc}"
+        )
         print(line)
 
-        # entropy: show normed entropy for visits and priors + KL/JS
         visits_list = [c.get("visits", 0) for c in cands]
         priors_list = [c.get("P", 0.0) for c in cands]
 
@@ -379,36 +623,157 @@ class GameViewer:
         kl = kl_divergence_bits(p_vis, p_pri)
 
         print(
-            f"  entropy (norm'd): visits={norm_vis:.3f} "
-            f"priors={norm_pri:.3f} KL(vis||pr)={kl:.3f} bits"
+            f"  entropy (norm'd): visits = {norm_vis:.3f} "
+            f" priors = {norm_pri:.3f}  KL(vis||pr) = {kl:.3f} bits"
         )
 
         cands_sorted = sorted(
             cands, key=lambda x: x.get("visits", 0), reverse=True
         )
+
         is_sf_turn = ("stockfish" in str(who).lower())
 
-        # index of SF's actual move among candidates (or None)
-        sf_idx = None
+        r_sf = self.sf_row_for_ply(self.ply)
+        sf_best_uci = None
+        if r_sf is not None:
+            sf_best_uci = str(r_sf.get("best_move", "") or "")
+
+        raw_xc0 = node.get("xc0_move")
+        if (not is_sf_turn) and (not raw_xc0):
+            xc0_move = chosen
+        else:
+            xc0_move = raw_xc0
+
+        sampled = bool((not is_sf_turn) and raw_xc0 and (raw_xc0 != chosen))
+
+        xc0_idx = None
+        if xc0_move:
+            for i, c in enumerate(cands_sorted):
+                if c.get("uci") == xc0_move:
+                    xc0_idx = i
+                    break
+
+        sf_best_idx = None
+        if sf_best_uci:
+            for i, c in enumerate(cands_sorted):
+                if c.get("uci") == sf_best_uci:
+                    sf_best_idx = i
+                    break
+
+        chosen_idx = None
         for i, c in enumerate(cands_sorted):
             if c.get("uci") == chosen:
-                sf_idx = i
+                chosen_idx = i
                 break
 
-        shown_ucis = set()
-        # top-N: never show ranks; just mark if SF move is in top-N
-        for i, c in enumerate(cands_sorted[:top_n]):
-            self.print_row(c, mark=is_sf_turn and (c.get("uci") == chosen))
-            shown_ucis.add(c.get("uci"))
+        need_rank = False
+        if is_sf_turn and chosen_idx is not None:
+            need_rank = (chosen_idx >= top_n)
 
-        # if SF's move exists but wasn't in top-N, show ellipsis + row WITH rank
-        if is_sf_turn and sf_idx is not None:
-            if cands_sorted[sf_idx].get("uci") not in shown_ucis:
+        if (not is_sf_turn) and sf_best_idx is not None:
+            need_rank = need_rank or (sf_best_idx >= top_n)
+
+        if (not is_sf_turn) and xc0_idx is not None:
+            need_rank = need_rank or (xc0_idx >= top_n)
+
+        self.print_header(show_rank=need_rank, show_rsc=True)
+        rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
+
+        shown_ucis = set()
+
+        for i, c in enumerate(cands_sorted[:top_n]):
+            uci = c.get("uci")
+            extra = []
+
+            if not is_sf_turn:
+                if xc0_move and (uci == xc0_move):
+                    if sf_best_uci and (uci == sf_best_uci):
+                        extra.append("<-Xc0, SF")
+                    else:
+                        extra.append("<-Xc0")
+
+                if sampled and (uci == chosen) and (chosen != xc0_move):
+                    if sf_best_uci and (chosen == sf_best_uci):
+                        extra.append("<-SF,samp")
+                    else:
+                        extra.append("<-sampled")
+
+            mark = False
+            if is_sf_turn:
+                mark = (uci == chosen)
+            else:
+                if sf_best_uci and (uci == sf_best_uci):
+                    is_xc0_sf = bool(xc0_move and (uci == xc0_move))
+                    is_samp_sf = bool(
+                        sampled and (chosen == sf_best_uci) and (uci == chosen)
+                        and (chosen != xc0_move)
+                    )
+                    if (not is_xc0_sf) and (not is_samp_sf):
+                        mark = True
+
+            self.print_row(
+                c,
+                mark=mark,
+                show_rank=need_rank,
+                rank_val=(i + 1) if need_rank else None,
+                show_rsc=True,
+                rsc_val=rsc_map.get(uci),
+                extra_flags=extra,
+            )
+            shown_ucis.add(uci)
+
+        if (not is_sf_turn) and xc0_move and (xc0_move not in shown_ucis):
+            if xc0_idx is not None:
+                print("   ...")
+                extra = []
+                if sf_best_uci and (xc0_move == sf_best_uci):
+                    extra.append("<-Xc0, SF")
+                else:
+                    extra.append("<-Xc0")
+
+                self.print_row(
+                    cands_sorted[xc0_idx],
+                    mark=False,
+                    show_rank=True,
+                    rank_val=xc0_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=extra
+                )
+                shown_ucis.add(xc0_move)
+
+        if (not is_sf_turn) and sf_best_uci and (sf_best_uci not in shown_ucis):
+            if sf_best_idx is not None:
+                print("   ...")
+                extra = []
+                mark = True
+
+                if sampled and (sf_best_uci == chosen) and (chosen != xc0_move):
+                    extra.append("<-SF,samp")
+                    mark = False
+
+                self.print_row(
+                    cands_sorted[sf_best_idx],
+                    mark=mark,
+                    show_rank=True,
+                    rank_val=sf_best_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=extra
+                )
+        if is_sf_turn and chosen and (chosen not in shown_ucis):
+            if chosen_idx is not None:
                 print("   ...")
                 self.print_row(
-                    cands_sorted[sf_idx], mark=True,
-                    show_rank=True, rank_val=sf_idx + 1,
+                    cands_sorted[chosen_idx],
+                    mark=True,
+                    show_rank=True,
+                    rank_val=chosen_idx + 1,
+                    show_rsc=True,
+                    rsc_val=None,
+                    extra_flags=None,
                 )
+                shown_ucis.add(chosen)
 
         this_q = node.get("best_Q")
         if this_q is None:
@@ -416,17 +781,16 @@ class GameViewer:
             if this_q is not None:
                 print(f"\nvisit-weighted Q={this_q}")
         else:
-            print(f"\nmost-visted Q={this_q}")
+            print(f"\nBest Q={this_q}")
 
-        # SF overlay (optional)
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
             stm_white = self.turn()
 
-            best_uci   = str(r.get("best_move", "") or "")
+            best_uci = str(r.get("best_move", "") or "")
             played_uci = str(r.get("played_move", "") or "")
 
-            best_cp_raw   = r.get("best_cp", None)
+            best_cp_raw = r.get("best_cp", None)
             played_cp_raw = r.get("played_cp", None)
 
             def pov(cp):
@@ -434,34 +798,45 @@ class GameViewer:
                     return None
                 return int(cp if stm_white else -cp)
 
-            best_cp_pov   = pov(best_cp_raw)
+            best_cp_pov = pov(best_cp_raw)
             played_cp_pov = pov(played_cp_raw)
 
             loss = r.get("clipped_loss", r.get("loss", None))
             if loss is None and best_cp_pov is not None and played_cp_pov is not None:
                 loss = max(0, best_cp_pov - played_cp_pov)
 
-            # recompute match flag from UCIs to avoid DF drift
-            matched = (best_uci == played_uci) if best_uci and played_uci else False
+            xc0_uci = node.get("xc0_move") if node else None
+            cmp_uci = xc0_uci if (xc0_uci and xc0_uci != chosen) else chosen
+            matched = ((best_uci == cmp_uci) if best_uci and cmp_uci else False)
 
             def to_san(uci):
                 return self.board.san(uci)
 
-            best_san   = to_san(best_uci) if best_uci else "?"
+            best_san = to_san(best_uci) if best_uci else "?"
             played_san = to_san(played_uci) if played_uci else "?"
+            xc0_san = to_san(xc0_uci) if xc0_uci else "?"
 
             parts = []
             if loss is not None:
                 parts.append(f"CPL={int(loss)}")
+
             if played_san != "?":
-                parts.append(f"played={played_san} ({'✓' if matched else '×'})")
+                parts.append(f"played={played_san}")
+
+            if xc0_uci and xc0_san != "?":
+                parts.append(f"Xc0={xc0_san} ({'✓' if matched else '×'})")
+            elif played_san != "?":
+                parts.append(f"({'✓' if matched else '×'})")
+
             if best_san != "?":
                 parts.append(f"SF best={best_san}")
+
             if (best_cp_pov is not None) and (played_cp_pov is not None):
                 parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
 
             if parts:
                 print("SF:", "  ".join(parts))
+
         print("=" * 60)
 
     def show_visits(self, uci_or_san):
@@ -471,22 +846,65 @@ class GameViewer:
             return
 
         cands = node.get("candidate_moves") or []
-        scands = sorted(cands, key=lambda x: x['visits'], reverse=True)
-        move = {}
+        scands = sorted(cands, key=lambda x: x["visits"], reverse=True)
+
+        move = None
         rank = 0
         for c in scands:
             rank += 1
-            if uci_or_san in [c['uci'], self.board.san(c['uci'])]:
+            if uci_or_san in [c["uci"], self.board.san(c["uci"])]:
                 move = c
                 break
-        
-        if not move:
+
+        if move is None:
             print(f"No visit info available for {uci_or_san}")
             return
-        
+
+        is_sf_turn = ("stockfish" in str(who).lower())
+        xc0_move = node.get("xc0_move") if node else None
+
+        r = self.sf_row_for_ply(self.ply)
+        sf_best_uci = None
+        if r is not None:
+            sf_best_uci = str(r.get("best_move", "") or "")
+
+        uci = move.get("uci")
+
+        sampled = bool(xc0_move and (xc0_move != chosen) and (not is_sf_turn))
+
+        extra = []
+        mark = False
+
+        if is_sf_turn:
+            if uci == chosen:
+                mark = True
+        else:
+            if xc0_move and uci == xc0_move:
+                if sf_best_uci and (uci == sf_best_uci):
+                    extra.append("<-Xc0, SF")
+                else:
+                    extra.append("<-Xc0")
+
+            if sampled and (uci == chosen) and (chosen != xc0_move):
+                if sf_best_uci and (chosen == sf_best_uci):
+                    extra.append("<-SF,samp")
+                else:
+                    extra.append("<-sampled")
+
+            if sf_best_uci and (uci == sf_best_uci):
+                mark = True
+
         print(f"  === Showing visit info for {uci_or_san} ===")
-        self.print_row(move)
-        print(f"   Rank: {rank}\tShare: {100*move['visits']/node['sims']:.3f}%")
+        self.print_header(show_rank=True, show_rsc=False)
+        self.print_row(
+            move,
+            mark=mark,
+            show_rank=True,
+            rank_val=rank,
+            show_rsc=False,
+            extra_flags=extra,
+        )
+        print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 
     def show_options(self):
         # concise CLI help for replay mode commands
@@ -496,8 +914,11 @@ class GameViewer:
         print("  b, back              previous move (same as b1)")
         print("  q, quit, exit        quit replay")
         print("  o, options, help     show this help text")
+        print("  fen                  print FEN for current position")
         print("  sf                   stockfish overlay (uses default depth)")
         print("  sf<D>                stockfish eval to depth D, e.g. sf12")
+        print("  lc0                  lc0 overlay (default 4000 nodes)")
+        print("  lc0 <N>              lc0 eval with N nodes, e.g. lc0 8000")
         print("  visits <move>        show MCTS visits for specific move")
         print("  visits <N>           show visit info for N top moves")
         print("  pv                   show principal variation (min_vis=1)")
@@ -524,6 +945,8 @@ class GameViewer:
                 break
             elif cmd in ("o", "options", "help", "h", "?"):
                 self.show_options()
+            elif cmd == "fen":
+                print(self.board.fen())
             elif cmd.startswith("pv"):
                 # pv or pvN (e.g. pv8)
                 if cmd == "pv":
@@ -533,7 +956,9 @@ class GameViewer:
                     n = int(s) if s.isdigit() else 1
                 self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
-                self.show_sf_overlay(cmd)  # cmd parsed for depth inside method
+                self.show_sf_overlay(cmd)
+            elif cmd.startswith("lc0"):
+                self.show_lc0_overlay(cmd)
             elif cmd.startswith("b"):
                 # b, back, b5, b 5 all supported
                 s = cmd[1:].strip()
@@ -605,7 +1030,7 @@ class GameViewer:
             rb = self.board
             lms = rb.legal_moves()
             
-            node = self.tree_data.get(str(self.ply), {})
+            node = self.tree_data.get(self.ply, {})
             if not node:
                 self.next()
                 continue
@@ -617,7 +1042,8 @@ class GameViewer:
                 
                 # add in all legal moves if missing
                 for move in [l for l in lms if l not in visited]:
-                    visited.append([[move, 1]])
+                    visited.add(move)
+                    visits.append([move, 1])
                     
                 visits = sorted(visits, key=lambda x: x[1], reverse=True)
                 
@@ -1473,7 +1899,7 @@ def stop_post_hoc_server(p, timeout=10):
 
 
 class RecordKeeper(object):    
-    def __init__(self, n_retrains, run_num, every_sec=60):
+    def __init__(self, n_retrains, run_num=None, every_sec=60):
         self.n_retrains = n_retrains
         self.run_num = run_num
         self.every_sec = every_sec
@@ -1492,7 +1918,6 @@ class RecordKeeper(object):
         self.telemetry = {}
 
     def ingest_recents(self, recent):
-        looper_id = recent['looper_id']
         meta = recent['meta']
 
         self.games_finished += 1
@@ -1523,37 +1948,44 @@ class RecordKeeper(object):
 
     def get_agg_metrics(self):
         time_delta = time.time() - 120
+
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
             "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
-            "s_priorless", "s_puct", "preds_per_second"
+            "s_priorless", "s_puct", "preds_per_second",
+
+            "s_must_visit", "s_with_priors",
+            "s_skipped", "s_pruned", "s_penalty",
+
+            # priors cache (per-worker) telemetry, aggregate across workers
+            "cache_size", "cache_capacity", "cache_queries", "cache_hits"
         ]
 
         summed = defaultdict(float)
         sum_seen = set()
 
-        to_avg = ['mbs', 'fwd_target', 'apl', "pred_wait", 'avg_ply']
+        to_avg = ["mbs", "batch_target", "apl", "pred_wait", "avg_ply"]
         avged = defaultdict(list)
         avg_seen = set()
-        valid = []
-        for looper_id, info in self.telemetry.items():
-            # if telemetry is timed out, skip it
-            if info['ts'] < time_delta:
-                continue
-            
-            for tosum in to_sum:
-                summed[tosum] += info.get(tosum, 0)
-                sum_seen.add(tosum)
 
-            for ta in to_avg:
-                avged[ta].append(info.get(ta, 0))
-                avg_seen.add(ta)
+        for _, info in self.telemetry.items():
+            if info.get("ts", 0) < time_delta:
+                continue
+
+            for k in to_sum:
+                summed[k] += info.get(k, 0)
+                sum_seen.add(k)
+
+            for k in to_avg:
+                avged[k].append(info.get(k, 0))
+                avg_seen.add(k)
 
         summed_out = {k: summed[k] for k in sorted(sum_seen)}
         avg_out = {k: np.mean(avged[k]) for k in sorted(avg_seen)}
+
         return summed_out, avg_out
 
-    def maybe_log_results(self, window=500, force=False):
+    def maybe_log_results(self, window=1500, force=False):
         now = time.time()
         if not force and (now - self._last_stats_log < self.every_sec):
             return
@@ -1577,7 +2009,7 @@ class RecordKeeper(object):
             f"avg_len={avg_moves:.1f} moves")
         print("-" * 72)
 
-        recent = self.recent_games[-500:]
+        recent = self.recent_games[-window:]
         if not recent:
             print("(no recent games to break down)")
             print("~" * 72)
@@ -1598,62 +2030,72 @@ class RecordKeeper(object):
         n_groups = summed.get("n_groups", 0)
         if n_groups == 0:
             return
-        
-        s_collected     = summed.get("s_collected", 0)
-        s_fast          = summed.get("s_fast", 0)
-        s_terminals     = summed.get("s_terminals", 0)
-        s_cached        = summed.get("s_cached", 0)
-        s_fast_stops    = summed.get("s_fast_stops", 0)
+
+        s_collected = summed.get("s_collected", 0)
+        s_terminals = summed.get("s_terminals", 0)
+        s_cached = summed.get("s_cached", 0)
+        s_fast_stops = summed.get("s_fast_stops", 0)
         s_collect_stops = summed.get("s_collect_stops", 0)
-        s_priorless     = summed.get("s_priorless", 0)
-        s_puct          = summed.get("s_puct", 0)
+        s_priorless = summed.get("s_priorless", 0)
+        s_puct = summed.get("s_puct", 0)
+
+        s_must_visit = summed.get("s_must_visit", 0)
+        s_with_priors = summed.get("s_with_priors", 0)
+
+        s_skipped = summed.get("s_skipped", 0)
+        s_pruned = summed.get("s_pruned", 0)
 
         avg_new = s_collected / n_groups
 
         total_overall = s_collected + s_terminals + s_cached
-        term_to_cached = s_terminals / s_cached if s_cached > 0 else 0.0
         pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
         pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
 
         f_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
         collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
 
-        mbs = avged['mbs']
-        print("-"*72)
-        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.0f}"
+        mbs = avged["mbs"]
+        print("-" * 72)
+        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.1f}"
         right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
 
-        left2 = f"[stop stats] fastpath_breaks={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
-        right2 = f"collect_breaks={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
+        left2 = f"[stop stats] fastpath_stops={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
+        right2 = f"collect_stops={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
 
-        # preds / active / finished runtime pre-compute
-        apl = avged['apl']
-        fwd_target = avged['fwd_target']
-        fill_pct = 100.0 * apl / max(1.0, fwd_target)
+        apl = avged["apl"]
+        batch_target = avged["batch_target"]
+        fill_pct = 100.0 * apl / max(1.0, batch_target)
 
-        pred_wait = avged['pred_wait']
-        preds_per_sec = summed['preds_per_second']
+        pred_wait = avged["pred_wait"]
+        preds_per_sec = summed["preds_per_second"]
 
-        left3 = f"[pred stats] fill={apl:.1f}/{fwd_target} ({fill_pct:.1f}%)"
+        left3 = f"[pred stats] fill={apl:.1f}/{batch_target:.1f} ({fill_pct:.1f}%)"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
 
-        with_priors = total_overall - s_priorless
-        puct_avg = s_puct / with_priors if with_priors else 0.0
-        priorless_pct = 100.0 * s_priorless / max(1, total_overall)
-        left4 = f"[leaf stats] priorless={s_priorless:.0f} ({priorless_pct:.2f}%)"
-        right4 = f"puct={s_puct:.0f}  puct/leaf={puct_avg:.1f}"
+        tot = s_priorless + s_with_priors + s_must_visit
+        wo_priors = 100.0 * s_priorless / tot if tot > 0.0 else 0.0
+        puct_per_leaf = s_puct / total_overall if total_overall else 0.0
+        left4 = f"[puct stats] priorless={s_priorless:.0f} ({wo_priors:.3f}%)"
+        right4 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
 
-        left5 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right5 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+        tot_skip = s_skipped + s_pruned
+        avoided_r = tot_skip / s_puct if s_puct else 0.0
+        skip_to_prune = s_skipped / s_pruned if s_pruned else 0.0
+        avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
+        left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.2f}"
+        right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
+
+        left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
+        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
         sims = self.sims_done_total
         moves = self.total_plies
         sims_per_move = sims / moves if moves > 0 else 0.0
 
-        n_active = summed['n_active']
-        avg_ply = avged['avg_ply']
-        left6 = f"[game stats] n={n_active:.0f} avg ply={avg_ply:.2f}"
-        right6 = f"sims per move={sims_per_move:.2f}"
+        n_active = summed["n_active"]
+        avg_ply = avged["avg_ply"]
+        left7 = f"[game stats] n={n_active:.0f}  avg ply={avg_ply:.2f}"
+        right7 = f"sims per move={sims_per_move:.2f}"
 
         col_width = 40
         print(f"{left1:<{col_width}} | {right1}")
@@ -1662,8 +2104,8 @@ class RecordKeeper(object):
         print(f"{left4:<{col_width}} | {right4}")
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")
+        print(f"{left7:<{col_width}} | {right7}")
 
-        # show game duration if its available
         last50 = self.recent_games[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
         avg_runtime = None
@@ -1671,4 +2113,4 @@ class RecordKeeper(object):
             avg_runtime = format_time(np.mean(durations))
             if avg_runtime:
                 print(f"[game stats] last 50 runtime: {avg_runtime}")
-        print("-"*72)
+        print("-" * 72)

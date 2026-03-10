@@ -2,6 +2,7 @@ import os, json, pathlib, time
 from pathlib import Path
 import uuid
 import sys
+import random
 import subprocess
 from collections import deque
 
@@ -15,8 +16,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
-    calc_entropy, cp_to_value_tanh, kl_divergence
+    score_cp_stm_pov, score_cp_white_pov, rnd, cp_to_value_tanh, kl_divergence
 )
 
 RS = "[rescore]"
@@ -53,6 +53,8 @@ class Rescorer(object):
         self.sf_played_time = 0
         # sf max will store the 10 longest sf search times, to reduce outliers
         self.sf_max = [0.0]*10
+        self.last_10_cpls = []
+        self.last_10_bmrs = []
 
         self.init_analyzer()
 
@@ -124,7 +126,7 @@ class Rescorer(object):
         - pi:  list/array of probs (sum ~= 1)
         - Y: target for value head
         """
-        cfg = self.config
+        
         # get indices from C++
         indices = board.moves_to_indices(ucis)  # list of int (0..4288)
         policy = np.zeros(64 * 67, dtype=np.float32)
@@ -132,7 +134,7 @@ class Rescorer(object):
         # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, cfg.prior_clip_min, cfg.prior_clip_max)
+        pi = np.clip(pi, 0.0002, 0.9)
         pi = pi / pi.sum()
 
         # accumulate probs into flattened policy
@@ -144,35 +146,54 @@ class Rescorer(object):
         mask = board.legal_move_mask()
 
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
-        
-        if len(self.training_data) >= cfg.retrain_batch_size:
-            out_dir = pathlib.Path(cfg.pending_training_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
+    
+    def write_training_data_pkl(self, size=None, randomize=True):
+        cfg = self.config
+        out_dir = pathlib.Path(cfg.pending_training_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-            chunk_size = cfg.retrain_batch_size
-            chunk = self.training_data[:chunk_size]
-            remainder = self.training_data[chunk_size:]
+        # we need to clear out any existing pkls because theyre probably corrupted
+        deleted = []
+        for p in out_dir.iterdir():
+            if not p.is_file():
+                continue
 
-            filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
-            out_path = out_dir / filename
+            suf = p.suffix.lower()
+            if suf in [".pkl", ".pickle"]:
+                p.unlink()
+                deleted.append(p.name)
 
-            with open(out_path, "wb") as f:
-                pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if deleted:
+            print(f"{RS} deleted {len(deleted)} stale pkls in {out_dir}")
 
-            self.training_data = remainder
-            self.written_this_round += len(chunk)
-            self.written_total += len(chunk)
+        if randomize:
+            random.shuffle(self.training_data)
 
-    def training_data_from_sf(self, board, mv, cm, Y):
+        if size is None:
+            size = cfg.get_retrain_size
+
+        chunk = self.training_data[:size]
+        remainder = self.training_data[size:]
+
+        filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
+        out_path = out_dir / filename
+
+        with open(out_path, "wb") as f:
+            pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        self.training_data = remainder
+        self.written_this_round += len(chunk)
+        self.written_total += len(chunk)
+
+    def training_data_from_sf(self, board, mv, cm, Y, is_draw):
         cfg = self.config
 
-        rows = [(c['uci'], c['visits']) for c in cm]
+        rows = [(c["uci"], c["visits"]) for c in cm]
         total_visits = sum([n for _, n in rows]) if rows else 0
 
         visit_map = None
         use_tree_visits = False
 
-        # make sure we have at least 10 visits for stability
         if rows and total_visits > 10:
             visit_map = {u: n for u, n in rows}
             most_visited_uci, max_visits = max(rows, key=lambda x: x[1])
@@ -180,9 +201,8 @@ class Rescorer(object):
             if most_visited_uci == mv:
                 use_tree_visits = True
             else:
-                # boost top visited with SF move
                 top_count = visit_map[most_visited_uci]
-                visit_map[mv] = 1 + int(top_count*1.25)
+                visit_map[mv] = 1 + int(top_count * 1.25)
                 use_tree_visits = True
 
         if use_tree_visits and visit_map is not None:
@@ -193,12 +213,11 @@ class Rescorer(object):
             ucis = [x[0] for x in raw]
             visits = [int(x[1]) for x in raw]
 
-        # calc KL divergence after adjustments
-        priors_map = {c['uci']: c['P'] for c in cm}
+        priors_map = {c["uci"]: c["P"] for c in cm}
         priors = [priors_map.get(u, 0.0) for u in ucis]
         kl = kl_divergence(priors, visits)
 
-        vwht = cfg.value_loss_weight
+        vwht = value_weight_for_game(cfg, is_draw)
         pwht = cfg.policy_loss_weight
         if kl > cfg.KL_boost_threshold:
             pwht *= cfg.KL_weight_boost
@@ -317,7 +336,7 @@ class Rescorer(object):
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
         result = game_data['result']
-
+        is_draw = (result == 0) or (result == 0.0)
         cpl_s = cpl_w = cpl_b = 0.0
         nw = nb = 0
         rows = []
@@ -357,7 +376,8 @@ class Rescorer(object):
             else:
                 this_q = tr.get("best_Q", tr.get("visit_weighted_Q"))
                 Q = this_q if turn else -1*this_q
-            Y = np.clip(0.5*Z_stm + 0.5*Q, -1.0, 1.0)
+
+            Y = np.clip(0.99*Z_stm + 0.01*Q, -1.0, 1.0)
 
             if Y != Y:
                 print("[rescore] nan value detected for Y")
@@ -367,20 +387,42 @@ class Rescorer(object):
 
             # if sf_move, gather training data, push moves, continue
             if is_sf_move:
-                self.training_data_from_sf(b_fast, mv, cm, Y)
+                self.training_data_from_sf(b_fast, mv, cm, Y, is_draw)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
 
             # if here, its MCTS move
-            # move_played may not be most visited due to temp sampling
-            # so inspect visits
+            # want CPL to reflect what Xerces would have played (robust/most_visited)
+            # not what was actually played when sampling is enabled.
             visits = [(c['uci'], max(1, c['visits'])) for c in cm]
             visits = sorted(visits, key=lambda x: x[1], reverse=True)
 
-            most_visited_uci = visits[0][0]
-            most_visited_ch = chess.Move.from_uci(most_visited_uci)
-            res = self.analyze_with_rank(most_visited_ch, board_ch)
+            if not visits:
+                continue
+
+            sel_method = tr.get("selection_method")
+            xc0_move = tr.get("xc0_move")
+
+            xerces_uci_for_cpl = mv
+            if xc0_move and xc0_move != mv:
+                xerces_uci_for_cpl = xc0_move
+                # if xc0 selected move isnt most visited, swap visits to make it so
+                top_uci = visits[0][0]
+                if xerces_uci_for_cpl != top_uci:
+                    vmap = {u: n for u, n in visits}
+                    top_n = vmap.get(top_uci, 1)
+                    xc0_n = vmap.get(xc0_move, 1)
+                    vmap[top_uci] = max(1, xc0_n)
+                    vmap[xc0_move] = max(1, top_n)
+                    visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            
+            elif not sel_method:
+                # backward-compat for older pkls that dont store method/xc0_move
+                xerces_uci_for_cpl = visits[0][0]
+
+            xerces_ch = chess.Move.from_uci(xerces_uci_for_cpl)
+            res = self.analyze_with_rank(xerces_ch, board_ch)
 
             loss_this = res['delta_signed']
             cpl_s += loss_this
@@ -390,15 +432,14 @@ class Rescorer(object):
             else:
                 cpl_b += loss_this
                 nb += 1
-            
-            # we penalize missed mates but still winning less harshly
+
+            # we penalize missed-mate-but-still-winning less harshly
             missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
             if missed_mate:
-                # cap loss_this at 300, we are still winning here
                 loss_this = min(300, loss_this)
-            
+
             rows.append([
-                i, mv, most_visited_uci, str(res['best_move']),
+                i, mv, xerces_uci_for_cpl, str(res['best_move']),
                 res['best_cp'], loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
                 board_ch.turn, loss_this
@@ -412,13 +453,18 @@ class Rescorer(object):
             # screen training data, adjust if needed and append
             lms = b_fast.legal_moves()
 
+            # determine correct cp threshold
+            blunder_cp = cfg.post_hoc_blunder_cp_loser
+            if Z_stm > 0.0:
+                blunder_cp = cfg.post_hoc_blunder_cp_winner
+
             # these moves are fine, no changes            
-            if loss_this <= 60:
+            if loss_this <= min(60, blunder_cp):
                 best_mv = mv
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
             
-            # for mild blunders or missed mates but still winning adjust visits
-            elif (loss_this < cfg.post_hoc_blunder_cp) or missed_mate:
+            # for mild blunders or missed-mate-but-still-winning, adjust visits
+            elif (loss_this < blunder_cp) or missed_mate:
                 best_mv = str(res.get('best_move'))
                 visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
 
@@ -443,7 +489,7 @@ class Rescorer(object):
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
-            vwht = cfg.value_loss_weight
+            vwht = value_weight_for_game(cfg, is_draw)
             pwht = cfg.policy_loss_weight
 
             # adjust training weights based on KL
@@ -473,8 +519,6 @@ class Rescorer(object):
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
         white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
         black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
-
-        total_plies = len(out_df)
 
         out = {
             'plies': nw + nb,
@@ -511,7 +555,21 @@ class Rescorer(object):
         self.n_saved += 1    
         self.tcpl += c; self.tbmr += b
 
+        # update the rolling windows
+        self.last_10_cpls.append(c)
+        self.last_10_cpls = self.last_10_cpls[-10:]
+        self.last_10_bmrs.append(b)
+        self.last_10_bmrs = self.last_10_bmrs[-10:]
+
         if report:
+            if len(self.last_10_cpls) >= 10:
+                last_10_avg_c = np.mean(self.last_10_cpls)
+                last_10_avg_b = np.mean(self.last_10_bmrs)
+                print(
+                    f"{RS} {'Last 10 avg:':<16} CPL {last_10_avg_c:.3f}",
+                    f"BMR {last_10_avg_b:.3f}"
+                )
+
             if self.n_saved >= 2:
                 cpl_mean = self.tcpl/self.n_saved
                 tmbr_mean = self.tbmr/self.n_saved 
@@ -551,6 +609,13 @@ class Rescorer(object):
         self.analyzed_results = []
 
 # helpers
+def value_weight_for_game(cfg, is_draw):
+    vwht = cfg.value_loss_weight
+    if is_draw:
+        vwht *= cfg.draw_value_scale
+    return vwht
+
+
 def ensure_all_legal_moves_have_visits(visit_pairs, lms):
     """
     visit_pairs: list of (uci, visits) or [uci, visits]
@@ -870,7 +935,7 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
     return [[u, int(v)] for u, v in items]
 
 
-def launch_retrain_async(run_tag, rt_script, working_cfg, n_samples):
+def launch_retrain_async(run_tag, rt_script, working_cfg):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
 
@@ -968,3 +1033,17 @@ def poll_retrain(handle, print_output=True):
         raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
 
     return True, rc
+
+
+def reclaim_vram(mb):
+    import tensorflow as tf
+
+    bytes_target = mb * 1024 * 1024
+    n = max(1, bytes_target // 4)
+
+    with tf.device("/GPU:0"):
+        x = tf.ones([n], dtype=tf.float32)
+        y = tf.reduce_sum(x)
+
+    _ = y.numpy()
+    return True

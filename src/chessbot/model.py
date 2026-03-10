@@ -78,38 +78,6 @@ def build_conv_trunk(input_shape=(8, 8, 70), width=256, n_blocks=8, leak=0.05):
     return Model(inputs, [trunk_feat, trunk_vec], name="conv_trunk")
 
 
-def make_conv_model(name, input_shape=(8, 8, 70), width=256, n_blocks=8):
-    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
-    inputs = trunk.input
-    trunk_feat, trunk_vec = trunk.output
-
-    # Heads
-    val_out, _ = value_head(trunk_vec, hidden=512)
-    best_outputs = policy_factor_head(trunk_vec, prefix="best", hidden=512)
-
-    model = Model(inputs, [val_out] + best_outputs, name=name)
-
-    losses = {
-        "value": tf.keras.losses.MeanSquaredError(),
-        "best_from": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_to":   tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_piece":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_promo":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-    }
-
-    loss_weights = {
-        "value": 0.5,
-        "best_from": 0.5,
-        "best_to": 0.5,
-        "best_piece": 0.5,
-        "best_promo": 0.1,
-    }
-
-    opt = tf.keras.optimizers.Adam(1e-4)
-    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
-    return model
-
-
 def make_fwd(model, warm_shapes=(64, 256)):
     """
     Returns a callable fwd(X_np) that:
@@ -387,19 +355,30 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
+def make_conv_infer(
+    model,
+    max_bs=1024,
+    uniform_eps=0.0,
+    prior_clip_max=1.0,
+    vscale=0.9,
+):
     """
     Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-    enc_np: int32 [B,64], legal_np: int32 [B,4288].
-    min_p, max_p are baked into the closure.
-    vscale scales the model value output (default 0.9 -> range ~[-0.9,0.9])
+
+    uniform_eps mixes uniform mass over legal moves:
+        probs = (1 - eps) * probs + eps * uniform_legal
+
+    prior_clip_max caps peaks after mixing (no floor clipping):
+        probs = min(probs, clip_max), then renorm
     """
 
-    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-    EPS = tf.constant(1e-12, dtype=tf.float32)
+    big_neg = tf.constant(-1e9, dtype=tf.float32)
+    eps_small = tf.constant(1e-12, dtype=tf.float32)
 
-    min_p_c = tf.constant(float(min_p), dtype=tf.float32)
-    max_p_c = tf.constant(float(max_p), dtype=tf.float32)
+    ue = tf.constant(float(uniform_eps), dtype=tf.float32)
+    ue = tf.clip_by_value(ue, 0.0, 1.0)
+
+    pcm = tf.constant(float(prior_clip_max), dtype=tf.float32)
     value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
 
     @tf.function(input_signature=[
@@ -407,37 +386,39 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
         tf.TensorSpec([None, 4288], tf.int32),
     ], experimental_compile=True)
     def graph(enc, legal):
-        # model returns (policy_logits, value)
         logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4288)
+        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
 
         mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
         logits32 = tf.cast(logits, tf.float32)
 
-        # mask illegal moves with a large negative in float32
-        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
+        masked_logits32 = tf.where(mask > 0.5, logits32, big_neg)
 
-        # softmax in float32 (temperature removed)
         row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
         exp = tf.exp(masked_logits32 - row_max) * mask
         sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
+
         has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
+        probs = tf.where(has_any, exp / (sumexp + eps_small), tf.zeros_like(exp))
 
-        # clipping on legal slots and renormalize (float32)
-        clipped = tf.where(mask > 0.5,
-                           tf.clip_by_value(probs, min_p_c, max_p_c),
-                           tf.zeros_like(probs))
-        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
-        valid = s > EPS
-        probs_final = tf.where(
-            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
-            tf.zeros_like(clipped)
-        )
+        if uniform_eps != 0.0:
+            legal_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
+            uni = tf.where(
+                legal_sum > 0.0,
+                mask / (legal_sum + eps_small),
+                tf.zeros_like(mask),
+            )
+            probs = (1.0 - ue) * probs + ue * uni
 
-        # scale value to reduce range (helps find mate scores)
+        if prior_clip_max < 1.0:
+            probs = tf.minimum(probs, pcm) * mask
+
+        s = tf.reduce_sum(probs, axis=1, keepdims=True)
+        probs = tf.where(s > eps_small, probs / (s + eps_small),
+                         tf.zeros_like(probs))
+
         value_f = tf.cast(value, tf.float32) * value_scale_c
-        return probs_final, value_f
+        return probs, value_f
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):
@@ -456,6 +437,7 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
         B = int(enc_np.shape[0])
         if B <= max_bs:
             return base_fwd((enc_np, legal_np))
+
         parts = None
         i = 0
         while i < B:
@@ -467,7 +449,9 @@ def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
                 parts[0] = np.concatenate([parts[0], p_probs], axis=0)
                 parts[1] = np.concatenate([parts[1], p_val], axis=0)
             i = j
+
         return parts
+
     return fwd
 
 
@@ -717,89 +701,6 @@ def build_conformer_64x67(
     # final value output (float32 for numerical stability)
     value_out = layers.Dense(
         1, activation="tanh", dtype="float32", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
-
-
-def build_lowrank_res_stack_64x67(
-    name,
-    d_model=64,
-    vocab_size=21,
-    inner_dim=64,
-    num_blocks=6,
-    dropout=0.05,
-):
-    """
-    Low-rank residual stack over a flattened 8x8xC representation.
-    No conv, no transformer. Outputs:
-      - policy head: 64 x 67 logits (flattened)
-      - value head: scalar in [-1, 1]
-    """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
-
-    # inputs -> token embedding
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    tok = layers.Embedding(
-        input_dim=vocab_size, output_dim=d_model, name="token_emb"
-    )(enc_in)
-
-    # flatten to global vector: D = 64 * d_model
-    flat_dim = 64 * d_model
-    x = layers.Reshape((flat_dim,), name="to_flat")(tok)
-
-    def lowrank_res_block(x_in, inner_dim, idx, return_dim, final_add=True):
-        nm = f"lr{idx}_"
-
-        # pre-activation (keeps the skip path clean)
-        ln = layers.LayerNormalization(axis=-1, epsilon=1e-5, name=nm + "ln")(x_in)
-
-        # x = x + φ2(A * φ1(Bx))
-        h = layers.Dense(inner_dim, kernel_initializer=HE, name=nm + "fc_b")(ln)
-
-        h = layers.Activation("gelu", name=nm + "gelu1")(h)
-        h = layers.Dense(return_dim, kernel_initializer=HE, name=nm + "fc_a", )(h)
-        h = layers.Activation("gelu", name=nm + "gelu2")(h)
-        h = layers.Dropout(dropout, name=nm + "drop2")(h)
-        
-        if final_add:
-            out = layers.Add(name=nm + "add")([x_in, h])
-
-        return out
-
-    for i in range(num_blocks):
-        x = lowrank_res_block(x, inner_dim, i)
-
-    # back to per-square features: (batch, 64, d_model)
-    tok_out = layers.Reshape((64, d_model), name="from_flat")(x)
-
-    # policy head: per-square logits -> (64, 67) then flatten
-    pol = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="pol_ln")(tok_out)
-    pol = layers.Dense(67, name="pol_fc_67")(pol)
-    pol = layers.Reshape((64, 67), name="to_64_67")(pol)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(pol)
-
-    # value head (no conv): per-token -> pooled -> MLP
-    v = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="v_ln0")(tok_out)
-    v = layers.Dense(64, activation=tf.nn.gelu, kernel_initializer=HE, name="v_fc0")(v)
-    v = layers.GlobalAveragePooling1D(name="v_gap")(v)
-    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
-    v = layers.Dropout(dropout, name="v_fc_drop")(v)
-    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
-
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 

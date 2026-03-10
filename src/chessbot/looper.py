@@ -3,36 +3,42 @@ import pathlib, json
 import time, gc
 import sys, subprocess
 
+import threading
+from queue import Queue, Empty
+
+import chess
+import chess.engine
+
+from chessbot.review import score_to_value_stm_pov
+
 _now = time.time
 
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-import chess
-
-from pyfastchess import raw_cache_bulk_insert
-from pyfastchess import raw_cache_clear, priors_cache_clear, priors_cache_stats
+from pyfastchess import raw_cache_bulk_insert, priors_cache_clear, priors_cache_stats
 
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
-
-import chessbot.utils as cbu
-from chessbot.utils import RateMeter, GameGenerator
+from chessbot.utils import RateMeter, GameGenerator, sf_eval
+#from chessbot.tf_thread import Batcher, TensorFlowThread
 
 
 class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_games_q, telemetry_q):
+    def __init__(self, model, cfg, recent_games_q, telemetry_q, msg_q):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_games_q
         self.telemetry_q = telemetry_q
+        self.msg_q = msg_q
+        self.unpause_queued = False
         self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
@@ -46,20 +52,17 @@ class GameLooper(object):
         
         self.model = model
 
-        self.eng = None
+        self.sf_games = {}
+        self.sf_thread = None
         if cfg.play_vs_sf_prob > 0.0:
-            self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-            self.eng.configure(cfg.sf_config)
-
-        cfg = self.config
-        self.infer = make_conv_infer(
-            self.model, max_bs=cfg.fwd_batch,
-            min_p=cfg.prior_clip_min, max_p=cfg.prior_clip_max,
-            vscale=cfg.vscale
-        )
+            self.sf_thread = StockfishThread(cfg.sf_config, cfg.sf_depth)
+            self.sf_thread.start()
+        
+        # pulls in model from config and XLA compilers inferencer
+        self.load_reload_model()
 
         self.infer_is_warm = False
-        self.batch_candidates = self.create_batch_candidates(cfg)
+        self.batch_candidates = self.create_batch_candidates(self.config)
         self.n_retrains = 0
         
         self._run_start = _now()
@@ -67,12 +70,21 @@ class GameLooper(object):
         self.lps = RateMeter("leafs")
         self._last_stats_log = _now()
         self.prediction_times = []
-        self.sf_search_depths = []
+
+        # self.batcher = Batcher(cfg, self.batch_candidates)
+        # self.tf_thread = TensorFlowThread(
+        #     cfg, self.infer, max_inflight=cfg.max_tf_inflight)
+        
+        # self.tf_thread.start()
     
     def close(self):
-        if self.eng is not None:
-            self.eng.quit()
-            self.eng = None
+        if self.sf_thread is not None:
+            self.sf_thread.close()
+            self.sf_thread = None
+        
+        # if self.tf_thread is not None:
+        #     self.tf_thread.close()
+        #     self.tf_thread = None
 
     def __enter__(self):
         return self
@@ -94,11 +106,95 @@ class GameLooper(object):
         self.infer_is_warm = True
         print("[model warmup] warm up complete")
 
+    def load_reload_model(self):
+        cfg = self.config
+        self.model = load_model(cfg.model_path)
+
+        self.infer = make_conv_infer(
+            self.model,
+            max_bs=cfg.fwd_batch,
+            uniform_eps=cfg.uniform_eps,
+            prior_clip_max=cfg.prior_clip_max,
+            vscale=cfg.vscale
+        )
+    
+    def check_for_pause(self):
+        """
+        Drain msg_q (non-blocking). Return True if a pause was requested.
+
+        Important: do NOT discard "unpause" if it arrives early. Buffer it so a later
+        pause_wait_and_reload() will not deadlock waiting for an unpause that was
+        already consumed.
+        """
+        while True:
+            try:
+                msg = self.msg_q.get_nowait()
+            except Empty:
+                return False
+
+            cmd = msg.get("cmd") if isinstance(msg, dict) else msg
+
+            if cmd == "pause":
+                return True
+
+            if cmd == "unpause":
+                self.unpause_queued = True
+                continue
+
+            # ignore everything else
+            continue
+
+    def pause_wait_and_reload(self):
+        """
+        Pause hard: stop TF preds, tear down GPU objects, then wait until "unpause".
+        After "unpause", reload model + infer and return.
+
+        If "unpause" arrived early and was buffered, do not block.
+        """
+        # if self.tf_thread is not None:
+        #     self.tf_thread.pause(blocking=True)
+        #     with self.tf_thread.infer_lock:
+        #         self.tf_thread.infer = None
+        
+        del self.infer
+        self.infer = None
+
+        del self.model
+        self.model = None
+
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        priors_cache_clear()
+
+        if self.unpause_queued:
+            self.unpause_queued = False
+        else:
+            while True:
+                msg = self.msg_q.get()
+                cmd = msg.get("cmd") if isinstance(msg, dict) else msg
+
+                if cmd == "unpause":
+                    break
+
+                if cmd == "pause":
+                    continue
+
+                continue
+
+        self.load_reload_model()
+
+        # if self.tf_thread is not None:
+        #     with self.tf_thread.infer_lock:
+        #         self.tf_thread.infer = self.infer
+        #     self.tf_thread.unpause()
+
+        self.n_retrains += 1
+
     def create_batch_candidates(self, cfg):
         # create sizes to warm up
-        batch_candidates = set()
-        batch_candidates.add(cfg.fwd_batch)
-        bs = 16
+        batch_candidates = set([cfg.min_batch, cfg.fwd_batch])
+        bs = cfg.min_batch
         while bs <= cfg.fwd_batch:
             batch_candidates.add(bs)
             bs *= 2
@@ -106,7 +202,10 @@ class GameLooper(object):
         # split difference between last 2 if large
         if len(batch_candidates) >= 2 and cfg.fwd_batch >= 128:
             sbc = sorted(batch_candidates)
-            sbc.append(int(sbc[-1] - sbc[-2] / 2))
+            lo = sbc[-2]
+            hi = sbc[-1]
+            mid = lo + (hi - lo) // 2
+            sbc.append(mid)
             return sorted(set(sbc))
         return sorted(set(batch_candidates))
 
@@ -141,7 +240,7 @@ class GameLooper(object):
             
             cg = ChessGame(board=board, meta=meta, cfg=self.config)
             self.active_games.append(cg)
-    
+
     def run(self, stop_event=None):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
@@ -149,101 +248,162 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        eng = self.eng
+        #batcher = self.batcher
         mbs = cfg.micro_batch
-        max_fastpath = max(200, int(2.5 * mbs))
-        lpb, counts = [], []
-        mps, lps = self.mps, self.lps
+        fwd = cfg.fwd_batch
+        max_fastpath = max(256, int(2.5 * mbs))
+        mps = self.mps
+
+        #(batch size, target), counts returned
+        pred_fill, counts = [], []
+        finished_ids = set()
+        #passes_since_trigger = 0
         while self.games_finished < cfg.n_games:
-            # check the stop event
+            # check a few stopping conditions 
             if stop_event is not None:
                 if stop_event.is_set():
                     return
             
-            if not self.active_games:
-                break
-            
-            preds_batch = []
-            finished = []
-            for game in self.active_games[:cfg.games_at_once]:
-                if game.tree.needs_root_noise(check_sims=True):
-                    game.tree.add_root_dirichlet_noise()
-
-                # if its stockfish turn, let SF move and skip MCTS this ply
-                if game.is_stockfish_turn():
-                    if game.tree.sims_completed_this_move > cfg.sf_move_sims:
-                        sf_terminal = game.make_move_with_stockfish(eng)
-                        mps.tick(1)
-                            
-                        if sf_terminal:
-                            self.finalize_game_data(game)
-                            finished.append(game.game_id)
-                            # pass until the next turn
-                            continue
-    
-                # if this game has reached its local sim budget, make the move
-                elif game.tree.stop_simulating():
-                    # bot plays from tree
-                    mcts_terminal = game.make_move_from_tree()
-                    mps.tick(1)
-                    
-                    # terminal after bot move?
-                    if mcts_terminal:
-                        self.finalize_game_data(game)
-                        finished.append(game.game_id)
-                        continue
-
-                # collect up to micro_batch leaves for this game
-                # CollectResults object from C++
-                res = game.tree.collect_many_leaves(mbs, max_fastpath)
-                
-                nn = res.count_new
-                nt = res.count_terminal
-                nc = res.count_cached
-                pl = res.total_priorless
-                pu = res.total_puct
-
-                # new + cached + terminal
-                n_leafs = nn + nc + nt 
-                lps.tick(n_leafs)
-
-                # update sim count
-                game.tree.sims_completed_this_move += n_leafs
-
-                if nn:
-                    preds_batch += game.tree.pending_encoded_64_tokens()
-
-                fastpaths = nt + nc
-                f_stop, c_stop = 0, 1
-                if nn < mbs:
-                    f_stop, c_stop = 1, 0
-
-                counts.append([nn, fastpaths, nt, nc, f_stop, c_stop, pl, pu])
-            
-            # run predictions if we have any. sends results to c++ raw cache
-            if preds_batch:
-                self.format_and_predict(preds_batch)
-                lpb.append(len(preds_batch))
-
-            if self.maybe_push_telemetry(counts, lpb, force=False):
-                self.prediction_times.clear()
-                counts = []
-                lpb = []
-            
-            # resolve fresh predictions back into each game tree
-            for game in self.active_games:
-                game.tree.resolve_pending()
-
             # remove any finished games
-            self.active_games = [
-                g for g in self.active_games if g.game_id not in finished
-            ]
+            if finished_ids:
+                self.active_games = [
+                    g for g in self.active_games if g.game_id not in finished_ids
+                ]
             
             # add in more games if needed
             self.fill_active_games()
-        
-        self.maybe_push_telemetry(counts, lpb, force=True)
+
+            if not self.active_games:
+                break
+            
+            if self.check_for_pause():
+                self.pause_wait_and_reload()
+
+            # drain sf thread queue
+            if self.sf_thread is not None:
+                sf_results = self.sf_thread.drain()
+                if sf_results:
+                    for tup in sf_results:
+                        if tup[0] == "__error__":
+                            raise tup[1]
+
+                        game_id, res_tup = tup
+                        g = self.sf_games[game_id]
+                        g.set_stockfish_result(res_tup)
+
+            # usually we will have perfectly filled batches, but some games
+            # may fill less than mbs, leaving room to pick extra leaves from other games
+            likely_fill = min(fwd, mbs * min(len(self.active_games), cfg.games_at_once))
+            batch_target = fwd
+            for candidate in self.batch_candidates:
+                if candidate >= likely_fill:
+                    batch_target = candidate
+                    break
+            
+            bonus = max(0, batch_target - likely_fill)
+            finished = []
+            preds_batch = []
+            # selfplay loop starts here
+            for game in self.active_games[:cfg.games_at_once]:
+                sf_terminal, mcts_terminal = False, False
+                # first resolve any recent preds
+                game.tree.resolve_inflight()
+
+                if game.tree.needs_root_noise(check_sims=True):
+                    game.tree.add_root_dirichlet_noise()
+                
+                # if its stockfish turn, check if the move is ready
+                # otherwise do not block and move on
+                if game.is_stockfish_turn():
+                    if not game.sf_pending:
+                        # submit move to sf queue here
+                        self.sf_thread.submit(game.game_id, game.python_chess_board)
+
+                        # stash the game here for easy reference later
+                        self.sf_games[game.game_id] = game
+                        game.sf_pending = True
+                    
+                    if game.tree.sims_completed_this_move >= cfg.sf_move_sims:
+                        if game.sf_pending and game.sf_ready:
+                            # sets pending, ready, res_tup to False, False, None
+                            sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
+                            mps.tick(1)
+                        else:
+                            bonus += mbs
+                            continue
+                
+                # if this game has reached its local sim budget, make the move
+                elif game.tree.stop_simulating():
+                    # xerces plays from tree
+                    mcts_terminal = game.make_move_from_tree()
+                    mps.tick(1)
+
+                # terminal check. do not sim on a finished game
+                if sf_terminal or mcts_terminal:
+                    self.finalize_game_data(game)
+                    finished.append(game.game_id)
+                    if game.game_id in self.sf_games:
+                        del self.sf_games[game.game_id]
+                    bonus += mbs
+                    continue
+
+                # if bonus available we can bump our microbatch up to 2x
+                this_mbs = mbs + min(bonus, mbs) if bonus > 0 else mbs
+                res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
+                nn, n_leafs = self.process_results(res, counts, this_mbs)
+                
+                # update bonus, could go up or down
+                bonus += mbs - nn
+                
+                # update sim count
+                game.tree.sims_completed_this_move += n_leafs
+                if nn:
+                    preds_batch += game.tree.pending_encoded_64_tokens()
+
+            if preds_batch:
+                batch_target, batch_size = self.format_and_predict(preds_batch)
+                pred_fill.append((batch_size, batch_target))
+
+            if self.maybe_push_telemetry(counts, pred_fill, force=False):
+                self.prediction_times.clear()
+                counts.clear(); pred_fill.clear()
+            
+            if finished:
+                finished_ids.update(finished)
+            
+        self.maybe_push_telemetry(counts, pred_fill, force=True)
         return 0
+
+    def process_results(self, res, counts, mbs):
+        nn = res.count_new
+        nt = res.count_terminal
+        nc = res.count_cached
+
+        pl = res.total_priorless
+        pu = res.total_puct
+
+        mv = res.total_must_visit
+        wp = res.total_with_priors
+
+        sk = res.total_skipped
+        pr = res.total_pruned
+        pen = res.total_penalty
+
+        n_leafs = nn + nc + nt
+        self.lps.tick(n_leafs)
+
+        fastpaths = nt + nc
+        f_stop, c_stop = 0, 1
+        if nn < mbs:
+            f_stop, c_stop = 1, 0
+
+        counts.append([
+            nn, fastpaths, nt, nc, f_stop, c_stop,
+            pl, pu,
+            mv, wp,
+            sk, pr, pen
+        ])
+        return nn, n_leafs
 
     def format_and_predict(self, preds_batch):
         """
@@ -274,7 +434,7 @@ class GameLooper(object):
         # stack to batch
         boards_np = np.stack(boards, axis=0)   # (B,64)
         legals_np = np.stack(legals, axis=0)   # (B,4288)
-        # pad up to fwd_batch or a smaller power of 2 if needed
+        # pad up to max_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
 
         target_bs = self.config.fwd_batch
@@ -299,6 +459,7 @@ class GameLooper(object):
                 start = _now()
                 probs_np, vals_np = self.infer((boards_np, legals_np))
         else:
+            new_target = target_bs
             start = _now()
             probs_np, vals_np = self.infer((boards_np, legals_np))
         
@@ -313,6 +474,7 @@ class GameLooper(object):
         raw_cache_bulk_insert(to_raw_cache)
         stop = _now()
         self.prediction_times.append(stop-start)
+        return new_target, B
 
     def finalize_game_data(self, game):
         """
@@ -326,16 +488,14 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
-        
-        sims_total = game.tree.sims_done_total 
-        moves = game.tree.n_moves_played
-        avg_sims = sims_total/moves if moves > 0 else 0
+        sims_total = game.tree.sims_done_total
+        cfg = self.config
 
         # read adjudicator flags (direct attrs; they always exist)
-        mat = self.config.use_material_diff
-        tb = self.config.use_syzygy
-        dr = self.config.use_eval_draw
-        cl = self.config.use_eval_collar
+        mat = cfg.use_material_diff
+        tb = cfg.use_syzygy
+        dr = cfg.use_eval_draw
+        cl = cfg.use_eval_collar
 
         # encode into 0..15 index: bit0=material, bit1=syzygy, bit2=eval_draw,
         # bit3=eval_collar
@@ -354,8 +514,11 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            # this is the specific c_puct, not the list of options
-            "c_puct": game.tree.c_puct
+            # this is the specific c_puct and dirichlet eps, not the list of options
+            "c_puct": game.tree.c_puct,
+            "dirichlet_eps": game.tree.dirichlet_eps,
+            "uniform_eps": cfg.uniform_eps,
+            "prior_clip_max": cfg.prior_clip_max
         }
 
         # on-disk record (full)
@@ -366,13 +529,15 @@ class GameLooper(object):
         }
 
         res.update(mem_summary)
-        res.update(self.config.to_dict())
+        res.update(cfg.to_dict())
         res.update(game.meta)
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
-        out_file = os.path.join(self.config.game_dir, game.game_id + "_log.pkl")
+        res["dirichlet_eps"] = game.tree.dirichlet_eps
+
+        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
 
@@ -390,13 +555,33 @@ class GameLooper(object):
         game.recents.clear()
         return
     
-    def maybe_push_telemetry(self, counts, lpb, every_sec=45.0, force=False):
+    def maybe_push_telemetry(self, counts, pred_fill, every_sec=45.0, force=False):
         now = _now()
         if not force:
             if now - self._last_stats_log < every_sec:
                 return False
 
         self._last_stats_log = now
+
+        lpb = [p[0] for p in pred_fill]
+        target = [p[1] for p in pred_fill]
+
+        s_collected = sum([r[0] for r in counts])
+        s_fast = sum([r[1] for r in counts])
+        s_terminals = sum([r[2] for r in counts])
+        s_cached = sum([r[3] for r in counts])
+        s_fast_stops = sum([r[4] for r in counts])
+        s_collect_stops = sum([r[5] for r in counts])
+
+        s_priorless = sum([r[6] for r in counts])
+        s_puct = sum([r[7] for r in counts])
+
+        s_must_visit = sum([r[8] for r in counts])
+        s_with_priors = sum([r[9] for r in counts])
+
+        s_skipped = sum([r[10] for r in counts])
+        s_pruned = sum([r[11] for r in counts])
+        s_penalty = sum([r[12] for r in counts])
 
         telemetry = {
             "ts": now,
@@ -406,30 +591,46 @@ class GameLooper(object):
             "apl": np.mean(lpb) if lpb else 0.0,
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
-            "fwd_target": self.config.fwd_batch,
+            "batch_target": np.mean(target) if target else 0.0,
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
             "n_groups": len(counts),
-            "s_collected": sum([r[0] for r in counts]),
-            "s_fast": sum([r[1] for r in counts]),
-            "s_terminals": sum([r[2] for r in counts]),
-            "s_cached": sum([r[3] for r in counts]),
-            "s_fast_stops": sum([r[4] for r in counts]),
-            "s_collect_stops": sum([r[5] for r in counts]),
-            "s_priorless": sum([r[6] for r in counts]),
-            "s_puct": sum([r[7] for r in counts]),
+
+            "s_collected": s_collected,
+            "s_fast": s_fast,
+            "s_terminals": s_terminals,
+            "s_cached": s_cached,
+            "s_fast_stops": s_fast_stops,
+            "s_collect_stops": s_collect_stops,
+
+            "s_priorless": s_priorless,
+            "s_puct": s_puct,
+
+            "s_must_visit": s_must_visit,
+            "s_with_priors": s_with_priors,
+
+            "s_skipped": s_skipped,
+            "s_pruned": s_pruned,
+            "s_penalty": s_penalty,
         }
 
         if self.active_games:
-            telemetry['avg_ply'] = np.mean([g.plies for g in self.active_games])
+            telemetry["avg_ply"] = np.mean([g.plies for g in self.active_games])
 
-        if self.prediction_times:
-            telemetry['pred_wait'] = np.mean(self.prediction_times)
-            telemetry['preds_per_second'] = telemetry['apl'] / telemetry['pred_wait']
-        
-        # put telemetry on the queue and return True to clear counts and lpb
+        # if self.tf_thread:
+        #     tf_stats = self.tf_thread.stats()
+        #     telemetry["pred_wait"] = tf_stats["mean_pred_s"]
+        #     telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
+        telemetry["pred_wait"] = np.mean(self.prediction_times)
+        telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
+
+        pcs = priors_cache_stats()
+        for k, v in pcs.items():
+            telemetry[f"cache_{k}"] = v
+
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
         return True
+
     
     def update_partial_telemetry(self):
         """send a partial update to the telemetry for more time sensitive metrics"""
@@ -445,7 +646,7 @@ class GameLooper(object):
         self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
 
 
-def init_selfplay(config, recent_games_q, telemetry_q):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -465,16 +666,82 @@ def init_selfplay(config, recent_games_q, telemetry_q):
 
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_games_q=recent_games_q, telemetry_q=telemetry_q
+        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q
     )
 
     # infer number of retrains already done from existing progress csv
     if os.path.exists(config.progress_csv_path):
-        try:
-            progress_df = pd.read_csv(config.progress_csv_path)
-            n_retrains = len(progress_df)
-            looper.n_retrains = n_retrains
-        except Exception as e:
-            print("[init_selfplay] failed reading progress csv:", e)
+        progress_df = pd.read_csv(config.progress_csv_path)
+        n_retrains = len(progress_df)
+        looper.n_retrains = n_retrains
 
     return looper
+
+
+class StockfishThread(object):
+    def __init__(self, sf_config, depth):
+        self.sf_loc = SF_LOC
+        self.sf_config = sf_config
+        self.depth = depth
+
+        self.req_q = Queue()
+        self.res_q = Queue()
+        self.stop_ev = threading.Event()
+        self.t = None
+
+        self.eng = None
+        self.err = None
+
+    def start(self):
+        if self.t is not None:
+            return
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def close(self):
+        self.stop_ev.set()
+        if self.t is not None:
+            self.t.join()
+        if self.eng is not None:
+            self.eng.quit()
+        self.t = None
+        self.eng = None
+
+        if self.err is not None:
+            raise self.err
+
+    def submit(self, game_id, board):
+        b = board.copy(stack=True)
+        self.req_q.put((game_id, b))
+
+    def drain(self, max_items=9999):
+        out = []
+        for _ in range(max_items):
+            try:
+                out.append(self.res_q.get_nowait())
+            except Empty:
+                break
+        return out
+
+    def run(self):
+        self.eng = chess.engine.SimpleEngine.popen_uci(self.sf_loc)
+        self.eng.configure(self.sf_config)
+
+        while not self.stop_ev.is_set():
+            try:
+                game_id, board = self.req_q.get(timeout=0.01)
+            except Empty:
+                continue
+
+            try:
+                res_tup = sf_eval(
+                    board, score_fn=score_to_value_stm_pov,
+                    depth=self.depth, engine=self.eng
+                )
+
+                self.res_q.put((game_id, res_tup))
+            except Exception as e:
+                self.err = e
+                self.res_q.put(("__error__", e))
+                self.stop_ev.set()
+                return

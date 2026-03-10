@@ -5,41 +5,33 @@ import queue as py_queue
 import multiprocessing as mp
 import sys
 import json
-from collections import deque
-import pathlib
 
 import numpy as np
 import pandas as pd
 
-from chessbot import SF_LOC, SP_DIR
-from chessbot.looper import GameLooper, init_selfplay
-from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain
+from chessbot import SP_DIR
+from chessbot.looper import init_selfplay
+from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain, reclaim_vram
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
 
-
 import signal
 import threading
 
 STOP_REQUESTED = threading.Event()
+PROCESS_TIME = 30.0
+MAX_BACKLOG = 200
+_now = time.time
 
 
 def request_stop(signum=None, frame=None):
     STOP_REQUESTED.set()
 
 
-_now = time.time
-
-PRINT_EVERY = 60.0
-PROCESS_TIME = 20.0
-ANALYSIS_BATCH = 30
-
-
 def update_game_index(game, base_cfg):
-    # update JSONL index (small)
-
+    # update JSONL index
     game['beat_sf'] = False
     if game['vs_stockfish']:
         game_result = game['result']
@@ -61,10 +53,6 @@ def update_game_index(game, base_cfg):
 
 
 def make_parent_queues():
-    """
-    Create mp queues in parent and return them.
-    Create them from default ctx (platform default).
-    """
     ctx = mp.get_context()
     recent_q = ctx.Queue()
     telemetry_q = ctx.Queue()
@@ -79,17 +67,15 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-
-        # customize workers
-        if not cfg.is_validation_run:
-            # only SF on first 2 workers (saves CPU)
-            if i > 1:
-                c.play_vs_sf_prob = 0.0
+        if not cfg.is_validation_run and i > 1:
+            c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()
+        msg_q = ctx.Queue()
+
         p = ctx.Process(
             target=child_looper,
-            args=(c, stop_ev, recent_q, telemetry_q),
+            args=(c, stop_ev, recent_q, telemetry_q, msg_q),
         )
         p.start()
 
@@ -97,6 +83,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
             "id": c.id,
             "p": p,
             "stop_ev": stop_ev,
+            "msg_q": msg_q,
             "stop_sent_at": None,
             "term_sent_at": None,
             "kill_sent_at": None,
@@ -105,8 +92,8 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     return procs
 
 
-def child_looper(cfg, stop_ev, recent_games_q, telemetry_q):
-    with init_selfplay(cfg, recent_games_q, telemetry_q) as looper:
+def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q):
+    with init_selfplay(cfg, recent_games_q, telemetry_q, msg_q) as looper:
         looper.run(stop_ev)
 
 
@@ -243,12 +230,50 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
-def launch_retrain(run_tag, working_cfg, n_samples):
+def reclaim_vram_worker(mb):
+    reclaim_vram(mb)
+
+
+def launch_retrain(run_tag, working_cfg):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
 
-    return launch_retrain_async(run_tag, rt_script, working_cfg, n_samples)
+    # need to try to pull back GPU VRAM for training
+    ctx = mp.get_context("spawn")
+    success = []
+    stop = False
+    for mb in [500, 1000, 2000, 4000, 6000]:
+        if stop:
+            break
+
+        for attempt in range(2):
+            p = ctx.Process(target=reclaim_vram_worker, args=(mb,))
+            p.start()
+            p.join()
+            ok = (p.exitcode == 0)
+
+            if ok:
+                success.append(mb)
+                break
+
+            if not ok and attempt > 0:
+                print(f"[reclaim_vram] failed {mb} MB, stopping reclaim")
+                stop = True
+                break
+    
+    if success:
+        print(f"[reclaim vram] ok levels: {success}")
+
+    return launch_retrain_async(run_tag, rt_script, working_cfg)
+
+
+def pull_pkl(to_process):
+    # might be nested or flat depending on where it came from
+    if 'meta' in to_process.keys():
+        return to_process['meta']['pkl_file']
+    else:
+        return to_process['pkl_file']
 
 
 def main(run_tag):
@@ -259,9 +284,17 @@ def main(run_tag):
     rescorer = Rescorer(base_cfg)
     finished_games = rescorer.get_unprocessed()
 
+    # infer n_retrains
+    if os.path.exists(base_cfg.progress_csv_path):
+        progress_df = pd.read_csv(base_cfg.progress_csv_path)
+        n_retrains = len(progress_df)
+    else:
+        n_retrains = 0
+    
+    recorder = RecordKeeper(n_retrains, run_num=0, every_sec=45.0)
+
     start = time.time()
     procs = []
-    cpl_list = []
     recent_q = None
     telemetry_q = None
     retrain = None
@@ -269,9 +302,9 @@ def main(run_tag):
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
+            recorder = RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
+            recorder.training_queue = len(rescorer.training_data)
 
-            n_processed = 0
-            next_print = 10
             if STOP_REQUESTED.is_set():
                 break
 
@@ -304,12 +337,10 @@ def main(run_tag):
                 n_retrains = len(progress_df)
             else:
                 n_retrains = 0
-            
-            recorder = RecordKeeper(n_retrains, run_num, every_sec=45.0)
 
             procs = check_and_reap_procs(procs)
-            needed = working_cfg.training_queue_thresh
-            while len(procs) or (recorder.training_queue < needed):
+            needed_to_retrain = working_cfg.training_queue_buffer
+            while len(procs) or (recorder.training_queue < needed_to_retrain):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
@@ -317,8 +348,8 @@ def main(run_tag):
                 # check for finished procs
                 procs = check_and_reap_procs(procs)
 
-                # break here if no workers and no finished games
-                if not procs and len(finished_games) == 0:
+                # break if no workers and backlog is small enough to carry into next round
+                if not procs and len(finished_games) < MAX_BACKLOG:
                     break
 
                 # check telemetry
@@ -343,14 +374,46 @@ def main(run_tag):
                         break
                     
                     to_process = finished_games.popleft()
-                    # might be nested or flat depending on where it came from
-                    if 'meta' in to_process.keys():
-                        pkl_file = to_process['meta']['pkl_file']
-                    else:
-                        pkl_file = to_process['pkl_file']
+                    pkl_file = pull_pkl(to_process)
+                    
                     rescorer.analyze_and_rescore(pkl_file)
-                    recorder.training_queue = rescorer.written_this_round
-                    # need to write this out to pkl
+                    recorder.training_queue = len(rescorer.training_data)
+
+                # check for a retrain
+                if recorder.training_queue >= needed_to_retrain:
+                    # pause workers
+                    for p in procs:
+                        p["msg_q"].put("pause")
+                    
+                    # sample and write training data, update training_queue for logging
+                    rescorer.write_training_data_pkl(
+                        size=working_cfg.retrain_size, randomize=True)
+
+                    recorder.training_queue = len(rescorer.training_data)
+
+                    if retrain is None:
+                        retrain = launch_retrain(run_tag, working_cfg)
+                        rescorer.reset_writer()
+                    
+                    while retrain is not None:
+                        done, rc = poll_retrain(retrain, print_output=True)
+                        if done:
+                            retrain = None
+                            recorder.n_retrains += 1
+                        
+                        # can still process games during retraining
+                        if len(finished_games):
+                            to_process = finished_games.popleft()
+                            pkl_file = pull_pkl(to_process)
+                            rescorer.analyze_and_rescore(pkl_file)
+                            recorder.training_queue = len(rescorer.training_data)
+                        
+                        else:
+                            time.sleep(0.05)
+                    
+                    # unpause workers
+                    for p in procs:
+                        p["msg_q"].put("unpause")
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)
@@ -370,29 +433,6 @@ def main(run_tag):
                 build_validation_summary(recorder)
                 # we do not train after validation currently
                 continue
-            
-            # check if we have enough to run retraining
-            n_samples = rescorer.written_this_round
-            if n_samples >= needed:
-                if retrain is None:
-                    retrain = launch_retrain(run_tag, working_cfg, n_samples)
-                    rescorer.reset_writer()
-                while retrain is not None:
-                    done, rc = poll_retrain(retrain, print_output=True)
-                    if done:
-                        retrain = None
-                    
-                    if len(finished_games):
-                        to_process = finished_games.popleft()
-                        # might be nested or flat depending on where it came from
-                        if 'meta' in to_process.keys():
-                            pkl_file = to_process['meta']['pkl_file']
-                        else:
-                            pkl_file = to_process['pkl_file']
-                        rescorer.analyze_and_rescore(pkl_file)
-                    
-                    else:
-                        time.sleep(0.05)
 
         # capture the return situation
         rescorer.push_analyzed(report=True)
@@ -409,12 +449,13 @@ def main(run_tag):
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.push_analyzed(report=True)
+        rescorer.write_training_data_pkl(size=9999999, randomize=False)
         rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 
 
 if __name__ == "__main__":
-    # build in gracefully exits
+    # build in graceful exits
     signal.signal(signal.SIGINT, request_stop)
 
     if hasattr(signal, "SIGTERM"):

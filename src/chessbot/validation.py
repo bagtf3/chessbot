@@ -5,8 +5,6 @@ import time
 import numpy as np
 import yaml
 
-from pyfastchess import Board as fastboard
-from chessbot.config import Config
 from chessbot.mcts_utils import ChessGame
 import chessbot.utils as cbu
 
@@ -22,16 +20,23 @@ SF_TABLE_DEFAULT = [
   {"depth": 5,  "elo": 1922, "name": "SF14d5"},
   {"depth": 6,  "elo": 2002, "name": "SF14d6"},
   {"depth": 7,  "elo": 2107, "name": "SF14d7"},
+  {"depth": 8,  "elo": 2222, "name": "SF14d8"},
   {"depth": 9,  "elo": 2336, "name": "SF14d9"},
+  {"depth": 10, "elo": 2439, "name": "SF14d10"},
+  {"depth": 11, "elo": 2541, "name": "SF14d11"},
   {"depth": 12, "elo": 2644, "name": "SF14d12"},
+  {"depth": 13, "elo": 2686, "name": "SF14d13"},
   {"depth": 14, "elo": 2727, "name": "SF14d14"},
+  {"depth": 15, "elo": 2769, "name": "SF14d15"},
   {"depth": 16, "elo": 2810, "name": "SF14d16"},
   {"depth": 18, "elo": 2847, "name": "SF14d18"},
-  {"depth": 21, "elo": 2903, "name": "SF14d21"},
-  {"depth": 25, "elo": 2965, "name": "SF14d25"},
-  {"depth": 30, "elo": 3043, "name": "SF14d30"}
+  {"depth": 20, "elo": 2884, "name": "SF14d20"},
+  {"depth": 22, "elo": 2919, "name": "SF14d22"},
+  {"depth": 24, "elo": 2950, "name": "SF14d24"},
+  {"depth": 26, "elo": 2981, "name": "SF14d26"},
+  {"depth": 28, "elo": 3012, "name": "SF14d28"},
+  {"depth": 30, "elo": 3043, "name": "SF14d30"},
 ]
-
 
 def create_validation_config(cfg, yaml_file=None):
     vcfg = cfg.copy()
@@ -155,23 +160,30 @@ def paired_validation_games(cfg):
     Return paired ChessGame instances for Stockfish validation.
 
     For each i in range(n):
-      - pick a random UHO premove path index
-      - build two identical fastboard positions from that index
+      - sample a UHO board using GameGenerator
+      - clone it
       - create two ChessGame objects where stockfish plays one as white
         and the other as black
     """
+    gen = cbu.GameGenerator(cfg)
 
     games = []
     n = cfg.n_games // 2
     for i in range(n):
-        board_white = cbu.create_UHO_PGN_game()
+        board_white, _ = gen.new_board(game_type="UHO")
         board_black = board_white.clone()
 
-        meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
-                  "scenario": "paired_validation"}
-        
-        meta_b = {"vs_stockfish": True, "stockfish_is_white": False,
-                  "scenario": "paired_validation"}
+        meta_w = {
+            "vs_stockfish": True,
+            "stockfish_is_white": True,
+            "scenario": "paired_validation"
+        }
+
+        meta_b = {
+            "vs_stockfish": True,
+            "stockfish_is_white": False,
+            "scenario": "paired_validation"
+        }
 
         cg_w = ChessGame(board=board_white, meta=meta_w, cfg=cfg)
         cg_b = ChessGame(board=board_black, meta=meta_b, cfg=cfg)

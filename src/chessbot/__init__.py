@@ -18,6 +18,7 @@ except Exception as e:
     print(f"Error setting TF GPU mem: {e}")
     
 SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
+LC0_LOC = "C:/Users/Bryan/Data/chessbot_data/lc0/lc0-v0.32.1-windows-gpu-nvidia-cuda12/lc0.exe"
 ENDGAME_LOC = "C:/Users/Bryan/Data/chessbot_data/endgame_tables"
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
 MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models/"

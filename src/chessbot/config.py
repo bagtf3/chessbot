@@ -29,18 +29,22 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    target_delta = 200
+    sims_absolute_ceiling = 1600
 
     # early stop
-    es_check_every = 50
-    use_sim_decision_model = False
-    sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
-
+    es_check_every = 100
+    target_delta = 200
+    min_top_visits = 300
+    min_delta = 100
+    use_robust = True
+    robust_only_above = 2400
+    
     # Game stuff
     n_games = 128
     games_at_once = 128
     micro_batch = 4
-    fwd_batch = 512
+    min_batch = 4
+    fwd_batch = 256
 
     sample_adjudicators = True
     
@@ -69,6 +73,8 @@ class Config(object):
 
     # overrides for the post hoc worker
     post_hoc_blunder_cp = 150
+    post_hoc_blunder_cp_loser = 90
+    post_hoc_blunder_cp_winner = 200
     post_hoc_analyze_batch = 30
     post_hoc_depth = 12
     post_hoc_equiv_range = 30
@@ -85,8 +91,8 @@ class Config(object):
     }
 
     # priors
-    prior_clip_max = 0.55
-    prior_clip_min = 0.015
+    uniform_eps = 0.25
+    prior_clip_max = 0.75
 
     # randomness
     add_root_noise = True
@@ -95,12 +101,14 @@ class Config(object):
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
     
-    policy_loss_weight = 0.25
-    value_loss_weight = 0.25
+    learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    policy_loss_weight = 0.25     # per-sample weight for policy head
+    value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
+    draw_value_scale = 0.5        # multiplies value_loss_weight for drawn games
     vscale = 0.9
-    draw_weight = 0.1
     retrain_batch_size = 512
-    training_queue_thresh = 10240
+    retrain_size = 10240
+    training_queue_buffer = 30720
 
     def __init__(self):
         self.init_paths()

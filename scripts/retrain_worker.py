@@ -6,8 +6,9 @@ retrain_worker.py
   - config.yaml        (the run config, loaded via Config.from_yaml)
 - each shard is a list of tuples:
   (x, mask, policy, Y, vwht, pwht)
-- model path is taken from the loaded config
-- after successful retrain+save, delete shard files that were loaded
+- model path is taken from the loaded config (single) or cfg.multiplex_models (multi)
+- in multiplex mode: shards are loaded once, each model is trained sequentially
+- after all models are trained, shard files are deleted
 """
 
 import argparse
@@ -83,7 +84,7 @@ def delete_files(paths):
     return removed
 
 
-def print_fit_history(history, epoch):
+def print_fit_history(history, epoch, label=""):
     if history is None:
         return
 
@@ -109,7 +110,7 @@ def print_fit_history(history, epoch):
 
     name_w = max([len(r[0]) for r in rows])
     num_w = 8
-    etag = f"[epoch {epoch:4d}]"
+    etag = f"[epoch {epoch:4d}]{(' ' + label) if label else ''}"
     fmt = (
         f"{etag} [model fit] "
         f"{{name:<{name_w}}} : value: {{start:{num_w}.4f}} -> "
@@ -143,11 +144,83 @@ def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
         raise RuntimeError("GPU was present but no logical GPU is active.")
 
 
+def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
+    """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
+    tag = f"[retrain{(' ' + label) if label else ''}]"
+    print(f"{tag} loading {model_path}")
+    model = load_model(model_path)
+
+    # ── recompile: explicit head weights + fresh LR ───────────────────────────
+    _opt_src = getattr(model, '_default_opt', None)
+    if isinstance(_opt_src, tf.keras.mixed_precision.LossScaleOptimizer):
+        _base_cls = type(_opt_src.inner_optimizer)
+        _base_cfg = _opt_src.inner_optimizer.get_config()
+    elif _opt_src is not None:
+        _base_cls = type(_opt_src)
+        _base_cfg = _opt_src.get_config()
+    else:
+        _base_cls = tf.keras.optimizers.Adam
+        _base_cfg = {}
+
+    _base_cfg['learning_rate'] = cfg.learning_rate
+    _inner = _base_cls.from_config(_base_cfg)
+    _opt = tf.keras.mixed_precision.LossScaleOptimizer(_inner)
+
+    _loss_dict = {
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out": "mse",
+    }
+    _head_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=_opt, loss=_loss_dict, loss_weights=_head_weights)
+    model._default_opt = _opt
+    model._default_loss_dict = _loss_dict
+
+    if not args.skip_plots:
+        if os.path.exists(cfg.progress_csv_path):
+            all_evals = pd.read_csv(cfg.progress_csv_path)
+        else:
+            all_evals = pd.DataFrame()
+
+        plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
+        eval_df = cbu.score_game_data(model, X, M, Y, epoch, save_path=plt_file)
+        all_evals = pd.concat([all_evals, eval_df])
+        all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
+
+        if len(all_evals) and len(all_evals) % 5 == 0:
+            cbu.plot_training_progress(
+                all_evals, epoch=epoch, save_path=cfg.progress_plot_path
+            )
+
+    history = model.fit(
+        X, Y, epochs=args.epochs, batch_size=args.batch_size,
+        verbose=0, sample_weight=s_wts, shuffle=True
+    )
+
+    print_fit_history(history, epoch, label=label)
+
+    bak_path = model_path.replace(".h5", "_backup.h5")
+    if os.path.exists(model_path):
+        try:
+            os.replace(model_path, bak_path)
+            print(f"{tag} backed up existing model")
+        except Exception as e:
+            print(f"{tag} failed to backup existing model:", e)
+
+    model.save(model_path)
+    print(f"{tag} retraining complete for epoch {epoch}")
+
+    del model
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--skip-plots", action="store_true",
+                   help="skip all plots and CSV progress saves")
     args = p.parse_args()
 
     # make sure we are running on the GPU not CPU
@@ -205,38 +278,7 @@ def main():
     Y = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht, "policy_logits": pwht}
 
-    model_path = cfg.model_path
-    model = load_model(model_path)
-
-    # ── recompile: explicit head weights + fresh LR ───────────────────────────
-    # Always force Keras head weights to 1.0 so the only active weights are the
-    # per-sample vwht/pwht arrays.  This prevents silent weight inheritance from
-    # whatever was baked into the model when it was last saved.
-    _opt_src = getattr(model, '_default_opt', None)
-    if isinstance(_opt_src, tf.keras.mixed_precision.LossScaleOptimizer):
-        _base_cls = type(_opt_src.inner_optimizer)
-        _base_cfg = _opt_src.inner_optimizer.get_config()
-    elif _opt_src is not None:
-        _base_cls = type(_opt_src)
-        _base_cfg = _opt_src.get_config()
-    else:
-        _base_cls = tf.keras.optimizers.Adam
-        _base_cfg = {}
-
-    _base_cfg['learning_rate'] = cfg.learning_rate
-    _inner = _base_cls.from_config(_base_cfg)
-    _opt = tf.keras.mixed_precision.LossScaleOptimizer(_inner)
-
-    _loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    _head_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=_opt, loss=_loss_dict, loss_weights=_head_weights)
-    model._default_opt = _opt
-    model._default_loss_dict = _loss_dict
-
-    # ── weight summary ────────────────────────────────────────────────────────
+    # ── weight summary (printed once, applies to all models) ─────────────────
     draw_vwht = cfg.value_loss_weight * cfg.draw_value_scale
     kl_str = (
         f"KL boost ×{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
@@ -250,49 +292,20 @@ def main():
         print(f"[retrain] {n}  min={w.min():.4f}  mean={w.mean():.4f}  max={w.max():.4f}")
 
     if os.path.exists(cfg.progress_csv_path):
-        all_evals = pd.read_csv(cfg.progress_csv_path)
-        n_retrains = len(all_evals)
+        n_retrains = len(pd.read_csv(cfg.progress_csv_path))
     else:
-        all_evals = pd.DataFrame()
         n_retrains = 0
-
-    plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
     epoch = n_retrains
-    eval_df = cbu.score_game_data(model, X, M, Y, epoch, save_path=plt_file)
-    all_evals = pd.concat([all_evals, eval_df])
-    all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
 
-    if len(all_evals) and len(all_evals) % 5 == 0:
-        cbu.plot_training_progress(
-            all_evals, epoch=epoch, save_path=cfg.progress_plot_path
-        )
-    
-    # fit and save new model: X is a list/tuple matching model inputs (planes, mask)
-    history = model.fit(
-        X, Y, epochs=args.epochs, batch_size=args.batch_size,
-        verbose=0, sample_weight=s_wts, shuffle=True
-    )
-
-    print_fit_history(history, epoch)
-
-    bak_path = model_path.replace(".h5", "_backup.h5")
-    if os.path.exists(model_path):
-        try:
-            os.replace(model_path, bak_path)
-            print("[retrain] backed up existing model")
-        except Exception as e:
-            print("[retrain] failed to backup existing model:", e)
-
-    model.save(model_path)
-    print("[retrain] retraining complete for epoch", epoch)
+    # ── train: single model or multiplex loop ────────────────────────────────
+    model_paths = cfg.multiplex_models if cfg.multiplex_models else [cfg.model_path]
+    for i, model_path in enumerate(model_paths):
+        label = os.path.basename(model_path) if cfg.multiplex_models else ""
+        retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")
 
-    # do some clean up to help the other procs with RAM    
-    del model
-    tf.keras.backend.clear_session()
-    gc.collect()
     return 0
 
 

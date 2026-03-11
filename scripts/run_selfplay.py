@@ -64,9 +64,12 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     procs = []
 
     n_workers = max(1, cfg.n_workers)
+    multiplex = cfg.multiplex_models  # [] or list of paths
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
+        if multiplex:
+            c.model_path = multiplex[i % len(multiplex)]
         if not cfg.is_validation_run and i > 1:
             c.play_vs_sf_prob = 0.0
 

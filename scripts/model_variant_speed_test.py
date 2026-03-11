@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """model_variant_speed_test.py
 
-Speed test for 7 ~16M-param chess model architecture variants.
+Speed test for 5 ~16M-param chess model architecture variants.
 
 Variants:
   16m-pure-conv      Pure conv ResNet, no context (baseline)
   16m-conformer      Interleaved conv+MHA per block (current production)
-  16m-transformer    Pure transformer, no conv
   16m-film           2×bare-MHA context encoder → FiLM scale/shift per conv block
-  16m-film-xattn     FiLM but gamma/beta from cross-attention (x queries g)
-  16m-concat-fusion  Global context concatenated mid-block, mixed by 3×3 conv
+  16m-concat-fusion  Global context concatenated mid-block, mixed by 3×3 conv (leaky relu on g_x before cat)
   16m-gated-ctx      Conv resblocks + x-gated additive context residual
 
 Backends tested:
@@ -85,20 +83,10 @@ VARIANTS = {
         d_embed=128, conv_filters=256, conv_blocks=10,
         transformer_layers=5, num_heads=8, ff_dim=1024, dropout=0.025,
     ),
-    "16m-transformer": dict(
-        transformer=True,
-        d_embed=384, conv_filters=0, conv_blocks=0,
-        transformer_layers=12, num_heads=6, ff_dim=1024, dropout=0.1,
-    ),
     "16m-film": dict(
         film=True,
         d_embed=256, conv_filters=256, conv_blocks=12,
         mha_heads=8, mha_layers=2, dropout=0.0,
-    ),
-    "16m-film-xattn": dict(
-        film_xattn=True,
-        d_embed=256, conv_filters=256, conv_blocks=10,
-        mha_heads=4, mha_layers=2, dropout=0.0,
     ),
     "16m-concat-fusion": dict(
         concat_fusion=True,
@@ -228,6 +216,7 @@ def _tf_attn_pool_value_head(x, C, layers):
         x_seq = layers.Reshape((64, C), name="v_seq")(x)
     else:
         x_seq = x
+    x_seq   = layers.LayerNormalization(axis=-1, name="v_ln")(x_seq)
     attn_w  = layers.Dense(1, name="attn_w")(x_seq)
     attn_w  = layers.Softmax(axis=1, name="attn_softmax")(attn_w)
     attn_wT = layers.Permute((2, 1), name="attn_w_T")(attn_w)
@@ -239,7 +228,7 @@ def _tf_attn_pool_value_head(x, C, layers):
 
 
 def _tf_context_encoder(proj, C, nh, nl, layers, tf):
-    """Shared context encoder: positional embedding + nl × prenorm bare-MHA.
+    """Shared context encoder: positional embedding + nl × prenorm MHA+FF.
     Returns g_2d (B,8,8,C). The conv stack starts from proj (no pos)."""
     pos = layers.Embedding(64, C, name="pos_emb")(
         tf.keras.backend.arange(0, 64, dtype="int32")
@@ -252,6 +241,11 @@ def _tf_context_encoder(proj, C, nh, nl, layers, tf):
             num_heads=nh, key_dim=C // nh, dropout=0.0, name=f"ctx{i}_mha"
         )(g, g)
         g = g + r
+        r = g
+        g = layers.LayerNormalization(axis=-1, name=f"ctx{i}_ff_ln")(g)
+        g = layers.Dense(C, activation="gelu", name=f"ctx{i}_ff")(g)
+        g = g + r
+    g = layers.LayerNormalization(axis=-1, name="ctx_out_ln")(g)
     return layers.Reshape((8, 8, C), name="g_to_2d")(g)
 
 # ---------------------------------------------------------------------------
@@ -381,8 +375,10 @@ def build_tf_film(cfg):
     proj = layers.Embedding(VOCAB_SIZE, C, name="token_emb")(inp)
     g_2d = _tf_context_encoder(proj, C, nh, nl, layers, tf)
     # all gammas and betas computed upfront from static g_2d
-    gammas = [layers.Conv2D(C, 1, padding="same", name=f"film{i}_gamma")(g_2d) for i in range(cb)]
-    betas  = [layers.Conv2D(C, 1, padding="same", name=f"film{i}_beta")(g_2d)  for i in range(cb)]
+    gammas = [layers.Conv2D(C, 1, padding="same", name=f"film{i}_gamma",
+                            kernel_initializer="zeros", bias_initializer="ones")(g_2d) for i in range(cb)]
+    betas  = [layers.Conv2D(C, 1, padding="same", name=f"film{i}_beta",
+                            kernel_initializer="zeros")(g_2d) for i in range(cb)]
     # conv stack starts from raw token proj (no pos, no ctx)
     x = layers.Reshape((8, 8, C), name="x_to_2d")(proj)
     for i in range(cb):
@@ -454,6 +450,7 @@ def build_tf_concat_fusion(cfg):
         h   = layers.Conv2D(C, 3, use_bias=False, padding="same", name=f"cv{i}_c1")(x)
         h   = layers.LeakyReLU(0.01, name=f"cv{i}_lr1")(h)
         g_x = layers.Conv2D(G, 1, padding="same", name=f"cv{i}_gx")(g_2d)
+        g_x = layers.LeakyReLU(0.01, name=f"cv{i}_gx_lr")(g_x)
         h   = layers.Concatenate(axis=-1, name=f"cv{i}_cat")([h, g_x])  # (B,8,8,C+G=320)
         h   = layers.Conv2D(C, 3, padding="same", name=f"cv{i}_c2")(h)  # bias=True (mixing conv)
         h   = layers.LayerNormalization(axis=-1, name=f"cv{i}_ln")(h)
@@ -488,7 +485,8 @@ def build_tf_gated_ctx(cfg):
         # gated context injection: gate depends on x (post-resblock)
         gate     = layers.Conv2D(C, 1, padding="same", name=f"cv{i}_gate")(x)
         gate     = layers.Activation("sigmoid", name=f"cv{i}_sig")(gate)
-        ctx_proj = layers.Conv2D(C, 1, padding="same", name=f"cv{i}_ctx")(g_2d)
+        ctx_proj = layers.Conv2D(C, 1, padding="same", name=f"cv{i}_ctx",
+                                kernel_initializer="zeros")(g_2d)
         x        = layers.Add(name=f"cv{i}_gadd")([x, layers.Multiply(
                        name=f"cv{i}_gmul")([gate, ctx_proj])])
     policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(x)
@@ -502,9 +500,7 @@ def build_tf_gated_ctx(cfg):
 TF_BUILDERS = {
     "16m-pure-conv":      build_tf_pure_conv,
     "16m-conformer":      build_tf_conformer,
-    "16m-transformer":    build_tf_transformer,
     "16m-film":           build_tf_film,
-    "16m-film-xattn":     build_tf_film_xattn,
     "16m-concat-fusion":  build_tf_concat_fusion,
     "16m-gated-ctx":      build_tf_gated_ctx,
 }
@@ -836,17 +832,18 @@ def build_pt_concat_fusion(cfg):
     class CFBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.c1  = nn.Conv2d(C, C, 3, padding=1, bias=False)
-            self.lr1 = nn.LeakyReLU(0.01, True)
-            self.gx  = nn.Conv2d(C, G, 1)
-            self.c2  = nn.Conv2d(C + G, C, 3, padding=1)  # bias=True (mixing conv)
-            self.ln  = _make_ln2d(C)
-            self.lr  = nn.LeakyReLU(0.01, True)
+            self.c1   = nn.Conv2d(C, C, 3, padding=1, bias=False)
+            self.lr1  = nn.LeakyReLU(0.01, True)
+            self.gx   = nn.Conv2d(C, G, 1)
+            self.gxlr = nn.LeakyReLU(0.01, True)
+            self.c2   = nn.Conv2d(C + G, C, 3, padding=1)  # bias=True (mixing conv)
+            self.ln   = _make_ln2d(C)
+            self.lr   = nn.LeakyReLU(0.01, True)
 
         def forward(self, x, g2):
             r  = x
             h  = self.lr1(self.c1(x))
-            gx = self.gx(g2)
+            gx = self.gxlr(self.gx(g2))
             h  = torch.cat([h, gx], dim=1)   # (B, C+G, 8, 8)
             h  = self.ln(self.c2(h))
             return self.lr(r + h)
@@ -944,9 +941,7 @@ def build_pt_gated_ctx(cfg):
 PT_BUILDERS = {
     "16m-pure-conv":      build_pt_pure_conv,
     "16m-conformer":      build_pt_conformer,
-    "16m-transformer":    build_pt_transformer,
     "16m-film":           build_pt_film,
-    "16m-film-xattn":     build_pt_film_xattn,
     "16m-concat-fusion":  build_pt_concat_fusion,
     "16m-gated-ctx":      build_pt_gated_ctx,
 }

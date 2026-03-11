@@ -518,7 +518,8 @@ class GameLooper(object):
             "c_puct": game.tree.c_puct,
             "dirichlet_eps": game.tree.dirichlet_eps,
             "uniform_eps": cfg.uniform_eps,
-            "prior_clip_max": cfg.prior_clip_max
+            "prior_clip_max": cfg.prior_clip_max,
+            "model_name": os.path.basename(cfg.model_path).replace("_model.h5", "").replace(".h5", ""),
         }
 
         # on-disk record (full)

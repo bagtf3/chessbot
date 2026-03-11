@@ -132,7 +132,7 @@ def make_fwd_batched(model, max_bs=1024, warm_shapes=(256, 512, 1024)):
     return fwd
 
 
-def set_loss_weights(model, loss_weights):
+def set_loss_weights(model, loss_weights, steps_per_execution=1, jit=False):
     # Get a fresh optimizer (same config) to avoid double-wrapping
     opt_candidate = model._default_opt
     if isinstance(opt_candidate, tf.keras.mixed_precision.LossScaleOptimizer):
@@ -144,10 +144,16 @@ def set_loss_weights(model, loss_weights):
     opt_cfg = tf.keras.optimizers.serialize(base_opt)
     opt = tf.keras.optimizers.deserialize(opt_cfg)
 
+    # re-wrap with LossScaleOptimizer when training in mixed float16
+    if tf.keras.mixed_precision.global_policy().name == "mixed_float16":
+        opt = tf.keras.mixed_precision.LossScaleOptimizer(opt)
+
     model.compile(
         optimizer=opt,
         loss=model._default_loss_dict,
-        loss_weights=loss_weights
+        loss_weights=loss_weights,
+        steps_per_execution=steps_per_execution,
+        jit_compile=jit,
     )
     model.loss_weights = loss_weights
     # remember the fresh optimizer for later use

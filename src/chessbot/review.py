@@ -1,4 +1,4 @@
-import os, json, pathlib, time
+import os, json, pathlib, time, random
 import psutil
 import uuid
 
@@ -1001,66 +1001,83 @@ class GameViewer:
         ent, norm = calc_entropy(p)
         return norm, p
 
-    def generate_training_data(self, sf_skip=False, **kwargs):
+    def generate_training_data(self, min_visits=200, sf_accept_rate=0.5, cpl_threshold=60, **kwargs):
         """
-        Walk the game using self.next() and produce Xerces training examples.
-        If sf_skip is True, plies played by Stockfish (per who_moved()) are
-        skipped.
+        Walk the game and produce Xerces training examples.
+        - Plies with fewer than min_visits total MCTS visits are skipped.
+        - SF plies are accepted with probability sf_accept_rate.
+        - For startpos/pre_opened/pre_opened_mini, plies 0-9 are accepted with
+          probability ramping from 0.5 (ply 0) to 0.95 (ply 9) to diversify
+          opening coverage.
+        - If sf_df was passed to __init__ and cpl_threshold is set, plies where
+          the played move's CPL (loss column) exceeds cpl_threshold are skipped.
+          Plies with no matching SF row are also skipped when SF data is present.
         """
-        # X, Mask, Pi, result (Z), this_Q, moves Remaining
         X, M, P, Z, V, R = [], [], [], [], [], []
         result = self.result
-
-        # start from initial position
         self.reset()
+
+        opening_scenarios = {'startpos', 'pre_opened', 'pre_opened_mini'}
+        is_opening_scenario = self.log.get('scenario', '') in opening_scenarios
+        use_cpl_filter = (self.sf_rows is not None) and (cpl_threshold is not None)
 
         total_plies = len(self.moves_uci)
         while self.ply < total_plies:
-            # detect whether the side to move is Stockfish
             move_played = self.moves_uci[self.ply]
             mover = self.who_moved().lower()
             is_white_move = "white" in mover
             is_sf_move = "stockfish" in mover
 
-            if sf_skip and is_sf_move:
-                # advance and skip this ply
-                self.next()
-                continue
+            if use_cpl_filter:
+                sf_row = self.sf_row_for_ply(self.ply)
+                if sf_row is None or sf_row['loss'] > cpl_threshold:
+                    self.next()
+                    continue
+
+            if is_opening_scenario and self.ply < 10:
+                accept_prob = 0.5 + 0.45 * (self.ply / 9)
+                if random.random() > accept_prob:
+                    self.next()
+                    continue
 
             rb = self.board
             lms = rb.legal_moves()
-            
+
             node = self.tree_data.get(self.ply, {})
             if not node:
                 self.next()
                 continue
-            
+
             cms = node.get("candidate_moves", {})
-            if cms:
-                visits = [[x['uci'], x['visits']] for x in cms]
-                visited = set([x[0] for x in visits])
-                
-                # add in all legal moves if missing
-                for move in [l for l in lms if l not in visited]:
-                    visited.add(move)
-                    visits.append([move, 1])
-                    
-                visits = sorted(visits, key=lambda x: x[1], reverse=True)
-                
-                if is_sf_move and visits[0][0] != move_played:
-                    if sum([x[1] for x in visits]) > 100:
-                        most_visited = visits[0][0]
-                        for v in visits:
-                            if v[0] == move_played:
-                                v[0] = most_visited
-                                break
-                        visits[0][0] = move_played
-                    else:
-                        visits = make_fake_visits(move_played, lms, ratio_best=51)
-            
-            else:
-                # legal moves and synthetic visits
-                visits = make_fake_visits(move_played, lms, ratio_best=51)
+            if not cms:
+                self.next()
+                continue
+
+            visits = [[x['uci'], x['visits']] for x in cms]
+
+            if sum(v[1] for v in visits) < min_visits:
+                self.next()
+                continue
+
+            visited = set(x[0] for x in visits)
+            for move in [l for l in lms if l not in visited]:
+                visited.add(move)
+                visits.append([move, 1])
+
+            visits = sorted(visits, key=lambda x: x[1], reverse=True)
+
+            if is_sf_move and visits[0][0] != move_played:
+                # SF disagrees with Xerces's top move — apply accept rate gate
+                if random.random() > sf_accept_rate:
+                    self.next()
+                    continue
+                # accepted: swap SF move into top slot
+                most_visited = visits[0][0]
+                for v in visits:
+                    if v[0] == move_played:
+                        v[0] = most_visited
+                        break
+                visits[0][0] = move_played
 
             # check_boost = kwargs.get("check_boost", 0)
             # capture_boost = kwargs.get("capture_boost", 0)

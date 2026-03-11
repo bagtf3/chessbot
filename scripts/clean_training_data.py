@@ -9,7 +9,7 @@ from chessbot.rescore import load_game_index
 from chessbot.rescore import ANALYZE_PKL
 
 
-CPL_MIN = 100
+CPL_MIN = 60
 SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 
 
@@ -212,7 +212,7 @@ def process_run(run_dir, cpl_min, dry_run):
 def main(dry_run=True):
     #skip = ["cf_10x256x5_low_sims3", "cf_10x256x5_full_sims"]
     #run_tags = [rt for rt in os.listdir(SP_DIR) if rt not in skip]
-    run_tags = ['cf_10x256x5_low_sims2']
+    run_tags = ['cf_10x256x5_full_sims4', 'film_16M_low_sims1']
 
     total_deleted = 0
     total_converted = 0

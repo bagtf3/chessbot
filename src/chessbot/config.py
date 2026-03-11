@@ -18,6 +18,7 @@ class Config(object):
     validation_every = 5
     n_workers = 2
     n_rounds = 51
+    multiplex_models = []   # list of model paths; workers round-robin through them
 
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]

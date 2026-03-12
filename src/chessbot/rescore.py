@@ -377,7 +377,8 @@ class Rescorer(object):
                 this_q = tr.get("best_Q", tr.get("visit_weighted_Q"))
                 Q = this_q if turn else -1*this_q
 
-            Y = np.clip(0.99*Z_stm + 0.01*Q, -1.0, 1.0)
+            zm = self.config.z_mix
+            Y = np.clip(zm*Z_stm + (1.0 - zm)*Q, -1.0, 1.0)
 
             if Y != Y:
                 print("[rescore] nan value detected for Y")

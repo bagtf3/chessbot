@@ -82,6 +82,8 @@ class Config(object):
     train_on_stockfish = True
     train_on_validation = False
 
+    z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
+
     KL_boost_threshold = 1.75
     KL_weight_boost = 1.0
 

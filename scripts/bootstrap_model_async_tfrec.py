@@ -25,34 +25,45 @@ from chessbot.utils import batch_policy_metrics, format_time, print_validation
 
 
 TFREC_DIR  = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
-RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_multi"
+RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_heavyweights"
 MODEL_DIR  = "C:/Users/Bryan/Data/chessbot_data/models"
 
-batch_size = 320
-epoch_size = batch_size * 32
-shuffle_buffer = 50000
+batch_size = 128
+epoch_size = batch_size * 80
+shuffle_buffer = 64000
 steps_per_epoch = epoch_size // batch_size
 MAX_EPOCH = 730
 PLOT_EVERY = 10
 
 MODEL_DEFS = [
     #"16m-pure-conv", # already done
-    "16m-film",
-    "16m-concat-fusion",
-    "16m-gated-ctx"
+    #"16m-film", # already done
+    #"16m-concat-fusion",
+    "16m-conformer-interweaved",
+    "16m-gated-ctx",
+    "16m-conformer",
+    "10m-transformer",
 ]
+
+# LW_SCHEDULE = {
+#     0: {"policy_logits": 0.1, "value_out": 0.1},
+#     5: {"policy_logits": 0.75, "value_out": 1.5},
+#     10: {"policy_logits": 1.5, "value_out": 3.0},
+#     80: {"policy_logits": 1.0, "value_out": 2.2},
+#     160: {"policy_logits": 0.8, "value_out": 1.8},
+#     320: {"policy_logits": 0.65, "value_out": 1.4},
+#     480: {"policy_logits": 0.45, "value_out": 1.2},
+#     640: {"policy_logits": 0.35, "value_out": 1.0},
+# }
 
 LW_SCHEDULE = {
     0: {"policy_logits": 0.1, "value_out": 0.1},
-    5: {"policy_logits": 0.75, "value_out": 1.5},
+    1: {"policy_logits": 0.75, "value_out": 1.5},
     10: {"policy_logits": 1.5, "value_out": 3.0},
-    80: {"policy_logits": 1.0, "value_out": 2.2},
-    160: {"policy_logits": 0.8, "value_out": 1.8},
-    320: {"policy_logits": 0.65, "value_out": 1.4},
-    480: {"policy_logits": 0.45, "value_out": 1.2},
-    640: {"policy_logits": 0.35, "value_out": 1.0},
+    160: {"policy_logits": 1.0, "value_out": 2.2},
+    480: {"policy_logits": 0.65, "value_out": 1.5},
+    640: {"policy_logits": 0.5, "value_out": 1.0}
 }
-
 
 def load_tf_model(path):
     model = keras.models.load_model(path)
@@ -295,7 +306,7 @@ def do_eval(ms, bundle, batch_size):
         latest_row = latest_row.reindex(columns=eval_df.columns)
         eval_df = pd.concat([eval_df, latest_row])
 
-    eval_df.to_csv(ms["progress_file"], index=False)
+    eval_df.round(4).to_csv(ms["progress_file"], index=False)
     ms["eval_df"] = eval_df
 
     print(f"[eval] {name}")

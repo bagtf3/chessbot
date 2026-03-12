@@ -156,7 +156,7 @@ def iter_game_records(game, sf_df):
     weight = 0.5 if gv.result == 0 else 1.0
 
     for enc_in, mask, policy, z, v in zip(x_list, m_list, p_list, z_list, v_list):
-        value = 0.99 * z + 0.1 * v
+        value = 0.9 * z + 0.1 * v
         yield make_example(enc_in, mask, policy, value, weight)
 
 

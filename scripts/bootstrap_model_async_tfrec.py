@@ -28,46 +28,40 @@ TFREC_DIR  = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
 RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_heavyweights"
 MODEL_DIR  = "C:/Users/Bryan/Data/chessbot_data/models"
 
-batch_size = 128
-epoch_size = batch_size * 80
+batch_size = 256
+epoch_size = 10240
 shuffle_buffer = 64000
 steps_per_epoch = epoch_size // batch_size
 MAX_EPOCH = 730
 PLOT_EVERY = 10
-
+LR = 2e-4
 MODEL_DEFS = [
-    #"16m-pure-conv", # already done
-    #"16m-film", # already done
-    #"16m-concat-fusion",
-    "16m-conformer-interweaved",
-    "16m-gated-ctx",
-    "16m-conformer",
-    "10m-transformer",
+    #"16m-pure-conv", # dead
+    #"16m-film", # gated ctx beats this
+    #"16m-concat-fusion", # dead
+    #"16m-conformer-interweaved", # really strong, hard to optimize
+    #"16m-gated-ctx", #solid 
+    "16m-conformer"
 ]
-
-# LW_SCHEDULE = {
-#     0: {"policy_logits": 0.1, "value_out": 0.1},
-#     5: {"policy_logits": 0.75, "value_out": 1.5},
-#     10: {"policy_logits": 1.5, "value_out": 3.0},
-#     80: {"policy_logits": 1.0, "value_out": 2.2},
-#     160: {"policy_logits": 0.8, "value_out": 1.8},
-#     320: {"policy_logits": 0.65, "value_out": 1.4},
-#     480: {"policy_logits": 0.45, "value_out": 1.2},
-#     640: {"policy_logits": 0.35, "value_out": 1.0},
-# }
 
 LW_SCHEDULE = {
     0: {"policy_logits": 0.1, "value_out": 0.1},
     1: {"policy_logits": 0.75, "value_out": 1.5},
-    10: {"policy_logits": 1.5, "value_out": 3.0},
-    160: {"policy_logits": 1.0, "value_out": 2.2},
-    480: {"policy_logits": 0.65, "value_out": 1.5},
+    10: {"policy_logits": 1.5, "value_out": 2.5},
+    160: {"policy_logits": 1.0, "value_out": 2.0},
+    250: {"policy_logits": 1.0, "value_out": 1.5},
+    480: {"policy_logits": 0.65, "value_out": 1.25},
     640: {"policy_logits": 0.5, "value_out": 1.0}
 }
 
-def load_tf_model(path):
+def load_tf_model(path, lr=LR):
     model = keras.models.load_model(path)
-    model._default_opt = model.optimizer
+    # always build a fresh optimizer at the requested LR — do not inherit
+    # whatever LR was baked into the saved h5, and do not rely on the
+    # serialize/deserialize path in set_loss_weights picking up any change.
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+    opt = mixed_precision.LossScaleOptimizer(opt)
+    model._default_opt = opt
     model._default_loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(
             from_logits=True

@@ -82,7 +82,7 @@ VARIANTS = {
     ),
     "16m-conformer": dict(
         conformer=True,
-        d_embed=256, conv_filters=256, conv_blocks=10,
+        conv_filters=256, conv_blocks=10,
         transformer_layers=5, num_heads=8, ff_dim=1024, dropout=0.05,
     ),
     "16m-film": dict(
@@ -115,6 +115,14 @@ VARIANTS = {
         transformer_layers=12,
         num_heads=8,
         ff_dim=1024,
+        dropout=0.05,
+    ),
+    "16m-transformer": dict(
+        transformer=True,
+        d_embed=384,
+        transformer_layers=8,
+        num_heads=8,
+        ff_dim=1536,
         dropout=0.05,
     ),
 }
@@ -294,14 +302,14 @@ def build_tf_pure_conv(cfg):
 
 
 def build_tf_conformer(cfg):
-    """10 ConvResBlocks → 5 Transformer layers → 1×1 conv mix.
-    Final policy/value heads match the other TF conv-style variants."""
+    """cb ConvResBlocks → tl Transformer layers → 1×1 conv mix.
+    Single cf dimension throughout. One pos embedding, injected before
+    conv blocks and again before the transformer."""
     import tensorflow as tf
     from tensorflow.keras import layers, Input, Model
 
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
-    de = cfg["d_embed"]
     cf = cfg["conv_filters"]
     cb = cfg["conv_blocks"]
     tl = cfg["transformer_layers"]
@@ -309,61 +317,28 @@ def build_tf_conformer(cfg):
     fd = cfg["ff_dim"]
     dr = cfg["dropout"]
 
+    sq = tf.keras.backend.arange(0, 64, dtype="int32")
+
     inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
-    x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
+    x   = layers.Embedding(VOCAB_SIZE, cf, name="token_emb")(inp)
 
-    pos = layers.Embedding(64, de, name="pos_emb")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-    pos = layers.Lambda(
-        lambda t: tf.expand_dims(t, axis=0),
-        name="pos_expand",
-    )(pos)
-    x = x + pos
+    # single pos embedding — reused at both injection points
+    pos_emb = layers.Embedding(64, cf, name="pos_emb")
+    pos  = layers.Lambda(lambda t: tf.expand_dims(t, axis=0), name="pos_expand")(pos_emb(sq))
 
-    x = layers.Reshape((8, 8, de), name="to_2d")(x)
-
-    if de != cf:
-        x = layers.Conv2D(
-            cf,
-            1,
-            use_bias=False,
-            padding="same",
-            name="conv_proj",
-        )(x)
-        x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
-        x = layers.LeakyReLU(0.01, name="lrelu_proj")(x)
+    x = x + pos                                            # inject before conv
+    x = layers.Reshape((8, 8, cf), name="to_2d")(x)
 
     for i in range(cb):
-        h = layers.Conv2D(
-            cf,
-            3,
-            use_bias=False,
-            padding="same",
-            name=f"c{i}_c1",
-        )(x)
+        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"c{i}_c1")(x)
         h = layers.LeakyReLU(0.01, name=f"c{i}_lr1")(h)
-        h = layers.Conv2D(
-            cf,
-            3,
-            use_bias=False,
-            padding="same",
-            name=f"c{i}_c2",
-        )(h)
+        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"c{i}_c2")(h)
         h = layers.LayerNormalization(axis=-1, name=f"c{i}_ln")(h)
         x = layers.LeakyReLU(0.01, name=f"c{i}_out")(x + h)
 
     x = layers.Reshape((64, cf), name="to_seq")(x)
+    x = x + pos                                            # inject before transformer
 
-    # reinject position information
-    pos2 = layers.Embedding(64, cf, name="pos_emb2")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-    pos2 = layers.Lambda(
-        lambda t: tf.expand_dims(t, axis=0),
-        name="pos_expand2",
-    )(pos2)
-    x = x + pos2
     for i in range(tl):
         r = x
         x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln1")(x)
@@ -510,11 +485,12 @@ def build_tf_transformer(cfg):
 
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
+    de    = cfg["d_embed"]
+    tl    = cfg["transformer_layers"]
+    nh    = cfg["num_heads"]
+    fd    = cfg["ff_dim"]
+    dr    = cfg["dropout"]
+    C_pol = 128  # spatial policy head width
 
     inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
     x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
@@ -532,10 +508,10 @@ def build_tf_transformer(cfg):
     for i in range(tl):
         if i == 2:
             x = x + 0.1*pos
-        
+
         if i == 5:
             x = x + 0.05*pos
-        
+
         r = x
         x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln1")(x)
         x = layers.MultiHeadAttention(
@@ -553,13 +529,32 @@ def build_tf_transformer(cfg):
         x = layers.Dropout(dr, name=f"t{i}_drop2")(x)
         x = layers.Dense(de, name=f"t{i}_ff2")(x)
         x = x + r
-    
-    # last mix of pos encoder
+
+    # final pos reinject before heads
     x = x + 0.025*pos
 
-    policy = layers.Dense(67, name="policy_dense")(x)
-    policy = layers.Reshape((SEQ_LEN * 67,), name="policy_logits")(policy)
+    # value reads from sequence space (B, 64, de) before spatial reshape
     value = _tf_attn_pool_value_head(x, de, layers)
+
+    # spatial policy head: conv blocks ground per-square logits in local 8×8 context
+    x = layers.Reshape((8, 8, de), name="pol_to_2d")(x)
+    x = layers.Conv2D(C_pol, 1, padding="same", use_bias=False, name="pol_mix")(x)
+    x = layers.LayerNormalization(axis=-1, name="pol_ln0")(x)
+    x = layers.LeakyReLU(0.01, name="pol_lrelu0")(x)
+    r = x
+    x = layers.Conv2D(C_pol, 3, padding="same", use_bias=False, name="pol_c1a")(x)
+    x = layers.LeakyReLU(0.01, name="pol_lrelu1a")(x)
+    x = layers.Conv2D(C_pol, 3, padding="same", use_bias=False, name="pol_c1b")(x)
+    x = layers.LayerNormalization(axis=-1, name="pol_ln1")(x)
+    x = layers.LeakyReLU(0.01, name="pol_lrelu1b")(layers.Add(name="pol_skip1")([r, x]))
+    r = x
+    x = layers.Conv2D(C_pol, 3, padding="same", use_bias=False, name="pol_c2a")(x)
+    x = layers.LeakyReLU(0.01, name="pol_lrelu2a")(x)
+    x = layers.Conv2D(C_pol, 3, padding="same", use_bias=False, name="pol_c2b")(x)
+    x = layers.LayerNormalization(axis=-1, name="pol_ln2")(x)
+    x = layers.LeakyReLU(0.01, name="pol_lrelu2b")(layers.Add(name="pol_skip2")([r, x]))
+    policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(x)
+    policy = layers.Reshape((SEQ_LEN * 67,), name="policy_logits")(policy)
 
     model = Model(inp, [policy, value])
     print(f"  TF params: {model.count_params():,}")
@@ -752,9 +747,11 @@ def build_pt_pure_conv(cfg):
 
 
 def build_pt_conformer(cfg):
-    """10 ConvResBlocks → 5 Transformer layers → 1×1 conv mix → GAP value head."""
+    """cb ConvResBlocks → tl Transformer layers → 1×1 conv mix.
+    Single cf dimension throughout. One pos embedding, injected before
+    conv blocks and again before the transformer."""
     import torch, torch.nn as nn, torch.nn.functional as F
-    de = cfg["d_embed"]; cf = cfg["conv_filters"]; cb = cfg["conv_blocks"]
+    cf = cfg["conv_filters"]; cb = cfg["conv_blocks"]
     tl = cfg["transformer_layers"]; nh = cfg["num_heads"]
     fd = cfg["ff_dim"]; dr = cfg["dropout"]
 
@@ -777,21 +774,18 @@ def build_pt_conformer(cfg):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb   = nn.Embedding(VOCAB_SIZE, de)
-            self.proj  = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
-            self.lnp   = _make_ln2d(cf) if de != cf else None
+            self.emb  = nn.Embedding(VOCAB_SIZE, cf)
+            self.pos  = nn.Embedding(64, cf)        # single table, used twice
             self.cblks = nn.ModuleList([self._cblk() for _ in range(cb)])
-            self.pos   = nn.Embedding(64, cf)
-            self.txs   = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.mix   = nn.Conv2d(cf, cf, 1, bias=False)
-            self.lnm   = _make_ln2d(cf)
-            self.pol   = nn.Conv2d(cf, 67, 1)
-            # GAP value head to match production
-            self.vconv = nn.Conv2d(cf, 64, 3, padding=1, bias=False)
-            self.vln   = _make_ln2d(64)
-            self.vfc1  = nn.Linear(64, 256)
-            self.vfc2  = nn.Linear(256, 128)
-            self.vout  = nn.Linear(128, 1)
+            self.txs  = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.mix  = nn.Conv2d(cf, cf, 1, bias=False)
+            self.lnm  = _make_ln2d(cf)
+            self.pol  = nn.Conv2d(cf, 67, 1)
+            self.v_ln = nn.LayerNorm(cf)
+            self.ap   = nn.Linear(cf, 1)
+            self.vfc1 = nn.Linear(cf, 256)
+            self.vfc2 = nn.Linear(256, 128)
+            self.vout = nn.Linear(128, 1)
 
         def _cblk(self):
             return nn.Sequential(
@@ -800,22 +794,23 @@ def build_pt_conformer(cfg):
             )
 
         def forward(self, t):
-            B = t.shape[0]
-            x = self.emb(t).reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
-            if self.proj is not None:
-                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
+            B   = t.shape[0]
+            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)  # (1,64,cf)
+            x   = self.emb(t) + pos                                          # inject before conv
+            x   = x.reshape(B, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
             for blk in self.cblks:
                 r = x; x = F.leaky_relu(r + blk(x), 0.01)
-            x = x.permute(0, 2, 3, 1).reshape(B, 64, cf)
-            pos = self.pos(torch.arange(64, device=t.device))
-            x = x + pos.unsqueeze(0)
+            x = x.permute(0, 2, 3, 1).reshape(B, 64, cf) + pos             # inject before transformer
             for tx in self.txs:
                 x = tx(x)
             x = x.reshape(B, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
             x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
-            pol = self.pol(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
-            v = F.leaky_relu(self.vln(self.vconv(x))).mean(dim=[2, 3])
-            v = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
+            pol   = self.pol(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
+            x_seq = x.permute(0, 2, 3, 1).reshape(B, 64, cf)
+            x_seq = self.v_ln(x_seq)
+            w     = torch.softmax(self.ap(x_seq), dim=1)
+            v     = (x_seq * w).sum(dim=1)
+            v     = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
             return pol, torch.tanh(self.vout(v))
 
     m = M()
@@ -922,27 +917,23 @@ def build_pt_transformer(cfg):
     import torch.nn as nn
     import torch.nn.functional as F
 
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
+    de    = cfg["d_embed"]
+    tl    = cfg["transformer_layers"]
+    nh    = cfg["num_heads"]
+    fd    = cfg["ff_dim"]
+    dr    = cfg["dropout"]
+    C_pol = 256  # spatial policy head width
 
     class TxLayer(nn.Module):
         def __init__(self):
             super().__init__()
-            self.ln1 = nn.LayerNorm(de)
-            self.attn = nn.MultiheadAttention(
-                de,
-                nh,
-                dropout=0.0,
-                batch_first=True,
-            )
+            self.ln1   = nn.LayerNorm(de)
+            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
             self.drop1 = nn.Dropout(dr)
-            self.ln2 = nn.LayerNorm(de)
-            self.ff1 = nn.Linear(de, fd)
+            self.ln2   = nn.LayerNorm(de)
+            self.ff1   = nn.Linear(de, fd)
             self.drop2 = nn.Dropout(dr)
-            self.ff2 = nn.Linear(fd, de)
+            self.ff2   = nn.Linear(fd, de)
 
         def forward(self, x):
             n = self.ln1(x)
@@ -962,35 +953,145 @@ def build_pt_transformer(cfg):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb = nn.Embedding(VOCAB_SIZE, de)
-            self.pos = nn.Embedding(64, de)
-            self.txs = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.reinj2 = PosReinject()
-            self.reinj4 = PosReinject()
-            self.pol = nn.Linear(de, 67)
-            self.ap = nn.Linear(de, 1)
+            self.emb         = nn.Embedding(VOCAB_SIZE, de)
+            self.pos         = nn.Embedding(64, de)
+            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.reinj2      = PosReinject()
+            self.reinj4      = PosReinject()
+            self.reinj_final = PosReinject()
+            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
+            self.pol_mix  = nn.Conv2d(de, C_pol, 1, bias=False)
+            self.pol_ln0  = _make_ln2d(C_pol)
+            self.pol_c1a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_c1b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_ln1  = _make_ln2d(C_pol)
+            self.pol_c2a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_c2b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_ln2  = _make_ln2d(C_pol)
+            self.pol_out  = nn.Conv2d(C_pol, 67, 1)
+            # value head (unchanged)
+            self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
             self.vout = nn.Linear(128, 1)
 
         def forward(self, t):
-            B = t.shape[0]
+            B   = t.shape[0]
             pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x = self.emb(t) + pos
+            x   = self.emb(t) + pos
 
             for i, tx in enumerate(self.txs):
                 x = tx(x)
-
                 if i == 1:
                     x = self.reinj2(x, pos)
-
                 if i == 3:
                     x = self.reinj4(x, pos)
 
-            pol = self.pol(x).reshape(B, SEQ_LEN * 67)
+            # value reads from sequence space (B, 64, de) before spatial reshape
             v = _pt_attn_pool(x, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
+
+            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
+            x = self.reinj_final(x, pos)
+            x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
+            pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
+
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
+    return m
+
+
+def build_pt_transformer_16m(cfg):
+    """Pure transformer with steady positional redrip (x = x + pos every tl//3 layers).
+    Default config: d_embed=384, 8 layers, 8 heads, ff_dim=1536 (~16M params).
+    """
+    import torch, torch.nn as nn, torch.nn.functional as F
+
+    de    = cfg["d_embed"]
+    tl    = cfg["transformer_layers"]
+    nh    = cfg["num_heads"]
+    fd    = cfg["ff_dim"]
+    dr    = cfg["dropout"]
+    reinject_every = max(1, tl // 3)  # for tl=8: reinject at i=3,6
+    C_pol = 192  # spatial policy head width
+
+    class TxLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(de)
+            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.ln2   = nn.LayerNorm(de)
+            self.ff1   = nn.Linear(de, fd)
+            self.drop2 = nn.Dropout(dr)
+            self.ff2   = nn.Linear(fd, de)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop1(h)
+            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
+
+    class PosReinject(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mix = nn.Parameter(torch.zeros(de))
+
+        def forward(self, x, pos):
+            gate = torch.sigmoid(self.mix).view(1, 1, de)
+            return x + pos * gate
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb         = nn.Embedding(VOCAB_SIZE, de)
+            self.pos         = nn.Embedding(64, de)
+            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.reinj_final = PosReinject()
+            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
+            self.pol_mix  = nn.Conv2d(de, C_pol, 1, bias=False)
+            self.pol_ln0  = _make_ln2d(C_pol)
+            self.pol_c1a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_c1b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_ln1  = _make_ln2d(C_pol)
+            self.pol_c2a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_c2b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
+            self.pol_ln2  = _make_ln2d(C_pol)
+            self.pol_out  = nn.Conv2d(C_pol, 67, 1)
+            # value head (unchanged)
+            self.ap   = nn.Linear(de, 1)
+            self.vfc1 = nn.Linear(de, 256)
+            self.vfc2 = nn.Linear(256, 128)
+            self.vout = nn.Linear(128, 1)
+
+        def forward(self, t):
+            B   = t.shape[0]
+            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
+            x   = self.emb(t) + pos
+            for i, tx in enumerate(self.txs):
+                if i > 0 and i % reinject_every == 0:
+                    x = x + pos  # steady redrip
+                x = tx(x)
+
+            # value reads from sequence space (B, 64, de) before spatial reshape
+            v = _pt_attn_pool(x, self.ap)
+            v = F.relu(self.vfc1(v))
+            v = F.relu(self.vfc2(v))
+
+            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
+            x = self.reinj_final(x, pos)
+            x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
+            pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
+
             return pol, torch.tanh(self.vout(v))
 
     m = M()
@@ -1175,6 +1276,7 @@ PT_BUILDERS = {
     "16m-concat-fusion":  build_pt_concat_fusion,
     "16m-gated-ctx":      build_pt_gated_ctx,
     "10m-transformer":    build_pt_transformer,
+    "16m-transformer":    build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved
 }
 
@@ -1396,16 +1498,19 @@ def main():
 
         # ── dry-run: just build + count ──────────────────────────────────
         if args.dry_run:
-            print(f"  Building TF model ...")
-            try:
-                _init_tf_gpu()
-                import tensorflow as tf
-                tf_model = TF_BUILDERS[name](cfg)
-                del tf_model
-                gc.collect()
-                tf.keras.backend.clear_session()
-            except Exception as e:
-                print(f"  [ERROR] TF build failed: {e}")
+            if name in TF_BUILDERS:
+                print(f"  Building TF model ...")
+                try:
+                    _init_tf_gpu()
+                    import tensorflow as tf
+                    tf_model = TF_BUILDERS[name](cfg)
+                    del tf_model
+                    gc.collect()
+                    tf.keras.backend.clear_session()
+                except Exception as e:
+                    print(f"  [ERROR] TF build failed: {e}")
+            else:
+                print(f"  Skipping TF build (PT-only variant)")
 
             if device is not None:
                 print(f"  Building PT model ...")
@@ -1418,23 +1523,26 @@ def main():
             continue
 
         # ── TF + XLA ──────────────────────────────────────────────────────
-        try:
-            _init_tf_gpu()
-            import tensorflow as tf
-            print(f"\n  Building TF+XLA for {name} ...")
-            tf_infer, tf_model = make_tf_infer(name, cfg)
-            res["TF+XLA"] = speed_test(f"{name}  TF+XLA [fp16]", tf_infer, bs)
+        if name in TF_BUILDERS:
+            try:
+                _init_tf_gpu()
+                import tensorflow as tf
+                print(f"\n  Building TF+XLA for {name} ...")
+                tf_infer, tf_model = make_tf_infer(name, cfg)
+                res["TF+XLA"] = speed_test(f"{name}  TF+XLA [fp16]", tf_infer, bs)
 
-            if save:
-                path = os.path.join(args.model_dir, f"{name}_model.h5")
-                tf_model.save(path)
-                print(f"  Saved TF model → {path}")
+                if save:
+                    path = os.path.join(args.model_dir, f"{name}_model.h5")
+                    tf_model.save(path)
+                    print(f"  Saved TF model → {path}")
 
-            del tf_infer, tf_model
-            gc.collect()
-            tf.keras.backend.clear_session()
-        except Exception as e:
-            print(f"  [ERROR] TF+XLA for {name}: {e}")
+                del tf_infer, tf_model
+                gc.collect()
+                tf.keras.backend.clear_session()
+            except Exception as e:
+                print(f"  [ERROR] TF+XLA for {name}: {e}")
+        else:
+            print(f"\n  Skipping TF+XLA for {name} (PT-only variant)")
 
         # ── PT eager ──────────────────────────────────────────────────────
         if device is not None:
@@ -1443,6 +1551,14 @@ def main():
                 print(f"\n  Building PT eager for {name} ...")
                 eager = make_pt_eager_infer(name, cfg, device)
                 res["PT eager"] = speed_test(f"{name}  PT eager [fp16]", eager, bs)
+
+                if save and "transformer" in name:
+                    pt_model = PT_BUILDERS[name](cfg).half().to(device)
+                    pt_path  = os.path.join(args.model_dir, f"{name}_pt_model.pt")
+                    torch.save({"model": pt_model.state_dict()}, pt_path)
+                    print(f"  Saved PT model → {pt_path}")
+                    del pt_model
+
                 del eager
                 gc.collect()
                 torch.cuda.empty_cache()

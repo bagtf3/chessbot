@@ -490,7 +490,7 @@ def build_tf_transformer(cfg):
     nh    = cfg["num_heads"]
     fd    = cfg["ff_dim"]
     dr    = cfg["dropout"]
-    C_pol = 128  # spatial policy head width
+    C_pol = 256  # spatial policy head width
 
     inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
     x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
@@ -941,24 +941,12 @@ def build_pt_transformer(cfg):
             x = x + self.drop1(h)
             return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
 
-    class PosReinject(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.mix = nn.Parameter(torch.zeros(de))
-
-        def forward(self, x, pos):
-            gate = torch.sigmoid(self.mix).view(1, 1, de)
-            return x + pos * gate
-
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb         = nn.Embedding(VOCAB_SIZE, de)
-            self.pos         = nn.Embedding(64, de)
-            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.reinj2      = PosReinject()
-            self.reinj4      = PosReinject()
-            self.reinj_final = PosReinject()
+            self.emb  = nn.Embedding(VOCAB_SIZE, de)
+            self.pos  = nn.Embedding(64, de)
+            self.txs  = nn.ModuleList([TxLayer() for _ in range(tl)])
             # spatial policy head: conv blocks ground per-square logits in local 8×8 context
             self.pol_mix  = nn.Conv2d(de, C_pol, 1, bias=False)
             self.pol_ln0  = _make_ln2d(C_pol)
@@ -978,22 +966,20 @@ def build_pt_transformer(cfg):
         def forward(self, t):
             B   = t.shape[0]
             pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x   = self.emb(t) + pos
+            x   = self.emb(t) + pos  # initial inject
 
             for i, tx in enumerate(self.txs):
+                if i % 2 == 1:  # flat 0.1 reinject every other layer pre-MHA
+                    x = x + 0.1 * pos
                 x = tx(x)
-                if i == 1:
-                    x = self.reinj2(x, pos)
-                if i == 3:
-                    x = self.reinj4(x, pos)
 
             # value reads from sequence space (B, 64, de) before spatial reshape
             v = _pt_attn_pool(x, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
 
-            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
-            x = self.reinj_final(x, pos)
+            # fixed 0.2 pos reinject before policy head
+            x = x + 0.2 * pos
             x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
             x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
             r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
@@ -1008,7 +994,7 @@ def build_pt_transformer(cfg):
 
 
 def build_pt_transformer_16m(cfg):
-    """Pure transformer with steady positional redrip (x = x + pos every tl//3 layers).
+    """Pure transformer with flat pos reinjection (0.1 every other layer pre-MHA, 0.2 before heads).
     Default config: d_embed=384, 8 layers, 8 heads, ff_dim=1536 (~16M params).
     """
     import torch, torch.nn as nn, torch.nn.functional as F
@@ -1018,8 +1004,7 @@ def build_pt_transformer_16m(cfg):
     nh    = cfg["num_heads"]
     fd    = cfg["ff_dim"]
     dr    = cfg["dropout"]
-    reinject_every = max(1, tl // 3)  # for tl=8: reinject at i=3,6
-    C_pol = 192  # spatial policy head width
+    C_pol = 256  # spatial policy head width
 
     class TxLayer(nn.Module):
         def __init__(self):
@@ -1038,22 +1023,12 @@ def build_pt_transformer_16m(cfg):
             x = x + self.drop1(h)
             return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
 
-    class PosReinject(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.mix = nn.Parameter(torch.zeros(de))
-
-        def forward(self, x, pos):
-            gate = torch.sigmoid(self.mix).view(1, 1, de)
-            return x + pos * gate
-
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb         = nn.Embedding(VOCAB_SIZE, de)
-            self.pos         = nn.Embedding(64, de)
-            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.reinj_final = PosReinject()
+            self.emb  = nn.Embedding(VOCAB_SIZE, de)
+            self.pos  = nn.Embedding(64, de)
+            self.txs  = nn.ModuleList([TxLayer() for _ in range(tl)])
             # spatial policy head: conv blocks ground per-square logits in local 8×8 context
             self.pol_mix  = nn.Conv2d(de, C_pol, 1, bias=False)
             self.pol_ln0  = _make_ln2d(C_pol)
@@ -1073,10 +1048,10 @@ def build_pt_transformer_16m(cfg):
         def forward(self, t):
             B   = t.shape[0]
             pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x   = self.emb(t) + pos
+            x   = self.emb(t) + pos  # initial inject
             for i, tx in enumerate(self.txs):
-                if i > 0 and i % reinject_every == 0:
-                    x = x + pos  # steady redrip
+                if i % 2 == 1:  # flat 0.1 reinject every other layer pre-MHA
+                    x = x + 0.1 * pos
                 x = tx(x)
 
             # value reads from sequence space (B, 64, de) before spatial reshape
@@ -1084,8 +1059,8 @@ def build_pt_transformer_16m(cfg):
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
 
-            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
-            x = self.reinj_final(x, pos)
+            # fixed 0.2 pos reinject before policy head
+            x = x + 0.2 * pos
             x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
             x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
             r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)

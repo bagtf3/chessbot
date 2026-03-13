@@ -283,8 +283,8 @@ MODEL_DEFS = [
 LW_SCHEDULE = {
     0: {"policy_logits": 0.1, "value_out": 0.1},
     1: {"policy_logits": 0.75, "value_out": 1.5},
-    10: {"policy_logits": 1.5, "value_out": 2.5},
-    160: {"policy_logits": 1.0, "value_out": 2.0},
+    10: {"policy_logits": 1.5, "value_out": 3.0},
+    160: {"policy_logits": 1.0, "value_out": 2.25},
     250: {"policy_logits": 1.0, "value_out": 1.5},
     480: {"policy_logits": 0.65, "value_out": 1.25},
     640: {"policy_logits": 0.5, "value_out": 1.0}

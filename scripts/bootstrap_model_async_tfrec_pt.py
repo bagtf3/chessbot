@@ -35,6 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
+from chessbot import SP_DIR, MODEL_DIR
 from chessbot.utils import batch_policy_metrics, format_time, print_validation
 
 
@@ -358,9 +359,8 @@ PT_BUILDERS = {
 # Config
 # ---------------------------------------------------------------------------
 
-TFREC_DIR = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
-RUN_DIR   = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_multi"
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
+TFREC_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
+RUN_DIR   = os.path.join(SP_DIR, "val_test_multi")
 
 batch_size      = 256
 epoch_size      = batch_size * 40

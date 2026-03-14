@@ -20,13 +20,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from chessbot import SP_DIR, MODEL_DIR
 from chessbot.model import set_loss_weights
 from chessbot.utils import batch_policy_metrics, format_time, print_validation
 
 
-TFREC_DIR  = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
-RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_multi"
-MODEL_DIR  = "C:/Users/Bryan/Data/chessbot_data/models"
+TFREC_DIR  = os.getenv("BOOTSTRAP_TFREC_DIR", "")
+RUN_DIR    = os.path.join(SP_DIR, "val_test_multi")
 
 batch_size = 128
 epoch_size = 10240

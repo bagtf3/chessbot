@@ -36,15 +36,21 @@ import os
 import gc
 import time
 import argparse
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ---------------------------------------------------------------------------
 # XLA libdevice fix — must precede TF import
 # ---------------------------------------------------------------------------
 
-def _fix_xla_libdevice():
+def fix_xla_libdevice():
     import shutil, tempfile
-    src = (r"C:\Program Files\NVIDIA GPU Computing Toolkit"
-           r"\CUDA\v11.8\nvvm\libdevice\libdevice.10.bc")
+    cuda_dir = os.getenv("CUDA_DIR", "")
+    if not cuda_dir:
+        return
+    src = os.path.join(cuda_dir, "nvvm", "libdevice", "libdevice.10.bc")
     if not os.path.exists(src):
         return
     dst_dir = os.path.join(tempfile.gettempdir(), "xla_cuda", "nvvm", "libdevice")
@@ -57,7 +63,7 @@ def _fix_xla_libdevice():
         f"{os.path.join(tempfile.gettempdir(), 'xla_cuda')}"
     )
 
-_fix_xla_libdevice()
+fix_xla_libdevice()
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
@@ -66,7 +72,7 @@ VOCAB_SIZE  = 21
 SEQ_LEN     = 64
 N_WARMUP    = 50
 N_ITERS     = 100
-MODEL_DIR   = r"C:/Users/Bryan/Data/chessbot_data/models"
+MODEL_DIR   = os.getenv("MODEL_DIR", "")
 TRT_CACHE   = os.path.join(os.path.expanduser("~"), ".cache", "xerces_variant_trt")
 
 DEFAULT_BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256]

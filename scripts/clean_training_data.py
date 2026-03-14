@@ -5,12 +5,12 @@ import pickle
 import numpy as np
 import pandas as pd
 
+from chessbot import SP_DIR
 from chessbot.rescore import load_game_index
 from chessbot.rescore import ANALYZE_PKL
 
 
 CPL_MIN = 60
-SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 
 
 def derive_pkl_path_from_json(json_path):

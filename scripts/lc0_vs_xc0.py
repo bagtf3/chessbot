@@ -18,11 +18,7 @@ pd.set_option("display.max_rows", None)
 import chess
 import chess.engine
 
-
-Lc0_LOC = (
-    "C:/Users/Bryan/Data/chessbot_data/lc0/"
-    "lc0-v0.32.1-windows-gpu-nvidia-cuda12/lc0.exe"
-)
+from chessbot import LC0_LOC
 
 
 EPS = 1e-12
@@ -532,7 +528,7 @@ def aggregate_chunk_metrics(pos_rows):
 
 def run_lc0_vs_xc0(
     pkl_paths,
-    lc0_loc=Lc0_LOC,
+    lc0_loc=LC0_LOC,
     nodes=10000,
     n_threads=4,
     break_every=5000,

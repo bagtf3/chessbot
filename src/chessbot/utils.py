@@ -116,18 +116,13 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         return val, str(best_move), search_depth
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
-with open(uci_path_path, "rb") as f:
+with open(os.getenv("PRE_OPENED_UCI_PATHS", ""), "rb") as f:
     PATHS = pickle.load(f)
-    
 
-uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
-with open(uci_path_path_mini, "rb") as f:
+with open(os.getenv("PRE_OPENED_UCI_PATHS_MINI", ""), "rb") as f:
     MINI_PATHS = pickle.load(f)
 
-
-pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
-with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
+with open(os.getenv("UHO_PGN_PATH", ""), "r", encoding="utf-8", errors="replace") as f:
     PGN_TEXT = f.read()
 
 

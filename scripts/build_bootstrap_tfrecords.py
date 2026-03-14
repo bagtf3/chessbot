@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 
 TARGET_WRITTEN_POSITIONS = 3_500_000
-OUT_DIR = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
+OUT_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
 #RUN_TAGS = [
 #    "cf_10x256x5_full_sims3",
 #    "cf_10x256x5_full_sims4",

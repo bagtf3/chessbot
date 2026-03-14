@@ -7,7 +7,6 @@ pd.set_option('display.max_columns', None)
 import json
 from pathlib import Path
 
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 HE = "he_normal"
 BIG_NEG = -1e9
 EPS = 1e-9

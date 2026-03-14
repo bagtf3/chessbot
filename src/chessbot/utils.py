@@ -404,7 +404,9 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     preds = model.predict(X, verbose=0, batch_size=128)
     value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
-    # Y values may be TF tensors (TF retrain path) or numpy — normalise to numpy
+    # inputs may be TF tensors (TF retrain path) or numpy — normalise to numpy
+    if hasattr(M, 'numpy'):
+        M = M.numpy()
     y_value = Y['value_out']
     if hasattr(y_value, 'numpy'):
         y_value = y_value.numpy()

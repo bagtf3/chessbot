@@ -108,15 +108,26 @@ class GameLooper(object):
 
     def load_reload_model(self):
         cfg = self.config
-        self.model = load_model(cfg.model_path)
-
-        self.infer = make_conv_infer(
-            self.model,
-            max_bs=cfg.fwd_batch,
-            uniform_eps=cfg.uniform_eps,
-            prior_clip_max=cfg.prior_clip_max,
-            vscale=cfg.vscale
-        )
+        if cfg.inference_backend == "ort_trt":
+            from chessbot.infer_ort import make_ort_infer
+            self.model, self.infer = make_ort_infer(
+                cfg.ort_onnx_path,
+                cfg.ort_trt_engine_cache_dir,
+                cfg.ort_trt_fp16,
+                cfg.fwd_batch,
+                cfg.uniform_eps,
+                cfg.prior_clip_max,
+                cfg.vscale,
+            )
+        else:
+            self.model = load_model(cfg.model_path)
+            self.infer = make_conv_infer(
+                self.model,
+                max_bs=cfg.fwd_batch,
+                uniform_eps=cfg.uniform_eps,
+                prior_clip_max=cfg.prior_clip_max,
+                vscale=cfg.vscale,
+            )
     
     def check_for_pause(self):
         """
@@ -162,7 +173,8 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        tf.keras.backend.clear_session()
+        if self.config.inference_backend == "tf_xla":
+            tf.keras.backend.clear_session()
         gc.collect()
 
         priors_cache_clear()

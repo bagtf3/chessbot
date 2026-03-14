@@ -113,6 +113,18 @@ class Config(object):
     retrain_size = 10240
     training_queue_buffer = 30720
 
+    # inference / retrain backend selection
+    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt"
+    retrain_backend = "tf"        # "tf" | "pytorch"
+
+    # ORT/TRT inference (only used when inference_backend = "ort_trt")
+    ort_onnx_path = ""
+    ort_trt_engine_cache_dir = ""
+    ort_trt_fp16 = True
+
+    # PyTorch retrain (only used when retrain_backend = "pytorch")
+    pytorch_model_path = ""
+
     def __init__(self):
         self.init_paths()
 

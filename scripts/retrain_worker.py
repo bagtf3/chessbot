@@ -49,6 +49,10 @@ def list_pending_shards(pending_dir):
 
 
 def load_shards(paths, tries=3, sleep_s=0.25):
+    """
+    Returns raw TF tensors (no .numpy() calls).
+    Callers convert to numpy if needed (pytorch path).
+    """
     X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
     loaded = []
 
@@ -62,18 +66,18 @@ def load_shards(paths, tries=3, sleep_s=0.25):
                     feat = tf.io.parse_single_example(raw, TFREC_FEATURE_SPEC)
                     X_list.append(tf.cast(
                         tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16), tf.int32
-                    ).numpy())
-                    M_list.append(tf.io.parse_tensor(feat["mask"], out_type=tf.int32).numpy())
-                    P_list.append(tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32).numpy())
-                    Y_list.append(feat["value_out"].numpy())
-                    vw = feat["value_weight"].numpy()
-                    if vw < 0:  # old single-weight format
-                        w = feat["weight"].numpy()
+                    ))
+                    M_list.append(tf.io.parse_tensor(feat["mask"], out_type=tf.int32))
+                    P_list.append(tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32))
+                    Y_list.append(feat["value_out"])
+                    vw = feat["value_weight"]
+                    if vw.numpy() < 0:  # old single-weight format
+                        w = feat["weight"]
                         vwht_list.append(w)
                         pwht_list.append(w)
                     else:
                         vwht_list.append(vw)
-                        pwht_list.append(feat["policy_weight"].numpy())
+                        pwht_list.append(feat["policy_weight"])
                 loaded.append(path)
                 ok = True
                 break
@@ -89,6 +93,16 @@ def load_shards(paths, tries=3, sleep_s=0.25):
                 print("[retrain] failed deleting bad shard:", path, e)
 
     return (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded
+
+
+def export_tf_to_onnx(model_path, onnx_path):
+    import tf2onnx
+    model = load_model(model_path)
+    input_sig = [tf.TensorSpec([None, 64], tf.int32, name="enc_in")]
+    model_proto, _ = tf2onnx.convert.from_keras(model, input_signature=input_sig, opset=17)
+    with open(onnx_path, "wb") as f:
+        f.write(model_proto.SerializeToString())
+    print(f"[retrain] tf→onnx export → {onnx_path}")
 
 
 def delete_files(paths):
@@ -242,14 +256,17 @@ def main():
                    help="skip all plots and CSV progress saves")
     args = p.parse_args()
 
-    # make sure we are running on the GPU not CPU
-    enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
-
     run_dir = args.run_dir
-
-    # load config from yaml and start looking for training shards
     config_file = os.path.join(run_dir, "config.yaml")
     cfg = Config.from_yaml(config_file)
+
+    if cfg.retrain_backend == "pytorch":
+        # give the GPU entirely to pytorch; TF only reads tfrecords on CPU
+        tf.config.set_visible_devices([], 'GPU')
+        from chessbot.train_pytorch import enforce_pytorch_gpu_or_die
+        enforce_pytorch_gpu_or_die()
+    else:
+        enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
 
     pending_dir = os.path.join(run_dir, "pending_training")
     shard_paths = list_pending_shards(pending_dir)
@@ -264,29 +281,49 @@ def main():
         print("[retrain] no training samples after loading shards")
         return 0
 
-    X = np.asarray(X_list, dtype=np.int32)
-    M = np.stack(M_list, axis=0).astype(np.int32)
-    P = np.stack(P_list, axis=0).astype(np.float32)
-    Y_value = np.asarray(Y_list, dtype=np.float32)
-    vwht = np.asarray(vwht_list, dtype=np.float32)
-    pwht = np.asarray(pwht_list, dtype=np.float32)
+    if cfg.retrain_backend == "pytorch":
+        # convert to numpy for pytorch training
+        X       = np.stack([t.numpy() for t in X_list], axis=0).astype(np.int32)
+        M       = np.stack([t.numpy() for t in M_list], axis=0).astype(np.int32)
+        P       = np.stack([t.numpy() for t in P_list], axis=0).astype(np.float32)
+        Y_value = np.array([t.numpy() for t in Y_list], dtype=np.float32)
+        vwht    = np.array([t.numpy() for t in vwht_list], dtype=np.float32)
+        pwht    = np.array([t.numpy() for t in pwht_list], dtype=np.float32)
 
-    # remove nans and shuffle
-    valid = ~np.isnan(Y_value)
-    if not valid.all():
-        print(f"[retrain] {(~valid).sum()} nan values found in Y, removing")
-    idx = np.random.permutation(valid.sum())
-    X      = X[valid][idx]
-    M      = M[valid][idx]
-    P      = P[valid][idx]
-    Y_value = Y_value[valid][idx]
-    vwht   = vwht[valid][idx]
-    pwht   = pwht[valid][idx]
+        valid = ~np.isnan(Y_value)
+        if not valid.all():
+            print(f"[retrain] {(~valid).sum()} nan values found in Y, removing")
+        idx     = np.random.permutation(valid.sum())
+        X       = X[valid][idx]
+        M       = M[valid][idx]
+        P       = P[valid][idx]
+        Y_value = Y_value[valid][idx]
+        vwht    = vwht[valid][idx]
+        pwht    = pwht[valid][idx]
+    else:
+        # keep as TF tensors — no numpy round trip
+        X       = tf.stack(X_list)
+        M       = tf.stack(M_list)
+        P       = tf.stack(P_list)
+        Y_value = tf.stack(Y_list)
+        vwht    = tf.stack(vwht_list)
+        pwht    = tf.stack(pwht_list)
 
-    Y = {"value_out": Y_value, "policy_logits": P}
-    s_wts = {"value_out": vwht, "policy_logits": pwht}
+        valid = ~tf.math.is_nan(Y_value)
+        n_invalid = tf.reduce_sum(tf.cast(~valid, tf.int32)).numpy()
+        if n_invalid > 0:
+            print(f"[retrain] {n_invalid} nan values found in Y, removing")
+        idx     = tf.random.shuffle(tf.cast(tf.where(valid)[:, 0], tf.int32))
+        X       = tf.gather(tf.boolean_mask(X,       valid), idx)
+        M       = tf.gather(tf.boolean_mask(M,       valid), idx)
+        P       = tf.gather(tf.boolean_mask(P,       valid), idx)
+        Y_value = tf.gather(tf.boolean_mask(Y_value, valid), idx)
+        vwht    = tf.gather(tf.boolean_mask(vwht,    valid), idx)
+        pwht    = tf.gather(tf.boolean_mask(pwht,    valid), idx)
 
-    # ── weight summary (printed once, applies to all models) ─────────────────
+    Y     = {"value_out": Y_value, "policy_logits": P}
+    s_wts = {"value_out": vwht,    "policy_logits": pwht}
+
     draw_vwht = cfg.value_loss_weight * cfg.draw_value_scale
     kl_str = (
         f"KL boost ×{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
@@ -297,7 +334,9 @@ def main():
           f"sample value={cfg.value_loss_weight} (draw: {draw_vwht:.4f})")
     print(f"[retrain] weights  {kl_str}")
     for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
-        print(f"[retrain] {n}  min={w.min():.4f}  mean={w.mean():.4f}  max={w.max():.4f}")
+        print(f"[retrain] {n}  min={float(tf.reduce_min(w) if hasattr(w, 'numpy') else w.min()):.4f}"
+              f"  mean={float(tf.reduce_mean(w) if hasattr(w, 'numpy') else w.mean()):.4f}"
+              f"  max={float(tf.reduce_max(w) if hasattr(w, 'numpy') else w.max()):.4f}")
 
     if os.path.exists(cfg.progress_csv_path):
         n_retrains = len(pd.read_csv(cfg.progress_csv_path))
@@ -305,11 +344,23 @@ def main():
         n_retrains = 0
     epoch = n_retrains
 
-    # ── train: single model or multiplex loop ────────────────────────────────
-    model_paths = cfg.multiplex_models if cfg.multiplex_models else [cfg.model_path]
-    for i, model_path in enumerate(model_paths):
-        label = os.path.basename(model_path) if cfg.multiplex_models else ""
-        retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)
+    if cfg.retrain_backend == "pytorch":
+        from chessbot.train_pytorch import (
+            load_pt_model, train_pt_model, save_pt_model, export_pt_to_onnx
+        )
+        model = load_pt_model(cfg.pytorch_model_path)
+        train_pt_model(model, X, M, P, Y_value, vwht, pwht, cfg, args)
+        save_pt_model(model, cfg.pytorch_model_path)
+        print(f"[retrain] pytorch checkpoint saved → {cfg.pytorch_model_path}")
+        if cfg.inference_backend == "ort_trt" and cfg.ort_onnx_path:
+            export_pt_to_onnx(model, cfg.ort_onnx_path)
+    else:
+        model_paths = cfg.multiplex_models if cfg.multiplex_models else [cfg.model_path]
+        for model_path in model_paths:
+            label = os.path.basename(model_path) if cfg.multiplex_models else ""
+            retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)
+        if cfg.inference_backend == "ort_trt" and cfg.ort_onnx_path:
+            export_tf_to_onnx(cfg.model_path, cfg.ort_onnx_path)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")

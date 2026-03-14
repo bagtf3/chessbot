@@ -73,7 +73,8 @@ SEQ_LEN     = 64
 N_WARMUP    = 50
 N_ITERS     = 100
 MODEL_DIR   = os.getenv("MODEL_DIR", "")
-TRT_CACHE   = os.path.join(os.path.expanduser("~"), ".cache", "xerces_variant_trt")
+TRT_CACHE   = os.getenv("TRT_ENGINE_CACHE_DIR",
+                        os.path.join(os.path.expanduser("~"), ".cache", "xerces_variant_trt"))
 
 DEFAULT_BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256]
 

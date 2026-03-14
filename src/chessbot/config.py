@@ -154,6 +154,10 @@ class Config(object):
             for d in (self.run_dir, self.game_dir):
                 os.makedirs(d, exist_ok=True)
 
+        # ORT/TRT: fall back to env var if not set explicitly in YAML
+        if self.inference_backend == "ort_trt" and not self.ort_trt_engine_cache_dir:
+            self.ort_trt_engine_cache_dir = os.getenv("TRT_ENGINE_CACHE_DIR", "")
+
         # public flag; keep the old name too for backward compatibility
         self.paths_initialized = True
         self._paths_initialized = True

@@ -10,6 +10,18 @@ def make_ort_infer(onnx_path, engine_cache_dir, fp16, max_bs, uniform_eps, prior
     Post-processing (masked softmax, uniform eps, prior clip) is done in numpy,
     mirroring what make_conv_infer does in XLA.
     """
+    import os
+
+    if engine_cache_dir:
+        os.makedirs(engine_cache_dir, exist_ok=True)
+        engine_files = [f for f in os.listdir(engine_cache_dir) if f.endswith(".engine")]
+        if engine_files:
+            print(f"[ort] TRT engine cache hit — {len(engine_files)} engine(s) found in {engine_cache_dir}")
+        else:
+            print(f"[ort] TRT engine cache MISS — first build will take ~10-15 min: {engine_cache_dir}")
+    else:
+        print("[ort] WARNING: no TRT engine cache dir configured — engine rebuilt every session")
+
     providers = [
         (
             "TensorrtExecutionProvider",

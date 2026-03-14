@@ -2,10 +2,10 @@
 retrain_worker.py
 
 - run_dir contains:
-  - pending_training/  (directory containing shard .pkl files)
+  - pending_training/  (directory containing .tfrecord.gz shard files)
   - config.yaml        (the run config, loaded via Config.from_yaml)
-- each shard is a list of tuples:
-  (x, mask, policy, Y, vwht, pwht)
+- each shard is a gzipped TFRecord with fields:
+  enc_in, mask, policy_logits, value_out, value_weight, policy_weight
 - model path is taken from the loaded config (single) or cfg.multiplex_models (multi)
 - in multiplex mode: shards are loaded once, each model is trained sequentially
 - after all models are trained, shard files are deleted
@@ -14,7 +14,6 @@ retrain_worker.py
 import argparse
 import os, sys
 import time
-import pickle
 import gc
 
 import numpy as np
@@ -27,32 +26,54 @@ from chessbot.config import Config
 import chessbot.utils as cbu
 
 
-def load_pickle(path):
-    with open(path, "rb") as fh:
-        return pickle.load(fh)
+TFREC_FEATURE_SPEC = {
+    "enc_in":        tf.io.FixedLenFeature([], tf.string),
+    "mask":          tf.io.FixedLenFeature([], tf.string),
+    "policy_logits": tf.io.FixedLenFeature([], tf.string),
+    "value_out":     tf.io.FixedLenFeature([], tf.float32),
+    # old bootstrap files have a single "weight" field; new rescore files split into two
+    "weight":        tf.io.FixedLenFeature([], tf.float32, default_value=1.0),
+    "value_weight":  tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
+    "policy_weight": tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
+}
 
 
 def list_pending_shards(pending_dir):
     if not os.path.isdir(pending_dir):
         return []
 
-    fns = [fn for fn in os.listdir(pending_dir) if fn.endswith(".pkl")]
-    fns = [fn for fn in fns if not fn.endswith(".tmp.pkl")]
+    fns = [fn for fn in os.listdir(pending_dir)
+           if fn.endswith(".tfrecord") or fn.endswith(".tfrecord.gz")]
     fns.sort()
     return [os.path.join(pending_dir, fn) for fn in fns]
 
 
 def load_shards(paths, tries=3, sleep_s=0.25):
-    combined = []
+    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
     loaded = []
 
     for path in paths:
         ok = False
+        compression = "GZIP" if path.endswith(".gz") else ""
         for _ in range(tries):
             try:
-                items = load_pickle(path)
-                if items:
-                    combined += list(items)
+                dataset = tf.data.TFRecordDataset(path, compression_type=compression)
+                for raw in dataset:
+                    feat = tf.io.parse_single_example(raw, TFREC_FEATURE_SPEC)
+                    X_list.append(tf.cast(
+                        tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16), tf.int32
+                    ).numpy())
+                    M_list.append(tf.io.parse_tensor(feat["mask"], out_type=tf.int32).numpy())
+                    P_list.append(tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32).numpy())
+                    Y_list.append(feat["value_out"].numpy())
+                    vw = feat["value_weight"].numpy()
+                    if vw < 0:  # old single-weight format
+                        w = feat["weight"].numpy()
+                        vwht_list.append(w)
+                        pwht_list.append(w)
+                    else:
+                        vwht_list.append(vw)
+                        pwht_list.append(feat["policy_weight"].numpy())
                 loaded.append(path)
                 ok = True
                 break
@@ -61,15 +82,13 @@ def load_shards(paths, tries=3, sleep_s=0.25):
 
         if not ok:
             print("[retrain] failed reading shard (skipped):", path)
+            try:
+                os.remove(path)
+                print("[retrain] deleted bad shard:", path)
+            except Exception as e:
+                print("[retrain] failed deleting bad shard:", path, e)
 
-            if path.lower().endswith(".pkl"):
-                try:
-                    os.remove(path)
-                    print("[retrain] deleted bad shard:", path)
-                except Exception as e:
-                    print("[retrain] failed deleting bad shard:", path, e)
-
-    return combined, loaded
+    return (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded
 
 
 def delete_files(paths):
@@ -150,30 +169,30 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     print(f"{tag} loading {model_path}")
     model = load_model(model_path)
 
-    # ── recompile: explicit head weights + fresh LR ───────────────────────────
-    _opt_src = getattr(model, '_default_opt', None)
-    if isinstance(_opt_src, tf.keras.mixed_precision.LossScaleOptimizer):
-        _base_cls = type(_opt_src.inner_optimizer)
-        _base_cfg = _opt_src.inner_optimizer.get_config()
-    elif _opt_src is not None:
-        _base_cls = type(_opt_src)
-        _base_cfg = _opt_src.get_config()
+    # recompile: explicit head weights + fresh LR
+    opt_src = getattr(model, '_default_opt', None)
+    if isinstance(opt_src, tf.keras.mixed_precision.LossScaleOptimizer):
+        base_cls = type(opt_src.inner_optimizer)
+        base_cfg = opt_src.inner_optimizer.get_config()
+    elif opt_src is not None:
+        base_cls = type(opt_src)
+        base_cfg = opt_src.get_config()
     else:
-        _base_cls = tf.keras.optimizers.Adam
-        _base_cfg = {}
+        base_cls = tf.keras.optimizers.Adam
+        base_cfg = {}
 
-    _base_cfg['learning_rate'] = cfg.learning_rate
-    _inner = _base_cls.from_config(_base_cfg)
-    _opt = tf.keras.mixed_precision.LossScaleOptimizer(_inner)
+    base_cfg['learning_rate'] = cfg.learning_rate
+    inner_opt = base_cls.from_config(base_cfg)
+    opt = tf.keras.mixed_precision.LossScaleOptimizer(inner_opt)
 
-    _loss_dict = {
+    loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
     }
-    _head_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=_opt, loss=_loss_dict, loss_weights=_head_weights)
-    model._default_opt = _opt
-    model._default_loss_dict = _loss_dict
+    head_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    model.compile(optimizer=opt, loss=loss_dict, loss_weights=head_weights)
+    model._default_opt = opt
+    model._default_loss_dict = loss_dict
 
     if not args.skip_plots:
         if os.path.exists(cfg.progress_csv_path):
@@ -192,7 +211,7 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
             )
 
     history = model.fit(
-        X, Y, epochs=args.epochs, batch_size=args.batch_size,
+        {"enc_in": X}, Y, epochs=args.epochs, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
 
@@ -238,42 +257,31 @@ def main():
         print("[retrain] no shards found in:", pending_dir)
         return 0
 
-    combined, loaded_shards = load_shards(shard_paths)
-    print(f"[retrain] loaded {len(loaded_shards)} shards, samples={len(combined)}")
+    (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded_shards = load_shards(shard_paths)
+    print(f"[retrain] loaded {len(loaded_shards)} shards, samples={len(X_list)}")
 
-    if not combined:
+    if not X_list:
         print("[retrain] no training samples after loading shards")
         return 0
 
-    idx = np.random.permutation(len(combined))
-    combined = [combined[i] for i in idx]
-
-    X_list = []
-    P_list = []
-    mask_list = []
-    Y_list = []
-    vwht_list = []
-    pwht_list = []
-
-    for x, mask, policy, y, vwht, pwht in combined:
-        # quick nan check, should never happen
-        if np.isnan(y):
-            print("[retrain] nan found in y value")
-            continue
-
-        X_list.append(x)
-        P_list.append(policy)
-        mask_list.append(mask)
-        Y_list.append(y)
-        vwht_list.append(vwht)
-        pwht_list.append(pwht)
-
     X = np.asarray(X_list, dtype=np.int32)
+    M = np.stack(M_list, axis=0).astype(np.int32)
     P = np.stack(P_list, axis=0).astype(np.float32)
-    M = np.stack(mask_list, axis=0).astype(np.int32)
     Y_value = np.asarray(Y_list, dtype=np.float32)
     vwht = np.asarray(vwht_list, dtype=np.float32)
     pwht = np.asarray(pwht_list, dtype=np.float32)
+
+    # remove nans and shuffle
+    valid = ~np.isnan(Y_value)
+    if not valid.all():
+        print(f"[retrain] {(~valid).sum()} nan values found in Y, removing")
+    idx = np.random.permutation(valid.sum())
+    X      = X[valid][idx]
+    M      = M[valid][idx]
+    P      = P[valid][idx]
+    Y_value = Y_value[valid][idx]
+    vwht   = vwht[valid][idx]
+    pwht   = pwht[valid][idx]
 
     Y = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht, "policy_logits": pwht}

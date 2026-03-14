@@ -13,18 +13,19 @@ from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 
-TARGET_WRITTEN_POSITIONS = 9_500_000
+TARGET_WRITTEN_POSITIONS = 3_500_000
 OUT_DIR = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
-RUN_TAGS = [
-    "cf_10x256x5_full_sims3",
-    "cf_10x256x5_full_sims4",
-    "cf_10x256x5_deep_sims1",
-    "film_16M_low_sims1",
-]
+#RUN_TAGS = [
+#    "cf_10x256x5_full_sims3",
+#    "cf_10x256x5_full_sims4",
+#    "cf_10x256x5_deep_sims1",
+#    "film_16M_low_sims1",
+#]
 
+RUN_TAGS = ["cf_10x256x5_full_sims2", "film_16M_low_sims1"]
 DRAW_RATE = 0.5
 MAX_CPL = 45       # game-level CPL filter (mean clipped loss across game)
-CPL_THRESHOLD = 70 # per-ply CPL filter passed to generate_training_data
+CPL_THRESHOLD = 60 # per-ply CPL filter passed to generate_training_data
 SHARD_GAMES = 250
 N_WORKERS = max([1, os.cpu_count() - 2])
 

@@ -93,12 +93,12 @@ VARIANTS = {
     "16m-concat-fusion": dict(
         concat_fusion=True,
         d_embed=256, conv_filters=256, conv_blocks=12,
-        mha_heads=4, mha_layers=2, dropout=0.05,
+        mha_heads=8, mha_layers=2, dropout=0.05,
     ),
     "16m-gated-ctx": dict(
         gated_ctx=True,
         d_embed=256, conv_filters=256, conv_blocks=12,
-        mha_heads=4, mha_layers=2, dropout=0.05,
+        mha_heads=8, mha_layers=2, dropout=0.05,
     ),
     "16m-conformer-interweaved": dict(
         conformer_interweaved=True,
@@ -109,13 +109,10 @@ VARIANTS = {
         ff_dim=1024,
         dropout=0.05,
     ),
-    "10m-transformer": dict(
-        transformer=True,
-        d_embed=256,
-        transformer_layers=12,
-        num_heads=8,
-        ff_dim=1024,
-        dropout=0.05,
+    "13m-conformer-transheavy": dict(
+        conformer_transheavy=True,
+        conv_filters=256, n_blocks=11,
+        num_heads=8, ff_dim=1024, dropout=0.05,
     ),
     "16m-transformer": dict(
         transformer=True,
@@ -175,6 +172,14 @@ def describe_variant(name, cfg):
         print("  Architecture : interweaved conformer — per-block MHA + ConvRes")
         print(f"  blocks       : {cfg['conv_blocks']} × [MHA(heads={cfg['num_heads']})"
             f" + Conv({C},3) + Conv({C},3)]")
+    elif cfg.get("conformer_transheavy"):
+        nb = cfg["n_blocks"]
+        n_conv = (nb + 1) // 2; n_tx = nb // 2
+        print(f"  Architecture : conformer-transheavy — alternating ConvBlock / TxBlock")
+        print(f"  blocks       : {nb} total ({n_conv} ConvBlock, {n_tx} TxBlock)")
+        print(f"  ConvBlock    : MHA(heads={cfg['num_heads']}) + Conv({C},3) + Conv({C},3)")
+        print(f"  TxBlock      : MHA(heads={cfg['num_heads']}) + FF(dim={cfg['ff_dim']})")
+        print(f"  pos inject   : full at start, taper drip (0.1/0.05/0.025) before TxBlocks")
     elif cfg.get("transformer"):
         print(f"  Architecture : pure transformer")
         print(f"  layers       : {cfg['transformer_layers']}  heads: {cfg['num_heads']}  ff_dim: {cfg['ff_dim']}")
@@ -203,6 +208,8 @@ def make_cache_key(name, cfg):
     if cfg.get("gated_ctx"):     return f"gated-ctx-cb{cfg['conv_blocks']}"
     if cfg.get("conformer_interweaved"):
         return f"conformer-interweaved-cb{cfg['conv_blocks']}-nh{cfg['num_heads']}"
+    if cfg.get("conformer_transheavy"):
+        return f"conformer-transheavy-nb{cfg['n_blocks']}-nh{cfg['num_heads']}"
     return name.replace(" ", "-")
 
 
@@ -236,7 +243,7 @@ def _tf_compile(model):
     return model
 
 
-def _tf_attn_pool_value_head(x, C, layers):
+def _tf_attn_pool_value_head(x, C, layers, activation="relu"):
     """Attention pooling value head. x: (B,8,8,C) or (B,64,C)."""
     if len(x.shape) == 4:
         x_seq = layers.Reshape((64, C), name="v_seq")(x)
@@ -248,8 +255,8 @@ def _tf_attn_pool_value_head(x, C, layers):
     attn_wT = layers.Permute((2, 1), name="attn_w_T")(attn_w)
     v = layers.Dot(axes=[2, 1], name="v_pool")([attn_wT, x_seq])
     v = layers.Reshape((C,), name="v_squeeze")(v)
-    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
-    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
+    v = layers.Dense(256, activation=activation, name="v_fc1")(v)
+    v = layers.Dense(128, activation=activation, name="v_fc2")(v)
     return layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
 
 
@@ -490,7 +497,7 @@ def build_tf_transformer(cfg):
     nh    = cfg["num_heads"]
     fd    = cfg["ff_dim"]
     dr    = cfg["dropout"]
-    C_pol = 256  # spatial policy head width
+    C_pol = 128  # spatial policy head width
 
     inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
     x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
@@ -534,7 +541,7 @@ def build_tf_transformer(cfg):
     x = x + 0.025*pos
 
     # value reads from sequence space (B, 64, de) before spatial reshape
-    value = _tf_attn_pool_value_head(x, de, layers)
+    value = _tf_attn_pool_value_head(x, de, layers, activation="gelu")
 
     # spatial policy head: conv blocks ground per-square logits in local 8×8 context
     x = layers.Reshape((8, 8, de), name="pol_to_2d")(x)
@@ -658,14 +665,93 @@ def build_tf_gated_ctx(cfg):
     return _tf_compile(model)
 
 
+def build_tf_conformer_transheavy(cfg):
+    """Alternating ConvBlock (MHA+Conv+Conv) and TxBlock (MHA+FF), 11 blocks.
+    TF-only for speed comparison — not saved."""
+    import tensorflow as tf
+    from tensorflow.keras import layers, Input, Model
+
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+    cf = cfg["conv_filters"]
+    nb = cfg["n_blocks"]
+    nh = cfg["num_heads"]
+    fd = cfg["ff_dim"]
+    dr = cfg["dropout"]
+
+    _TX_POS = [0.1, 0.05, 0.025, 0.0, 0.0, 0.0]
+
+    sq  = tf.keras.backend.arange(0, 64, dtype="int32")
+    inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
+    pos = layers.Lambda(
+        lambda t: tf.expand_dims(t, axis=0), name="pos_expand"
+    )(layers.Embedding(64, cf, name="pos_emb")(sq))        # (1, 64, cf)
+
+    x = layers.Embedding(VOCAB_SIZE, cf, name="token_emb")(inp)   # (B, 64, cf)
+    x = x + pos                                                     # full initial inject
+
+    tx_idx = 0
+    for i in range(nb):
+        if i % 2 == 0:
+            # ConvBlock: MHA (prenorm) → ConvRes
+            r = x
+            x = layers.LayerNormalization(axis=-1, name=f"b{i}_ln1")(x)
+            x = layers.MultiHeadAttention(
+                num_heads=nh, key_dim=cf // nh, dropout=0.0, name=f"b{i}_mha"
+            )(x, x)
+            x = layers.Dropout(dr, name=f"b{i}_drop1")(x)
+            x = r + x
+            x2 = layers.Reshape((8, 8, cf), name=f"b{i}_to2d")(x)
+            r2 = x2
+            h  = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c1")(x2)
+            h  = layers.LeakyReLU(0.01, name=f"b{i}_lr1")(h)
+            h  = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c2")(h)
+            h  = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(h)
+            x  = layers.Reshape((64, cf), name=f"b{i}_toseq")(
+                layers.LeakyReLU(0.01, name=f"b{i}_out")(r2 + h)
+            )
+        else:
+            # TxBlock: taper pos inject + MHA (prenorm) + FF
+            scale = _TX_POS[tx_idx] if tx_idx < len(_TX_POS) else 0.0
+            if scale != 0.0:
+                x = x + scale * pos
+            r = x
+            x = layers.LayerNormalization(axis=-1, name=f"b{i}_ln1")(x)
+            x = layers.MultiHeadAttention(
+                num_heads=nh, key_dim=cf // nh, dropout=0.0, name=f"b{i}_mha"
+            )(x, x)
+            x = layers.Dropout(dr, name=f"b{i}_drop1")(x)
+            x = r + x
+            r = x
+            x = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(x)
+            x = layers.Dense(fd, activation="gelu", name=f"b{i}_ff1")(x)
+            x = layers.Dropout(dr, name=f"b{i}_drop2")(x)
+            x = layers.Dense(cf, name=f"b{i}_ff2")(x)
+            x = r + x
+            tx_idx += 1
+
+    x = layers.Reshape((8, 8, cf), name="final_to2d")(x)
+    x = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="conv_mix")(x)
+    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
+    x = layers.LeakyReLU(0.01, name="lrelu_mix")(x)
+
+    policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(x)
+    policy = layers.Reshape((SEQ_LEN * 67,), name="policy_logits")(policy)
+    value  = _tf_attn_pool_value_head(x, cf, layers)
+
+    model = Model(inp, [policy, value])
+    print(f"  TF params: {model.count_params():,}")
+    return _tf_compile(model)
+
+
 TF_BUILDERS = {
-    "16m-pure-conv":      build_tf_pure_conv,
-    "16m-conformer":      build_tf_conformer,
+    "16m-pure-conv":             build_tf_pure_conv,
+    "16m-conformer":             build_tf_conformer,
     "16m-conformer-interweaved": build_tf_conformer_interweaved,
-    "16m-film":           build_tf_film,
-    "16m-concat-fusion":  build_tf_concat_fusion,
-    "16m-gated-ctx":      build_tf_gated_ctx,
-    "10m-transformer":    build_tf_transformer   
+    "16m-film":                  build_tf_film,
+    "16m-concat-fusion":         build_tf_concat_fusion,
+    "16m-gated-ctx":             build_tf_gated_ctx,
+    "13m-conformer-transheavy":  build_tf_conformer_transheavy,
 }
 
 # ---------------------------------------------------------------------------
@@ -819,7 +905,11 @@ def build_pt_conformer(cfg):
 
 
 def build_pt_conformer_interweaved(cfg):
-    """Interweaved conformer: 10 x [MHA -> Conv -> Conv]."""
+    """Interweaved conformer: 10 x [MHA -> Conv -> Conv].
+    Op-for-op identical to build_tf_conformer_interweaved:
+      - graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none
+      - LayerNorm before attention pooling in value head
+    """
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -830,9 +920,13 @@ def build_pt_conformer_interweaved(cfg):
     nh = cfg["num_heads"]
     dr = cfg["dropout"]
 
+    # Graduated pos injection scales matching TF: {block_idx: scale}
+    _POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
+
     class Block(nn.Module):
-        def __init__(self):
+        def __init__(self, pos_scale):
             super().__init__()
+            self.pos_scale = pos_scale
             self.ln1 = nn.LayerNorm(cf)
             self.attn = nn.MultiheadAttention(
                 cf,
@@ -850,7 +944,8 @@ def build_pt_conformer_interweaved(cfg):
             b = x.shape[0]
 
             s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-            s = s + 0.01*pos
+            if self.pos_scale != 0.0:
+                s = s + self.pos_scale * pos
 
             r = s
             n = self.ln1(s)
@@ -873,10 +968,13 @@ def build_pt_conformer_interweaved(cfg):
             self.proj = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
             self.lnp = _make_ln2d(cf) if de != cf else None
             self.pos = nn.Embedding(64, cf)
-            self.blocks = nn.ModuleList([Block() for _ in range(cb)])
+            self.blocks = nn.ModuleList(
+                [Block(_POS_SCALES.get(i, 0.0)) for i in range(cb)]
+            )
             self.mix = nn.Conv2d(cf, cf, 1, bias=False)
             self.lnm = _make_ln2d(cf)
             self.pol = nn.Conv2d(cf, 67, 1)
+            self.v_ln = nn.LayerNorm(cf)   # matches TF: LN before attn pool
             self.ap = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
@@ -901,6 +999,7 @@ def build_pt_conformer_interweaved(cfg):
             pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
 
             s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+            s = self.v_ln(s)             # matches TF: LN before attn pool
             v = _pt_attn_pool(s, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
@@ -922,7 +1021,7 @@ def build_pt_transformer(cfg):
     nh    = cfg["num_heads"]
     fd    = cfg["ff_dim"]
     dr    = cfg["dropout"]
-    C_pol = 256  # spatial policy head width
+    C_pol = 128  # spatial policy head width
 
     class TxLayer(nn.Module):
         def __init__(self):
@@ -957,7 +1056,7 @@ def build_pt_transformer(cfg):
             self.pol_c2b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
             self.pol_ln2  = _make_ln2d(C_pol)
             self.pol_out  = nn.Conv2d(C_pol, 67, 1)
-            # value head (unchanged)
+            # value head
             self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
@@ -975,8 +1074,8 @@ def build_pt_transformer(cfg):
 
             # value reads from sequence space (B, 64, de) before spatial reshape
             v = _pt_attn_pool(x, self.ap)
-            v = F.relu(self.vfc1(v))
-            v = F.relu(self.vfc2(v))
+            v = F.gelu(self.vfc1(v))
+            v = F.gelu(self.vfc2(v))
 
             # fixed 0.2 pos reinject before policy head
             x = x + 0.2 * pos
@@ -1004,7 +1103,6 @@ def build_pt_transformer_16m(cfg):
     nh    = cfg["num_heads"]
     fd    = cfg["ff_dim"]
     dr    = cfg["dropout"]
-    C_pol = 256  # spatial policy head width
 
     class TxLayer(nn.Module):
         def __init__(self):
@@ -1029,17 +1127,19 @@ def build_pt_transformer_16m(cfg):
             self.emb  = nn.Embedding(VOCAB_SIZE, de)
             self.pos  = nn.Embedding(64, de)
             self.txs  = nn.ModuleList([TxLayer() for _ in range(tl)])
-            # spatial policy head: conv blocks ground per-square logits in local 8×8 context
-            self.pol_mix  = nn.Conv2d(de, C_pol, 1, bias=False)
-            self.pol_ln0  = _make_ln2d(C_pol)
-            self.pol_c1a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
-            self.pol_c1b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
-            self.pol_ln1  = _make_ln2d(C_pol)
-            self.pol_c2a  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
-            self.pol_c2b  = nn.Conv2d(C_pol, C_pol, 3, padding=1, bias=False)
-            self.pol_ln2  = _make_ln2d(C_pol)
-            self.pol_out  = nn.Conv2d(C_pol, 67, 1)
-            # value head (unchanged)
+            # spatial policy head: tapered 256→192→67
+            self.pol_mix  = nn.Conv2d(de, 256, 1, bias=False)
+            self.pol_ln0  = _make_ln2d(256)
+            self.pol_c1a  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_c1b  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_ln1  = _make_ln2d(256)
+            self.pol_down = nn.Conv2d(256, 192, 1, bias=False)  # step down
+            self.pol_lnd  = _make_ln2d(192)
+            self.pol_c2a  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_c2b  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_ln2  = _make_ln2d(192)
+            self.pol_out  = nn.Conv2d(192, 67, 1)
+            # value head
             self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
@@ -1048,22 +1148,23 @@ def build_pt_transformer_16m(cfg):
         def forward(self, t):
             B   = t.shape[0]
             pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x   = self.emb(t) + pos  # initial inject
+            x   = self.emb(t) + pos  # full inject before first layer
             for i, tx in enumerate(self.txs):
-                if i % 2 == 1:  # flat 0.1 reinject every other layer pre-MHA
+                if i > 0:  # steady 0.1 drip before every layer after the first
                     x = x + 0.1 * pos
                 x = tx(x)
 
             # value reads from sequence space (B, 64, de) before spatial reshape
             v = _pt_attn_pool(x, self.ap)
-            v = F.relu(self.vfc1(v))
-            v = F.relu(self.vfc2(v))
+            v = F.gelu(self.vfc1(v))
+            v = F.gelu(self.vfc2(v))
 
             # fixed 0.2 pos reinject before policy head
             x = x + 0.2 * pos
             x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
             x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
             r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
+            x = F.leaky_relu(self.pol_lnd(self.pol_down(x)), 0.01)  # 256→192
             r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
             pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
 
@@ -1244,13 +1345,124 @@ def build_pt_gated_ctx(cfg):
     return m
 
 
+def build_pt_conformer_transheavy(cfg):
+    """Alternating ConvBlock (MHA+Conv+Conv) and TxBlock (MHA+FF), odd total blocks.
+    Pattern for 11 blocks: Conv Tx Conv Tx Conv Tx Conv Tx Conv Tx Conv
+    Pos: full inject at start; taper-drip (0.1, 0.05, 0.025) before each TxBlock.
+    PT-only. Policy + value heads identical to conformer-interweaved.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    cf = cfg["conv_filters"]   # 256
+    nb = cfg["n_blocks"]       # 11
+    nh = cfg["num_heads"]      # 8
+    fd = cfg["ff_dim"]         # 1024
+    dr = cfg["dropout"]        # 0.05
+
+    # Taper pos-reinject scales for TxBlocks (in order of appearance)
+    _TX_POS = [0.1, 0.05, 0.025, 0.0, 0.0, 0.0]
+
+    class ConvBlock(nn.Module):
+        """MHA (prenorm) → ConvRes. Operates in (B, 64, cf) seq space."""
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(cf)
+            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.c1    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.lr1   = nn.LeakyReLU(0.01, True)
+            self.c2    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.ln2   = _make_ln2d(cf)
+
+        def forward(self, s):
+            b = s.shape[0]
+            r = s
+            n = self.ln1(s)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            s = r + self.drop1(h)
+            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
+            r = x
+            h = self.lr1(self.c1(x))
+            h = self.ln2(self.c2(h))
+            x = F.leaky_relu(r + h, 0.01)
+            return x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+
+    class TxBlock(nn.Module):
+        """MHA (prenorm) + FF. Operates in (B, 64, cf) seq space."""
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(cf)
+            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.ln2   = nn.LayerNorm(cf)
+            self.ff1   = nn.Linear(cf, fd)
+            self.drop2 = nn.Dropout(dr)
+            self.ff2   = nn.Linear(fd, cf)
+
+        def forward(self, x):
+            r = x
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = r + self.drop1(h)
+            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb  = nn.Embedding(VOCAB_SIZE, cf)
+            self.pos  = nn.Embedding(64, cf)
+            # alternating Conv/Tx; nb must be odd → first and last are ConvBlock
+            self.blocks = nn.ModuleList(
+                [ConvBlock() if i % 2 == 0 else TxBlock() for i in range(nb)]
+            )
+            self.mix  = nn.Conv2d(cf, cf, 1, bias=False)
+            self.lnm  = _make_ln2d(cf)
+            self.pol  = nn.Conv2d(cf, 67, 1)
+            self.v_ln = nn.LayerNorm(cf)
+            self.ap   = nn.Linear(cf, 1)
+            self.vfc1 = nn.Linear(cf, 256)
+            self.vfc2 = nn.Linear(256, 128)
+            self.vout = nn.Linear(128, 1)
+
+        def forward(self, t):
+            b = t.shape[0]
+            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
+            s = self.emb(t) + pos   # full pos inject at start
+
+            tx_idx = 0
+            for block in self.blocks:
+                if isinstance(block, TxBlock):
+                    scale = _TX_POS[tx_idx] if tx_idx < len(_TX_POS) else 0.0
+                    if scale != 0.0:
+                        s = s + scale * pos
+                    tx_idx += 1
+                s = block(s)
+
+            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
+            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
+            pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
+
+            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+            s = self.v_ln(s)
+            v = _pt_attn_pool(s, self.ap)
+            v = F.relu(self.vfc1(v))
+            v = F.relu(self.vfc2(v))
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
 PT_BUILDERS = {
     "16m-pure-conv":      build_pt_pure_conv,
     "16m-conformer":      build_pt_conformer,
     "16m-film":           build_pt_film,
     "16m-concat-fusion":  build_pt_concat_fusion,
     "16m-gated-ctx":      build_pt_gated_ctx,
-    "10m-transformer":    build_pt_transformer,
+    "13m-conformer-transheavy": build_pt_conformer_transheavy,
     "16m-transformer":    build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved
 }
@@ -1506,7 +1718,7 @@ def main():
                 tf_infer, tf_model = make_tf_infer(name, cfg)
                 res["TF+XLA"] = speed_test(f"{name}  TF+XLA [fp16]", tf_infer, bs)
 
-                if save:
+                if save and name not in ("16m-conformer-interweaved", "13m-conformer-transheavy"):
                     path = os.path.join(args.model_dir, f"{name}_model.h5")
                     tf_model.save(path)
                     print(f"  Saved TF model → {path}")
@@ -1527,7 +1739,8 @@ def main():
                 eager = make_pt_eager_infer(name, cfg, device)
                 res["PT eager"] = speed_test(f"{name}  PT eager [fp16]", eager, bs)
 
-                if save and "transformer" in name:
+                if save and ("transformer" in name or "conformer-interweaved" in name
+                            or "conformer-transheavy" in name):
                     pt_model = PT_BUILDERS[name](cfg).half().to(device)
                     pt_path  = os.path.join(args.model_dir, f"{name}_pt_model.pt")
                     torch.save({"model": pt_model.state_dict()}, pt_path)

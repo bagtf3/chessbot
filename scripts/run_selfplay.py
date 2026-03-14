@@ -389,7 +389,7 @@ def main(run_tag):
                         p["msg_q"].put("pause")
                     
                     # sample and write training data, update training_queue for logging
-                    rescorer.write_training_data_pkl(
+                    rescorer.write_training_data_tfrec(
                         size=working_cfg.retrain_size, randomize=True)
 
                     recorder.training_queue = len(rescorer.training_data)
@@ -452,7 +452,7 @@ def main(run_tag):
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.push_analyzed(report=True)
-        rescorer.write_training_data_pkl(size=9999999, randomize=False)
+        rescorer.write_training_data_tfrec(size=9999999, randomize=False)
         rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 

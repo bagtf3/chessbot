@@ -25,42 +25,48 @@ from chessbot.utils import batch_policy_metrics, format_time, print_validation
 
 
 TFREC_DIR  = "C:/Users/Bryan/Data/chessbot_data/bootstrap_tfrecords"
-RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_heavyweights"
+RUN_DIR    = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_multi"
 MODEL_DIR  = "C:/Users/Bryan/Data/chessbot_data/models"
 
-batch_size = 256
+batch_size = 128
 epoch_size = 10240
 shuffle_buffer = 64000
 steps_per_epoch = epoch_size // batch_size
-MAX_EPOCH = 730
+MAX_EPOCH = 900
 PLOT_EVERY = 10
-LR = 2e-4
+LR = 1e-4
 MODEL_DEFS = [
     #"16m-pure-conv", # dead
-    #"16m-film", # gated ctx beats this
+    #"16m-film", # solid
     #"16m-concat-fusion", # dead
-    #"16m-conformer-interweaved", # really strong, hard to optimize
-    #"16m-gated-ctx", #solid 
-    "16m-conformer"
+    #"16m-conformer", # dead
+    #"16m-gated-ctx", #solid
+    "16m-frankenformer-interweaved"
 ]
 
 LW_SCHEDULE = {
     0: {"policy_logits": 0.1, "value_out": 0.1},
     1: {"policy_logits": 0.75, "value_out": 1.5},
-    10: {"policy_logits": 1.5, "value_out": 2.5},
-    160: {"policy_logits": 1.0, "value_out": 2.0},
-    250: {"policy_logits": 1.0, "value_out": 1.5},
+    10: {"policy_logits": 1.5, "value_out": 3.0},
+    160: {"policy_logits": 1.0, "value_out": 2.25},
+    250: {"policy_logits": 0.75, "value_out": 1.5},
     480: {"policy_logits": 0.65, "value_out": 1.25},
-    640: {"policy_logits": 0.5, "value_out": 1.0}
+    640: {"policy_logits": 0.5, "value_out": 1.0},
+    700: {"policy_logits": 0.25, "value_out": 0.5}
 }
 
 def load_tf_model(path, lr=LR):
     model = keras.models.load_model(path)
-    # always build a fresh optimizer at the requested LR — do not inherit
-    # whatever LR was baked into the saved h5, and do not rely on the
-    # serialize/deserialize path in set_loss_weights picking up any change.
+
+    # print + save summary
+    print("\n" + "=" * 80)
+    print(f"MODEL SUMMARY: {path}")
+    print("=" * 80)
+
+    # always build a fresh optimizer at the requested LR
     opt = tf.keras.optimizers.Adam(learning_rate=lr)
     opt = mixed_precision.LossScaleOptimizer(opt)
+
     model._default_opt = opt
     model._default_loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(
@@ -68,6 +74,7 @@ def load_tf_model(path, lr=LR):
         ),
         "value_out": tf.keras.losses.MeanSquaredError(),
     }
+
     return model
 
 
@@ -351,6 +358,8 @@ def do_eval(ms, bundle, batch_size):
 
         fig.tight_layout()
         plt.show()
+        plt.close(fig)
+        plt.close("all")
 
 
 n_files = len(list_tfrecord_files(TFREC_DIR))

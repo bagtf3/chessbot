@@ -310,16 +310,22 @@ def main():
         pwht    = tf.stack(pwht_list)
 
         valid = ~tf.math.is_nan(Y_value)
-        n_invalid = tf.reduce_sum(tf.cast(~valid, tf.int32)).numpy()
+        n_invalid = int(tf.reduce_sum(tf.cast(~valid, tf.int32)).numpy())
         if n_invalid > 0:
             print(f"[retrain] {n_invalid} nan values found in Y, removing")
-        idx     = tf.random.shuffle(tf.cast(tf.where(valid)[:, 0], tf.int32))
-        X       = tf.gather(tf.boolean_mask(X,       valid), idx)
-        M       = tf.gather(tf.boolean_mask(M,       valid), idx)
-        P       = tf.gather(tf.boolean_mask(P,       valid), idx)
-        Y_value = tf.gather(tf.boolean_mask(Y_value, valid), idx)
-        vwht    = tf.gather(tf.boolean_mask(vwht,    valid), idx)
-        pwht    = tf.gather(tf.boolean_mask(pwht,    valid), idx)
+        X       = tf.boolean_mask(X,       valid)
+        M       = tf.boolean_mask(M,       valid)
+        P       = tf.boolean_mask(P,       valid)
+        Y_value = tf.boolean_mask(Y_value, valid)
+        vwht    = tf.boolean_mask(vwht,    valid)
+        pwht    = tf.boolean_mask(pwht,    valid)
+        idx     = tf.random.shuffle(tf.range(tf.shape(X)[0], dtype=tf.int32))
+        X       = tf.gather(X,       idx)
+        M       = tf.gather(M,       idx)
+        P       = tf.gather(P,       idx)
+        Y_value = tf.gather(Y_value, idx)
+        vwht    = tf.gather(vwht,    idx)
+        pwht    = tf.gather(pwht,    idx)
 
     Y     = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht,    "policy_logits": pwht}
@@ -334,9 +340,11 @@ def main():
           f"sample value={cfg.value_loss_weight} (draw: {draw_vwht:.4f})")
     print(f"[retrain] weights  {kl_str}")
     for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
-        print(f"[retrain] {n}  min={float(tf.reduce_min(w) if hasattr(w, 'numpy') else w.min()):.4f}"
-              f"  mean={float(tf.reduce_mean(w) if hasattr(w, 'numpy') else w.mean()):.4f}"
-              f"  max={float(tf.reduce_max(w) if hasattr(w, 'numpy') else w.max()):.4f}")
+        if isinstance(w, tf.Tensor):
+            mn, me, mx = float(tf.reduce_min(w)), float(tf.reduce_mean(w)), float(tf.reduce_max(w))
+        else:
+            mn, me, mx = float(w.min()), float(w.mean()), float(w.max())
+        print(f"[retrain] {n}  min={mn:.4f}  mean={me:.4f}  max={mx:.4f}")
 
     if os.path.exists(cfg.progress_csv_path):
         n_retrains = len(pd.read_csv(cfg.progress_csv_path))

@@ -402,13 +402,17 @@ def print_validation(epoch, stats):
 def score_game_data(model, X, M, Y, epoch, save_path=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
     preds = model.predict(X, verbose=0, batch_size=128)
-    value_preds = preds[1].ravel()
+    value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
-    value_preds = preds[1].ravel()  # (B,)
-    targets = Y['value_out'].ravel()
-    value_mse = np.mean((value_preds - targets) ** 2)
+    # Y values may be TF tensors (TF retrain path) or numpy — normalise to numpy
+    y_value = Y['value_out']
+    if hasattr(y_value, 'numpy'):
+        y_value = y_value.numpy()
+    targets = y_value.ravel()
+
+    value_mse  = np.mean((value_preds - targets) ** 2)
     value_corr = np.corrcoef(value_preds, targets)[0, 1]
-    
+
     plt.scatter(targets, value_preds, s=6)
     plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
     plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
@@ -421,7 +425,9 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     plt.close()
 
     policy_logits = preds[0]  # (B,4096)
-    policy_true = Y['policy_logits']
+    policy_true   = Y['policy_logits']
+    if hasattr(policy_true, 'numpy'):
+        policy_true = policy_true.numpy()
     policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
 
     # build print dict and call the printer

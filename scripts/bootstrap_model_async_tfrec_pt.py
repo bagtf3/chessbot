@@ -536,6 +536,7 @@ def save_pt_model(ms):
         "optimizer": ms["optimizer"].state_dict(),
         "scaler":    ms["scaler"].state_dict(),
         "epoch":     ms["epoch"],
+        "arch":      ms["name"],
     }, ms["model_file"])
     print(f"[save] {ms['name']} → {ms['model_file']}")
 

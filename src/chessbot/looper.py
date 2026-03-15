@@ -108,16 +108,15 @@ class GameLooper(object):
 
     def load_reload_model(self):
         cfg = self.config
-        if cfg.inference_backend == "ort_trt":
-            from chessbot.infer_ort import make_ort_infer
-            self.model, self.infer = make_ort_infer(
-                cfg.ort_onnx_path,
-                cfg.ort_trt_engine_cache_dir,
-                cfg.ort_trt_fp16,
-                cfg.fwd_batch,
-                cfg.uniform_eps,
-                cfg.prior_clip_max,
-                cfg.vscale,
+        if cfg.inference_backend == "pytorch":
+            from chessbot.train_pytorch import load_pt_model, make_pt_infer
+            model, _ = load_pt_model(cfg.pytorch_model_path)
+            self.model, self.infer = make_pt_infer(
+                model,
+                max_bs=cfg.fwd_batch,
+                uniform_eps=cfg.uniform_eps,
+                prior_clip_max=cfg.prior_clip_max,
+                vscale=cfg.vscale,
             )
         else:
             self.model = load_model(cfg.model_path)
@@ -173,7 +172,10 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        if self.config.inference_backend == "tf_xla":
+        if self.config.inference_backend == "pytorch":
+            import torch
+            torch.cuda.empty_cache()
+        else:
             tf.keras.backend.clear_session()
         gc.collect()
 
@@ -669,7 +671,9 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
     else:
         model_path = config.model_path
 
-    if os.path.exists(model_path):
+    if config.inference_backend == "pytorch":
+        model = None
+    elif os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
         model = load_model(model_path)
     else:

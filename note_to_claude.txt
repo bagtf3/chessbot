@@ -1,0 +1,74 @@
+SESSION HANDOFF NOTE
+====================
+
+## Current Task
+Switching to chess_onnx conda env to debug ORT-TRT + PyTorch backend for val_test run.
+
+## What Was Just Done
+Updated val_test config.yaml to use:
+  inference_backend: ort_trt
+  retrain_backend: pytorch
+  ort_onnx_path: C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/val_test_model.onnx
+  pytorch_model_path: C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/val_test_model.pt
+
+run_selfplay.py now has two auto-setup functions called at startup (before workers spawn):
+  1. ensure_onnx_exported(cfg) -- exports .pt -> .onnx if ONNX doesn't exist yet
+  2. prebuild_trt_engine(cfg)  -- builds TRT engine once in parent before workers start
+
+## The Error We Hit
+Running: python run_selfplay.py val_test (in chess_onnx env)
+Output:
+  [onnx] exporting .../val_test_model.pt -> .../val_test_model.onnx
+  AttributeError: 'collections.OrderedDict' object has no attribute 'parameters'
+  in export_pt_to_onnx -> device = next(model.parameters()).device
+
+## Root Cause
+load_pt_model() in train_pytorch.py has this logic:
+  obj = torch.load(path)
+  if isinstance(obj, torch.nn.Module): return obj          # full model saved
+  if isinstance(obj, dict) and "model" in obj: return obj["model"]  # checkpoint dict
+
+The val_test_model.pt is a checkpoint dict: {"model": OrderedDict(...)}
+where obj["model"] is a STATE DICT (OrderedDict of param tensors), NOT an nn.Module.
+So load_pt_model returns the OrderedDict, then export_pt_to_onnx tries .parameters() on it -> crash.
+
+## What We Need To Do Next Session
+1. Inspect the .pt file to understand its structure:
+      import torch
+      obj = torch.load('C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/val_test_model.pt', map_location='cpu')
+      print(type(obj), obj.keys() if isinstance(obj, dict) else "")
+      # if obj["model"] is a state dict, print first 8 keys to identify architecture:
+      sd = obj["model"] if "model" in obj else obj
+      print(list(sd.keys())[:10])
+
+2. Identify which PyTorch model architecture class the state dict belongs to.
+   The PyTorch model builders are defined inline in:
+     scripts/bootstrap_model_async_tfrec_pt.py  (look for class definitions)
+     scripts/model_variant_speed_test.py        (also has PT builders)
+   The active TF model is build_conformer_64x67 (conformer, cb=10, tl=5, nh=8, d=128)
+   The PT equivalent is likely the "16m-conformer" variant in those scripts.
+
+3. Fix load_pt_model in src/chessbot/train_pytorch.py to handle state dict format.
+   Options:
+   a) If we can identify the architecture from state dict keys, reconstruct the model
+      then load_state_dict() into it.
+   b) OR: update save_pt_model to always save the full nn.Module (not just state dict)
+      going forward, and handle the old format as a one-time migration.
+   c) OR: add an architecture name field to the checkpoint: {"model": sd, "arch": "conformer-cb10-tl5"}
+      and use that to reconstruct.
+
+4. Once load works, ensure_onnx_exported will re-run and export successfully.
+
+## Key Files
+  src/chessbot/train_pytorch.py       -- load_pt_model, export_pt_to_onnx, save_pt_model
+  scripts/run_selfplay.py             -- ensure_onnx_exported, prebuild_trt_engine
+  src/chessbot/infer_ort.py           -- make_ort_infer (cache hit/miss logging)
+  src/chessbot/config.py              -- ort_trt_engine_cache_dir auto-fills from TRT_ENGINE_CACHE_DIR env var
+  C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test/config.yaml  -- the run config
+
+## Environment Notes
+- Must use chess_onnx conda env (has torch, onnxruntime-gpu with TRT, tf2onnx)
+- TRT engine cache: C:/Users/Bryan/.cache/xerces_variant_trt (set in .env as TRT_ENGINE_CACHE_DIR)
+- .env is at repo root: C:/Users/Bryan/repos/chessbot/.env
+- python-dotenv is NOT installed in chess_onnx env yet (was missing, caused first error)
+  --> run: pip install python-dotenv  in chess_onnx before anything else

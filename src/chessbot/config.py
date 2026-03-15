@@ -117,11 +117,6 @@ class Config(object):
     inference_backend = "tf_xla"  # "tf_xla" | "ort_trt"
     retrain_backend = "tf"        # "tf" | "pytorch"
 
-    # ORT/TRT inference (only used when inference_backend = "ort_trt")
-    ort_onnx_path = ""
-    ort_trt_engine_cache_dir = ""
-    ort_trt_fp16 = True
-
     # PyTorch retrain (only used when retrain_backend = "pytorch")
     pytorch_model_path = ""
 

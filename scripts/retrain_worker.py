@@ -353,22 +353,16 @@ def main():
     epoch = n_retrains
 
     if cfg.retrain_backend == "pytorch":
-        from chessbot.train_pytorch import (
-            load_pt_model, train_pt_model, save_pt_model, export_pt_to_onnx
-        )
-        model = load_pt_model(cfg.pytorch_model_path)
+        from chessbot.train_pytorch import load_pt_model, train_pt_model, save_pt_model
+        model, arch = load_pt_model(cfg.pytorch_model_path)
         train_pt_model(model, X, M, P, Y_value, vwht, pwht, cfg, args)
-        save_pt_model(model, cfg.pytorch_model_path)
+        save_pt_model(model, cfg.pytorch_model_path, arch)
         print(f"[retrain] pytorch checkpoint saved → {cfg.pytorch_model_path}")
-        if cfg.inference_backend == "ort_trt" and cfg.ort_onnx_path:
-            export_pt_to_onnx(model, cfg.ort_onnx_path)
     else:
         model_paths = cfg.multiplex_models if cfg.multiplex_models else [cfg.model_path]
         for model_path in model_paths:
             label = os.path.basename(model_path) if cfg.multiplex_models else ""
             retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)
-        if cfg.inference_backend == "ort_trt" and cfg.ort_onnx_path:
-            export_tf_to_onnx(cfg.model_path, cfg.ort_onnx_path)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")

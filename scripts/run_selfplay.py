@@ -60,30 +60,6 @@ def make_parent_queues():
     return recent_q, telemetry_q
 
 
-def prebuild_trt_engine(cfg):
-    """
-    Build the TRT engine once in the parent process before workers start.
-    TRT writes a .engine file to the cache dir on first build (~10-15 min).
-    Subsequent loads by each worker just read that file (~20s each).
-    Without this, all N workers would try to compile simultaneously -> OOM.
-    """
-    if cfg.inference_backend.lower() != "ort_trt":
-        return
-    from chessbot.infer_ort import make_ort_infer
-    print("[trt] pre-building TRT engine before spawning workers...")
-    session, fwd = make_ort_infer(
-        cfg.ort_onnx_path,
-        cfg.ort_trt_engine_cache_dir,
-        cfg.ort_trt_fp16,
-        cfg.fwd_batch,
-        cfg.uniform_eps,
-        cfg.prior_clip_max,
-        cfg.vscale,
-    )
-    del session, fwd
-    gc.collect()
-    print("[trt] engine ready — workers will load from cache")
-
 
 def spawn_workers(cfg, recent_q, telemetry_q):
     ctx = mp.get_context()
@@ -309,7 +285,6 @@ def main(run_tag):
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
-    prebuild_trt_engine(base_cfg)
 
     # init the rescorer
     rescorer = Rescorer(base_cfg)

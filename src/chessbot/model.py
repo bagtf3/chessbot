@@ -720,3 +720,237 @@ def build_conformer_64x67(
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
 
     return model, opt, loss_weights, loss_dict
+
+
+# ---------------------------------------------------------------------------
+# PyTorch model builders
+# ---------------------------------------------------------------------------
+
+PT_CONFORMER_INTERWEAVED_CFG = {
+    "d_embed": 256,
+    "conv_filters": 256,
+    "conv_blocks": 10,
+    "num_heads": 8,
+    "dropout": 0.05,
+}
+
+PT_TRANSFORMER_16M_CFG = {
+    "d_embed": 384,
+    "transformer_layers": 8,
+    "num_heads": 8,
+    "ff_dim": 1536,
+    "dropout": 0.05,
+}
+
+
+def build_pt_conformer_interweaved(cfg=None):
+    """Interweaved conformer: cb x [MHA -> Conv -> Conv].
+
+    Graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none.
+    LayerNorm before attention pooling in value head.
+    """
+    if cfg is None:
+        cfg = PT_CONFORMER_INTERWEAVED_CFG
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    VOCAB_SIZE = 21
+    SEQ_LEN    = 64
+
+    de = cfg["d_embed"]
+    cf = cfg["conv_filters"]
+    cb = cfg["conv_blocks"]
+    nh = cfg["num_heads"]
+    dr = cfg["dropout"]
+
+    _POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
+
+    def _make_ln2d(ch):
+        class Ln2d(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.ones(ch))
+                self.b = nn.Parameter(torch.zeros(ch))
+            def forward(self, x):
+                c = x - x.mean(1, keepdim=True)
+                return (c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
+                        * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1))
+        return Ln2d()
+
+    def _pt_attn_pool(x_seq, linear):
+        w = torch.softmax(linear(x_seq), dim=1)
+        return (x_seq * w).sum(dim=1)
+
+    class Block(nn.Module):
+        def __init__(self, pos_scale):
+            super().__init__()
+            self.pos_scale = pos_scale
+            self.ln1   = nn.LayerNorm(cf)
+            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.c1    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.lr1   = nn.LeakyReLU(0.01, True)
+            self.c2    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.ln2   = _make_ln2d(cf)
+
+        def forward(self, x, pos):
+            b = x.shape[0]
+            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+            if self.pos_scale != 0.0:
+                s = s + self.pos_scale * pos
+            r = s
+            n = self.ln1(s)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            s = r + self.drop1(h)
+            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
+            r = x
+            h = self.lr1(self.c1(x))
+            h = self.ln2(self.c2(h))
+            return F.leaky_relu(r + h, 0.01)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb    = nn.Embedding(VOCAB_SIZE, de)
+            self.proj   = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
+            self.lnp    = _make_ln2d(cf) if de != cf else None
+            self.pos    = nn.Embedding(SEQ_LEN, cf)
+            self.blocks = nn.ModuleList(
+                [Block(_POS_SCALES.get(i, 0.0)) for i in range(cb)]
+            )
+            self.mix    = nn.Conv2d(cf, cf, 1, bias=False)
+            self.lnm    = _make_ln2d(cf)
+            self.pol    = nn.Conv2d(cf, 67, 1)
+            self.v_ln   = nn.LayerNorm(cf)
+            self.ap     = nn.Linear(cf, 1)
+            self.vfc1   = nn.Linear(cf, 256)
+            self.vfc2   = nn.Linear(256, 128)
+            self.vout   = nn.Linear(128, 1)
+
+        def forward(self, t):
+            b = t.shape[0]
+            x = self.emb(t).reshape(b, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            if self.proj is not None:
+                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            for block in self.blocks:
+                x = block(x, pos)
+            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
+            pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
+            s = x.permute(0, 2, 3, 1).reshape(b, SEQ_LEN, cf)
+            s = self.v_ln(s)
+            v = _pt_attn_pool(s, self.ap)
+            v = F.relu(self.vfc1(v))
+            v = F.relu(self.vfc2(v))
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_transformer_16m(cfg=None):
+    """Pure transformer with steady pos drip (full at layer 0, 0.1 every layer after, 0.2 before heads).
+    Tapered policy head: 256->192->67.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    VOCAB_SIZE = 21
+    SEQ_LEN    = 64
+
+    if cfg is None:
+        cfg = PT_TRANSFORMER_16M_CFG
+
+    de = cfg["d_embed"]
+    tl = cfg["transformer_layers"]
+    nh = cfg["num_heads"]
+    fd = cfg["ff_dim"]
+    dr = cfg["dropout"]
+
+    def _make_ln2d(ch):
+        class Ln2d(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.ones(ch))
+                self.b = nn.Parameter(torch.zeros(ch))
+            def forward(self, x):
+                c = x - x.mean(1, keepdim=True)
+                return (c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
+                        * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1))
+        return Ln2d()
+
+    def _pt_attn_pool(x_seq, linear):
+        w = torch.softmax(linear(x_seq), dim=1)
+        return (x_seq * w).sum(dim=1)
+
+    class TxLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(de)
+            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.ln2   = nn.LayerNorm(de)
+            self.ff1   = nn.Linear(de, fd)
+            self.drop2 = nn.Dropout(dr)
+            self.ff2   = nn.Linear(fd, de)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop1(h)
+            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb      = nn.Embedding(VOCAB_SIZE, de)
+            self.pos      = nn.Embedding(SEQ_LEN, de)
+            self.txs      = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.pol_mix  = nn.Conv2d(de, 256, 1, bias=False)
+            self.pol_ln0  = _make_ln2d(256)
+            self.pol_c1a  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_c1b  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_ln1  = _make_ln2d(256)
+            self.pol_down = nn.Conv2d(256, 192, 1, bias=False)
+            self.pol_lnd  = _make_ln2d(192)
+            self.pol_c2a  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_c2b  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_ln2  = _make_ln2d(192)
+            self.pol_out  = nn.Conv2d(192, 67, 1)
+            self.ap       = nn.Linear(de, 1)
+            self.vfc1     = nn.Linear(de, 256)
+            self.vfc2     = nn.Linear(256, 128)
+            self.vout     = nn.Linear(128, 1)
+
+        def forward(self, t):
+            B   = t.shape[0]
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            x   = self.emb(t) + pos
+            for i, tx in enumerate(self.txs):
+                if i > 0:
+                    x = x + 0.1 * pos
+                x = tx(x)
+            v = _pt_attn_pool(x, self.ap)
+            v = F.gelu(self.vfc1(v))
+            v = F.gelu(self.vfc2(v))
+            x = x + 0.2 * pos
+            x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
+            x = F.leaky_relu(self.pol_lnd(self.pol_down(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
+            pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+PT_BUILDERS = {
+    "16m-conformer-interweaved": build_pt_conformer_interweaved,
+    "16m-transformer":           build_pt_transformer_16m,
+}

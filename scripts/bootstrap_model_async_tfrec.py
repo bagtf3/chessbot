@@ -33,7 +33,7 @@ import pandas as pd
 
 BATCH_SIZE        = 256
 EPOCH_SIZE        = 10_240
-SHUFFLE_BUFFER    = 64_000
+SHUFFLE_BUFFER    = 256_000
 STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE
 
 EPOCHS_PER_WORKER = 100
@@ -41,7 +41,7 @@ CHECKPOINT_EVERY  = 20    # multiple of PLOT_EVERY so checkpoints always land on
 PLOT_EVERY        = 10
 
 DEFAULT_LR        = 2e-4
-DEFAULT_MAX_EPOCH = 900
+DEFAULT_MAX_EPOCH = 920
 DEFAULT_MODEL     = "16m-frankenformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
@@ -213,7 +213,7 @@ def worker_main(wargs: dict) -> None:
     print(f"{'#' * 72}\n")
     print(f"[worker] loading {load_from}")
 
-    model = keras.models.load_model(load_from)
+    model = keras.models.load_model(load_from, compile=False)
     opt   = tf.keras.optimizers.Adam(learning_rate=lr)
     opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt

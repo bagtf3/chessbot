@@ -1,332 +1,373 @@
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import mixed_precision
+#!/usr/bin/env python3
+"""
+bootstrap_model_async_tfrec.py — OOM-robust bootstrap trainer
 
-mixed_precision.set_global_policy("mixed_float16")
+The supervisor spawns a fresh subprocess for each 100-epoch block.
+On crash / OOM the supervisor rolls back to the last checkpoint
+(saved every 25 epochs) and restarts.  The TFRecord stream is seeded
+per block so that .skip() can fast-forward to the correct position.
 
-gpus = tf.config.list_physical_devices("GPU")
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu, True)
+Usage
+-----
+    python scripts/bootstrap_model_async_tfrec.py [options]
 
-print("compute policy:", mixed_precision.global_policy())
+Options
+-------
+    --model      Model name          (default: 16m-frankenformer-interweaved)
+    --run-tag    Sub-dir under SP_DIR (default: val_test_multi)
+    --run-dir    Explicit run dir (overrides --run-tag)
+    --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
+    --max-epoch  Total epochs to train       (default: 900)
+    --lr         Learning rate               (default: 1e-4)
+"""
+from __future__ import annotations
 
-import gc
+import argparse
+import multiprocessing as mp
 import os
 import queue
+import re
+import sys
 import threading
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from chessbot import SP_DIR, MODEL_DIR
-from chessbot.model import set_loss_weights
-from chessbot.utils import batch_policy_metrics, format_time, print_validation
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants  (no TF — safe for supervisor)
+# ──────────────────────────────────────────────────────────────────────────────
+BATCH_SIZE        = 128
+EPOCH_SIZE        = 10_240
+SHUFFLE_BUFFER    = 64_000
+STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE     # 80
 
+EPOCHS_PER_WORKER = 100   # subprocess handles this many epochs then exits cleanly
+CHECKPOINT_EVERY  = 20    # checkpoint saved when ep % CHECKPOINT_EVERY == 0
+                          # 20 is a multiple of PLOT_EVERY so checkpoints always
+                          # land on eval epochs — no out-of-turn evals needed
+PLOT_EVERY        = 10    # eval + CSV update every N epochs; plot saved at ckpt epochs
 
-TFREC_DIR  = os.getenv("BOOTSTRAP_TFREC_DIR", "")
-RUN_DIR    = os.path.join(SP_DIR, "val_test_multi")
+DEFAULT_LR        = 1e-4
+DEFAULT_MAX_EPOCH = 900
+DEFAULT_MODEL     = "16m-frankenformer-interweaved"
+DEFAULT_RUN_TAG   = "val_test_multi"
 
-batch_size = 128
-epoch_size = 10240
-shuffle_buffer = 64000
-steps_per_epoch = epoch_size // batch_size
-MAX_EPOCH = 900
-PLOT_EVERY = 10
-LR = 1e-4
-MODEL_DEFS = [
-    #"16m-pure-conv", # dead
-    #"16m-film", # solid
-    #"16m-concat-fusion", # dead
-    #"16m-conformer", # dead
-    #"16m-gated-ctx", #solid
-    "16m-frankenformer-interweaved"
-]
-
-LW_SCHEDULE = {
-    0: {"policy_logits": 0.1, "value_out": 0.1},
-    1: {"policy_logits": 0.75, "value_out": 1.5},
-    10: {"policy_logits": 1.5, "value_out": 3.0},
-    160: {"policy_logits": 1.0, "value_out": 2.25},
-    250: {"policy_logits": 0.75, "value_out": 1.5},
+LW_SCHEDULE: dict[int, dict[str, float]] = {
+    0:   {"policy_logits": 0.10, "value_out": 0.10},
+    1:   {"policy_logits": 0.75, "value_out": 1.50},
+    10:  {"policy_logits": 1.25, "value_out": 2.50},
+    160: {"policy_logits": 1.00, "value_out": 2.25},
+    250: {"policy_logits": 0.75, "value_out": 1.50},
     480: {"policy_logits": 0.65, "value_out": 1.25},
-    640: {"policy_logits": 0.5, "value_out": 1.0},
-    700: {"policy_logits": 0.25, "value_out": 0.5}
+    640: {"policy_logits": 0.50, "value_out": 1.00},
+    700: {"policy_logits": 0.25, "value_out": 0.50},
 }
 
-def load_tf_model(path, lr=LR):
-    model = keras.models.load_model(path)
 
-    # print + save summary
-    print("\n" + "=" * 80)
-    print(f"MODEL SUMMARY: {path}")
-    print("=" * 80)
+# ──────────────────────────────────────────────────────────────────────────────
+# Checkpoint / recovery helpers  (no TF)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    # always build a fresh optimizer at the requested LR
-    opt = tf.keras.optimizers.Adam(learning_rate=lr)
-    opt = mixed_precision.LossScaleOptimizer(opt)
+def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
+    return os.path.join(run_dir, f"{name}_ckpt{epoch:04d}.h5")
 
+
+def find_last_checkpoint(run_dir: str, name: str) -> int:
+    """Return epoch number of the newest checkpoint file, or -1 if none."""
+    pat = re.compile(rf"^{re.escape(name)}_ckpt(\d{{4}})\.h5$")
+    best = -1
+    try:
+        for fname in os.listdir(run_dir):
+            m = pat.match(fname)
+            if m:
+                best = max(best, int(m.group(1)))
+    except FileNotFoundError:
+        pass
+    return best
+
+
+def trim_progress_csv(progress_file: str, max_training_epoch: int) -> None:
+    """Drop rows where training_epoch > max_training_epoch, overwrite in-place."""
+    if not os.path.exists(progress_file):
+        return
+    df = pd.read_csv(progress_file)
+    if "training_epoch" not in df.columns:
+        os.remove(progress_file)
+        return
+    df = df[df["training_epoch"] <= max_training_epoch]
+    if df.empty:
+        os.remove(progress_file)
+    else:
+        df.to_csv(progress_file, index=False)
+
+
+def get_resume_epoch(run_dir: str, name: str) -> int:
+    """
+    Determine the epoch to resume from.
+
+    Scans checkpoint files to find the last verified save, trims the
+    eval_progress CSV to match, and returns the next epoch to train.
+    """
+    os.makedirs(run_dir, exist_ok=True)
+    progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
+    last_ckpt = find_last_checkpoint(run_dir, name)
+
+    if last_ckpt < 0:
+        # No checkpoints at all — start from scratch
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+            print(f"[recovery] no checkpoints found; cleared {progress_file}")
+        return 0
+
+    trim_progress_csv(progress_file, last_ckpt)
+    resume = last_ckpt + 1
+    print(f"[recovery] last checkpoint epoch={last_ckpt}  →  resuming from epoch {resume}")
+    return resume
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Background prefetch thread  (TF imported lazily inside run())
+# ──────────────────────────────────────────────────────────────────────────────
+
+class EpochBufferThread(threading.Thread):
+    """Reads STEPS_PER_EPOCH batches from a TF dataset and queues epoch bundles."""
+
+    def __init__(self, dataset, steps_per_epoch: int, max_ready: int = 2):
+        super().__init__(daemon=True)
+        self.dataset         = dataset
+        self.steps_per_epoch = steps_per_epoch
+        self._q              = queue.Queue(maxsize=max_ready)
+        self._stop           = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def get(self):
+        item = self._q.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def run(self) -> None:
+        import tensorflow as tf   # already loaded in the worker process
+        try:
+            it = iter(self.dataset)
+            while not self._stop.is_set():
+                parts: dict[str, list] = {
+                    "enc_in": [], "mask": [], "policy_logits": [],
+                    "value_out": [], "weight": [],
+                }
+                for _ in range(self.steps_per_epoch):
+                    if self._stop.is_set():
+                        return
+                    inp, out, wt = next(it)
+                    parts["enc_in"].append(inp["enc_in"])
+                    parts["mask"].append(inp["mask"])
+                    parts["policy_logits"].append(out["policy_logits"])
+                    parts["value_out"].append(out["value_out"])
+                    parts["weight"].append(wt["policy_logits"])
+                bundle = {k: tf.concat(v, axis=0) for k, v in parts.items()}
+                self._q.put(bundle)
+        except Exception as exc:
+            try:
+                self._q.put(exc, timeout=1.0)
+            except queue.Full:
+                pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Worker  (runs in a spawned subprocess — all TF imports are local)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def worker_main(wargs: dict) -> None:
+    """
+    Train for one block of epochs.  All TF imports are local so the
+    supervisor process never touches the GPU.
+    """
+    import gc
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import mixed_precision
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    mixed_precision.set_global_policy("mixed_float16")
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+    from chessbot import MODEL_DIR
+    from chessbot.model import set_loss_weights
+    from chessbot.utils import batch_policy_metrics, format_time, print_validation
+
+    name        = wargs["name"]
+    run_dir     = wargs["run_dir"]
+    tfrec_dir   = wargs["tfrec_dir"]
+    model_dir   = wargs.get("model_dir", MODEL_DIR)
+    start_epoch = wargs["start_epoch"]
+    end_epoch   = wargs["end_epoch"]
+    lr          = wargs.get("lr", DEFAULT_LR)
+    max_epoch   = wargs["max_epoch"]
+
+    progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
+    plot_file     = os.path.join(run_dir, f"{name}_plot.png")
+
+    # ── Load model ────────────────────────────────────────────────────────────
+    if start_epoch == 0:
+        load_from = os.path.join(model_dir, f"{name}_model.h5")
+    else:
+        last_ckpt = find_last_checkpoint(run_dir, name)
+        if last_ckpt < 0:
+            raise RuntimeError(f"start_epoch={start_epoch} but no checkpoint found in {run_dir}")
+        load_from = ckpt_path(run_dir, name, last_ckpt)
+
+    print(f"\n{'#' * 72}")
+    print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
+    print(f"{'#' * 72}\n")
+    print(f"[worker] loading {load_from}")
+
+    model = keras.models.load_model(load_from)
+    opt   = tf.keras.optimizers.Adam(learning_rate=lr)
+    opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt
     model._default_loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(
-            from_logits=True
-        ),
-        "value_out": tf.keras.losses.MeanSquaredError(),
+        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+        "value_out":     tf.keras.losses.MeanSquaredError(),
+    }
+    set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
+    current_lw: dict | None = None
+
+    # ── Load existing progress CSV ────────────────────────────────────────────
+    eval_df: pd.DataFrame | None = None
+    if os.path.exists(progress_file):
+        existing = pd.read_csv(progress_file)
+        eval_df = existing if not existing.empty else None
+
+    # ── Build deterministic TFRecord stream ───────────────────────────────────
+    feature_spec = {
+        "enc_in":        tf.io.FixedLenFeature([], tf.string),
+        "mask":          tf.io.FixedLenFeature([], tf.string),
+        "policy_logits": tf.io.FixedLenFeature([], tf.string),
+        "value_out":     tf.io.FixedLenFeature([], tf.float32),
+        "weight":        tf.io.FixedLenFeature([], tf.float32),
     }
 
-    return model
+    def parse_record(raw):
+        feat   = tf.io.parse_single_example(raw, feature_spec)
+        enc_in = tf.cast(
+            tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16), tf.int32
+        )
+        mask   = tf.io.parse_tensor(feat["mask"], out_type=tf.int32)
+        policy = tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
+        value  = tf.reshape(feat["value_out"], [1])
+        weight = feat["weight"]
+        return (
+            {"enc_in": enc_in, "mask": mask},
+            {"policy_logits": policy, "value_out": value},
+            {"policy_logits": weight, "value_out": weight},
+        )
 
-
-model_states = []
-for name in MODEL_DEFS:
-    run_model_file  = os.path.join(RUN_DIR,   f"{name}_model.h5")
-    src_model_file  = os.path.join(MODEL_DIR, f"{name}_model.h5")
-    progress_file   = os.path.join(RUN_DIR,   f"{name}_eval_progress.csv")
-
-    print(f"[init] {name}: loading fresh from MODEL_DIR")
-    model_states.append({
-        "name":            name,
-        "load_from":       src_model_file,
-        "model_file":      run_model_file,
-        "progress_file":   progress_file,
-        "model":           None,
-        "eval_df":         None,
-        "metrics_history": {"value_mse": [], "value_corr": []},
-        "current_lw":      None,
-        "epoch":           0,
-    })
-
-
-feature_spec = {
-    "enc_in": tf.io.FixedLenFeature([], tf.string),
-    "mask": tf.io.FixedLenFeature([], tf.string),
-    "policy_logits": tf.io.FixedLenFeature([], tf.string),
-    "value_out": tf.io.FixedLenFeature([], tf.float32),
-    "weight": tf.io.FixedLenFeature([], tf.float32),
-}
-
-
-def list_tfrecord_files(tfrec_dir):
-    files = [
-        os.path.join(tfrec_dir, x)
-        for x in os.listdir(tfrec_dir)
-        if x.endswith(".tfrecord.gz")
-    ]
-    files.sort()
-    return files
-
-
-def parse_record(raw):
-    feat = tf.io.parse_single_example(raw, feature_spec)
-    enc_in = tf.cast(
-        tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16),
-        tf.int32,
+    files = sorted(
+        os.path.join(tfrec_dir, f)
+        for f in os.listdir(tfrec_dir)
+        if f.endswith(".tfrecord.gz")
     )
-    mask = tf.io.parse_tensor(feat["mask"], out_type=tf.int32)
-    policy = tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
-    value = tf.reshape(feat["value_out"], [1])
-    weight = feat["weight"]
-
-    return (
-        {"enc_in": enc_in, "mask": mask},
-        {"policy_logits": policy, "value_out": value},
-        {"policy_logits": weight, "value_out": weight},
-    )
-
-
-def make_batch_stream(tfrec_dir, batch_size, shuffle_buffer):
-    file_list = list_tfrecord_files(tfrec_dir)
-    if not file_list:
+    if not files:
         raise RuntimeError(f"No .tfrecord.gz files in {tfrec_dir}")
 
-    ds = tf.data.Dataset.from_tensor_slices(file_list)
-    ds = ds.shuffle(len(file_list), reshuffle_each_iteration=True)
-    ds = ds.repeat()
+    print(f"[tfrec] files={len(files)}  shuffle_buffer={SHUFFLE_BUFFER}")
 
+    ds = tf.data.Dataset.from_tensor_slices(files)
+    ds = ds.shuffle(len(files), reshuffle_each_iteration=True)
+    ds = ds.repeat()
     ds = ds.interleave(
-        lambda path: tf.data.TFRecordDataset(
-            path,
-            compression_type="GZIP",
-        ),
+        lambda p: tf.data.TFRecordDataset(p, compression_type="GZIP"),
         cycle_length=tf.data.AUTOTUNE,
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=False,
     )
     ds = ds.map(parse_record, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
-    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.shuffle(SHUFFLE_BUFFER, reshuffle_each_iteration=True)
+    ds = ds.batch(BATCH_SIZE, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
 
+    prefetcher = EpochBufferThread(ds, STEPS_PER_EPOCH, max_ready=2)
+    prefetcher.start()
 
-class EpochBufferWorker(threading.Thread):
+    # ── Inner helpers ─────────────────────────────────────────────────────────
+    def moving_average(arr, window: int) -> np.ndarray:
+        s = pd.Series(arr)
+        return s.rolling(window, center=True, min_periods=1).mean().to_numpy()
 
-    def __init__(self, batch_stream, steps_per_epoch, max_ready=2):
-        super().__init__(daemon=True)
-        self.batch_stream = batch_stream
-        self.steps_per_epoch = steps_per_epoch
-        self.ready = queue.Queue(maxsize=max_ready)
-        self.stop_event = threading.Event()
-        self.error = None
+    def fit_epoch(bundle, lw: dict):
+        x = {"enc_in": bundle["enc_in"]}
+        if "mask" in model.input_names:
+            x["mask"] = bundle["mask"]
+        y = {
+            "policy_logits": bundle["policy_logits"],
+            "value_out":     bundle["value_out"],
+        }
+        sw = {
+            "policy_logits": tf.ones_like(bundle["weight"]) * lw["policy_logits"],
+            "value_out":     bundle["weight"] * lw["value_out"],
+        }
+        return model.fit(
+            x=x, y=y, sample_weight=sw,
+            batch_size=BATCH_SIZE, epochs=1, verbose=0, shuffle=False,
+        )
 
-    def stop(self):
-        self.stop_event.set()
+    def do_eval(bundle, ep: int) -> tuple[pd.DataFrame | None, dict | None]:
+        """Run model.predict, append row to eval_df, save CSV. Returns updated
+        eval_df and scatter data dict for optional plot use."""
+        nonlocal eval_df
+        x = {"enc_in": bundle["enc_in"]}
+        if "mask" in model.input_names:
+            x["mask"] = bundle["mask"]
 
-    def get(self):
-        item = self.ready.get()
-        if isinstance(item, Exception):
-            raise item
-        return item
+        preds      = model.predict(x, verbose=0, batch_size=64)
+        pol_preds  = preds[0]
+        val_preds  = preds[1].ravel()
+        pstack     = bundle["policy_logits"].numpy()
+        ystack     = bundle["value_out"].numpy().ravel()
+        mstack     = bundle["mask"].numpy()
 
-    def run(self):
-        try:
-            it = iter(self.batch_stream)
+        pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
+        value_mse  = float(np.mean((val_preds - ystack) ** 2))
+        value_corr = float(np.corrcoef(val_preds, ystack)[0, 1])
 
-            while not self.stop_event.is_set():
-                x_parts = []
-                m_parts = []
-                p_parts = []
-                y_parts = []
-                w_parts = []
+        row = {"training_epoch": ep, "value_mse": value_mse, "value_corr": value_corr}
+        row.update(pol_stats)
 
-                for _ in range(self.steps_per_epoch):
-                    if self.stop_event.is_set():
-                        return
+        new_row = pd.DataFrame([row])
+        eval_df = (
+            new_row if eval_df is None
+            else pd.concat([eval_df, new_row], ignore_index=True)
+        )
+        eval_df.round(4).to_csv(progress_file, index=False)
 
-                    inp, out, wt = next(it)
-                    x_parts.append(inp["enc_in"])
-                    m_parts.append(inp["mask"])
-                    p_parts.append(out["policy_logits"])
-                    y_parts.append(out["value_out"])
-                    w_parts.append(wt["policy_logits"])
+        print_metrics = {"value_mse": value_mse, "value_corr": value_corr, **pol_stats}
+        print_validation(ep, print_metrics)
 
-                bundle = {
-                    "enc_in": tf.concat(x_parts, axis=0),
-                    "mask": tf.concat(m_parts, axis=0),
-                    "policy_logits": tf.concat(p_parts, axis=0),
-                    "value_out": tf.concat(y_parts, axis=0),
-                    "weight": tf.concat(w_parts, axis=0),
-                }
+        return eval_df, {"ystack": ystack, "val_preds": val_preds}
 
-                self.ready.put(bundle)
+    def save_plot(ep: int, scatter: dict | None) -> None:
+        """Overwrite the single plot file; no-op if too few eval rows."""
+        if eval_df is None or len(eval_df) < 2:
+            return
+        n     = len(eval_df)
+        hide  = max(int(0.1 * n), 5)
+        win   = min(max(3, int(n * 0.2)), 15)
+        if win % 2 == 0:
+            win += 1
+        xs      = np.arange(n)
+        xs_show = xs[hide:]
+        if len(xs_show) < 2:
+            return
 
-        except Exception as exc:
-            self.error = exc
-            try:
-                self.ready.put(exc, timeout=1.0)
-            except queue.Full:
-                pass
-
-
-def build_model_inputs(model, bundle):
-    inputs = {}
-
-    for name in model.input_names:
-        if name == "enc_in":
-            inputs["enc_in"] = bundle["enc_in"]
-        elif name == "mask":
-            inputs["mask"] = bundle["mask"]
-
-    return inputs
-
-
-def fit_epoch(model, bundle, batch_size, lw):
-    x = {"enc_in": bundle["enc_in"]}
-    if "mask" in model.input_names and "mask" in bundle:
-        x["mask"] = bundle["mask"]
-
-    y = {
-        "policy_logits": bundle["policy_logits"],
-        "value_out": bundle["value_out"],
-    }
-
-    sample_weight = {
-        "policy_logits": tf.ones_like(bundle["weight"]) * lw["policy_logits"],
-        "value_out": bundle["weight"] * lw["value_out"],
-    }
-
-    return model.fit(
-        x=x,
-        y=y,
-        sample_weight=sample_weight,
-        batch_size=batch_size,
-        epochs=1,
-        verbose=0,
-        shuffle=False,
-    )
-
-def moving_average_pd(arr, window=15):
-    s = pd.Series(arr)
-    return s.rolling(window, center=True, min_periods=1).mean().values
-
-
-def do_eval(ms, bundle, batch_size):
-    name = ms["name"]
-    model = ms["model"]
-    epoch = ms["epoch"]
-
-    preds = model.predict(
-        build_model_inputs(model, bundle),
-        verbose=0,
-        batch_size=64,
-    )
-
-    policy_logits = preds[0]
-    value_preds = preds[1].ravel()
-
-    pstack = bundle["policy_logits"].numpy()
-    ystack = bundle["value_out"].numpy().ravel()
-    mstack = bundle["mask"].numpy()
-
-    policy_stats = batch_policy_metrics(policy_logits, pstack, mstack)
-    value_mse = np.mean((value_preds - ystack) ** 2)
-    value_corr = np.corrcoef(value_preds, ystack)[0, 1]
-
-    mh = ms["metrics_history"]
-    for k, v in policy_stats.items():
-        if k not in mh:
-            mh[k] = []
-        mh[k].append(v)
-
-    mh["value_mse"].append(value_mse)
-    mh["value_corr"].append(value_corr)
-
-    latest_row = pd.DataFrame(mh).iloc[[-1], :]
-    n_samples = bundle["enc_in"].shape[0]
-    if epoch > 0:
-        n_samples *= PLOT_EVERY
-    latest_row["n_samples"] = n_samples
-
-    eval_df = ms["eval_df"]
-    if eval_df is None:
-        latest_row["model_epoch"] = 0
-        eval_df = latest_row.copy()
-    else:
-        latest_row["model_epoch"] = eval_df.tail(1)["model_epoch"].item() + 1
-        latest_row = latest_row.reindex(columns=eval_df.columns)
-        eval_df = pd.concat([eval_df, latest_row])
-
-    eval_df.round(4).to_csv(ms["progress_file"], index=False)
-    ms["eval_df"] = eval_df
-
-    print(f"[eval] {name}")
-    print_metrics = {"value_mse": value_mse, "value_corr": value_corr}
-    print_metrics.update(policy_stats)
-    print_validation(epoch, print_metrics)
-
-    retrains = eval_df.tail(1)["model_epoch"].item()
-    hide_first = max(int(0.1 * retrains), 5)
-    ma_window = min(max(3, int(retrains * 0.2)), 15)
-    if ma_window % 2 == 0:
-        ma_window += 1
-
-    x = np.arange(len(eval_df["policy_ce"]))
-    xs = x[hide_first:]
-
-    if len(xs) > hide_first:
+        run_tag = os.path.basename(run_dir)
         fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        fig.suptitle(f"{name}  —  epoch {epoch}")
+        fig.suptitle(f"{name}  [{run_tag}]  —  epoch {ep}")
 
         for ax, key, title in [
             (axes[0, 0], "policy_ce",  "policy CE (nats)"),
@@ -335,176 +376,194 @@ def do_eval(ms, bundle, batch_size):
             (axes[1, 0], "value_corr", "value corr"),
             (axes[1, 1], "top1_exact", "top1 exact"),
         ]:
-            raw = np.array(eval_df[key])[hide_first:]
-            ma  = moving_average_pd(eval_df[key], window=ma_window)[hide_first:]
-            if raw.size:
-                ax.plot(xs, raw, alpha=0.6, lw=1, label=key)
-            if ma.size:
-                ax.plot(xs, ma, lw=2, label=f"MA{ma_window}")
+            if key not in eval_df.columns:
+                continue
+            raw = eval_df[key].to_numpy()[hide:]
+            ma  = moving_average(eval_df[key].to_numpy(), window=win)[hide:]
+            ax.plot(xs_show, raw, alpha=0.6, lw=1, label=key)
+            ax.plot(xs_show, ma,  lw=2,      label=f"MA{win}")
             ax.set_title(title)
             ax.legend()
 
-        # value scatter
         ax_sc = axes[1, 2]
-        ax_sc.scatter(ystack, value_preds, s=2, alpha=0.3)
-        lims = [
-            min(ystack.min(), value_preds.min()), max(ystack.max(), value_preds.max())
-        ]
-        
-        ax_sc.plot(lims, lims, "r--", lw=1)
-        ax_sc.set_xlabel("target")
-        ax_sc.set_ylabel("pred")
-        ax_sc.set_title(f"value scatter  (r={value_corr:.3f})")
+        if scatter is not None:
+            ys, vp = scatter["ystack"], scatter["val_preds"]
+            corr   = float(np.corrcoef(vp, ys)[0, 1])
+            ax_sc.scatter(ys, vp, s=2, alpha=0.3)
+            lims = [min(ys.min(), vp.min()), max(ys.max(), vp.max())]
+            ax_sc.plot(lims, lims, "r--", lw=1)
+            ax_sc.set_xlabel("target")
+            ax_sc.set_ylabel("pred")
+            ax_sc.set_title(f"value scatter  (r={corr:.3f})")
 
         fig.tight_layout()
-        plt.show()
+        fig.savefig(plot_file, dpi=100)
         plt.close(fig)
         plt.close("all")
+        print(f"[plot] saved → {plot_file}")
 
+    # ── Training loop ─────────────────────────────────────────────────────────
+    begin          = time.time()
+    epoch_times: list[float] = []
+    t_fetch = t_fit = t_eval = 0.0
+    total_samples  = 0
+    window_samples = 0
+    last_scatter: dict | None = None
 
-n_files = len(list_tfrecord_files(TFREC_DIR))
-print(
-    f"[tfrec] files={n_files}  shuffle_buffer={shuffle_buffer}  "
-    f"epoch_size={epoch_size}  steps_per_epoch={steps_per_epoch}  "
-    f"batch_size={batch_size}"
-)
+    for ep in range(start_epoch, end_epoch):
+        target_lw = LW_SCHEDULE[max(k for k in LW_SCHEDULE if k <= ep)]
+        if target_lw is not current_lw:
+            current_lw = target_lw
+            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
+            print(f"[lw update] epoch {ep}: {lw_str}")
 
-try:
-    for ms in model_states:
-        name = ms["name"]
+        epoch_start = time.time()
 
-        print(f"\n{'#' * 72}")
-        print(f"  Training: {name}  ".center(72, "#"))
-        print(f"{'#' * 72}\n")
+        # fetch
+        t0 = time.time()
+        bundle = prefetcher.get()
+        t_fetch += time.time() - t0
 
-        ms["model"] = load_tf_model(ms["load_from"])
-        ms["current_lw"] = None
-        ms["metrics_history"] = {"value_mse": [], "value_corr": []}
-        ms["epoch"] = 0
+        print("-" * 89)
 
-        # compile once with unit loss weights — LW schedule via sample_weight scaling
-        set_loss_weights(
-            ms["model"],
-            {"policy_logits": 1.0, "value_out": 1.0},
-            jit=False,
+        # train
+        t0   = time.time()
+        hist = fit_epoch(bundle, target_lw)
+        t_fit += time.time() - t0
+
+        n_this          = int(bundle["enc_in"].shape[0])
+        total_samples  += n_this
+        window_samples += n_this
+
+        h = hist.history
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"policy_loss: {h.get('policy_logits_loss', [float('nan')])[0]:.4f}  "
+            f"value_loss: {h.get('value_out_loss', [float('nan')])[0]:.4f}  "
+            f"total: {h.get('loss', [float('nan')])[0]:.4f}  "
+            f"samples: {total_samples:,}"
         )
 
-        batch_stream = make_batch_stream(
-            TFREC_DIR,
-            batch_size,
-            shuffle_buffer,
+        # eval + CSV update every PLOT_EVERY epochs
+        if ep % PLOT_EVERY == 0:
+            t0 = time.time()
+            eval_df, last_scatter = do_eval(bundle, ep)
+            t_eval += time.time() - t0
+
+        # checkpoint every CHECKPOINT_EVERY epochs (always an eval epoch since
+        # CHECKPOINT_EVERY is a multiple of PLOT_EVERY) and at the final epoch
+        is_ckpt = ep % CHECKPOINT_EVERY == 0
+        if is_ckpt or ep == max_epoch - 1:
+            cp = ckpt_path(run_dir, name, ep)
+            model.save(cp)
+            print(f"[ckpt] epoch {ep} → {cp}")
+            save_plot(ep, last_scatter)
+
+        # timing
+        elapsed = time.time() - epoch_start
+        epoch_times.append(elapsed)
+        print(
+            f"[time check] last: {format_time(elapsed)}  "
+            f"avg: {format_time(float(np.mean(epoch_times)))}  "
+            f"total: {format_time(time.time() - begin)}"
         )
-        worker = EpochBufferWorker(batch_stream, steps_per_epoch, max_ready=2)
-        worker.start()
 
-        epoch = 0
-        epoch_time_list = []
-        begin = time.time()
-
-        t_fetch = 0.0
-        t_eval = 0.0
-        t_fit = 0.0
-        total_samples  = 0
-        window_samples = 0
-
-        while epoch <= MAX_EPOCH:
-            ep = ms["epoch"]
-            do_plot = (ep % PLOT_EVERY == 0)
-            epoch_start = time.time()
-
-            target_lw = LW_SCHEDULE[max([k for k in LW_SCHEDULE if k <= ep])]
-            if target_lw is not ms["current_lw"]:
-                ms["current_lw"] = target_lw
-                lw_str = "  ".join([f"{k}={v}" for k, v in target_lw.items()])
-                print(f"[lw update  ] {name} epoch {ep}: {lw_str}")
-
-            t0 = time.time()
-            bundle = worker.get()
-            t_fetch += time.time() - t0
-
-            if do_plot:
-                t0 = time.time()
-                do_eval(ms, bundle, batch_size)
-                t_eval += time.time() - t0
-
-            print("-" * 89)
-            t0 = time.time()
-            hist = fit_epoch(ms["model"], bundle, batch_size, target_lw)
-            t_fit += time.time() - t0
-
-            n_this = bundle["enc_in"].shape[0]
-            total_samples  += n_this
-            window_samples += n_this
-
-            h = hist.history
-            p_loss = h.get("policy_logits_loss", [float("nan")])[0]
-            v_loss = h.get("value_out_loss", [float("nan")])[0]
-            t_loss = h.get("loss", [float("nan")])[0]
-
+        if ep % PLOT_EVERY == 0 and ep > start_epoch:
             print(
-                f"[epoch {ep:4d}] [{name}] "
-                f"policy_loss: {p_loss:.4f}  "
-                f"value_loss: {v_loss:.4f}  "
-                f"total: {t_loss:.4f}  "
-                f"samples: {total_samples:,}"
+                f"[timing/{PLOT_EVERY}ep] fetch: {t_fetch:.2f}s  "
+                f"fit: {t_fit:.2f}s  eval: {t_eval:.2f}s  "
+                f"samples_window: {window_samples:,}  "
+                f"samples_total: {total_samples:,}"
             )
+            t_fetch = t_fit = t_eval = 0.0
+            window_samples = 0
 
-            ms["epoch"] += 1
-            epoch += 1
+        print()
 
-            if ep > 0 and ep % 25 == 0:
-                ms["model"].save(ms["model_file"])
-                print(f"[save] {name} → {ms['model_file']}")
+    prefetcher.stop()
+    gc.collect()
+    print(f"[worker] {name}: block complete (epochs {start_epoch}..{end_epoch - 1})")
 
-            if ep > 0 and ep % 50 == 0:
-                del ms["model"]
-                ms["model"] = None
-                tf.keras.backend.clear_session()
-                gc.collect()
-                print(f"[reload] {name} session cleared at epoch {ep}, reloading...")
-                ms["model"] = load_tf_model(ms["model_file"])
-                set_loss_weights(
-                    ms["model"],
-                    {"policy_logits": 1.0, "value_out": 1.0},
-                    jit=False,
-                )
-                ms["current_lw"] = None  # force LW schedule re-apply next iter
-                print(f"[reload] {name} ready, resuming from epoch {ep + 1}")
 
-            epoch_time = time.time() - epoch_start
-            epoch_time_list.append(epoch_time)
+# ──────────────────────────────────────────────────────────────────────────────
+# Supervisor
+# ──────────────────────────────────────────────────────────────────────────────
 
-            print("-" * 89)
-            print(
-                f"[time check] last: {format_time(epoch_time)}  "
-                f"avg: {format_time(np.mean(epoch_time_list))}  "
-                f"total: {format_time(time.time() - begin)}"
-            )
+def spawn_block(wargs: dict) -> int:
+    """Spawn one block as a subprocess; return its exit code."""
+    ctx = mp.get_context("spawn")
+    p   = ctx.Process(target=worker_main, args=(wargs,), daemon=False)
+    p.start()
+    p.join()
+    return p.exitcode if p.exitcode is not None else -1
 
-            if do_plot and epoch > 0:
-                n = PLOT_EVERY
-                print(
-                    f"[timing/{n}ep] fetch: {t_fetch:.2f}s  "
-                    f"fit: {t_fit:.2f}s  "
-                    f"eval: {t_eval:.2f}s  "
-                    f"samples_window: {window_samples:,}  "
-                    f"samples_total: {total_samples:,}"
-                )
-                t_fetch = 0.0
-                t_eval = 0.0
-                t_fit = 0.0
-                window_samples = 0
 
-            print()
+def main() -> None:
+    from chessbot import SP_DIR, MODEL_DIR
 
-        worker.stop()
-        ms["model"].save(ms["model_file"])
-        print(f"[save] final {name} → {ms['model_file']}")
+    parser = argparse.ArgumentParser(
+        description="OOM-robust bootstrap trainer for Xerces",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--model",     default=DEFAULT_MODEL,     help="model name")
+    parser.add_argument("--run-tag",   default=DEFAULT_RUN_TAG,   help="run tag under SP_DIR")
+    parser.add_argument("--run-dir",   default=None,              help="explicit run dir (overrides --run-tag)")
+    parser.add_argument(
+        "--tfrec-dir",
+        default=os.getenv("BOOTSTRAP_TFREC_DIR", ""),
+        help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
+    )
+    parser.add_argument("--max-epoch", type=int,   default=DEFAULT_MAX_EPOCH)
+    parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
+    args = parser.parse_args()
 
-        del ms["model"]
-        ms["model"] = None
-        tf.keras.backend.clear_session()
-        gc.collect()
+    if not args.tfrec_dir:
+        parser.error("--tfrec-dir is required (or set $BOOTSTRAP_TFREC_DIR)")
 
-except KeyboardInterrupt:
-    print("\n[bootstrap] KeyboardInterrupt")
+    run_dir = args.run_dir or os.path.join(SP_DIR, args.run_tag)
+    os.makedirs(run_dir, exist_ok=True)
+
+    name = args.model
+    print(f"[supervisor] model={name}")
+    print(f"[supervisor] run_dir={run_dir}")
+    print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
+    print(f"[supervisor] max_epoch={args.max_epoch}  lr={args.lr}")
+
+    resume = get_resume_epoch(run_dir, name)
+
+    while resume < args.max_epoch:
+        block_start = (resume // EPOCHS_PER_WORKER) * EPOCHS_PER_WORKER
+        end_epoch   = min(block_start + EPOCHS_PER_WORKER, args.max_epoch)
+
+        print(
+            f"\n[supervisor] ── block {block_start // EPOCHS_PER_WORKER} ──  "
+            f"epochs {resume}..{end_epoch - 1}  (block_start={block_start})"
+        )
+
+        wargs = {
+            "name":        name,
+            "run_dir":     run_dir,
+            "tfrec_dir":   args.tfrec_dir,
+            "model_dir":   MODEL_DIR,
+            "start_epoch": resume,
+            "end_epoch":   end_epoch,
+            "lr":          args.lr,
+            "max_epoch":   args.max_epoch,
+        }
+
+        exit_code = spawn_block(wargs)
+
+        if exit_code == 0:
+            resume = end_epoch
+            print(f"[supervisor] block complete  →  resume={resume}")
+        else:
+            print(f"[supervisor] worker crashed (exit={exit_code}), recovering …")
+            time.sleep(5)
+            resume = get_resume_epoch(run_dir, name)
+            print(f"[supervisor] will retry from epoch {resume}")
+
+    print(f"\n[supervisor] Training complete! ({args.max_epoch} epochs)")
+
+
+if __name__ == "__main__":
+    main()

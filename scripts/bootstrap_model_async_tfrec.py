@@ -37,7 +37,7 @@ import pandas as pd
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants  (no TF — safe for supervisor)
 # ──────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE        = 128
+BATCH_SIZE        = 256
 EPOCH_SIZE        = 10_240
 SHUFFLE_BUFFER    = 64_000
 STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE     # 80
@@ -48,7 +48,7 @@ CHECKPOINT_EVERY  = 20    # checkpoint saved when ep % CHECKPOINT_EVERY == 0
                           # land on eval epochs — no out-of-turn evals needed
 PLOT_EVERY        = 10    # eval + CSV update every N epochs; plot saved at ckpt epochs
 
-DEFAULT_LR        = 1e-4
+DEFAULT_LR        = 2e-4
 DEFAULT_MAX_EPOCH = 900
 DEFAULT_MODEL     = "16m-frankenformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"

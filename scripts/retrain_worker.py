@@ -242,6 +242,18 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     model._default_opt = opt
     model._default_loss_dict = loss_dict
 
+    model_stem = os.path.splitext(os.path.basename(model_path))[0]
+    train_ckpts_dir = os.path.join(cfg.run_dir, "train_ckpts", model_stem)
+    os.makedirs(train_ckpts_dir, exist_ok=True)
+    epoch_var = tf.Variable(epoch, trainable=False, dtype=tf.int64)
+    tf_ckpt   = tf.train.Checkpoint(model=model, optimizer=opt, epoch=epoch_var)
+    manager   = tf.train.CheckpointManager(tf_ckpt, train_ckpts_dir, max_to_keep=2)
+    if manager.latest_checkpoint:
+        tf_ckpt.restore(manager.latest_checkpoint)
+        print(f"{tag} restored optimizer state from {manager.latest_checkpoint}")
+    else:
+        print(f"{tag} no prior optimizer checkpoint — starting fresh")
+
     if not args.skip_plots:
         if os.path.exists(cfg.progress_csv_path):
             all_evals = pd.read_csv(cfg.progress_csv_path)
@@ -274,7 +286,9 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
             print(f"{tag} failed to backup existing model:", e)
 
     model.save(model_path)
-    print(f"{tag} retraining complete for epoch {epoch}")
+    epoch_var.assign(epoch)
+    manager.save()
+    print(f"{tag} retraining complete for epoch {epoch}  optimizer → {manager.latest_checkpoint}")
 
     del model
     tf.keras.backend.clear_session()

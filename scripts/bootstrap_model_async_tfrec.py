@@ -4,21 +4,18 @@ bootstrap_model_async_tfrec.py — OOM-robust bootstrap trainer
 
 The supervisor spawns a fresh subprocess for each 100-epoch block.
 On crash / OOM the supervisor rolls back to the last checkpoint
-(saved every 25 epochs) and restarts.  The TFRecord stream is seeded
-per block so that .skip() can fast-forward to the correct position.
+(saved every 20 epochs) and restarts with a fresh random data stream.
 
-Usage
------
+Usage:
     python scripts/bootstrap_model_async_tfrec.py [options]
 
-Options
--------
+Options:
     --model      Model name          (default: 16m-frankenformer-interweaved)
     --run-tag    Sub-dir under SP_DIR (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
     --max-epoch  Total epochs to train       (default: 900)
-    --lr         Learning rate               (default: 1e-4)
+    --lr         Learning rate               (default: 2e-4)
 """
 from __future__ import annotations
 
@@ -34,19 +31,14 @@ import time
 import numpy as np
 import pandas as pd
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants  (no TF — safe for supervisor)
-# ──────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE        = 256
 EPOCH_SIZE        = 10_240
 SHUFFLE_BUFFER    = 64_000
-STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE     # 80
+STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE
 
-EPOCHS_PER_WORKER = 100   # subprocess handles this many epochs then exits cleanly
-CHECKPOINT_EVERY  = 20    # checkpoint saved when ep % CHECKPOINT_EVERY == 0
-                          # 20 is a multiple of PLOT_EVERY so checkpoints always
-                          # land on eval epochs — no out-of-turn evals needed
-PLOT_EVERY        = 10    # eval + CSV update every N epochs; plot saved at ckpt epochs
+EPOCHS_PER_WORKER = 100
+CHECKPOINT_EVERY  = 20    # multiple of PLOT_EVERY so checkpoints always land on eval epochs
+PLOT_EVERY        = 10
 
 DEFAULT_LR        = 2e-4
 DEFAULT_MAX_EPOCH = 900
@@ -65,12 +57,22 @@ LW_SCHEDULE: dict[int, dict[str, float]] = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Checkpoint / recovery helpers  (no TF)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
     return os.path.join(run_dir, f"{name}_ckpt{epoch:04d}.h5")
+
+
+def delete_old_checkpoints(run_dir: str, name: str, keep_epoch: int) -> None:
+    """Delete all checkpoint files except the one at keep_epoch."""
+    pat = re.compile(rf"^{re.escape(name)}_ckpt(\d{{4}})\.h5$")
+    try:
+        for fname in os.listdir(run_dir):
+            m = pat.match(fname)
+            if m and int(m.group(1)) != keep_epoch:
+                path = os.path.join(run_dir, fname)
+                os.remove(path)
+                print(f"[ckpt] removed old checkpoint {fname}")
+    except FileNotFoundError:
+        pass
 
 
 def find_last_checkpoint(run_dir: str, name: str) -> int:
@@ -103,18 +105,12 @@ def trim_progress_csv(progress_file: str, max_training_epoch: int) -> None:
 
 
 def get_resume_epoch(run_dir: str, name: str) -> int:
-    """
-    Determine the epoch to resume from.
-
-    Scans checkpoint files to find the last verified save, trims the
-    eval_progress CSV to match, and returns the next epoch to train.
-    """
+    """Scan checkpoint files, trim the eval CSV to match, return next epoch to train."""
     os.makedirs(run_dir, exist_ok=True)
     progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
     last_ckpt = find_last_checkpoint(run_dir, name)
 
     if last_ckpt < 0:
-        # No checkpoints at all — start from scratch
         if os.path.exists(progress_file):
             os.remove(progress_file)
             print(f"[recovery] no checkpoints found; cleared {progress_file}")
@@ -126,12 +122,8 @@ def get_resume_epoch(run_dir: str, name: str) -> int:
     return resume
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Background prefetch thread  (TF imported lazily inside run())
-# ──────────────────────────────────────────────────────────────────────────────
-
 class EpochBufferThread(threading.Thread):
-    """Reads STEPS_PER_EPOCH batches from a TF dataset and queues epoch bundles."""
+    """Prefetches epoch bundles from a TF dataset in a background thread."""
 
     def __init__(self, dataset, steps_per_epoch: int, max_ready: int = 2):
         super().__init__(daemon=True)
@@ -150,7 +142,7 @@ class EpochBufferThread(threading.Thread):
         return item
 
     def run(self) -> None:
-        import tensorflow as tf   # already loaded in the worker process
+        import tensorflow as tf
         try:
             it = iter(self.dataset)
             while not self._stop.is_set():
@@ -176,15 +168,9 @@ class EpochBufferThread(threading.Thread):
                 pass
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Worker  (runs in a spawned subprocess — all TF imports are local)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def worker_main(wargs: dict) -> None:
-    """
-    Train for one block of epochs.  All TF imports are local so the
-    supervisor process never touches the GPU.
-    """
+    """Train for one block of epochs. All TF imports are local so the
+    supervisor process never touches the GPU."""
     import gc
     import tensorflow as tf
     from tensorflow import keras
@@ -213,7 +199,7 @@ def worker_main(wargs: dict) -> None:
     progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
     plot_file     = os.path.join(run_dir, f"{name}_plot.png")
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    # load model
     if start_epoch == 0:
         load_from = os.path.join(model_dir, f"{name}_model.h5")
     else:
@@ -238,13 +224,25 @@ def worker_main(wargs: dict) -> None:
     set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
     current_lw: dict | None = None
 
-    # ── Load existing progress CSV ────────────────────────────────────────────
+    # tf.train.Checkpoint for optimizer state persistence across block restarts
+    train_ckpts_dir = os.path.join(run_dir, "train_ckpts")
+    os.makedirs(train_ckpts_dir, exist_ok=True)
+    epoch_var = tf.Variable(start_epoch, trainable=False, dtype=tf.int64)
+    tf_ckpt   = tf.train.Checkpoint(model=model, optimizer=opt, epoch=epoch_var)
+    manager   = tf.train.CheckpointManager(tf_ckpt, train_ckpts_dir, max_to_keep=2)
+    if manager.latest_checkpoint:
+        tf_ckpt.restore(manager.latest_checkpoint)
+        print(f"[train_ckpt] restored optimizer state from {manager.latest_checkpoint}")
+    else:
+        print("[train_ckpt] no prior optimizer checkpoint — starting fresh")
+
+    # load existing progress CSV
     eval_df: pd.DataFrame | None = None
     if os.path.exists(progress_file):
         existing = pd.read_csv(progress_file)
         eval_df = existing if not existing.empty else None
 
-    # ── Build deterministic TFRecord stream ───────────────────────────────────
+    # build dataset
     feature_spec = {
         "enc_in":        tf.io.FixedLenFeature([], tf.string),
         "mask":          tf.io.FixedLenFeature([], tf.string),
@@ -295,7 +293,6 @@ def worker_main(wargs: dict) -> None:
     prefetcher = EpochBufferThread(ds, STEPS_PER_EPOCH, max_ready=2)
     prefetcher.start()
 
-    # ── Inner helpers ─────────────────────────────────────────────────────────
     def moving_average(arr, window: int) -> np.ndarray:
         s = pd.Series(arr)
         return s.rolling(window, center=True, min_periods=1).mean().to_numpy()
@@ -318,8 +315,6 @@ def worker_main(wargs: dict) -> None:
         )
 
     def do_eval(bundle, ep: int) -> tuple[pd.DataFrame | None, dict | None]:
-        """Run model.predict, append row to eval_df, save CSV. Returns updated
-        eval_df and scatter data dict for optional plot use."""
         nonlocal eval_df
         x = {"enc_in": bundle["enc_in"]}
         if "mask" in model.input_names:
@@ -352,7 +347,6 @@ def worker_main(wargs: dict) -> None:
         return eval_df, {"ystack": ystack, "val_preds": val_preds}
 
     def save_plot(ep: int, scatter: dict | None) -> None:
-        """Overwrite the single plot file; no-op if too few eval rows."""
         if eval_df is None or len(eval_df) < 2:
             return
         n     = len(eval_df)
@@ -402,7 +396,7 @@ def worker_main(wargs: dict) -> None:
         plt.close("all")
         print(f"[plot] saved → {plot_file}")
 
-    # ── Training loop ─────────────────────────────────────────────────────────
+    # training loop
     begin          = time.time()
     epoch_times: list[float] = []
     t_fetch = t_fit = t_eval = 0.0
@@ -419,14 +413,12 @@ def worker_main(wargs: dict) -> None:
 
         epoch_start = time.time()
 
-        # fetch
         t0 = time.time()
         bundle = prefetcher.get()
         t_fetch += time.time() - t0
 
         print("-" * 89)
 
-        # train
         t0   = time.time()
         hist = fit_epoch(bundle, target_lw)
         t_fit += time.time() - t0
@@ -444,22 +436,22 @@ def worker_main(wargs: dict) -> None:
             f"samples: {total_samples:,}"
         )
 
-        # eval + CSV update every PLOT_EVERY epochs
         if ep % PLOT_EVERY == 0:
             t0 = time.time()
             eval_df, last_scatter = do_eval(bundle, ep)
             t_eval += time.time() - t0
 
-        # checkpoint every CHECKPOINT_EVERY epochs (always an eval epoch since
-        # CHECKPOINT_EVERY is a multiple of PLOT_EVERY) and at the final epoch
         is_ckpt = ep % CHECKPOINT_EVERY == 0
-        if is_ckpt or ep == max_epoch - 1:
+        if is_ckpt or ep == end_epoch - 1 or ep == max_epoch - 1:
             cp = ckpt_path(run_dir, name, ep)
             model.save(cp)
             print(f"[ckpt] epoch {ep} → {cp}")
+            delete_old_checkpoints(run_dir, name, keep_epoch=ep)
+            epoch_var.assign(ep)
+            manager.save()
+            print(f"[train_ckpt] optimizer state → {manager.latest_checkpoint}")
             save_plot(ep, last_scatter)
 
-        # timing
         elapsed = time.time() - epoch_start
         epoch_times.append(elapsed)
         print(
@@ -485,10 +477,6 @@ def worker_main(wargs: dict) -> None:
     print(f"[worker] {name}: block complete (epochs {start_epoch}..{end_epoch - 1})")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Supervisor
-# ──────────────────────────────────────────────────────────────────────────────
-
 def spawn_block(wargs: dict) -> int:
     """Spawn one block as a subprocess; return its exit code."""
     ctx = mp.get_context("spawn")
@@ -499,6 +487,9 @@ def spawn_block(wargs: dict) -> int:
 
 
 def main() -> None:
+    from dotenv import load_dotenv
+    load_dotenv()
+
     from chessbot import SP_DIR, MODEL_DIR
 
     parser = argparse.ArgumentParser(
@@ -535,10 +526,7 @@ def main() -> None:
         block_start = (resume // EPOCHS_PER_WORKER) * EPOCHS_PER_WORKER
         end_epoch   = min(block_start + EPOCHS_PER_WORKER, args.max_epoch)
 
-        print(
-            f"\n[supervisor] ── block {block_start // EPOCHS_PER_WORKER} ──  "
-            f"epochs {resume}..{end_epoch - 1}  (block_start={block_start})"
-        )
+        print(f"\n[supervisor] block {block_start // EPOCHS_PER_WORKER}  epochs {resume}..{end_epoch - 1}")
 
         wargs = {
             "name":        name,
@@ -557,12 +545,12 @@ def main() -> None:
             resume = end_epoch
             print(f"[supervisor] block complete  →  resume={resume}")
         else:
-            print(f"[supervisor] worker crashed (exit={exit_code}), recovering …")
+            print(f"[supervisor] worker crashed (exit={exit_code}), recovering ...")
             time.sleep(5)
             resume = get_resume_epoch(run_dir, name)
             print(f"[supervisor] will retry from epoch {resume}")
 
-    print(f"\n[supervisor] Training complete! ({args.max_epoch} epochs)")
+    print(f"\n[supervisor] training complete ({args.max_epoch} epochs)")
 
 
 if __name__ == "__main__":

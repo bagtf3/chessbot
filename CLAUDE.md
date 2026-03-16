@@ -86,3 +86,9 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - Config loaded from YAML via `Config.from_yaml()`; unknown keys raise `AttributeError`
 - Games saved as pkl to `<run_dir>/game_logs/<game_id>_log.pkl`
 - Analysis chunks staged to `<run_dir>/analysis_staging/`, merged to `analyze_results_combined.pkl`
+
+## Style Preferences
+- Lines under 89 chars where possible (not strict)
+- No `_leading_underscores` in names
+- No comment dividers with dashes or box-drawing characters
+- Minimal comments and code — avoid verbosity, prefer clean readable code over explanation

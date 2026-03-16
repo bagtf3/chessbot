@@ -147,22 +147,20 @@ class Rescorer(object):
 
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
     
-    def write_training_data_tfrec(self, size=None, randomize=True):
-        import tensorflow as tf
-
+    def write_training_data_pkl(self, size=None, randomize=True):
         cfg = self.config
         out_dir = pathlib.Path(cfg.pending_training_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # clear stale shards from any previous failed retrain
+        # clear stale pkl shards from any previous failed retrain
         deleted = []
         for p in out_dir.iterdir():
-            if p.is_file() and (p.name.endswith(".tfrecord") or p.name.endswith(".tfrecord.gz")):
+            if p.is_file() and p.suffix == ".pkl":
                 p.unlink()
                 deleted.append(p.name)
 
         if deleted:
-            print(f"{RS} deleted {len(deleted)} stale tfrecord files in {out_dir}")
+            print(f"{RS} deleted {len(deleted)} stale pkl files in {out_dir}")
 
         if randomize:
             random.shuffle(self.training_data)
@@ -173,12 +171,11 @@ class Rescorer(object):
         chunk = self.training_data[:size]
         remainder = self.training_data[size:]
 
-        filename = f"{int(time.time())}-{uuid.uuid4().hex}.tfrecord"
+        filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
         out_path = out_dir / filename
 
-        with tf.io.TFRecordWriter(str(out_path)) as writer:
-            for x, mask, policy, Y, vwht, pwht in chunk:
-                writer.write(make_tf_example(x, mask, policy, Y, vwht, pwht))
+        with open(out_path, "wb") as f:
+            pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         self.training_data = remainder
         self.written_this_round += len(chunk)
@@ -609,29 +606,6 @@ class Rescorer(object):
         self.analyzed_results = []
 
 # helpers
-def make_tf_example(x, mask, policy, value, vwht, pwht):
-    import tensorflow as tf
-
-    enc_bytes = tf.io.serialize_tensor(
-        tf.cast(tf.convert_to_tensor(x), tf.int16)
-    ).numpy()
-    mask_bytes = tf.io.serialize_tensor(
-        tf.cast(tf.convert_to_tensor(mask), tf.int32)
-    ).numpy()
-    pol_bytes = tf.io.serialize_tensor(
-        tf.convert_to_tensor(policy, dtype=tf.float32)
-    ).numpy()
-
-    return tf.train.Example(features=tf.train.Features(feature={
-        "enc_in":        tf.train.Feature(bytes_list=tf.train.BytesList(value=[enc_bytes])),
-        "mask":          tf.train.Feature(bytes_list=tf.train.BytesList(value=[mask_bytes])),
-        "policy_logits": tf.train.Feature(bytes_list=tf.train.BytesList(value=[pol_bytes])),
-        "value_out":     tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)])),
-        "value_weight":  tf.train.Feature(float_list=tf.train.FloatList(value=[float(vwht)])),
-        "policy_weight": tf.train.Feature(float_list=tf.train.FloatList(value=[float(pwht)])),
-    })).SerializeToString()
-
-
 def value_weight_for_game(cfg, is_draw):
     vwht = cfg.value_loss_weight
     if is_draw:

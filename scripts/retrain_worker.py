@@ -48,11 +48,39 @@ def list_pending_shards(pending_dir):
     return [os.path.join(pending_dir, fn) for fn in fns]
 
 
+def list_pending_shards_pkl(pending_dir):
+    if not os.path.isdir(pending_dir):
+        return []
+
+    fns = sorted(fn for fn in os.listdir(pending_dir) if fn.endswith(".pkl"))
+    return [os.path.join(pending_dir, fn) for fn in fns]
+
+
+def load_shards_pkl(paths):
+    import pickle
+    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
+    loaded = []
+
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                chunk = pickle.load(f)
+            for x, mask, policy, Y, vwht, pwht in chunk:
+                X_list.append(x)
+                M_list.append(mask)
+                P_list.append(policy)
+                Y_list.append(Y)
+                vwht_list.append(vwht)
+                pwht_list.append(pwht)
+            loaded.append(path)
+        except Exception as e:
+            print("[retrain] failed reading pkl shard (skipped):", path, e)
+
+    return (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded
+
+
 def load_shards(paths, tries=3, sleep_s=0.25):
-    """
-    Returns raw TF tensors (no .numpy() calls).
-    Callers convert to numpy if needed (pytorch path).
-    """
+    """Load bootstrap tfrecord shards. Returns lists of TF tensors."""
     X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
     loaded = []
 
@@ -64,20 +92,25 @@ def load_shards(paths, tries=3, sleep_s=0.25):
                 dataset = tf.data.TFRecordDataset(path, compression_type=compression)
                 for raw in dataset:
                     feat = tf.io.parse_single_example(raw, TFREC_FEATURE_SPEC)
-                    X_list.append(tf.cast(
-                        tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16), tf.int32
-                    ))
-                    M_list.append(tf.io.parse_tensor(feat["mask"], out_type=tf.int32))
-                    P_list.append(tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32))
-                    Y_list.append(feat["value_out"])
-                    vw = feat["value_weight"]
-                    if vw.numpy() < 0:  # old single-weight format
-                        w = feat["weight"]
+                    X_list.append(
+                        tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16)
+                        .numpy().astype(np.int32))
+                    M_list.append(
+                        tf.io.parse_tensor(feat["mask"], out_type=tf.int32)
+                        .numpy().astype(np.int32))
+                    P_list.append(
+                        tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
+                        .numpy().astype(np.float32))
+                    vw = feat["value_weight"].numpy()
+                    if vw < 0:  # old single-weight format
+                        w = feat["weight"].numpy().astype(np.float32)
                         vwht_list.append(w)
                         pwht_list.append(w)
                     else:
-                        vwht_list.append(vw)
-                        pwht_list.append(feat["policy_weight"])
+                        vwht_list.append(vw.astype(np.float32))
+                        pwht_list.append(
+                            feat["policy_weight"].numpy().astype(np.float32))
+                    Y_list.append(feat["value_out"].numpy().astype(np.float32))
                 loaded.append(path)
                 ok = True
                 break
@@ -99,7 +132,8 @@ def export_tf_to_onnx(model_path, onnx_path):
     import tf2onnx
     model = load_model(model_path)
     input_sig = [tf.TensorSpec([None, 64], tf.int32, name="enc_in")]
-    model_proto, _ = tf2onnx.convert.from_keras(model, input_signature=input_sig, opset=17)
+    model_proto, _ = tf2onnx.convert.from_keras(
+        model, input_signature=input_sig, opset=17)
     with open(onnx_path, "wb") as f:
         f.write(model_proto.SerializeToString())
     print(f"[retrain] tf→onnx export → {onnx_path}")
@@ -269,63 +303,45 @@ def main():
         enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
 
     pending_dir = os.path.join(run_dir, "pending_training")
-    shard_paths = list_pending_shards(pending_dir)
-    if not shard_paths:
+    pkl_paths = list_pending_shards_pkl(pending_dir)
+    tfrec_paths = list_pending_shards(pending_dir)
+
+    if pkl_paths:
+        lists, loaded_shards = load_shards_pkl(pkl_paths)
+        print(f"[retrain] loaded {len(loaded_shards)} pkl shards, "
+              f"samples={len(lists[0])}")
+    elif tfrec_paths:
+        lists, loaded_shards = load_shards(tfrec_paths)
+        print(f"[retrain] loaded {len(loaded_shards)} tfrecord shards, "
+              f"samples={len(lists[0])}")
+    else:
         print("[retrain] no shards found in:", pending_dir)
         return 0
 
-    (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded_shards = load_shards(shard_paths)
-    print(f"[retrain] loaded {len(loaded_shards)} shards, samples={len(X_list)}")
+    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = lists
 
     if not X_list:
         print("[retrain] no training samples after loading shards")
         return 0
 
-    if cfg.retrain_backend == "pytorch":
-        # convert to numpy for pytorch training
-        X       = np.stack([t.numpy() for t in X_list], axis=0).astype(np.int32)
-        M       = np.stack([t.numpy() for t in M_list], axis=0).astype(np.int32)
-        P       = np.stack([t.numpy() for t in P_list], axis=0).astype(np.float32)
-        Y_value = np.array([t.numpy() for t in Y_list], dtype=np.float32)
-        vwht    = np.array([t.numpy() for t in vwht_list], dtype=np.float32)
-        pwht    = np.array([t.numpy() for t in pwht_list], dtype=np.float32)
+    X       = np.stack(X_list).astype(np.int32)
+    M       = np.stack(M_list).astype(np.int32)
+    P       = np.stack(P_list).astype(np.float32)
+    Y_value = np.array(Y_list,    dtype=np.float32)
+    vwht    = np.array(vwht_list, dtype=np.float32)
+    pwht    = np.array(pwht_list, dtype=np.float32)
 
-        valid = ~np.isnan(Y_value)
-        if not valid.all():
-            print(f"[retrain] {(~valid).sum()} nan values found in Y, removing")
-        idx     = np.random.permutation(valid.sum())
-        X       = X[valid][idx]
-        M       = M[valid][idx]
-        P       = P[valid][idx]
-        Y_value = Y_value[valid][idx]
-        vwht    = vwht[valid][idx]
-        pwht    = pwht[valid][idx]
-    else:
-        # keep as TF tensors — no numpy round trip
-        X       = tf.stack(X_list)
-        M       = tf.stack(M_list)
-        P       = tf.stack(P_list)
-        Y_value = tf.stack(Y_list)
-        vwht    = tf.stack(vwht_list)
-        pwht    = tf.stack(pwht_list)
-
-        valid = ~tf.math.is_nan(Y_value)
-        n_invalid = int(tf.reduce_sum(tf.cast(~valid, tf.int32)).numpy())
-        if n_invalid > 0:
-            print(f"[retrain] {n_invalid} nan values found in Y, removing")
-        X       = tf.boolean_mask(X,       valid)
-        M       = tf.boolean_mask(M,       valid)
-        P       = tf.boolean_mask(P,       valid)
-        Y_value = tf.boolean_mask(Y_value, valid)
-        vwht    = tf.boolean_mask(vwht,    valid)
-        pwht    = tf.boolean_mask(pwht,    valid)
-        idx     = tf.random.shuffle(tf.range(tf.shape(X)[0], dtype=tf.int32))
-        X       = tf.gather(X,       idx)
-        M       = tf.gather(M,       idx)
-        P       = tf.gather(P,       idx)
-        Y_value = tf.gather(Y_value, idx)
-        vwht    = tf.gather(vwht,    idx)
-        pwht    = tf.gather(pwht,    idx)
+    valid = ~np.isnan(Y_value)
+    n_invalid = int((~valid).sum())
+    if n_invalid > 0:
+        print(f"[retrain] {n_invalid} nan values found in Y, removing")
+    idx     = np.random.permutation(valid.sum())
+    X       = X[valid][idx]
+    M       = M[valid][idx]
+    P       = P[valid][idx]
+    Y_value = Y_value[valid][idx]
+    vwht    = vwht[valid][idx]
+    pwht    = pwht[valid][idx]
 
     Y     = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht,    "policy_logits": pwht}
@@ -335,15 +351,13 @@ def main():
         f"KL boost ×{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
         if cfg.KL_weight_boost != 1.0 else "KL boost disabled"
     )
-    print(f"[retrain] weights  lr={cfg.learning_rate}  head policy=1.0  head value=1.0")
+    print(f"[retrain] weights  lr={cfg.learning_rate}  "
+          f"head policy=1.0  head value=1.0")
     print(f"[retrain] weights  sample policy={cfg.policy_loss_weight}  "
           f"sample value={cfg.value_loss_weight} (draw: {draw_vwht:.4f})")
     print(f"[retrain] weights  {kl_str}")
     for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
-        if isinstance(w, tf.Tensor):
-            mn, me, mx = float(tf.reduce_min(w)), float(tf.reduce_mean(w)), float(tf.reduce_max(w))
-        else:
-            mn, me, mx = float(w.min()), float(w.mean()), float(w.max())
+        mn, me, mx = float(w.min()), float(w.mean()), float(w.max())
         print(f"[retrain] {n}  min={mn:.4f}  mean={me:.4f}  max={mx:.4f}")
 
     if os.path.exists(cfg.progress_csv_path):
@@ -359,7 +373,7 @@ def main():
         save_pt_model(model, cfg.pytorch_model_path, arch)
         print(f"[retrain] pytorch checkpoint saved → {cfg.pytorch_model_path}")
     else:
-        model_paths = cfg.multiplex_models if cfg.multiplex_models else [cfg.model_path]
+        model_paths = cfg.multiplex_models or [cfg.model_path]
         for model_path in model_paths:
             label = os.path.basename(model_path) if cfg.multiplex_models else ""
             retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)

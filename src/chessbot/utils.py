@@ -399,12 +399,7 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     preds = model.predict(X, verbose=0, batch_size=128)
     value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
-    # inputs may be TF tensors (TF retrain path) or numpy — normalise to numpy
-    if hasattr(M, 'numpy'):
-        M = M.numpy()
     y_value = Y['value_out']
-    if hasattr(y_value, 'numpy'):
-        y_value = y_value.numpy()
     targets = y_value.ravel()
 
     value_mse  = np.mean((value_preds - targets) ** 2)
@@ -423,8 +418,6 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
 
     policy_logits = preds[0]  # (B,4096)
     policy_true   = Y['policy_logits']
-    if hasattr(policy_true, 'numpy'):
-        policy_true = policy_true.numpy()
     policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
 
     # build print dict and call the printer

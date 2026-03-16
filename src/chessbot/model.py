@@ -26,8 +26,7 @@ from tensorflow.keras.layers import (
 
 
 def load_model(model_loc):
-    model = keras.models.load_model(model_loc)
-    return model
+    return keras.models.load_model(model_loc, compile=False)
 
 
 def save_model(model, model_loc):

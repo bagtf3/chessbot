@@ -21,7 +21,6 @@ import pandas as pd
 
 import tensorflow as tf
 
-from chessbot.model import load_model
 from chessbot.config import Config
 import chessbot.utils as cbu
 
@@ -130,13 +129,13 @@ def load_shards(paths, tries=3, sleep_s=0.25):
 
 def export_tf_to_onnx(model_path, onnx_path):
     import tf2onnx
-    model = load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
     input_sig = [tf.TensorSpec([None, 64], tf.int32, name="enc_in")]
     model_proto, _ = tf2onnx.convert.from_keras(
         model, input_signature=input_sig, opset=17)
     with open(onnx_path, "wb") as f:
         f.write(model_proto.SerializeToString())
-    print(f"[retrain] tf→onnx export → {onnx_path}")
+    print(f"[retrain] tf->onnx export -> {onnx_path}")
 
 
 def delete_files(paths):
@@ -215,7 +214,7 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
     tag = f"[retrain{(' ' + label) if label else ''}]"
     print(f"{tag} loading {model_path}")
-    model = load_model(model_path)
+    model = tf.keras.models.load_model(model_path, compile=False)
 
     # recompile: explicit head weights + fresh LR
     opt_src = getattr(model, '_default_opt', None)
@@ -288,7 +287,7 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     model.save(model_path)
     epoch_var.assign(epoch)
     manager.save()
-    print(f"{tag} retraining complete for epoch {epoch}  optimizer → {manager.latest_checkpoint}")
+    print(f"{tag} retraining complete for epoch {epoch}  optimizer -> {manager.latest_checkpoint}")
 
     del model
     tf.keras.backend.clear_session()
@@ -385,7 +384,7 @@ def main():
         model, arch = load_pt_model(cfg.pytorch_model_path)
         train_pt_model(model, X, M, P, Y_value, vwht, pwht, cfg, args)
         save_pt_model(model, cfg.pytorch_model_path, arch)
-        print(f"[retrain] pytorch checkpoint saved → {cfg.pytorch_model_path}")
+        print(f"[retrain] pytorch checkpoint saved -> {cfg.pytorch_model_path}")
     else:
         model_paths = cfg.multiplex_models or [cfg.model_path]
         for model_path in model_paths:

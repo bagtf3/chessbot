@@ -92,3 +92,4 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - No `_leading_underscores` in names
 - No comment dividers with dashes or box-drawing characters
 - Minimal comments and code — avoid verbosity, prefer clean readable code over explanation
+- No Unicode characters outside ASCII in print statements or log output — Windows subprocesses use cp1252 and will crash on characters like arrows or other non-ASCII symbols. Use ASCII equivalents (e.g. `->` not `->`).

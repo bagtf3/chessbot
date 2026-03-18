@@ -248,7 +248,7 @@ def launch_retrain(run_tag, working_cfg):
     ctx = mp.get_context("spawn")
     success = []
     stop = False
-    for mb in [500, 1000, 2000, 4000, 6000]:
+    for mb in [1000, 3000, 6000]:
         if stop:
             break
 

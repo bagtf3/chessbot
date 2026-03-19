@@ -528,9 +528,10 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            # this is the specific c_puct and dirichlet eps, not the list of options
+            # these are the specific sampled values, not the list of options
             "c_puct": game.tree.c_puct,
             "dirichlet_eps": game.tree.dirichlet_eps,
+            "es_jsd_thresh": game.tree.es_jsd_thresh,
             "uniform_eps": cfg.uniform_eps,
             "prior_clip_max": cfg.prior_clip_max,
             "model_name": os.path.basename(cfg.model_path).replace("_model.h5", "").replace(".h5", ""),
@@ -551,6 +552,7 @@ class GameLooper(object):
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
         res["dirichlet_eps"] = game.tree.dirichlet_eps
+        res["es_jsd_thresh"] = game.tree.es_jsd_thresh
 
         out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl")
         out_path = pathlib.Path(out_file)
@@ -644,7 +646,38 @@ class GameLooper(object):
             telemetry[f"cache_{k}"] = v
 
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
+
+        if random.random() < 0.10:
+            self.print_and_reset_es_stats()
+
         return True
+
+    def print_and_reset_es_stats(self):
+        totals = {}
+        for g in self.active_games:
+            for k, v in g.tree.es_fails.items():
+                totals[k] = totals.get(k, 0) + v
+            g.tree.es_fails.clear()
+
+        if not totals:
+            return
+
+        rsc = totals.get('rsc_es_granted', 0)
+        jsd = totals.get('jsd_es_granted', 0)
+        total_stops = rsc + jsd
+        jsd_frac = jsd / total_stops if total_stops > 0 else 0.0
+
+        fails = {k: v for k, v in totals.items()
+                 if k not in ('rsc_es_granted', 'jsd_es_granted', 'rsc_granted_single')}
+        top_fails = sorted(fails.items(), key=lambda x: x[1], reverse=True)[:5]
+        tag = f"[es w={self.id}]"
+        fails1 = "  ".join(f"{k}={v}" for k, v in top_fails[:3])
+        fails2 = "  ".join(f"{k}={v}" for k, v in top_fails[3:])
+
+        print(f"{tag} stops: rsc={rsc} jsd={jsd} jsd_frac={jsd_frac:.2f}")
+        print(f"{tag} fails: {fails1}")
+        if fails2:
+            print(f"{tag}        {fails2}")
 
     
     def update_partial_telemetry(self):

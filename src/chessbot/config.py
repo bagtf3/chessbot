@@ -30,15 +30,16 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    sims_absolute_ceiling = 1600
 
     # early stop
     es_check_every = 100
-    target_delta = 200
     min_top_visits = 300
     min_delta = 100
     use_robust = True
     robust_only_above = 2400
+    es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
+    es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
+    es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop
     
     # Game stuff
     n_games = 128

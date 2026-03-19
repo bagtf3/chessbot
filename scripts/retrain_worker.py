@@ -213,7 +213,8 @@ def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
 def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
     tag = f"[retrain{(' ' + label) if label else ''}]"
-    print(f"{tag} loading {model_path}")
+    short_model = os.path.join(os.path.basename(os.path.dirname(model_path)), os.path.basename(model_path))
+    print(f"{tag} loading {short_model}")
     model = tf.keras.models.load_model(model_path, compile=False)
 
     # recompile: explicit head weights + fresh LR
@@ -249,7 +250,9 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     manager   = tf.train.CheckpointManager(tf_ckpt, train_ckpts_dir, max_to_keep=2)
     if manager.latest_checkpoint:
         tf_ckpt.restore(manager.latest_checkpoint)
-        print(f"{tag} restored optimizer state from {manager.latest_checkpoint}")
+        ckpt = manager.latest_checkpoint
+        short_ckpt = os.path.join(os.path.basename(os.path.dirname(ckpt)), os.path.basename(ckpt))
+        print(f"{tag} restored optimizer state from {short_ckpt}")
     else:
         print(f"{tag} no prior optimizer checkpoint — starting fresh")
 
@@ -287,7 +290,9 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     model.save(model_path)
     epoch_var.assign(epoch)
     manager.save()
-    print(f"{tag} retraining complete for epoch {epoch}  optimizer -> {manager.latest_checkpoint}")
+    ckpt = manager.latest_checkpoint
+    short_ckpt = os.path.join(os.path.basename(os.path.dirname(ckpt)), os.path.basename(ckpt))
+    print(f"{tag} retraining complete for epoch {epoch}  optimizer -> {short_ckpt}")
 
     del model
     tf.keras.backend.clear_session()

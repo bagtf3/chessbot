@@ -381,6 +381,8 @@ class MCTSTree(fasttree):
             return False
 
         if sims_done >= self.sims_ceiling:
+            self.es_fails['no_es_full_sims'] += 1
+            self.es_fails['full_sims_sum'] += sims_done
             self._es_tripped = True
             return True
 
@@ -408,12 +410,14 @@ class MCTSTree(fasttree):
         if cfg.use_robust and visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
             if self.rsc_performance_stop(rsc, details):
                 self._es_tripped = True
+                self.es_fails['rsc_sims_sum'] += sims_done
                 self.es_times.append(_now() - es_time_start)
                 return True
 
         # Rule 2: JSD convergence stop
         if self.jsd_convergence_stop():
             self._es_tripped = True
+            self.es_fails['jsd_sims_sum'] += sims_done
             self.es_times.append(_now() - es_time_start)
             return True
 

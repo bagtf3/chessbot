@@ -244,31 +244,16 @@ def launch_retrain(run_tag, working_cfg):
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
 
-    # need to try to pull back GPU VRAM for training
     ctx = mp.get_context("spawn")
-    success = []
-    stop = False
-    for mb in [1000, 3000, 6000]:
-        if stop:
+    for attempt in range(3):
+        p = ctx.Process(target=reclaim_vram_worker, args=(6000,))
+        p.start()
+        p.join()
+        if p.exitcode == 0:
+            print(f"[reclaim vram] ok")
             break
-
-        for attempt in range(2):
-            p = ctx.Process(target=reclaim_vram_worker, args=(mb,))
-            p.start()
-            p.join()
-            ok = (p.exitcode == 0)
-
-            if ok:
-                success.append(mb)
-                break
-
-            if not ok and attempt > 0:
-                print(f"[reclaim_vram] failed {mb} MB, stopping reclaim")
-                stop = True
-                break
-    
-    if success:
-        print(f"[reclaim vram] ok levels: {success}")
+        if attempt == 2:
+            print(f"[reclaim_vram] failed after 3 attempts, skipping")
 
     return launch_retrain_async(run_tag, rt_script, working_cfg)
 
@@ -387,15 +372,14 @@ def main(run_tag):
 
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
-                    # pause workers
-                    for p in procs:
-                        p["msg_q"].put("pause")
-                    
-                    # sample and write training data, update training_queue for logging
+                    # write data first so workers keep playing during the write
                     rescorer.write_training_data_pkl(
                         size=working_cfg.retrain_size, randomize=True)
-
                     recorder.training_queue = len(rescorer.training_data)
+
+                    # pause workers before reclaim + launch
+                    for p in procs:
+                        p["msg_q"].put("pause")
 
                     if retrain is None:
                         retrain = launch_retrain(run_tag, working_cfg)

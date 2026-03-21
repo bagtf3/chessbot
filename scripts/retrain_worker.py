@@ -210,11 +210,17 @@ def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
         raise RuntimeError("GPU was present but no logical GPU is active.")
 
 
-def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
+def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", timings=None):
     """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
+    if timings is None:
+        timings = {}
     tag = f"[retrain{(' ' + label) if label else ''}]"
-    short_model = os.path.join(os.path.basename(os.path.dirname(model_path)), os.path.basename(model_path))
+    short_model = os.path.join(
+        os.path.basename(os.path.dirname(model_path)),
+        os.path.basename(model_path))
     print(f"{tag} loading {short_model}")
+
+    t0 = time.time()
     model = tf.keras.models.load_model(model_path, compile=False)
 
     # recompile: explicit head weights + fresh LR
@@ -251,34 +257,41 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     if manager.latest_checkpoint:
         tf_ckpt.restore(manager.latest_checkpoint)
         ckpt = manager.latest_checkpoint
-        short_ckpt = os.path.join(os.path.basename(os.path.dirname(ckpt)), os.path.basename(ckpt))
+        short_ckpt = os.path.join(
+            os.path.basename(os.path.dirname(ckpt)),
+            os.path.basename(ckpt))
         print(f"{tag} restored optimizer state from {short_ckpt}")
     else:
-        print(f"{tag} no prior optimizer checkpoint — starting fresh")
+        print(f"{tag} no prior optimizer checkpoint - starting fresh")
+    timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
-    if not args.skip_plots:
-        if os.path.exists(cfg.progress_csv_path):
-            all_evals = pd.read_csv(cfg.progress_csv_path)
-        else:
-            all_evals = pd.DataFrame()
+    if os.path.exists(cfg.progress_csv_path):
+        all_evals = pd.read_csv(cfg.progress_csv_path)
+    else:
+        all_evals = pd.DataFrame()
 
-        plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
-        eval_df = cbu.score_game_data(model, X, M, Y, epoch, save_path=plt_file)
-        all_evals = pd.concat([all_evals, eval_df])
-        all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
+    t0 = time.time()
+    preds = model.predict(X, verbose=0, batch_size=128)
+    timings['predict'] = timings.get('predict', 0.0) + (time.time() - t0)
 
-        if len(all_evals) and len(all_evals) % 5 == 0:
-            cbu.plot_training_progress(
-                all_evals, epoch=epoch, save_path=cfg.progress_plot_path
-            )
+    plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
+    t0 = time.time()
+    eval_df = cbu.score_game_data(None, X, M, Y, epoch, save_path=plt_file, preds=preds)
+    timings['scatter'] = timings.get('scatter', 0.0) + (time.time() - t0)
 
+    all_evals = pd.concat([all_evals, eval_df])
+    all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
+
+    t0 = time.time()
     history = model.fit(
         {"enc_in": X}, Y, epochs=args.epochs, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
+    timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
 
     print_fit_history(history, epoch, label=label)
 
+    t0 = time.time()
     bak_path = model_path.replace(".h5", "_backup.h5")
     if os.path.exists(model_path):
         try:
@@ -291,12 +304,32 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=""):
     epoch_var.assign(epoch)
     manager.save()
     ckpt = manager.latest_checkpoint
-    short_ckpt = os.path.join(os.path.basename(os.path.dirname(ckpt)), os.path.basename(ckpt))
+    short_ckpt = os.path.join(
+        os.path.basename(os.path.dirname(ckpt)),
+        os.path.basename(ckpt))
     print(f"{tag} retraining complete for epoch {epoch}  optimizer -> {short_ckpt}")
+    timings['save'] = timings.get('save', 0.0) + (time.time() - t0)
 
     del model
     tf.keras.backend.clear_session()
     gc.collect()
+
+
+def print_timings(timings):
+    order = [
+        ('tf_init',     'tf init'),
+        ('load_shards', 'load shards'),
+        ('load_model',  'load model'),
+        ('predict',     'predict'),
+        ('scatter',     'scatter'),
+        ('fit',         'fit'),
+        ('save',        'save'),
+        ('total',       'total'),
+    ]
+    print("[retrain] timing")
+    for key, label in order:
+        if key in timings:
+            print(f"  {label:<12} {timings[key]:6.1f}s")
 
 
 def main():
@@ -305,22 +338,28 @@ def main():
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--skip-plots", action="store_true",
-                   help="skip all plots and CSV progress saves")
+                   help="skip scatter plot save")
     args = p.parse_args()
+
+    t_total = time.time()
+    timings = {}
 
     run_dir = args.run_dir
     config_file = os.path.join(run_dir, "config.yaml")
     cfg = Config.from_yaml(config_file)
 
+    t0 = time.time()
     if cfg.retrain_backend == "pytorch":
-        # give the GPU entirely to pytorch; TF only reads tfrecords on CPU
         tf.config.set_visible_devices([], 'GPU')
         from chessbot.train_pytorch import enforce_pytorch_gpu_or_die
         enforce_pytorch_gpu_or_die()
     else:
         enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
+    timings['tf_init'] = time.time() - t0
 
     pending_dir = os.path.join(run_dir, "pending_training")
+
+    t0 = time.time()
     pkl_paths = list_pending_shards_pkl(pending_dir)
     tfrec_paths = list_pending_shards(pending_dir)
 
@@ -348,6 +387,7 @@ def main():
     Y_value = np.array(Y_list,    dtype=np.float32)
     vwht    = np.array(vwht_list, dtype=np.float32)
     pwht    = np.array(pwht_list, dtype=np.float32)
+    timings['load_shards'] = time.time() - t0
 
     valid = ~np.isnan(Y_value)
     n_invalid = int((~valid).sum())
@@ -366,7 +406,7 @@ def main():
 
     draw_vwht = cfg.value_loss_weight * cfg.draw_value_scale
     kl_str = (
-        f"KL boost ×{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
+        f"KL boost x{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
         if cfg.KL_weight_boost != 1.0 else "KL boost disabled"
     )
     print(f"[retrain] weights  lr={cfg.learning_rate}  "
@@ -394,10 +434,15 @@ def main():
         model_paths = cfg.multiplex_models or [cfg.model_path]
         for model_path in model_paths:
             label = os.path.basename(model_path) if cfg.multiplex_models else ""
-            retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label=label)
+            retrain_one_model(
+                model_path, X, M, Y, s_wts, cfg, epoch, args,
+                label=label, timings=timings)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")
+
+    timings['total'] = time.time() - t_total
+    print_timings(timings)
 
     return 0
 

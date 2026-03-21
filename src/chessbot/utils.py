@@ -394,9 +394,10 @@ def print_validation(epoch, stats):
           f"{pair('true ratio', ratio)}")
 
 
-def score_game_data(model, X, M, Y, epoch, save_path=None):
+def score_game_data(model, X, M, Y, epoch, save_path=None, preds=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
-    preds = model.predict(X, verbose=0, batch_size=128)
+    if preds is None:
+        preds = model.predict(X, verbose=0, batch_size=128)
     value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
     y_value = Y['value_out']
@@ -412,8 +413,6 @@ def score_game_data(model, X, M, Y, epoch, save_path=None):
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path)
-        csv_path = os.path.splitext(save_path)[0] + ".csv"
-        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(csv_path, index=False)
     plt.close()
 
     policy_logits = preds[0]  # (B,4096)

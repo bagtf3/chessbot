@@ -274,10 +274,10 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
     preds = model.predict(X, verbose=0, batch_size=128)
     timings['predict'] = timings.get('predict', 0.0) + (time.time() - t0)
 
-    plt_file = os.path.join(cfg.run_dir, "true_vs_pred_plot_latest.png")
+    csv_file = os.path.join(cfg.run_dir, "true_vs_pred_latest.csv")
     t0 = time.time()
-    eval_df = cbu.score_game_data(None, X, M, Y, epoch, save_path=plt_file, preds=preds)
-    timings['scatter'] = timings.get('scatter', 0.0) + (time.time() - t0)
+    eval_df = cbu.score_game_data(None, X, M, Y, epoch, save_path=csv_file, preds=preds)
+    timings['metrics'] = timings.get('metrics', 0.0) + (time.time() - t0)
 
     all_evals = pd.concat([all_evals, eval_df])
     all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
@@ -321,7 +321,7 @@ def print_timings(timings):
         ('load_shards', 'load shards'),
         ('load_model',  'load model'),
         ('predict',     'predict'),
-        ('scatter',     'scatter'),
+        ('metrics',     'metrics'),
         ('fit',         'fit'),
         ('save',        'save'),
         ('total',       'total'),

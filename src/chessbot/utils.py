@@ -406,14 +406,9 @@ def score_game_data(model, X, M, Y, epoch, save_path=None, preds=None):
     value_mse  = np.mean((value_preds - targets) ** 2)
     value_corr = np.corrcoef(value_preds, targets)[0, 1]
 
-    plt.scatter(targets, value_preds, s=6)
-    plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
-    plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
-    plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target")
-    plt.tight_layout()
     if save_path is not None:
-        plt.savefig(save_path)
-    plt.close()
+        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(
+            save_path, index=False)
 
     policy_logits = preds[0]  # (B,4096)
     policy_true   = Y['policy_logits']

@@ -283,15 +283,28 @@ class MCTSTree(fasttree):
         if curr_dist is None:
             return
 
+        top10 = set(list(curr_dist)[:10])
+        curr_sub = {u: v for u, v in curr_dist.items() if u in top10}
+        curr_sub_total = sum(curr_sub.values())
+        curr_sub = {u: v / curr_sub_total for u, v in curr_sub.items()}
+
         if not self.es_checks:
             prior_total = sum(d.prior for d in details)
             if prior_total > 0:
                 ref = {d.uci: d.prior / prior_total for d in details}
             else:
                 ref = {d.uci: 1.0 / len(details) for d in details}
-            jsd = self.js_divergence(ref, curr_dist)
         else:
-            jsd = self.js_divergence(self.es_checks[-1].visit_dist, curr_dist)
+            ref = self.es_checks[-1].visit_dist
+
+        ref_sub = {u: v for u, v in ref.items() if u in top10}
+        ref_sub_total = sum(ref_sub.values())
+        if ref_sub_total > 0:
+            ref_sub = {u: v / ref_sub_total for u, v in ref_sub.items()}
+        else:
+            ref_sub = {u: 1.0 / len(top10) for u in top10}
+
+        jsd = self.js_divergence(ref_sub, curr_sub)
 
         d0 = details[0]
         d1 = details[1] if len(details) > 1 else None
@@ -407,12 +420,13 @@ class MCTSTree(fasttree):
         self.record_es_check(details, sims_done)
 
         # Rule 1: RSC performance stop
-        if cfg.use_robust and visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
-            if self.rsc_performance_stop(rsc, details):
-                self._es_tripped = True
-                self.es_fails['rsc_sims_sum'] += sims_done
-                self.es_times.append(_now() - es_time_start)
-                return True
+        if cfg.use_robust:
+            if visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
+                if self.rsc_performance_stop(rsc, details):
+                    self._es_tripped = True
+                    self.es_fails['rsc_sims_sum'] += sims_done
+                    self.es_times.append(_now() - es_time_start)
+                    return True
 
         # Rule 2: JSD convergence stop
         if self.jsd_convergence_stop():

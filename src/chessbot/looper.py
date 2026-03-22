@@ -647,8 +647,8 @@ class GameLooper(object):
 
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
 
-        #if random.random() < 0.10:
-        #    self.print_and_reset_es_stats()
+        if random.random() < 0.10:
+           self.print_and_reset_es_stats()
 
         return True
 

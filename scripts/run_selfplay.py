@@ -18,6 +18,7 @@ from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
 
 import gc
+import pickle
 import signal
 import threading
 
@@ -275,6 +276,15 @@ def main(run_tag):
     rescorer = Rescorer(base_cfg)
     finished_games = rescorer.get_unprocessed()
 
+    # load any previously saved untrained samples
+    remaining_pkl = os.path.join(base_cfg.run_dir, "remaining_untrained.pkl")
+    if os.path.exists(remaining_pkl):
+        with open(remaining_pkl, "rb") as f:
+            rescorer.training_data = pickle.load(f)
+        os.remove(remaining_pkl)
+        n_loaded = len(rescorer.training_data)
+        print(f"[main] loaded {n_loaded} samples from remaining_untrained.pkl")
+
     # infer n_retrains
     if os.path.exists(base_cfg.progress_csv_path):
         progress_df = pd.read_csv(base_cfg.progress_csv_path)
@@ -439,7 +449,14 @@ def main(run_tag):
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.push_analyzed(report=True)
-        rescorer.write_training_data_pkl(size=9999999, randomize=False)
+        if rescorer.training_data:
+            remaining_pkl = os.path.join(
+                base_cfg.run_dir, "remaining_untrained.pkl"
+            )
+            with open(remaining_pkl, "wb") as f:
+                pickle.dump(rescorer.training_data, f)
+            n_saved = len(rescorer.training_data)
+            print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
         rescorer.close()
         shutdown_round(procs, recent_q, telemetry_q)
 

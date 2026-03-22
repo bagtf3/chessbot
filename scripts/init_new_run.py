@@ -72,6 +72,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("run_tag")
     p.add_argument("--clone", default=None)
+    p.add_argument("--ignore-eval-progress", action="store_true")
     args = p.parse_args()
 
     run_tag = args.run_tag
@@ -143,6 +144,21 @@ def main():
         if os.path.exists(src_val):
             shutil.copy2(src_val, train_yaml_dst)
             print(f"[clone] copied training_config.yaml from {clone_tag}")
+
+        # move remaining_untrained.pkl if present
+        src_remaining = os.path.join(src_dir, "remaining_untrained.pkl")
+        if os.path.exists(src_remaining):
+            dst_remaining = os.path.join(dest_dir, "remaining_untrained.pkl")
+            shutil.move(src_remaining, dst_remaining)
+            print(f"[clone] moved remaining_untrained.pkl from {clone_tag}")
+
+        # copy eval_progress.csv unless suppressed
+        if not args.ignore_eval_progress:
+            src_eval = os.path.join(src_dir, "eval_progress.csv")
+            if os.path.exists(src_eval):
+                dst_eval = os.path.join(dest_dir, "eval_progress.csv")
+                shutil.copy2(src_eval, dst_eval)
+                print(f"[clone] copied eval_progress.csv from {clone_tag}")
     else:
         # not cloning: write minimal files
         write_yaml(cfg_yaml_dst, {

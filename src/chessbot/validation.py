@@ -262,13 +262,14 @@ def build_validation_summary(looper):
     bumped = False
     action = "none"
 
-    if consec >= 2:
+    dominant = (n >= min_games) and (score > 0.9)
+
+    if dominant or consec >= 2:
         if index < (len(table) - 1):
             bumped = True
-            action = "bumped_depth"
+            action = "bumped_depth_dominant" if dominant else "bumped_depth"
             consec = 0
         else:
-            # at max depth row do not advance
             action = "at_max_depth"
 
     # Do NOT persist the validation config file. Only append history.

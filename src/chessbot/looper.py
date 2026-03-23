@@ -658,7 +658,7 @@ class GameLooper(object):
             for k, v in g.tree.es_fails.items():
                 totals[k] = totals.get(k, 0) + v
             g.tree.es_fails.clear()
-
+        
         if not totals:
             return
 
@@ -694,7 +694,6 @@ class GameLooper(object):
         print(f"{tag} fails: {fails1}")
         if fails2:
             print(f"{tag}        {fails2}")
-
     
     def update_partial_telemetry(self):
         """send a partial update to the telemetry for more time sensitive metrics"""

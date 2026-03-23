@@ -916,15 +916,16 @@ def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
         if m not in d:
             d[m] = 1
 
-    # compute old max
-    old_max = max(d.values()) if d else 1
-    old_min = min(d.values()) if d else 1
+    # if not a blunder, make best_mv visits = played_mv visits
+    if not was_blunder:
+        d[best_mv] = d[played_mv]
 
-    # adjust by swapping visits between played and best with 30% bump
-    d[played_mv] = int(np.ceil(0.7*d[best_mv]))
-    if was_blunder:
-        d[best_mv] = old_min
+    # otherwise swap visit counts with +/- bumps
     else:
+        # compute old max
+        old_max = max(d.values()) if d else 1
+        
+        d[played_mv] = int(np.ceil(0.7*d[best_mv]))
         d[best_mv] = int(np.ceil(1.3*old_max))
 
     # build sorted list

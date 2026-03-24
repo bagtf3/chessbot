@@ -548,6 +548,15 @@ class GameLooper(object):
         res.update(cfg.to_dict())
         res.update(game.meta)
 
+        # unscale Q values from inference vscale before saving
+        vs = cfg.vscale
+        if vs and vs != 1.0:
+            q_keys = ("Q_stm", "Q_white", "best_Q", "visit_weighted_Q")
+            for td in game.tree_data.values():
+                for k in q_keys:
+                    if k in td:
+                        td[k] = td[k] / vs
+
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct

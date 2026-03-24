@@ -155,21 +155,20 @@ class GameViewer:
             print("No SF info (maybe engine failed).")
             return
     
-        # print top-3
-        print("SF top moves (white-POV cp):")
+        sign = 1 if self.turn() else -1
+        print("SF top moves (STM-POV cp):")
         top_ucis = set()
         for i, (uci, san, cp, pv) in enumerate(topk, start=1):
-            cp_str = ("mate" if cp is None else str(int(cp)))
+            cp_stm = None if cp is None else int(cp * sign)
+            cp_str = "mate" if cp_stm is None else str(cp_stm)
             print(f"  #{i}. {san:<6}  cp={cp_str}")
             if uci:
                 top_ucis.add(uci)
-    
-        # check the move about to be played (selected from moves_uci[self.ply])
+
         if self.ply < len(self.moves_uci):
             upcoming_uci = self.moves_uci[self.ply]
             upcoming_san = self.board.san(upcoming_uci)
             if upcoming_uci not in top_ucis:
-                # get forced eval for the played move
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
@@ -178,11 +177,10 @@ class GameViewer:
                         sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
                     )
-                    
                     score_obj = info.get("score")
                     if score_obj is not None:
                         cp = score_obj.white().score(mate_score=1500)
-                        print(f"  cp(played) = {int(cp)} (white-POV)")
+                        print(f"  cp(played) = {int(cp * sign)} (STM-POV)")
                     else:
                         print("  played move eval not available")
             else:
@@ -255,7 +253,7 @@ class GameViewer:
         )
         sep = "  " + "-" * (len(hdr) - 2)
         to_move = "White" if white_to_move else "Black"
-        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=white-pov):")
+        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=STM-pov):")
         print(hdr)
         print(sep)
 
@@ -270,7 +268,7 @@ class GameViewer:
 
             xc0   = xc0_map.get(mv)
             p_xc0 = xc0["P"] if xc0 else float("nan")
-            q_xc0 = xc0["Q"] if xc0 else float("nan")
+            q_xc0 = xc0["Q"] * sign if xc0 else float("nan")
 
             print(
                 f"  {san:<7}  {n:>6}  {p_lc0:>7.3f}  {p_xc0:>7.3f}"
@@ -541,15 +539,14 @@ class GameViewer:
         visits = c.get("visits", 0)
         visit_share = c.get("visit_share", 0.0)
 
-        q = c.get("Q", 0.0)
-        qema = c.get("Qema", 0.0)
-        ds = c.get("Qdelta_sign", 0.0)
+        sign = 1 if self.board.side_to_move() == "w" else -1
+        q = c.get("Q", 0.0) * sign
+        qema = c.get("Qema", 0.0) * sign
+        ds = c.get("Qdelta_sign", 0.0) * sign
 
         p = c.get("P", 0.0)
         u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
-
-        qrel = q if self.board.side_to_move() == "w" else -q
-        puct = qrel + u
+        puct = q + u
 
         flags = []
         if mark:
@@ -779,9 +776,9 @@ class GameViewer:
         if this_q is None:
             this_q = node.get("visit_weighted_Q")
             if this_q is not None:
-                print(f"\nvisit-weighted Q={this_q}")
+                print(f"\nvisit-weighted Q={this_q:+.4f}")
         else:
-            print(f"\nBest Q={this_q}")
+            print(f"\nBest Q={this_q:+.4f}")
 
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
@@ -821,18 +818,19 @@ class GameViewer:
                 parts.append(f"CPL={int(loss)}")
 
             if played_san != "?":
-                parts.append(f"played={played_san}")
-
-            if xc0_uci and xc0_san != "?":
-                parts.append(f"Xc0={xc0_san} ({'✓' if matched else '×'})")
-            elif played_san != "?":
-                parts.append(f"({'✓' if matched else '×'})")
+                if xc0_uci and xc0_san != "?":
+                    parts.append(f"played={played_san}")
+                    xc0_cp = f" ({played_cp_pov})" if played_cp_pov is not None else ""
+                    parts.append(f"Xc0={xc0_san}{xc0_cp}")
+                else:
+                    played_cp = f" ({played_cp_pov})" if played_cp_pov is not None else ""
+                    parts.append(f"played={played_san}{played_cp}")
 
             if best_san != "?":
-                parts.append(f"SF best={best_san}")
+                best_cp = f" ({best_cp_pov})" if best_cp_pov is not None else ""
+                parts.append(f"SF best={best_san}{best_cp}")
 
-            if (best_cp_pov is not None) and (played_cp_pov is not None):
-                parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
+            parts.append(f"played best: {'✓' if matched else '×'}")
 
             if parts:
                 print("SF:", "  ".join(parts))

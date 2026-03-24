@@ -283,8 +283,8 @@ class MCTSTree(fasttree):
         if curr_dist is None:
             return
 
-        top10 = set(list(curr_dist)[:10])
-        curr_sub = {u: v for u, v in curr_dist.items() if u in top10}
+        top5 = set(list(curr_dist)[:5])
+        curr_sub = {u: v for u, v in curr_dist.items() if u in top5}
         curr_sub_total = sum(curr_sub.values())
         curr_sub = {u: v / curr_sub_total for u, v in curr_sub.items()}
 
@@ -297,12 +297,12 @@ class MCTSTree(fasttree):
         else:
             ref = self.es_checks[-1].visit_dist
 
-        ref_sub = {u: v for u, v in ref.items() if u in top10}
+        ref_sub = {u: v for u, v in ref.items() if u in top5}
         ref_sub_total = sum(ref_sub.values())
         if ref_sub_total > 0:
             ref_sub = {u: v / ref_sub_total for u, v in ref_sub.items()}
         else:
-            ref_sub = {u: 1.0 / len(top10) for u in top10}
+            ref_sub = {u: 1.0 / len(top5) for u in top5}
 
         jsd = self.js_divergence(ref_sub, curr_sub)
 

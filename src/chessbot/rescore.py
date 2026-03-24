@@ -56,6 +56,10 @@ class Rescorer(object):
         self.last_10_cpls = []
         self.last_10_bmrs = []
 
+        zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0}
+        self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
+        self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
+
         self.init_analyzer()
 
     def close(self):
@@ -427,7 +431,8 @@ class Rescorer(object):
                 i, mv, xerces_uci_for_cpl, str(res['best_move']),
                 res['best_cp'], loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
-                board_ch.turn, loss_this
+                board_ch.turn, loss_this,
+                tr.get("stop_reason", "")
             ])
 
             if skip_all_training:
@@ -493,7 +498,7 @@ class Rescorer(object):
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
-            'best_absolute', 'played_absolute', 'stm', 'loss'
+            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason'
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
@@ -524,13 +529,71 @@ class Rescorer(object):
             out[key] = val
             out_df[key] = val
 
+        stop_stats = {}
+        for st in ("full", "rsc", "jsd"):
+            mask_st = out_df['stop_reason'] == st
+            n_st = mask_st.sum()
+            stop_stats[st] = {
+                'n': int(n_st),
+                'cpl': rnd(out_df.loc[mask_st, 'delta'].mean(), 3) if n_st else np.nan,
+                'bmr': out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan,
+            }
+        out['stop_stats'] = stop_stats
+
         out['df'] = out_df
         self.analyzed_results.append(out)
         self.games_processed += 1
         self.games_seen.add(gid)
+        self.accumulate_stop_stats(stop_stats)
+        if self.games_processed % 150 == 0:
+            self.print_stop_stats()
         if len(self.analyzed_results) >= self.config.post_hoc_analyze_batch:
             self.push_analyzed(report=True)
         
+    def accumulate_stop_stats(self, stop_stats):
+        for st, s in stop_stats.items():
+            n = s['n']
+            if not n:
+                continue
+            for acc in (self.total_stop, self.window_stop):
+                acc[st]['n'] += n
+                acc[st]['cpl'] += s['cpl'] * n
+                acc[st]['bmr'] += s['bmr'] * n
+
+    def print_stop_stats(self):
+        stops = ("full", "rsc", "jsd")
+
+        def pct(acc, st):
+            total_n = sum(acc[s]['n'] for s in stops)
+            n = acc[st]['n']
+            return n / total_n if total_n else 0.0
+
+        def cpl(acc, st):
+            n = acc[st]['n']
+            return acc[st]['cpl'] / n if n else float('nan')
+
+        def bmr(acc, st):
+            n = acc[st]['n']
+            return acc[st]['bmr'] / n if n else float('nan')
+
+        def rows(label, acc):
+            hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4} ({pct(acc,st):.0%})  |" for st in stops)
+            crow = f"{RS}  {label:<12} |" + "".join(f"  CPL {cpl(acc,st):5.2f}  |" for st in stops)
+            brow = f"{RS}  {label:<12} |" + "".join(f"  BMR {bmr(acc,st):.3f}  |" for st in stops)
+            return hdr, crow, brow
+
+        wh, wc, wb = rows("last 150", self.window_stop)
+        th, tc, tb = rows("overall",  self.total_stop)
+        print(wh)
+        print(wc)
+        print(wb)
+        print()
+        print(tc)
+        print(tb)
+
+        for st in stops:
+            self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0}
+
     def push_analyzed(self, report=True):
         # safeguard here
         if not len(self.analyzed_results):

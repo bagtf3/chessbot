@@ -686,6 +686,7 @@ class ChessGame(object):
         self.sf_res_tup = None
         self.sf_ready = False
         self.sf_pending = False
+        self.tree.sim_stop_reason = "sf"
         return self.push_move(best_move, "stockfish", None)
 
     def make_move_from_tree(self):

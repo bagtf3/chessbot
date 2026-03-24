@@ -187,9 +187,6 @@ class Rescorer(object):
         rows = [(c["uci"], c["visits"]) for c in cm]
         total_visits = sum([n for _, n in rows]) if rows else 0
 
-        visit_map = None
-        use_tree_visits = False
-
         if rows and total_visits > 10:
             top_uci = max(rows, key=lambda x: x[1])[0]
             pairs = encourage_best_move(rows, top_uci, mv, board.legal_moves())
@@ -457,9 +454,9 @@ class Rescorer(object):
                 # cat 2: fine move, no adjustment, no KL boost
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
             else:
-                # cat 3 + 4: mild encouragement - set best_mv visits = played_mv
+                # cat 3 + 4: mild encouragement - set best_mv visits = xerces top
                 best_mv_uci = str(res.get('best_move'))
-                visits = encourage_best_move(visits, mv, best_mv_uci, lms)
+                visits = encourage_best_move(visits, visits[0][0], best_mv_uci, lms)
 
             if not visits or sum([v[1] for v in visits]) <= 0:
                 print("[rescorer] visits invalid or sum <= 0; skipping sample",

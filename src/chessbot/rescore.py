@@ -191,19 +191,10 @@ class Rescorer(object):
         use_tree_visits = False
 
         if rows and total_visits > 10:
-            visit_map = {u: n for u, n in rows}
-            most_visited_uci, max_visits = max(rows, key=lambda x: x[1])
-
-            if most_visited_uci == mv:
-                use_tree_visits = True
-            else:
-                top_count = visit_map[most_visited_uci]
-                visit_map[mv] = 1 + int(top_count * 1.25)
-                use_tree_visits = True
-
-        if use_tree_visits and visit_map is not None:
-            ucis = board.legal_moves()
-            visits = [max(1, visit_map.get(u, 1)) for u in ucis]
+            top_uci = max(rows, key=lambda x: x[1])[0]
+            pairs = encourage_best_move(rows, top_uci, mv, board.legal_moves())
+            ucis = [v[0] for v in pairs]
+            visits = [v[1] for v in pairs]
         else:
             raw = make_fake_visits(mv, board.legal_moves(), ratio_best=60)
             ucis = [x[0] for x in raw]

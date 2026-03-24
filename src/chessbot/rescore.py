@@ -16,7 +16,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, rnd, cp_to_value_tanh, kl_divergence
+    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence
 )
 
 RS = "[rescore]"
@@ -214,7 +214,7 @@ class Rescorer(object):
         kl = kl_divergence(priors, visits)
 
         vwht = value_weight_for_game(cfg, is_draw)
-        pwht = cfg.policy_loss_weight
+        pwht = 1.0
         if kl > cfg.KL_boost_threshold:
             pwht *= cfg.KL_weight_boost
 
@@ -450,32 +450,29 @@ class Rescorer(object):
             # screen training data, adjust if needed and append
             lms = b_fast.legal_moves()
 
-            # determine correct cp threshold
             blunder_cp = cfg.post_hoc_blunder_cp_loser
             if Z_stm > 0.0:
                 blunder_cp = cfg.post_hoc_blunder_cp_winner
 
-            # these moves are fine, no changes            
-            if loss_this <= min(60, blunder_cp):
-                best_mv = mv
-                visits = ensure_all_legal_moves_have_visits(visits, lms)
-            
-            # for mild blunders or missed-mate-but-still-winning, adjust visits
-            elif (loss_this < blunder_cp) or missed_mate:
-                best_mv = str(res.get('best_move'))
-                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
+            best_cp_stm = res.get('best_cp', 0)
+            played_cp_stm = res.get('played_cp', 0)
 
-            # everything else is a blunder
+            kl_eligible = False
+            if loss_this <= cfg.post_hoc_equiv_range:
+                # cat 1: excellent move, eligible for KL boost
+                visits = ensure_all_legal_moves_have_visits(visits, lms)
+                kl_eligible = True
+            elif loss_this <= 60:
+                # cat 2: fine move, no adjustment, no KL boost
+                visits = ensure_all_legal_moves_have_visits(visits, lms)
             else:
-                best_mv = str(res.get('best_move'))
-                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=True)
-                # use the SF value here since its a blunder
-                best_cp = res.get('best_cp')
-                Y = cp_to_value_tanh(best_cp) if best_cp is not None else 0.0
+                # cat 3 + 4: mild encouragement - set best_mv visits = played_mv
+                best_mv_uci = str(res.get('best_move'))
+                visits = encourage_best_move(visits, mv, best_mv_uci, lms)
 
             if not visits or sum([v[1] for v in visits]) <= 0:
                 print("[rescorer] visits invalid or sum <= 0; skipping sample",
-                    "move_idx=", i, "played=", mv, "best=", best_mv)
+                    "move_idx=", i, "played=", mv)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
@@ -487,14 +484,18 @@ class Rescorer(object):
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
             vwht = value_weight_for_game(cfg, is_draw)
-            pwht = cfg.policy_loss_weight
+            pwht = 1.0
 
-            # adjust training weights based on KL
-            if do_KL_boost:
+            if kl_eligible and do_KL_boost:
                 kl = kl_divergence(priors, vis)
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
-            
+            elif loss_this > blunder_cp and do_KL_boost:
+                # cat 4: penalize policy on true blunders
+                is_true_blunder = not (played_cp_stm > 350 and Z_stm > 0)
+                if is_true_blunder:
+                    pwht /= KL_coef
+
             self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
             
             board_ch.push(move_ch)
@@ -607,10 +608,7 @@ class Rescorer(object):
 
 # helpers
 def value_weight_for_game(cfg, is_draw):
-    vwht = cfg.value_loss_weight
-    if is_draw:
-        vwht *= cfg.draw_value_scale
-    return vwht
+    return cfg.draw_value_scale if is_draw else 1.0
 
 
 def ensure_all_legal_moves_have_visits(visit_pairs, lms):
@@ -896,39 +894,18 @@ def make_fake_visits(mv, lms, ratio_best=60):
     return visits
 
 
-def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
+def encourage_best_move(visits, played_mv, best_mv, lms):
     """
-    cm: list of {'uci': ..., 'visits': ...}
-    Ensure every legal move in lms appears (min 1) and swap visits
-    for best and played with 30% bump. This stabilizes training.
-    Return list of [uci, int_visits] sorted desc.
+    visits: list of (uci, count) from tree
+    Sets best_mv visits equal to played_mv visits without lowering played_mv.
+    Ensures all legal moves have at least 1 visit.
+    Returns list of [uci, int_visits] sorted desc.
     """
-    # build dict of existing counts (min 1)
-    d = {}
-    for c in cm:
-        u = c.get('uci')
-        v = int(c.get('visits', 1))
-        if u:
-            d[u] = max(1, v)
-
-    # ensure all legal moves exist with min 1
+    d = {u: max(1, int(v)) for u, v in visits if u}
     for m in lms:
         if m not in d:
             d[m] = 1
-
-    # if not a blunder, make best_mv visits = played_mv visits
-    if not was_blunder:
-        d[best_mv] = d[played_mv]
-
-    # otherwise swap visit counts with +/- bumps
-    else:
-        # compute old max
-        old_max = max(d.values()) if d else 1
-        
-        d[played_mv] = int(np.ceil(0.7*d[best_mv]))
-        d[best_mv] = int(np.ceil(1.3*old_max))
-
-    # build sorted list
+    d[best_mv] = max(d.get(best_mv, 1), d.get(played_mv, 1))
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)
     return [[u, int(v)] for u, v in items]
 

@@ -243,7 +243,7 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
     }
-    head_weights = {"policy_logits": 1.0, "value_out": 1.0}
+    head_weights = {"policy_logits": cfg.policy_loss_weight, "value_out": cfg.value_loss_weight}
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=head_weights)
     model._default_opt = opt
     model._default_loss_dict = loss_dict
@@ -404,15 +404,15 @@ def main():
     Y     = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht,    "policy_logits": pwht}
 
-    draw_vwht = cfg.value_loss_weight * cfg.draw_value_scale
     kl_str = (
         f"KL boost x{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
         if cfg.KL_weight_boost != 1.0 else "KL boost disabled"
     )
+    draw_vwht = cfg.draw_value_scale
     print(f"[retrain] weights  lr={cfg.learning_rate}  "
-          f"head policy=1.0  head value=1.0")
-    print(f"[retrain] weights  sample policy={cfg.policy_loss_weight}  "
-          f"sample value={cfg.value_loss_weight} (draw: {draw_vwht:.4f})")
+          f"head policy={cfg.policy_loss_weight}  head value={cfg.value_loss_weight}")
+    print(f"[retrain] weights  sample policy=1.0  "
+          f"sample value=1.0 (draw: {draw_vwht:.4f})")
     print(f"[retrain] weights  {kl_str}")
     for n, w in zip(['vwht', 'pwht'], [vwht, pwht]):
         mn, me, mx = float(w.min()), float(w.mean()), float(w.max())

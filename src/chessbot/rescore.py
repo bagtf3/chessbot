@@ -577,7 +577,7 @@ class Rescorer(object):
             return acc[st]['bmr'] / n if n else float('nan')
 
         def rows(label, acc):
-            hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4} ({pct(acc,st):.0%})  |" for st in stops)
+            hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4}({pct(acc,st):.0%})  |" for st in stops)
             crow = f"{RS}  {label:<12} |" + "".join(f"  CPL {cpl(acc,st):5.2f}  |" for st in stops)
             brow = f"{RS}  {label:<12} |" + "".join(f"  BMR {bmr(acc,st):.3f}  |" for st in stops)
             return hdr, crow, brow

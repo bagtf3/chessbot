@@ -605,9 +605,10 @@ class GameViewer:
         max_d = node.get("max_depth", 0)
         cv = node.get("children_visited", 0)
         tc = node.get("total_children", 0)
+        stop = node.get("stop_reason") or "?"
 
         line = (
-            f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
+            f"  sims={sims}  stop={stop}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
             f"max_depth={max_d} children visited={cv}/{tc}"
         )
         print(line)

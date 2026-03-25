@@ -33,16 +33,19 @@ import pandas as pd
 
 BATCH_SIZE        = 256
 EPOCH_SIZE        = 10_240
-SHUFFLE_BUFFER    = 256_000
+SHUFFLE_BUFFER     = 64_000
+VAL_SHUFFLE_BUFFER = 16_000
 STEPS_PER_EPOCH   = EPOCH_SIZE // BATCH_SIZE
+VAL_FRACTION      = 0.05
+VAL_SPLIT_SEED    = 42
 
-EPOCHS_PER_WORKER = 100
+EPOCHS_PER_WORKER = 150
 CHECKPOINT_EVERY  = 20    # multiple of PLOT_EVERY so checkpoints always land on eval epochs
 PLOT_EVERY        = 10
 
 DEFAULT_LR        = 2e-4
 DEFAULT_MAX_EPOCH = 920
-DEFAULT_MODEL     = "16m-frankenformer-interweaved"
+DEFAULT_MODEL     = "16m-conformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
 LW_SCHEDULE: dict[int, dict[str, float]] = {
@@ -189,7 +192,8 @@ def worker_main(wargs: dict) -> None:
 
     name        = wargs["name"]
     run_dir     = wargs["run_dir"]
-    tfrec_dir   = wargs["tfrec_dir"]
+    train_files = wargs["train_files"]
+    val_files   = wargs["val_files"]
     model_dir   = wargs.get("model_dir", MODEL_DIR)
     start_epoch = wargs["start_epoch"]
     end_epoch   = wargs["end_epoch"]
@@ -266,32 +270,33 @@ def worker_main(wargs: dict) -> None:
             {"policy_logits": weight, "value_out": weight},
         )
 
-    files = sorted(
-        os.path.join(tfrec_dir, f)
-        for f in os.listdir(tfrec_dir)
-        if f.endswith(".tfrecord.gz")
-    )
-    if not files:
-        raise RuntimeError(f"No .tfrecord.gz files in {tfrec_dir}")
+    if not train_files:
+        raise RuntimeError("train_files is empty")
+    if not val_files:
+        raise RuntimeError("val_files is empty")
 
-    print(f"[tfrec] files={len(files)}  shuffle_buffer={SHUFFLE_BUFFER}")
+    print(f"[tfrec] train={len(train_files)}  val={len(val_files)}  shuffle_buffer={SHUFFLE_BUFFER}")
 
-    ds = tf.data.Dataset.from_tensor_slices(files)
-    ds = ds.shuffle(len(files), reshuffle_each_iteration=True)
-    ds = ds.repeat()
-    ds = ds.interleave(
-        lambda p: tf.data.TFRecordDataset(p, compression_type="GZIP"),
-        cycle_length=tf.data.AUTOTUNE,
-        num_parallel_calls=tf.data.AUTOTUNE,
-        deterministic=False,
-    )
-    ds = ds.map(parse_record, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.shuffle(SHUFFLE_BUFFER, reshuffle_each_iteration=True)
-    ds = ds.batch(BATCH_SIZE, drop_remainder=True)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
+    def make_dataset(file_list: list[str], shuffle_buffer: int) -> "tf.data.Dataset":
+        ds = tf.data.Dataset.from_tensor_slices(file_list)
+        ds = ds.shuffle(len(file_list), reshuffle_each_iteration=True)
+        ds = ds.repeat()
+        ds = ds.interleave(
+            lambda p: tf.data.TFRecordDataset(p, compression_type="GZIP"),
+            cycle_length=tf.data.AUTOTUNE,
+            num_parallel_calls=tf.data.AUTOTUNE,
+            deterministic=False,
+        )
+        ds = ds.map(parse_record, num_parallel_calls=tf.data.AUTOTUNE)
+        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+        ds = ds.batch(BATCH_SIZE, drop_remainder=True)
+        ds = ds.prefetch(tf.data.AUTOTUNE)
+        return ds
 
-    prefetcher = EpochBufferThread(ds, STEPS_PER_EPOCH, max_ready=2)
+    prefetcher     = EpochBufferThread(make_dataset(train_files, SHUFFLE_BUFFER),     STEPS_PER_EPOCH, max_ready=2)
+    val_prefetcher = EpochBufferThread(make_dataset(val_files,   VAL_SHUFFLE_BUFFER), STEPS_PER_EPOCH, max_ready=1)
     prefetcher.start()
+    val_prefetcher.start()
 
     def moving_average(arr, window: int) -> np.ndarray:
         s = pd.Series(arr)
@@ -413,11 +418,17 @@ def worker_main(wargs: dict) -> None:
 
         epoch_start = time.time()
 
+        print("-" * 89)
+
+        if ep % PLOT_EVERY == 0:
+            t0 = time.time()
+            val_bundle = val_prefetcher.get()
+            eval_df, last_scatter = do_eval(val_bundle, ep)
+            t_eval += time.time() - t0
+
         t0 = time.time()
         bundle = prefetcher.get()
         t_fetch += time.time() - t0
-
-        print("-" * 89)
 
         t0   = time.time()
         hist = fit_epoch(bundle, target_lw)
@@ -435,11 +446,6 @@ def worker_main(wargs: dict) -> None:
             f"total: {h.get('loss', [float('nan')])[0]:.4f}  "
             f"samples: {total_samples:,}"
         )
-
-        if ep % PLOT_EVERY == 0:
-            t0 = time.time()
-            eval_df, last_scatter = do_eval(bundle, ep)
-            t_eval += time.time() - t0
 
         is_ckpt = ep % CHECKPOINT_EVERY == 0
         if is_ckpt or ep == end_epoch - 1 or ep == max_epoch - 1:
@@ -473,6 +479,7 @@ def worker_main(wargs: dict) -> None:
         print()
 
     prefetcher.stop()
+    val_prefetcher.stop()
     gc.collect()
     print(f"[worker] {name}: block complete (epochs {start_epoch}..{end_epoch - 1})")
 
@@ -520,6 +527,21 @@ def main() -> None:
     print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
     print(f"[supervisor] max_epoch={args.max_epoch}  lr={args.lr}")
 
+    all_files = sorted(
+        os.path.join(args.tfrec_dir, f)
+        for f in os.listdir(args.tfrec_dir)
+        if f.endswith(".tfrecord.gz")
+    )
+    if not all_files:
+        parser.error(f"no .tfrecord.gz files found in {args.tfrec_dir}")
+
+    rng     = np.random.default_rng(VAL_SPLIT_SEED)
+    idx     = rng.permutation(len(all_files))
+    n_val   = max(1, int(len(all_files) * VAL_FRACTION))
+    val_files   = [all_files[i] for i in idx[:n_val]]
+    train_files = [all_files[i] for i in idx[n_val:]]
+    print(f"[supervisor] train_files={len(train_files)}  val_files={len(val_files)}")
+
     resume = get_resume_epoch(run_dir, name)
 
     while resume < args.max_epoch:
@@ -531,7 +553,8 @@ def main() -> None:
         wargs = {
             "name":        name,
             "run_dir":     run_dir,
-            "tfrec_dir":   args.tfrec_dir,
+            "train_files": train_files,
+            "val_files":   val_files,
             "model_dir":   MODEL_DIR,
             "start_epoch": resume,
             "end_epoch":   end_epoch,

@@ -474,20 +474,27 @@ def build_tf_conformer_interweaved(cfg):
         h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(h)
         x = layers.LeakyReLU(0.01, name=f"b{i}_out")(r + h)
 
-    x = layers.Conv2D(
-        cf,
-        1,
-        use_bias=False,
-        padding="same",
-        name="conv_mix",
-    )(x)
-    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
-    x = layers.LeakyReLU(0.01, name="lrelu_mix")(x)
+    # separate mixers — breaks gradient conflict between heads
+    p = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="policy_mix")(x)
+    p = layers.LayerNormalization(axis=-1, name="policy_mix_ln")(p)
+    p = layers.LeakyReLU(0.01, name="policy_mix_act")(p)
 
-    policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(x)
+    v = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="value_mix")(x)
+    v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
+    v = layers.LeakyReLU(0.01, name="value_mix_act")(v)
+
+    # dedicated policy spatial refinement block
+    r = p
+    h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name="policy_res_c1")(p)
+    h = layers.LeakyReLU(0.01, name="policy_res_lr1")(h)
+    h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name="policy_res_c2")(h)
+    h = layers.LayerNormalization(axis=-1, name="policy_res_ln")(h)
+    p = layers.LeakyReLU(0.01, name="policy_res_out")(r + h)
+
+    policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(p)
     policy = layers.Reshape((SEQ_LEN * 67,), name="policy_logits")(policy)
 
-    value = _tf_attn_pool_value_head(x, cf, layers)
+    value = _tf_attn_pool_value_head(v, cf, layers)
 
     model = Model(inp, [policy, value])
     print(f"  TF params: {model.count_params():,}")
@@ -1725,7 +1732,7 @@ def main():
                 tf_infer, tf_model = make_tf_infer(name, cfg)
                 res["TF+XLA"] = speed_test(f"{name}  TF+XLA [fp16]", tf_infer, bs)
 
-                if save and name not in ("16m-conformer-interweaved", "13m-conformer-transheavy"):
+                if save and name not in ("13m-conformer-transheavy",):
                     path = os.path.join(args.model_dir, f"{name}_model.h5")
                     tf_model.save(path)
                     print(f"  Saved TF model → {path}")

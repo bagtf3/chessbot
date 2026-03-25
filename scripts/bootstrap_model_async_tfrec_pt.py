@@ -362,12 +362,15 @@ PT_BUILDERS = {
 TFREC_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
 RUN_DIR   = os.path.join(SP_DIR, "val_test_multi")
 
-batch_size      = 256
-epoch_size      = batch_size * 40
-shuffle_buffer  = 64000
-steps_per_epoch = epoch_size // batch_size
-MAX_EPOCH       = 780
-PLOT_EVERY      = 10
+batch_size         = 256
+epoch_size         = batch_size * 40
+shuffle_buffer     = 64_000
+val_shuffle_buffer = 16_000
+steps_per_epoch    = epoch_size // batch_size
+MAX_EPOCH          = 780
+PLOT_EVERY         = 10
+VAL_FRACTION       = 0.05
+VAL_SPLIT_SEED     = 42
 LR = 2e-4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -429,10 +432,9 @@ def parse_record(raw):
     )
 
 
-def make_batch_stream(tfrec_dir, batch_size, shuffle_buffer):
-    file_list = list_tfrecord_files(tfrec_dir)
+def make_batch_stream(file_list, batch_size, shuffle_buffer):
     if not file_list:
-        raise RuntimeError(f"No .tfrecord.gz files in {tfrec_dir}")
+        raise RuntimeError("file_list is empty")
 
     ds = tf.data.Dataset.from_tensor_slices(file_list)
     ds = ds.shuffle(len(file_list), reshuffle_each_iteration=True)
@@ -735,9 +737,17 @@ for name in MODEL_DEFS:
         "epoch":           0,
     })
 
-n_files = len(list_tfrecord_files(TFREC_DIR))
+all_files = list_tfrecord_files(TFREC_DIR)
+if not all_files:
+    raise RuntimeError(f"No .tfrecord.gz files in {TFREC_DIR}")
+rng       = np.random.default_rng(VAL_SPLIT_SEED)
+idx       = rng.permutation(len(all_files))
+n_val     = max(1, int(len(all_files) * VAL_FRACTION))
+val_files   = [all_files[i] for i in idx[:n_val]]
+train_files = [all_files[i] for i in idx[n_val:]]
 print(
-    f"[tfrec] files={n_files}  shuffle_buffer={shuffle_buffer}  "
+    f"[tfrec] train={len(train_files)}  val={len(val_files)}  "
+    f"shuffle_buffer={shuffle_buffer}  val_shuffle_buffer={val_shuffle_buffer}  "
     f"epoch_size={epoch_size}  steps_per_epoch={steps_per_epoch}  "
     f"batch_size={batch_size}"
 )
@@ -758,9 +768,16 @@ try:
         ms["metrics_history"] = {"value_mse": [], "value_corr": []}
         ms["epoch"]           = 0
 
-        batch_stream = make_batch_stream(TFREC_DIR, batch_size, shuffle_buffer)
-        worker = EpochBufferWorker(batch_stream, steps_per_epoch, max_ready=2)
+        worker = EpochBufferWorker(
+            make_batch_stream(train_files, batch_size, shuffle_buffer),
+            steps_per_epoch, max_ready=2,
+        )
+        val_worker = EpochBufferWorker(
+            make_batch_stream(val_files, batch_size, val_shuffle_buffer),
+            steps_per_epoch, max_ready=1,
+        )
         worker.start()
+        val_worker.start()
 
         epoch           = 0
         epoch_time_list = []
@@ -779,16 +796,18 @@ try:
                 lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
                 print(f"[lw update  ] {name} epoch {ep}: {lw_str}")
 
+            print("-" * 89)
+
+            if do_plot:
+                t0 = time.time()
+                val_bundle = val_worker.get()
+                do_eval(ms, val_bundle, batch_size, DEVICE)
+                t_eval += time.time() - t0
+
             t0 = time.time()
             bundle = worker.get()
             t_fetch += time.time() - t0
 
-            if do_plot:
-                t0 = time.time()
-                do_eval(ms, bundle, batch_size, DEVICE)
-                t_eval += time.time() - t0
-
-            print("-" * 89)
             t0 = time.time()
             p_loss, v_loss, t_loss = fit_epoch(ms, bundle, batch_size, target_lw, DEVICE)
             t_fit += time.time() - t0
@@ -849,6 +868,7 @@ try:
             print()
 
         worker.stop()
+        val_worker.stop()
         save_pt_model(ms)
 
         del ms["model"], ms["optimizer"], ms["scaler"]

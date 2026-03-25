@@ -545,7 +545,7 @@ class Rescorer(object):
         self.games_processed += 1
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
-        if self.games_processed % 150 == 0:
+        if self.games_processed % 100 == 0:
             self.print_stop_stats()
         if len(self.analyzed_results) >= self.config.post_hoc_analyze_batch:
             self.push_analyzed(report=True)

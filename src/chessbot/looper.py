@@ -656,7 +656,7 @@ class GameLooper(object):
 
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
 
-        if random.random() < 0.05:
+        if random.random() < 0.10:
            self.print_and_reset_es_stats()
 
         return True
@@ -670,39 +670,39 @@ class GameLooper(object):
         
         if not totals:
             return
+        return
+        # rsc  = totals.get('rsc_es_granted', 0)
+        # jsd  = totals.get('jsd_es_granted', 0)
+        # full = totals.get('no_es_full_sims', 0)
 
-        rsc  = totals.get('rsc_es_granted', 0)
-        jsd  = totals.get('jsd_es_granted', 0)
-        full = totals.get('no_es_full_sims', 0)
+        # rsc_total = rsc + totals.get('rsc_granted_single', 0)
+        # rsc_avg  = totals.get('rsc_sims_sum',  0) / rsc_total if rsc_total > 0 else 0.0
+        # jsd_avg  = totals.get('jsd_sims_sum',  0) / jsd  if jsd  > 0 else 0.0
+        # full_avg = totals.get('full_sims_sum', 0) / full if full > 0 else 0.0
 
-        rsc_total = rsc + totals.get('rsc_granted_single', 0)
-        rsc_avg  = totals.get('rsc_sims_sum',  0) / rsc_total if rsc_total > 0 else 0.0
-        jsd_avg  = totals.get('jsd_sims_sum',  0) / jsd  if jsd  > 0 else 0.0
-        full_avg = totals.get('full_sims_sum', 0) / full if full > 0 else 0.0
+        # jsd_frac = jsd / (jsd + full + rsc) if (jsd + full + rsc) > 0 else 0.0
 
-        jsd_frac = jsd / (jsd + full + rsc) if (jsd + full + rsc) > 0 else 0.0
+        # skip = {'rsc_es_granted', 'jsd_es_granted', 'rsc_granted_single',
+        #         'no_es_full_sims', 'rsc_sims_sum', 'jsd_sims_sum', 'full_sims_sum'}
+        # fails = {k: v for k, v in totals.items() if k not in skip}
+        # top_fails = sorted(fails.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        skip = {'rsc_es_granted', 'jsd_es_granted', 'rsc_granted_single',
-                'no_es_full_sims', 'rsc_sims_sum', 'jsd_sims_sum', 'full_sims_sum'}
-        fails = {k: v for k, v in totals.items() if k not in skip}
-        top_fails = sorted(fails.items(), key=lambda x: x[1], reverse=True)[:5]
+        # tag = f"[es w={self.id}]"
+        # rsc_s  = f"rsc={rsc}";   rsc_a  = f"rsc={rsc_avg:.1f}"
+        # full_s = f"full={full}"; full_a = f"full={full_avg:.1f}"
+        # jsd_s  = f"jsd={jsd}";  jsd_a  = f"jsd={jsd_avg:.1f}"
+        # w1 = max(len(rsc_s), len(rsc_a))
+        # w2 = max(len(full_s), len(full_a))
+        # w3 = max(len(jsd_s), len(jsd_a))
 
-        tag = f"[es w={self.id}]"
-        rsc_s  = f"rsc={rsc}";   rsc_a  = f"rsc={rsc_avg:.1f}"
-        full_s = f"full={full}"; full_a = f"full={full_avg:.1f}"
-        jsd_s  = f"jsd={jsd}";  jsd_a  = f"jsd={jsd_avg:.1f}"
-        w1 = max(len(rsc_s), len(rsc_a))
-        w2 = max(len(full_s), len(full_a))
-        w3 = max(len(jsd_s), len(jsd_a))
+        # print(f"{tag} stops: {rsc_s:<{w1}} {full_s:<{w2}} {jsd_s:<{w3}} jsd_frac={jsd_frac:.2f}")
+        # print(f"{tag} sims:  {rsc_a:<{w1}} {full_a:<{w2}} {jsd_a:<{w3}}")
 
-        print(f"{tag} stops: {rsc_s:<{w1}} {full_s:<{w2}} {jsd_s:<{w3}} jsd_frac={jsd_frac:.2f}")
-        print(f"{tag} sims:  {rsc_a:<{w1}} {full_a:<{w2}} {jsd_a:<{w3}}")
-
-        fails1 = "  ".join(f"{k}={v}" for k, v in top_fails[:3])
-        fails2 = "  ".join(f"{k}={v}" for k, v in top_fails[3:])
-        print(f"{tag} fails: {fails1}")
-        if fails2:
-            print(f"{tag}        {fails2}")
+        # fails1 = "  ".join(f"{k}={v}" for k, v in top_fails[:3])
+        # fails2 = "  ".join(f"{k}={v}" for k, v in top_fails[3:])
+        # print(f"{tag} fails: {fails1}")
+        # if fails2:
+        #     print(f"{tag}        {fails2}")
     
     def update_partial_telemetry(self):
         """send a partial update to the telemetry for more time sensitive metrics"""

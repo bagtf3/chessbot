@@ -601,7 +601,7 @@ class Rescorer(object):
         print(tb)
 
         for st in stops:
-            self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0}
+            self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
 
     def push_analyzed(self, report=True):
         # safeguard here

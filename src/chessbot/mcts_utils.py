@@ -12,7 +12,7 @@ from chessbot import ENDGAME_LOC
 from chessbot.review import score_to_value_stm_pov
 from chessbot.utils import rnd
 import chessbot.utils as cbu
-from collections import defaultdict, namedtuple
+from collections import namedtuple
 
 ESCheck = namedtuple('ESCheck', [
     'sims', 'jsd', 'top_uci', 'second_uci', 'third_uci',
@@ -80,15 +80,8 @@ class MCTSTree(fasttree):
         self._es_tripped = False
         self.sim_stop_reason = ""
 
-        # for early stop bookkeeping
-        self.most_visited = []
-        self.runner_up = []
-        self.visit_delta = []
         self.es_checks = []
         self.es_jsd_thresh = float(cbu.maybe_random_from_list(cfg.es_jsd_thresh))
-
-        self.es_fails = defaultdict(int)
-        self.es_times = []
 
     def best(self):
         """
@@ -217,9 +210,6 @@ class MCTSTree(fasttree):
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
 
-        self.most_visited.clear()
-        self.runner_up.clear()
-        self.visit_delta.clear()
         self.es_checks.clear()
 
     def set_new_sims_ceiling(self, n_plies=None):
@@ -327,30 +317,24 @@ class MCTSTree(fasttree):
     def rsc_performance_stop(self, rsc, details):
         """Rule 1: stop immediately if RSC clearly confirms the top move."""
         if not rsc or len(rsc) < 2:
-            self.es_fails['rsc_granted_single'] += 1
             return True
 
         d0 = details[0]
         if max(rsc, key=rsc.get) != d0.uci:
-            self.es_fails['not_best_rsc'] += 1
             return False
 
         if d0.visit_share < 0.15:
-            self.es_fails['vs_under_15'] += 1
             return False
 
         vals = sorted(rsc.values(), reverse=True)
         if vals[0] - vals[1] < 0.05:
-            self.es_fails['rsc_delta_under_05'] += 1
             return False
 
         dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
         if d0.Qdelta_sign < 0.0 and len(dS_dict) >= 3:
             if d0.uci in sorted(dS_dict, key=dS_dict.get)[:2]:
-                self.es_fails['dS_in_bottom_2'] += 1
                 return False
-
-        self.es_fails['rsc_es_granted'] += 1
+        
         return True
 
     def jsd_convergence_stop(self):
@@ -364,23 +348,18 @@ class MCTSTree(fasttree):
         recent = self.es_checks[-n:]
 
         if any(c.jsd > self.es_jsd_thresh for c in recent):
-            self.es_fails['jsd_too_high'] += 1
             return False
 
         if len(set(c.top_uci for c in recent)) > 1:
-            self.es_fails['jsd_top_move_unstable'] += 1
             return False
 
         if recent[-1].delta_12 < cfg.es_jsd_min_delta:
-            self.es_fails['jsd_delta_too_small'] += 1
             return False
 
         deltas = [c.delta_12 for c in recent]
         if not all(deltas[i] >= deltas[i-1] for i in range(1, len(deltas))):
-            self.es_fails['jsd_gap_closing'] += 1
             return False
-
-        self.es_fails['jsd_es_granted'] += 1
+        
         return True
 
     def maybe_early_stop(self):
@@ -394,8 +373,6 @@ class MCTSTree(fasttree):
             return False
 
         if sims_done >= self.sims_ceiling:
-            self.es_fails['no_es_full_sims'] += 1
-            self.es_fails['full_sims_sum'] += sims_done
             self._es_tripped = True
             self.sim_stop_reason = "full"
             return True
@@ -414,10 +391,6 @@ class MCTSTree(fasttree):
         d0, d1 = details[0], details[1]
         visit_delta = d0.N - d1.N
 
-        self.most_visited.append(d0.uci)
-        self.runner_up.append(d1.uci)
-        self.visit_delta.append(visit_delta)
-
         self.record_es_check(details, sims_done)
 
         # Rule 1: RSC performance stop
@@ -426,19 +399,14 @@ class MCTSTree(fasttree):
                 if self.rsc_performance_stop(rsc, details):
                     self._es_tripped = True
                     self.sim_stop_reason = "rsc"
-                    self.es_fails['rsc_sims_sum'] += sims_done
-                    self.es_times.append(_now() - es_time_start)
                     return True
 
         # Rule 2: JSD convergence stop
         if self.jsd_convergence_stop():
             self._es_tripped = True
             self.sim_stop_reason = "jsd"
-            self.es_fails['jsd_sims_sum'] += sims_done
-            self.es_times.append(_now() - es_time_start)
             return True
-
-        self.es_times.append(_now() - es_time_start)
+        
         return False
 
     def stop_simulating(self):

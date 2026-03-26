@@ -19,6 +19,7 @@ class Config(object):
     n_workers = 2
     n_rounds = 51
     multiplex_models = []   # list of model paths; workers round-robin through them
+    custom_worker_configs = {}  # int-keyed per-worker config overrides; falsey = disabled
 
     # MCTS (float or list)
     c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]

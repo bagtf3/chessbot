@@ -73,6 +73,10 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         c.id = f"w{i}"
         if multiplex:
             c.model_path = multiplex[i % len(multiplex)]
+        if cfg.custom_worker_configs:
+            worker_overrides = cfg.custom_worker_configs.get(i, {})
+            if worker_overrides:
+                c.update(worker_overrides)
         #if not cfg.is_validation_run and i > 1:
         #    c.play_vs_sf_prob = 0.0
 

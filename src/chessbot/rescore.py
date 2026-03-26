@@ -56,7 +56,7 @@ class Rescorer(object):
         self.last_10_cpls = []
         self.last_10_bmrs = []
 
-        zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0}
+        zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
         self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
@@ -432,7 +432,7 @@ class Rescorer(object):
                 res['best_cp'], loss_this, res['played_cp'],
                 res['best_absolute'], res['played_absolute'],
                 board_ch.turn, loss_this,
-                tr.get("stop_reason", "")
+                tr.get("stop_reason", ""), tr.get("sims", 0)
             ])
 
             if skip_all_training:
@@ -498,7 +498,7 @@ class Rescorer(object):
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
-            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason'
+            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims'
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
@@ -537,6 +537,7 @@ class Rescorer(object):
                 'n': int(n_st),
                 'cpl': rnd(out_df.loc[mask_st, 'delta'].mean(), 3) if n_st else np.nan,
                 'bmr': out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan,
+                'sims': float(out_df.loc[mask_st, 'sims'].mean()) if n_st else float('nan'),
             }
         out['stop_stats'] = stop_stats
 
@@ -559,6 +560,8 @@ class Rescorer(object):
                 acc[st]['n'] += n
                 acc[st]['cpl'] += s['cpl'] * n
                 acc[st]['bmr'] += s['bmr'] * n
+                if not np.isnan(s.get('sims', float('nan'))):
+                    acc[st]['sims'] += s['sims'] * n
 
     def print_stop_stats(self):
         stops = ("full", "rsc", "jsd")
@@ -576,15 +579,21 @@ class Rescorer(object):
             n = acc[st]['n']
             return acc[st]['bmr'] / n if n else float('nan')
 
+        def avg_sims(acc, st):
+            n = acc[st]['n']
+            return round(acc[st]['sims'] / n) if n else 0
+
         def rows(label, acc):
             hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4}({pct(acc,st):.0%})  |" for st in stops)
             crow = f"{RS}  {label:<12} |" + "".join(f"  CPL {cpl(acc,st):5.2f}  |" for st in stops)
             brow = f"{RS}  {label:<12} |" + "".join(f"  BMR {bmr(acc,st):.3f}  |" for st in stops)
             return hdr, crow, brow
 
-        wh, wc, wb = rows("last 150", self.window_stop)
+        wh, wc, wb = rows("last 100", self.window_stop)
         th, tc, tb = rows("overall",  self.total_stop)
+        srow = f"{RS}  {'avg sims':<12} |" + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops)
         print(wh)
+        print(srow)
         print(wc)
         print(wb)
         print()

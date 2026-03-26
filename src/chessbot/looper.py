@@ -555,7 +555,7 @@ class GameLooper(object):
             for td in game.tree_data.values():
                 for k in q_keys:
                     if k in td:
-                        td[k] = td[k] / vs
+                        td[k] = np.clip(td[k] / vs, -1.0, 1.0)
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data

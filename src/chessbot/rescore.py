@@ -138,9 +138,9 @@ class Rescorer(object):
         # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        uniform_eps = getattr(self.config, 'uniform_eps', 0.05)
-        uniform_mass = uniform_eps/len(ucis) if len(ucis) else 0.0
-        pi = uniform_mass + (1.0 - uniform_eps) * pi
+        eps = getattr(self.config, 'uniform_eps', 0.05)
+        uniform_mass = 1/len(ucis) if len(ucis) else 0.0
+        pi = eps*uniform_mass + (1.0 - eps) * pi
         pi = np.clip(pi, 0.0, 0.8)
         pi = pi / pi.sum()
 

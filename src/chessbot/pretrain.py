@@ -24,7 +24,7 @@ import pandas as pd
 
 BATCH_SIZE         = 256
 EPOCH_SIZE         = 10_240
-SHUFFLE_BUFFER     = 64_000
+SHUFFLE_BUFFER     = 256_000
 VAL_SHUFFLE_BUFFER = 16_000
 STEPS_PER_EPOCH    = EPOCH_SIZE // BATCH_SIZE
 VAL_FRACTION       = 0.05
@@ -40,9 +40,9 @@ DEFAULT_MAX_EPOCH  = 920
 # Loss-weight schedule with cosine decay
 # ---------------------------------------------------------------------------
 
-VALUE_POLICY_RATIO = 4.0
+VALUE_POLICY_RATIO = 8.0
 LW_DECAY_START     = 1.25   # policy weight at epoch 10
-LW_DECAY_END       = 0.25   # policy weight at DEFAULT_MAX_EPOCH
+LW_DECAY_END       = 0.15   # policy weight at DEFAULT_MAX_EPOCH
 
 LW_SCHEDULE: dict[int, dict[str, float]] = {
     0:  {"policy_logits": 0.10, "value_out": 0.10},

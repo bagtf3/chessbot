@@ -26,7 +26,7 @@ RUN_TAGS = ["cf_10x256x5_full_sims2", "film_16M_low_sims1"]
 DRAW_RATE = 0.5
 MAX_CPL = 45       # game-level CPL filter (mean clipped loss across game)
 CPL_THRESHOLD = 60 # per-ply CPL filter passed to generate_training_data
-SHARD_GAMES = 250
+SHARD_GAMES = 50
 N_WORKERS = max([1, os.cpu_count() - 2])
 
 
@@ -161,36 +161,15 @@ def iter_game_records(game, sf_df):
         yield make_example(enc_in, mask, policy, value, weight)
 
 
-def write_shard(shard_path, games, sf_df):
-    n_games = 0
-    n_pos = 0
-
-    options = tf.io.TFRecordOptions(compression_type="GZIP")
-    with tf.io.TFRecordWriter(shard_path, options=options) as w:
-        for game in games:
-            wrote_any = False
-
-            for rec in iter_game_records(game, sf_df):
-                w.write(rec)
-                n_pos += 1
-                wrote_any = True
-
-            if wrote_any:
-                n_games += 1
-
-    return n_games, n_pos
-
-
 def make_jobs(games_by_run):
-    jobs = []
-    shard_id = 0
-
+    all_games = []
     for run_tag, games in games_by_run.items():
-        for i in range(0, len(games), SHARD_GAMES):
-            jobs.append((shard_id, run_tag, games[i:i + SHARD_GAMES]))
-            shard_id += 1
-
-    random.shuffle(jobs)
+        for game in games:
+            all_games.append((run_tag, game))
+    random.shuffle(all_games)
+    jobs = []
+    for i in range(0, len(all_games), SHARD_GAMES):
+        jobs.append((i // SHARD_GAMES, all_games[i:i + SHARD_GAMES]))
     return jobs
 
 
@@ -201,22 +180,39 @@ def worker_init(seed_base):
 
 
 def process_shard(job):
-    shard_id, run_tag, games = job
-    game_ids = [g["game_id"] for g in games]
-    sf_df = load_sf_df_for_games(run_tag, game_ids)
+    shard_id, tagged_games = job
 
-    shard_name = f"{run_tag}_train_{shard_id:05d}.tfrecord.gz"
+    by_run = {}
+    for run_tag, game in tagged_games:
+        by_run.setdefault(run_tag, []).append(game)
+
+    records = []
+    n_games = 0
+    sf_rows = 0
+    for run_tag, games in by_run.items():
+        sf_df = load_sf_df_for_games(run_tag, [g["game_id"] for g in games])
+        sf_rows += len(sf_df)
+        for game in games:
+            recs = list(iter_game_records(game, sf_df))
+            if recs:
+                records.extend(recs)
+                n_games += 1
+
+    random.shuffle(records)
+
+    shard_name = f"train_{shard_id:05d}.tfrecord.gz"
     shard_path = os.path.join(OUT_DIR, shard_name)
-
-    n_games, n_pos = write_shard(shard_path, games, sf_df)
+    options = tf.io.TFRecordOptions(compression_type="GZIP")
+    with tf.io.TFRecordWriter(shard_path, options=options) as w:
+        for rec in records:
+            w.write(rec)
 
     return {
         "shard_id": shard_id,
-        "run_tag": run_tag,
         "shard_name": shard_name,
         "n_games": n_games,
-        "n_pos": n_pos,
-        "sf_rows": len(sf_df),
+        "n_pos": len(records),
+        "sf_rows": sf_rows,
     }
 
 
@@ -235,7 +231,6 @@ def main():
         print(f"  {rt}: {len(games_by_run.get(rt, []))}")
 
     jobs = make_jobs(games_by_run)
-    random.shuffle(jobs)
 
     total_games = 0
     total_pos = 0
@@ -275,7 +270,7 @@ def main():
                 pct = min([100.0, pct])
 
                 print(
-                    f"[{res['shard_id']:05d}] {res['run_tag']}  "
+                    f"[{res['shard_id']:05d}]  "
                     f"games={res['n_games']}  "
                     f"positions={res['n_pos']}  "
                     f"sf_rows={res['sf_rows']}  "

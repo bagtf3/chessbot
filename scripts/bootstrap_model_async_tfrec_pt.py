@@ -368,9 +368,7 @@ RUN_DIR   = os.path.join(SP_DIR, "val_test_multi")
 DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODEL_DEFS = [
-    "13m-conformer-transheavy",
     "16m-transformer",
-    # "16m-conformer-interweaved",
 ]
 
 

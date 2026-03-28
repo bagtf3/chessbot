@@ -567,7 +567,7 @@ class Rescorer(object):
                     acc[st]['sims'] += s['sims'] * n
 
     def print_stop_stats(self):
-        stops = ("full", "rsc", "jsd")
+        stops = ("rsc", "jsd", "full")
 
         def pct(acc, st):
             total_n = sum(acc[s]['n'] for s in stops)

@@ -263,7 +263,7 @@ class GameViewer:
             san = self.board.san(mv)
             n     = r.get("N", 0)
             p_lc0 = r.get("P_pct", 0.0) / 100.0
-            q_lc0 = r.get("Q", 0.0) * sign
+            q_lc0 = r.get("Q", 0.0)
             d     = r.get("D", 0.0)
 
             xc0   = xc0_map.get(mv)
@@ -296,7 +296,7 @@ class GameViewer:
             if upcoming_uci not in top_ucis:
                 match = next((r for r in all_rows if r["move"] == upcoming_uci), None)
                 if match:
-                    q_lc0 = match.get("Q", 0.0) * sign
+                    q_lc0 = match.get("Q", 0.0)
                     n     = match.get("N", 0)
                     print(
                         f"\nPlayed {upcoming_san} not in top-5:"

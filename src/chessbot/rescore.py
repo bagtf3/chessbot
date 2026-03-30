@@ -56,6 +56,11 @@ class Rescorer(object):
         self.last_10_cpls = []
         self.last_10_bmrs = []
 
+        zero_collar = lambda: {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+        self.collar_total = zero_collar()
+        self.collar_window = zero_collar()
+        self.collar_history = []
+
         zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
         self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
@@ -123,35 +128,24 @@ class Rescorer(object):
         self.n_sf_played = 0
         self.sf_max = [0.0]*10
     
-    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
-        """
-        Snapshot inputs and a flat 4288-length policy vector for training.
-        - ucis: list[str] legal moves (same order as probs)
-        - pi:  list/array of probs (sum ~= 1)
-        - Y: target for value head
-        """
-        
-        # get indices from C++
-        indices = board.moves_to_indices(ucis)  # list of int (0..4288)
+    def make_policy_example(self, board, ucis, visits):
+        indices = board.moves_to_indices(ucis)
         policy = np.zeros(64 * 67, dtype=np.float32)
-
-        # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
         eps = getattr(self.config, 'uniform_eps', 0.05)
-        uniform_mass = 1/len(ucis) if len(ucis) else 0.0
-        pi = eps*uniform_mass + (1.0 - eps) * pi
+        uniform_mass = 1 / len(ucis) if len(ucis) else 0.0
+        pi = eps * uniform_mass + (1.0 - eps) * pi
         pi = np.clip(pi, 0.0, 0.8)
         pi = pi / pi.sum()
-
-        # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
             policy[idx] += p
-
-        # snapshot inputs and push example
         x = board.encode_64_tokens()
         mask = board.legal_move_mask()
+        return x, mask, policy
 
+    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
+        x, mask, policy = self.make_policy_example(board, ucis, visits)
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
     
     def write_training_data_pkl(self, size=None, randomize=True):
@@ -331,6 +325,8 @@ class Rescorer(object):
         cpl_s = cpl_w = cpl_b = 0.0
         nw = nb = 0
         rows = []
+        eval_trace = []
+        pending = []
         
         # set a flag in case we want to skip all training data
         skip_all_training = False
@@ -415,6 +411,7 @@ class Rescorer(object):
 
             xerces_ch = chess.Move.from_uci(xerces_uci_for_cpl)
             res = self.analyze_with_rank(xerces_ch, board_ch)
+            eval_trace.append((i, res['best_absolute']))
 
             loss_this = res['delta_signed']
             cpl_s += loss_this
@@ -492,10 +489,29 @@ class Rescorer(object):
                 if is_true_blunder:
                     pwht /= KL_coef
 
-            self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
-            
+            x, mask, policy = self.make_policy_example(b_fast, mvs, vis)
+            pending.append((x, mask, policy, Q, bool(turn), i, vwht, pwht))
+
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
+
+        # collar rescore: compute effective Z per ply, emit buffered examples
+        cfg = self.config
+        eff_z_by_ply, n_triggers = collar_z_map(
+            eval_trace, result,
+            cfg.collar_threshold_cp, cfg.collar_n_consec, cfg.collar_reset_cp,
+        )
+        n_diff = 0
+        for (x, mask, policy, Q, is_white, ply, vwht, pwht) in pending:
+            z_orig = result if is_white else -result
+            eff_z_white = eff_z_by_ply.get(ply, float(result))
+            z_eff = eff_z_white if is_white else -eff_z_white
+            if eff_z_white != float(result):
+                n_diff += 1
+            z = z_orig if cfg.collar_rescore_dry_run else z_eff
+            Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
+            self.training_data.append((x, mask, policy, Y, vwht, pwht))
+        self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
         # assemble df and summary
         cols = [
@@ -554,6 +570,15 @@ class Rescorer(object):
         if len(self.analyzed_results) >= self.config.post_hoc_analyze_batch:
             self.push_analyzed(report=True)
         
+    def accumulate_collar_stats(self, n_triggers, n_diff, n_total):
+        has_collar = n_triggers > 0
+        for acc in (self.collar_total, self.collar_window):
+            acc['seen'] += 1
+            acc['triggers'] += n_triggers
+            acc['games'] += int(has_collar)
+            acc['positions'] += n_diff
+            acc['total_pos'] += n_total
+
     def accumulate_stop_stats(self, stop_stats):
         for st, s in stop_stats.items():
             n = s['n']
@@ -594,17 +619,43 @@ class Rescorer(object):
 
         wh, wc, wb = rows("last 100", self.window_stop)
         th, tc, tb = rows("overall",  self.total_stop)
-        srow = f"{RS}  {'avg sims':<12} |" + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops)
+        tph = (f"{RS}  {'':<12} |"
+               + "".join(f"  {st:<4}({pct(self.total_stop,st):.0%})  |" for st in stops))
+        srow = (f"{RS}  {'avg sims':<12} |"
+                + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops))
         print(wh)
         print(srow)
         print(wc)
         print(wb)
         print()
+        print(tph)
         print(tc)
         print(tb)
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
+
+    def print_collar_stats(self):
+        dry = " [dry]" if self.config.collar_rescore_dry_run else ""
+
+        def fmt_row(label, s):
+            pos_pct = (s['positions'] / s['total_pos'] * 100) if s['total_pos'] else 0.0
+            return (
+                f"{RS} Collar{dry}  {label:<12}"
+                f"  trigs {s['triggers']:>4}"
+                f"  collar_games {s['games']:>3}/{s['seen']:<3}"
+                f"  pos {s['positions']:>5} ({pos_pct:.1f}%)"
+            )
+
+        w = self.collar_window
+        print(fmt_row(f"batch {w['seen']:>3}:", w))
+
+        if len(self.collar_history) >= 10:
+            combined = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+            for h in self.collar_history[-10:]:
+                for k in combined:
+                    combined[k] += h[k]
+            print(fmt_row("last 300:", combined))
 
     def push_analyzed(self, report=True):
         # safeguard here
@@ -663,13 +714,102 @@ class Rescorer(object):
                     f"max {self.sf_max[-1]:.3f}"
                 )
             
+            self.print_collar_stats()
+
             w_this = self.written_this_round
             wtot = self.written_total
             print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
-        
+
+        self.collar_history.append(dict(self.collar_window))
+        self.collar_history = self.collar_history[-10:]
+        zero_collar = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+        self.collar_window = dict(zero_collar)
+
         self.analyzed_results = []
 
 # helpers
+def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
+    """
+    Walk eval_trace (list of (ply, white_pov_cp)) and return
+    (eff_z_by_ply, n_triggers).
+
+    eff_z_by_ply: dict[ply -> white-pov effective result]
+      - positions inside a collar segment: +1.0 or -1.0 (collar winner)
+      - positions outside any collar: float(game_result)
+    n_triggers: number of collar resets (blunder-induced segment splits)
+
+    Collar activates after n_consec consecutive plies above threshold (white)
+    or below -threshold (black), retroactively marking those plies.
+    Collar resets when the eval crosses back within reset_cp of zero.
+    The reset ply itself starts the new segment (gets game_result).
+    """
+    if not eval_trace:
+        return {}, 0
+
+    plies = [p for p, _ in eval_trace]
+    evals = [e for _, e in eval_trace]
+    n = len(evals)
+
+    collar_state = [None] * n
+    collar = None
+    count = 0
+    run_start = 0
+    segment_start = 0
+
+    for i, ev in enumerate(evals):
+        if collar is None:
+            if ev > threshold:
+                if count <= 0:
+                    count = 0
+                    run_start = i
+                count += 1
+            elif ev < -threshold:
+                if count >= 0:
+                    count = 0
+                    run_start = i
+                count -= 1
+            else:
+                count = 0
+
+            if count >= n_consec:
+                for j in range(segment_start, i + 1):
+                    collar_state[j] = 'white'
+                collar = 'white'
+                count = 0
+            elif count <= -n_consec:
+                for j in range(segment_start, i + 1):
+                    collar_state[j] = 'black'
+                collar = 'black'
+                count = 0
+        else:
+            broken = (
+                (collar == 'white' and ev < reset_cp) or
+                (collar == 'black' and ev > -reset_cp)
+            )
+            if broken:
+                segment_start = i
+                collar = None
+                count = 0
+            else:
+                collar_state[i] = collar
+
+    n_triggers = sum(
+        1 for i in range(1, n)
+        if collar_state[i - 1] is not None and collar_state[i] is None
+    )
+
+    eff_z = {}
+    for i, ply in enumerate(plies):
+        if collar_state[i] == 'white':
+            eff_z[ply] = 1.0
+        elif collar_state[i] == 'black':
+            eff_z[ply] = -1.0
+        else:
+            eff_z[ply] = float(game_result)
+
+    return eff_z, n_triggers
+
+
 def value_weight_for_game(cfg, is_draw):
     return cfg.draw_value_scale if is_draw else 1.0
 

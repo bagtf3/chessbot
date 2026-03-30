@@ -584,7 +584,6 @@ class ChessGame(object):
         data['best_Q'] = best_q
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
-
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 

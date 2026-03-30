@@ -926,9 +926,13 @@ class GameViewer:
 
     def replay(self):
         print(f"Replaying {self.log['scenario']}. Result {self.log['result']}")
-        # flip the board if sf plays white
         sf_color = self.log.get("stockfish_color", None)
-        flipped = sf_color if sf_color else False
+        vs_stockfish = self.log.get("vs_stockfish", False)
+        if vs_stockfish:
+            flipped = sf_color if sf_color else False
+        else:
+            result = self.log.get("result", 0)
+            flipped = result < 0
         print("Controls: Enter/Space=forward, b=back, q=quit, o=options")
         shown = False
         while True:

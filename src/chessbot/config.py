@@ -81,6 +81,11 @@ class Config(object):
     post_hoc_analyze_batch = 30
     post_hoc_depth = 12
     post_hoc_equiv_range = 30
+
+    collar_rescore_dry_run = True
+    collar_threshold_cp = 300
+    collar_n_consec = 5
+    collar_reset_cp = 50
     train_on_stockfish = True
     train_on_validation = False
 

@@ -17,12 +17,10 @@ import time
 import gc
 
 import numpy as np
-import pandas as pd
 
 import tensorflow as tf
 
 from chessbot.config import Config
-import chessbot.utils as cbu
 
 
 TFREC_FEATURE_SPEC = {
@@ -265,23 +263,6 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
         print(f"{tag} no prior optimizer checkpoint - starting fresh")
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
-    if os.path.exists(cfg.progress_csv_path):
-        all_evals = pd.read_csv(cfg.progress_csv_path)
-    else:
-        all_evals = pd.DataFrame()
-
-    t0 = time.time()
-    preds = model.predict(X, verbose=0, batch_size=128)
-    timings['predict'] = timings.get('predict', 0.0) + (time.time() - t0)
-
-    csv_file = os.path.join(cfg.run_dir, "true_vs_pred_latest.csv")
-    t0 = time.time()
-    eval_df = cbu.score_game_data(None, X, M, Y, epoch, save_path=csv_file, preds=preds)
-    timings['metrics'] = timings.get('metrics', 0.0) + (time.time() - t0)
-
-    all_evals = pd.concat([all_evals, eval_df])
-    all_evals.round(5).to_csv(cfg.progress_csv_path, index=False)
-
     t0 = time.time()
     history = model.fit(
         {"enc_in": X}, Y, epochs=args.epochs, batch_size=args.batch_size,
@@ -316,20 +297,11 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
 
 
 def print_timings(timings):
-    order = [
-        ('tf_init',     'tf init'),
-        ('load_shards', 'load shards'),
-        ('load_model',  'load model'),
-        ('predict',     'predict'),
-        ('metrics',     'metrics'),
-        ('fit',         'fit'),
-        ('save',        'save'),
-        ('total',       'total'),
-    ]
-    print("[retrain] timing")
-    for key, label in order:
+    parts = []
+    for key, label in [('load_shards', 'shards'), ('fit', 'fit'), ('total', 'total')]:
         if key in timings:
-            print(f"  {label:<12} {timings[key]:6.1f}s")
+            parts.append(f"{label}={timings[key]:.1f}s")
+    print(f"[retrain] {' '.join(parts)}")
 
 
 def main():
@@ -337,8 +309,7 @@ def main():
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--skip-plots", action="store_true",
-                   help="skip scatter plot save")
+    p.add_argument("--epoch", type=int, default=0, help="retrain epoch number for logging")
     args = p.parse_args()
 
     t_total = time.time()
@@ -418,11 +389,7 @@ def main():
         mn, me, mx = float(w.min()), float(w.mean()), float(w.max())
         print(f"[retrain] {n}  min={mn:.4f}  mean={me:.4f}  max={mx:.4f}")
 
-    if os.path.exists(cfg.progress_csv_path):
-        n_retrains = len(pd.read_csv(cfg.progress_csv_path))
-    else:
-        n_retrains = 0
-    epoch = n_retrains
+    epoch = args.epoch
 
     if cfg.retrain_backend == "pytorch":
         from chessbot.train_pytorch import load_pt_model, train_pt_model, save_pt_model

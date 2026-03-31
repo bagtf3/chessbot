@@ -296,6 +296,82 @@ def stable_softmax(logits):
     return e / (s + 1e-9)
 
 
+def batch_policy_metrics_from_priors(samples, uniform_eps=0.05):
+    """
+    Compute policy metrics from per-position prior dicts and visit lists.
+    samples: list of (nn_priors_dict, visit_list) where
+      nn_priors_dict: {uci: prob}  — raw NN distribution over legal moves
+      visit_list:     [(uci, count)] — post-redistribution MCTS visits
+    Returns same keys as batch_policy_metrics (excluding mass_on_legal).
+    """
+    eps_ll = 1e-12
+    keys = [
+        'policy_ce', 'uniform_ce', 'ce_gain',
+        'exp_prob_model', 'exp_prob_uniform',
+        'top1_exact', 'avg_top_prob',
+        'top1_mass', 'top3_mass', 'top5_mass', 'prob_on_others',
+    ]
+    acc = {k: 0.0 for k in keys}
+    n_valid = 0
+
+    for nn_priors, visits in samples:
+        if not nn_priors or not visits:
+            continue
+        all_ucis = sorted(set(nn_priors.keys()) | {u for u, _ in visits})
+        n = len(all_ucis)
+        if n == 0:
+            continue
+
+        p = np.array([nn_priors.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        p_sum = p.sum()
+        if p_sum <= 0:
+            continue
+        p /= p_sum
+
+        visit_map = {u: float(c) for u, c in visits}
+        v = np.array([visit_map.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        v_sum = v.sum()
+        if v_sum <= 0:
+            continue
+        v /= v_sum
+
+        uniform = np.ones(n, dtype=np.float64) / n
+        labels = uniform_eps * uniform + (1.0 - uniform_eps) * v
+        labels = np.clip(labels, 0.0, 0.8)
+        labels /= labels.sum()
+
+        policy_ce  = -np.sum(labels * np.log(p + eps_ll))
+        uniform_ce = -np.sum(labels * np.log(uniform + eps_ll))
+
+        label_top1 = int(np.argmax(labels))
+        model_top1 = int(np.argmax(p))
+
+        k3 = min(3, n)
+        k5 = min(5, n)
+        top3_idx = np.argpartition(-labels, k3 - 1)[:k3]
+        top5_idx = np.argpartition(-labels, k5 - 1)[:k5]
+
+        support = labels > 0
+        support[label_top1] = False
+
+        acc['policy_ce']        += policy_ce
+        acc['uniform_ce']       += uniform_ce
+        acc['ce_gain']          += uniform_ce - policy_ce
+        acc['exp_prob_model']   += float(np.sum(labels * p))
+        acc['exp_prob_uniform'] += float(np.sum(labels * uniform))
+        acc['top1_exact']       += float(label_top1 == model_top1)
+        acc['avg_top_prob']     += float(p[model_top1])
+        acc['top1_mass']        += float(p[label_top1])
+        acc['top3_mass']        += float(p[top3_idx].sum())
+        acc['top5_mass']        += float(p[top5_idx].sum())
+        acc['prob_on_others']   += float((p * support).sum())
+        n_valid += 1
+
+    if n_valid == 0:
+        return {k: float('nan') for k in keys}
+    return {k: v / n_valid for k, v in acc.items()}
+
+
 def batch_policy_metrics(logits, labels, mask):
     eps = 1e-12
     big_neg = -1e6
@@ -368,14 +444,15 @@ def batch_policy_metrics(logits, labels, mask):
     }
 
 
-def print_validation(epoch, stats):
+def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     eps = 1e-12
 
+    # name_w derived from actual display labels so columns align
     keys = [
-        "val_mse", "val_corr",
-        "policy_ce", "uniform_ce", "ce_gain",
-        "top1_exact", "avg_top_prob",
-        "top1_mass", "prob_on_others"
+        "value_mse", "value_corr",
+        "policy_ce", "uniform_ce",
+        "top1_exact", "avg_top",
+        "top1_mass",  "true ratio",
     ]
     name_w = max(len(k) for k in keys)
     num_w = 8
@@ -383,15 +460,19 @@ def print_validation(epoch, stats):
     def pair(k, v):
         return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
     ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
+    pfx = f"[epoch {epoch:4d}] [validation]"
 
-    print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
+    print(f"{pfx} {pair('value_mse', stats['value_mse'])}  "
           f"{pair('value_corr', stats['value_corr'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
+    print(f"{pfx} {pair('policy_ce', stats['policy_ce'])}  "
           f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
-          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "
+    print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
+          f"{pair('avg_top', stats['avg_top_prob'])}")
+    print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "
           f"{pair('true ratio', ratio)}")
+    if mass_on_legal is not None:
+        cov_str = f" ({mol_coverage:.0%} coverage)" if mol_coverage is not None else ""
+        print(f"{pfx} mass_on_legal (est): {mass_on_legal:.4f}{cov_str}")
 
 
 def score_game_data(model, X, M, Y, epoch, save_path=None, preds=None):

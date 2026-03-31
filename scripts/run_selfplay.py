@@ -244,23 +244,23 @@ def reclaim_vram_worker(mb):
     reclaim_vram(mb)
 
 
-def launch_retrain(run_tag, working_cfg):
+def launch_retrain(run_tag, working_cfg, epoch=0):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
 
-    ctx = mp.get_context("spawn")
-    for attempt in range(3):
-        p = ctx.Process(target=reclaim_vram_worker, args=(6000,))
-        p.start()
-        p.join()
-        if p.exitcode == 0:
-            print(f"[reclaim vram] ok")
-            break
-        if attempt == 2:
-            print(f"[reclaim_vram] failed after 3 attempts, skipping")
+    # ctx = mp.get_context("spawn")
+    # for attempt in range(3):
+    #     p = ctx.Process(target=reclaim_vram_worker, args=(6000,))
+    #     p.start()
+    #     p.join()
+    #     if p.exitcode == 0:
+    #         print(f"[reclaim vram] ok")
+    #         break
+    #     if attempt == 2:
+    #         print(f"[reclaim_vram] failed after 3 attempts, skipping")
 
-    return launch_retrain_async(run_tag, rt_script, working_cfg)
+    return launch_retrain_async(run_tag, rt_script, working_cfg, epoch=epoch)
 
 
 def pull_pkl(to_process):
@@ -396,14 +396,18 @@ def main(run_tag):
                         p["msg_q"].put("pause")
 
                     if retrain is None:
-                        retrain = launch_retrain(run_tag, working_cfg)
+                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
                         rescorer.reset_writer()
-                    
+
                     while retrain is not None:
                         done, rc = poll_retrain(retrain, print_output=True)
                         if done:
                             retrain = None
                             recorder.n_retrains += 1
+                            rescorer.aggregate_metrics(
+                                n_retrains, working_cfg.vscale,
+                                working_cfg.progress_csv_path)
+                            n_retrains += 1
                         
                         # can still process games during retraining
                         if len(finished_games):

@@ -16,7 +16,8 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence
+    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
+    batch_policy_metrics_from_priors, print_validation,
 )
 
 RS = "[rescore]"
@@ -29,12 +30,13 @@ class Rescorer(object):
         self.config = cfg
         self.training_data = []
         self.analyzed_results = []
+        self.pending_metrics = []
 
         self.train_on_stockfish = cfg.train_on_stockfish
         self.train_on_validation = cfg.train_on_validation
 
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        self.eng.configure(cfg.sf_config)
+        self.eng.configure({**cfg.sf_config, "UCI_ShowWDL": True})
 
         self.start_time = time.time()
         self.games_seen = set()
@@ -230,12 +232,15 @@ class Rescorer(object):
         best_move = top1['pv'][0]
         best_cp   = score_cp_stm_pov(top1["score"])
         best_abs  = score_cp_white_pov(top1["score"], clipped=False)
-        
+        wdl = top1.get("wdl")
+        sf_wdl = (wdl.relative.wins - wdl.relative.losses) / 1000.0 if wdl is not None else None
+
         # default
         res = {}
         res['best_move'] = best_move
         res['best_cp'] = best_cp
         res['best_absolute'] = best_abs
+        res['sf_wdl'] = sf_wdl
 
         if move == best_move:
             res['played_cp'] = best_cp
@@ -327,6 +332,7 @@ class Rescorer(object):
         rows = []
         eval_trace = []
         pending = []
+        pending_meta = []
         
         # set a flag in case we want to skip all training data
         skip_all_training = False
@@ -491,6 +497,16 @@ class Rescorer(object):
 
             x, mask, policy = self.make_policy_example(b_fast, mvs, vis)
             pending.append((x, mask, policy, Q, bool(turn), i, vwht, pwht))
+            pending_meta.append({
+                'stm': bool(turn),
+                'nn_value': tr.get('nn_value'),
+                'nn_raw_priors': tr.get('nn_raw_priors', []),
+                'mass_on_legal': tr.get('nn_mass_on_legal'),
+                'sf_cp': res['best_cp'],
+                'sf_wdl': res.get('sf_wdl'),
+                'candidate_visits': list(zip(mvs, vis)),
+                'result_z_stm': Z_stm,
+            })
 
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
@@ -502,7 +518,8 @@ class Rescorer(object):
             cfg.collar_threshold_cp, cfg.collar_n_consec, cfg.collar_reset_cp,
         )
         n_diff = 0
-        for (x, mask, policy, Q, is_white, ply, vwht, pwht) in pending:
+        for (x, mask, policy, Q, is_white, ply, vwht, pwht), meta in zip(
+                pending, pending_meta):
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply, float(result))
             z_eff = eff_z_white if is_white else -eff_z_white
@@ -511,6 +528,7 @@ class Rescorer(object):
             z = z_orig if cfg.collar_rescore_dry_run else z_eff
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
             self.training_data.append((x, mask, policy, Y, vwht, pwht))
+            self.pending_metrics.append({**meta, 'target_y': float(Y)})
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
         # assemble df and summary
@@ -656,6 +674,127 @@ class Rescorer(object):
                 for k in combined:
                     combined[k] += h[k]
             print(fmt_row("last 300:", combined))
+
+    def aggregate_metrics(self, epoch, vscale, progress_csv_path):
+        if not self.pending_metrics:
+            return
+
+        chunk_size = self.config.retrain_size
+        chunk = self.pending_metrics[:chunk_size]
+        self.pending_metrics = self.pending_metrics[chunk_size:]
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        nn_vals_stm, target_ys, sf_cps, sf_wdls, result_zs = [], [], [], [], []
+        mol_vals, policy_samples = [], []
+
+        for m in chunk:
+            nn_v = m.get('nn_value')
+            if nn_v is None:
+                continue
+            stm_sign = 1.0 if m['stm'] else -1.0
+            nn_stm = float(np.clip(nn_v * stm_sign / vscale, -1.0, 1.0))
+            nn_vals_stm.append(nn_stm)
+            target_ys.append(m['target_y'])
+            sf_cps.append(m['sf_cp'])
+            wdl = m.get('sf_wdl')
+            sf_wdls.append(wdl if wdl is not None else float('nan'))
+            result_zs.append(m['result_z_stm'])
+            mol = m.get('mass_on_legal')
+            mol_vals.append(mol if mol is not None else float('nan'))
+            priors_map = {u: p for u, p in m.get('nn_raw_priors', [])}
+            policy_samples.append((priors_map, m.get('candidate_visits', [])))
+
+        nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
+        target_ys   = np.array(target_ys,   dtype=np.float32)
+        sf_cps      = np.array(sf_cps,      dtype=np.float32)
+        sf_wdls     = np.array(sf_wdls,     dtype=np.float32)
+        result_zs   = np.array(result_zs,   dtype=np.float32)
+        mol_vals    = np.array(mol_vals,     dtype=np.float32)
+
+        valid_v = ~np.isnan(nn_vals_stm) & ~np.isnan(target_ys)
+        n = int(valid_v.sum())
+        val_mse = float(np.mean(
+            (nn_vals_stm[valid_v] - target_ys[valid_v]) ** 2
+        )) if n else float('nan')
+        val_corr = float(
+            np.corrcoef(nn_vals_stm[valid_v], target_ys[valid_v])[0, 1]
+        ) if n > 1 else float('nan')
+
+        cfg_eps = getattr(self.config, 'uniform_eps', 0.05)
+        pol_stats = batch_policy_metrics_from_priors(policy_samples, cfg_eps)
+
+        valid_m = ~np.isnan(mol_vals)
+        mol_est = float(np.mean(mol_vals[valid_m])) if valid_m.any() else float('nan')
+        mol_cov = float(valid_m.mean()) if len(valid_m) else 0.0
+
+        stats = {'value_mse': val_mse, 'value_corr': val_corr}
+        stats.update(pol_stats)
+        stats['mass_on_legal'] = mol_est
+        print_validation(epoch, stats, mass_on_legal=mol_est, mol_coverage=mol_cov)
+
+        row = {**stats, 'model_epoch': epoch, 'n_samples': n,
+               'mol_coverage_pct': round(mol_cov * 100, 1)}
+        row_df = pd.DataFrame([row])
+        if os.path.exists(progress_csv_path):
+            all_df = pd.concat(
+                [pd.read_csv(progress_csv_path), row_df], ignore_index=True)
+        else:
+            all_df = row_df
+        all_df.round(5).to_csv(progress_csv_path, index=False)
+
+        MAX_SC = 5000
+        n_pts = len(nn_vals_stm)
+        idx = (np.random.choice(n_pts, MAX_SC, replace=False)
+               if n_pts > MAX_SC
+               else np.arange(n_pts))
+
+        xv   = nn_vals_stm[idx]
+        ytgt = target_ys[idx]
+        ycp  = sf_cps[idx]
+        ywdl = sf_wdls[idx]
+        zc   = result_zs[idx]
+
+        z_palette = {1.0: "#3cb371", 0.0: "#ffd700", -1.0: "#ff8c00"}
+        c_all = [z_palette.get(round(float(z)), "#999999") for z in zc]
+
+        import matplotlib.patches as mpatches
+        legend = [
+            mpatches.Patch(color="#3cb371", label="win"),
+            mpatches.Patch(color="#ffd700", label="draw"),
+            mpatches.Patch(color="#ff8c00", label="loss"),
+        ]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        axes[0].scatter(ytgt, xv, s=4, alpha=0.3, c='steelblue')
+        axes[0].set_xlabel("target Y")
+        axes[0].set_ylabel("NN value (STM-POV)")
+        axes[0].set_title(f"Epoch {epoch}: NN value vs target")
+
+        valid2 = ~np.isnan(ycp)
+        c2 = [c_all[i] for i in range(len(xv)) if valid2[i]]
+        axes[1].scatter(ycp[valid2], xv[valid2], s=4, alpha=0.3, c=c2)
+        axes[1].set_xlabel("SF CP (STM-POV)")
+        axes[1].set_ylabel("NN value (STM-POV)")
+        axes[1].set_title("NN value vs SF centipawns")
+        axes[1].legend(handles=legend, fontsize=8)
+
+        valid3 = ~np.isnan(ywdl)
+        c3 = [c_all[i] for i in range(len(xv)) if valid3[i]]
+        axes[2].scatter(ywdl[valid3], xv[valid3], s=4, alpha=0.3, c=c3)
+        axes[2].set_xlabel("SF WDL score (STM-POV)")
+        axes[2].set_ylabel("NN value (STM-POV)")
+        axes[2].set_title("NN value vs SF WDL")
+        axes[2].legend(handles=legend, fontsize=8)
+
+        fig.tight_layout()
+        plot_path = os.path.join(os.path.dirname(progress_csv_path), "validation_latest.png")
+        fig.savefig(plot_path, dpi=120)
+        plt.close(fig)
+        print(f"[metrics] plot saved")
 
     def push_analyzed(self, report=True):
         # safeguard here
@@ -1113,9 +1252,11 @@ def encourage_best_move(visits, played_mv, best_mv, lms):
     return [[u, int(v)] for u, v in items]
 
 
-def launch_retrain_async(run_tag, rt_script, working_cfg):
+def launch_retrain_async(run_tag, rt_script, working_cfg, epoch=None):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
+    if epoch is not None:
+        cmd += ["--epoch", str(epoch)]
 
     print(f"[retrain] launching worker")
 

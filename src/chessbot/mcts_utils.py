@@ -46,7 +46,8 @@ class MCTSTree(fasttree):
             self.sims_ceiling = cfg.sims_ceiling
 
         self.pruning_factor = cfg.pruning_factor
-        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor)
+        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor,
+                         cfg.uniform_eps, cfg.prior_clip_max)
 
         # bookkeeping
         self.board = board
@@ -615,6 +616,12 @@ class ChessGame(object):
         
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv
+
+        nn = self.tree.emulate_nn_result()
+        data["nn_value"] = nn["value"]
+        data["nn_raw_priors"] = nn["raw_priors"]
+        data["nn_mass_on_legal"] = nn["mass_on_legal"]
+
         self.tree_data[self.plies] = data
     
     def make_move_with_stockfish(self, eng):

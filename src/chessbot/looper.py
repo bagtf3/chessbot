@@ -114,8 +114,6 @@ class GameLooper(object):
             self.model, self.infer = make_pt_infer(
                 model,
                 max_bs=cfg.fwd_batch,
-                uniform_eps=cfg.uniform_eps,
-                prior_clip_max=cfg.prior_clip_max,
                 vscale=cfg.vscale,
             )
         else:
@@ -123,8 +121,6 @@ class GameLooper(object):
             self.infer = make_conv_infer(
                 self.model,
                 max_bs=cfg.fwd_batch,
-                uniform_eps=cfg.uniform_eps,
-                prior_clip_max=cfg.prior_clip_max,
                 vscale=cfg.vscale,
             )
     

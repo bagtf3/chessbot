@@ -86,63 +86,40 @@ def train_pt_model(model, X, M, P, Y_value, vwht, pwht, cfg, args):
         print(f"[pytorch] epoch {epoch}  loss={total_loss / max(1, steps):.4f}")
 
 
-def make_pt_infer(model, max_bs, uniform_eps, prior_clip_max, vscale):
+def make_pt_infer(model, max_bs, vscale):
     """
-    Returns (model, fwd) where fwd((enc_np, mask_np)) -> (probs_np, val_np).
-    Matches the make_conv_infer / make_ort_infer interface.
+    Returns (model, fwd) where fwd((enc_np, _)) -> (logits_np, val_np).
+    Softmax, uniform_eps, and prior_clip_max are applied in C++ build_priors.
     """
     device = torch.device("cuda")
     model = model.to(device).half().eval()
-    eps_small = 1e-12
-
-    ue      = torch.tensor(uniform_eps,  device=device, dtype=torch.float32)
-    pcm     = torch.tensor(prior_clip_max, device=device, dtype=torch.float32)
-    vscale_t = torch.tensor(vscale,       device=device, dtype=torch.float32)
-    eps_t   = torch.tensor(eps_small,     device=device, dtype=torch.float32)
+    vscale_t = torch.tensor(vscale, device=device, dtype=torch.float32)
 
     def base_fwd(pair):
-        enc_np, mask_np = pair
-        mask = torch.from_numpy(mask_np.astype(np.float32)).to(device)
-
+        enc_np = pair[0]
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             enc_t = torch.from_numpy(enc_np).long().to(device)
             logits, value = model(enc_t)
 
         logits = logits.float()
-        logits = torch.where(mask > 0.5, logits, torch.tensor(-1e9, device=device))
-        row_max = logits.max(dim=1, keepdim=True).values
-        exp     = torch.exp(logits - row_max) * mask
-        sum_exp = exp.sum(dim=1, keepdim=True)
-        probs   = exp / (sum_exp + eps_t)
-
-        if uniform_eps > 0.0:
-            legal_sum = mask.sum(dim=1, keepdim=True)
-            uni   = mask / (legal_sum + eps_t)
-            probs = (1.0 - ue) * probs + ue * uni
-
-        if prior_clip_max < 1.0:
-            probs = torch.minimum(probs, pcm) * mask
-            s     = probs.sum(dim=1, keepdim=True)
-            probs = probs / (s + eps_t)
-
         value = (value.float() * vscale_t).clamp(-1.0, 1.0)
-        return probs.cpu().numpy(), value.cpu().numpy()
+        return logits.cpu().numpy(), value.cpu().numpy()
 
     if max_bs is None:
         return model, base_fwd
 
     def fwd(pair):
-        enc_np, mask_np = pair
+        enc_np = pair[0]
         B = int(enc_np.shape[0])
         if B <= max_bs:
             return base_fwd(pair)
-        probs_parts, val_parts = [], []
+        logits_parts, val_parts = [], []
         for i in range(0, B, max_bs):
             j = min(i + max_bs, B)
-            p, v = base_fwd((enc_np[i:j], mask_np[i:j]))
-            probs_parts.append(p)
+            lg, v = base_fwd((enc_np[i:j],))
+            logits_parts.append(lg)
             val_parts.append(v)
-        return np.concatenate(probs_parts, axis=0), np.concatenate(val_parts, axis=0)
+        return np.concatenate(logits_parts, axis=0), np.concatenate(val_parts, axis=0)
 
     return model, fwd
 

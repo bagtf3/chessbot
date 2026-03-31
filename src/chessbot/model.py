@@ -359,98 +359,48 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(
-    model,
-    max_bs=1024,
-    uniform_eps=0.0,
-    prior_clip_max=1.0,
-    vscale=0.9,
-):
+def make_conv_infer(model, max_bs=1024, vscale=0.9):
     """
-    Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-
-    uniform_eps mixes uniform mass over legal moves:
-        probs = (1 - eps) * probs + eps * uniform_legal
-
-    prior_clip_max caps peaks after mixing (no floor clipping):
-        probs = min(probs, clip_max), then renorm
+    Returns fwd((enc_np, _)) -> (logits_np, val_np).
+    Softmax, uniform_eps, and prior_clip_max are applied in C++ build_priors.
     """
-
-    big_neg = tf.constant(-1e9, dtype=tf.float32)
-    eps_small = tf.constant(1e-12, dtype=tf.float32)
-
-    ue = tf.constant(float(uniform_eps), dtype=tf.float32)
-    ue = tf.clip_by_value(ue, 0.0, 1.0)
-
-    pcm = tf.constant(float(prior_clip_max), dtype=tf.float32)
     value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
 
     @tf.function(input_signature=[
         tf.TensorSpec([None, 64], tf.int32),
-        tf.TensorSpec([None, 4288], tf.int32),
     ], experimental_compile=True)
-    def graph(enc, legal):
+    def graph(enc):
         logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
-
-        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
-        logits32 = tf.cast(logits, tf.float32)
-
-        masked_logits32 = tf.where(mask > 0.5, logits32, big_neg)
-
-        row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
-        exp = tf.exp(masked_logits32 - row_max) * mask
-        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
-
-        has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + eps_small), tf.zeros_like(exp))
-
-        if uniform_eps != 0.0:
-            legal_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
-            uni = tf.where(
-                legal_sum > 0.0,
-                mask / (legal_sum + eps_small),
-                tf.zeros_like(mask),
-            )
-            probs = (1.0 - ue) * probs + ue * uni
-
-        if prior_clip_max < 1.0:
-            probs = tf.minimum(probs, pcm) * mask
-
-        s = tf.reduce_sum(probs, axis=1, keepdims=True)
-        probs = tf.where(s > eps_small, probs / (s + eps_small),
-                         tf.zeros_like(probs))
-
+        logits = tf.cast(tf.reshape(logits, [tf.shape(logits)[0], -1]), tf.float32)
         value_f = tf.cast(value, tf.float32) * value_scale_c
-        return probs, value_f
+        return logits, value_f
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):
-            raise ValueError("pass (enc_np, legal_np) tuple")
-        enc_np, legal_np = pair
+            raise ValueError("pass (enc_np, ...) tuple")
+        enc_np = pair[0]
         e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
-        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
-        probs_tf, val_tf = graph(e_tf, l_tf)
-        return probs_tf.numpy(), val_tf.numpy()
+        logits_tf, val_tf = graph(e_tf)
+        return logits_tf.numpy(), val_tf.numpy()
 
     if max_bs is None:
         return base_fwd
 
     def fwd(pair):
-        enc_np, legal_np = pair
+        enc_np = pair[0]
         B = int(enc_np.shape[0])
         if B <= max_bs:
-            return base_fwd((enc_np, legal_np))
+            return base_fwd(pair)
 
         parts = None
         i = 0
         while i < B:
             j = min(i + max_bs, B)
-            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]))
+            p_logits, p_val = base_fwd((enc_np[i:j],))
             if parts is None:
-                parts = [p_probs, p_val]
+                parts = [p_logits, p_val]
             else:
-                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
+                parts[0] = np.concatenate([parts[0], p_logits], axis=0)
                 parts[1] = np.concatenate([parts[1], p_val], axis=0)
             i = j
 

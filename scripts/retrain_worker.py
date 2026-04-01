@@ -270,8 +270,6 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
     )
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
 
-    print_fit_history(history, epoch, label=label)
-
     t0 = time.time()
     bak_path = model_path.replace(".h5", "_backup.h5")
     if os.path.exists(model_path):

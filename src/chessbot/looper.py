@@ -417,12 +417,12 @@ class GameLooper(object):
 
     def format_and_predict(self, preds_batch):
         """
-        preds_batch: list of items produced by tree.pending_encoded_stm_pov(...)
+        preds_batch: list of items produced by tree.pending_encoded_64_tokens(...)
         expected shape:
-            - (zobrist, board_np, legal_np)
+            - (zobrist, board_np)
 
-        This calls self.infer on the GPU (masked softmax + clip + renorm).
-        It writes into the raw policy cache as (zobrist, {"value": v, "policy": probs}).
+        Runs inference and writes into the raw policy cache as (zobrist, value, probs).
+        Masking/softmax is applied in C++ build_priors.
         """
 
         if not preds_batch:
@@ -430,20 +430,14 @@ class GameLooper(object):
 
         # collect arrays + keys
         boards = []
-        legals = []
         keys = []
 
         for item in preds_batch:
             keys.append(item[0])
-            board_np = item[1]
-            legal_np = item[2]
-
-            boards.append(np.asarray(board_np, dtype=np.int32))
-            legals.append(np.asarray(legal_np, dtype=np.int32))
+            boards.append(np.asarray(item[1], dtype=np.int32))
 
         # stack to batch
         boards_np = np.stack(boards, axis=0)   # (B,64)
-        legals_np = np.stack(legals, axis=0)   # (B,4288)
         # pad up to max_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
 
@@ -457,21 +451,19 @@ class GameLooper(object):
             pad = max(0, int(new_target - B))
             if pad:
                 pad_boards = np.zeros((pad,)+boards_np.shape[1:], dtype=boards_np.dtype)
-                pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
                 boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
-                legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
                 start = _now()
-                probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
+                probs_np_p, vals_np_p = self.infer((boards_np_p,))
                 probs_np = probs_np_p[:B]
                 vals_np = vals_np_p[:B]
-            
+
             else:
                 start = _now()
-                probs_np, vals_np = self.infer((boards_np, legals_np))
+                probs_np, vals_np = self.infer((boards_np,))
         else:
             new_target = target_bs
             start = _now()
-            probs_np, vals_np = self.infer((boards_np, legals_np))
+            probs_np, vals_np = self.infer((boards_np,))
         
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []

@@ -86,6 +86,7 @@ def spawn_workers(cfg, recent_q, telemetry_q):
         p = ctx.Process(
             target=child_looper,
             args=(c, stop_ev, recent_q, telemetry_q, msg_q),
+            daemon=True,
         )
         p.start()
 

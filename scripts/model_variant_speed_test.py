@@ -411,13 +411,7 @@ def build_tf_conformer_interweaved(cfg):
     x = layers.Reshape((8, 8, de), name="to_2d")(x)
 
     if de != cf:
-        x = layers.Conv2D(
-            cf,
-            1,
-            use_bias=False,
-            padding="same",
-            name="conv_proj",
-        )(x)
+        x = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="conv_proj")(x)
         x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
         x = layers.LeakyReLU(0.01, name="lrelu_proj")(x)
 
@@ -456,45 +450,63 @@ def build_tf_conformer_interweaved(cfg):
 
         x = layers.Reshape((8, 8, cf), name=f"b{i}_to_2d")(s)
         r = x
-        h = layers.Conv2D(
-            cf,
-            3,
-            use_bias=False,
-            padding="same",
-            name=f"b{i}_c1",
-        )(x)
+        h = layers.Conv2D(cf,3, use_bias=False, padding="same", name=f"b{i}_c1")(x)
         h = layers.LeakyReLU(0.01, name=f"b{i}_lr1")(h)
-        h = layers.Conv2D(
-            cf,
-            3,
-            use_bias=False,
-            padding="same",
-            name=f"b{i}_c2",
-        )(h)
+        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c2")(h)
         h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(h)
         x = layers.LeakyReLU(0.01, name=f"b{i}_out")(r + h)
-
-    # separate mixers — breaks gradient conflict between heads
-    p = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="policy_mix")(x)
-    p = layers.LayerNormalization(axis=-1, name="policy_mix_ln")(p)
-    p = layers.LeakyReLU(0.01, name="policy_mix_act")(p)
-
+    
+    # VALUE HEAD
     v = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="value_mix")(x)
     v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
     v = layers.LeakyReLU(0.01, name="value_mix_act")(v)
 
-    # dedicated policy spatial refinement block
-    r = p
-    h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name="policy_res_c1")(p)
-    h = layers.LeakyReLU(0.01, name="policy_res_lr1")(h)
-    h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name="policy_res_c2")(h)
-    h = layers.LayerNormalization(axis=-1, name="policy_res_ln")(h)
-    p = layers.LeakyReLU(0.01, name="policy_res_out")(r + h)
-
-    policy = layers.Conv2D(67, 1, padding="same", name="policy_conv")(p)
-    policy = layers.Reshape((SEQ_LEN * 67,), name="policy_logits")(policy)
-
     value = _tf_attn_pool_value_head(v, cf, layers)
+
+    # NEW RELATIONAL POLICY HEAD
+    # (B, 8, 8, cf) -> (B, 64, cf)
+    x_seq = layers.Reshape((64, cf), name="pol_to_seq")(x)
+
+    # normal move head: 64 x 64
+    from_h = layers.Dense(384, activation="gelu", name="pol_from_fc1")(x_seq)
+    from_h = layers.Dense(256, activation="gelu", name="pol_from_fc2")(from_h)
+    from_vec = layers.Dense(128, name="pol_from_proj")(from_h)
+
+    to_h = layers.Dense(384, activation="gelu", name="pol_to_fc1")(x_seq)
+    to_h = layers.Dense(256, activation="gelu", name="pol_to_fc2")(to_h)
+    to_vec = layers.Dense(128, name="pol_to_proj")(to_h)
+
+    normal_logits = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
+    normal_logits = layers.Lambda(
+        lambda t: t / (128 ** 0.5), name="pol_qk_scale")(normal_logits)
+
+    # (B, 4096)
+    normal_logits = layers.Reshape((64 * 64,), name="pol_normal_flat")(normal_logits)
+
+    # underpromo head: 8 x 8 x 3 = 192
+    # backend semantics: from_file x to_file x promo_type
+    p = layers.Conv2D(
+        64, 1, use_bias=False, padding="same", name="pol_promo_mix",
+    )(x) # (B, 8, 8, 64)
+
+    p = layers.LayerNormalization(axis=-1, name="pol_promo_mix_ln")(p)
+    p = layers.LeakyReLU(0.01, name="pol_promo_mix_act")(p)
+
+    # (B, 8, 8, 64)
+    p = layers.Conv2D(64, 3, use_bias=False, padding="same", name="pol_promo_c1",)(p)
+    p = layers.LayerNormalization(axis=-1, name="pol_promo_ln")(p)
+    p = layers.LeakyReLU(0.01, name="pol_promo_act")(p)
+
+    # (B, 8, 8, 3)
+    promo_logits = layers.Conv2D(3, 1, padding="same", name="pol_promo_conv",)(p)
+
+    # (B, 192)
+    promo_logits = layers.Reshape((8 * 8 * 3,), name="pol_promo_flat")(promo_logits)
+
+    # (B, 4288)
+    policy = layers.Concatenate(axis=1, name="policy_logits")(
+        [normal_logits, promo_logits]
+    )
 
     model = Model(inp, [policy, value])
     print(f"  TF params: {model.count_params():,}")

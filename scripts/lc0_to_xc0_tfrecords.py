@@ -28,7 +28,7 @@ RECORDS_PER_FILE = 10_240
 BUFFER_SIZE      = 300_000
 POLICY_MAX_CLIP  = 0.6
 CHUNK_BATCH_SIZE = 512
-DRAW_DROP_RATE   = 0.25
+DRAW_DROP_RATE   = 0.75
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
 DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0\040126"

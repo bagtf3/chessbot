@@ -262,7 +262,7 @@ def build_validation_summary(looper):
     bumped = False
     action = "none"
 
-    dominant = (n >= min_games) and (score > 0.9)
+    dominant = (n >= min_games) and (score > 0.8)
 
     if dominant or consec >= 2:
         if index < (len(table) - 1):

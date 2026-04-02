@@ -401,19 +401,20 @@ class Rescorer(object):
             xerces_uci_for_cpl = mv
             if xc0_move and xc0_move != mv:
                 xerces_uci_for_cpl = xc0_move
-                # if xc0 selected move isnt most visited, swap visits to make it so
-                top_uci = visits[0][0]
-                if xerces_uci_for_cpl != top_uci:
-                    vmap = {u: n for u, n in visits}
-                    top_n = vmap.get(top_uci, 1)
-                    xc0_n = vmap.get(xc0_move, 1)
-                    vmap[top_uci] = max(1, xc0_n)
-                    vmap[xc0_move] = max(1, top_n)
-                    visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
-            
             elif not sel_method:
                 # backward-compat for older pkls that dont store method/xc0_move
                 xerces_uci_for_cpl = visits[0][0]
+
+            # normalize: treat xc0 move as most-visited if it isn't already
+            # (rsc may select a non-top move; standardize so training is consistent)
+            top_uci = visits[0][0]
+            if xerces_uci_for_cpl != top_uci:
+                vmap = {u: n for u, n in visits}
+                top_n = vmap.get(top_uci, 1)
+                xc0_n = vmap.get(xerces_uci_for_cpl, 1)
+                vmap[top_uci] = max(1, xc0_n)
+                vmap[xerces_uci_for_cpl] = max(1, top_n)
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             xerces_ch = chess.Move.from_uci(xerces_uci_for_cpl)
             res = self.analyze_with_rank(xerces_ch, board_ch)
@@ -431,7 +432,7 @@ class Rescorer(object):
             # we penalize missed-mate-but-still-winning less harshly
             missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
             if missed_mate:
-                loss_this = min(300, loss_this)
+                loss_this = min(200, loss_this)
 
             rows.append([
                 i, mv, xerces_uci_for_cpl, str(res['best_move']),
@@ -452,22 +453,45 @@ class Rescorer(object):
             blunder_cp = cfg.post_hoc_blunder_cp_loser
             if Z_stm > 0.0:
                 blunder_cp = cfg.post_hoc_blunder_cp_winner
-
-            best_cp_stm = res.get('best_cp', 0)
+            
             played_cp_stm = res.get('played_cp', 0)
 
             kl_eligible = False
+            best_mv_uci = str(res.get('best_move'))
+            xc0_uci = visits[0][0]
+            xc0_n = visits[0][1]
+
             if loss_this <= cfg.post_hoc_equiv_range:
                 # cat 1: excellent move, eligible for KL boost
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
                 kl_eligible = True
             elif loss_this <= 60:
-                # cat 2: fine move, no adjustment, no KL boost
-                visits = ensure_all_legal_moves_have_visits(visits, lms)
+                # cat 2: soft nudge - best_mv floor at 50% of xc0 visits
+                vmap = {u: max(1, int(v)) for u, v in visits}
+                for m in lms:
+                    if m not in vmap:
+                        vmap[m] = 1
+                vmap[best_mv_uci] = max(vmap.get(best_mv_uci, 1), max(1, xc0_n // 2))
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            elif loss_this < blunder_cp:
+                # cat 3: best_mv visits raised to xc0 visits
+                vmap = {u: max(1, int(v)) for u, v in visits}
+                for m in lms:
+                    if m not in vmap:
+                        vmap[m] = 1
+                vmap[best_mv_uci] = max(vmap.get(best_mv_uci, 1), xc0_n)
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
             else:
-                # cat 3 + 4: mild encouragement - set best_mv visits = xerces top
-                best_mv_uci = str(res.get('best_move'))
-                visits = encourage_best_move(visits, visits[0][0], best_mv_uci, lms)
+                # cat 4: best_mv raised to xc0; true blunder also demotes xc0 to 50%
+                is_true_blunder = not (played_cp_stm > 350 and Z_stm > 0)
+                vmap = {u: max(1, int(v)) for u, v in visits}
+                for m in lms:
+                    if m not in vmap:
+                        vmap[m] = 1
+                vmap[best_mv_uci] = xc0_n
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, xc0_n // 2)
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             if not visits or sum([v[1] for v in visits]) <= 0:
                 print("[rescorer] visits invalid or sum <= 0; skipping sample",
@@ -489,11 +513,6 @@ class Rescorer(object):
                 kl = kl_divergence(priors, vis)
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
-            elif loss_this > blunder_cp and do_KL_boost:
-                # cat 4: penalize policy on true blunders
-                is_true_blunder = not (played_cp_stm > 350 and Z_stm > 0)
-                if is_true_blunder:
-                    pwht /= KL_coef
 
             x, mask, policy = self.make_policy_example(b_fast, mvs, vis)
             pending.append((x, mask, policy, Q, bool(turn), i, vwht, pwht))

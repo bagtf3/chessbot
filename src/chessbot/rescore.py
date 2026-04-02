@@ -465,8 +465,9 @@ class Rescorer(object):
                 # cat 1: excellent move, eligible for KL boost
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
                 kl_eligible = True
-            elif loss_this <= 60:
+            elif loss_this <= 60 or missed_mate:
                 # cat 2: soft nudge - best_mv floor at 50% of xc0 visits
+                # missed mates folded in here: hint at better move, don't learn deep SF lines
                 vmap = {u: max(1, int(v)) for u, v in visits}
                 for m in lms:
                     if m not in vmap:

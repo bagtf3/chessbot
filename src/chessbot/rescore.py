@@ -1,4 +1,4 @@
-import os, json, pathlib, time
+import os, json, gzip, pathlib, time
 from pathlib import Path
 import uuid
 import sys
@@ -303,8 +303,11 @@ class Rescorer(object):
         # allow passing a filepath (str or Path) to a pkl/json game record
         if isinstance(game_data, (str, pathlib.Path)):
             path = str(game_data)
-            if path.lower().endswith(('.pkl', '.json')) and os.path.exists(path):
-                if path.lower().endswith('.pkl'):
+            if path.lower().endswith(('.pkl', '.pkl.gz', '.json')) and os.path.exists(path):
+                if path.lower().endswith('.pkl.gz'):
+                    with gzip.open(path, 'rb') as f:
+                        game_data = pickle.load(f)
+                elif path.lower().endswith('.pkl'):
                     with open(path, 'rb') as f:
                         game_data = pickle.load(f)
                 else:
@@ -736,10 +739,10 @@ class Rescorer(object):
 
         valid_v = ~np.isnan(nn_vals_stm) & ~np.isnan(target_ys)
         n = int(valid_v.sum())
-        val_mse = float(np.mean(
+        val_mse = np.mean(
             (nn_vals_stm[valid_v] - target_ys[valid_v]) ** 2
-        )) if n else float('nan')
-        val_corr = float(
+        ) if n else float('nan')
+        val_corr = (
             np.corrcoef(nn_vals_stm[valid_v], target_ys[valid_v])[0, 1]
         ) if n > 1 else float('nan')
 
@@ -792,22 +795,37 @@ class Rescorer(object):
         axes[0].scatter(ytgt, xv, s=4, alpha=0.3, c='steelblue')
         axes[0].set_xlabel("target Y")
         axes[0].set_ylabel("NN value (STM-POV)")
-        axes[0].set_title(f"Epoch {epoch}: NN value vs target")
+        axes[0].set_title(f"Epoch {epoch}: NN value vs target  MSE={val_mse:.2f} r={val_corr:.2f}")
 
         valid2 = ~np.isnan(ycp)
+        xv2, ycp2 = xv[valid2], ycp[valid2]
+        ycp2_tanh = np.tanh(ycp2 * (np.arctanh(0.8) / 500.0))
+        mse2 = np.mean((xv2 - ycp2_tanh) ** 2) if len(xv2) > 1 else float('nan')
+        corr2 = np.corrcoef(xv2, ycp2)[0, 1] if len(xv2) > 1 else float('nan')
         c2 = [c_all[i] for i in range(len(xv)) if valid2[i]]
-        axes[1].scatter(ycp[valid2], xv[valid2], s=4, alpha=0.3, c=c2)
+        axes[1].scatter(ycp2, xv2, s=4, alpha=0.3, c=c2)
         axes[1].set_xlabel("SF CP (STM-POV)")
         axes[1].set_ylabel("NN value (STM-POV)")
-        axes[1].set_title("NN value vs SF centipawns")
+        axes[1].set_title(f"NN value vs SF centipawns  MSE={mse2:.2f} r={corr2:.2f}")
         axes[1].legend(handles=legend, fontsize=8)
 
         valid3 = ~np.isnan(ywdl)
+        xv3_raw, ywdl3_raw = xv[valid3], ywdl[valid3]
+        mse3 = np.mean((xv3_raw - ywdl3_raw) ** 2) if len(xv3_raw) > 1 else float('nan')
+        corr3 = np.corrcoef(xv3_raw, ywdl3_raw)[0, 1] if len(xv3_raw) > 1 else float('nan')
         c3 = [c_all[i] for i in range(len(xv)) if valid3[i]]
-        axes[2].scatter(ywdl[valid3], xv[valid3], s=4, alpha=0.3, c=c3)
+
+        def boundary_jitter(arr, scale=0.05):
+            j = np.random.uniform(-scale, scale, size=arr.shape).astype(arr.dtype)
+            j = np.where(arr + j > 1.0, -np.abs(j), np.where(arr + j < -1.0, np.abs(j), j))
+            return arr + j
+
+        xv3   = boundary_jitter(xv3_raw)
+        ywdl3 = boundary_jitter(ywdl3_raw)
+        axes[2].scatter(ywdl3, xv3, s=4, alpha=0.3, c=c3)
         axes[2].set_xlabel("SF WDL score (STM-POV)")
         axes[2].set_ylabel("NN value (STM-POV)")
-        axes[2].set_title("NN value vs SF WDL")
+        axes[2].set_title(f"NN value vs SF WDL  MSE={mse3:.2f} r={corr3:.2f}")
         axes[2].legend(handles=legend, fontsize=8)
 
         fig.tight_layout()

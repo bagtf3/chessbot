@@ -1,4 +1,4 @@
-import os, pickle, random
+import os, pickle, gzip, random
 import pathlib, json
 import time, gc
 import sys, subprocess
@@ -551,12 +551,12 @@ class GameLooper(object):
         res["dirichlet_eps"] = game.tree.dirichlet_eps
         res["es_jsd_thresh"] = game.tree.es_jsd_thresh
 
-        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl")
+        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl.gz")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "wb") as f:
+        with gzip.open(out_path, "wb") as f:
             pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
         
         # this is small, push it to parent process via Queue instead on appending

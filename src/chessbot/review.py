@@ -1,4 +1,4 @@
-import os, json, pathlib, time, random
+import os, json, gzip, pathlib, time, random
 import psutil
 import uuid
 
@@ -52,9 +52,13 @@ class GameViewer:
             raise FileNotFoundError(f"log file not found: {self.path}")
 
         suffix = self.path.suffix.lower()
+        name = self.path.name.lower()
         if suffix == ".json":
             with open(self.path, "r", encoding="utf-8") as f:
                 self.log = json.load(f)
+        elif name.endswith(".pkl.gz"):
+            with gzip.open(self.path, "rb") as f:
+                self.log = pickle.load(f)
         elif suffix in (".pkl", ".pickle"):
             with open(self.path, "rb") as f:
                 self.log = pickle.load(f)

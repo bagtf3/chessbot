@@ -33,7 +33,7 @@ UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
 DEFAULT_LR         = 2e-4
-DEFAULT_MAX_EPOCH  = 1001
+DEFAULT_MAX_EPOCH  = 1201
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ DEFAULT_MAX_EPOCH  = 1001
 # ---------------------------------------------------------------------------
 
 VALUE_POLICY_RATIO = 8.0
-LW_DECAY_START     = 1.25   # policy weight at epoch 10
+LW_DECAY_START     = 1.00   # policy weight at epoch 10
 LW_DECAY_END       = 0.15   # policy weight at DEFAULT_MAX_EPOCH
 
 LW_SCHEDULE: dict[int, dict[str, float]] = {

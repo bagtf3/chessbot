@@ -37,7 +37,7 @@ from chessbot.pretrain import (
     moving_average, save_plot,
 )
 
-EPOCHS_PER_WORKER = 150
+EPOCHS_PER_WORKER = 100
 CHECKPOINT_EVERY  = 20    # must be a multiple of PLOT_EVERY
 DEFAULT_MODEL     = "16m-conformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
@@ -362,7 +362,12 @@ def main() -> None:
         default=os.getenv("BOOTSTRAP_TFREC_DIR", ""),
         help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
     )
-    parser.add_argument("--max-epoch", type=int,   default=1001)
+    parser.add_argument(
+        "--tfrec-dir-2",
+        default="",
+        help="second folder to blend 50/50 with --tfrec-dir",
+    )
+    parser.add_argument("--max-epoch", type=int,   default=1201)
     parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
     args = parser.parse_args()
 
@@ -376,11 +381,27 @@ def main() -> None:
     print(f"[supervisor] model={name}")
     print(f"[supervisor] run_dir={run_dir}")
     print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
+    if args.tfrec_dir_2:
+        print(f"[supervisor] tfrec_dir_2={args.tfrec_dir_2}  (50/50 blend)")
     print(f"[supervisor] max_epoch={args.max_epoch}  lr={args.lr}")
 
-    all_files = list_tfrecord_files(args.tfrec_dir)
-    if not all_files:
+    files1 = list_tfrecord_files(args.tfrec_dir)
+    if not files1:
         parser.error(f"no .tfrecord.gz files found in {args.tfrec_dir}")
+
+    if args.tfrec_dir_2:
+        files2 = list_tfrecord_files(args.tfrec_dir_2)
+        if not files2:
+            parser.error(f"no .tfrecord.gz files found in {args.tfrec_dir_2}")
+        n = min(len(files1), len(files2))
+        rng = np.random.default_rng(42)
+        sample1 = rng.choice(files1, size=n, replace=False).tolist()
+        sample2 = rng.choice(files2, size=n, replace=False).tolist()
+        all_files = sample1 + sample2
+        rng.shuffle(all_files)
+        print(f"[supervisor] blended: {n} from each dir -> {len(all_files)} total")
+    else:
+        all_files = files1
 
     train_files, val_files = split_train_val(all_files)
     print(f"[supervisor] train_files={len(train_files)}  val_files={len(val_files)}")

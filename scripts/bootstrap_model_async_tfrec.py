@@ -14,7 +14,7 @@ Options:
     --run-tag    Sub-dir under SP_DIR (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
-    --max-epoch  Total epochs to train       (default: 920)
+    --max-epoch  Total epochs to train       (default: 1001)
     --lr         Learning rate               (default: 2e-4)
 """
 from __future__ import annotations
@@ -309,7 +309,7 @@ def worker_main(wargs: dict) -> None:
         epoch_times.append(elapsed)
         print(
             f"[time check] last: {format_time(elapsed)}  "
-            f"avg: {format_time(float(np.mean(epoch_times)))}  "
+            f"avg: {format_time(np.mean(epoch_times))}  "
             f"total: {format_time(time.time() - begin)}"
         )
 
@@ -362,7 +362,7 @@ def main() -> None:
         default=os.getenv("BOOTSTRAP_TFREC_DIR", ""),
         help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
     )
-    parser.add_argument("--max-epoch", type=int,   default=DEFAULT_MAX_EPOCH)
+    parser.add_argument("--max-epoch", type=int,   default=1001)
     parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
     args = parser.parse_args()
 

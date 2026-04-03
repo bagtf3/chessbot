@@ -452,8 +452,8 @@ def main(run_tag):
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
 
+            game_queue.cancel_join_thread()
             game_queue.close()
-            game_queue.join_thread()
 
             procs = []
             recent_q = None
@@ -497,8 +497,8 @@ def main(run_tag):
         rescorer.close()
         if game_queue is not None:
             try:
+                game_queue.cancel_join_thread()
                 game_queue.close()
-                game_queue.join_thread()
             except Exception:
                 pass
         shutdown_round(procs, recent_q, telemetry_q)

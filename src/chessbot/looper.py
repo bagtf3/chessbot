@@ -223,7 +223,7 @@ class GameLooper(object):
         #batcher = self.batcher
         mbs = cfg.micro_batch
         fwd = cfg.fwd_batch
-        max_fastpath = max(256, int(2.5 * mbs))
+        max_fastpath = max(512, int(2.5 * mbs))
         mps = self.mps
 
         #(batch size, target), counts returned
@@ -450,7 +450,7 @@ class GameLooper(object):
         # aggregate stats
         self.games_finished += 1
         sims_total = game.tree.sims_done_total
-        cfg = self.config
+        cfg = game.config
 
         # read adjudicator flags (direct attrs; they always exist)
         mat = cfg.use_material_diff
@@ -475,13 +475,12 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            # these are the specific sampled values, not the list of options
             "c_puct": game.tree.c_puct,
             "dirichlet_eps": game.tree.dirichlet_eps(),
             "es_jsd_thresh": game.tree.es_jsd_thresh,
             "uniform_eps": cfg.uniform_eps,
             "prior_clip_max": cfg.prior_clip_max,
-            "model_name": os.path.basename(cfg.model_path).replace("_model.h5", "").replace(".h5", ""),
+            "reuse_tree": cfg.reuse_tree
         }
 
         # on-disk record (full)
@@ -490,9 +489,9 @@ class GameLooper(object):
             "moves_played": game.moves_played,
             "model_epoch": self.n_retrains
         }
-
-        res.update(mem_summary)
+        
         res.update(cfg.to_dict())
+        res.update(mem_summary)
         res.update(game.meta)
 
         # unscale Q values from inference vscale before saving

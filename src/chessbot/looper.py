@@ -202,7 +202,9 @@ class GameLooper(object):
 
     def pull_from_queue(self):
         from pyfastchess import Board as fastboard
-        while len(self.active_games) < self.config.games_at_once:
+        coast_limit = self.config.n_games + 3
+        while (len(self.active_games) < self.config.games_at_once and
+               len(self.active_games) + self.games_finished < coast_limit):
             try:
                 spec = self.game_queue.get_nowait()
             except Exception:

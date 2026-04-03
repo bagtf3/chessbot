@@ -890,12 +890,14 @@ class Rescorer(object):
                     f"avg_rerun {avg_rerun:.3f} exp {expected:.3f} "
                     f"max {self.sf_max[-1]:.3f}"
                 )
-            
+                print()
+
             self.print_collar_stats()
 
             w_this = self.written_this_round
             wtot = self.written_total
             print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
+            print()
 
         self.collar_history.append(dict(self.collar_window))
         self.collar_history = self.collar_history[-10:]

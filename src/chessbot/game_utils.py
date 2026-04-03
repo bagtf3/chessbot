@@ -423,12 +423,12 @@ class GameGenerator:
                 fen=fen, moves=moves,
                 meta={"vs_stockfish": True, "stockfish_is_white": True,
                       "scenario": "paired_validation"},
-                cfg=cfg,
+                cfg=resolve_cfg(cfg),
             ))
             specs.append(GameSpec(
                 fen=fen, moves=list(moves),
                 meta={"vs_stockfish": True, "stockfish_is_white": False,
                       "scenario": "paired_validation"},
-                cfg=cfg,
+                cfg=resolve_cfg(cfg),
             ))
         return specs

@@ -296,7 +296,7 @@ def stable_softmax(logits):
     return e / (s + 1e-9)
 
 
-def batch_policy_metrics_from_priors(samples, uniform_eps=0.05):
+def batch_policy_metrics_from_priors(samples, uniform_eps=0.05, clip_max=0.8):
     """
     Compute policy metrics from per-position prior dicts and visit lists.
     samples: list of (nn_priors_dict, visit_list) where
@@ -337,7 +337,7 @@ def batch_policy_metrics_from_priors(samples, uniform_eps=0.05):
 
         uniform = np.ones(n, dtype=np.float64) / n
         labels = uniform_eps * uniform + (1.0 - uniform_eps) * v
-        labels = np.clip(labels, 0.0, 0.8)
+        labels = np.clip(labels, 0.0, clip_max)
         labels /= labels.sum()
 
         policy_ce  = -np.sum(labels * np.log(p + eps_ll))

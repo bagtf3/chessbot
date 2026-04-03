@@ -135,10 +135,10 @@ class Rescorer(object):
         policy = np.zeros(64 * 67, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        eps = getattr(self.config, 'uniform_eps', 0.05)
+        eps = self.config.uniform_eps
         uniform_mass = 1 / len(ucis) if len(ucis) else 0.0
         pi = eps * uniform_mass + (1.0 - eps) * pi
-        pi = np.clip(pi, 0.0, 0.8)
+        pi = np.clip(pi, 0.0, self.config.prior_clip_max)
         pi = pi / pi.sum()
         for idx, p in zip(indices, pi):
             policy[idx] += p
@@ -746,8 +746,8 @@ class Rescorer(object):
             np.corrcoef(nn_vals_stm[valid_v], target_ys[valid_v])[0, 1]
         ) if n > 1 else float('nan')
 
-        cfg_eps = getattr(self.config, 'uniform_eps', 0.05)
-        pol_stats = batch_policy_metrics_from_priors(policy_samples, cfg_eps)
+        pol_stats = batch_policy_metrics_from_priors(
+            policy_samples, self.config.uniform_eps, self.config.prior_clip_max)
 
         valid_m = ~np.isnan(mol_vals)
         mol_est = float(np.mean(mol_vals[valid_m])) if valid_m.any() else float('nan')

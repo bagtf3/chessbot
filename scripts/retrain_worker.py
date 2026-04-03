@@ -4,7 +4,7 @@ retrain_worker.py
 - run_dir contains:
   - pending_training/  (directory containing .pkl shard files)
   - config.yaml        (the run config, loaded via Config.from_yaml)
-- each shard is a pickle file with arrays: enc_in, mask, policy_logits, value_out, value_weight, policy_weight
+- each shard is a pickle file with arrays: enc_in, mask (ignored), policy_logits, value_out, value_weight, policy_weight
 - legacy .tfrecord/.tfrecord.gz shards are still supported as a fallback
 - model path is taken from cfg.model_path
 - after training, shard files are deleted
@@ -54,16 +54,15 @@ def list_pending_shards_pkl(pending_dir):
 
 def load_shards_pkl(paths):
     import pickle
-    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
+    X_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], []
     loaded = []
 
     for path in paths:
         try:
             with open(path, "rb") as f:
                 chunk = pickle.load(f)
-            for x, mask, policy, Y, vwht, pwht in chunk:
+            for x, _mask, policy, Y, vwht, pwht in chunk:
                 X_list.append(x)
-                M_list.append(mask)
                 P_list.append(policy)
                 Y_list.append(Y)
                 vwht_list.append(vwht)
@@ -72,12 +71,12 @@ def load_shards_pkl(paths):
         except Exception as e:
             print("[retrain] failed reading pkl shard (skipped):", path, e)
 
-    return (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded
+    return (X_list, P_list, Y_list, vwht_list, pwht_list), loaded
 
 
 def load_shards(paths, tries=3, sleep_s=0.25):
     """Load bootstrap tfrecord shards. Returns lists of TF tensors."""
-    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], [], []
+    X_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], []
     loaded = []
 
     for path in paths:
@@ -90,9 +89,6 @@ def load_shards(paths, tries=3, sleep_s=0.25):
                     feat = tf.io.parse_single_example(raw, TFREC_FEATURE_SPEC)
                     X_list.append(
                         tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16)
-                        .numpy().astype(np.int32))
-                    M_list.append(
-                        tf.io.parse_tensor(feat["mask"], out_type=tf.int32)
                         .numpy().astype(np.int32))
                     P_list.append(
                         tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
@@ -121,7 +117,7 @@ def load_shards(paths, tries=3, sleep_s=0.25):
             except Exception as e:
                 print("[retrain] failed deleting bad shard:", path, e)
 
-    return (X_list, M_list, P_list, Y_list, vwht_list, pwht_list), loaded
+    return (X_list, P_list, Y_list, vwht_list, pwht_list), loaded
 
 
 def export_tf_to_onnx(model_path, onnx_path):
@@ -207,7 +203,7 @@ def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
         raise RuntimeError("GPU was present but no logical GPU is active.")
 
 
-def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", timings=None):
+def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timings=None):
     """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
     if timings is None:
         timings = {}
@@ -240,7 +236,11 @@ def retrain_one_model(model_path, X, M, Y, s_wts, cfg, epoch, args, label="", ti
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out": "mse",
     }
-    head_weights = {"policy_logits": cfg.policy_loss_weight, "value_out": cfg.value_loss_weight}
+    head_weights = {
+        "policy_logits": cfg.policy_loss_weight,
+        "value_out": cfg.value_loss_weight
+
+    }
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=head_weights)
     model._default_opt = opt
     model._default_loss_dict = loss_dict
@@ -343,14 +343,13 @@ def main():
         print("[retrain] no shards found in:", pending_dir)
         return 0
 
-    X_list, M_list, P_list, Y_list, vwht_list, pwht_list = lists
+    X_list, P_list, Y_list, vwht_list, pwht_list = lists
 
     if not X_list:
         print("[retrain] no training samples after loading shards")
         return 0
 
     X       = np.stack(X_list).astype(np.int32)
-    M       = np.stack(M_list).astype(np.int32)
     P       = np.stack(P_list).astype(np.float32)
     Y_value = np.array(Y_list,    dtype=np.float32)
     vwht    = np.array(vwht_list, dtype=np.float32)
@@ -363,7 +362,6 @@ def main():
         print(f"[retrain] {n_invalid} nan values found in Y, removing")
     idx     = np.random.permutation(valid.sum())
     X       = X[valid][idx]
-    M       = M[valid][idx]
     P       = P[valid][idx]
     Y_value = Y_value[valid][idx]
     vwht    = vwht[valid][idx]
@@ -391,14 +389,13 @@ def main():
     if cfg.retrain_backend == "pytorch":
         from chessbot.train_pytorch import load_pt_model, train_pt_model, save_pt_model
         model, arch = load_pt_model(cfg.pytorch_model_path)
-        train_pt_model(model, X, M, P, Y_value, vwht, pwht, cfg, args)
+        train_pt_model(model, X, P, Y_value, vwht, pwht, cfg, args)
         save_pt_model(model, cfg.pytorch_model_path, arch)
         print(f"[retrain] pytorch checkpoint saved -> {cfg.pytorch_model_path}")
     else:
-        for model_path in [cfg.model_path]:
-            retrain_one_model(
-                model_path, X, M, Y, s_wts, cfg, epoch, args,
-                label=label, timings=timings)
+        retrain_one_model(
+            cfg.model_path, X, Y, s_wts, cfg, epoch, args,
+            label="", timings=timings)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")

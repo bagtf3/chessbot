@@ -515,7 +515,7 @@ class GameLooper(object):
             "adjudication_index": adjudication_index,
             # these are the specific sampled values, not the list of options
             "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps,
+            "dirichlet_eps": game.tree.dirichlet_eps(),
             "es_jsd_thresh": game.tree.es_jsd_thresh,
             "uniform_eps": cfg.uniform_eps,
             "prior_clip_max": cfg.prior_clip_max,
@@ -545,7 +545,7 @@ class GameLooper(object):
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
         res['c_puct'] = game.tree.c_puct
-        res["dirichlet_eps"] = game.tree.dirichlet_eps
+        res["dirichlet_eps"] = game.tree.dirichlet_eps()
         res["es_jsd_thresh"] = game.tree.es_jsd_thresh
 
         out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl.gz")

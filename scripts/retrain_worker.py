@@ -2,13 +2,12 @@
 retrain_worker.py
 
 - run_dir contains:
-  - pending_training/  (directory containing .tfrecord.gz shard files)
+  - pending_training/  (directory containing .pkl shard files)
   - config.yaml        (the run config, loaded via Config.from_yaml)
-- each shard is a gzipped TFRecord with fields:
-  enc_in, mask, policy_logits, value_out, value_weight, policy_weight
-- model path is taken from the loaded config (single) or cfg.multiplex_models (multi)
-- in multiplex mode: shards are loaded once, each model is trained sequentially
-- after all models are trained, shard files are deleted
+- each shard is a pickle file with arrays: enc_in, mask, policy_logits, value_out, value_weight, policy_weight
+- legacy .tfrecord/.tfrecord.gz shards are still supported as a fallback
+- model path is taken from cfg.model_path
+- after training, shard files are deleted
 """
 
 import argparse
@@ -396,9 +395,7 @@ def main():
         save_pt_model(model, cfg.pytorch_model_path, arch)
         print(f"[retrain] pytorch checkpoint saved -> {cfg.pytorch_model_path}")
     else:
-        model_paths = cfg.multiplex_models or [cfg.model_path]
-        for model_path in model_paths:
-            label = os.path.basename(model_path) if cfg.multiplex_models else ""
+        for model_path in [cfg.model_path]:
             retrain_one_model(
                 model_path, X, M, Y, s_wts, cfg, epoch, args,
                 label=label, timings=timings)

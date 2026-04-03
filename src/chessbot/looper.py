@@ -85,7 +85,7 @@ class GameLooper(object):
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
-        return FalseW
+        return False
 
     def load_reload_model(self):
         cfg = self.config

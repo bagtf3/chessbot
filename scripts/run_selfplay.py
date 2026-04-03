@@ -307,9 +307,8 @@ def main(run_tag):
     procs = []
     recent_q = None
     telemetry_q = None
-    game_queues = []
-    creator_stop = threading.Event()
-    creator_thread = None
+    game_queue = None
+    game_gen = None
     retrain = None
     total_games = 0
     try:    
@@ -344,25 +343,16 @@ def main(run_tag):
             recent_q, telemetry_q = make_parent_queues()
 
             ctx = mp.get_context()
-            n_workers = max(1, working_cfg.n_workers)
-            game_queues = [ctx.Queue() for _ in range(n_workers)]
+            game_queue = ctx.Queue()
+            game_gen = GameGenerator(working_cfg)
 
-            creator_stop = threading.Event()
             if is_validation:
-                # pre-generate all paired validation specs and distribute evenly
-                game_gen = GameGenerator(working_cfg)
-                val_specs = game_gen.validation_games()
-                for j, spec in enumerate(val_specs):
-                    game_queues[j % n_workers].put(spec)
-                creator_thread = None
+                for spec in game_gen.validation_games():
+                    game_queue.put(spec)
             else:
-                game_gen = GameGenerator(working_cfg)
-                creator_thread = GameCreatorThread(
-                    game_gen, game_queues, creator_stop
-                )
-                creator_thread.start()
+                top_up_game_queue(game_queue, game_gen)
 
-            procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queues)
+            procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
 
             # infer n_retrains
             if os.path.exists(working_cfg.progress_csv_path):
@@ -384,6 +374,10 @@ def main(run_tag):
                 # break if no workers and backlog is small enough to carry into next round
                 if not procs and len(finished_games) < MAX_BACKLOG:
                     break
+
+                # top up game queue if running low (training rounds only)
+                if not is_validation and game_queue.qsize() < GAME_QUEUE_MIN:
+                    top_up_game_queue(game_queue, game_gen)
 
                 # check telemetry
                 msgs = drain_queue(telemetry_q)
@@ -451,24 +445,19 @@ def main(run_tag):
                     for p in procs:
                         p["msg_q"].put("unpause")
             
-            # stop the creator thread before shutting down workers
-            creator_stop.set()
-            if creator_thread is not None:
-                creator_thread.join(timeout=2.0)
-
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
 
-            for gq in game_queues:
-                gq.close()
-                gq.join_thread()
+            game_queue.close()
+            game_queue.join_thread()
 
             procs = []
             recent_q = None
             telemetry_q = None
-            game_queues = []
+            game_queue = None
+            game_gen = None
 
             # selfplay round report
             recorder.maybe_log_results(force=True)
@@ -504,13 +493,10 @@ def main(run_tag):
             n_saved = len(rescorer.training_data)
             print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
         rescorer.close()
-        creator_stop.set()
-        if creator_thread is not None:
-            creator_thread.join(timeout=2.0)
-        for gq in game_queues:
+        if game_queue is not None:
             try:
-                gq.close()
-                gq.join_thread()
+                game_queue.close()
+                game_queue.join_thread()
             except Exception:
                 pass
         shutdown_round(procs, recent_q, telemetry_q)

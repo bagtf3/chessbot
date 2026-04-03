@@ -642,7 +642,7 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None):
 
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q,
+        recent_q=recent_games_q, telem_q=telemetry_q, msg_q=msg_q,
         game_queue=game_queue,
     )
 

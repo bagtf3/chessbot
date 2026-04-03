@@ -108,6 +108,7 @@ class Config(object):
     add_root_noise = True
     dirichlet_eps = 0.3
     dirichlet_alpha = 0.3
+    reuse_tree = True
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
     

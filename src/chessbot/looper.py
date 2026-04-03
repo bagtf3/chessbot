@@ -319,9 +319,6 @@ class GameLooper(object):
                 # first resolve any recent preds
                 game.tree.resolve_inflight()
 
-                if game.tree.needs_root_noise(check_sims=True):
-                    game.tree.add_root_dirichlet_noise()
-                
                 # if its stockfish turn, check if the move is ready
                 # otherwise do not block and move on
                 if game.is_stockfish_turn():

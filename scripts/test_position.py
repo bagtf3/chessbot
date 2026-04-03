@@ -107,7 +107,6 @@ class XercesEngine:
                 board.push_uci(mv)
         self.board = board
         self.tree = MCTSTree(board, self.config)
-        self.tree.add_root_dirichlet_noise()
 
     def go(self, sims=None, keep_tree=True):
         if self.tree is None:
@@ -137,9 +136,6 @@ class XercesEngine:
 
         while not tree.stop_simulating():
             tree.resolve_inflight()
-
-            if tree.needs_root_noise(check_sims=True):
-                tree.add_root_dirichlet_noise()
 
             if tree.count_unresolved() >= max_unresolved:
                 time.sleep(0.0005)

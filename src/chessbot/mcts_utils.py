@@ -65,16 +65,12 @@ class MCTSTree(fasttree):
 
         self.n_moves_played = 0
         self.sims_done_total = 0
-        
-        # root noise
-        self.add_root_noise = cfg.add_root_noise
-        self.root_noise_added = False
 
-        # epsilon may be sampled
-        if self.add_root_noise:
-            self.dirichlet_eps = float(cbu.maybe_random_from_list(cfg.dirichlet_eps))
-        else:
-            self.dirichlet_eps = 0.0
+        # configure C++ tree
+        if cfg.add_root_noise:
+            eps = float(cbu.maybe_random_from_list(cfg.dirichlet_eps))
+            self.set_dirichlet(eps, float(cfg.dirichlet_alpha))
+        self.set_reuse_tree(bool(cbu.maybe_random_from_list(cfg.reuse_tree)))
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -197,10 +193,6 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
-            
-        # add noise to the root for exploration
-        self.root_noise_added = False
-        self.add_root_dirichlet_noise()
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
@@ -223,25 +215,6 @@ class MCTSTree(fasttree):
         
         self.sims_ceiling = new_ceiling
         self.set_sim_budget(float(new_ceiling))
-
-    def needs_root_noise(self, check_sims=False):
-        check = self.add_root_noise and not self.root_noise_added
-        if not check:
-            return False
-
-        if not check_sims:
-            return check
-        # make sure some sims have been completed already
-        return check and (self.sims_completed_this_move > 10)
-
-    def add_root_dirichlet_noise(self):
-        if not self.needs_root_noise():
-            return
-
-        super().add_root_dirichlet_noise(
-            eps=self.dirichlet_eps, alpha=self.config.dirichlet_alpha)
-        
-        self.root_noise_added = True
 
     def get_sim_decision_probs(self):
         # not implemented right now

@@ -22,9 +22,9 @@ from pyfastchess import raw_cache_bulk_insert, priors_cache_clear, priors_cache_
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
-from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
-from chessbot.utils import RateMeter, GameGenerator, sf_eval
+from chessbot.utils import RateMeter, sf_eval
+from chessbot.game_utils import GameSpec
 #from chessbot.tf_thread import Batcher, TensorFlowThread
 
 
@@ -32,23 +32,18 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_games_q, telemetry_q, msg_q):
+    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None):
         self.id = cfg.id
         self.config = cfg
-        self.recent_games_q = recent_games_q
-        self.telemetry_q = telemetry_q
+        self.recent_games_q = recent_q
+        self.telemetry_q = telem_q
         self.msg_q = msg_q
+        self.game_queue = game_queue
         self.unpause_queued = False
-        self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
-        self.sf_count = 0
 
-        # different game logic for training vs validation
-        if self.config.is_validation_run:
-            self.active_games = paired_validation_games(self.config)
-        else:
-            self.fill_active_games()
+        self.pull_from_queue()
         
         self.model = model
 
@@ -60,8 +55,7 @@ class GameLooper(object):
         
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()
-
-        self.infer_is_warm = False
+        
         self.batch_candidates = self.create_batch_candidates(self.config)
         self.n_retrains = 0
         
@@ -91,20 +85,7 @@ class GameLooper(object):
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
-        return False
-
-    def warmup_infer(self):
-        if self.infer_is_warm:
-            return
-        print(f"[model warmup] warming GPU for {self.batch_candidates}")
-        for bs in self.batch_candidates:
-            for _ in range(3):
-                rep_mask = (np.random.rand(bs, 4288) < 0.02).astype(np.int32)
-                rep_enc = (np.random.rand(bs, 64) < 0.32).astype(np.int32)
-                self.infer((rep_enc, rep_mask))
-
-        self.infer_is_warm = True
-        print("[model warmup] warm up complete")
+        return FalseW
 
     def load_reload_model(self):
         cfg = self.config
@@ -202,7 +183,7 @@ class GameLooper(object):
         self.n_retrains += 1
 
     def create_batch_candidates(self, cfg):
-        # create sizes to warm up
+        # create sizes
         batch_candidates = set([cfg.min_batch, cfg.fwd_batch])
         bs = cfg.min_batch
         while bs <= cfg.fwd_batch:
@@ -219,36 +200,17 @@ class GameLooper(object):
             return sorted(set(sbc))
         return sorted(set(batch_candidates))
 
-    def fill_active_games(self):
-        cfg = self.config
-        needed = cfg.n_games - self.games_finished - len(self.active_games)
-        if needed <= 0:
-            return
-
-        # add games w.r.t. num needed and games_at_once
-        for _ in range(needed):
-            if len(self.active_games) >= cfg.games_at_once:
-                return
-
-            # this has game probs from the config
-            board, meta = self.game_gen.new_board()
-
-            meta['vs_stockfish'] = False
-            meta['stockfish_is_white'] = False
-            meta['vs_stockfish'] = np.random.uniform() <= cfg.play_vs_sf_prob
-
-            # stockfish only plays certain scenarios
-            if meta['scenario'] in cfg.sf_exclude:
-                meta['vs_stockfish'] = False
-
-            if meta['vs_stockfish']:
-                self.sf_count += 1
-                meta['vs_stockfish'] = True
-            
-                # alternate sf color to balance white and black
-                meta['stockfish_is_white'] = bool(self.sf_count % 2)
-            
-            cg = ChessGame(board=board, meta=meta, cfg=self.config)
+    def pull_from_queue(self):
+        from pyfastchess import Board as fastboard
+        while len(self.active_games) < self.config.games_at_once:
+            try:
+                spec = self.game_queue.get_nowait()
+            except Exception:
+                break
+            board = fastboard(spec.fen)
+            for mv in spec.moves:
+                board.push_uci(mv)
+            cg = ChessGame(board=board, meta=spec.meta, cfg=spec.cfg)
             self.active_games.append(cg)
 
     def run(self, stop_event=None):
@@ -281,7 +243,7 @@ class GameLooper(object):
                 ]
             
             # add in more games if needed
-            self.fill_active_games()
+            self.pull_from_queue()
 
             if not self.active_games:
                 break
@@ -658,7 +620,7 @@ class GameLooper(object):
         self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
 
 
-def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -680,7 +642,8 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
 
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q
+        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q,
+        game_queue=game_queue,
     )
 
     # infer number of retrains already done from existing progress csv

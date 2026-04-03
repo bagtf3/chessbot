@@ -96,9 +96,13 @@ class Config(object):
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
-        "random_init": 0.08,
-        "piece_odds": 0.02, "piece_training": 0.01
+        "random_init": 0.08, "piece_odds": 0.02, "piece_training": 0.01
     }
+
+    # game type mix for validation rounds; same format as game_probs.
+    # all games are paired (one as white, one as black) and must be unique positions.
+    # if a type exhausts unique positions, UHO fills the remainder.
+    validation_game_probs = {"UHO": 1.0}
 
     # priors
     uniform_eps = 0.25

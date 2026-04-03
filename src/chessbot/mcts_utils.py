@@ -24,16 +24,11 @@ class MCTSTree(fasttree):
     def __init__(self, board, cfg):
         self.config = cfg
 
-        # if c_puct is given as a list, pick an option randomly
-        # must be float for c++
-        self.c_puct = float(cbu.maybe_random_from_list(cfg.c_puct))
+        self.c_puct = float(cfg.c_puct)
 
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
         self.sims_ceiling_schedule = {}
-        
-        # ceiling can be a list for varied gameplay
-        self.sims_ceiling = cbu.maybe_random_from_list(cfg.sims_ceiling)
 
         # can also be a dict, interpreted as a sims schedule
         if isinstance(cfg.sims_ceiling, dict):
@@ -67,10 +62,10 @@ class MCTSTree(fasttree):
         self.sims_done_total = 0
 
         # configure C++ tree
+        # explicit casts required — these are passed directly to C++
         if cfg.add_root_noise:
-            eps = float(cbu.maybe_random_from_list(cfg.dirichlet_eps))
-            self.set_dirichlet(eps, float(cfg.dirichlet_alpha))
-        self.set_reuse_tree(bool(cbu.maybe_random_from_list(cfg.reuse_tree)))
+            self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
+        self.set_reuse_tree(bool(cfg.reuse_tree))
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -78,7 +73,7 @@ class MCTSTree(fasttree):
         self.sim_stop_reason = ""
 
         self.es_checks = []
-        self.es_jsd_thresh = float(cbu.maybe_random_from_list(cfg.es_jsd_thresh))
+        self.es_jsd_thresh = cfg.es_jsd_thresh
 
     def best(self):
         """
@@ -435,14 +430,6 @@ class ChessGame(object):
         self.game_id = str(uuid.uuid4())
         self.started_at = _now()
 
-        # we may sample adjudicators to vary gameplay
-        if cfg.sample_adjudicators:
-            cfg = cfg.copy()
-            cfg.use_material_diff = bool(np.random.random() > 0.5)
-            cfg.use_syzygy = bool(np.random.random() > 0.5)
-            cfg.use_eval_draw = bool(np.random.random() > 0.5)
-            cfg.use_eval_collar = bool(np.random.random() > 0.5)
-            
         self.config = cfg
 
         self.board = board

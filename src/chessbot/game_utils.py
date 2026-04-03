@@ -253,13 +253,20 @@ def short_fen(fen):
     return " ".join(fen.split(" ")[:4])
 
 
+def resolve_cfg(cfg):
+    """Return a copy of cfg with sampleable params replaced by sampled scalars."""
+    resolved = cfg.copy()
+    resolved.update({param: random.choice(options) for param, options in cfg.sampleable.items()})
+    resolved.sampleable = {}
+    return resolved
+
+
 class GameGenerator:
     def __init__(self, cfg):
         self.config = cfg
         self.game_types = list(cfg.game_probs.keys())
         self.sf_count = 0
         self.used_fens = set()
-
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
 
     def generate(self, game_type):
@@ -363,7 +370,7 @@ class GameGenerator:
             self.used_fens.add(key)
 
         self.assign_sf(meta)
-        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=cfg)
+        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
 
     def validation_games(self, cfg=None):
         if cfg is None:

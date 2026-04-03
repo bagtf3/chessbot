@@ -18,11 +18,14 @@ class Config(object):
     validation_every = 5
     n_workers = 2
     n_rounds = 51
-    multiplex_models = []   # list of model paths; workers round-robin through them
-    custom_worker_configs = {}  # int-keyed per-worker config overrides; falsey = disabled
 
-    # MCTS (float or list)
-    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    # per-game parameter sampling; resolved once per game in the main process.
+    # each entry: param_name: [list of options to pick from].
+    # only 1st-order scalar params are supported (no nested keys).
+    sampleable = {}
+
+    # MCTS
+    c_puct = 2.0
 
     use_smart_pruning = True
     pruning_factor = 1.33
@@ -49,8 +52,6 @@ class Config(object):
     min_batch = 4
     fwd_batch = 256
 
-    sample_adjudicators = True
-    
     max_game_length = 200
     min_game_length = 5
     use_syzygy = False

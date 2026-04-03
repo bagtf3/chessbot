@@ -67,16 +67,9 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue):
     procs = []
 
     n_workers = max(1, cfg.n_workers)
-    multiplex = cfg.multiplex_models  # [] or list of paths
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-        if multiplex:
-            c.model_path = multiplex[i % len(multiplex)]
-        if cfg.custom_worker_configs:
-            worker_overrides = cfg.custom_worker_configs.get(i, {})
-            if worker_overrides:
-                c.update(worker_overrides)
 
         stop_ev = ctx.Event()
         msg_q = ctx.Queue()

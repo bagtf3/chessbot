@@ -350,7 +350,9 @@ def main(run_tag):
                 for spec in game_gen.validation_games():
                     game_queue.put(spec)
             else:
-                top_up_game_queue(game_queue, game_gen)
+                n_workers = max(1, working_cfg.n_workers)
+                initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
+                top_up_game_queue(game_queue, game_gen, target=initial_target)
 
             procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
 

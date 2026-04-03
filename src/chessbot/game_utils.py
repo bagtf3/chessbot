@@ -260,9 +260,7 @@ class GameGenerator:
         self.sf_count = 0
         self.used_fens = set()
 
-        self.uho_sampler = None
-        if "UHO" in self.game_types:
-            self.uho_sampler = UhoPgnSampler(PGN_TEXT)
+        self.uho_sampler = UhoPgnSampler(PGN_TEXT)
 
     def generate(self, game_type):
         """Returns (fen, moves, meta). fen is the starting position; moves are
@@ -305,7 +303,7 @@ class GameGenerator:
             fen, meta = make_piece_training_board()
             meta["scenario"] = "piece_training"
             moves = []
-
+        
         elif game_type == "startpos":
             fen, moves = STARTPOS_FEN, []
             meta = {"scenario": "startpos"}

@@ -11,7 +11,10 @@ import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain, reclaim_vram
+from chessbot.rescore import (
+    Rescorer, SFRescoreThread, SFCache,
+    launch_retrain_async, poll_retrain, reclaim_vram,
+)
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
@@ -25,78 +28,6 @@ import queue
 
 STOP_REQUESTED = threading.Event()
 
-
-class RescorerThread:
-    """Wraps a Rescorer and runs analyze_and_rescore on a background thread."""
-
-    def __init__(self, rescorer):
-        self.rescorer = rescorer
-        self.work_queue = queue.Queue()
-        self.stopped = False
-        self.thread = threading.Thread(target=self.worker, daemon=True)
-        self.thread.start()
-
-    def worker(self):
-        while True:
-            item = self.work_queue.get()
-            if item is None:
-                self.work_queue.task_done()
-                return
-            try:
-                self.rescorer.analyze_and_rescore(item)
-            finally:
-                self.work_queue.task_done()
-
-    def submit(self, pkl_file):
-        self.work_queue.put(pkl_file)
-
-    def drain(self):
-        self.work_queue.join()
-
-    @property
-    def training_data_size(self):
-        return len(self.rescorer.training_data)
-
-    @property
-    def config(self):
-        return self.rescorer.config
-
-    @config.setter
-    def config(self, value):
-        self.rescorer.config = value
-
-    @property
-    def training_data(self):
-        self.drain()
-        return self.rescorer.training_data
-
-    @training_data.setter
-    def training_data(self, value):
-        self.rescorer.training_data = value
-
-    def write_training_data_pkl(self, size=None, randomize=True):
-        self.rescorer.write_training_data_pkl(size=size, randomize=randomize)
-
-    def push_analyzed(self, report=True):
-        self.rescorer.push_analyzed(report=report)
-
-    def aggregate_metrics(self, *args, **kwargs):
-        self.rescorer.aggregate_metrics(*args, **kwargs)
-
-    def reset_writer(self):
-        self.rescorer.reset_writer()
-
-    def get_unprocessed(self):
-        return self.rescorer.get_unprocessed()
-
-    def close(self):
-        if self.stopped:
-            return
-        self.stopped = True
-        self.drain()
-        self.work_queue.put(None)
-        self.thread.join()
-        self.rescorer.close()
 MAX_BACKLOG = 200
 GAME_QUEUE_MIN = 48  # top up when central queue drops below this
 
@@ -351,8 +282,13 @@ def main(run_tag):
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
 
-    # init the rescorer (runs analyze_and_rescore on a background thread)
-    rescorer = RescorerThread(Rescorer(base_cfg))
+    # init the async SF worker and rescorer
+    req_q = queue.Queue()
+    res_q = queue.Queue()
+    sf_rescore_thread = SFRescoreThread(req_q, res_q, base_cfg)
+    sf_rescore_thread.start()
+    cache = SFCache()
+    rescorer = Rescorer(base_cfg, req_q, res_q, cache)
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
@@ -471,10 +407,11 @@ def main(run_tag):
                 
                 recorder.maybe_log_results()
 
-                # submit all pending games to the rescorer thread (non-blocking)
+                # submit all pending games and tick the rescorer pipeline
                 while finished_games:
                     to_process = finished_games.popleft()
                     rescorer.submit(pull_pkl(to_process))
+                rescorer.tick()
 
                 recorder.training_queue = rescorer.training_data_size
 
@@ -512,6 +449,7 @@ def main(run_tag):
                         while finished_games:
                             to_process = finished_games.popleft()
                             rescorer.submit(pull_pkl(to_process))
+                        rescorer.tick()
 
                         time.sleep(0.05)
 
@@ -550,6 +488,7 @@ def main(run_tag):
                 continue
 
         # capture the return situation
+        rescorer.tick()
         rescorer.push_analyzed(report=True)
         rescorer.close()
         alive = mp.active_children()
@@ -563,7 +502,9 @@ def main(run_tag):
     
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
+        rescorer.tick()
         rescorer.push_analyzed(report=True)
+        sf_rescore_thread.close()
         if rescorer.training_data:
             remaining_pkl = os.path.join(
                 base_cfg.run_dir, "remaining_untrained.pkl"

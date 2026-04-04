@@ -1,7 +1,7 @@
 from chessbot import MODEL_DIR, SF_LOC
 
 from chessbot.utils import sf_eval, random_init, mirror_move, format_time
-from chessbot.utils import GameGenerator
+from chessbot.game_utils import GameGenerator
 from chessbot.model import save_transformer_model
 
 from chessbot.review import make_fake_visits

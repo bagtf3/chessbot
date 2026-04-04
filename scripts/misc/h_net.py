@@ -24,7 +24,7 @@ HE = "he_normal"
 from chessbot.utils import format_time
 from chessbot.encoding import compute_move_priors
 import chessbot.utils as cbu
-from chessbot.utils import get_pre_opened_game
+from chessbot.game_utils import get_pre_opened_game
 
 from chessbot import SF_LOC, ENDGAME_LOC
 import chess.syzygy

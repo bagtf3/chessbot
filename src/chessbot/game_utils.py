@@ -341,6 +341,17 @@ class GameGenerator:
         meta["vs_stockfish"] = True
         meta["stockfish_is_white"] = bool(self.sf_count % 2)
 
+    def new_board(self, game_type=None):
+        """Returns (board, meta) — compatibility API for misc scripts."""
+        if game_type is None:
+            types, probs = zip(*self.config.game_probs.items())
+            game_type = random.choices(types, weights=probs, k=1)[0]
+        fen, moves, meta = self.generate(game_type)
+        b = fastboard(fen)
+        for mv in moves:
+            b.push_uci(mv)
+        return b, meta
+
     def next_game(self, game_type=None, cfg=None):
         if cfg is None:
             cfg = self.config

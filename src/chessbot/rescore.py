@@ -95,7 +95,7 @@ class SFRescoreThread:
     def __init__(self, req_q, res_q, cfg):
         self.req_q = req_q
         self.res_q = res_q
-        self.depth = cfg.post_hoc_depth
+        self.depth = cfg.rescore_depth
         self.sf_config = {'Hash': 256, 'UCI_ShowWDL': True}
         self.stop_ev = threading.Event()
         self.t = None
@@ -415,11 +415,12 @@ class Rescorer(object):
         game_cfg_keys = (
             'train_on_stockfish', 'z_mix',
             'KL_weight_boost', 'KL_boost_threshold',
-            'post_hoc_equiv_range', 'post_hoc_blunder_cp_loser',
-            'post_hoc_blunder_cp_winner', 'post_hoc_inaccuracy_cp',
+            'rescore_equiv_range', 'rescore_blunder_cp_loser',
+            'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
             'uniform_eps', 'prior_clip_max',
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
-            'collar_rescore_dry_run', 'post_hoc_analyze_batch',
+            'collar_rescore_dry_run', 'rescore_analyze_batch',
+            'draw_value_scale',
         )
         game_state = {
             'gid': gid,
@@ -675,7 +676,7 @@ class Rescorer(object):
 
         KL_coef = cfg.KL_weight_boost
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
-        EQUIV = cfg.post_hoc_equiv_range
+        EQUIV = cfg.rescore_equiv_range
 
         cpl_s = cpl_w = cpl_b = 0.0
         nw = nb = 0
@@ -738,9 +739,9 @@ class Rescorer(object):
                 continue
 
             lms = ply['lms']
-            blunder_cp = cfg.post_hoc_blunder_cp_loser
+            blunder_cp = cfg.rescore_blunder_cp_loser
             if Z_stm > 0.0:
-                blunder_cp = cfg.post_hoc_blunder_cp_winner
+                blunder_cp = cfg.rescore_blunder_cp_winner
 
             kl_eligible = False
             xc0_uci = visits[0][0]
@@ -757,7 +758,7 @@ class Rescorer(object):
             if loss_this <= EQUIV:
                 kl_eligible = True
             
-            elif loss_this <= cfg.post_hoc_inaccuracy_cp or missed_mate:
+            elif loss_this <= cfg.rescore_inaccuracy_cp or missed_mate:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
                 visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
@@ -887,7 +888,7 @@ class Rescorer(object):
         self.accumulate_stop_stats(stop_stats)
         if self.games_processed % 100 == 0:
             self.print_stop_stats()
-        if len(self.analyzed_results) >= cfg.post_hoc_analyze_batch:
+        if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
             self.push_analyzed(report=True)
 
 
@@ -1148,7 +1149,7 @@ class Rescorer(object):
                 )
 
             n_tot = self.games_processed
-            if n_tot > self.config.post_hoc_analyze_batch:
+            if n_tot > self.config.rescore_analyze_batch:
                 rate = n_tot / (time.time() - self.start_time)
                 print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
             

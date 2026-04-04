@@ -75,13 +75,15 @@ class Config(object):
     sf_config = {"Threads": 1, "Hash": 256}
     sf_exclude = ["piece_training"]
 
-    # overrides for the post hoc worker
-    post_hoc_depth = 12
-    post_hoc_analyze_batch = 30
-    post_hoc_equiv_range = 25
-    post_hoc_inaccuracy_cp = 75
-    post_hoc_blunder_cp_loser = 90
-    post_hoc_blunder_cp_winner = 200
+    # rescoring config
+    rescore_depth = 12
+    rescore_analyze_batch = 30
+    rescore_equiv_range = 25
+    rescore_inaccuracy_cp = 75
+    rescore_blunder_cp_loser = 90
+    rescore_blunder_cp_winner = 200
+    rescore_eviction_window = 500
+    rescore_cache_size = 50000
 
     collar_rescore_dry_run = True
     collar_threshold_cp = 300

@@ -287,7 +287,10 @@ def main(run_tag):
     res_q = queue.Queue()
     sf_rescore_thread = SFRescoreThread(req_q, res_q, base_cfg)
     sf_rescore_thread.start()
-    cache = SFCache()
+    cache = SFCache(
+        eviction_window=base_cfg.rescore_eviction_window,
+        max_size=base_cfg.rescore_cache_size,
+    )
     rescorer = Rescorer(base_cfg, req_q, res_q, cache)
     finished_games = rescorer.get_unprocessed()
 

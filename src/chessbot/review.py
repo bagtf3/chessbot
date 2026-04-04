@@ -1711,11 +1711,11 @@ def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
         p.cpu_affinity(cores)
 
     # apply overrides
-    POLL_INTERVAL = run_cfg.post_hoc_poll_interval
-    BLUNDER_CP = run_cfg.post_hoc_blunder_cp
-    ANALYZE_BATCH = run_cfg.post_hoc_analyze_batch
-    DEPTH = run_cfg.post_hoc_depth
-    EQUIV_RANGE = run_cfg.post_hoc_equiv_range
+    POLL_INTERVAL = run_cfg.rescore_poll_interval
+    BLUNDER_CP = run_cfg.rescore_blunder_cp
+    ANALYZE_BATCH = run_cfg.rescore_analyze_batch
+    DEPTH = run_cfg.rescore_depth
+    EQUIV_RANGE = run_cfg.rescore_equiv_range
 
     # also set them in globals so other functions (defined above) see them
     globals().update({

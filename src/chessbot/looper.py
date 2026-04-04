@@ -43,13 +43,12 @@ class GameLooper(object):
         self.unpause_queued = False
         self.games_finished = 0
         self.active_games = []
+        self.sf_games = {}
+        self.sf_thread = None  # lazy-initialized on first vs_stockfish game
 
         self.pull_from_queue()
 
         self.model = model
-
-        self.sf_games = {}
-        self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()

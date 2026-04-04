@@ -22,9 +22,85 @@ import gc
 import pickle
 import signal
 import threading
+import queue
 
 STOP_REQUESTED = threading.Event()
-PROCESS_TIME = 30.0
+
+
+class RescorerThread:
+    """Wraps a Rescorer and runs analyze_and_rescore on a background thread."""
+
+    def __init__(self, rescorer):
+        self.rescorer = rescorer
+        self.work_queue = queue.Queue()
+        self.stopped = False
+        self.thread = threading.Thread(target=self.worker, daemon=True)
+        self.thread.start()
+
+    def worker(self):
+        while True:
+            item = self.work_queue.get()
+            if item is None:
+                self.work_queue.task_done()
+                return
+            try:
+                self.rescorer.analyze_and_rescore(item)
+            finally:
+                self.work_queue.task_done()
+
+    def submit(self, pkl_file):
+        self.work_queue.put(pkl_file)
+
+    def drain(self):
+        self.work_queue.join()
+
+    @property
+    def training_data_size(self):
+        return len(self.rescorer.training_data)
+
+    @property
+    def config(self):
+        return self.rescorer.config
+
+    @config.setter
+    def config(self, value):
+        self.rescorer.config = value
+
+    @property
+    def training_data(self):
+        self.drain()
+        return self.rescorer.training_data
+
+    @training_data.setter
+    def training_data(self, value):
+        self.rescorer.training_data = value
+
+    def write_training_data_pkl(self, size=None, randomize=True):
+        self.drain()
+        self.rescorer.write_training_data_pkl(size=size, randomize=randomize)
+
+    def push_analyzed(self, report=True):
+        self.drain()
+        self.rescorer.push_analyzed(report=report)
+
+    def aggregate_metrics(self, *args, **kwargs):
+        self.drain()
+        self.rescorer.aggregate_metrics(*args, **kwargs)
+
+    def reset_writer(self):
+        self.rescorer.reset_writer()
+
+    def get_unprocessed(self):
+        return self.rescorer.get_unprocessed()
+
+    def close(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        self.drain()
+        self.work_queue.put(None)
+        self.thread.join()
+        self.rescorer.close()
 MAX_BACKLOG = 200
 GAME_QUEUE_MIN = 48  # top up when central queue drops below this
 
@@ -274,8 +350,8 @@ def main(run_tag):
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
 
-    # init the rescorer
-    rescorer = Rescorer(base_cfg)
+    # init the rescorer (runs analyze_and_rescore on a background thread)
+    rescorer = RescorerThread(Rescorer(base_cfg))
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
@@ -388,25 +464,19 @@ def main(run_tag):
                 
                 recorder.maybe_log_results()
 
-                process_start = time.time()
-                # process games for a little bit then keep checking
-                while time.time() < process_start + PROCESS_TIME:
-                    if not len(finished_games):
-                        time.sleep(2.0)
-                        break
-                    
+                # submit all pending games to the rescorer thread (non-blocking)
+                while finished_games:
                     to_process = finished_games.popleft()
-                    pkl_file = pull_pkl(to_process)
-                    
-                    rescorer.analyze_and_rescore(pkl_file)
-                    recorder.training_queue = len(rescorer.training_data)
+                    rescorer.submit(pull_pkl(to_process))
+
+                recorder.training_queue = rescorer.training_data_size
 
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
-                    # write data first so workers keep playing during the write
+                    # drain so write gets accurate data; workers keep playing meanwhile
                     rescorer.write_training_data_pkl(
                         size=working_cfg.retrain_size, randomize=True)
-                    recorder.training_queue = len(rescorer.training_data)
+                    recorder.training_queue = rescorer.training_data_size
 
                     # pause workers before reclaim + launch
                     for p in procs:
@@ -425,20 +495,25 @@ def main(run_tag):
                                 n_retrains, working_cfg.vscale,
                                 working_cfg.progress_csv_path)
                             n_retrains += 1
-                        
-                        # can still process games during retraining
-                        if len(finished_games):
+
+                        # keep submitting games while waiting on retrain
+                        pulled_games = drain_queue(recent_q)
+                        for game in pulled_games:
+                            recorder.ingest_recents(game)
+                            update_game_index(game['meta'], base_cfg)
+                            finished_games.append(game)
+                        while finished_games:
                             to_process = finished_games.popleft()
-                            pkl_file = pull_pkl(to_process)
-                            rescorer.analyze_and_rescore(pkl_file)
-                            recorder.training_queue = len(rescorer.training_data)
-                        
-                        else:
-                            time.sleep(0.05)
-                    
+                            rescorer.submit(pull_pkl(to_process))
+
+                        time.sleep(0.05)
+
                     # unpause workers
                     for p in procs:
                         p["msg_q"].put("unpause")
+
+                else:
+                    time.sleep(0.5)
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)

@@ -1086,15 +1086,6 @@ class GameViewer:
                         break
                 visits[0][0] = move_played
 
-            # check_boost = kwargs.get("check_boost", 0)
-            # capture_boost = kwargs.get("capture_boost", 0)
-            # if check_boost or capture_boost:
-            #     for i, (move, v) in enumerate(visits):
-            #         if rb.gives_check(move):
-            #             visits[i][1] += check_boost
-            #         if rb.is_capture(move):
-            #             visits[i][1] += capture_boost
-
             counts = np.array([x[1] for x in visits], dtype=np.float32)
             s = counts.sum()
             if s > 0.0:

@@ -32,26 +32,24 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None):
+    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None, sf_queue=None):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_q
         self.telemetry_q = telem_q
         self.msg_q = msg_q
         self.game_queue = game_queue
+        self.sf_queue = sf_queue
         self.unpause_queued = False
         self.games_finished = 0
         self.active_games = []
 
         self.pull_from_queue()
-        
+
         self.model = model
 
         self.sf_games = {}
-        self.sf_thread = None
-        if cfg.play_vs_sf_prob > 0.0:
-            self.sf_thread = StockfishThread(cfg.sf_config, cfg.sf_depth)
-            self.sf_thread.start()
+        self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()
@@ -205,10 +203,22 @@ class GameLooper(object):
         coast_limit = self.config.n_games + 3
         while (len(self.active_games) < self.config.games_at_once and
                len(self.active_games) + self.games_finished < coast_limit):
-            try:
-                spec = self.game_queue.get_nowait()
-            except Exception:
-                break
+            spec = None
+            if self.sf_queue is not None:
+                try:
+                    spec = self.sf_queue.get_nowait()
+                except Exception:
+                    pass
+            if spec is None:
+                try:
+                    spec = self.game_queue.get_nowait()
+                except Exception:
+                    break
+            if spec.meta.get("vs_stockfish") and self.sf_thread is None:
+                self.sf_thread = StockfishThread(
+                    self.config.sf_config, self.config.sf_depth
+                )
+                self.sf_thread.start()
             board = fastboard(spec.fen)
             for mv in spec.moves:
                 board.push_uci(mv)
@@ -621,7 +631,7 @@ class GameLooper(object):
         self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
 
 
-def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, sf_queue=None):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -644,7 +654,7 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None):
     looper = GameLooper(
         model=model, cfg=config.copy(),
         recent_q=recent_games_q, telem_q=telemetry_q, msg_q=msg_q,
-        game_queue=game_queue,
+        game_queue=game_queue, sf_queue=sf_queue,
     )
 
     # infer number of retrains already done from existing progress csv

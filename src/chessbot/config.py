@@ -76,12 +76,12 @@ class Config(object):
     sf_exclude = ["piece_training"]
 
     # overrides for the post hoc worker
-    post_hoc_blunder_cp = 150
+    post_hoc_depth = 12
+    post_hoc_analyze_batch = 30
+    post_hoc_equiv_range = 25
+    post_hoc_inaccuracy_cp = 75
     post_hoc_blunder_cp_loser = 90
     post_hoc_blunder_cp_winner = 200
-    post_hoc_analyze_batch = 30
-    post_hoc_depth = 12
-    post_hoc_equiv_range = 30
 
     collar_rescore_dry_run = True
     collar_threshold_cp = 300

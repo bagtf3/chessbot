@@ -4,7 +4,9 @@ import uuid
 import sys
 import random
 import subprocess
+import threading
 from collections import deque
+from queue import Queue, Empty
 
 import pickle
 import chess, chess.engine
@@ -22,6 +24,144 @@ from chessbot.utils import (
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
+EVICTION_WINDOW = 5000
+EVICTION_MAX_SIZE = 80000
+
+
+class SFCache:
+    """
+    Position-keyed cache for Stockfish analysis results.
+    Key: short FEN (position + turn + castling + ep, no move clocks).
+    Each entry stores the best move found and any other moves analyzed
+    at that position, so repeated positions skip SF calls entirely.
+    """
+
+    def __init__(self, eviction_window=EVICTION_WINDOW, max_size=EVICTION_MAX_SIZE):
+        self.data = {}
+        self.eviction_window = eviction_window
+        self.max_size = max_size
+
+    @staticmethod
+    def make_key(board):
+        return ' '.join(board.fen().split()[:4])
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def touch(self, key, game_num):
+        entry = self.data.get(key)
+        if entry is not None:
+            entry['hits'] += 1
+            entry['last_seen'] = game_num
+
+    def set_best(self, key, uci, cp, wdl, game_num):
+        if key not in self.data:
+            self.data[key] = {
+                'best': None, 'others': {}, 'hits': 0, 'last_seen': game_num
+            }
+        entry = self.data[key]
+        entry['best'] = (uci, cp, wdl)
+        entry['hits'] += 1
+        entry['last_seen'] = game_num
+
+    def set_move(self, key, uci, cp, game_num):
+        entry = self.data.get(key)
+        if entry is not None:
+            entry['others'][uci] = cp
+            entry['last_seen'] = game_num
+
+    def maybe_evict(self, game_num):
+        if len(self.data) < self.max_size:
+            return 0
+        threshold = game_num - self.eviction_window
+        stale = [k for k, v in self.data.items() if v['last_seen'] < threshold]
+        for k in stale:
+            del self.data[k]
+        return len(stale)
+
+    def stats(self):
+        return {
+            'size': len(self.data),
+            'total_hits': sum(v['hits'] for v in self.data.values()),
+        }
+
+
+class SFRescoreThread:
+    """
+    Pure SF worker. Pulls (req_id, board, move) from req_q, runs analysis,
+    pushes (req_id, result) to res_q. No cache, no game logic.
+    move=None -> best-move analysis, returns type='best' result.
+    move=Move -> single-move analysis, returns type='move' result.
+    Multiple instances can share the same req_q/res_q for parallelism.
+    """
+
+    def __init__(self, req_q, res_q, cfg):
+        self.req_q = req_q
+        self.res_q = res_q
+        self.depth = cfg.post_hoc_depth
+        self.sf_config = {'Hash': 256, 'UCI_ShowWDL': True}
+        self.stop_ev = threading.Event()
+        self.t = None
+        self.eng = None
+
+    def start(self):
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def close(self):
+        self.stop_ev.set()
+        self.req_q.put(None)
+        if self.t is not None:
+            self.t.join()
+        if self.eng is not None:
+            self.eng.quit()
+            self.eng = None
+
+    def run(self):
+        self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        self.eng.configure(self.sf_config)
+        limit = chess.engine.Limit(depth=self.depth)
+
+        while not self.stop_ev.is_set():
+            try:
+                item = self.req_q.get(timeout=0.01)
+            except Empty:
+                continue
+            if item is None:
+                break
+            req_id, board, move = item
+            try:
+                if move is None:
+                    info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
+                    best = info['pv'][0]
+                    wdl = info.get('wdl')
+                    wdl_val = (
+                        (wdl.relative.wins - wdl.relative.losses) / 1000.0
+                        if wdl is not None else None
+                    )
+                    self.res_q.put((req_id, {
+                        'type': 'best',
+                        'best_uci': str(best),
+                        'best_cp': score_cp_stm_pov(info['score']),
+                        'best_abs': score_cp_white_pov(info['score'], clipped=False),
+                        'wdl': wdl_val,
+                    }))
+                else:
+                    info = self.eng.analyse(
+                        board, limit,
+                        root_moves=[move], info=chess.engine.INFO_ALL
+                    )
+                    self.res_q.put((req_id, {
+                        'type': 'move',
+                        'move_uci': str(move),
+                        'move_cp': score_cp_stm_pov(info['score']),
+                        'move_abs': score_cp_white_pov(info['score'], clipped=False),
+                    }))
+            except Exception as e:
+                self.res_q.put(('__error__', e))
+                self.stop_ev.set()
+                return
+
 
 class Rescorer(object):
     eng = None
@@ -468,7 +608,7 @@ class Rescorer(object):
                 # cat 1: excellent move, eligible for KL boost
                 visits = ensure_all_legal_moves_have_visits(visits, lms)
                 kl_eligible = True
-            elif loss_this <= 60 or missed_mate:
+            elif loss_this <= cfg.post_hoc_inaccuracy_cp or missed_mate:
                 # cat 2: soft nudge - best_mv floor at 50% of xc0 visits
                 # missed mates folded in here: hint at better move, don't learn deep SF lines
                 vmap = {u: max(1, int(v)) for u, v in visits}

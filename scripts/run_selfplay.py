@@ -18,7 +18,6 @@ from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
 from chessbot.game_utils import GameGenerator
 
-import gc
 import pickle
 import signal
 import threading
@@ -76,15 +75,12 @@ class RescorerThread:
         self.rescorer.training_data = value
 
     def write_training_data_pkl(self, size=None, randomize=True):
-        self.drain()
         self.rescorer.write_training_data_pkl(size=size, randomize=randomize)
 
     def push_analyzed(self, report=True):
-        self.drain()
         self.rescorer.push_analyzed(report=report)
 
     def aggregate_metrics(self, *args, **kwargs):
-        self.drain()
         self.rescorer.aggregate_metrics(*args, **kwargs)
 
     def reset_writer(self):
@@ -138,7 +134,7 @@ def make_parent_queues():
     return recent_q, telemetry_q
 
 
-def spawn_workers(cfg, recent_q, telemetry_q, game_queue):
+def spawn_workers(cfg, recent_q, telemetry_q, game_queue, sf_queue=None):
     ctx = mp.get_context()
     procs = []
 
@@ -150,9 +146,12 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue):
         stop_ev = ctx.Event()
         msg_q = ctx.Queue()
 
+        # worker 0 gets the sf_queue; all others do pure selfplay
+        worker_sf_q = sf_queue if i == 0 else None
+
         p = ctx.Process(
             target=child_looper,
-            args=(c, stop_ev, recent_q, telemetry_q, msg_q, game_queue),
+            args=(c, stop_ev, recent_q, telemetry_q, msg_q, game_queue, worker_sf_q),
             daemon=True,
         )
         p.start()
@@ -170,15 +169,29 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue):
     return procs
 
 
-def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
-    with init_selfplay(cfg, recent_games_q, telemetry_q, msg_q,
-                      game_queue=game_queue) as looper:
+def child_looper(
+    cfg,
+    stop_ev,
+    recent_games_q,
+    telemetry_q,
+    msg_q,
+    game_queue,
+    sf_queue=None,
+):
+    with init_selfplay(
+        cfg, recent_games_q, telemetry_q, msg_q,
+        game_queue=game_queue, sf_queue=sf_queue,
+    ) as looper:
         looper.run(stop_ev)
 
 
-def top_up_game_queue(game_queue, game_gen, target=GAME_QUEUE_MIN * 2):
-    while game_queue.qsize() < target:
-        game_queue.put(game_gen.next_game())
+def top_up_queues(game_queue, sf_queue, game_gen, target=GAME_QUEUE_MIN * 2):
+    while game_queue.qsize() + sf_queue.qsize() < target:
+        spec = game_gen.next_game()
+        if spec.meta.get("vs_stockfish"):
+            sf_queue.put(spec)
+        else:
+            game_queue.put(spec)
 
 
 def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
@@ -322,18 +335,6 @@ def launch_retrain(run_tag, working_cfg, epoch=0):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
-
-    # ctx = mp.get_context("spawn")
-    # for attempt in range(3):
-    #     p = ctx.Process(target=reclaim_vram_worker, args=(6000,))
-    #     p.start()
-    #     p.join()
-    #     if p.exitcode == 0:
-    #         print(f"[reclaim vram] ok")
-    #         break
-    #     if attempt == 2:
-    #         print(f"[reclaim_vram] failed after 3 attempts, skipping")
-
     return launch_retrain_async(run_tag, rt_script, working_cfg, epoch=epoch)
 
 
@@ -377,6 +378,7 @@ def main(run_tag):
     recent_q = None
     telemetry_q = None
     game_queue = None
+    sf_queue = None
     game_gen = None
     retrain = None
     total_games = 0
@@ -412,18 +414,23 @@ def main(run_tag):
             recent_q, telemetry_q = make_parent_queues()
 
             ctx = mp.get_context()
-            game_queue = ctx.Queue()
             game_gen = GameGenerator(working_cfg)
 
             if is_validation:
+                game_queue = ctx.Queue()
+                sf_queue = None
                 for spec in game_gen.validation_games():
                     game_queue.put(spec)
+                procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
             else:
+                game_queue = ctx.Queue()
+                sf_queue = ctx.Queue()
                 n_workers = max(1, working_cfg.n_workers)
                 initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
-                top_up_game_queue(game_queue, game_gen, target=initial_target)
-
-            procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
+                top_up_queues(game_queue, sf_queue, game_gen, target=initial_target)
+                procs = spawn_workers(
+                    working_cfg, recent_q, telemetry_q, game_queue, sf_queue
+                )
 
             # infer n_retrains
             if os.path.exists(working_cfg.progress_csv_path):
@@ -446,9 +453,9 @@ def main(run_tag):
                 if not procs and len(finished_games) < MAX_BACKLOG:
                     break
 
-                # top up game queue if running low (training rounds only)
-                if not is_validation and game_queue.qsize() < GAME_QUEUE_MIN:
-                    top_up_game_queue(game_queue, game_gen)
+                # top up queues if running low (training rounds only)
+                if not is_validation and game_queue.qsize() + sf_queue.qsize() < GAME_QUEUE_MIN:
+                    top_up_queues(game_queue, sf_queue, game_gen)
 
                 # check telemetry
                 msgs = drain_queue(telemetry_q)
@@ -520,13 +527,16 @@ def main(run_tag):
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
 
-            game_queue.cancel_join_thread()
-            game_queue.close()
+            for q in (game_queue, sf_queue):
+                if q is not None:
+                    q.cancel_join_thread()
+                    q.close()
 
             procs = []
             recent_q = None
             telemetry_q = None
             game_queue = None
+            sf_queue = None
             game_gen = None
 
             # selfplay round report
@@ -563,12 +573,13 @@ def main(run_tag):
             n_saved = len(rescorer.training_data)
             print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
         rescorer.close()
-        if game_queue is not None:
-            try:
-                game_queue.cancel_join_thread()
-                game_queue.close()
-            except Exception:
-                pass
+        for q in (game_queue, sf_queue):
+            if q is not None:
+                try:
+                    q.cancel_join_thread()
+                    q.close()
+                except Exception:
+                    pass
         shutdown_round(procs, recent_q, telemetry_q)
 
 

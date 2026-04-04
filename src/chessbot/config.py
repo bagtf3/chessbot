@@ -84,6 +84,7 @@ class Config(object):
     rescore_blunder_cp_winner = 200
     rescore_eviction_window = 500
     rescore_cache_size = 50000
+    rescore_n_sf_threads = 1
 
     collar_rescore_dry_run = True
     collar_threshold_cp = 300

@@ -757,22 +757,24 @@ class Rescorer(object):
             # visit correction based on move quality
             if loss_this <= EQUIV:
                 kl_eligible = True
+
+                # respect SF best move, set a modest floor
+                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 5))
             
             elif loss_this <= cfg.rescore_inaccuracy_cp or missed_mate:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
-                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             elif loss_this < blunder_cp:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
-                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             else:
                 is_true_blunder = not (played_cp > 350 and Z_stm > 0)
                 vmap[best_uci] = xc0_n
                 if is_true_blunder:
                     vmap[xc0_uci] = max(1, xc0_n // 2)
-                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
+            # re-sort after any adjustments
+            visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
             if not visits or sum(v[1] for v in visits) <= 0:
                 print(f"[rescore] visits invalid; skipping move_idx={i} played={mv}")
                 continue

@@ -282,11 +282,15 @@ def main(run_tag):
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
 
-    # init the async SF worker and rescorer
+    # init the async SF worker(s) and rescorer
     req_q = queue.Queue()
     res_q = queue.Queue()
-    sf_rescore_thread = SFRescoreThread(req_q, res_q, base_cfg)
-    sf_rescore_thread.start()
+    sf_rescore_threads = [
+        SFRescoreThread(req_q, res_q, base_cfg)
+        for _ in range(max(1, base_cfg.rescore_n_sf_threads))
+    ]
+    for t in sf_rescore_threads:
+        t.start()
     cache = SFCache(
         eviction_window=base_cfg.rescore_eviction_window,
         max_size=base_cfg.rescore_cache_size,
@@ -507,7 +511,8 @@ def main(run_tag):
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.tick()
         rescorer.push_analyzed(report=True)
-        sf_rescore_thread.close()
+        for t in sf_rescore_threads:
+            t.close()
         if rescorer.training_data:
             remaining_pkl = os.path.join(
                 base_cfg.run_dir, "remaining_untrained.pkl"

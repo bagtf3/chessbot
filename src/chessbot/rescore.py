@@ -1,4 +1,5 @@
 import os, json, gzip, pathlib, time
+from types import SimpleNamespace
 from pathlib import Path
 import uuid
 import sys
@@ -176,8 +177,6 @@ class Rescorer(object):
         self.analyzed_results = []
         self.pending_metrics = []
 
-        self.train_on_stockfish = cfg.train_on_stockfish
-        self.train_on_validation = cfg.train_on_validation
 
         self.start_time = time.time()
         self.games_seen = set()
@@ -247,7 +246,7 @@ class Rescorer(object):
                 raise result
             self.handle_sf_result(req_id, result)
 
-        while self.intake and len(self.pending) < 32:
+        while self.intake and len(self.pending) < 20:
             self.start_game(self.intake.popleft())
 
         done = [gid for gid, g in self.pending.items() if not g['waiting']]
@@ -409,13 +408,23 @@ class Rescorer(object):
         is_draw = (result == 0) or (result == 0.0)
 
         skip_all_training = False
-        if not self.train_on_validation:
+        if not cfg.train_on_validation:
             if 'validation' in game_data.get('scenario', '').lower():
                 skip_all_training = True
 
+        game_cfg_keys = (
+            'train_on_stockfish', 'z_mix',
+            'KL_weight_boost', 'KL_boost_threshold',
+            'post_hoc_equiv_range', 'post_hoc_blunder_cp_loser',
+            'post_hoc_blunder_cp_winner', 'post_hoc_inaccuracy_cp',
+            'uniform_eps', 'prior_clip_max',
+            'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
+            'collar_rescore_dry_run', 'post_hoc_analyze_batch',
+        )
         game_state = {
             'gid': gid,
             'game_data': game_data,
+            'cfg': SimpleNamespace(**{k: getattr(cfg, k) for k in game_cfg_keys}),
             'ply_states': [],
             'waiting': set(),
         }
@@ -427,7 +436,7 @@ class Rescorer(object):
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
 
-            if is_sf_move and ((not self.train_on_stockfish) or skip_all_training):
+            if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 repetitions[b_fast.fen(include_counters=False)] += 1
@@ -487,7 +496,7 @@ class Rescorer(object):
                 vmap[xerces_uci] = max(1, top_n)
                 visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
-            lms = list(b_fast.legal_moves())
+            lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
             x = b_fast.encode_64_tokens()
             mask = b_fast.legal_move_mask()
@@ -658,7 +667,7 @@ class Rescorer(object):
             ply['resolved'] = True
 
     def finalize_game(self, game_state):
-        cfg = self.config
+        cfg = game_state['cfg']
         game_data = game_state['game_data']
         gid = game_state['gid']
         result = game_data['result']
@@ -692,20 +701,16 @@ class Rescorer(object):
             played_abs = ply.get('played_abs', best_abs)
             visits = list(ply['visits'])
 
-            # apply equiv range logic (mirrors old analyze_with_rank)
+            best_uci = best_uci_raw
             delta = best_cp - played_cp
             if abs(delta) <= EQUIV:
-                best_uci = xerces_uci
-                best_cp = best_cp
-                played_cp = best_cp
-                played_abs = best_abs
                 delta = 0
             elif delta <= -EQUIV:
+                # xerces found a notably better move than SF
                 best_uci = xerces_uci
                 best_cp = played_cp
                 best_abs = played_abs
-            else:
-                best_uci = best_uci_raw
+                delta = 0
 
             loss_this = delta
             cpl_s += loss_this
@@ -740,30 +745,28 @@ class Rescorer(object):
             kl_eligible = False
             xc0_uci = visits[0][0]
             xc0_n = visits[0][1]
+            
+            # ensure all legal moves have at least 1 visit
+            vmap = {u: max(1, int(v)) for u, v in visits}
+            for m in lms:
+                if m not in vmap:
+                    vmap[m] = 1
+            visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
+            # visit correction based on move quality
             if loss_this <= EQUIV:
-                visits = ensure_all_legal_moves_have_visits(visits, lms)
                 kl_eligible = True
+            
             elif loss_this <= cfg.post_hoc_inaccuracy_cp or missed_mate:
-                vmap = {u: max(1, int(v)) for u, v in visits}
-                for m in lms:
-                    if m not in vmap:
-                        vmap[m] = 1
                 vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
                 visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+
             elif loss_this < blunder_cp:
-                vmap = {u: max(1, int(v)) for u, v in visits}
-                for m in lms:
-                    if m not in vmap:
-                        vmap[m] = 1
                 vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
                 visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+
             else:
                 is_true_blunder = not (played_cp > 350 and Z_stm > 0)
-                vmap = {u: max(1, int(v)) for u, v in visits}
-                for m in lms:
-                    if m not in vmap:
-                        vmap[m] = 1
                 vmap[best_uci] = xc0_n
                 if is_true_blunder:
                     vmap[xc0_uci] = max(1, xc0_n // 2)
@@ -820,10 +823,11 @@ class Rescorer(object):
             pending, pending_meta
         ):
             z_orig = result if is_white else -result
-            eff_z_white = eff_z_by_ply.get(ply_i, float(result))
+            eff_z_white = eff_z_by_ply.get(ply_i, result)
             z_eff = eff_z_white if is_white else -eff_z_white
-            if eff_z_white != float(result):
+            if eff_z_white != result:
                 n_diff += 1
+
             z = z_orig if cfg.collar_rescore_dry_run else z_eff
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
             self.training_data.append((x, mask, policy, Y, vwht, pwht))
@@ -836,7 +840,7 @@ class Rescorer(object):
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
         ]
         out_df = pd.DataFrame(rows, columns=cols)
-        out_df['played_best_move'] = out_df['most_visited_move'] == out_df['best_move']
+        out_df['played_best_move'] = out_df['delta'] <= 0
 
         mask_w = out_df['stm'] == True
         mask_b = out_df['stm'] == False
@@ -1161,6 +1165,7 @@ class Rescorer(object):
                 f"{RS} SF requests: {self.n_sf_submitted} submitted,"
                 f" {self.n_cache_hits} cache hits,"
                 f" compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
+                f" req_q {self.req_q.qsize()}  pending {len(self.pending)},"
                 f" cache size {cache_stats['size']}"
             )
             self.sf_call_time = 0.0
@@ -1209,20 +1214,18 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
     collar_state = [None] * n
     collar = None
     count = 0
-    run_start = 0
     segment_start = 0
+    n_triggers = 0
 
     for i, ev in enumerate(evals):
         if collar is None:
             if ev > threshold:
                 if count <= 0:
                     count = 0
-                    run_start = i
                 count += 1
             elif ev < -threshold:
                 if count >= 0:
                     count = 0
-                    run_start = i
                 count -= 1
             else:
                 count = 0
@@ -1246,15 +1249,16 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
                 segment_start = i
                 collar = None
                 count = 0
+                n_triggers += 1
             else:
                 collar_state[i] = collar
 
-    n_triggers = sum(
-        1 for i in range(1, n)
-        if collar_state[i - 1] is not None and collar_state[i] is None
-    )
-
     eff_z = {}
+
+    # if we detected 0 flips, no updates.
+    if not n_triggers:
+        return eff_z, n_triggers
+    
     for i, ply in enumerate(plies):
         if collar_state[i] == 'white':
             eff_z[ply] = 1.0
@@ -1268,27 +1272,6 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
 
 def value_weight_for_game(cfg, is_draw):
     return cfg.draw_value_scale if is_draw else 1.0
-
-
-def ensure_all_legal_moves_have_visits(visit_pairs, lms):
-    """
-    visit_pairs: list of (uci, visits) or [uci, visits]
-    lms: list of legal move UCIs
-    Ensures every legal move appears with visits >= 1.
-    Returns list of [uci, int_visits] sorted desc.
-    """
-    d = {}
-    for u, v in visit_pairs:
-        if not u:
-            continue
-        d[u] = max(1, int(v))
-
-    for m in lms:
-        if m not in d:
-            d[m] = 1
-
-    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
-    return [[u, int(v)] for u, v in items]
 
 
 def save_pickle_atomic(obj, path, tries=0):

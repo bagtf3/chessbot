@@ -502,7 +502,7 @@ class Rescorer(object):
             x = b_fast.encode_64_tokens()
             mask = b_fast.legal_move_mask()
             short_fen = b_fast.fen(include_counters=False)
-            reps = repetitions[short_fen]
+            reps = 3 if repetitions[short_fen] >= 3 else 0
             hmc = b_fast.halfmove_clock()
             halfmoves = 0 if hmc < 45 else hmc
             cache_key = (short_fen, reps, halfmoves)

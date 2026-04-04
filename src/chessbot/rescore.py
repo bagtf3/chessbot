@@ -5,7 +5,7 @@ import sys
 import random
 import subprocess
 import threading
-from collections import deque
+from collections import deque, defaultdict
 from queue import Queue, Empty
 
 import pickle
@@ -40,10 +40,6 @@ class SFCache:
         self.data = {}
         self.eviction_window = eviction_window
         self.max_size = max_size
-
-    @staticmethod
-    def make_key(board):
-        return ' '.join(board.fen().split()[:4])
 
     def get(self, key):
         return self.data.get(key)
@@ -131,8 +127,10 @@ class SFRescoreThread:
                 break
             req_id, board, move = item
             try:
+                t0 = time.time()
                 if move is None:
                     info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
+                    elapsed = time.time() - t0
                     best = info['pv'][0]
                     wdl = info.get('wdl')
                     wdl_val = (
@@ -145,17 +143,20 @@ class SFRescoreThread:
                         'best_cp': score_cp_stm_pov(info['score']),
                         'best_abs': score_cp_white_pov(info['score'], clipped=False),
                         'wdl': wdl_val,
+                        'elapsed': elapsed,
                     }))
                 else:
                     info = self.eng.analyse(
                         board, limit,
                         root_moves=[move], info=chess.engine.INFO_ALL
                     )
+                    elapsed = time.time() - t0
                     self.res_q.put((req_id, {
                         'type': 'move',
                         'move_uci': str(move),
                         'move_cp': score_cp_stm_pov(info['score']),
                         'move_abs': score_cp_white_pov(info['score'], clipped=False),
+                        'elapsed': elapsed,
                     }))
             except Exception as e:
                 self.res_q.put(('__error__', e))
@@ -189,6 +190,10 @@ class Rescorer(object):
 
         self.n_sf_submitted = 0
         self.n_cache_hits = 0
+        self.sf_call_time = 0.0
+        self.sf_call_count = 0
+        self.sf_compute_time = 0.0
+        self.sf_compute_count = 0
         self.last_10_cpls = []
         self.last_10_bmrs = []
 
@@ -415,6 +420,8 @@ class Rescorer(object):
             'waiting': set(),
         }
 
+        repetitions = defaultdict(int)
+        repetitions[b_fast.fen(include_counters=False)] += 1
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
@@ -423,6 +430,7 @@ class Rescorer(object):
             if is_sf_move and ((not self.train_on_stockfish) or skip_all_training):
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             tr = tree_data.get(i, tree_data.get(str(i), {}))
@@ -430,6 +438,7 @@ class Rescorer(object):
             if not cm:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             Z_stm = result if turn else -result
@@ -443,12 +452,14 @@ class Rescorer(object):
             if Y_init != Y_init:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             if is_sf_move:
                 self.training_data_from_sf(b_fast, mv, cm, Y_init, is_draw)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             visits = [(c['uci'], max(1, c['visits'])) for c in cm]
@@ -456,6 +467,7 @@ class Rescorer(object):
             if not visits:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             sel_method = tr.get('selection_method')
@@ -479,7 +491,11 @@ class Rescorer(object):
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
             x = b_fast.encode_64_tokens()
             mask = b_fast.legal_move_mask()
-            cache_key = SFCache.make_key(board_ch)
+            short_fen = b_fast.fen(include_counters=False)
+            reps = repetitions[short_fen]
+            hmc = b_fast.halfmove_clock()
+            halfmoves = 0 if hmc < 45 else hmc
+            cache_key = (short_fen, reps, halfmoves)
 
             ply = {
                 'ply_idx': i,
@@ -528,13 +544,14 @@ class Rescorer(object):
                     ply['resolved'] = True
                 else:
                     rid = self.next_req_id()
-                    self.req_map[rid] = (gid, i, 'move')
+                    self.req_map[rid] = (gid, i, 'move', time.time())
                     game_state['waiting'].add(rid)
-                    self.req_q.put((rid, board_ch.copy(), chess.Move.from_uci(xerces_uci)))
+                    cmove = chess.Move.from_uci(xerces_uci)
+                    self.req_q.put((rid, board_ch.copy(), cmove))
                     self.n_sf_submitted += 1
             else:
                 rid = self.next_req_id()
-                self.req_map[rid] = (gid, i, 'best')
+                self.req_map[rid] = (gid, i, 'best', time.time())
                 game_state['waiting'].add(rid)
                 self.req_q.put((rid, board_ch.copy(), None))
                 self.n_sf_submitted += 1
@@ -542,6 +559,7 @@ class Rescorer(object):
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
+            repetitions[b_fast.fen(include_counters=False)] += 1
 
         self.pending[gid] = game_state
         if not game_state['waiting']:
@@ -550,7 +568,13 @@ class Rescorer(object):
     def handle_sf_result(self, req_id, result):
         if req_id not in self.req_map:
             return
-        gid, ply_idx, req_type = self.req_map.pop(req_id)
+        
+        gid, ply_idx, req_type, t_sent = self.req_map.pop(req_id)
+        self.sf_call_time += time.time() - t_sent
+        self.sf_call_count += 1
+        elapsed = result.get('elapsed', 0.0)
+        self.sf_compute_time += elapsed
+        self.sf_compute_count += 1
         if gid not in self.pending:
             return
 
@@ -567,7 +591,11 @@ class Rescorer(object):
             best_cp = result['best_cp']
             best_abs = result['best_abs']
             wdl = result['wdl']
-            self.cache.set_best(key, best_uci, best_cp, best_abs, wdl, self.games_processed)
+            self.cache.set_best(
+                key, best_uci, best_cp, best_abs, wdl,
+                self.games_processed
+            )
+
             ply['best_uci'] = best_uci
             ply['best_cp'] = best_cp
             ply['best_abs'] = best_abs
@@ -586,7 +614,7 @@ class Rescorer(object):
                 ply['resolved'] = True
             else:
                 rid = self.next_req_id()
-                self.req_map[rid] = (gid, ply_idx, 'move')
+                self.req_map[rid] = (gid, ply_idx, 'move', time.time())
                 game['waiting'].add(rid)
                 self.req_q.put(
                     (rid, ply['board_ch'], chess.Move.from_uci(xerces_uci))
@@ -597,7 +625,34 @@ class Rescorer(object):
             played_cp = result['move_cp']
             played_abs = result['move_abs']
             played_uci = result['move_uci']
-            self.cache.set_move(key, played_uci, played_cp, played_abs, self.games_processed)
+
+            entry = self.cache.get(key)
+            if entry and entry['best'] is not None:
+                old_best_uci, old_best_cp, old_best_abs, old_best_wdl = entry['best']
+                if played_cp > old_best_cp:
+                    # xerces move is actually stronger — promote it to best
+                    self.cache.set_best(
+                        key, played_uci, played_cp, played_abs,
+                        old_best_wdl, self.games_processed
+                    )
+                    self.cache.set_move(
+                        key, old_best_uci, old_best_cp, old_best_abs,
+                        self.games_processed
+                    )
+                    ply['best_uci'] = played_uci
+                    ply['best_cp'] = played_cp
+                    ply['best_abs'] = played_abs
+                else:
+                    self.cache.set_move(
+                        key, played_uci, played_cp, played_abs,
+                        self.games_processed
+                    )
+            else:
+                self.cache.set_move(
+                    key, played_uci, played_cp, played_abs,
+                    self.games_processed
+                )
+
             ply['played_cp'] = played_cp
             ply['played_abs'] = played_abs
             ply['resolved'] = True
@@ -1094,11 +1149,24 @@ class Rescorer(object):
                 print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
             
             cache_stats = self.cache.stats()
+            avg_total_ms = (
+                1000 * self.sf_call_time / self.sf_call_count
+                if self.sf_call_count else 0.0
+            )
+            avg_compute_ms = (
+                1000 * self.sf_compute_time / self.sf_compute_count
+                if self.sf_compute_count else 0.0
+            )
             print(
                 f"{RS} SF requests: {self.n_sf_submitted} submitted,"
                 f" {self.n_cache_hits} cache hits,"
+                f" compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
                 f" cache size {cache_stats['size']}"
             )
+            self.sf_call_time = 0.0
+            self.sf_call_count = 0
+            self.sf_compute_time = 0.0
+            self.sf_compute_count = 0
             print()
 
             self.print_collar_stats()

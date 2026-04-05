@@ -246,6 +246,10 @@ class Rescorer(object):
                 raise result
             self.handle_sf_result(req_id, result)
 
+        if len(self.intake) > len(self.pending):
+            intake_list = list(self.intake)
+            random.shuffle(intake_list)
+            self.intake = deque(intake_list)
         while self.intake and len(self.pending) < 20:
             self.start_game(self.intake.popleft())
 

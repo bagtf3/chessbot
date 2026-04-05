@@ -491,7 +491,8 @@ class GameLooper(object):
             "es_jsd_thresh": game.tree.es_jsd_thresh,
             "uniform_eps": cfg.uniform_eps,
             "prior_clip_max": cfg.prior_clip_max,
-            "reuse_tree": cfg.reuse_tree
+            "reuse_tree": cfg.reuse_tree,
+            "robust_only_above": cfg.robust_only_above
         }
 
         # on-disk record (full)

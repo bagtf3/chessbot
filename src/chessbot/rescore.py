@@ -57,6 +57,8 @@ class SFCache:
                 'best': None, 'others': {}, 'hits': 0, 'last_seen': game_num
             }
         entry = self.data[key]
+        if wdl is None and entry['best'] is not None:
+            wdl = entry['best'][3]
         entry['best'] = (uci, cp, abs_cp, wdl)
         entry['hits'] += 1
         entry['last_seen'] = game_num
@@ -233,6 +235,17 @@ class Rescorer(object):
         self.req_counter += 1
         return self.req_counter
 
+    def maybe_seed_cache(self, b_fast, mv, Q_stm, turn, repetitions):
+        short_fen = b_fast.fen(include_counters=False)
+        reps = 3 if repetitions[short_fen] >= 3 else 0
+        hmc = b_fast.halfmove_clock()
+        halfmoves = 0 if hmc < 45 else hmc
+        cache_key = (short_fen, reps, halfmoves)
+        if self.cache.get(cache_key) is None:
+            best_cp = int(Q_stm * 1000)
+            best_abs = best_cp if turn else -best_cp
+            self.cache.set_best(cache_key, mv, best_cp, best_abs, None, self.games_processed)
+
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
 
@@ -408,6 +421,7 @@ class Rescorer(object):
         tree_data = game_data.get('tree_search_data', {})
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
+        game_sf_depth = game_data.get('sf_depth')
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
 
@@ -442,6 +456,11 @@ class Rescorer(object):
             turn = board_ch.turn
 
             if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
+                if not skip_all_training and game_sf_depth and game_sf_depth >= cfg.rescore_depth:
+                    tr_sf = tree_data.get(i, tree_data.get(str(i), {}))
+                    Q_stm = tr_sf.get('Q_stm')
+                    if Q_stm is not None:
+                        self.maybe_seed_cache(b_fast, mv, Q_stm, turn, repetitions)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 repetitions[b_fast.fen(include_counters=False)] += 1
@@ -470,6 +489,8 @@ class Rescorer(object):
                 continue
 
             if is_sf_move:
+                if game_sf_depth and game_sf_depth >= cfg.rescore_depth:
+                    self.maybe_seed_cache(b_fast, mv, Q, turn, repetitions)
                 self.training_data_from_sf(b_fast, mv, cm, Y_init, is_draw)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
@@ -539,7 +560,8 @@ class Rescorer(object):
 
             entry = self.cache.get(cache_key)
             if entry and entry['best'] is not None:
-                best_uci, best_cp, best_abs, best_wdl = entry['best']
+                best_uci, best_cp, best_abs, *_wdl = entry['best']
+                best_wdl = _wdl[0] if _wdl else None
                 ply['best_uci'] = best_uci
                 ply['best_cp'] = best_cp
                 ply['best_abs'] = best_abs
@@ -642,7 +664,8 @@ class Rescorer(object):
 
             entry = self.cache.get(key)
             if entry and entry['best'] is not None:
-                old_best_uci, old_best_cp, old_best_abs, old_best_wdl = entry['best']
+                old_best_uci, old_best_cp, old_best_abs, *_wdl = entry['best']
+                old_best_wdl = _wdl[0] if _wdl else None
                 if played_cp > old_best_cp:
                     # xerces move is actually stronger — promote it to best
                     self.cache.set_best(
@@ -763,7 +786,7 @@ class Rescorer(object):
                 kl_eligible = True
 
                 # respect SF best move, set a modest floor
-                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 5))
+                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 4))
             
             elif loss_this <= cfg.rescore_inaccuracy_cp or missed_mate:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))

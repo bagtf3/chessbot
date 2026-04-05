@@ -28,8 +28,8 @@ import queue
 
 STOP_REQUESTED = threading.Event()
 
-MAX_BACKLOG = 200
-GAME_QUEUE_MIN = 48  # top up when central queue drops below this
+MAX_BACKLOG = 250
+GAME_QUEUE_MIN = 36  # top up when central queue drops below this
 
 
 def request_stop(signum=None, frame=None):

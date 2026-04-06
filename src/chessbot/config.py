@@ -92,6 +92,7 @@ class Config(object):
     collar_reset_cp = 50
     train_on_stockfish = True
     train_on_validation = False
+    validation_min_training_depth = 9
 
     z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
 

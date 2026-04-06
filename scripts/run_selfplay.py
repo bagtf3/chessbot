@@ -78,7 +78,11 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue, sf_queue=None):
         msg_q = ctx.Queue()
 
         # worker 0 gets the sf_queue; all others do pure selfplay
-        worker_sf_q = sf_queue if i == 0 else None
+        worker_sf_q = None
+        if i == 0:
+            worker_sf_q = sf_queue
+            # 20% more games for the SF worker since those games are quicker
+            c.n_games = int(c.n_games * 1.2)
 
         p = ctx.Process(
             target=child_looper,

@@ -733,12 +733,12 @@ class Rescorer(object):
             delta = best_cp - played_cp
             if abs(delta) <= EQUIV:
                 delta = 0
+            
             elif delta <= -EQUIV:
                 # xerces found a notably better move than SF
                 best_uci = xerces_uci
                 best_cp = played_cp
                 best_abs = played_abs
-                delta = 0
 
             loss_this = delta
             cpl_s += loss_this
@@ -781,6 +781,8 @@ class Rescorer(object):
                     vmap[m] = 1
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
+            is_true_blunder = not (played_cp > 350 and Z_stm > 0)
+
             # visit correction based on move quality
             if loss_this <= EQUIV:
                 kl_eligible = True
@@ -793,9 +795,10 @@ class Rescorer(object):
 
             elif loss_this < blunder_cp:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, 2* xc0_n // 3)
 
             else:
-                is_true_blunder = not (played_cp > 350 and Z_stm > 0)
                 vmap[best_uci] = xc0_n
                 if is_true_blunder:
                     vmap[xc0_uci] = max(1, xc0_n // 2)

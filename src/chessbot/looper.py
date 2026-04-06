@@ -486,14 +486,14 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps(),
-            "es_jsd_thresh": game.tree.es_jsd_thresh,
+            "c_puct": cfg.c_puct,
+            "dirichlet_eps": cfg.dirichlet_eps,
             "uniform_eps": cfg.uniform_eps,
-            "prior_clip_max": cfg.prior_clip_max,
-            "reuse_tree": cfg.reuse_tree,
-            "robust_only_above": cfg.robust_only_above
         }
+
+        # add any per-game sampled param values (specific value used, not the options list)
+        for param in self.config.sampleable:
+            mem_summary[param] = getattr(cfg, param)
 
         # on-disk record (full)
         res = {
@@ -517,9 +517,6 @@ class GameLooper(object):
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
-        res['c_puct'] = game.tree.c_puct
-        res["dirichlet_eps"] = game.tree.dirichlet_eps()
-        res["es_jsd_thresh"] = game.tree.es_jsd_thresh
 
         out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl.gz")
         out_path = pathlib.Path(out_file)

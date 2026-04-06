@@ -66,6 +66,7 @@ class MCTSTree(fasttree):
         if cfg.add_root_noise:
             self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
         self.set_reuse_tree(bool(cfg.reuse_tree))
+        self.set_use_u_attn(bool(cfg.use_u_attn))
 
         # early-stop rolling state
         self._es_last_checked_at = 0

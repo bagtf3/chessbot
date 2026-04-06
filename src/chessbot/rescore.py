@@ -1265,9 +1265,18 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
     segment_start = 0
     n_triggers = 0
     replayable_blunders = []
+    neutral_blunders = []
     collar_set_by_eventual_loser = False
+    still_neutral = abs(evals[0]) < threshold
 
     for i, ev in enumerate(evals):
+        # detect a neutral -> losing blunder
+        if still_neutral and abs(ev) > threshold:
+            still_neutral = False
+            if abs(ev - evals[i-1]) > 0.8 * threshold:
+                winning_side = 'white' if ev > 0 else 'black'
+                neutral_blunders.append((i, winning_side))
+
         if collar is None:
             if ev > threshold:
                 if count <= 0:
@@ -1316,7 +1325,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
 
     # if we detected 0 flips, no updates.
     if not n_triggers:
-        return eff_z, n_triggers, []
+        return eff_z, n_triggers, neutral_blunders
     
     for i, ply in enumerate(plies):
         if collar_state[i] == 'white':
@@ -1326,7 +1335,11 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
         else:
             eff_z[ply] = float(game_result)
 
-    return eff_z, n_triggers, replayable_blunders
+    # sanity check: if all eff_z values collapsed back to game_result, no real flips
+    if all(v == float(game_result) for v in eff_z.values()):
+        return {}, 0, neutral_blunders
+
+    return eff_z, n_triggers, replayable_blunders + neutral_blunders
 
 
 def value_weight_for_game(cfg, is_draw):

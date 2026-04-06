@@ -358,7 +358,7 @@ class Rescorer(object):
             random.shuffle(self.training_data)
 
         if size is None:
-            size = cfg.get_retrain_size
+            size = cfg.retrain_size
 
         chunk = self.training_data[:size]
         remainder = self.training_data[size:]
@@ -1273,7 +1273,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
         # detect a neutral -> losing blunder
         if still_neutral and abs(ev) > threshold:
             still_neutral = False
-            if abs(ev - evals[i-1]) > 0.8 * threshold:
+            if abs(ev - evals[i-1]) > abs(reset_cp - threshold):
                 winning_side = 'white' if ev > 0 else 'black'
                 neutral_blunders.append((i, winning_side))
 

@@ -24,10 +24,6 @@ class Config(object):
     # only 1st-order scalar params are supported (no nested keys).
     sampleable = {}
 
-    # blunder replay
-    blunder_replay_min_ply = 20       # only detect blunders after this half-move (move 15)
-    blunder_replay_max_bonus = 100    # max extra n_games the SF worker can receive
-
     # MCTS
     c_puct = 2.0
     use_u_attn = True
@@ -84,6 +80,10 @@ class Config(object):
     rescore_eviction_window = 500
     rescore_cache_size = 50000
     rescore_n_sf_threads = 1
+
+    # blunder replay
+    blunder_replay_min_ply = 20       # only detect blunders after this half-move
+    blunder_replay_max_bonus = 100    # max extra n_games the SF worker can receive
 
     use_collar_rescoring = False
     collar_threshold_cp = 300

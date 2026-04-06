@@ -125,6 +125,11 @@ class GameLooper(object):
                 self.unpause_queued = True
                 continue
 
+            if cmd == "add_games":
+                n = msg.get("n", 1) if isinstance(msg, dict) else 1
+                self.config.n_games += n
+                continue
+
             # ignore everything else
             continue
 

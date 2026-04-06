@@ -19,7 +19,7 @@ from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
-from chessbot.game_utils import GameGenerator
+from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 
 import pickle
 import signal
@@ -81,8 +81,6 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue, sf_queue=None):
         worker_sf_q = None
         if i == 0:
             worker_sf_q = sf_queue
-            # 20% more games for the SF worker since those games are quicker
-            c.n_games = int(c.n_games * 1.2)
 
         p = ctx.Process(
             target=child_looper,
@@ -379,6 +377,11 @@ def main(run_tag):
                     working_cfg, recent_q, telemetry_q, game_queue, sf_queue
                 )
 
+            sf_worker_msg_q = procs[0]['msg_q'] if procs and not is_validation else None
+            sf_worker_bonus = 0
+            sf_last_idle_bump = -100
+            main_loop_iter = 0
+
             # infer n_retrains
             if os.path.exists(working_cfg.progress_csv_path):
                 progress_df = pd.read_csv(working_cfg.progress_csv_path)
@@ -423,6 +426,38 @@ def main(run_tag):
                     to_process = finished_games.popleft()
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
+                main_loop_iter += 1
+
+                # drain blunder replays onto sf_queue
+                if sf_queue is not None and sf_worker_msg_q is not None:
+                    while rescorer.blunder_replay_specs:
+                        spec_data = rescorer.blunder_replay_specs.pop(0)
+                        meta = {
+                            'scenario': 'blunder_replay',
+                            'vs_stockfish': True,
+                            'stockfish_is_white': spec_data['stockfish_is_white'],
+                        }
+                        sf_queue.put(GameSpec(
+                            fen=spec_data['fen'], moves=spec_data['moves'],
+                            meta=meta, cfg=resolve_cfg(working_cfg),
+                        ))
+                        if sf_worker_bonus < working_cfg.blunder_replay_max_bonus:
+                            sf_worker_msg_q.put({"cmd": "add_games", "n": 1})
+                            sf_worker_bonus += 1
+
+                    # bump SF worker if queue drained while >100 games remain in round
+                    round_target = working_cfg.n_games * max(1, working_cfg.n_workers)
+                    games_remaining = round_target - recorder.games_finished
+                    if (games_remaining > 100
+                            and main_loop_iter - sf_last_idle_bump >= 60
+                            and sf_queue.qsize() == 0
+                            and sf_worker_bonus < working_cfg.blunder_replay_max_bonus):
+                        sf_worker = next((w for w in procs if w['id'] == 'w0'), None)
+                        if sf_worker and sf_worker['p'].is_alive():
+                            n_add = min(10, working_cfg.blunder_replay_max_bonus - sf_worker_bonus)
+                            sf_worker_msg_q.put({"cmd": "add_games", "n": n_add})
+                            sf_worker_bonus += n_add
+                            sf_last_idle_bump = main_loop_iter
 
                 recorder.training_queue = rescorer.training_data_size
 

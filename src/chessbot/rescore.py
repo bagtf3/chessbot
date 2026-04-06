@@ -198,6 +198,8 @@ class Rescorer(object):
         self.last_10_cpls = []
         self.last_10_bmrs = []
 
+        self.blunder_replay_specs = []
+
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
             'total_pos': 0, 'seen': 0,
@@ -709,6 +711,7 @@ class Rescorer(object):
         nw = nb = 0
         rows = []
         eval_trace = []
+        turn_at = {}
         pending = []
         pending_meta = []
 
@@ -716,6 +719,7 @@ class Rescorer(object):
             i = ply['ply_idx']
             mv = ply['mv']
             turn = ply['turn']
+            turn_at[i] = turn
             tr = ply['tr']
             cm = ply['cm']
             Z_stm = ply['Z_stm']
@@ -847,10 +851,21 @@ class Rescorer(object):
                 'result_z_stm': Z_stm,
             })
 
-        eff_z_by_ply, n_triggers = collar_z_map(
+        eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
             eval_trace, result,
             cfg.collar_threshold_cp, cfg.collar_n_consec, cfg.collar_reset_cp,
         )
+
+        for list_idx, blundering_side in replayable_blunders:
+            blunder_ply = eval_trace[list_idx][0]
+            if blunder_ply >= self.config.blunder_replay_min_ply:
+                self.blunder_replay_specs.append({
+                    'fen': game_data['start_fen'],
+                    'moves': game_data['moves_played'][:blunder_ply],
+                    'stockfish_is_white': (blundering_side == 'white'),
+                    'source_game_id': gid,
+                })
+
         n_diff = 0
         for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), meta in zip(
             pending, pending_meta
@@ -1238,7 +1253,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
     The reset ply itself starts the new segment (gets game_result).
     """
     if not eval_trace:
-        return {}, 0
+        return {}, 0, []
 
     plies = [p for p, _ in eval_trace]
     evals = [e for _, e in eval_trace]
@@ -1249,6 +1264,8 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
     count = 0
     segment_start = 0
     n_triggers = 0
+    replayable_blunders = []
+    collar_set_by_eventual_loser = False
 
     for i, ev in enumerate(evals):
         if collar is None:
@@ -1267,22 +1284,31 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
                 for j in range(segment_start, i + 1):
                     collar_state[j] = 'white'
                 collar = 'white'
+                collar_set_by_eventual_loser = game_result < 1.0
                 count = 0
             elif count <= -n_consec:
                 for j in range(segment_start, i + 1):
                     collar_state[j] = 'black'
                 collar = 'black'
+                collar_set_by_eventual_loser = game_result > -1.0
                 count = 0
         else:
             broken = (
                 (collar == 'white' and ev < reset_cp) or
                 (collar == 'black' and ev > -reset_cp)
             )
+
             if broken:
+                # first, check if replayable based on collar holder and prev eval
+                if collar_set_by_eventual_loser and abs(evals[i-1]) > threshold:
+                    replayable_blunders.append((i, collar))
+
+                # then continue collar logic
                 segment_start = i
                 collar = None
                 count = 0
                 n_triggers += 1
+
             else:
                 collar_state[i] = collar
 
@@ -1290,7 +1316,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
 
     # if we detected 0 flips, no updates.
     if not n_triggers:
-        return eff_z, n_triggers
+        return eff_z, n_triggers, []
     
     for i, ply in enumerate(plies):
         if collar_state[i] == 'white':
@@ -1300,7 +1326,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
         else:
             eff_z[ply] = float(game_result)
 
-    return eff_z, n_triggers
+    return eff_z, n_triggers, replayable_blunders
 
 
 def value_weight_for_game(cfg, is_draw):

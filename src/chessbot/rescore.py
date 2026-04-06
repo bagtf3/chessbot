@@ -796,12 +796,12 @@ class Rescorer(object):
             elif loss_this < blunder_cp:
                 vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
                 if is_true_blunder:
-                    vmap[xc0_uci] = max(1, 2* xc0_n // 3)
+                    vmap[xc0_uci] = max(1, xc0_n // 2)
 
             else:
                 vmap[best_uci] = xc0_n
                 if is_true_blunder:
-                    vmap[xc0_uci] = max(1, xc0_n // 2)
+                    vmap[xc0_uci] = max(1, xc0_n // 4)
 
             # re-sort after any adjustments
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)

@@ -69,12 +69,6 @@ class Config(object):
     eval_draw_thresh = 0.1
     eval_draw_span = 15
 
-    use_eval_collar = True
-    eval_collar_min_plies = 40
-    eval_collar_thresh = 0.75
-    eval_collar_span = 15
-    eval_collar_trigger = 0.3
-    
     play_vs_sf_prob = 0.5
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
@@ -91,7 +85,7 @@ class Config(object):
     rescore_cache_size = 50000
     rescore_n_sf_threads = 1
 
-    collar_rescore_dry_run = True
+    use_collar_rescoring = False
     collar_threshold_cp = 300
     collar_n_consec = 5
     collar_reset_cp = 50

@@ -455,19 +455,11 @@ class ChessGame(object):
         self.outcome = None
         self.plies = 0
         self.sf_eval = None
-        
+
         self.sf_pending = False
         self.sf_ready = False
         self.sf_res_tup = None
         self.tf_last_resolved = 0
-
-        # eval collar and eval draw to shorten selfplay games
-        self.collar_stop_set = False
-        self.collar_stop_eventual_outcome = None
-        if self.config.use_eval_collar:
-            self.next_collar_stop_check = cfg.eval_collar_min_plies
-        else:
-            self.next_collar_stop_check = 999
 
         # set when to start checking for draw by agreement
         if self.config.use_eval_draw:
@@ -671,78 +663,9 @@ class ChessGame(object):
         else:
             return True
     
-    def check_for_collar_stop(self, cfg):
-        n_last = cfg.eval_collar_span
-        thresh = cfg.eval_collar_thresh
-
-        # first-time detection of a collar stop candidate
-        if not self.collar_stop_set:
-            if self.plies < self.next_collar_stop_check:
-                return False, None
-
-            # scan newest->oldest. rev_i 0 == newest
-            sign_check = None
-            for rev_i, ex in enumerate(reversed(self.recents[-n_last:])):
-                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
-                best_q = ex[3]
-                # magnitude must meet the lock threshold
-                if abs(best_q) < thresh:
-                    needed = n_last - rev_i
-                    self.next_collar_stop_check = self.plies + needed
-                    return False, None
-
-                # use white-POV signed value here
-                q_white = ex[2]
-                sign = 1*(q_white > 0) - 1*(q_white < 0)
-
-                if sign_check is None:
-                    sign_check = sign
-                elif sign != sign_check:
-                    # mixed signs -> wait until this newest violator is evicted
-                    needed = n_last - rev_i
-                    self.next_collar_stop_check = self.plies + needed
-                    return False, None
-
-            # all checks passed. set collar stop
-            self.collar_stop_set = True
-            self.collar_stop_eventual_outcome = sign_check  # -1 or +1
-            # keep trigger as a positive magnitude for release checks
-            self.collar_stop_trigger = cfg.eval_collar_trigger
-            return False, None
-
-        # already locked, check to see if max game length is approaching
-        elif self.plies >= cfg.max_game_length:
-            return True, self.collar_stop_eventual_outcome
-        
-        # otherwise check to see if a blunder has lowered the score
-        else:
-            check_depth = 3
-            tail = self.recents[-check_depth:]
-
-            for ex in tail:
-                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
-                q_white = ex[2]
-                # positive when leader still ahead
-                sign_stability = self.collar_stop_eventual_outcome * q_white
-
-                # if sign_stability falls below the trigger, we stop and award win
-                if sign_stability < self.collar_stop_trigger:
-                    return True, self.collar_stop_eventual_outcome
-        
-        # no stop detected
-        return False, None
-
     def check_for_terminal(self):
         cfg = self.config
-        # check to see if a collar stop has been set
-        if cfg.use_eval_collar:
-            if self.plies >= cfg.eval_collar_min_plies:
-                collar_stop, outcome = self.check_for_collar_stop(cfg)
-                if collar_stop:
-                    self.outcome = outcome
-                    return True
-        
-        # otherwise look for conventional terminal states
+        # look for conventional terminal states
         reason, result = self.board.is_game_over()
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
@@ -786,11 +709,9 @@ class ChessGame(object):
                 self.outcome = 0.0
                 return True
 
-        # check for overal game_length limit
+        # check for overall game_length limit
         if self.plies > cfg.max_game_length:
             self.outcome = 0.0
-            if self.collar_stop_set:
-                self.outcome = self.collar_stop_eventual_outcome
             return True
         # if we made it here the game is active
         return False

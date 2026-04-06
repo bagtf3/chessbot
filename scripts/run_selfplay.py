@@ -435,12 +435,17 @@ def main(run_tag):
                         meta = {
                             'scenario': 'blunder_replay',
                             'vs_stockfish': True,
-                            'stockfish_is_white': spec_data['stockfish_is_white'],
+                            'stockfish_is_white': spec_data['stockfish_is_white']
                         }
+
+                        game_spec_cfg = resolve_cfg(working_cfg)
+                        game_spec_cfg.sample_moves = False
+
                         sf_queue.put(GameSpec(
                             fen=spec_data['fen'], moves=spec_data['moves'],
-                            meta=meta, cfg=resolve_cfg(working_cfg),
+                            meta=meta, cfg=game_spec_cfg
                         ))
+
                         if sf_worker_bonus < working_cfg.blunder_replay_max_bonus:
                             sf_worker_msg_q.put({"cmd": "add_games", "n": 1})
                             sf_worker_bonus += 1
@@ -450,8 +455,8 @@ def main(run_tag):
                     games_remaining = round_target - recorder.games_finished
                     if (games_remaining > 100
                             and main_loop_iter - sf_last_idle_bump >= 60
-                            and sf_queue.qsize() == 0
-                            and sf_worker_bonus < working_cfg.blunder_replay_max_bonus):
+                            and sf_queue.qsize() == 0):
+                        
                         sf_worker = next((w for w in procs if w['id'] == 'w0'), None)
                         if sf_worker and sf_worker['p'].is_alive():
                             n_add = min(10, working_cfg.blunder_replay_max_bonus - sf_worker_bonus)

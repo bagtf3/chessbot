@@ -439,7 +439,7 @@ class Rescorer(object):
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
             'uniform_eps', 'prior_clip_max',
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
-            'collar_rescore_dry_run', 'rescore_analyze_batch',
+            'use_collar_rescoring', 'rescore_analyze_batch',
             'draw_value_scale',
         )
         game_state = {
@@ -876,7 +876,7 @@ class Rescorer(object):
             if eff_z_white != result:
                 n_diff += 1
 
-            z = z_orig if cfg.collar_rescore_dry_run else z_eff
+            z = z_eff if cfg.use_collar_rescoring else z_orig
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
             self.training_data.append((x, mask, policy, Y, vwht, pwht))
             self.pending_metrics.append({**meta, 'target_y': float(Y)})
@@ -1005,7 +1005,7 @@ class Rescorer(object):
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
 
     def print_collar_stats(self):
-        dry = " [dry]" if self.config.collar_rescore_dry_run else ""
+        dry = "" if self.config.use_collar_rescoring else " [dry]"
 
         def fmt_row(label, s):
             pos_pct = (s['positions'] / s['total_pos'] * 100) if s['total_pos'] else 0.0

@@ -468,15 +468,11 @@ class GameLooper(object):
         sims_total = game.tree.sims_done_total
         cfg = game.config
 
-        # read adjudicator flags (direct attrs; they always exist)
+        # encode adjudicator flags: bit0=material, bit1=syzygy, bit2=eval_draw
         mat = cfg.use_material_diff
         tb = cfg.use_syzygy
         dr = cfg.use_eval_draw
-        cl = cfg.use_eval_collar
-
-        # encode into 0..15 index: bit0=material, bit1=syzygy, bit2=eval_draw,
-        # bit3=eval_collar
-        adjudication_index = (mat) | (tb << 1) | (dr << 2) | (cl << 3)
+        adjudication_index = (mat) | (tb << 1) | (dr << 2)
 
         # cast types for JSON 
         mem_summary = {

@@ -1046,7 +1046,7 @@ class Rescorer(object):
             if nn_v is None:
                 continue
             stm_sign = 1.0 if m['stm'] else -1.0
-            nn_stm = float(np.clip(nn_v * stm_sign / vscale, -1.0, 1.0))
+            nn_stm = np.clip(nn_v * stm_sign / vscale, -1.0, 1.0)
             nn_vals_stm.append(nn_stm)
             target_ys.append(m['target_y'])
             sf_cps.append(m['sf_cp'])

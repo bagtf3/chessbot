@@ -1,4 +1,4 @@
-import os, pickle, random
+import os, pickle, gzip, random
 import pathlib, json
 import time, gc
 import sys, subprocess
@@ -22,9 +22,9 @@ from pyfastchess import raw_cache_bulk_insert, priors_cache_clear, priors_cache_
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
-from chessbot.validation import paired_validation_games
 from chessbot.mcts_utils import ChessGame
-from chessbot.utils import RateMeter, GameGenerator, sf_eval
+from chessbot.utils import RateMeter, sf_eval
+from chessbot.game_utils import GameSpec
 #from chessbot.tf_thread import Batcher, TensorFlowThread
 
 
@@ -32,36 +32,27 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_games_q, telemetry_q, msg_q):
+    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None, sf_queue=None):
         self.id = cfg.id
         self.config = cfg
-        self.recent_games_q = recent_games_q
-        self.telemetry_q = telemetry_q
+        self.recent_games_q = recent_q
+        self.telemetry_q = telem_q
         self.msg_q = msg_q
+        self.game_queue = game_queue
+        self.sf_queue = sf_queue
         self.unpause_queued = False
-        self.game_gen = GameGenerator(self.config)
         self.games_finished = 0
         self.active_games = []
-        self.sf_count = 0
-
-        # different game logic for training vs validation
-        if self.config.is_validation_run:
-            self.active_games = paired_validation_games(self.config)
-        else:
-            self.fill_active_games()
-        
-        self.model = model
-
         self.sf_games = {}
-        self.sf_thread = None
-        if cfg.play_vs_sf_prob > 0.0:
-            self.sf_thread = StockfishThread(cfg.sf_config, cfg.sf_depth)
-            self.sf_thread.start()
+        self.sf_thread = None  # lazy-initialized on first vs_stockfish game
+
+        self.pull_from_queue()
+
+        self.model = model
         
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()
-
-        self.infer_is_warm = False
+        
         self.batch_candidates = self.create_batch_candidates(self.config)
         self.n_retrains = 0
         
@@ -93,30 +84,23 @@ class GameLooper(object):
         self.close()
         return False
 
-    def warmup_infer(self):
-        if self.infer_is_warm:
-            return
-        print(f"[model warmup] warming GPU for {self.batch_candidates}")
-        for bs in self.batch_candidates:
-            for _ in range(3):
-                rep_mask = (np.random.rand(bs, 4288) < 0.02).astype(np.int32)
-                rep_enc = (np.random.rand(bs, 64) < 0.32).astype(np.int32)
-                self.infer((rep_enc, rep_mask))
-
-        self.infer_is_warm = True
-        print("[model warmup] warm up complete")
-
     def load_reload_model(self):
         cfg = self.config
-        self.model = load_model(cfg.model_path)
-
-        self.infer = make_conv_infer(
-            self.model,
-            max_bs=cfg.fwd_batch,
-            uniform_eps=cfg.uniform_eps,
-            prior_clip_max=cfg.prior_clip_max,
-            vscale=cfg.vscale
-        )
+        if cfg.inference_backend == "pytorch":
+            from chessbot.train_pytorch import load_pt_model, make_pt_infer
+            model, _ = load_pt_model(cfg.pytorch_model_path)
+            self.model, self.infer = make_pt_infer(
+                model,
+                max_bs=cfg.fwd_batch,
+                vscale=cfg.vscale,
+            )
+        else:
+            self.model = load_model(cfg.model_path)
+            self.infer = make_conv_infer(
+                self.model,
+                max_bs=cfg.fwd_batch,
+                vscale=cfg.vscale,
+            )
     
     def check_for_pause(self):
         """
@@ -141,6 +125,11 @@ class GameLooper(object):
                 self.unpause_queued = True
                 continue
 
+            if cmd == "add_games":
+                n = msg.get("n", 1) if isinstance(msg, dict) else 1
+                self.config.n_games += n
+                continue
+
             # ignore everything else
             continue
 
@@ -162,7 +151,11 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        tf.keras.backend.clear_session()
+        if self.config.inference_backend == "pytorch":
+            import torch
+            torch.cuda.empty_cache()
+        else:
+            tf.keras.backend.clear_session()
         gc.collect()
 
         priors_cache_clear()
@@ -192,7 +185,7 @@ class GameLooper(object):
         self.n_retrains += 1
 
     def create_batch_candidates(self, cfg):
-        # create sizes to warm up
+        # create sizes
         batch_candidates = set([cfg.min_batch, cfg.fwd_batch])
         bs = cfg.min_batch
         while bs <= cfg.fwd_batch:
@@ -209,36 +202,31 @@ class GameLooper(object):
             return sorted(set(sbc))
         return sorted(set(batch_candidates))
 
-    def fill_active_games(self):
-        cfg = self.config
-        needed = cfg.n_games - self.games_finished - len(self.active_games)
-        if needed <= 0:
-            return
-
-        # add games w.r.t. num needed and games_at_once
-        for _ in range(needed):
-            if len(self.active_games) >= cfg.games_at_once:
-                return
-
-            # this has game probs from the config
-            board, meta = self.game_gen.new_board()
-
-            meta['vs_stockfish'] = False
-            meta['stockfish_is_white'] = False
-            meta['vs_stockfish'] = np.random.uniform() <= cfg.play_vs_sf_prob
-
-            # stockfish only plays certain scenarios
-            if meta['scenario'] in cfg.sf_exclude:
-                meta['vs_stockfish'] = False
-
-            if meta['vs_stockfish']:
-                self.sf_count += 1
-                meta['vs_stockfish'] = True
-            
-                # alternate sf color to balance white and black
-                meta['stockfish_is_white'] = bool(self.sf_count % 2)
-            
-            cg = ChessGame(board=board, meta=meta, cfg=self.config)
+    def pull_from_queue(self):
+        from pyfastchess import Board as fastboard
+        coast_limit = self.config.n_games + 3
+        while (len(self.active_games) < self.config.games_at_once and
+               len(self.active_games) + self.games_finished < coast_limit):
+            spec = None
+            if self.sf_queue is not None:
+                try:
+                    spec = self.sf_queue.get_nowait()
+                except Exception:
+                    pass
+            if spec is None:
+                try:
+                    spec = self.game_queue.get_nowait()
+                except Exception:
+                    break
+            if spec.meta.get("vs_stockfish") and self.sf_thread is None:
+                self.sf_thread = StockfishThread(
+                    self.config.sf_config, self.config.sf_depth
+                )
+                self.sf_thread.start()
+            board = fastboard(spec.fen)
+            for mv in spec.moves:
+                board.push_uci(mv)
+            cg = ChessGame(board=board, meta=spec.meta, cfg=spec.cfg)
             self.active_games.append(cg)
 
     def run(self, stop_event=None):
@@ -251,7 +239,7 @@ class GameLooper(object):
         #batcher = self.batcher
         mbs = cfg.micro_batch
         fwd = cfg.fwd_batch
-        max_fastpath = max(256, int(2.5 * mbs))
+        max_fastpath = max(1024, int(2.5 * mbs))
         mps = self.mps
 
         #(batch size, target), counts returned
@@ -271,7 +259,7 @@ class GameLooper(object):
                 ]
             
             # add in more games if needed
-            self.fill_active_games()
+            self.pull_from_queue()
 
             if not self.active_games:
                 break
@@ -309,9 +297,6 @@ class GameLooper(object):
                 # first resolve any recent preds
                 game.tree.resolve_inflight()
 
-                if game.tree.needs_root_noise(check_sims=True):
-                    game.tree.add_root_dirichlet_noise()
-                
                 # if its stockfish turn, check if the move is ready
                 # otherwise do not block and move on
                 if game.is_stockfish_turn():
@@ -407,12 +392,12 @@ class GameLooper(object):
 
     def format_and_predict(self, preds_batch):
         """
-        preds_batch: list of items produced by tree.pending_encoded_stm_pov(...)
+        preds_batch: list of items produced by tree.pending_encoded_64_tokens(...)
         expected shape:
-            - (zobrist, board_np, legal_np)
+            - (zobrist, board_np)
 
-        This calls self.infer on the GPU (masked softmax + clip + renorm).
-        It writes into the raw policy cache as (zobrist, {"value": v, "policy": probs}).
+        Runs inference and writes into the raw policy cache as (zobrist, value, probs).
+        Masking/softmax is applied in C++ build_priors.
         """
 
         if not preds_batch:
@@ -420,20 +405,14 @@ class GameLooper(object):
 
         # collect arrays + keys
         boards = []
-        legals = []
         keys = []
 
         for item in preds_batch:
             keys.append(item[0])
-            board_np = item[1]
-            legal_np = item[2]
-
-            boards.append(np.asarray(board_np, dtype=np.int32))
-            legals.append(np.asarray(legal_np, dtype=np.int32))
+            boards.append(np.asarray(item[1], dtype=np.int32))
 
         # stack to batch
         boards_np = np.stack(boards, axis=0)   # (B,64)
-        legals_np = np.stack(legals, axis=0)   # (B,4288)
         # pad up to max_batch or a smaller power of 2 if needed
         # (helps XLA/static-trace shapes)
 
@@ -447,21 +426,19 @@ class GameLooper(object):
             pad = max(0, int(new_target - B))
             if pad:
                 pad_boards = np.zeros((pad,)+boards_np.shape[1:], dtype=boards_np.dtype)
-                pad_legals = np.zeros((pad, legals_np.shape[1]), dtype=legals_np.dtype)
                 boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
-                legals_np_p = np.concatenate([legals_np, pad_legals], axis=0)
                 start = _now()
-                probs_np_p, vals_np_p = self.infer((boards_np_p, legals_np_p))
+                probs_np_p, vals_np_p = self.infer((boards_np_p,))
                 probs_np = probs_np_p[:B]
                 vals_np = vals_np_p[:B]
-            
+
             else:
                 start = _now()
-                probs_np, vals_np = self.infer((boards_np, legals_np))
+                probs_np, vals_np = self.infer((boards_np,))
         else:
             new_target = target_bs
             start = _now()
-            probs_np, vals_np = self.infer((boards_np, legals_np))
+            probs_np, vals_np = self.infer((boards_np,))
         
         # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
         to_raw_cache = []
@@ -489,17 +466,13 @@ class GameLooper(object):
         # aggregate stats
         self.games_finished += 1
         sims_total = game.tree.sims_done_total
-        cfg = self.config
+        cfg = game.config
 
-        # read adjudicator flags (direct attrs; they always exist)
+        # encode adjudicator flags: bit0=material, bit1=syzygy, bit2=eval_draw
         mat = cfg.use_material_diff
         tb = cfg.use_syzygy
         dr = cfg.use_eval_draw
-        cl = cfg.use_eval_collar
-
-        # encode into 0..15 index: bit0=material, bit1=syzygy, bit2=eval_draw,
-        # bit3=eval_collar
-        adjudication_index = (mat) | (tb << 1) | (dr << 2) | (cl << 3)
+        adjudication_index = (mat) | (tb << 1) | (dr << 2)
 
         # cast types for JSON 
         mem_summary = {
@@ -514,12 +487,14 @@ class GameLooper(object):
             "sims_done_total": sims_total,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
-            # this is the specific c_puct and dirichlet eps, not the list of options
-            "c_puct": game.tree.c_puct,
-            "dirichlet_eps": game.tree.dirichlet_eps,
+            "c_puct": cfg.c_puct,
+            "dirichlet_eps": cfg.dirichlet_eps,
             "uniform_eps": cfg.uniform_eps,
-            "prior_clip_max": cfg.prior_clip_max
         }
+
+        # add any per-game sampled param values (specific value used, not the options list)
+        for param in self.config.sampleable:
+            mem_summary[param] = getattr(cfg, param)
 
         # on-disk record (full)
         res = {
@@ -527,22 +502,29 @@ class GameLooper(object):
             "moves_played": game.moves_played,
             "model_epoch": self.n_retrains
         }
-
-        res.update(mem_summary)
+        
         res.update(cfg.to_dict())
+        res.update(mem_summary)
         res.update(game.meta)
+
+        # unscale Q values from inference vscale before saving
+        vs = cfg.vscale
+        if vs and vs != 1.0:
+            q_keys = ("Q_stm", "Q_white", "best_Q", "visit_weighted_Q")
+            for td in game.tree_data.values():
+                for k in q_keys:
+                    if k in td:
+                        td[k] = np.clip(td[k] / vs, -1.0, 1.0)
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data
-        res['c_puct'] = game.tree.c_puct
-        res["dirichlet_eps"] = game.tree.dirichlet_eps
 
-        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl")
+        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl.gz")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "wb") as f:
+        with gzip.open(out_path, "wb") as f:
             pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
         
         # this is small, push it to parent process via Queue instead on appending
@@ -621,16 +603,17 @@ class GameLooper(object):
         #     tf_stats = self.tf_thread.stats()
         #     telemetry["pred_wait"] = tf_stats["mean_pred_s"]
         #     telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
-        telemetry["pred_wait"] = np.mean(self.prediction_times)
-        telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
+        telemetry["pred_wait"] = np.mean(self.prediction_times) if self.prediction_times else 0.0
+        telemetry["preds_per_second"] = (telemetry["apl"] / telemetry["pred_wait"]
+                                         if telemetry["pred_wait"] else 0.0)
 
         pcs = priors_cache_stats()
         for k, v in pcs.items():
             telemetry[f"cache_{k}"] = v
 
         self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
-        return True
 
+        return True
     
     def update_partial_telemetry(self):
         """send a partial update to the telemetry for more time sensitive metrics"""
@@ -646,7 +629,7 @@ class GameLooper(object):
         self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
 
 
-def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, sf_queue=None):
     # pre-built config (from yaml)
     model_name = config.run_tag + "_model.h5"
 
@@ -656,7 +639,9 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
     else:
         model_path = config.model_path
 
-    if os.path.exists(model_path):
+    if config.inference_backend == "pytorch":
+        model = None
+    elif os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
         model = load_model(model_path)
     else:
@@ -666,7 +651,8 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q):
 
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_games_q=recent_games_q, telemetry_q=telemetry_q, msg_q=msg_q
+        recent_q=recent_games_q, telem_q=telemetry_q, msg_q=msg_q,
+        game_queue=game_queue, sf_queue=sf_queue,
     )
 
     # infer number of retrains already done from existing progress csv

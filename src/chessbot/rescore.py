@@ -1,10 +1,13 @@
-import os, json, pathlib, time
+import os, json, gzip, pathlib, time
+from types import SimpleNamespace
 from pathlib import Path
 import uuid
 import sys
 import random
 import subprocess
-from collections import deque
+import threading
+from collections import deque, defaultdict
+from queue import Queue, Empty
 
 import pickle
 import chess, chess.engine
@@ -16,25 +19,166 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, rnd, cp_to_value_tanh, kl_divergence
+    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
+    batch_policy_metrics_from_priors, print_validation,
 )
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
+EVICTION_WINDOW = 5000
+EVICTION_MAX_SIZE = 80000
+
+
+class SFCache:
+    """
+    Position-keyed cache for Stockfish analysis results.
+    Key: short FEN (position + turn + castling + ep, no move clocks).
+    Each entry stores the best move found and any other moves analyzed
+    at that position, so repeated positions skip SF calls entirely.
+    """
+
+    def __init__(self, eviction_window=EVICTION_WINDOW, max_size=EVICTION_MAX_SIZE):
+        self.data = {}
+        self.eviction_window = eviction_window
+        self.max_size = max_size
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def touch(self, key, game_num):
+        entry = self.data.get(key)
+        if entry is not None:
+            entry['hits'] += 1
+            entry['last_seen'] = game_num
+
+    def set_best(self, key, uci, cp, abs_cp, wdl, game_num):
+        if key not in self.data:
+            self.data[key] = {
+                'best': None, 'others': {}, 'hits': 0, 'last_seen': game_num
+            }
+        entry = self.data[key]
+        if wdl is None and entry['best'] is not None:
+            wdl = entry['best'][3]
+        entry['best'] = (uci, cp, abs_cp, wdl)
+        entry['hits'] += 1
+        entry['last_seen'] = game_num
+
+    def set_move(self, key, uci, cp, abs_cp, game_num):
+        entry = self.data.get(key)
+        if entry is not None:
+            entry['others'][uci] = (cp, abs_cp)
+            entry['last_seen'] = game_num
+
+    def maybe_evict(self, game_num):
+        if len(self.data) < self.max_size:
+            return 0
+        threshold = game_num - self.eviction_window
+        stale = [k for k, v in self.data.items() if v['last_seen'] < threshold]
+        for k in stale:
+            del self.data[k]
+        return len(stale)
+
+    def stats(self):
+        return {
+            'size': len(self.data),
+            'total_hits': sum(v['hits'] for v in self.data.values()),
+        }
+
+
+class SFRescoreThread:
+    """
+    Pure SF worker. Pulls (req_id, board, move) from req_q, runs analysis,
+    pushes (req_id, result) to res_q. No cache, no game logic.
+    move=None -> best-move analysis, returns type='best' result.
+    move=Move -> single-move analysis, returns type='move' result.
+    Multiple instances can share the same req_q/res_q for parallelism.
+    """
+
+    def __init__(self, req_q, res_q, cfg):
+        self.req_q = req_q
+        self.res_q = res_q
+        self.depth = cfg.rescore_depth
+        self.sf_config = {'Hash': 256, 'UCI_ShowWDL': True}
+        self.stop_ev = threading.Event()
+        self.t = None
+        self.eng = None
+
+    def start(self):
+        self.t = threading.Thread(target=self.run, daemon=True)
+        self.t.start()
+
+    def close(self):
+        self.stop_ev.set()
+        self.req_q.put(None)
+        if self.t is not None:
+            self.t.join()
+        if self.eng is not None:
+            self.eng.quit()
+            self.eng = None
+
+    def run(self):
+        self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+        self.eng.configure(self.sf_config)
+        limit = chess.engine.Limit(depth=self.depth)
+
+        while not self.stop_ev.is_set():
+            try:
+                item = self.req_q.get(timeout=0.01)
+            except Empty:
+                continue
+            if item is None:
+                break
+            req_id, board, move = item
+            try:
+                t0 = time.time()
+                if move is None:
+                    info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
+                    elapsed = time.time() - t0
+                    best = info['pv'][0]
+                    wdl = info.get('wdl')
+                    wdl_val = (
+                        (wdl.relative.wins - wdl.relative.losses) / 1000.0
+                        if wdl is not None else None
+                    )
+                    self.res_q.put((req_id, {
+                        'type': 'best',
+                        'best_uci': str(best),
+                        'best_cp': score_cp_stm_pov(info['score']),
+                        'best_abs': score_cp_white_pov(info['score'], clipped=False),
+                        'wdl': wdl_val,
+                        'elapsed': elapsed,
+                    }))
+                else:
+                    info = self.eng.analyse(
+                        board, limit,
+                        root_moves=[move], info=chess.engine.INFO_ALL
+                    )
+                    elapsed = time.time() - t0
+                    self.res_q.put((req_id, {
+                        'type': 'move',
+                        'move_uci': str(move),
+                        'move_cp': score_cp_stm_pov(info['score']),
+                        'move_abs': score_cp_white_pov(info['score'], clipped=False),
+                        'elapsed': elapsed,
+                    }))
+            except Exception as e:
+                self.res_q.put(('__error__', e))
+                self.stop_ev.set()
+                return
+
 
 class Rescorer(object):
-    eng = None
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, req_q, res_q, cache):
         self.config = cfg
+        self.req_q = req_q
+        self.res_q = res_q
+        self.cache = cache
+
         self.training_data = []
         self.analyzed_results = []
+        self.pending_metrics = []
 
-        self.train_on_stockfish = cfg.train_on_stockfish
-        self.train_on_validation = cfg.train_on_validation
-
-        self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-        self.eng.configure(cfg.sf_config)
 
         self.start_time = time.time()
         self.games_seen = set()
@@ -45,23 +189,38 @@ class Rescorer(object):
         self.tcpl = 0
         self.tbmr = 0
 
-        # stockfish time keeping
-        self.n_sf_best = 0
-        self.sf_best_time = 0
-
-        self.n_sf_played = 0
-        self.sf_played_time = 0
-        # sf max will store the 10 longest sf search times, to reduce outliers
-        self.sf_max = [0.0]*10
+        self.n_sf_submitted = 0
+        self.n_cache_hits = 0
+        self.sf_call_time = 0.0
+        self.sf_call_count = 0
+        self.sf_compute_time = 0.0
+        self.sf_compute_count = 0
         self.last_10_cpls = []
         self.last_10_bmrs = []
+
+        self.blunder_replay_specs = []
+
+        zero_collar = lambda: {
+            'games': 0, 'triggers': 0, 'positions': 0,
+            'total_pos': 0, 'seen': 0,
+        }
+        self.collar_total = zero_collar()
+        self.collar_window = zero_collar()
+        self.collar_history = []
+
+        zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
+        self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
+        self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
+
+        self.intake = deque()
+        self.pending = {}
+        self.req_map = {}
+        self.req_counter = 0
 
         self.init_analyzer()
 
     def close(self):
-        if self.eng is not None:
-            self.eng.quit()
-            self.eng = None
+        pass
 
     def __enter__(self):
         return self
@@ -69,6 +228,52 @@ class Rescorer(object):
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
+
+    @property
+    def training_data_size(self):
+        return len(self.training_data)
+
+    def next_req_id(self):
+        self.req_counter += 1
+        return self.req_counter
+
+    def maybe_seed_cache(self, b_fast, mv, Q_stm, turn, repetitions):
+        short_fen = b_fast.fen(include_counters=False)
+        reps = 3 if repetitions[short_fen] >= 3 else 0
+        hmc = b_fast.halfmove_clock()
+        halfmoves = 0 if hmc < 45 else hmc
+        cache_key = (short_fen, reps, halfmoves)
+        if self.cache.get(cache_key) is None:
+            best_cp = int(Q_stm * 1000)
+            best_abs = best_cp if turn else -best_cp
+            self.cache.set_best(cache_key, mv, best_cp, best_abs, None, self.games_processed)
+
+    def submit(self, pkl_file):
+        self.intake.append(pkl_file)
+
+    def tick(self):
+        while True:
+            try:
+                req_id, result = self.res_q.get_nowait()
+            except Empty:
+                break
+            if req_id == '__error__':
+                raise result
+            self.handle_sf_result(req_id, result)
+
+        if len(self.intake) > len(self.pending):
+            intake_list = list(self.intake)
+            random.shuffle(intake_list)
+            self.intake = deque(intake_list)
+        while self.intake and len(self.pending) < 20:
+            self.start_game(self.intake.popleft())
+
+        done = [gid for gid, g in self.pending.items() if not g['waiting']]
+        for gid in done:
+            self.finalize_game(self.pending.pop(gid))
+
+        if self.games_processed > 0 and self.games_processed % 100 == 0:
+            self.cache.maybe_evict(self.games_processed)
 
     def init_analyzer(self):
         run_dir = self.config.run_dir
@@ -113,38 +318,25 @@ class Rescorer(object):
 
     def reset_writer(self):
         self.written_this_round = 0
-        self.sf_best_time = 0
-        self.n_sf_best = 0
-        self.sf_played_time = 0
-        self.n_sf_played = 0
-        self.sf_max = [0.0]*10
     
-    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
-        """
-        Snapshot inputs and a flat 4288-length policy vector for training.
-        - ucis: list[str] legal moves (same order as probs)
-        - pi:  list/array of probs (sum ~= 1)
-        - Y: target for value head
-        """
-        
-        # get indices from C++
-        indices = board.moves_to_indices(ucis)  # list of int (0..4288)
+    def make_policy_example(self, board, ucis, visits):
+        indices = board.moves_to_indices(ucis)
         policy = np.zeros(64 * 67, dtype=np.float32)
-
-        # normalize visits -> pi
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, 0.0002, 0.9)
+        eps = self.config.uniform_eps
+        uniform_mass = 1 / len(ucis) if len(ucis) else 0.0
+        pi = eps * uniform_mass + (1.0 - eps) * pi
+        pi = np.clip(pi, 0.0, self.config.prior_clip_max)
         pi = pi / pi.sum()
-
-        # accumulate probs into flattened policy
         for idx, p in zip(indices, pi):
             policy[idx] += p
-
-        # snapshot inputs and push example
         x = board.encode_64_tokens()
         mask = board.legal_move_mask()
+        return x, mask, policy
 
+    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
+        x, mask, policy = self.make_policy_example(board, ucis, visits)
         self.training_data.append((x, mask, policy, Y, vwht, pwht))
     
     def write_training_data_pkl(self, size=None, randomize=True):
@@ -152,25 +344,21 @@ class Rescorer(object):
         out_dir = pathlib.Path(cfg.pending_training_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # we need to clear out any existing pkls because theyre probably corrupted
+        # clear stale pkl shards from any previous failed retrain
         deleted = []
         for p in out_dir.iterdir():
-            if not p.is_file():
-                continue
-
-            suf = p.suffix.lower()
-            if suf in [".pkl", ".pickle"]:
+            if p.is_file() and p.suffix == ".pkl":
                 p.unlink()
                 deleted.append(p.name)
 
         if deleted:
-            print(f"{RS} deleted {len(deleted)} stale pkls in {out_dir}")
+            print(f"{RS} deleted {len(deleted)} stale pkl files in {out_dir}")
 
         if randomize:
             random.shuffle(self.training_data)
 
         if size is None:
-            size = cfg.get_retrain_size
+            size = cfg.retrain_size
 
         chunk = self.training_data[:size]
         remainder = self.training_data[size:]
@@ -191,23 +379,11 @@ class Rescorer(object):
         rows = [(c["uci"], c["visits"]) for c in cm]
         total_visits = sum([n for _, n in rows]) if rows else 0
 
-        visit_map = None
-        use_tree_visits = False
-
         if rows and total_visits > 10:
-            visit_map = {u: n for u, n in rows}
-            most_visited_uci, max_visits = max(rows, key=lambda x: x[1])
-
-            if most_visited_uci == mv:
-                use_tree_visits = True
-            else:
-                top_count = visit_map[most_visited_uci]
-                visit_map[mv] = 1 + int(top_count * 1.25)
-                use_tree_visits = True
-
-        if use_tree_visits and visit_map is not None:
-            ucis = board.legal_moves()
-            visits = [max(1, visit_map.get(u, 1)) for u in ucis]
+            top_uci = max(rows, key=lambda x: x[1])[0]
+            pairs = encourage_best_move(rows, top_uci, mv, board.legal_moves())
+            ucis = [v[0] for v in pairs]
+            visits = [v[1] for v in pairs]
         else:
             raw = make_fake_visits(mv, board.legal_moves(), ratio_best=60)
             ucis = [x[0] for x in raw]
@@ -218,304 +394,508 @@ class Rescorer(object):
         kl = kl_divergence(priors, visits)
 
         vwht = value_weight_for_game(cfg, is_draw)
-        pwht = cfg.policy_loss_weight
+        pwht = 1.0
         if kl > cfg.KL_boost_threshold:
             pwht *= cfg.KL_weight_boost
 
         self.append_flat_policy_example(board, ucis, visits, Y, vwht, pwht)
-    
-    def analyze_with_rank(self, move, board):
-        # Get Stockfish root best at this depth (white-POV score included in info)
-        cfg = self.config
-        eng = self.eng
-        limit = chess.engine.Limit(depth=cfg.post_hoc_depth)
-        info_all = chess.engine.INFO_ALL
 
-        t0 = time.perf_counter()
-        top1 = eng.analyse(board, limit=limit, info=info_all)
-        sf_time = time.perf_counter() - t0
-        self.sf_best_time += sf_time
-        self.n_sf_best += 1
+    def start_game(self, pkl_file):
+        path = str(pkl_file)
+        if path.lower().endswith('.pkl.gz'):
+            with gzip.open(path, 'rb') as f:
+                game_data = pickle.load(f)
+        elif path.lower().endswith('.pkl'):
+            with open(path, 'rb') as f:
+                game_data = pickle.load(f)
+        else:
+            with open(path, 'r', encoding='utf-8') as f:
+                game_data = json.load(f)
 
-        # collect the max time 
-        if sf_time > self.sf_max[0]:
-            self.sf_max.append(sf_time)
-            self.sf_max = sorted(self.sf_max)[-10:]
-
-        best_move = top1['pv'][0]
-        best_cp   = score_cp_stm_pov(top1["score"])
-        best_abs  = score_cp_white_pov(top1["score"], clipped=False)
-        
-        # default
-        res = {}
-        res['best_move'] = best_move
-        res['best_cp'] = best_cp
-        res['best_absolute'] = best_abs
-
-        if move == best_move:
-            res['played_cp'] = best_cp
-            res['played_absolute'] = best_abs
-            res['delta_signed'] = 0
-            res['sf_rank'] = 1
-            return res
-
-        t0 = time.perf_counter()
-        played = eng.analyse(board, limit=limit, root_moves=[move], info=info_all)
-        
-        sf_time = time.perf_counter() - t0
-        self.sf_played_time += sf_time
-        self.n_sf_played += 1
-
-        # collect the max time 
-        if sf_time > self.sf_max[0]:
-            self.sf_max.append(sf_time)
-            self.sf_max = sorted(self.sf_max)[-10:]
-
-        played_cp = score_cp_stm_pov(played['score'])
-        played_abs = score_cp_white_pov(played["score"], clipped=False)
-        delta = best_cp - played_cp
-        
-        # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
-        EQUIV_RANGE = cfg.post_hoc_equiv_range
-        if abs(delta) <= EQUIV_RANGE:
-            res['best_move'] = move # our move is also best
-            res['played_cp'] = best_cp
-            res['played_absolute'] = best_abs
-            res['delta_signed'] = 0
-            return res
-
-        # If the played move appears better (delta negative beyond EQUIV_RANGE),
-        # treat the played move as the best move (but keep delta_signed negative).
-        if delta <= -EQUIV_RANGE:
-            res['best_move'] = move
-            res['best_cp'] = played_cp
-            res['played_cp'] = played_cp
-            res['best_absolute'] = played_abs
-            res['played_absolute'] = played_abs
-            res['delta_signed'] = delta
-            return res
-        
-        # otherwise, our move is worse
-        res['played_cp'] = played_cp
-        res['played_absolute'] = played_abs
-        res['delta_signed'] = delta
-        return res
-
-    def analyze_and_rescore(self, game_data):
-        """
-        Single-pass analyze + rescore training-data maker.
-
-        - train_on_stockfish: include plies played by SF in training if True.
-        - base_weight: default sample weight used as 'weight' in returned sample.
-        """
-        cfg = self.config
-
-        # allow passing a filepath (str or Path) to a pkl/json game record
-        if isinstance(game_data, (str, pathlib.Path)):
-            path = str(game_data)
-            if path.lower().endswith(('.pkl', '.json')) and os.path.exists(path):
-                if path.lower().endswith('.pkl'):
-                    with open(path, 'rb') as f:
-                        game_data = pickle.load(f)
-                else:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        game_data = json.load(f)
-
-        # must be a dict from here on
-        if not isinstance(game_data, dict):
-            raise TypeError("game_data must be a dict or path to .pkl/.json")
-
-        gid = game_data.get("game_id")
+        gid = str(game_data.get('game_id'))
         if gid in self.games_seen:
             return
-        
+
+        cfg = self.config
         board_ch = chess.Board(game_data['start_fen'])
         b_fast = Board(game_data['start_fen'])
 
         tree_data = game_data.get('tree_search_data', {})
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
+        game_sf_depth = game_data.get('sf_depth')
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
-        cpl_s = cpl_w = cpl_b = 0.0
-        nw = nb = 0
-        rows = []
-        
-        # set a flag in case we want to skip all training data
+
         skip_all_training = False
-        if not self.train_on_validation:
-            if 'validation' in game_data['scenario'].lower():
+        if not cfg.train_on_validation:
+            if 'validation' in game_data.get('scenario', '').lower():
                 skip_all_training = True
-        
-        KL_coef = self.config.KL_weight_boost
-        do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
-        
+
+        game_cfg_keys = (
+            'train_on_stockfish', 'z_mix',
+            'KL_weight_boost', 'KL_boost_threshold',
+            'rescore_equiv_range', 'rescore_blunder_cp_loser',
+            'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
+            'uniform_eps', 'prior_clip_max',
+            'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
+            'use_collar_rescoring', 'rescore_analyze_batch',
+            'draw_value_scale',
+        )
+        game_state = {
+            'gid': gid,
+            'game_data': game_data,
+            'cfg': SimpleNamespace(**{k: getattr(cfg, k) for k in game_cfg_keys}),
+            'ply_states': [],
+            'waiting': set(),
+        }
+
+        repetitions = defaultdict(int)
+        repetitions[b_fast.fen(include_counters=False)] += 1
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
-            
-            # handle sf-played plies
-            if is_sf_move and ((not self.train_on_stockfish) or (skip_all_training)):
+
+            if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
+                if not skip_all_training and game_sf_depth and game_sf_depth >= cfg.rescore_depth:
+                    tr_sf = tree_data.get(i, tree_data.get(str(i), {}))
+                    Q_stm = tr_sf.get('Q_stm')
+                    if Q_stm is not None:
+                        self.maybe_seed_cache(b_fast, mv, Q_stm, turn, repetitions)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
-            # tree data for this move
             tr = tree_data.get(i, tree_data.get(str(i), {}))
             cm = tr.get('candidate_moves', [])
             if not cm:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
-            # calculate Y value
-            Z_stm = result if turn else -1*result
-            if 'Q_stm' in tr.keys():
+            Z_stm = result if turn else -result
+            if 'Q_stm' in tr:
                 Q = tr['Q_stm']
             else:
-                this_q = tr.get("best_Q", tr.get("visit_weighted_Q"))
-                Q = this_q if turn else -1*this_q
+                this_q = tr.get('best_Q', tr.get('visit_weighted_Q'))
+                Q = this_q if turn else -this_q
 
-            Y = np.clip(0.99*Z_stm + 0.01*Q, -1.0, 1.0)
-
-            if Y != Y:
-                print("[rescore] nan value detected for Y")
+            Y_init = np.clip(cfg.z_mix * Z_stm + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
+            if Y_init != Y_init:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
-            # if sf_move, gather training data, push moves, continue
             if is_sf_move:
-                self.training_data_from_sf(b_fast, mv, cm, Y, is_draw)
+                if game_sf_depth and game_sf_depth >= cfg.rescore_depth:
+                    self.maybe_seed_cache(b_fast, mv, Q, turn, repetitions)
+                self.training_data_from_sf(b_fast, mv, cm, Y_init, is_draw)
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
-            # if here, its MCTS move
-            # want CPL to reflect what Xerces would have played (robust/most_visited)
-            # not what was actually played when sampling is enabled.
             visits = [(c['uci'], max(1, c['visits'])) for c in cm]
             visits = sorted(visits, key=lambda x: x[1], reverse=True)
-
             if not visits:
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
-            sel_method = tr.get("selection_method")
-            xc0_move = tr.get("xc0_move")
-
-            xerces_uci_for_cpl = mv
+            sel_method = tr.get('selection_method')
+            xc0_move = tr.get('xc0_move')
+            xerces_uci = mv
             if xc0_move and xc0_move != mv:
-                xerces_uci_for_cpl = xc0_move
-                # if xc0 selected move isnt most visited, swap visits to make it so
-                top_uci = visits[0][0]
-                if xerces_uci_for_cpl != top_uci:
-                    vmap = {u: n for u, n in visits}
-                    top_n = vmap.get(top_uci, 1)
-                    xc0_n = vmap.get(xc0_move, 1)
-                    vmap[top_uci] = max(1, xc0_n)
-                    vmap[xc0_move] = max(1, top_n)
-                    visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
-            
+                xerces_uci = xc0_move
             elif not sel_method:
-                # backward-compat for older pkls that dont store method/xc0_move
-                xerces_uci_for_cpl = visits[0][0]
+                xerces_uci = visits[0][0]
 
-            xerces_ch = chess.Move.from_uci(xerces_uci_for_cpl)
-            res = self.analyze_with_rank(xerces_ch, board_ch)
+            top_uci = visits[0][0]
+            if xerces_uci != top_uci:
+                vmap = {u: n for u, n in visits}
+                top_n = vmap.get(top_uci, 1)
+                xc0_n = vmap.get(xerces_uci, 1)
+                vmap[top_uci] = max(1, xc0_n)
+                vmap[xerces_uci] = max(1, top_n)
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
-            loss_this = res['delta_signed']
+            lms = b_fast.legal_moves()
+            idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
+            x = b_fast.encode_64_tokens()
+            mask = b_fast.legal_move_mask()
+            short_fen = b_fast.fen(include_counters=False)
+            reps = 3 if repetitions[short_fen] >= 3 else 0
+            hmc = b_fast.halfmove_clock()
+            halfmoves = 0 if hmc < 45 else hmc
+            cache_key = (short_fen, reps, halfmoves)
+
+            ply = {
+                'ply_idx': i,
+                'mv': mv,
+                'turn': bool(turn),
+                'tr': tr,
+                'cm': cm,
+                'Z_stm': Z_stm,
+                'Q': Q,
+                'visits': visits,
+                'lms': lms,
+                'x': x,
+                'mask': mask,
+                'idx_map': idx_map,
+                'skip_training': skip_all_training,
+                'xerces_uci': xerces_uci,
+                'board_ch': board_ch.copy(),
+                'cache_key': cache_key,
+                'best_uci': None,
+                'best_cp': None,
+                'best_abs': None,
+                'sf_wdl': None,
+                'played_cp': None,
+                'played_abs': None,
+                'resolved': False,
+            }
+
+            entry = self.cache.get(cache_key)
+            if entry and entry['best'] is not None:
+                best_uci, best_cp, best_abs, *_wdl = entry['best']
+                best_wdl = _wdl[0] if _wdl else None
+                ply['best_uci'] = best_uci
+                ply['best_cp'] = best_cp
+                ply['best_abs'] = best_abs
+                ply['sf_wdl'] = best_wdl
+                self.cache.touch(cache_key, self.games_processed)
+                self.n_cache_hits += 1
+
+                if xerces_uci == best_uci:
+                    ply['played_cp'] = best_cp
+                    ply['played_abs'] = best_abs
+                    ply['resolved'] = True
+                elif xerces_uci in entry['others']:
+                    played_cp, played_abs = entry['others'][xerces_uci]
+                    ply['played_cp'] = played_cp
+                    ply['played_abs'] = played_abs
+                    ply['resolved'] = True
+                else:
+                    rid = self.next_req_id()
+                    self.req_map[rid] = (gid, i, 'move', time.time())
+                    game_state['waiting'].add(rid)
+                    cmove = chess.Move.from_uci(xerces_uci)
+                    self.req_q.put((rid, board_ch.copy(), cmove))
+                    self.n_sf_submitted += 1
+            else:
+                rid = self.next_req_id()
+                self.req_map[rid] = (gid, i, 'best', time.time())
+                game_state['waiting'].add(rid)
+                self.req_q.put((rid, board_ch.copy(), None))
+                self.n_sf_submitted += 1
+
+            game_state['ply_states'].append(ply)
+            board_ch.push(move_ch)
+            b_fast.push_uci(mv)
+            repetitions[b_fast.fen(include_counters=False)] += 1
+
+        self.pending[gid] = game_state
+        if not game_state['waiting']:
+            self.finalize_game(self.pending.pop(gid))
+
+    def handle_sf_result(self, req_id, result):
+        if req_id not in self.req_map:
+            return
+        
+        gid, ply_idx, req_type, t_sent = self.req_map.pop(req_id)
+        self.sf_call_time += time.time() - t_sent
+        self.sf_call_count += 1
+        elapsed = result.get('elapsed', 0.0)
+        self.sf_compute_time += elapsed
+        self.sf_compute_count += 1
+        if gid not in self.pending:
+            return
+
+        game = self.pending[gid]
+        game['waiting'].discard(req_id)
+        ply = next((p for p in game['ply_states'] if p['ply_idx'] == ply_idx), None)
+        if ply is None:
+            return
+
+        key = ply['cache_key']
+
+        if req_type == 'best':
+            best_uci = result['best_uci']
+            best_cp = result['best_cp']
+            best_abs = result['best_abs']
+            wdl = result['wdl']
+            self.cache.set_best(
+                key, best_uci, best_cp, best_abs, wdl,
+                self.games_processed
+            )
+
+            ply['best_uci'] = best_uci
+            ply['best_cp'] = best_cp
+            ply['best_abs'] = best_abs
+            ply['sf_wdl'] = wdl
+
+            xerces_uci = ply['xerces_uci']
+            entry = self.cache.get(key)
+            if xerces_uci == best_uci:
+                ply['played_cp'] = best_cp
+                ply['played_abs'] = best_abs
+                ply['resolved'] = True
+            elif entry and xerces_uci in entry['others']:
+                played_cp, played_abs = entry['others'][xerces_uci]
+                ply['played_cp'] = played_cp
+                ply['played_abs'] = played_abs
+                ply['resolved'] = True
+            else:
+                rid = self.next_req_id()
+                self.req_map[rid] = (gid, ply_idx, 'move', time.time())
+                game['waiting'].add(rid)
+                self.req_q.put(
+                    (rid, ply['board_ch'], chess.Move.from_uci(xerces_uci))
+                )
+                self.n_sf_submitted += 1
+
+        elif req_type == 'move':
+            played_cp = result['move_cp']
+            played_abs = result['move_abs']
+            played_uci = result['move_uci']
+
+            entry = self.cache.get(key)
+            if entry and entry['best'] is not None:
+                old_best_uci, old_best_cp, old_best_abs, *_wdl = entry['best']
+                old_best_wdl = _wdl[0] if _wdl else None
+                if played_cp > old_best_cp:
+                    # xerces move is actually stronger — promote it to best
+                    self.cache.set_best(
+                        key, played_uci, played_cp, played_abs,
+                        old_best_wdl, self.games_processed
+                    )
+                    self.cache.set_move(
+                        key, old_best_uci, old_best_cp, old_best_abs,
+                        self.games_processed
+                    )
+                    ply['best_uci'] = played_uci
+                    ply['best_cp'] = played_cp
+                    ply['best_abs'] = played_abs
+                else:
+                    self.cache.set_move(
+                        key, played_uci, played_cp, played_abs,
+                        self.games_processed
+                    )
+            else:
+                self.cache.set_move(
+                    key, played_uci, played_cp, played_abs,
+                    self.games_processed
+                )
+
+            ply['played_cp'] = played_cp
+            ply['played_abs'] = played_abs
+            ply['resolved'] = True
+
+    def finalize_game(self, game_state):
+        cfg = game_state['cfg']
+        game_data = game_state['game_data']
+        gid = game_state['gid']
+        result = game_data['result']
+        is_draw = (result == 0) or (result == 0.0)
+
+        KL_coef = cfg.KL_weight_boost
+        do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
+        EQUIV = cfg.rescore_equiv_range
+
+        cpl_s = cpl_w = cpl_b = 0.0
+        nw = nb = 0
+        rows = []
+        eval_trace = []
+        turn_at = {}
+        pending = []
+        pending_meta = []
+
+        for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
+            i = ply['ply_idx']
+            mv = ply['mv']
+            turn = ply['turn']
+            turn_at[i] = turn
+            tr = ply['tr']
+            cm = ply['cm']
+            Z_stm = ply['Z_stm']
+            Q = ply['Q']
+            xerces_uci = ply['xerces_uci']
+            best_uci_raw = ply['best_uci']
+            best_cp = ply['best_cp']
+            best_abs = ply['best_abs']
+            sf_wdl = ply['sf_wdl']
+            played_cp = ply['played_cp']
+            played_abs = ply.get('played_abs', best_abs)
+            visits = list(ply['visits'])
+
+            best_uci = best_uci_raw
+            delta = best_cp - played_cp
+            if abs(delta) <= EQUIV:
+                delta = 0
+            
+            elif delta <= -EQUIV:
+                # xerces found a notably better move than SF
+                best_uci = xerces_uci
+                best_cp = played_cp
+                best_abs = played_abs
+
+            loss_this = delta
             cpl_s += loss_this
-            if board_ch.turn:
+            if turn:
                 cpl_w += loss_this
                 nw += 1
             else:
                 cpl_b += loss_this
                 nb += 1
 
-            # we penalize missed-mate-but-still-winning less harshly
-            missed_mate = (res.get('best_cp', 0) >= 1200) and (res['played_cp'] >= 500)
+            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
             if missed_mate:
-                loss_this = min(300, loss_this)
+                loss_this = min(200, loss_this)
 
+            eval_trace.append((i, best_abs))
             rows.append([
-                i, mv, xerces_uci_for_cpl, str(res['best_move']),
-                res['best_cp'], loss_this, res['played_cp'],
-                res['best_absolute'], res['played_absolute'],
-                board_ch.turn, loss_this
+                i, mv, xerces_uci, best_uci,
+                best_cp, loss_this, played_cp,
+                best_abs, played_abs,
+                turn, loss_this,
+                tr.get('stop_reason', ''), tr.get('sims', 0),
             ])
 
-            if skip_all_training:
-                board_ch.push(move_ch)
-                b_fast.push_uci(mv)
+            if ply['skip_training']:
                 continue
 
-            # screen training data, adjust if needed and append
-            lms = b_fast.legal_moves()
-
-            # determine correct cp threshold
-            blunder_cp = cfg.post_hoc_blunder_cp_loser
+            lms = ply['lms']
+            blunder_cp = cfg.rescore_blunder_cp_loser
             if Z_stm > 0.0:
-                blunder_cp = cfg.post_hoc_blunder_cp_winner
+                blunder_cp = cfg.rescore_blunder_cp_winner
 
-            # these moves are fine, no changes            
-            if loss_this <= min(60, blunder_cp):
-                best_mv = mv
-                visits = ensure_all_legal_moves_have_visits(visits, lms)
+            kl_eligible = False
+            xc0_uci = visits[0][0]
+            xc0_n = visits[0][1]
             
-            # for mild blunders or missed-mate-but-still-winning, adjust visits
-            elif (loss_this < blunder_cp) or missed_mate:
-                best_mv = str(res.get('best_move'))
-                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=False)
+            # ensure all legal moves have at least 1 visit
+            vmap = {u: max(1, int(v)) for u, v in visits}
+            for m in lms:
+                if m not in vmap:
+                    vmap[m] = 1
+            visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
-            # everything else is a blunder
+            is_true_blunder = not (played_cp > 350 and Z_stm > 0)
+
+            # visit correction based on move quality
+            if loss_this <= EQUIV:
+                kl_eligible = True
+
+                # respect SF best move, set a modest floor
+                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 4))
+            
+            elif loss_this <= cfg.rescore_inaccuracy_cp or missed_mate:
+                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
+
+            elif loss_this < blunder_cp:
+                vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, xc0_n // 2)
+
             else:
-                best_mv = str(res.get('best_move'))
-                visits = adjust_visits_from_cm(cm, mv, best_mv, lms, was_blunder=True)
-                # use the SF value here since its a blunder
-                best_cp = res.get('best_cp')
-                Y = cp_to_value_tanh(best_cp) if best_cp is not None else 0.0
+                vmap[best_uci] = xc0_n
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, xc0_n // 4)
 
-            if not visits or sum([v[1] for v in visits]) <= 0:
-                print("[rescorer] visits invalid or sum <= 0; skipping sample",
-                    "move_idx=", i, "played=", mv, "best=", best_mv)
-                board_ch.push(move_ch)
-                b_fast.push_uci(mv)
+            # re-sort after any adjustments
+            visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            if not visits or sum(v[1] for v in visits) <= 0:
+                print(f"[rescore] visits invalid; skipping move_idx={i} played={mv}")
                 continue
 
             mvs = [v[0] for v in visits]
             vis = [v[1] for v in visits]
-
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
             vwht = value_weight_for_game(cfg, is_draw)
-            pwht = cfg.policy_loss_weight
-
-            # adjust training weights based on KL
-            if do_KL_boost:
+            pwht = 1.0
+            if kl_eligible and do_KL_boost:
                 kl = kl_divergence(priors, vis)
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
-            
-            self.append_flat_policy_example(b_fast, mvs, vis, Y, vwht, pwht)
-            
-            board_ch.push(move_ch)
-            b_fast.push_uci(mv)
 
-        # assemble df and summary
+            # build policy from precomputed board state
+            idx_map = ply['idx_map']
+            indices = [idx_map[u] for u in mvs]
+            policy = np.zeros(64 * 67, dtype=np.float32)
+            s = sum(vis)
+            pi = np.array([v / s for v in vis], dtype=np.float32)
+            eps = cfg.uniform_eps
+            uni = 1.0 / len(mvs) if mvs else 0.0
+            pi = eps * uni + (1.0 - eps) * pi
+            pi = np.clip(pi, 0.0, cfg.prior_clip_max)
+            pi = pi / pi.sum()
+            for idx, p in zip(indices, pi):
+                policy[idx] += p
+
+            pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
+            pending_meta.append({
+                'stm': turn,
+                'nn_value': tr.get('nn_value'),
+                'nn_raw_priors': tr.get('nn_raw_priors', []),
+                'mass_on_legal': tr.get('nn_mass_on_legal'),
+                'sf_cp': best_cp,
+                'sf_wdl': sf_wdl,
+                'candidate_visits': list(zip(mvs, vis)),
+                'result_z_stm': Z_stm
+            })
+
+        eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
+            eval_trace, result,
+            cfg.collar_threshold_cp, cfg.collar_n_consec, cfg.collar_reset_cp,
+        )
+
+        for list_idx, blundering_side in replayable_blunders:
+            blunder_ply = eval_trace[list_idx][0]
+            sf_is_white = (blundering_side == 'white')
+            if turn_at.get(blunder_ply) != sf_is_white:
+                print("[blunder replay] sf_color does not match STM at this ply")
+                continue
+            if blunder_ply >= self.config.blunder_replay_min_ply:
+                self.blunder_replay_specs.append({
+                    'fen': game_data['start_fen'],
+                    'moves': game_data['moves_played'][:blunder_ply],
+                    'stockfish_is_white': sf_is_white,
+                    'source_game_id': gid,
+                })
+
+        n_diff = 0
+        for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), meta in zip(
+            pending, pending_meta
+        ):
+            z_orig = result if is_white else -result
+            eff_z_white = eff_z_by_ply.get(ply_i, result)
+            z_eff = eff_z_white if is_white else -eff_z_white
+            if eff_z_white != result:
+                n_diff += 1
+
+            z = z_eff if cfg.use_collar_rescoring else z_orig
+            Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
+            self.training_data.append((x, mask, policy, Y, vwht, pwht))
+            self.pending_metrics.append({**meta, 'target_y': float(Y)})
+        self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
+
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
-            'best_absolute', 'played_absolute', 'stm', 'loss'
+            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
         ]
-
         out_df = pd.DataFrame(rows, columns=cols)
-        out_df['played_best_move'] = out_df['most_visited_move'] == out_df['best_move']
+        out_df['played_best_move'] = out_df['delta'] <= 0
 
         mask_w = out_df['stm'] == True
         mask_b = out_df['stm'] == False
-
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
         white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
         black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
@@ -527,24 +907,265 @@ class Rescorer(object):
             'black_cpl': rnd(cpl_b / nb, 3) if nb else np.nan,
             'overall_best_move_rate': overall_bmr,
             'best_move_rate_white': white_bmr,
-            'best_move_rate_black': black_bmr
+            'best_move_rate_black': black_bmr,
         }
-
         for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
             val = game_data.get(key)
             if key == 'ts':
                 val = int(val)
-                
             out[key] = val
             out_df[key] = val
 
+        stop_stats = {}
+        for st in ('full', 'rsc', 'jsd'):
+            mask_st = out_df['stop_reason'] == st
+            n_st = mask_st.sum()
+            stop_stats[st] = {
+                'n': int(n_st),
+                'cpl': rnd(out_df.loc[mask_st, 'delta'].mean(), 3) if n_st else np.nan,
+                'bmr': (
+                    out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan
+                ),
+                'sims': (
+                    float(out_df.loc[mask_st, 'sims'].mean()) if n_st else float('nan')
+                ),
+            }
+        out['stop_stats'] = stop_stats
         out['df'] = out_df
+
         self.analyzed_results.append(out)
         self.games_processed += 1
         self.games_seen.add(gid)
-        if len(self.analyzed_results) >= self.config.post_hoc_analyze_batch:
+        self.accumulate_stop_stats(stop_stats)
+        if self.games_processed % 100 == 0:
+            self.print_stop_stats()
+        if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
             self.push_analyzed(report=True)
-        
+
+
+    def accumulate_collar_stats(self, n_triggers, n_diff, n_total):
+        has_collar = n_triggers > 0
+        for acc in (self.collar_total, self.collar_window):
+            acc['seen'] += 1
+            acc['triggers'] += n_triggers
+            acc['games'] += int(has_collar)
+            acc['positions'] += n_diff
+            acc['total_pos'] += n_total
+
+    def accumulate_stop_stats(self, stop_stats):
+        for st, s in stop_stats.items():
+            n = s['n']
+            if not n:
+                continue
+            for acc in (self.total_stop, self.window_stop):
+                acc[st]['n'] += n
+                acc[st]['cpl'] += s['cpl'] * n
+                acc[st]['bmr'] += s['bmr'] * n
+                if not np.isnan(s.get('sims', float('nan'))):
+                    acc[st]['sims'] += s['sims'] * n
+
+    def print_stop_stats(self):
+        stops = ("rsc", "jsd", "full")
+
+        def pct(acc, st):
+            total_n = sum(acc[s]['n'] for s in stops)
+            n = acc[st]['n']
+            return n / total_n if total_n else 0.0
+
+        def cpl(acc, st):
+            n = acc[st]['n']
+            return acc[st]['cpl'] / n if n else float('nan')
+
+        def bmr(acc, st):
+            n = acc[st]['n']
+            return acc[st]['bmr'] / n if n else float('nan')
+
+        def avg_sims(acc, st):
+            n = acc[st]['n']
+            return round(acc[st]['sims'] / n) if n else 0
+
+        def rows(label, acc):
+            hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4}({pct(acc,st):.0%})  |" for st in stops)
+            crow = f"{RS}  {label:<12} |" + "".join(f"  CPL {cpl(acc,st):5.2f}  |" for st in stops)
+            brow = f"{RS}  {label:<12} |" + "".join(f"  BMR {bmr(acc,st):.3f}  |" for st in stops)
+            return hdr, crow, brow
+
+        wh, wc, wb = rows("last 100", self.window_stop)
+        th, tc, tb = rows("overall",  self.total_stop)
+        tph = (f"{RS}  {'':<12} |"
+               + "".join(f"  {st:<4}({pct(self.total_stop,st):.0%})  |" for st in stops))
+        srow = (f"{RS}  {'avg sims':<12} |"
+                + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops))
+        print(wh)
+        print(srow)
+        print(wc)
+        print(wb)
+        print()
+        print(tph)
+        print(tc)
+        print(tb)
+
+        for st in stops:
+            self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
+
+    def print_collar_stats(self):
+        dry = "" if self.config.use_collar_rescoring else " [dry]"
+
+        def fmt_row(label, s):
+            pos_pct = (s['positions'] / s['total_pos'] * 100) if s['total_pos'] else 0.0
+            return (
+                f"{RS} Collar{dry}  {label:<12}"
+                f"  trigs {s['triggers']:>4}"
+                f"  collar_games {s['games']:>3}/{s['seen']:<3}"
+                f"  pos {s['positions']:>5} ({pos_pct:.1f}%)"
+            )
+
+        w = self.collar_window
+        print(fmt_row(f"batch {w['seen']:>3}:", w))
+
+        if len(self.collar_history) >= 10:
+            combined = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+            for h in self.collar_history[-10:]:
+                for k in combined:
+                    combined[k] += h[k]
+            print(fmt_row("last 300:", combined))
+
+    def aggregate_metrics(self, epoch, vscale, progress_csv_path):
+        if not self.pending_metrics:
+            return
+
+        chunk_size = self.config.retrain_size
+        chunk = self.pending_metrics[:chunk_size]
+        self.pending_metrics = self.pending_metrics[chunk_size:]
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        nn_vals_stm, target_ys, sf_cps, sf_wdls, result_zs = [], [], [], [], []
+        mol_vals, policy_samples = [], []
+
+        for m in chunk:
+            nn_v = m.get('nn_value')
+            if nn_v is None:
+                continue
+            stm_sign = 1.0 if m['stm'] else -1.0
+            nn_stm = np.clip(nn_v * stm_sign / vscale, -1.0, 1.0)
+            nn_vals_stm.append(nn_stm)
+            target_ys.append(m['target_y'])
+            sf_cps.append(m['sf_cp'])
+            wdl = m.get('sf_wdl')
+            sf_wdls.append(wdl if wdl is not None else float('nan'))
+            result_zs.append(m['result_z_stm'])
+            mol = m.get('mass_on_legal')
+            mol_vals.append(mol if mol is not None else float('nan'))
+            priors_map = {u: p for u, p in m.get('nn_raw_priors', [])}
+            policy_samples.append((priors_map, m.get('candidate_visits', [])))
+
+        nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
+        target_ys   = np.array(target_ys,   dtype=np.float32)
+        sf_cps      = np.array(sf_cps,      dtype=np.float32)
+        sf_wdls     = np.array(sf_wdls,     dtype=np.float32)
+        result_zs   = np.array(result_zs,   dtype=np.float32)
+        mol_vals    = np.array(mol_vals,     dtype=np.float32)
+
+        valid_v = ~np.isnan(nn_vals_stm) & ~np.isnan(target_ys)
+        n = int(valid_v.sum())
+        val_mse = np.mean(
+            (nn_vals_stm[valid_v] - target_ys[valid_v]) ** 2
+        ) if n else float('nan')
+        val_corr = (
+            np.corrcoef(nn_vals_stm[valid_v], target_ys[valid_v])[0, 1]
+        ) if n > 1 else float('nan')
+
+        pol_stats = batch_policy_metrics_from_priors(
+            policy_samples, self.config.uniform_eps, self.config.prior_clip_max)
+
+        valid_m = ~np.isnan(mol_vals)
+        mol_est = float(np.mean(mol_vals[valid_m])) if valid_m.any() else float('nan')
+        mol_cov = float(valid_m.mean()) if len(valid_m) else 0.0
+
+        stats = {'value_mse': val_mse, 'value_corr': val_corr}
+        stats.update(pol_stats)
+        stats['mass_on_legal'] = mol_est
+        print_validation(epoch, stats, mass_on_legal=mol_est, mol_coverage=mol_cov)
+
+        row = {**stats, 'model_epoch': epoch, 'n_samples': n,
+               'mol_coverage_pct': round(mol_cov * 100, 1)}
+        row_df = pd.DataFrame([row])
+        if os.path.exists(progress_csv_path):
+            all_df = pd.concat(
+                [pd.read_csv(progress_csv_path), row_df], ignore_index=True)
+        else:
+            all_df = row_df
+        all_df.round(5).to_csv(progress_csv_path, index=False)
+
+        MAX_SC = 5000
+        n_pts = len(nn_vals_stm)
+        idx = (np.random.choice(n_pts, MAX_SC, replace=False)
+               if n_pts > MAX_SC
+               else np.arange(n_pts))
+
+        xv   = nn_vals_stm[idx]
+        ytgt = target_ys[idx]
+        ycp  = sf_cps[idx]
+        ywdl = sf_wdls[idx]
+        zc   = result_zs[idx]
+
+        z_palette = {1.0: "#3cb371", 0.0: "#ffd700", -1.0: "#ff8c00"}
+        c_all = [z_palette.get(round(float(z)), "#999999") for z in zc]
+
+        import matplotlib.patches as mpatches
+        legend = [
+            mpatches.Patch(color="#3cb371", label="win"),
+            mpatches.Patch(color="#ffd700", label="draw"),
+            mpatches.Patch(color="#ff8c00", label="loss"),
+        ]
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        axes[0].scatter(ytgt, xv, s=4, alpha=0.3, c='steelblue')
+        axes[0].set_xlabel("target Y")
+        axes[0].set_ylabel("NN value (STM-POV)")
+        axes[0].set_title(f"Epoch {epoch}: NN value vs target  MSE={val_mse:.2f} r={val_corr:.2f}")
+
+        valid2 = ~np.isnan(ycp)
+        xv2, ycp2 = xv[valid2], ycp[valid2]
+        ycp2_tanh = np.tanh(ycp2 * (np.arctanh(0.8) / 500.0))
+        mse2 = np.mean((xv2 - ycp2_tanh) ** 2) if len(xv2) > 1 else float('nan')
+        corr2 = np.corrcoef(xv2, ycp2)[0, 1] if len(xv2) > 1 else float('nan')
+        c2 = [c_all[i] for i in range(len(xv)) if valid2[i]]
+        axes[1].scatter(ycp2, xv2, s=4, alpha=0.3, c=c2)
+        axes[1].set_xlabel("SF CP (STM-POV)")
+        axes[1].set_ylabel("NN value (STM-POV)")
+        axes[1].set_title(f"NN value vs SF centipawns  MSE={mse2:.2f} r={corr2:.2f}")
+        axes[1].legend(handles=legend, fontsize=8)
+
+        valid3 = ~np.isnan(ywdl)
+        xv3_raw, ywdl3_raw = xv[valid3], ywdl[valid3]
+        mse3 = np.mean((xv3_raw - ywdl3_raw) ** 2) if len(xv3_raw) > 1 else float('nan')
+        corr3 = np.corrcoef(xv3_raw, ywdl3_raw)[0, 1] if len(xv3_raw) > 1 else float('nan')
+        c3 = [c_all[i] for i in range(len(xv)) if valid3[i]]
+
+        def boundary_jitter(arr, scale=0.05):
+            j = np.random.uniform(-scale, scale, size=arr.shape).astype(arr.dtype)
+            j = np.where(arr + j > 1.0, -np.abs(j), np.where(arr + j < -1.0, np.abs(j), j))
+            return arr + j
+
+        xv3   = boundary_jitter(xv3_raw)
+        ywdl3 = boundary_jitter(ywdl3_raw)
+        axes[2].scatter(ywdl3, xv3, s=4, alpha=0.3, c=c3)
+        axes[2].set_xlabel("SF WDL score (STM-POV)")
+        axes[2].set_ylabel("NN value (STM-POV)")
+        axes[2].set_title(f"NN value vs SF WDL  MSE={mse3:.2f} r={corr3:.2f}")
+        axes[2].legend(handles=legend, fontsize=8)
+
+        fig.tight_layout()
+        plot_path = os.path.join(os.path.dirname(progress_csv_path), "validation_latest.png")
+        fig.savefig(plot_path, dpi=120)
+        plt.close(fig)
+        print(f"[metrics] plot saved")
+
     def push_analyzed(self, report=True):
         # safeguard here
         if not len(self.analyzed_results):
@@ -579,62 +1200,158 @@ class Rescorer(object):
                 )
 
             n_tot = self.games_processed
-            if n_tot > self.config.post_hoc_analyze_batch:
+            if n_tot > self.config.rescore_analyze_batch:
                 rate = n_tot / (time.time() - self.start_time)
                 print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
             
-            # SF timing summary
-            if self.n_sf_best > 0:
-                avg_first = self.sf_best_time / self.n_sf_best
-                if self.n_sf_played > 0:
-                    avg_rerun = self.sf_played_time / self.n_sf_played
-                else:
-                    avg_rerun = 0.0
+            cache_stats = self.cache.stats()
+            avg_total_ms = (
+                1000 * self.sf_call_time / self.sf_call_count
+                if self.sf_call_count else 0.0
+            )
+            avg_compute_ms = (
+                1000 * self.sf_compute_time / self.sf_compute_count
+                if self.sf_compute_count else 0.0
+            )
+            print(
+                f"{RS} SF requests: {self.n_sf_submitted} submitted,"
+                f" {self.n_cache_hits} cache hits,"
+                f" compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
+                f" req_q {self.req_q.qsize()}  pending {len(self.pending)},"
+                f" cache size {cache_stats['size']}"
+            )
+            self.sf_call_time = 0.0
+            self.sf_call_count = 0
+            self.sf_compute_time = 0.0
+            self.sf_compute_count = 0
+            print()
 
-                total = int(self.n_sf_played + self.n_sf_best)
-                rerun_rate = (self.n_sf_played / self.n_sf_best)
-                expected = avg_first + rerun_rate * avg_rerun
-                
-                print(f"{RS} SF timing: Total {total} | rerun rate {rerun_rate:.3f}")
-                print(
-                    f"{RS} SF timing: avg_first {avg_first:.3f} "
-                    f"avg_rerun {avg_rerun:.3f} exp {expected:.3f} "
-                    f"max {self.sf_max[-1]:.3f}"
-                )
-            
+            self.print_collar_stats()
+
             w_this = self.written_this_round
             wtot = self.written_total
             print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
-        
+            print()
+
+        self.collar_history.append(dict(self.collar_window))
+        self.collar_history = self.collar_history[-10:]
+        zero_collar = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+        self.collar_window = dict(zero_collar)
+
         self.analyzed_results = []
 
 # helpers
+def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
+    """
+    Walk eval_trace (list of (ply, white_pov_cp)) and return
+    (eff_z_by_ply, n_triggers).
+
+    eff_z_by_ply: dict[ply -> white-pov effective result]
+      - positions inside a collar segment: +1.0 or -1.0 (collar winner)
+      - positions outside any collar: float(game_result)
+    n_triggers: number of collar resets (blunder-induced segment splits)
+
+    Collar activates after n_consec consecutive plies above threshold (white)
+    or below -threshold (black), retroactively marking those plies.
+    Collar resets when the eval crosses back within reset_cp of zero.
+    The reset ply itself starts the new segment (gets game_result).
+    """
+    if not eval_trace:
+        return {}, 0, []
+
+    plies = [p for p, _ in eval_trace]
+    evals = [e for _, e in eval_trace]
+    n = len(evals)
+
+    collar_state = [None] * n
+    collar = None
+    count = 0
+    segment_start = 0
+    n_triggers = 0
+    replayable_blunders = []
+    neutral_blunders = []
+    collar_set_by_eventual_loser = False
+    still_neutral = abs(evals[0]) < threshold
+
+    for i, ev in enumerate(evals):
+        # detect a neutral -> losing blunder
+        if still_neutral and abs(ev) >= threshold:
+            still_neutral = False
+            if abs(ev - evals[i-1]) > abs(reset_cp - threshold):
+                blundering_side = 'black' if ev > 0 else 'white'
+                blunderer_lost = (
+                    game_result > 0 if blundering_side == 'black' else game_result < 0
+                )
+                if blunderer_lost:
+                    neutral_blunders.append((i - 1, blundering_side))
+
+        if collar is None:
+            if ev > threshold:
+                if count <= 0:
+                    count = 0
+                count += 1
+            elif ev < -threshold:
+                if count >= 0:
+                    count = 0
+                count -= 1
+            else:
+                count = 0
+
+            if count >= n_consec:
+                for j in range(segment_start, i + 1):
+                    collar_state[j] = 'white'
+                collar = 'white'
+                collar_set_by_eventual_loser = game_result < 1.0
+                count = 0
+            elif count <= -n_consec:
+                for j in range(segment_start, i + 1):
+                    collar_state[j] = 'black'
+                collar = 'black'
+                collar_set_by_eventual_loser = game_result > -1.0
+                count = 0
+        else:
+            broken = (
+                (collar == 'white' and ev < reset_cp) or
+                (collar == 'black' and ev > -reset_cp)
+            )
+
+            if broken:
+                # first, check if replayable based on collar holder and prev eval
+                if collar_set_by_eventual_loser and abs(evals[i-1]) > threshold:
+                    replayable_blunders.append((i - 1, collar))
+
+                # then continue collar logic
+                segment_start = i
+                collar = None
+                count = 0
+                n_triggers += 1
+
+            else:
+                collar_state[i] = collar
+
+    eff_z = {}
+
+    # if we detected 0 flips, no updates.
+    if not n_triggers:
+        return eff_z, n_triggers, neutral_blunders
+    
+    for i, ply in enumerate(plies):
+        if collar_state[i] == 'white':
+            eff_z[ply] = 1.0
+        elif collar_state[i] == 'black':
+            eff_z[ply] = -1.0
+        else:
+            eff_z[ply] = float(game_result)
+
+    # sanity check: if all eff_z values collapsed back to game_result, no real flips
+    if all(v == float(game_result) for v in eff_z.values()):
+        return {}, 0, neutral_blunders
+
+    return eff_z, n_triggers, replayable_blunders + neutral_blunders
+
+
 def value_weight_for_game(cfg, is_draw):
-    vwht = cfg.value_loss_weight
-    if is_draw:
-        vwht *= cfg.draw_value_scale
-    return vwht
-
-
-def ensure_all_legal_moves_have_visits(visit_pairs, lms):
-    """
-    visit_pairs: list of (uci, visits) or [uci, visits]
-    lms: list of legal move UCIs
-    Ensures every legal move appears with visits >= 1.
-    Returns list of [uci, int_visits] sorted desc.
-    """
-    d = {}
-    for u, v in visit_pairs:
-        if not u:
-            continue
-        d[u] = max(1, int(v))
-
-    for m in lms:
-        if m not in d:
-            d[m] = 1
-
-    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
-    return [[u, int(v)] for u, v in items]
+    return cfg.draw_value_scale if is_draw else 1.0
 
 
 def save_pickle_atomic(obj, path, tries=0):
@@ -899,45 +1616,27 @@ def make_fake_visits(mv, lms, ratio_best=60):
     return visits
 
 
-def adjust_visits_from_cm(cm, played_mv, best_mv, lms, was_blunder=False):
+def encourage_best_move(visits, played_mv, best_mv, lms):
     """
-    cm: list of {'uci': ..., 'visits': ...}
-    Ensure every legal move in lms appears (min 1) and swap visits
-    for best and played with 30% bump. This stabilizes training.
-    Return list of [uci, int_visits] sorted desc.
+    visits: list of (uci, count) from tree
+    Sets best_mv visits equal to played_mv visits without lowering played_mv.
+    Ensures all legal moves have at least 1 visit.
+    Returns list of [uci, int_visits] sorted desc.
     """
-    # build dict of existing counts (min 1)
-    d = {}
-    for c in cm:
-        u = c.get('uci')
-        v = int(c.get('visits', 1))
-        if u:
-            d[u] = max(1, v)
-
-    # ensure all legal moves exist with min 1
+    d = {u: max(1, int(v)) for u, v in visits if u}
     for m in lms:
         if m not in d:
             d[m] = 1
-
-    # compute old max
-    old_max = max(d.values()) if d else 1
-    old_min = min(d.values()) if d else 1
-
-    # adjust by swapping visits between played and best with 30% bump
-    d[played_mv] = int(np.ceil(0.7*d[best_mv]))
-    if was_blunder:
-        d[best_mv] = old_min
-    else:
-        d[best_mv] = int(np.ceil(1.3*old_max))
-
-    # build sorted list
+    d[best_mv] = max(d.get(best_mv, 1), d.get(played_mv, 1))
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)
     return [[u, int(v)] for u, v in items]
 
 
-def launch_retrain_async(run_tag, rt_script, working_cfg):
+def launch_retrain_async(run_tag, rt_script, working_cfg, epoch=None):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
+    if epoch is not None:
+        cmd += ["--epoch", str(epoch)]
 
     print(f"[retrain] launching worker")
 

@@ -1,4 +1,4 @@
-import os, json, pathlib, time
+import os, json, gzip, pathlib, time, random
 import psutil
 import uuid
 
@@ -52,9 +52,13 @@ class GameViewer:
             raise FileNotFoundError(f"log file not found: {self.path}")
 
         suffix = self.path.suffix.lower()
+        name = self.path.name.lower()
         if suffix == ".json":
             with open(self.path, "r", encoding="utf-8") as f:
                 self.log = json.load(f)
+        elif name.endswith(".pkl.gz"):
+            with gzip.open(self.path, "rb") as f:
+                self.log = pickle.load(f)
         elif suffix in (".pkl", ".pickle"):
             with open(self.path, "rb") as f:
                 self.log = pickle.load(f)
@@ -155,21 +159,20 @@ class GameViewer:
             print("No SF info (maybe engine failed).")
             return
     
-        # print top-3
-        print("SF top moves (white-POV cp):")
+        sign = 1 if self.turn() else -1
+        print("SF top moves (STM-POV cp):")
         top_ucis = set()
         for i, (uci, san, cp, pv) in enumerate(topk, start=1):
-            cp_str = ("mate" if cp is None else str(int(cp)))
+            cp_stm = None if cp is None else int(cp * sign)
+            cp_str = "mate" if cp_stm is None else str(cp_stm)
             print(f"  #{i}. {san:<6}  cp={cp_str}")
             if uci:
                 top_ucis.add(uci)
-    
-        # check the move about to be played (selected from moves_uci[self.ply])
+
         if self.ply < len(self.moves_uci):
             upcoming_uci = self.moves_uci[self.ply]
             upcoming_san = self.board.san(upcoming_uci)
             if upcoming_uci not in top_ucis:
-                # get forced eval for the played move
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
@@ -178,11 +181,10 @@ class GameViewer:
                         sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
                     )
-                    
                     score_obj = info.get("score")
                     if score_obj is not None:
                         cp = score_obj.white().score(mate_score=1500)
-                        print(f"  cp(played) = {int(cp)} (white-POV)")
+                        print(f"  cp(played) = {int(cp * sign)} (STM-POV)")
                     else:
                         print("  played move eval not available")
             else:
@@ -255,7 +257,7 @@ class GameViewer:
         )
         sep = "  " + "-" * (len(hdr) - 2)
         to_move = "White" if white_to_move else "Black"
-        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=white-pov):")
+        print(f"\n  lc0 top moves ({nodes} nodes, {to_move} to move, Q=STM-pov):")
         print(hdr)
         print(sep)
 
@@ -265,12 +267,12 @@ class GameViewer:
             san = self.board.san(mv)
             n     = r.get("N", 0)
             p_lc0 = r.get("P_pct", 0.0) / 100.0
-            q_lc0 = r.get("Q", 0.0) * sign
+            q_lc0 = r.get("Q", 0.0)
             d     = r.get("D", 0.0)
 
             xc0   = xc0_map.get(mv)
             p_xc0 = xc0["P"] if xc0 else float("nan")
-            q_xc0 = xc0["Q"] if xc0 else float("nan")
+            q_xc0 = xc0["Q"] * sign if xc0 else float("nan")
 
             print(
                 f"  {san:<7}  {n:>6}  {p_lc0:>7.3f}  {p_xc0:>7.3f}"
@@ -298,7 +300,7 @@ class GameViewer:
             if upcoming_uci not in top_ucis:
                 match = next((r for r in all_rows if r["move"] == upcoming_uci), None)
                 if match:
-                    q_lc0 = match.get("Q", 0.0) * sign
+                    q_lc0 = match.get("Q", 0.0)
                     n     = match.get("N", 0)
                     print(
                         f"\nPlayed {upcoming_san} not in top-5:"
@@ -541,15 +543,14 @@ class GameViewer:
         visits = c.get("visits", 0)
         visit_share = c.get("visit_share", 0.0)
 
-        q = c.get("Q", 0.0)
-        qema = c.get("Qema", 0.0)
-        ds = c.get("Qdelta_sign", 0.0)
+        sign = 1 if self.board.side_to_move() == "w" else -1
+        q = c.get("Q", 0.0) * sign
+        qema = c.get("Qema", 0.0) * sign
+        ds = c.get("Qdelta_sign", 0.0) * sign
 
         p = c.get("P", 0.0)
         u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
-
-        qrel = q if self.board.side_to_move() == "w" else -q
-        puct = qrel + u
+        puct = q + u
 
         flags = []
         if mark:
@@ -608,9 +609,10 @@ class GameViewer:
         max_d = node.get("max_depth", 0)
         cv = node.get("children_visited", 0)
         tc = node.get("total_children", 0)
+        stop = node.get("stop_reason") or "?"
 
         line = (
-            f"  sims={sims}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
+            f"  sims={sims}  stop={stop}  time={t:.2f}s  avg_depth={avg_d:.2f}  "
             f"max_depth={max_d} children visited={cv}/{tc}"
         )
         print(line)
@@ -779,9 +781,9 @@ class GameViewer:
         if this_q is None:
             this_q = node.get("visit_weighted_Q")
             if this_q is not None:
-                print(f"\nvisit-weighted Q={this_q}")
+                print(f"\nvisit-weighted Q={this_q:+.4f}")
         else:
-            print(f"\nBest Q={this_q}")
+            print(f"\nBest Q={this_q:+.4f}")
 
         r = self.sf_row_for_ply(self.ply)
         if r is not None:
@@ -821,18 +823,19 @@ class GameViewer:
                 parts.append(f"CPL={int(loss)}")
 
             if played_san != "?":
-                parts.append(f"played={played_san}")
-
-            if xc0_uci and xc0_san != "?":
-                parts.append(f"Xc0={xc0_san} ({'✓' if matched else '×'})")
-            elif played_san != "?":
-                parts.append(f"({'✓' if matched else '×'})")
+                if xc0_uci and xc0_san != "?":
+                    parts.append(f"played={played_san}")
+                    xc0_cp = f" ({played_cp_pov})" if played_cp_pov is not None else ""
+                    parts.append(f"Xc0={xc0_san}{xc0_cp}")
+                else:
+                    played_cp = f" ({played_cp_pov})" if played_cp_pov is not None else ""
+                    parts.append(f"played={played_san}{played_cp}")
 
             if best_san != "?":
-                parts.append(f"SF best={best_san}")
+                best_cp = f" ({best_cp_pov})" if best_cp_pov is not None else ""
+                parts.append(f"SF best={best_san}{best_cp}")
 
-            if (best_cp_pov is not None) and (played_cp_pov is not None):
-                parts.append(f"cp(best/played)={best_cp_pov}/{played_cp_pov}")
+            parts.append(f"played best: {'✓' if matched else '×'}")
 
             if parts:
                 print("SF:", "  ".join(parts))
@@ -927,9 +930,13 @@ class GameViewer:
 
     def replay(self):
         print(f"Replaying {self.log['scenario']}. Result {self.log['result']}")
-        # flip the board if sf plays white
         sf_color = self.log.get("stockfish_color", None)
-        flipped = sf_color if sf_color else False
+        vs_stockfish = self.log.get("vs_stockfish", False)
+        if vs_stockfish:
+            flipped = sf_color if sf_color else False
+        else:
+            result = self.log.get("result", 0)
+            flipped = result < 0
         print("Controls: Enter/Space=forward, b=back, q=quit, o=options")
         shown = False
         while True:
@@ -1001,75 +1008,83 @@ class GameViewer:
         ent, norm = calc_entropy(p)
         return norm, p
 
-    def generate_training_data(self, sf_skip=False, **kwargs):
+    def generate_training_data(self, min_visits=200, sf_accept_rate=0.5, cpl_threshold=60, **kwargs):
         """
-        Walk the game using self.next() and produce Xerces training examples.
-        If sf_skip is True, plies played by Stockfish (per who_moved()) are
-        skipped.
+        Walk the game and produce Xerces training examples.
+        - Plies with fewer than min_visits total MCTS visits are skipped.
+        - SF plies are accepted with probability sf_accept_rate.
+        - For startpos/pre_opened/pre_opened_mini, plies 0-9 are accepted with
+          probability ramping from 0.5 (ply 0) to 0.95 (ply 9) to diversify
+          opening coverage.
+        - If sf_df was passed to __init__ and cpl_threshold is set, plies where
+          the played move's CPL (loss column) exceeds cpl_threshold are skipped.
+          Plies with no matching SF row are also skipped when SF data is present.
         """
-        # X, Mask, Pi, result (Z), this_Q, moves Remaining
         X, M, P, Z, V, R = [], [], [], [], [], []
         result = self.result
-
-        # start from initial position
         self.reset()
+
+        opening_scenarios = {'startpos', 'pre_opened', 'pre_opened_mini'}
+        is_opening_scenario = self.log.get('scenario', '') in opening_scenarios
+        use_cpl_filter = (self.sf_rows is not None) and (cpl_threshold is not None)
 
         total_plies = len(self.moves_uci)
         while self.ply < total_plies:
-            # detect whether the side to move is Stockfish
             move_played = self.moves_uci[self.ply]
             mover = self.who_moved().lower()
             is_white_move = "white" in mover
             is_sf_move = "stockfish" in mover
 
-            if sf_skip and is_sf_move:
-                # advance and skip this ply
-                self.next()
-                continue
+            if use_cpl_filter:
+                sf_row = self.sf_row_for_ply(self.ply)
+                if sf_row is None or sf_row['loss'] > cpl_threshold:
+                    self.next()
+                    continue
+
+            if is_opening_scenario and self.ply < 10:
+                accept_prob = 0.5 + 0.45 * (self.ply / 9)
+                if random.random() > accept_prob:
+                    self.next()
+                    continue
 
             rb = self.board
             lms = rb.legal_moves()
-            
+
             node = self.tree_data.get(self.ply, {})
             if not node:
                 self.next()
                 continue
-            
-            cms = node.get("candidate_moves", {})
-            if cms:
-                visits = [[x['uci'], x['visits']] for x in cms]
-                visited = set([x[0] for x in visits])
-                
-                # add in all legal moves if missing
-                for move in [l for l in lms if l not in visited]:
-                    visited.add(move)
-                    visits.append([move, 1])
-                    
-                visits = sorted(visits, key=lambda x: x[1], reverse=True)
-                
-                if is_sf_move and visits[0][0] != move_played:
-                    if sum([x[1] for x in visits]) > 100:
-                        most_visited = visits[0][0]
-                        for v in visits:
-                            if v[0] == move_played:
-                                v[0] = most_visited
-                                break
-                        visits[0][0] = move_played
-                    else:
-                        visits = make_fake_visits(move_played, lms, ratio_best=51)
-            
-            else:
-                # legal moves and synthetic visits
-                visits = make_fake_visits(move_played, lms, ratio_best=51)
 
-            # check_boost = kwargs.get("check_boost", 0)
-            # capture_boost = kwargs.get("capture_boost", 0)
-            # if check_boost or capture_boost:
-            #     for i, (move, v) in enumerate(visits):
-            #         if rb.gives_check(move):
-            #             visits[i][1] += check_boost
-            #         if rb.is_capture(move):
-            #             visits[i][1] += capture_boost
+            cms = node.get("candidate_moves", {})
+            if not cms:
+                self.next()
+                continue
+
+            visits = [[x['uci'], x['visits']] for x in cms]
+
+            if sum(v[1] for v in visits) < min_visits:
+                self.next()
+                continue
+
+            visited = set(x[0] for x in visits)
+            for move in [l for l in lms if l not in visited]:
+                visited.add(move)
+                visits.append([move, 1])
+
+            visits = sorted(visits, key=lambda x: x[1], reverse=True)
+
+            if is_sf_move and visits[0][0] != move_played:
+                # SF disagrees with Xerces's top move — apply accept rate gate
+                if random.random() > sf_accept_rate:
+                    self.next()
+                    continue
+                # accepted: swap SF move into top slot
+                most_visited = visits[0][0]
+                for v in visits:
+                    if v[0] == move_played:
+                        v[0] = most_visited
+                        break
+                visits[0][0] = move_played
 
             counts = np.array([x[1] for x in visits], dtype=np.float32)
             s = counts.sum()
@@ -1696,11 +1711,11 @@ def post_hoc_worker(run_cfg, batch_games=10, batch_secs=90):
         p.cpu_affinity(cores)
 
     # apply overrides
-    POLL_INTERVAL = run_cfg.post_hoc_poll_interval
-    BLUNDER_CP = run_cfg.post_hoc_blunder_cp
-    ANALYZE_BATCH = run_cfg.post_hoc_analyze_batch
-    DEPTH = run_cfg.post_hoc_depth
-    EQUIV_RANGE = run_cfg.post_hoc_equiv_range
+    POLL_INTERVAL = run_cfg.rescore_poll_interval
+    BLUNDER_CP = run_cfg.rescore_blunder_cp
+    ANALYZE_BATCH = run_cfg.rescore_analyze_batch
+    DEPTH = run_cfg.rescore_depth
+    EQUIV_RANGE = run_cfg.rescore_equiv_range
 
     # also set them in globals so other functions (defined above) see them
     globals().update({

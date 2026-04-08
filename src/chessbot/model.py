@@ -7,7 +7,6 @@ pd.set_option('display.max_columns', None)
 import json
 from pathlib import Path
 
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
 HE = "he_normal"
 BIG_NEG = -1e9
 EPS = 1e-9
@@ -27,8 +26,7 @@ from tensorflow.keras.layers import (
 
 
 def load_model(model_loc):
-    model = keras.models.load_model(model_loc)
-    return model
+    return keras.models.load_model(model_loc, compile=False)
 
 
 def save_model(model, model_loc):
@@ -132,7 +130,7 @@ def make_fwd_batched(model, max_bs=1024, warm_shapes=(256, 512, 1024)):
     return fwd
 
 
-def set_loss_weights(model, loss_weights):
+def set_loss_weights(model, loss_weights, steps_per_execution=1, jit=False):
     # Get a fresh optimizer (same config) to avoid double-wrapping
     opt_candidate = model._default_opt
     if isinstance(opt_candidate, tf.keras.mixed_precision.LossScaleOptimizer):
@@ -144,10 +142,16 @@ def set_loss_weights(model, loss_weights):
     opt_cfg = tf.keras.optimizers.serialize(base_opt)
     opt = tf.keras.optimizers.deserialize(opt_cfg)
 
+    # re-wrap with LossScaleOptimizer when training in mixed float16
+    if tf.keras.mixed_precision.global_policy().name == "mixed_float16":
+        opt = tf.keras.mixed_precision.LossScaleOptimizer(opt)
+
     model.compile(
         optimizer=opt,
         loss=model._default_loss_dict,
-        loss_weights=loss_weights
+        loss_weights=loss_weights,
+        steps_per_execution=steps_per_execution,
+        jit_compile=jit,
     )
     model.loss_weights = loss_weights
     # remember the fresh optimizer for later use
@@ -355,98 +359,48 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(
-    model,
-    max_bs=1024,
-    uniform_eps=0.0,
-    prior_clip_max=1.0,
-    vscale=0.9,
-):
+def make_conv_infer(model, max_bs=1024, vscale=0.9):
     """
-    Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-
-    uniform_eps mixes uniform mass over legal moves:
-        probs = (1 - eps) * probs + eps * uniform_legal
-
-    prior_clip_max caps peaks after mixing (no floor clipping):
-        probs = min(probs, clip_max), then renorm
+    Returns fwd((enc_np, _)) -> (logits_np, val_np).
+    Softmax, uniform_eps, and prior_clip_max are applied in C++ build_priors.
     """
-
-    big_neg = tf.constant(-1e9, dtype=tf.float32)
-    eps_small = tf.constant(1e-12, dtype=tf.float32)
-
-    ue = tf.constant(float(uniform_eps), dtype=tf.float32)
-    ue = tf.clip_by_value(ue, 0.0, 1.0)
-
-    pcm = tf.constant(float(prior_clip_max), dtype=tf.float32)
     value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
 
     @tf.function(input_signature=[
         tf.TensorSpec([None, 64], tf.int32),
-        tf.TensorSpec([None, 4288], tf.int32),
     ], experimental_compile=True)
-    def graph(enc, legal):
+    def graph(enc):
         logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])
-
-        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
-        logits32 = tf.cast(logits, tf.float32)
-
-        masked_logits32 = tf.where(mask > 0.5, logits32, big_neg)
-
-        row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
-        exp = tf.exp(masked_logits32 - row_max) * mask
-        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
-
-        has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + eps_small), tf.zeros_like(exp))
-
-        if uniform_eps != 0.0:
-            legal_sum = tf.reduce_sum(mask, axis=1, keepdims=True)
-            uni = tf.where(
-                legal_sum > 0.0,
-                mask / (legal_sum + eps_small),
-                tf.zeros_like(mask),
-            )
-            probs = (1.0 - ue) * probs + ue * uni
-
-        if prior_clip_max < 1.0:
-            probs = tf.minimum(probs, pcm) * mask
-
-        s = tf.reduce_sum(probs, axis=1, keepdims=True)
-        probs = tf.where(s > eps_small, probs / (s + eps_small),
-                         tf.zeros_like(probs))
-
+        logits = tf.cast(tf.reshape(logits, [tf.shape(logits)[0], -1]), tf.float32)
         value_f = tf.cast(value, tf.float32) * value_scale_c
-        return probs, value_f
+        return logits, value_f
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):
-            raise ValueError("pass (enc_np, legal_np) tuple")
-        enc_np, legal_np = pair
+            raise ValueError("pass (enc_np, ...) tuple")
+        enc_np = pair[0]
         e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
-        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
-        probs_tf, val_tf = graph(e_tf, l_tf)
-        return probs_tf.numpy(), val_tf.numpy()
+        logits_tf, val_tf = graph(e_tf)
+        return logits_tf.numpy(), val_tf.numpy()
 
     if max_bs is None:
         return base_fwd
 
     def fwd(pair):
-        enc_np, legal_np = pair
+        enc_np = pair[0]
         B = int(enc_np.shape[0])
         if B <= max_bs:
-            return base_fwd((enc_np, legal_np))
+            return base_fwd(pair)
 
         parts = None
         i = 0
         while i < B:
             j = min(i + max_bs, B)
-            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]))
+            p_logits, p_val = base_fwd((enc_np[i:j],))
             if parts is None:
-                parts = [p_probs, p_val]
+                parts = [p_logits, p_val]
             else:
-                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
+                parts[0] = np.concatenate([parts[0], p_logits], axis=0)
                 parts[1] = np.concatenate([parts[1], p_val], axis=0)
             i = j
 
@@ -715,3 +669,237 @@ def build_conformer_64x67(
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
 
     return model, opt, loss_weights, loss_dict
+
+
+# ---------------------------------------------------------------------------
+# PyTorch model builders
+# ---------------------------------------------------------------------------
+
+PT_CONFORMER_INTERWEAVED_CFG = {
+    "d_embed": 256,
+    "conv_filters": 256,
+    "conv_blocks": 10,
+    "num_heads": 8,
+    "dropout": 0.05,
+}
+
+PT_TRANSFORMER_16M_CFG = {
+    "d_embed": 384,
+    "transformer_layers": 8,
+    "num_heads": 8,
+    "ff_dim": 1536,
+    "dropout": 0.05,
+}
+
+
+def build_pt_conformer_interweaved(cfg=None):
+    """Interweaved conformer: cb x [MHA -> Conv -> Conv].
+
+    Graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none.
+    LayerNorm before attention pooling in value head.
+    """
+    if cfg is None:
+        cfg = PT_CONFORMER_INTERWEAVED_CFG
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    VOCAB_SIZE = 21
+    SEQ_LEN    = 64
+
+    de = cfg["d_embed"]
+    cf = cfg["conv_filters"]
+    cb = cfg["conv_blocks"]
+    nh = cfg["num_heads"]
+    dr = cfg["dropout"]
+
+    _POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
+
+    def _make_ln2d(ch):
+        class Ln2d(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.ones(ch))
+                self.b = nn.Parameter(torch.zeros(ch))
+            def forward(self, x):
+                c = x - x.mean(1, keepdim=True)
+                return (c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
+                        * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1))
+        return Ln2d()
+
+    def _pt_attn_pool(x_seq, linear):
+        w = torch.softmax(linear(x_seq), dim=1)
+        return (x_seq * w).sum(dim=1)
+
+    class Block(nn.Module):
+        def __init__(self, pos_scale):
+            super().__init__()
+            self.pos_scale = pos_scale
+            self.ln1   = nn.LayerNorm(cf)
+            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.c1    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.lr1   = nn.LeakyReLU(0.01, True)
+            self.c2    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.ln2   = _make_ln2d(cf)
+
+        def forward(self, x, pos):
+            b = x.shape[0]
+            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+            if self.pos_scale != 0.0:
+                s = s + self.pos_scale * pos
+            r = s
+            n = self.ln1(s)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            s = r + self.drop1(h)
+            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
+            r = x
+            h = self.lr1(self.c1(x))
+            h = self.ln2(self.c2(h))
+            return F.leaky_relu(r + h, 0.01)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb    = nn.Embedding(VOCAB_SIZE, de)
+            self.proj   = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
+            self.lnp    = _make_ln2d(cf) if de != cf else None
+            self.pos    = nn.Embedding(SEQ_LEN, cf)
+            self.blocks = nn.ModuleList(
+                [Block(_POS_SCALES.get(i, 0.0)) for i in range(cb)]
+            )
+            self.mix    = nn.Conv2d(cf, cf, 1, bias=False)
+            self.lnm    = _make_ln2d(cf)
+            self.pol    = nn.Conv2d(cf, 67, 1)
+            self.v_ln   = nn.LayerNorm(cf)
+            self.ap     = nn.Linear(cf, 1)
+            self.vfc1   = nn.Linear(cf, 256)
+            self.vfc2   = nn.Linear(256, 128)
+            self.vout   = nn.Linear(128, 1)
+
+        def forward(self, t):
+            b = t.shape[0]
+            x = self.emb(t).reshape(b, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            if self.proj is not None:
+                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            for block in self.blocks:
+                x = block(x, pos)
+            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
+            pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
+            s = x.permute(0, 2, 3, 1).reshape(b, SEQ_LEN, cf)
+            s = self.v_ln(s)
+            v = _pt_attn_pool(s, self.ap)
+            v = F.relu(self.vfc1(v))
+            v = F.relu(self.vfc2(v))
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_transformer_16m(cfg=None):
+    """Pure transformer with steady pos drip (full at layer 0, 0.1 every layer after, 0.2 before heads).
+    Tapered policy head: 256->192->67.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    VOCAB_SIZE = 21
+    SEQ_LEN    = 64
+
+    if cfg is None:
+        cfg = PT_TRANSFORMER_16M_CFG
+
+    de = cfg["d_embed"]
+    tl = cfg["transformer_layers"]
+    nh = cfg["num_heads"]
+    fd = cfg["ff_dim"]
+    dr = cfg["dropout"]
+
+    def _make_ln2d(ch):
+        class Ln2d(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.ones(ch))
+                self.b = nn.Parameter(torch.zeros(ch))
+            def forward(self, x):
+                c = x - x.mean(1, keepdim=True)
+                return (c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
+                        * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1))
+        return Ln2d()
+
+    def _pt_attn_pool(x_seq, linear):
+        w = torch.softmax(linear(x_seq), dim=1)
+        return (x_seq * w).sum(dim=1)
+
+    class TxLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(de)
+            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.ln2   = nn.LayerNorm(de)
+            self.ff1   = nn.Linear(de, fd)
+            self.drop2 = nn.Dropout(dr)
+            self.ff2   = nn.Linear(fd, de)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop1(h)
+            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb      = nn.Embedding(VOCAB_SIZE, de)
+            self.pos      = nn.Embedding(SEQ_LEN, de)
+            self.txs      = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.pol_mix  = nn.Conv2d(de, 256, 1, bias=False)
+            self.pol_ln0  = _make_ln2d(256)
+            self.pol_c1a  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_c1b  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
+            self.pol_ln1  = _make_ln2d(256)
+            self.pol_down = nn.Conv2d(256, 192, 1, bias=False)
+            self.pol_lnd  = _make_ln2d(192)
+            self.pol_c2a  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_c2b  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
+            self.pol_ln2  = _make_ln2d(192)
+            self.pol_out  = nn.Conv2d(192, 67, 1)
+            self.ap       = nn.Linear(de, 1)
+            self.vfc1     = nn.Linear(de, 256)
+            self.vfc2     = nn.Linear(256, 128)
+            self.vout     = nn.Linear(128, 1)
+
+        def forward(self, t):
+            B   = t.shape[0]
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            x   = self.emb(t) + pos
+            for i, tx in enumerate(self.txs):
+                if i > 0:
+                    x = x + 0.1 * pos
+                x = tx(x)
+            v = _pt_attn_pool(x, self.ap)
+            v = F.gelu(self.vfc1(v))
+            v = F.gelu(self.vfc2(v))
+            x = x + 0.2 * pos
+            x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))), 0.01)
+            x = F.leaky_relu(self.pol_lnd(self.pol_down(x)), 0.01)
+            r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
+            pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
+            return pol, torch.tanh(self.vout(v))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+PT_BUILDERS = {
+    "16m-conformer-interweaved": build_pt_conformer_interweaved,
+    "16m-transformer":           build_pt_transformer_16m,
+}

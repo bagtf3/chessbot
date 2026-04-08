@@ -15,7 +15,6 @@ class Batcher(object):
         self.currently_batched_keys = set()
         self.keys = []
         self.boards = []
-        self.legals = []
 
         self.total_seen = 0
         self.duplicate_removed = 0
@@ -30,9 +29,9 @@ class Batcher(object):
                 continue
 
             #self.total_seen += 1
-            # key (hash), board, legal moves
-            k, b, l = item
-            
+            # key (hash), board
+            k, b = item
+
             # no dupes allowed
             if k in self.currently_batched_keys:
                 #self.duplicate_removed += 1
@@ -41,10 +40,9 @@ class Batcher(object):
             self.currently_batched_keys.add(k)
             self.keys.append(k)
             self.boards.append(np.asarray(b, dtype=np.int32))
-            self.legals.append(np.asarray(l, dtype=np.int32))
 
     def pop_batch(self, max_size=None, always_pad=False, never_pad=False):
-        """Pop a batch and return (keys, boards_np, legals_np).
+        """Pop a batch and return (keys, boards_np).
 
         Chooses the candidate batch size that minimizes waste:
         - padding waste when s >= n: s - n
@@ -108,7 +106,6 @@ class Batcher(object):
 
         real_keys = self.keys[:take]
         boards_np = np.stack(self.boards[:take], axis=0)
-        legals_np = np.stack(self.legals[:take], axis=0)
 
         out_keys = list(real_keys)
 
@@ -116,16 +113,13 @@ class Batcher(object):
             out_keys += [KEY_PAD] * pad
             pad_shape = (pad,) + boards_np.shape[1:]
             pad_boards = np.zeros(pad_shape, dtype=boards_np.dtype)
-            pad_legals = np.zeros((pad,) + legals_np.shape[1:], dtype=legals_np.dtype)
             boards_np = np.concatenate([boards_np, pad_boards], axis=0)
-            legals_np = np.concatenate([legals_np, pad_legals], axis=0)
 
         self.currently_batched_keys.difference_update(real_keys)
         self.keys = self.keys[take:]
         self.boards = self.boards[take:]
-        self.legals = self.legals[take:]
 
-        return (out_keys, boards_np, legals_np)
+        return (out_keys, boards_np)
 
 
 class TensorFlowThread(object):
@@ -259,7 +253,7 @@ class TensorFlowThread(object):
                     self.paused_ack_ev.set()
                     continue
 
-                keys, boards_np, legals_np = batch
+                keys, boards_np = batch
 
                 t0 = time.time()
                 with self.infer_lock:
@@ -268,7 +262,7 @@ class TensorFlowThread(object):
                 if infer is None:
                     continue
 
-                probs_np, vals_np = infer((boards_np, legals_np))
+                probs_np, vals_np = infer((boards_np,))
 
                 to_raw_cache = []
                 for i, k in enumerate(keys):

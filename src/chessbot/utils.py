@@ -116,20 +116,6 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         return val, str(best_move), search_depth
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
-with open(uci_path_path, "rb") as f:
-    PATHS = pickle.load(f)
-    
-
-uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
-with open(uci_path_path_mini, "rb") as f:
-    MINI_PATHS = pickle.load(f)
-
-
-pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
-with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
-    PGN_TEXT = f.read()
-
 
 def rnd(x, n):
     return np.round(x, n)
@@ -301,6 +287,82 @@ def stable_softmax(logits):
     return e / (s + 1e-9)
 
 
+def batch_policy_metrics_from_priors(samples, uniform_eps=0.05, clip_max=0.8):
+    """
+    Compute policy metrics from per-position prior dicts and visit lists.
+    samples: list of (nn_priors_dict, visit_list) where
+      nn_priors_dict: {uci: prob}  — raw NN distribution over legal moves
+      visit_list:     [(uci, count)] — post-redistribution MCTS visits
+    Returns same keys as batch_policy_metrics (excluding mass_on_legal).
+    """
+    eps_ll = 1e-12
+    keys = [
+        'policy_ce', 'uniform_ce', 'ce_gain',
+        'exp_prob_model', 'exp_prob_uniform',
+        'top1_exact', 'avg_top_prob',
+        'top1_mass', 'top3_mass', 'top5_mass', 'prob_on_others',
+    ]
+    acc = {k: 0.0 for k in keys}
+    n_valid = 0
+
+    for nn_priors, visits in samples:
+        if not nn_priors or not visits:
+            continue
+        all_ucis = sorted(set(nn_priors.keys()) | {u for u, _ in visits})
+        n = len(all_ucis)
+        if n == 0:
+            continue
+
+        p = np.array([nn_priors.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        p_sum = p.sum()
+        if p_sum <= 0:
+            continue
+        p /= p_sum
+
+        visit_map = {u: float(c) for u, c in visits}
+        v = np.array([visit_map.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        v_sum = v.sum()
+        if v_sum <= 0:
+            continue
+        v /= v_sum
+
+        uniform = np.ones(n, dtype=np.float64) / n
+        labels = uniform_eps * uniform + (1.0 - uniform_eps) * v
+        labels = np.clip(labels, 0.0, clip_max)
+        labels /= labels.sum()
+
+        policy_ce  = -np.sum(labels * np.log(p + eps_ll))
+        uniform_ce = -np.sum(labels * np.log(uniform + eps_ll))
+
+        label_top1 = int(np.argmax(labels))
+        model_top1 = int(np.argmax(p))
+
+        k3 = min(3, n)
+        k5 = min(5, n)
+        top3_idx = np.argpartition(-labels, k3 - 1)[:k3]
+        top5_idx = np.argpartition(-labels, k5 - 1)[:k5]
+
+        support = labels > 0
+        support[label_top1] = False
+
+        acc['policy_ce']        += policy_ce
+        acc['uniform_ce']       += uniform_ce
+        acc['ce_gain']          += uniform_ce - policy_ce
+        acc['exp_prob_model']   += float(np.sum(labels * p))
+        acc['exp_prob_uniform'] += float(np.sum(labels * uniform))
+        acc['top1_exact']       += float(label_top1 == model_top1)
+        acc['avg_top_prob']     += float(p[model_top1])
+        acc['top1_mass']        += float(p[label_top1])
+        acc['top3_mass']        += float(p[top3_idx].sum())
+        acc['top5_mass']        += float(p[top5_idx].sum())
+        acc['prob_on_others']   += float((p * support).sum())
+        n_valid += 1
+
+    if n_valid == 0:
+        return {k: float('nan') for k in keys}
+    return {k: v / n_valid for k, v in acc.items()}
+
+
 def batch_policy_metrics(logits, labels, mask):
     eps = 1e-12
     big_neg = -1e6
@@ -373,14 +435,15 @@ def batch_policy_metrics(logits, labels, mask):
     }
 
 
-def print_validation(epoch, stats):
+def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     eps = 1e-12
 
+    # name_w derived from actual display labels so columns align
     keys = [
-        "val_mse", "val_corr",
-        "policy_ce", "uniform_ce", "ce_gain",
-        "top1_exact", "avg_top_prob",
-        "top1_mass", "prob_on_others"
+        "value_mse", "value_corr",
+        "policy_ce", "uniform_ce",
+        "top1_exact", "avg_top",
+        "top1_mass",  "true ratio",
     ]
     name_w = max(len(k) for k in keys)
     num_w = 8
@@ -388,40 +451,39 @@ def print_validation(epoch, stats):
     def pair(k, v):
         return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
     ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
+    pfx = f"[epoch {epoch:4d}] [validation]"
 
-    print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
+    print(f"{pfx} {pair('value_mse', stats['value_mse'])}  "
           f"{pair('value_corr', stats['value_corr'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
+    print(f"{pfx} {pair('policy_ce', stats['policy_ce'])}  "
           f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
-          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "
+    print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
+          f"{pair('avg_top', stats['avg_top_prob'])}")
+    print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "
           f"{pair('true ratio', ratio)}")
+    if mass_on_legal is not None:
+        cov_str = f" ({mol_coverage:.0%} coverage)" if mol_coverage is not None else ""
+        print(f"{pfx} mass_on_legal (est): {mass_on_legal:.4f}{cov_str}")
 
 
-def score_game_data(model, X, M, Y, epoch, save_path=None):
+def score_game_data(model, X, M, Y, epoch, save_path=None, preds=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
-    preds = model.predict(X, verbose=0, batch_size=128)
-    value_preds = preds[1].ravel()
+    if preds is None:
+        preds = model.predict(X, verbose=0, batch_size=128)
+    value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
-    value_preds = preds[1].ravel()  # (B,)
-    targets = Y['value_out'].ravel()
-    value_mse = np.mean((value_preds - targets) ** 2)
+    y_value = Y['value_out']
+    targets = y_value.ravel()
+
+    value_mse  = np.mean((value_preds - targets) ** 2)
     value_corr = np.corrcoef(value_preds, targets)[0, 1]
-    
-    plt.scatter(targets, value_preds, s=6)
-    plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
-    plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
-    plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target")
-    plt.tight_layout()
+
     if save_path is not None:
-        plt.savefig(save_path)
-        csv_path = os.path.splitext(save_path)[0] + ".csv"
-        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(csv_path, index=False)
-    plt.close()
+        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(
+            save_path, index=False)
 
     policy_logits = preds[0]  # (B,4096)
-    policy_true = Y['policy_logits']
+    policy_true   = Y['policy_logits']
     policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
 
     # build print dict and call the printer
@@ -908,365 +970,6 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     return paths
 
     
-def get_pre_opened_game(index=None, mini=False):
-    b = fastboard()
-    path_list = MINI_PATHS if mini else PATHS
-    if index is None:
-        moves_to_play = random.choice(path_list)
-    else:
-        try:
-            moves_to_play = path_list[index]
-        except:
-            print(
-                f"No premove path found for {index}!",
-                f"please choose 0 - {len(path_list)-1}.",
-                "Selecting random premove path"
-            )
-            moves_to_play = random.choice(path_list)
-
-    for mtp in moves_to_play:
-        b.push_uci(mtp)
-    return b
-
-
-def create_UHO_PGN_game():
-    """
-    Sample a game from PGN_TEXT (already loaded in memory), push mainline moves
-    onto a fastboard(), and return the resulting board.
-
-    index: 0-based game index, or None for random
-    max_plies: cap number of half-moves played (None = all)
-    """
-    UHO_EVENT_START_RE = re.compile(r'(?m)^\[Event "')
-
-    starts = [m.start() for m in UHO_EVENT_START_RE.finditer(PGN_TEXT)]
-    if not starts:
-        raise ValueError("No games found (no [Event at line start).")
-
-    k = random.randrange(len(starts))
-    a = starts[k]
-    b = starts[k + 1] if k + 1 < len(starts) else len(PGN_TEXT)
-    chunk = PGN_TEXT[a:b]
-
-    blank = chunk.find("\n\n")
-    moves_blob = chunk if blank == -1 else chunk[blank + 2:]
-
-    game = chess.pgn.read_game(io.StringIO(moves_blob))
-    if game is None:
-        return fastboard()
-
-    fb = fastboard()
-    n = 0
-    for mv in game.mainline_moves():
-        fb.push_uci(mv.uci())
-        n += 1
-
-    return fb
-
-
-def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
-    """
-    Make a legal endgame-like position with exactly `pieces` total pieces.
-    Pieces are drawn from a bag proportional to a real starting set:
-      per color: 8P, 2N, 2B, 2R, 1Q (plus the king already placed)
-    Constraints:
-      - pawns never on 1st/8th rank for their color
-      - never exceed real caps per piece type per color
-      - board is valid and not immediately game-over
-      - if ensure_move, side to move has at least one legal move
-    """
-    if pieces < 6:
-        raise ValueError("pieces must be >= 6")
-    if pieces > 32:
-        raise ValueError("pieces must be <= 32")
-
-    # Max counts per color, mirroring real chess
-    cap = {
-        chess.PAWN: 8,
-        chess.KNIGHT: 2,
-        chess.BISHOP: 2,
-        chess.ROOK: 2,
-        chess.QUEEN: 1,
-    }
-    
-    if not queens:
-        cap[chess.QUEEN] = 0
-    
-    pool_piece_types = [
-        chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
-    ]
-    colors = [chess.WHITE, chess.BLACK]
-
-    # Squares where pawns are allowed
-    pawn_ok_squares = set([i for i in range(8, 56)])
-
-    # Weighted draw from the remaining bag
-    def draw_piece_type_and_color(rem_white, rem_black):
-        bag = []
-        # fill bag with counts so probability ∝ remaining allowed
-        for pt in pool_piece_types:
-            for _ in range(rem_white[pt]):
-                bag.append((pt, chess.WHITE))
-            for _ in range(rem_black[pt]):
-                bag.append((pt, chess.BLACK))
-        if not bag:
-            return None
-        return random.choice(bag)
-
-    # Place a non-pawn on any empty square; pawn on allowed rank squares
-    def place_piece(board, piece_type, color):
-        empties = [sq for sq in chess.SQUARES if board.piece_at(sq) is None]
-        if not empties:
-            return False
-
-        if piece_type == chess.PAWN:
-            candidates = [sq for sq in empties if sq in pawn_ok_squares]
-        else:
-            candidates = empties
-
-        if not candidates:
-            return False
-
-        sq = random.choice(candidates)
-        board.set_piece_at(sq, chess.Piece(piece_type, color))
-        return True
-
-    # Try until we get a valid, non-terminal position
-    for _ in range(1000):
-        board = chess.Board(None)
-
-        # Kings first (any distinct squares is fine; validity checked later)
-        
-        wk = random.choice(chess.SQUARES) if wk is None else wk
-        while True:
-            bk = random.choice(chess.SQUARES) if bk is None else bk
-            if bk != wk:
-                break
-            # prevents spinning forever
-            bk= None
-
-        board.set_piece_at(wk, chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
-
-        # Remaining counts per color
-        rem_white = dict(cap)
-        rem_black = dict(cap)
-
-        # How many more to place
-        need = pieces - 2
-        ok_build = True
-
-        while need > 0 and ok_build:
-            choice = draw_piece_type_and_color(rem_white, rem_black)
-            if choice is None:
-                ok_build = False
-                break
-
-            pt, color = choice
-            placed = place_piece(board, pt, color)
-            if not placed:
-                # If we failed to place this kind, remove this option once
-                # by temporarily decrementing and continue; if it hits zero
-                # it won't be drawn again.
-                if color == chess.WHITE:
-                    if rem_white[pt] > 0:
-                        rem_white[pt] -= 1
-                else:
-                    if rem_black[pt] > 0:
-                        rem_black[pt] -= 1
-                continue
-
-            # Successful placement consumes from that color's pool
-            if color == chess.WHITE:
-                rem_white[pt] -= 1
-            else:
-                rem_black[pt] -= 1
-            need -= 1
-
-        if not ok_build or need != 0:
-            continue
-
-        # Randomize side to move
-        board.turn = random.choice(colors)
-
-        # Final validity checks
-        if not board.is_valid():
-            # try to flip the turn
-            board.turn = not board.turn
-            if not board.is_valid():
-                continue
-        
-        if board.is_game_over():
-            continue
-        if board.legal_moves.count() == 0:
-            continue
-        
-        return fastboard(board.fen()) if pyfast else board
-    
-    #if we made it here, it couldnt work
-    print("Unable to find valid board. Loosening requirements...")
-    next_pieces = max(6, pieces-1)
-    return random_board_setup(next_pieces, wk=None, bk=None, queens=False, pyfast=pyfast)
-
-
-def make_piece_odds_board():
-    b = chess.Board()
-    meta = {"scenario": "piece_odds", "removed": {"white": [], "black": []}}
-
-    remove_from = random.choice([chess.WHITE, chess.BLACK])
-    removable = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
-    to_remove = random.choice(removable)
-    need_to_remove = np.random.randint(1, 4) if to_remove == chess.PAWN else 1
-
-    color_str = "white" if remove_from == chess.WHITE else "black"
-
-    for _ in range(need_to_remove):
-        # recompute candidates fresh each time (so we never hit an empty square)
-        pool = [sq for sq, pc in b.piece_map().items()
-                if pc.color == remove_from and pc.piece_type == to_remove]
-        if not pool:
-            break  # nothing left of this type/color. bail
-
-        sq = random.choice(pool)
-        pc = b.remove_piece_at(sq)
-        meta["removed"][color_str].append(pc.symbol())
-
-    return fastboard(b.fen()), meta
-
-
-def random_backrow_fen():
-    pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
-
-    # shuffle to get a random white backrank
-    random.shuffle(pieces)
-    white_back = "".join(pieces)
-
-    random.shuffle(pieces)
-    black_back = "".join(pieces).lower()
-
-    # pawns and empty ranks standard; castling field '-' disables castling
-    fen = f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
-    return fen
-
-
-def make_piece_training_board():
-    fens = {
-        "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
-        "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
-        "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1',
-        "random_backrow": random_backrow_fen()
-    }
-    
-    pick = random.choice(list(fens.keys()))
-    board = chess.Board(fens[pick])
-    if np.random.uniform() < 0.5:
-        board = board.mirror()
-    return fastboard(board.fen()), {"scenario": f"pt_{pick}"}
-        
-
-class UhoPgnSampler:
-    def __init__(self, pgn_text):
-        self.pgn_text = pgn_text
-        self.uho_event_start_re = re.compile(r'(?m)^\[Event "')
-        self.starts = [
-            m.start()
-            for m in self.uho_event_start_re.finditer(pgn_text)
-        ]
-        if not self.starts:
-            raise ValueError("No games found (no [Event at line start).")
-
-    def sample_fastboard(self):
-        k = random.randrange(len(self.starts))
-        a = self.starts[k]
-        b = self.starts[k + 1] if k + 1 < len(self.starts) else len(self.pgn_text)
-        chunk = self.pgn_text[a:b]
-
-        blank = chunk.find("\n\n")
-        moves_blob = chunk if blank == -1 else chunk[blank + 2:]
-
-        game = chess.pgn.read_game(io.StringIO(moves_blob))
-        if game is None:
-            return fastboard()
-
-        fb = fastboard()
-        for mv in game.mainline_moves():
-            fb.push_uci(mv.uci())
-
-        return fb
-
-
-class GameGenerator(object):
-    """ Curriculum game generator """
-    def __init__(self, cfg):
-        self.config = cfg
-        self.game_types = list(self.config.game_probs.keys())
-
-        self.uho_sampler = None
-        if "UHO" in self.game_types:
-            self.uho_sampler = UhoPgnSampler(PGN_TEXT)
-
-    def new_board(self, game_type=None):
-        if game_type is not None and game_type not in self.game_types:
-            raise ValueError(
-                f"Unknown game type {game_type}. "
-                f"Pick one of {self.game_types}"
-            )
-
-        if game_type is None:
-            types, probs = zip(*self.config.game_probs.items())
-            game_type = random.choices(types, weights=probs, k=1)[0]
-
-        if game_type == "pre_opened":
-            board = get_pre_opened_game()
-            meta = {"scenario": "pre_opened"}
-
-        elif game_type == "pre_opened_mini":
-            board = get_pre_opened_game(mini=True)
-            meta = {"scenario": "pre_opened_mini"}
-
-        elif game_type == "UHO":
-            board = self.uho_sampler.sample_fastboard()
-            meta = {"scenario": "UHO"}
-
-        elif game_type == "random_init":
-            plies = 2 * np.random.randint(1, 5)
-            board = random_init(plies)
-            meta = {"scenario": "random_init", "start_plies": plies}
-
-        elif game_type == "random_middle_game":
-            plies = np.random.randint(20, 31)
-            board = random_init(plies)
-            meta = {"scenario": "random_middle_game", "start_plies": plies}
-
-        elif game_type == "random_endgame":
-            pieces = np.random.randint(8, 14)
-            wk = np.random.randint(0, 33)
-            bk = np.random.randint(33, 64)
-            board = random_board_setup(pieces, wk, bk, queens=False)
-            meta = {"scenario": "random_endgame", "pieces": pieces}
-
-        elif game_type == "piece_odds":
-            board, meta = make_piece_odds_board()
-
-        elif game_type == "piece_training":
-            board, meta = make_piece_training_board()
-            meta["scenario"] = "piece_training"
-
-        elif game_type == "startpos":
-            board = fastboard()
-            meta = {"scenario": "startpos"}
-
-        else:
-            raise ValueError(f"unhandled game_type {game_type}")
-
-        if board.legal_moves():
-            return board, meta
-
-        return self.new_board(game_type=game_type)
-
-
 def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
     def _score_pov_cp(pov_score, white_to_move, mate_cp):
         s = pov_score.white() if white_to_move else pov_score.black()

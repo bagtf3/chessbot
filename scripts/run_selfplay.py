@@ -11,19 +11,25 @@ import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import Rescorer, launch_retrain_async, poll_retrain, reclaim_vram
+from chessbot.rescore import (
+    Rescorer, SFRescoreThread, SFCache,
+    launch_retrain_async, poll_retrain, reclaim_vram,
+)
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
+from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 
+import pickle
 import signal
 import threading
+import queue
 
 STOP_REQUESTED = threading.Event()
-PROCESS_TIME = 30.0
-MAX_BACKLOG = 200
-_now = time.time
+
+MAX_BACKLOG = 250
+GAME_QUEUE_MIN = 36  # top up when central queue drops below this
 
 
 def request_stop(signum=None, frame=None):
@@ -59,7 +65,7 @@ def make_parent_queues():
     return recent_q, telemetry_q
 
 
-def spawn_workers(cfg, recent_q, telemetry_q):
+def spawn_workers(cfg, recent_q, telemetry_q, game_queue, sf_queue=None):
     ctx = mp.get_context()
     procs = []
 
@@ -67,15 +73,19 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     for i in range(n_workers):
         c = cfg.copy()
         c.id = f"w{i}"
-        if not cfg.is_validation_run and i > 1:
-            c.play_vs_sf_prob = 0.0
 
         stop_ev = ctx.Event()
         msg_q = ctx.Queue()
 
+        # worker 0 gets the sf_queue; all others do pure selfplay
+        worker_sf_q = None
+        if i == 0:
+            worker_sf_q = sf_queue
+
         p = ctx.Process(
             target=child_looper,
-            args=(c, stop_ev, recent_q, telemetry_q, msg_q),
+            args=(c, stop_ev, recent_q, telemetry_q, msg_q, game_queue, worker_sf_q),
+            daemon=True,
         )
         p.start()
 
@@ -92,9 +102,29 @@ def spawn_workers(cfg, recent_q, telemetry_q):
     return procs
 
 
-def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q):
-    with init_selfplay(cfg, recent_games_q, telemetry_q, msg_q) as looper:
+def child_looper(
+    cfg,
+    stop_ev,
+    recent_games_q,
+    telemetry_q,
+    msg_q,
+    game_queue,
+    sf_queue=None,
+):
+    with init_selfplay(
+        cfg, recent_games_q, telemetry_q, msg_q,
+        game_queue=game_queue, sf_queue=sf_queue,
+    ) as looper:
         looper.run(stop_ev)
+
+
+def top_up_queues(game_queue, sf_queue, game_gen, target=GAME_QUEUE_MIN * 2):
+    while game_queue.qsize() + sf_queue.qsize() < target:
+        spec = game_gen.next_game()
+        if spec.meta.get("vs_stockfish"):
+            sf_queue.put(spec)
+        else:
+            game_queue.put(spec)
 
 
 def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
@@ -234,38 +264,11 @@ def reclaim_vram_worker(mb):
     reclaim_vram(mb)
 
 
-def launch_retrain(run_tag, working_cfg):
+def launch_retrain(run_tag, working_cfg, epoch=0):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
-
-    # need to try to pull back GPU VRAM for training
-    ctx = mp.get_context("spawn")
-    success = []
-    stop = False
-    for mb in [500, 1000, 2000, 4000, 6000]:
-        if stop:
-            break
-
-        for attempt in range(2):
-            p = ctx.Process(target=reclaim_vram_worker, args=(mb,))
-            p.start()
-            p.join()
-            ok = (p.exitcode == 0)
-
-            if ok:
-                success.append(mb)
-                break
-
-            if not ok and attempt > 0:
-                print(f"[reclaim_vram] failed {mb} MB, stopping reclaim")
-                stop = True
-                break
-    
-    if success:
-        print(f"[reclaim vram] ok levels: {success}")
-
-    return launch_retrain_async(run_tag, rt_script, working_cfg)
+    return launch_retrain_async(run_tag, rt_script, working_cfg, epoch=epoch)
 
 
 def pull_pkl(to_process):
@@ -280,9 +283,31 @@ def main(run_tag):
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
-    # init the rescorer
-    rescorer = Rescorer(base_cfg)
+
+    # init the async SF worker(s) and rescorer
+    req_q = queue.Queue()
+    res_q = queue.Queue()
+    sf_rescore_threads = [
+        SFRescoreThread(req_q, res_q, base_cfg)
+        for _ in range(max(1, base_cfg.rescore_n_sf_threads))
+    ]
+    for t in sf_rescore_threads:
+        t.start()
+    cache = SFCache(
+        eviction_window=base_cfg.rescore_eviction_window,
+        max_size=base_cfg.rescore_cache_size,
+    )
+    rescorer = Rescorer(base_cfg, req_q, res_q, cache)
     finished_games = rescorer.get_unprocessed()
+
+    # load any previously saved untrained samples
+    remaining_pkl = os.path.join(base_cfg.run_dir, "remaining_untrained.pkl")
+    if os.path.exists(remaining_pkl):
+        with open(remaining_pkl, "rb") as f:
+            rescorer.training_data = pickle.load(f)
+        os.remove(remaining_pkl)
+        n_loaded = len(rescorer.training_data)
+        print(f"[main] loaded {n_loaded} samples from remaining_untrained.pkl")
 
     # infer n_retrains
     if os.path.exists(base_cfg.progress_csv_path):
@@ -297,6 +322,9 @@ def main(run_tag):
     procs = []
     recent_q = None
     telemetry_q = None
+    game_queue = None
+    sf_queue = None
+    game_gen = None
     retrain = None
     total_games = 0
     try:    
@@ -329,7 +357,30 @@ def main(run_tag):
             # update the rescorer config
             rescorer.config = working_cfg
             recent_q, telemetry_q = make_parent_queues()
-            procs = spawn_workers(working_cfg, recent_q, telemetry_q)
+
+            ctx = mp.get_context()
+            game_gen = GameGenerator(working_cfg)
+
+            if is_validation:
+                game_queue = ctx.Queue()
+                sf_queue = None
+                for spec in game_gen.validation_games():
+                    game_queue.put(spec)
+                procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
+            else:
+                game_queue = ctx.Queue()
+                sf_queue = ctx.Queue()
+                n_workers = max(1, working_cfg.n_workers)
+                initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
+                top_up_queues(game_queue, sf_queue, game_gen, target=initial_target)
+                procs = spawn_workers(
+                    working_cfg, recent_q, telemetry_q, game_queue, sf_queue
+                )
+
+            sf_worker_msg_q = procs[0]['msg_q'] if procs and not is_validation else None
+            sf_worker_bonus = 0
+            sf_last_idle_bump = -100
+            main_loop_iter = 0
 
             # infer n_retrains
             if os.path.exists(working_cfg.progress_csv_path):
@@ -352,6 +403,10 @@ def main(run_tag):
                 if not procs and len(finished_games) < MAX_BACKLOG:
                     break
 
+                # top up queues if running low (training rounds only)
+                if not is_validation and game_queue.qsize() + sf_queue.qsize() < GAME_QUEUE_MIN:
+                    top_up_queues(game_queue, sf_queue, game_gen)
+
                 # check telemetry
                 msgs = drain_queue(telemetry_q)
                 for msg in msgs:
@@ -366,63 +421,113 @@ def main(run_tag):
                 
                 recorder.maybe_log_results()
 
-                process_start = time.time()
-                # process games for a little bit then keep checking
-                while time.time() < process_start + PROCESS_TIME:
-                    if not len(finished_games):
-                        time.sleep(2.0)
-                        break
-                    
+                # submit all pending games and tick the rescorer pipeline
+                while finished_games:
                     to_process = finished_games.popleft()
-                    pkl_file = pull_pkl(to_process)
-                    
-                    rescorer.analyze_and_rescore(pkl_file)
-                    recorder.training_queue = len(rescorer.training_data)
+                    rescorer.submit(pull_pkl(to_process))
+                rescorer.tick()
+                main_loop_iter += 1
+
+                # drain blunder replays onto sf_queue
+                if sf_queue is not None and sf_worker_msg_q is not None:
+                    while rescorer.blunder_replay_specs:
+                        spec_data = rescorer.blunder_replay_specs.pop(0)
+                        meta = {
+                            'scenario': 'blunder_replay',
+                            'vs_stockfish': True,
+                            'stockfish_is_white': spec_data['stockfish_is_white']
+                        }
+
+                        game_spec_cfg = resolve_cfg(working_cfg)
+                        game_spec_cfg.sample_moves = False
+                        game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
+                        
+                        sf_queue.put(GameSpec(
+                            fen=spec_data['fen'], moves=spec_data['moves'],
+                            meta=meta, cfg=game_spec_cfg
+                        ))
+
+                        if sf_worker_bonus < working_cfg.blunder_replay_max_bonus:
+                            sf_worker_msg_q.put({"cmd": "add_games", "n": 1})
+                            sf_worker_bonus += 1
+
+                    # bump SF worker if queue drained while >100 games remain in round
+                    round_target = working_cfg.n_games * max(1, working_cfg.n_workers)
+                    games_remaining = round_target - recorder.games_finished
+                    if (games_remaining > 100
+                            and main_loop_iter - sf_last_idle_bump >= 60
+                            and sf_queue.qsize() == 0):
+                        
+                        sf_worker = next((w for w in procs if w['id'] == 'w0'), None)
+                        if sf_worker and sf_worker['p'].is_alive():
+                            n_add = min(10, working_cfg.blunder_replay_max_bonus - sf_worker_bonus)
+                            sf_worker_msg_q.put({"cmd": "add_games", "n": n_add})
+                            sf_worker_bonus += n_add
+                            sf_last_idle_bump = main_loop_iter
+
+                recorder.training_queue = rescorer.training_data_size
 
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
-                    # pause workers
-                    for p in procs:
-                        p["msg_q"].put("pause")
-                    
-                    # sample and write training data, update training_queue for logging
+                    # drain so write gets accurate data; workers keep playing meanwhile
                     rescorer.write_training_data_pkl(
                         size=working_cfg.retrain_size, randomize=True)
+                    recorder.training_queue = rescorer.training_data_size
 
-                    recorder.training_queue = len(rescorer.training_data)
+                    # pause workers before reclaim + launch
+                    for p in procs:
+                        p["msg_q"].put("pause")
 
                     if retrain is None:
-                        retrain = launch_retrain(run_tag, working_cfg)
+                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
                         rescorer.reset_writer()
-                    
+
                     while retrain is not None:
                         done, rc = poll_retrain(retrain, print_output=True)
                         if done:
                             retrain = None
                             recorder.n_retrains += 1
-                        
-                        # can still process games during retraining
-                        if len(finished_games):
+                            rescorer.aggregate_metrics(
+                                n_retrains, working_cfg.vscale,
+                                working_cfg.progress_csv_path)
+                            n_retrains += 1
+
+                        # keep submitting games while waiting on retrain
+                        pulled_games = drain_queue(recent_q)
+                        for game in pulled_games:
+                            recorder.ingest_recents(game)
+                            update_game_index(game['meta'], base_cfg)
+                            finished_games.append(game)
+                        while finished_games:
                             to_process = finished_games.popleft()
-                            pkl_file = pull_pkl(to_process)
-                            rescorer.analyze_and_rescore(pkl_file)
-                            recorder.training_queue = len(rescorer.training_data)
-                        
-                        else:
-                            time.sleep(0.05)
-                    
+                            rescorer.submit(pull_pkl(to_process))
+                        rescorer.tick()
+
+                        time.sleep(0.05)
+
                     # unpause workers
                     for p in procs:
                         p["msg_q"].put("unpause")
+
+                else:
+                    time.sleep(0.5)
             
             # when done, close the queues
             procs = shutdown_round(procs, recent_q, telemetry_q)
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
-            
+
+            for q in (game_queue, sf_queue):
+                if q is not None:
+                    q.cancel_join_thread()
+                    q.close()
+
             procs = []
             recent_q = None
             telemetry_q = None
+            game_queue = None
+            sf_queue = None
+            game_gen = None
 
             # selfplay round report
             recorder.maybe_log_results(force=True)
@@ -435,6 +540,7 @@ def main(run_tag):
                 continue
 
         # capture the return situation
+        rescorer.tick()
         rescorer.push_analyzed(report=True)
         rescorer.close()
         alive = mp.active_children()
@@ -448,9 +554,26 @@ def main(run_tag):
     
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
+        rescorer.tick()
         rescorer.push_analyzed(report=True)
-        rescorer.write_training_data_pkl(size=9999999, randomize=False)
+        for t in sf_rescore_threads:
+            t.close()
+        if rescorer.training_data:
+            remaining_pkl = os.path.join(
+                base_cfg.run_dir, "remaining_untrained.pkl"
+            )
+            with open(remaining_pkl, "wb") as f:
+                pickle.dump(rescorer.training_data, f)
+            n_saved = len(rescorer.training_data)
+            print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
         rescorer.close()
+        for q in (game_queue, sf_queue):
+            if q is not None:
+                try:
+                    q.cancel_join_thread()
+                    q.close()
+                except Exception:
+                    pass
         shutdown_round(procs, recent_q, telemetry_q)
 
 

@@ -1,7 +1,8 @@
 from chessbot import MODEL_DIR, SF_LOC
 
 from chessbot.utils import sf_eval, random_init, format_time
-from chessbot.utils import GameGenerator, batch_policy_metrics, print_validation
+from chessbot.utils import batch_policy_metrics, print_validation
+from chessbot.game_utils import GameGenerator
 
 from chessbot.review import make_fake_visits
 import chess, chess.engine

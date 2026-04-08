@@ -12,23 +12,23 @@ from chessbot import ENDGAME_LOC
 from chessbot.review import score_to_value_stm_pov
 from chessbot.utils import rnd
 import chessbot.utils as cbu
-from collections import defaultdict
+from collections import namedtuple
+
+ESCheck = namedtuple('ESCheck', [
+    'sims', 'jsd', 'top_uci', 'second_uci', 'third_uci',
+    'delta_12', 'delta_23', 'visit_dist',
+])
 
 
 class MCTSTree(fasttree):
     def __init__(self, board, cfg):
         self.config = cfg
 
-        # if c_puct is given as a list, pick an option randomly
-        # must be float for c++
-        self.c_puct = float(cbu.maybe_random_from_list(cfg.c_puct))
+        self.c_puct = float(cfg.c_puct)
 
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
         self.sims_ceiling_schedule = {}
-        
-        # ceiling can be a list for varied gameplay
-        self.sims_ceiling = cbu.maybe_random_from_list(cfg.sims_ceiling)
 
         # can also be a dict, interpreted as a sims schedule
         if isinstance(cfg.sims_ceiling, dict):
@@ -40,17 +40,9 @@ class MCTSTree(fasttree):
         else:
             self.sims_ceiling = cfg.sims_ceiling
 
-        # naive early stop/bonus sims based on 1-2 move visit delta
-        # interpret as ratio
-        if cfg.target_delta < 1:
-            self.target_delta = np.floor(cfg.target_delta*self.sims_ceiling)
-
-        # otherwise use number per se
-        else:
-            self.target_delta = int(cfg.target_delta)
-
         self.pruning_factor = cfg.pruning_factor
-        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor)
+        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor,
+                         cfg.uniform_eps, cfg.prior_clip_max)
 
         # bookkeeping
         self.board = board
@@ -68,30 +60,21 @@ class MCTSTree(fasttree):
 
         self.n_moves_played = 0
         self.sims_done_total = 0
-        
-        # root noise
-        self.add_root_noise = cfg.add_root_noise
-        self.root_noise_added = False
 
-        # epsilon may be sampled
-        if self.add_root_noise:
-            self.dirichlet_eps = float(cbu.maybe_random_from_list(cfg.dirichlet_eps))
-        else:
-            self.dirichlet_eps = 0.0
+        # configure C++ tree
+        # explicit casts required — these are passed directly to C++
+        if cfg.add_root_noise:
+            self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
+        self.set_reuse_tree(bool(cfg.reuse_tree))
+        self.set_use_u_attn(bool(cfg.use_u_attn))
 
         # early-stop rolling state
         self._es_last_checked_at = 0
         self._es_tripped = False
         self.sim_stop_reason = ""
 
-        # for early stop
-        self.most_visited = []
-        self.runner_up = []
-        self.visit_delta = []
-
-        self.es_fails = defaultdict(int)
-        self.extension_reasons = defaultdict(int)
-        self.es_times = []
+        self.es_checks = []
+        self.es_jsd_thresh = cfg.es_jsd_thresh
 
     def best(self):
         """
@@ -206,29 +189,17 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
-            
-        # add noise to the root for exploration
-        self.root_noise_added = False
-        self.add_root_dirichlet_noise()
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
-        # sims budget may have been adjusted with bonuses, so reset
         self.set_sim_budget(float(self.sims_ceiling))
 
-        # if a ratio is used, update that
-        if self.config.target_delta < 1:
-            self.target_delta = np.floor(self.config.target_delta*self.sims_ceiling)
-        
-        # check the sims schedule, update if applicapable
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
-        
-        self.most_visited.clear()
-        self.runner_up.clear()
-        self.visit_delta.clear()
+
+        self.es_checks.clear()
 
     def set_new_sims_ceiling(self, n_plies=None):
         if n_plies is None:
@@ -239,212 +210,173 @@ class MCTSTree(fasttree):
             return
         
         self.sims_ceiling = new_ceiling
-        # this updates the c++ tree so e.g. smart pruning knows the new budget
         self.set_sim_budget(float(new_ceiling))
-
-        # if a ratio is used, update that
-        if self.config.target_delta < 1:
-            self.target_delta = np.floor(self.config.target_delta*new_ceiling)
-
-    def needs_root_noise(self, check_sims=False):
-        check = self.add_root_noise and not self.root_noise_added
-        if not check:
-            return False
-
-        if not check_sims:
-            return check
-        # make sure some sims have been completed already
-        return check and (self.sims_completed_this_move > 10)
-
-    def add_root_dirichlet_noise(self):
-        if not self.needs_root_noise():
-            return
-
-        super().add_root_dirichlet_noise(
-            eps=self.dirichlet_eps, alpha=self.config.dirichlet_alpha)
-        
-        self.root_noise_added = True
 
     def get_sim_decision_probs(self):
         # not implemented right now
         return None
 
+    def compute_visit_dist(self):
+        rows = self.root_child_visits()
+        if not rows:
+            return None
+        total = sum(n for _, n in rows)
+        if total <= 0:
+            return None
+        return {uci: n / total for uci, n in rows}
+
+    def js_divergence(self, p, q):
+        """Jensen-Shannon divergence, bounded [0, ln(2)] in nats."""
+        result = 0.0
+        for u in set(p) | set(q):
+            pi = p.get(u, 0.0)
+            qi = q.get(u, 0.0)
+            mi = 0.5 * (pi + qi)
+            if pi > 0:
+                result += 0.5 * pi * np.log(pi / mi)
+            if qi > 0:
+                result += 0.5 * qi * np.log(qi / mi)
+        return result
+
+    def record_es_check(self, details, sims):
+        curr_dist = self.compute_visit_dist()
+        if curr_dist is None:
+            return
+
+        top5 = set(list(curr_dist)[:5])
+        curr_sub = {u: v for u, v in curr_dist.items() if u in top5}
+        curr_sub_total = sum(curr_sub.values())
+        curr_sub = {u: v / curr_sub_total for u, v in curr_sub.items()}
+
+        if not self.es_checks:
+            prior_total = sum(d.prior for d in details)
+            if prior_total > 0:
+                ref = {d.uci: d.prior / prior_total for d in details}
+            else:
+                ref = {d.uci: 1.0 / len(details) for d in details}
+        else:
+            ref = self.es_checks[-1].visit_dist
+
+        ref_sub = {u: v for u, v in ref.items() if u in top5}
+        ref_sub_total = sum(ref_sub.values())
+        if ref_sub_total > 0:
+            ref_sub = {u: v / ref_sub_total for u, v in ref_sub.items()}
+        else:
+            ref_sub = {u: 1.0 / len(top5) for u in top5}
+
+        jsd = self.js_divergence(ref_sub, curr_sub)
+
+        d0 = details[0]
+        d1 = details[1] if len(details) > 1 else None
+        d2 = details[2] if len(details) > 2 else None
+
+        self.es_checks.append(ESCheck(
+            sims=sims,
+            jsd=jsd,
+            top_uci=d0.uci,
+            second_uci=d1.uci if d1 else None,
+            third_uci=d2.uci if d2 else None,
+            delta_12=d0.N - (d1.N if d1 else 0),
+            delta_23=(d1.N if d1 else 0) - (d2.N if d2 else 0),
+            visit_dist=curr_dist,
+        ))
+
+        if len(self.es_checks) > self.config.es_jsd_n_stable + 2:
+            self.es_checks.pop(0)
+
+    def rsc_performance_stop(self, rsc, details):
+        """Rule 1: stop immediately if RSC clearly confirms the top move."""
+        if not rsc or len(rsc) < 2:
+            return True
+
+        d0 = details[0]
+        if max(rsc, key=rsc.get) != d0.uci:
+            return False
+
+        if d0.visit_share < 0.15:
+            return False
+
+        vals = sorted(rsc.values(), reverse=True)
+        if vals[0] - vals[1] < 0.05:
+            return False
+
+        dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
+        if d0.Qdelta_sign < 0.0 and len(dS_dict) >= 3:
+            if d0.uci in sorted(dS_dict, key=dS_dict.get)[:2]:
+                return False
+        
+        return True
+
+    def jsd_convergence_stop(self):
+        """Rule 2: stop if visit distribution has stabilized across n checks."""
+        cfg = self.config
+        n = cfg.es_jsd_n_stable
+
+        if len(self.es_checks) < n:
+            return False
+
+        recent = self.es_checks[-n:]
+
+        if any(c.jsd > self.es_jsd_thresh for c in recent):
+            return False
+
+        if len(set(c.top_uci for c in recent)) > 1:
+            return False
+
+        if recent[-1].delta_12 < cfg.es_jsd_min_delta:
+            return False
+
+        deltas = [c.delta_12 for c in recent]
+        if not all(deltas[i] >= deltas[i-1] for i in range(1, len(deltas))):
+            return False
+        
+        return True
+
     def maybe_early_stop(self):
         if self._es_tripped:
             return True
 
-        # upper limit check
         cfg = self.config
         sims_done = self.sims_completed_this_move
 
-        # if not at the floor, stop here
         if sims_done < cfg.sims_floor:
             return False
-        
-        # upper limit check
-        if sims_done >= cfg.sims_absolute_ceiling:
+
+        if sims_done >= self.sims_ceiling:
             self._es_tripped = True
+            self.sim_stop_reason = "full"
             return True
-        
-        # everything else is gated
+
         if sims_done - self._es_last_checked_at < cfg.es_check_every:
             return False
-        
-        # register this check
+
         self._es_last_checked_at = sims_done
-        
         es_time_start = _now()
 
-        # evenly weighted visits, vs, Q, Qema, dS
         rsc, details = self.robust_selection_criteria(5, 100)
 
-        # would only see this if the tree isnt very far along or is in transition
         if not details or len(details) < 2:
             return False
 
-        # some book keeping
         d0, d1 = details[0], details[1]
-        visits0, visits1 = d0.N, d1.N
-        visit_delta = visits0 - visits1
-
-        self.most_visited.append(d0.uci)
-        self.runner_up.append(d1.uci)
-        self.visit_delta.append(visit_delta)
-        
-        # early stop: if min_delta and most-visited also has best rsc
-        if visit_delta >= cfg.min_delta and cfg.use_robust:
-            if visits0 >= cfg.min_top_visits:
-                if self.should_early_stop(rsc, details):
-                    self._es_tripped = True
-                    self.es_times.append(_now() - es_time_start)
-                    return True
-            else:
-                self.es_fails['min_top_visits_not_met'] += 1
-
-        else:
-            self.es_fails['visit_delta_too_small'] += 1
-        
-        # next check: visit gap criteria
-        curr_budget = self.sim_budget()
-        remaining = max(0, curr_budget - sims_done)
-        stop_condition = min(remaining, self.target_delta)
-
-        # if stopping condition reached, stop unless we have reason to extend
-        stop_triggered = False
-        if visit_delta >= stop_condition:
-            stop_triggered = True
-
-            # check for extensions only if not maxed
-            if curr_budget < cfg.sims_absolute_ceiling:
-                if self.should_extend_sims(rsc, details):
-                    stop_triggered = False
-                    new_ceiling = curr_budget + cfg.es_check_every
-                    new_ceiling = min(cfg.sims_absolute_ceiling, new_ceiling)
-                    self.set_sim_budget(new_ceiling)
-                    self.es_times.append(_now() - es_time_start)
-                    return False
-                
-        # stop here if budget reached and no reason to extend
-        if stop_triggered:
-            self._es_tripped = True
-            self.es_times.append(_now() - es_time_start)
-            return True
-        else:
-            self.extension_reasons['stop_condition_not_met'] += 1
-        
-        # everything else is a no stop
-        self.es_times.append(_now() - es_time_start)
-        return False
-
-    def should_early_stop(self, rsc, details):
-        # if only one move with > 100 visits...
-        if not rsc or len(rsc) < 2:
-            self.es_fails['es_granted'] += 1
-            return True
-            
-        d0 = details[0]
-        best_rsc_uci = max(rsc, key=rsc.get)
-        # best rsc 
-        if best_rsc_uci != d0.uci:
-            self.es_fails['not_best_rsc'] += 1
-            return False
-        
-        # 15% visit_share
-        if d0.visit_share < 0.15:
-            self.es_fails['vs_under_15'] += 1
-            return False
-        
-        # make sure rsc delta and dS are sufficient
-        vals = sorted(rsc.values(), reverse=True)
-        rsc_delta = vals[0] - vals[1]
-        if rsc_delta < 0.05:
-            self.es_fails['rsc_delta_under_05'] += 1
-            return False
-        
-        dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
-        if d0.Qdelta_sign < 0.0 and len(dS_dict) >= 3:
-            worst_dS_uci = sorted(dS_dict, key=dS_dict.get)  # ascending
-            if d0.uci in worst_dS_uci[:2]:
-                self.es_fails['dS_in_bottom_2'] += 1
-                return False
-        
-        # if any move has better visit_share and dS, it might be able to catch or pass
-        vs_dict = {d.uci: d.visit_share for d in details if d.uci in rsc}
-        for uci, visit_share in vs_dict.items():
-            if uci == d0.uci:
-                continue
-            if visit_share > d0.visit_share:
-                if dS_dict[uci] > d0.Qdelta_sign:
-                    self.es_fails['move_with_better_vs_and_dS'] += 1
-                    return False
-        
-        # if here, all checks passed
-        self.es_fails['es_granted'] += 1
-        return True
-
-    def should_extend_sims(self, rsc, details):
-        d0 = details[0]
-        if d0.N < self.config.min_top_visits:
-            self.extension_reasons['min_top_visits_not_met'] += 1
-            return True
-
-        # if the same #2 move has been improving
-        if len(self.runner_up) >= 3:
-            if len(set(self.runner_up[-3:])) == 1:
-                a, b, c = self.visit_delta[-3:]
-                if (c < b) and (b < a):
-                    self.extension_reasons['runner_up_move_trending'] += 1
-                    return True
-        
-        # if most visited not in top 2 rsc
-        top2_uci = sorted(rsc, key=rsc.get, reverse=True)[:2]
-        if d0.uci not in top2_uci:
-            self.extension_reasons['not_in_top2_rsc'] += 1
-            return True
-            
-        # if low visit share and another move has better dS    
-        if d0.visit_share < 0.2:
-            for d in details:
-                if d.uci not in rsc or d.uci == d0.uci:
-                    continue
-                
-                if d.Qdelta_sign > d0.Qdelta_sign:
-                    self.extension_reasons['low_vs_and_not_top_dS'] += 1
-                    return True
-        
-        # dont want dS in bottom 
-        d1 = details[1]
         visit_delta = d0.N - d1.N
-        if d0.Qdelta_sign < 0.0 and visit_delta < 500:
-            dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
-            if len(dS_dict) >= 3:
-                worst_dS_uci = sorted(dS_dict, key=dS_dict.get)  # ascending
-                worst_k = 2
-                if d0.uci in worst_dS_uci[:worst_k]:
-                    self.extension_reasons['dS_in_bottom_2'] += 1
-                    return False
+
+        self.record_es_check(details, sims_done)
+
+        # Rule 1: RSC performance stop
+        if cfg.use_robust:
+            if visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
+                if self.rsc_performance_stop(rsc, details):
+                    self._es_tripped = True
+                    self.sim_stop_reason = "rsc"
+                    return True
+
+        # Rule 2: JSD convergence stop
+        if self.jsd_convergence_stop():
+            self._es_tripped = True
+            self.sim_stop_reason = "jsd"
+            return True
         
-        self.extension_reasons['no_extension'] += 1
         return False
 
     def stop_simulating(self):
@@ -499,14 +431,6 @@ class ChessGame(object):
         self.game_id = str(uuid.uuid4())
         self.started_at = _now()
 
-        # we may sample adjudicators to vary gameplay
-        if cfg.sample_adjudicators:
-            cfg = cfg.copy()
-            cfg.use_material_diff = bool(np.random.random() > 0.5)
-            cfg.use_syzygy = bool(np.random.random() > 0.5)
-            cfg.use_eval_draw = bool(np.random.random() > 0.5)
-            cfg.use_eval_collar = bool(np.random.random() > 0.5)
-            
         self.config = cfg
 
         self.board = board
@@ -531,19 +455,11 @@ class ChessGame(object):
         self.outcome = None
         self.plies = 0
         self.sf_eval = None
-        
+
         self.sf_pending = False
         self.sf_ready = False
         self.sf_res_tup = None
         self.tf_last_resolved = 0
-
-        # eval collar and eval draw to shorten selfplay games
-        self.collar_stop_set = False
-        self.collar_stop_eventual_outcome = None
-        if self.config.use_eval_collar:
-            self.next_collar_stop_check = cfg.eval_collar_min_plies
-        else:
-            self.next_collar_stop_check = 999
 
         # set when to start checking for draw by agreement
         if self.config.use_eval_draw:
@@ -622,7 +538,6 @@ class ChessGame(object):
         data['best_Q'] = best_q
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
-
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 
@@ -654,6 +569,12 @@ class ChessGame(object):
         
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv
+
+        nn = self.tree.emulate_nn_result()
+        data["nn_value"] = nn["value"]
+        data["nn_raw_priors"] = nn["raw_priors"]
+        data["nn_mass_on_legal"] = nn["mass_on_legal"]
+
         self.tree_data[self.plies] = data
     
     def make_move_with_stockfish(self, eng):
@@ -692,6 +613,7 @@ class ChessGame(object):
         self.sf_res_tup = None
         self.sf_ready = False
         self.sf_pending = False
+        self.tree.sim_stop_reason = "sf"
         return self.push_move(best_move, "stockfish", None)
 
     def make_move_from_tree(self):
@@ -741,78 +663,9 @@ class ChessGame(object):
         else:
             return True
     
-    def check_for_collar_stop(self, cfg):
-        n_last = cfg.eval_collar_span
-        thresh = cfg.eval_collar_thresh
-
-        # first-time detection of a collar stop candidate
-        if not self.collar_stop_set:
-            if self.plies < self.next_collar_stop_check:
-                return False, None
-
-            # scan newest->oldest. rev_i 0 == newest
-            sign_check = None
-            for rev_i, ex in enumerate(reversed(self.recents[-n_last:])):
-                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
-                best_q = ex[3]
-                # magnitude must meet the lock threshold
-                if abs(best_q) < thresh:
-                    needed = n_last - rev_i
-                    self.next_collar_stop_check = self.plies + needed
-                    return False, None
-
-                # use white-POV signed value here
-                q_white = ex[2]
-                sign = 1*(q_white > 0) - 1*(q_white < 0)
-
-                if sign_check is None:
-                    sign_check = sign
-                elif sign != sign_check:
-                    # mixed signs -> wait until this newest violator is evicted
-                    needed = n_last - rev_i
-                    self.next_collar_stop_check = self.plies + needed
-                    return False, None
-
-            # all checks passed. set collar stop
-            self.collar_stop_set = True
-            self.collar_stop_eventual_outcome = sign_check  # -1 or +1
-            # keep trigger as a positive magnitude for release checks
-            self.collar_stop_trigger = cfg.eval_collar_trigger
-            return False, None
-
-        # already locked, check to see if max game length is approaching
-        elif self.plies >= cfg.max_game_length:
-            return True, self.collar_stop_eventual_outcome
-        
-        # otherwise check to see if a blunder has lowered the score
-        else:
-            check_depth = 3
-            tail = self.recents[-check_depth:]
-
-            for ex in tail:
-                # ex is a tuple: (mv, Q_stm, Q_white, best_q, turn)
-                q_white = ex[2]
-                # positive when leader still ahead
-                sign_stability = self.collar_stop_eventual_outcome * q_white
-
-                # if sign_stability falls below the trigger, we stop and award win
-                if sign_stability < self.collar_stop_trigger:
-                    return True, self.collar_stop_eventual_outcome
-        
-        # no stop detected
-        return False, None
-
     def check_for_terminal(self):
         cfg = self.config
-        # check to see if a collar stop has been set
-        if cfg.use_eval_collar:
-            if self.plies >= cfg.eval_collar_min_plies:
-                collar_stop, outcome = self.check_for_collar_stop(cfg)
-                if collar_stop:
-                    self.outcome = outcome
-                    return True
-        
-        # otherwise look for conventional terminal states
+        # look for conventional terminal states
         reason, result = self.board.is_game_over()
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
@@ -856,11 +709,9 @@ class ChessGame(object):
                 self.outcome = 0.0
                 return True
 
-        # check for overal game_length limit
+        # check for overall game_length limit
         if self.plies > cfg.max_game_length:
             self.outcome = 0.0
-            if self.collar_stop_set:
-                self.outcome = self.collar_stop_eventual_outcome
             return True
         # if we made it here the game is active
         return False

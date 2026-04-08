@@ -19,8 +19,14 @@ class Config(object):
     n_workers = 2
     n_rounds = 51
 
-    # MCTS (float or list)
-    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    # per-game parameter sampling; resolved once per game in the main process.
+    # each entry: param_name: [list of options to pick from].
+    # only 1st-order scalar params are supported (no nested keys).
+    sampleable = {}
+
+    # MCTS
+    c_puct = 2.0
+    use_u_attn = True
 
     use_smart_pruning = True
     pruning_factor = 1.33
@@ -29,15 +35,16 @@ class Config(object):
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    sims_absolute_ceiling = 1600
 
     # early stop
     es_check_every = 100
-    target_delta = 200
     min_top_visits = 300
     min_delta = 100
     use_robust = True
     robust_only_above = 2400
+    es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
+    es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
+    es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop
     
     # Game stuff
     n_games = 128
@@ -46,8 +53,6 @@ class Config(object):
     min_batch = 4
     fwd_batch = 256
 
-    sample_adjudicators = True
-    
     max_game_length = 200
     min_game_length = 5
     use_syzygy = False
@@ -60,35 +65,48 @@ class Config(object):
     eval_draw_thresh = 0.1
     eval_draw_span = 15
 
-    use_eval_collar = True
-    eval_collar_min_plies = 40
-    eval_collar_thresh = 0.75
-    eval_collar_span = 15
-    eval_collar_trigger = 0.3
-    
     play_vs_sf_prob = 0.5
     sf_depth = 10
     sf_config = {"Threads": 1, "Hash": 256}
     sf_exclude = ["piece_training"]
 
-    # overrides for the post hoc worker
-    post_hoc_blunder_cp = 150
-    post_hoc_blunder_cp_loser = 90
-    post_hoc_blunder_cp_winner = 200
-    post_hoc_analyze_batch = 30
-    post_hoc_depth = 12
-    post_hoc_equiv_range = 30
+    # rescoring config
+    rescore_depth = 12
+    rescore_analyze_batch = 30
+    rescore_equiv_range = 25
+    rescore_inaccuracy_cp = 75
+    rescore_blunder_cp_loser = 90
+    rescore_blunder_cp_winner = 200
+    rescore_eviction_window = 500
+    rescore_cache_size = 50000
+    rescore_n_sf_threads = 1
+
+    # blunder replay
+    blunder_replay_min_ply = 20       # only detect blunders after this half-move
+    blunder_replay_max_bonus = 250    # max extra n_games the SF worker can receive
+
+    use_collar_rescoring = False
+    collar_threshold_cp = 300
+    collar_n_consec = 5
+    collar_reset_cp = 50
     train_on_stockfish = True
     train_on_validation = False
+    validation_min_training_depth = 9
+
+    z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
 
     KL_boost_threshold = 1.75
     KL_weight_boost = 1.0
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
-        "random_init": 0.08,
-        "piece_odds": 0.02, "piece_training": 0.01
+        "random_init": 0.08, "piece_odds": 0.02, "piece_training": 0.01
     }
+
+    # game type mix for validation rounds; same format as game_probs.
+    # all games are paired (one as white, one as black) and must be unique positions.
+    # if a type exhausts unique positions, UHO fills the remainder.
+    validation_game_probs = {"UHO": 1.0}
 
     # priors
     uniform_eps = 0.25
@@ -98,6 +116,7 @@ class Config(object):
     add_root_noise = True
     dirichlet_eps = 0.3
     dirichlet_alpha = 0.3
+    reuse_tree = True
     sample_moves = True
     move_sample_temp_range = [0.000001, 1.25]
     
@@ -109,6 +128,13 @@ class Config(object):
     retrain_batch_size = 512
     retrain_size = 10240
     training_queue_buffer = 30720
+
+    # inference / retrain backend selection
+    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt"
+    retrain_backend = "tf"        # "tf" | "pytorch"
+
+    # PyTorch retrain (only used when retrain_backend = "pytorch")
+    pytorch_model_path = ""
 
     def __init__(self):
         self.init_paths()
@@ -138,6 +164,10 @@ class Config(object):
         if 'dummy' not in self.run_dir:
             for d in (self.run_dir, self.game_dir):
                 os.makedirs(d, exist_ok=True)
+
+        # ORT/TRT: fall back to env var if not set explicitly in YAML
+        if self.inference_backend == "ort_trt" and not self.ort_trt_engine_cache_dir:
+            self.ort_trt_engine_cache_dir = os.getenv("TRT_ENGINE_CACHE_DIR", "")
 
         # public flag; keep the old name too for backward compatibility
         self.paths_initialized = True

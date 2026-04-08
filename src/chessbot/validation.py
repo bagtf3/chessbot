@@ -65,8 +65,11 @@ def create_validation_config(cfg, yaml_file=None):
 
     if prev_last is not None:
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
+
+    vcfg.train_on_validation = vcfg.sf_depth >= vcfg.validation_min_training_depth
     
     format_and_print_validation_info(vcfg, prev_last)
+    
     return vcfg
 
 
@@ -262,13 +265,14 @@ def build_validation_summary(looper):
     bumped = False
     action = "none"
 
-    if consec >= 2:
+    dominant = (n >= min_games) and (score > 0.8)
+
+    if dominant or consec >= 2:
         if index < (len(table) - 1):
             bumped = True
-            action = "bumped_depth"
+            action = "bumped_depth_dominant" if dominant else "bumped_depth"
             consec = 0
         else:
-            # at max depth row do not advance
             action = "at_max_depth"
 
     # Do NOT persist the validation config file. Only append history.

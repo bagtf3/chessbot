@@ -239,7 +239,7 @@ class GameLooper(object):
         #batcher = self.batcher
         mbs = cfg.micro_batch
         fwd = cfg.fwd_batch
-        max_fastpath = max(512, int(2.5 * mbs))
+        max_fastpath = max(1024, int(2.5 * mbs))
         mps = self.mps
 
         #(batch size, target), counts returned

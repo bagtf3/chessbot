@@ -83,7 +83,7 @@ class Config(object):
 
     # blunder replay
     blunder_replay_min_ply = 20       # only detect blunders after this half-move
-    blunder_replay_max_bonus = 100    # max extra n_games the SF worker can receive
+    blunder_replay_max_bonus = 250    # max extra n_games the SF worker can receive
 
     use_collar_rescoring = False
     collar_threshold_cp = 300

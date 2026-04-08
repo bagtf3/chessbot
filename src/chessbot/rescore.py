@@ -186,8 +186,9 @@ class Rescorer(object):
         self.written_total = 0
         self.written_this_round = 0
         self.n_saved = 0
-        self.tcpl = 0
-        self.tbmr = 0
+        self.total_cpl_plies = 0.0
+        self.total_bmr_plies = 0.0
+        self.total_plies = 0
 
         self.n_sf_submitted = 0
         self.n_cache_hits = 0
@@ -197,8 +198,10 @@ class Rescorer(object):
         self.sf_compute_count = 0
         self.last_10_cpls = []
         self.last_10_bmrs = []
+        self.last_10_plies = []
 
         self.blunder_replay_specs = []
+        self.blunder_replay_counts = {'winning': 0, 'neutral': 0, 'mismatch': 0}
 
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
@@ -856,11 +859,18 @@ class Rescorer(object):
             cfg.collar_threshold_cp, cfg.collar_n_consec, cfg.collar_reset_cp,
         )
 
-        for list_idx, blundering_side in replayable_blunders:
+        for list_idx, blundering_side, blunder_type in replayable_blunders:
             blunder_ply = eval_trace[list_idx][0]
             sf_is_white = (blundering_side == 'white')
-            if turn_at.get(blunder_ply) != sf_is_white:
-                print("[blunder replay] sf_color does not match STM at this ply")
+            actual_stm_is_white = turn_at.get(blunder_ply)
+            if actual_stm_is_white != sf_is_white:
+                self.blunder_replay_counts['mismatch'] += 1
+                print(
+                    f"[blunder replay] sf_color does not match STM at this ply"
+                    f" | gid={gid} vs_sf={vs_stockfish} game_sf_is_white={sf_color}"
+                    f" blundering_side={blundering_side} blunder_ply={blunder_ply}"
+                    f" actual_stm_is_white={actual_stm_is_white} type={blunder_type}"
+                )
                 continue
             if blunder_ply >= self.config.blunder_replay_min_ply:
                 self.blunder_replay_specs.append({
@@ -869,6 +879,15 @@ class Rescorer(object):
                     'stockfish_is_white': sf_is_white,
                     'source_game_id': gid,
                 })
+                self.blunder_replay_counts[blunder_type] += 1
+                total = sum(self.blunder_replay_counts.values())
+                if total % 50 == 0:
+                    c = self.blunder_replay_counts
+                    print(
+                        f"[blunder replay] tally at {total}:"
+                        f" winning={c['winning']} neutral={c['neutral']}"
+                        f" mismatch={c['mismatch']}"
+                    )
 
         n_diff = 0
         for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), meta in zip(
@@ -1172,31 +1191,35 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b = save_analysis_chunk_simple(run_dir, self.analyzed_results)
-        self.n_saved += 1    
-        self.tcpl += c; self.tbmr += b
+        outp, c, b, plies = save_analysis_chunk_simple(run_dir, self.analyzed_results)
+        self.n_saved += 1
+        self.total_cpl_plies += c * plies
+        self.total_bmr_plies += b * plies
+        self.total_plies += plies
 
-        # update the rolling windows
         self.last_10_cpls.append(c)
         self.last_10_cpls = self.last_10_cpls[-10:]
         self.last_10_bmrs.append(b)
         self.last_10_bmrs = self.last_10_bmrs[-10:]
+        self.last_10_plies.append(plies)
+        self.last_10_plies = self.last_10_plies[-10:]
 
         if report:
             if len(self.last_10_cpls) >= 10:
-                last_10_avg_c = np.mean(self.last_10_cpls)
-                last_10_avg_b = np.mean(self.last_10_bmrs)
+                w = np.array(self.last_10_plies, dtype=np.float64)
+                last_10_avg_c = np.dot(self.last_10_cpls, w) / w.sum()
+                last_10_avg_b = np.dot(self.last_10_bmrs, w) / w.sum()
                 print(
                     f"{RS} {'Last 10 avg:':<16} CPL {last_10_avg_c:.3f}",
                     f"BMR {last_10_avg_b:.3f}"
                 )
 
             if self.n_saved >= 2:
-                cpl_mean = self.tcpl/self.n_saved
-                tmbr_mean = self.tbmr/self.n_saved 
+                cpl_mean = self.total_cpl_plies / self.total_plies
+                bmr_mean = self.total_bmr_plies / self.total_plies
                 print(
                     f"{RS} {'Overall stats:':<16} CPL {cpl_mean:.3f}",
-                    f"BMR {tmbr_mean:.3f}"
+                    f"BMR {bmr_mean:.3f}"
                 )
 
             n_tot = self.games_processed
@@ -1215,10 +1238,9 @@ class Rescorer(object):
             )
             print(
                 f"{RS} SF requests: {self.n_sf_submitted} submitted,"
-                f" {self.n_cache_hits} cache hits,"
-                f" compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
-                f" req_q {self.req_q.qsize()}  pending {len(self.pending)},"
-                f" cache size {cache_stats['size']}"
+                f" {self.n_cache_hits} cache hits, cache size {cache_stats['size']}\n"
+                f"{RS} compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
+                f" req_q {self.req_q.qsize()}  pending {len(self.pending)}"
             )
             self.sf_call_time = 0.0
             self.sf_call_count = 0
@@ -1283,7 +1305,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
                     game_result > 0 if blundering_side == 'black' else game_result < 0
                 )
                 if blunderer_lost:
-                    neutral_blunders.append((i - 1, blundering_side))
+                    neutral_blunders.append((i - 1, blundering_side, 'neutral'))
 
         if collar is None:
             if ev > threshold:
@@ -1318,7 +1340,7 @@ def collar_z_map(eval_trace, game_result, threshold, n_consec, reset_cp):
             if broken:
                 # first, check if replayable based on collar holder and prev eval
                 if collar_set_by_eventual_loser and abs(evals[i-1]) > threshold:
-                    replayable_blunders.append((i - 1, collar))
+                    replayable_blunders.append((i - 1, collar, 'winning'))
 
                 # then continue collar logic
                 segment_start = i
@@ -1590,7 +1612,8 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
-    
+    plies = len(df_all)
+
     print(f"{RS} Saving {len(batch)} analyzed games")
     print(f"{RS} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f}")
 
@@ -1600,7 +1623,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr
+    return outp, cpl, bmr, plies
 
 
 def make_fake_visits(mv, lms, ratio_best=60):

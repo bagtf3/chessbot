@@ -705,6 +705,8 @@ class Rescorer(object):
         gid = game_state['gid']
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
+        vs_stockfish = game_data.get('vs_stockfish', False)
+        sf_color = game_data.get('stockfish_is_white')
 
         KL_coef = cfg.KL_weight_boost
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)

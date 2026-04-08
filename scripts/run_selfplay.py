@@ -440,7 +440,8 @@ def main(run_tag):
 
                         game_spec_cfg = resolve_cfg(working_cfg)
                         game_spec_cfg.sample_moves = False
-
+                        game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
+                        
                         sf_queue.put(GameSpec(
                             fen=spec_data['fen'], moves=spec_data['moves'],
                             meta=meta, cfg=game_spec_cfg

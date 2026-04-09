@@ -867,12 +867,6 @@ class Rescorer(object):
             actual_stm_is_white = turn_at.get(blunder_ply)
             if actual_stm_is_white != sf_is_white:
                 self.blunder_replay_counts['mismatch'] += 1
-                print(
-                    f"[blunder replay] sf_color does not match STM at this ply"
-                    f" | gid={gid} vs_sf={vs_stockfish} game_sf_is_white={sf_color}"
-                    f" blundering_side={blundering_side} blunder_ply={blunder_ply}"
-                    f" actual_stm_is_white={actual_stm_is_white} type={blunder_type}"
-                )
                 continue
             if blunder_ply >= self.config.blunder_replay_min_ply:
                 self.blunder_replay_specs.append({

@@ -1923,6 +1923,8 @@ class RecordKeeper(object):
 
         self.sims_done_total = 0
         self.total_plies = 0
+        self.mcts_sims_total = 0
+        self.mcts_plies_total = 0
         self.games_finished = 0
         self.white_wins = 0
         self.black_wins = 0
@@ -1938,6 +1940,8 @@ class RecordKeeper(object):
         self.games_finished += 1
         self.total_plies += meta['plies']
         self.sims_done_total += meta['sims_done_total']
+        self.mcts_sims_total += meta['mcts_sims_total']
+        self.mcts_plies_total += meta['mcts_plies']
 
         if meta['result'] > 0:
             self.white_wins += 1
@@ -2103,9 +2107,8 @@ class RecordKeeper(object):
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
         right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
-        sims = self.sims_done_total
-        moves = self.total_plies
-        sims_per_move = sims / moves if moves > 0 else 0.0
+        m = self.mcts_plies_total
+        sims_per_move = self.mcts_sims_total / m if m > 0 else 0.0
 
         n_active = summed["n_active"]
         avg_ply = avged["avg_ply"]

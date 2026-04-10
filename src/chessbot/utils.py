@@ -529,6 +529,13 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         else:
             epoch = len(df)
 
+    def mask_top_outliers(raw, ma, n=4):
+        dist = np.abs(raw.astype(float) - ma.astype(float))
+        idx = np.argsort(dist)[-n:]
+        out = raw.copy().astype(float)
+        out[idx] = np.nan
+        return out
+
     hide_first = 10
     if epoch < 12:
         return
@@ -552,7 +559,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
     raw_seg = raw[start:] if raw.size else np.array([])
     if raw_seg.size:
-        ax.plot(xs, raw_seg, label="policy_ce", alpha=0.6, lw=1)
+        ax.plot(xs, mask_top_outliers(raw_seg, ma), label="policy_ce", alpha=0.6, lw=1)
     if ma.size:
         ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
     ax.set_title("policy CE (nats)")
@@ -564,7 +571,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
     raw_seg = raw[start:] if raw.size else np.array([])
     if raw_seg.size:
-        ax.plot(xs, raw_seg, label="ce_gain", alpha=0.6, lw=1)
+        ax.plot(xs, mask_top_outliers(raw_seg, ma), label="ce_gain", alpha=0.6, lw=1)
     if ma.size:
         ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
     ax.set_title("CE gain vs uniform")
@@ -576,7 +583,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
     raw_seg = raw[start:] if raw.size else np.array([])
     if raw_seg.size:
-        ax.plot(xs, raw_seg, label="mse", alpha=0.6, lw=1)
+        ax.plot(xs, mask_top_outliers(raw_seg, ma), label="mse", alpha=0.6, lw=1)
     if ma.size:
         ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
     ax.set_title("value MSE")
@@ -588,7 +595,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
     raw_seg = raw[start:] if raw.size else np.array([])
     if raw_seg.size:
-        ax.plot(xs, raw_seg, label="corr", alpha=0.6, lw=1)
+        ax.plot(xs, mask_top_outliers(raw_seg, ma), label="corr", alpha=0.6, lw=1)
     if ma.size:
         ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
     ax.set_title("value corr")
@@ -629,8 +636,8 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         ax.set_axis_off()
     else:
         x = np.arange(len(mol))
-        ax.plot(x, mol, label="mass_on_legal", alpha=0.6, lw=1)
         ma_mol = moving_average_pd(np.array(mol), window=ma_window)
+        ax.plot(x, mask_top_outliers(np.array(mol), ma_mol), label="mass_on_legal", alpha=0.6, lw=1)
         ax.plot(x, ma_mol, lw=2, alpha=0.7, label=f"MA{ma_window}")
         ax.set_title("mass_on_legal")
         ax.legend(fontsize=8)

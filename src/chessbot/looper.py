@@ -485,6 +485,8 @@ class GameLooper(object):
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,
             "sims_done_total": sims_total,
+            "mcts_sims_total": game.mcts_sims_total,
+            "mcts_plies": game.mcts_plies,
             "start_fen": game.starting_fen,
             "adjudication_index": adjudication_index,
             "c_puct": cfg.c_puct,

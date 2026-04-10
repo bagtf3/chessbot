@@ -454,6 +454,8 @@ class ChessGame(object):
         self.mat_adv_counter = 0
         self.outcome = None
         self.plies = 0
+        self.mcts_sims_total = 0
+        self.mcts_plies = 0
         self.sf_eval = None
 
         self.sf_pending = False
@@ -477,6 +479,10 @@ class ChessGame(object):
     def push_move(self, mv, method, xc0_move):
         # collect search data then push and update
         self.collect_tree_search_data(mv, method, xc0_move)
+
+        if method != "stockfish":
+            self.mcts_sims_total += self.tree.sims_completed_this_move
+            self.mcts_plies += 1
 
         # advance tree (pushes move) and reset
         self.tree.advance(self.board, mv)

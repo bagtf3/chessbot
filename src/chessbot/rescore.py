@@ -1330,7 +1330,9 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply):
                 # first, check if replayable based on collar holder and prev eval
                 if plies[i] >= replay_min_ply:
                     if collar_set_by_eventual_loser and abs(evals[i-1]) > threshold:
-                        replayable_blunders.append((plies[i-1], 'winning', collar == 'white'))
+                        replayable_blunders.append(
+                            (plies[i-1], 'winning', collar == 'white')
+                        )
 
                 # then continue collar logic
                 segment_start = i

@@ -529,7 +529,9 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
         else:
             epoch = len(df)
 
-    def mask_top_outliers(raw, ma, n=4):
+    def mask_top_outliers(raw, ma, n=None):
+        if n is None:
+            n = min(4, len(raw) // 100)
         dist = np.abs(raw.astype(float) - ma.astype(float))
         idx = np.argsort(dist)[-n:]
         out = raw.copy().astype(float)

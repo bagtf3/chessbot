@@ -712,8 +712,8 @@ class Rescorer(object):
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         EQUIV = cfg.rescore_equiv_range
 
-        cpl_s = cpl_w = cpl_b = 0.0
-        nw = nb = 0
+        cpl_s = 0.0
+        n_plies = 0
         rows = []
         eval_trace = []
         turn_at = {}
@@ -751,12 +751,7 @@ class Rescorer(object):
 
             loss_this = delta
             cpl_s += loss_this
-            if turn:
-                cpl_w += loss_this
-                nw += 1
-            else:
-                cpl_b += loss_this
-                nb += 1
+            n_plies += 1
 
             missed_mate = (best_cp >= 1200) and (played_cp >= 500)
             if missed_mate:
@@ -912,20 +907,12 @@ class Rescorer(object):
         out_df = pd.DataFrame(rows, columns=cols)
         out_df['played_best_move'] = out_df['delta'] <= 0
 
-        mask_w = out_df['stm'] == True
-        mask_b = out_df['stm'] == False
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
-        white_bmr = out_df.loc[mask_w, 'played_best_move'].mean() if mask_w.any() else np.nan
-        black_bmr = out_df.loc[mask_b, 'played_best_move'].mean() if mask_b.any() else np.nan
 
         out = {
-            'plies': nw + nb,
-            'overall_cpl': rnd(cpl_s / (nw + nb), 3) if (nw + nb) else np.nan,
-            'white_cpl': rnd(cpl_w / nw, 3) if nw else np.nan,
-            'black_cpl': rnd(cpl_b / nb, 3) if nb else np.nan,
+            'plies': n_plies,
+            'overall_cpl': rnd(cpl_s / n_plies, 3) if n_plies else np.nan,
             'overall_best_move_rate': overall_bmr,
-            'best_move_rate_white': white_bmr,
-            'best_move_rate_black': black_bmr
         }
 
         for key in ['game_id', 'scenario', 'stockfish_color', 'ts']:
@@ -942,10 +929,8 @@ class Rescorer(object):
             stop_stats[st] = {
                 'n': int(n_st),
                 'cpl': rnd(out_df.loc[mask_st, 'delta'].mean(), 3) if n_st else np.nan,
-                'bmr': (
-                    out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan
-                ),
-                'sims': out_df.loc[mask_st, 'sims'].mean() if n_st else float('nan')
+                'bmr': out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan,
+                'sims': out_df.loc[mask_st, 'sims'].mean() if n_st else np.nan
             }
 
         out['stop_stats'] = stop_stats
@@ -1012,6 +997,7 @@ class Rescorer(object):
         th, tc, tb = rows("overall",  self.total_stop)
         tph = (f"{RS}  {'':<12} |"
                + "".join(f"  {st:<4}({pct(self.total_stop,st):.0%})  |" for st in stops))
+        
         srow = (f"{RS}  {'avg sims':<12} |"
                 + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops))
         print(wh)
@@ -1439,20 +1425,12 @@ def lightweight_summary(results):
     Build the small summary dict you use in combined chunk files.
     'results' is a list of per-game dicts (the merged_results or results).
     """
-    wm = [r.get("white_cpl", np.nan) for r in results]
-    bm = [r.get("black_cpl", np.nan) for r in results]
     om = [r.get("overall_cpl", np.nan) for r in results]
-    wb = [r.get("best_move_rate_white", np.nan) for r in results]
-    bb = [r.get("best_move_rate_black", np.nan) for r in results]
     ob = [r.get("overall_best_move_rate", np.nan) for r in results]
 
     return {
         "games": len(results),
-        "avg_white_mean_cpl": round(safe_mean(wm), 3),
-        "avg_black_mean_cpl": round(safe_mean(bm), 3),
         "avg_overall_mean_cpl": round(safe_mean(om), 3),
-        "avg_best_move_rate_white": round(safe_mean(wb), 3),
-        "avg_best_move_rate_black": round(safe_mean(bb), 3),
         "avg_overall_best_move_rate": round(safe_mean(ob), 3)
     }
 
@@ -1590,11 +1568,7 @@ def save_analysis_chunk_simple(run_dir, batch):
         row = {
             "game_id": analysis_out.get("game_id"),
             "ts": analysis_out.get("ts"),
-            "white_cpl": analysis_out.get("white_cpl"),
-            "black_cpl": analysis_out.get("black_cpl"),
             "overall_cpl": analysis_out.get("overall_cpl"),
-            "best_move_rate_white": analysis_out.get("best_move_rate_white"),
-            "best_move_rate_black": analysis_out.get("best_move_rate_black"),
             "overall_best_move_rate": analysis_out.get("overall_best_move_rate")
         }
         results.append(row)

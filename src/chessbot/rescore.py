@@ -1285,16 +1285,8 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
     collar_set_by_non_winner = False
     neutral_position = False
     neutral_count = 0
-    debug_rows = []
 
     for i, ev in enumerate(evals):
-        still_neutral_before = neutral_position
-        blunder_detected = False
-        blundering_side_str = ''
-        blunder_type_str = ''
-        replay_requested = False
-        replay_starting_ply = -1
-
         # detect a neutral -> losing deviation
         if neutral_position and abs(ev) >= reset_cp:
             if plies[i] >= replay_min_ply:
@@ -1303,12 +1295,7 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
                     # and the current STM loses the game
                     if game_result > 0 if ev > 0 else game_result < 0:
                         neutral_blunders.append((plies[i-1], 'neutral', ev < 0))
-                        blunder_detected = True
-                        blundering_side_str = 'white' if ev < 0 else 'black'
-                        blunder_type_str = 'neutral'
-                        replay_requested = True
-                        replay_starting_ply = plies[i-1]
-        
+
         neutral_count = neutral_count + 1 if abs(ev) < reset_cp else 0
         neutral_position = neutral_count >= n_consec
 
@@ -1349,11 +1336,6 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
                         replayable_blunders.append(
                             (plies[i-1], 'winning', collar == 'white')
                         )
-                        blunder_detected = True
-                        blundering_side_str = collar
-                        blunder_type_str = 'winning'
-                        replay_requested = True
-                        replay_starting_ply = plies[i-1]
 
                 # then continue collar logic
                 segment_start = i
@@ -1364,29 +1346,10 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
             else:
                 collar_state[i] = collar
 
-        debug_rows.append({
-            'ply': plies[i],
-            'eval': ev,
-            'still_neutral': still_neutral_before,
-            'blunder_detected': blunder_detected,
-            'blundering_side': blundering_side_str,
-            'blunder_type': blunder_type_str,
-            'replay_requested': replay_requested,
-            'replay_starting_ply': replay_starting_ply,
-            'collar_set': collar is not None,
-            'collar_advantaged_side': collar or '',
-            'game_result': game_result,
-            'z_eff': None,
-        })
-
     eff_z = {}
 
     # if we detected 0 flips, no updates.
     if not n_triggers:
-        if neutral_blunders:
-            for row in debug_rows:
-                row['z_eff'] = float(game_result)
-            _save_collar_debug(game_id, debug_rows, 'neutral')
         return eff_z, n_triggers, neutral_blunders
 
     for i, ply in enumerate(plies):
@@ -1401,20 +1364,7 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
     if all(v == float(game_result) for v in eff_z.values()):
         return {}, 0, neutral_blunders
 
-    for row in debug_rows:
-        row['z_eff'] = eff_z.get(row['ply'], float(game_result))
-    _save_collar_debug(game_id, debug_rows, 'winning')
-
     return eff_z, n_triggers, replayable_blunders + neutral_blunders
-
-
-def _save_collar_debug(game_id, rows, subdir):
-    game_id = game_id or str(uuid.uuid4())
-    out_dir = r"C:\Users\Bryan\Data\chessbot_data\training_data\collar_validation"
-    out_dir = os.path.join(out_dir, subdir)
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{game_id}.csv")
-    pd.DataFrame(rows).to_csv(path, index=False)
 
 
 def value_weight_for_game(cfg, is_draw):

@@ -482,8 +482,9 @@ def main(run_tag):
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
                     # drain so write gets accurate data; workers keep playing meanwhile
+                    k = max(1, recorder.training_queue // working_cfg.retrain_size)
                     rescorer.write_training_data_pkl(
-                        size=working_cfg.retrain_size, randomize=True)
+                        size=k * working_cfg.retrain_size, randomize=True)
                     recorder.training_queue = rescorer.training_data_size
 
                     # pause workers before reclaim + launch
@@ -501,7 +502,8 @@ def main(run_tag):
                             recorder.n_retrains += 1
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
-                                working_cfg.progress_csv_path)
+                                working_cfg.progress_csv_path,
+                                size=k * working_cfg.retrain_size)
                             n_retrains += 1
 
                         # keep submitting games while waiting on retrain

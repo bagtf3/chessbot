@@ -1054,11 +1054,11 @@ class Rescorer(object):
                     combined[k] += h[k]
             print(fmt_row("last 300:", combined))
 
-    def aggregate_metrics(self, epoch, vscale, progress_csv_path):
+    def aggregate_metrics(self, epoch, vscale, progress_csv_path, size=None):
         if not self.pending_metrics:
             return
 
-        chunk_size = self.config.retrain_size
+        chunk_size = size if size is not None else self.config.retrain_size
         chunk = self.pending_metrics[:chunk_size]
         self.pending_metrics = self.pending_metrics[chunk_size:]
 

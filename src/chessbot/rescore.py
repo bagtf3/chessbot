@@ -249,7 +249,9 @@ class Rescorer(object):
         if self.cache.get(cache_key) is None:
             best_cp = int(Q_stm * 1000)
             best_abs = best_cp if turn else -best_cp
-            self.cache.set_best(cache_key, mv, best_cp, best_abs, None, self.games_processed)
+            self.cache.set_best(
+                cache_key, mv, best_cp, best_abs, None, self.games_processed
+            )
 
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
@@ -376,7 +378,7 @@ class Rescorer(object):
         self.written_this_round += len(chunk)
         self.written_total += len(chunk)
 
-    def training_data_from_sf(self, board, mv, cm, Y, is_draw):
+    def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
         cfg = self.config
 
         rows = [(c["uci"], c["visits"]) for c in cm]
@@ -397,11 +399,7 @@ class Rescorer(object):
         kl = kl_divergence(priors, visits)
 
         vwht = value_weight_for_game(cfg, is_draw)
-        pwht = 1.0
-        if kl > cfg.KL_boost_threshold:
-            pwht *= cfg.KL_weight_boost
-
-        self.append_flat_policy_example(board, ucis, visits, Y, vwht, pwht)
+        self.append_flat_policy_example(board, ucis, visits, Y, vwht, policy_weight)
 
     def start_game(self, pkl_file):
         path = str(pkl_file)
@@ -430,10 +428,10 @@ class Rescorer(object):
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
 
+        is_validation_game = 'validation' in game_data.get('scenario', '').lower()
         skip_all_training = False
-        if not cfg.train_on_validation:
-            if 'validation' in game_data.get('scenario', '').lower():
-                skip_all_training = True
+        if not cfg.train_on_validation and is_validation_game:
+            skip_all_training = True
 
         game_cfg_keys = (
             'train_on_stockfish', 'z_mix',
@@ -443,7 +441,7 @@ class Rescorer(object):
             'uniform_eps', 'prior_clip_max',
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
             'use_collar_rescoring', 'rescore_analyze_batch',
-            'draw_value_scale',
+            'draw_value_scale'
         )
         game_state = {
             'gid': gid,
@@ -461,7 +459,8 @@ class Rescorer(object):
             turn = board_ch.turn
 
             if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
-                if not skip_all_training and game_sf_depth and game_sf_depth >= cfg.rescore_depth:
+                deep_enough = game_sf_depth and game_sf_depth >= cfg.rescore_depth
+                if not skip_all_training and deep_enough:
                     tr_sf = tree_data.get(i, tree_data.get(str(i), {}))
                     Q_stm = tr_sf.get('Q_stm')
                     if Q_stm is not None:
@@ -496,7 +495,25 @@ class Rescorer(object):
             if is_sf_move:
                 if game_sf_depth and game_sf_depth >= cfg.rescore_depth:
                     self.maybe_seed_cache(b_fast, mv, Q, turn, repetitions)
-                self.training_data_from_sf(b_fast, mv, cm, Y_init, is_draw)
+                
+                sf_pwht = 0.0 if is_validation_game else 1.0
+                self.training_data_from_sf(
+                    b_fast, mv, cm, Y_init, is_draw, policy_weight=sf_pwht
+                )
+
+                self.pending_metrics.append({
+                    'stm': turn,
+                    'nn_value': tr.get('nn_value'),
+                    'nn_raw_priors': tr.get('nn_raw_priors', []),
+                    'mass_on_legal': tr.get('nn_mass_on_legal'),
+                    'sf_cp': int(Q * 1000),
+                    'sf_wdl': np.tanh(Q * 10 * np.arctanh(0.5)),
+                    'candidate_visits': [(c['uci'], c['visits']) for c in cm],
+                    'result_z_stm': Z_stm,
+                    'target_y': Y_init,
+                    'policy_eligible': sf_pwht > 0
+                })
+
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 repetitions[b_fast.fen(include_counters=False)] += 1
@@ -648,11 +665,13 @@ class Rescorer(object):
                 ply['played_cp'] = best_cp
                 ply['played_abs'] = best_abs
                 ply['resolved'] = True
+
             elif entry and xerces_uci in entry['others']:
                 played_cp, played_abs = entry['others'][xerces_uci]
                 ply['played_cp'] = played_cp
                 ply['played_abs'] = played_abs
                 ply['resolved'] = True
+
             else:
                 rid = self.next_req_id()
                 self.req_map[rid] = (gid, ply_idx, 'move', time.time())
@@ -897,6 +916,7 @@ class Rescorer(object):
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
             self.training_data.append((x, mask, policy, Y, vwht, pwht))
             self.pending_metrics.append({**meta, 'target_y': float(Y)})
+        
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
         cols = [
@@ -1064,7 +1084,8 @@ class Rescorer(object):
             mol = m.get('mass_on_legal')
             mol_vals.append(mol if mol is not None else float('nan'))
             priors_map = {u: p for u, p in m.get('nn_raw_priors', [])}
-            policy_samples.append((priors_map, m.get('candidate_visits', [])))
+            if m.get('policy_eligible', True):
+                policy_samples.append((priors_map, m.get('candidate_visits', [])))
 
         nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
         target_ys   = np.array(target_ys,   dtype=np.float32)

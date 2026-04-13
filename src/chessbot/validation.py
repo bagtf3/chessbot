@@ -67,7 +67,7 @@ def create_validation_config(cfg, yaml_file=None):
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
 
     vcfg.train_on_validation = vcfg.sf_depth >= vcfg.validation_min_training_depth
-    
+
     format_and_print_validation_info(vcfg, prev_last)
     
     return vcfg

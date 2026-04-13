@@ -119,9 +119,14 @@ def child_looper(
 
 
 def top_up_queues(game_queue, sf_queue, game_gen, target=GAME_QUEUE_MIN * 2):
-    while game_queue.qsize() + sf_queue.qsize() < target:
+    sf_target = target // 2
+    for _ in range(target * 3):
+        game_ok = game_queue.qsize() >= target
+        sf_ok = sf_queue is None or sf_queue.qsize() >= sf_target
+        if game_ok and sf_ok:
+            break
         spec = game_gen.next_game()
-        if spec.meta.get("vs_stockfish"):
+        if spec.meta.get("vs_stockfish") and sf_queue is not None:
             sf_queue.put(spec)
         else:
             game_queue.put(spec)
@@ -404,8 +409,12 @@ def main(run_tag):
                     break
 
                 # top up queues if running low (training rounds only)
-                if not is_validation and game_queue.qsize() + sf_queue.qsize() < GAME_QUEUE_MIN:
-                    top_up_queues(game_queue, sf_queue, game_gen)
+                if not is_validation:
+                    if game_queue.qsize() < GAME_QUEUE_MIN:
+                        top_up_queues(game_queue, sf_queue, game_gen)
+                    
+                    if sf_queue.qsize() < GAME_QUEUE_MIN // 2:
+                        top_up_queues(game_queue, sf_queue, game_gen)
 
                 # check telemetry
                 msgs = drain_queue(telemetry_q)
@@ -460,7 +469,10 @@ def main(run_tag):
                         
                         sf_worker = next((w for w in procs if w['id'] == 'w0'), None)
                         if sf_worker and sf_worker['p'].is_alive():
-                            n_add = min(10, working_cfg.blunder_replay_max_bonus - sf_worker_bonus)
+                            n_add = min(
+                                10,
+                                working_cfg.blunder_replay_max_bonus - sf_worker_bonus)
+                            
                             sf_worker_msg_q.put({"cmd": "add_games", "n": n_add})
                             sf_worker_bonus += n_add
                             sf_last_idle_bump = main_loop_iter
@@ -516,6 +528,20 @@ def main(run_tag):
             procs = shutdown_round(procs, recent_q, telemetry_q)
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
+
+            if sf_queue is not None:
+                while True:
+                    try:
+                        spec = sf_queue.get_nowait()
+                        if spec.meta.get('scenario') == 'blunder_replay':
+                            rescorer.blunder_replay_specs.append({
+                                'fen': spec.fen,
+                                'moves': spec.moves,
+                                'stockfish_is_white': spec.meta['stockfish_is_white']
+                            })
+                    
+                    except Exception:
+                        break
 
             for q in (game_queue, sf_queue):
                 if q is not None:

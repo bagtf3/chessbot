@@ -45,6 +45,7 @@ class Config(object):
     es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
     es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
     es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop
+    jsd_min_sims = 600      # sims before JSD stop is considered; RSC stop is active before this
     
     # Game stuff
     n_games = 128

@@ -361,9 +361,11 @@ class MCTSTree(fasttree):
         d0, d1 = details[0], details[1]
         visit_delta = d0.N - d1.N
 
-        self.record_es_check(details, sims_done)
+        jsd_collect_start = cfg.jsd_min_sims - 3 * cfg.es_check_every
+        if sims_done >= jsd_collect_start:
+            self.record_es_check(details, sims_done)
 
-        # Rule 1: RSC performance stop
+        # Rule 1: RSC performance stop (active after sims_floor)
         if cfg.use_robust:
             if visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
                 if self.rsc_performance_stop(rsc, details):
@@ -371,11 +373,12 @@ class MCTSTree(fasttree):
                     self.sim_stop_reason = "rsc"
                     return True
 
-        # Rule 2: JSD convergence stop
-        if self.jsd_convergence_stop():
-            self._es_tripped = True
-            self.sim_stop_reason = "jsd"
-            return True
+        # Rule 2: JSD convergence stop (only after jsd_min_sims)
+        if sims_done >= cfg.jsd_min_sims:
+            if self.jsd_convergence_stop():
+                self._es_tripped = True
+                self.sim_stop_reason = "jsd"
+                return True
         
         return False
 

@@ -504,8 +504,7 @@ def main(run_tag):
                             recorder.n_retrains += 1
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
-                                working_cfg.progress_csv_path,
-                                size=k * working_cfg.retrain_size)
+                                working_cfg.progress_csv_path)
                             n_retrains += 1
 
                         # keep submitting games while waiting on retrain

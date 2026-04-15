@@ -749,6 +749,11 @@ class Rescorer(object):
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         EQUIV = cfg.rescore_equiv_range
 
+        # thresholds for retrain acceptance
+        kl_t = cfg.rescore_kl_threshold
+        mse_t = cfg.rescore_mse_threshold
+        cpl_t = cfg.rescore_inaccuracy_cp
+
         cpl_s = 0.0
         n_plies = 0
         rows = []
@@ -857,8 +862,8 @@ class Rescorer(object):
 
             vwht = value_weight_for_game(cfg, is_draw)
             pwht = 1.0
+            kl = kl_divergence(priors, vis)
             if kl_eligible and do_KL_boost:
-                kl = kl_divergence(priors, vis)
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
 
@@ -885,13 +890,16 @@ class Rescorer(object):
                 'sf_cp': best_cp,
                 'sf_wdl': sf_wdl,
                 'candidate_visits': list(zip(mvs, vis)),
-                'result_z_stm': Z_stm
+                'result_z_stm': Z_stm,
+                'kl': kl,
+                'cpl': loss_this
             })
 
         eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
             eval_trace, result, cfg, self.config.blunder_replay_min_ply, gid
         )
 
+        # look for and handle blunder replays
         for blunder_ply, blunder_type, blunderer_is_white in replayable_blunders:
             if vs_stockfish and blunderer_is_white == sf_color:
                 # SF blundered, skip
@@ -932,7 +940,19 @@ class Rescorer(object):
 
             z = z_eff if cfg.use_collar_rescoring else z_orig
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
-            self.training_data.append((x, mask, policy, Y, vwht, pwht))
+
+            # accept into retraining based on accuracy + random sampling
+            nn_val = meta['nn_value']
+            mse = (nn_val - Y) ** 2 if nn_val is not None else 0.0
+            kl = meta['kl']
+
+            if kl > kl_t or mse > mse_t or meta['cpl'] >= cpl_t:
+                self.training_data.append((x, mask, policy, Y, vwht, pwht))
+            else:
+                score = max(kl / kl_t, mse / mse_t)
+                if random.random() < max(cfg.rescore_sample_floor, score):
+                    self.training_data.append((x, mask, policy, Y, vwht, pwht))
+
             self.pending_metrics.append({**meta, 'target_y': float(Y)})
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
@@ -942,6 +962,7 @@ class Rescorer(object):
             'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims'
         ]
+
         out_df = pd.DataFrame(rows, columns=cols)
         out_df['played_best_move'] = out_df['delta'] <= 0
 
@@ -1073,10 +1094,10 @@ class Rescorer(object):
             print(fmt_row("last 300:", combined))
 
     def aggregate_metrics(self, epoch, vscale, progress_csv_path, size=None):
-        if not self.pending_metrics:
+        if len(self.pending_metrics) < self.config.retrain_size // 2:
             return
 
-        chunk_size = size if size is not None else self.config.retrain_size
+        chunk_size = size if size is not None else len(self.pending_metrics)
         chunk = self.pending_metrics[:chunk_size]
         self.pending_metrics = self.pending_metrics[chunk_size:]
 

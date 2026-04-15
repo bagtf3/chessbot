@@ -69,6 +69,24 @@ class SFCache:
             entry['others'][uci] = (cp, abs_cp)
             entry['last_seen'] = game_num
 
+    def load_seed(self, path):
+        """Merge a pre-computed SFCache pickle (gzipped) into this cache.
+        Existing entries are not overwritten — the seeded depth-20 values win
+        only for positions not yet seen in the live run."""
+        import gzip as gz
+        with gz.open(path, "rb") as f:
+            saved = pickle.load(f)
+        seeded = saved.get("data", {})
+        depth = saved.get("depth", "?")
+        added = 0
+        for key, entry in seeded.items():
+            if key not in self.data:
+                entry["last_seen"] = 10 ** 9  # pin: never evict
+                self.data[key] = entry
+                added += 1
+        print(f"[SFCache] loaded seed: {added:,} entries (depth={depth}) from {path}")
+        return added
+
     def maybe_evict(self, game_num):
         if len(self.data) < self.max_size:
             return 0

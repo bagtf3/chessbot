@@ -891,6 +891,38 @@ class GameViewer:
         )
         print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 
+    def seek_cpl(self, threshold):
+        if self.sf_rows is None:
+            print("No SF data loaded for this game.")
+            return
+        for ply in range(self.ply + 1, len(self.moves_uci)):
+            r = self.sf_row_for_ply(ply)
+            if r is None:
+                continue
+            loss = r.get("clipped_loss", r.get("loss", None))
+            if loss is not None and loss >= threshold:
+                self.goto(ply)
+                print(f"Found CPL={int(loss)} at ply {ply + 1}")
+                return
+        print(f"No move with CPL >= {threshold} found after ply {self.ply + 1}.")
+
+    def seek_kl(self, threshold):
+        for ply in range(self.ply + 1, len(self.moves_uci)):
+            node = self.tree_data.get(ply) or {}
+            cands = node.get("candidate_moves") or []
+            if not cands:
+                continue
+            visits_list = [c.get("visits", 0) for c in cands]
+            priors_list = [c.get("P", 0.0) for c in cands]
+            _, p_vis = self.compute_norm_entropy(visits_list)
+            _, p_pri = self.compute_norm_entropy(priors_list)
+            kl = kl_divergence_bits(p_vis, p_pri)
+            if kl >= threshold:
+                self.goto(ply)
+                print(f"Found KL={kl:.3f} bits at ply {ply + 1}")
+                return
+        print(f"No move with KL >= {threshold} found after ply {self.ply + 1}.")
+
     def show_options(self):
         # concise CLI help for replay mode commands
         print("Commands:")
@@ -909,6 +941,8 @@ class GameViewer:
         print("  pv                   show principal variation (min_vis=1)")
         print("  pv<N>                show principal variation filtered by")
         print("                       minimum visits, e.g. pv8")
+        print("  cpl > <N>            seek next move with CPL >= N, e.g. cpl > 50")
+        print("  kl > <N>             seek next move with KL >= N, e.g. kl > 1.5")
 
     def replay(self):
         print(f"Replaying {self.log['scenario']}. Result {self.log['result']}")
@@ -962,6 +996,22 @@ class GameViewer:
                 target = max(0, self.ply - n)
                 shown = False
                 self.goto(target)
+            elif cmd.startswith("cpl"):
+                parts = cmd.replace(">", " ").split()
+                try:
+                    threshold = float(parts[-1])
+                    shown = False
+                    self.seek_cpl(threshold)
+                except (ValueError, IndexError):
+                    print("Usage: cpl > <number>")
+            elif cmd.startswith("kl"):
+                parts = cmd.replace(">", " ").split()
+                try:
+                    threshold = float(parts[-1])
+                    shown = False
+                    self.seek_kl(threshold)
+                except (ValueError, IndexError):
+                    print("Usage: kl > <number>")
             elif cmd.startswith("visits"):
                 split = [c.strip() for c in cmd.split(" ") if c.strip()]
                 # check to see if a int was given to show deeper visit info

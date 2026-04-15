@@ -9,7 +9,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from chessbot import SP_DIR
+from chessbot import SP_DIR, SF_SEED_CACHE
 from chessbot.looper import init_selfplay
 from chessbot.rescore import (
     Rescorer, SFRescoreThread, SFCache,
@@ -302,6 +302,8 @@ def main(run_tag):
         eviction_window=base_cfg.rescore_eviction_window,
         max_size=base_cfg.rescore_cache_size,
     )
+    if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
+        cache.load_seed(SF_SEED_CACHE)
     rescorer = Rescorer(base_cfg, req_q, res_q, cache)
     finished_games = rescorer.get_unprocessed()
 

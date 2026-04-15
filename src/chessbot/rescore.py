@@ -233,6 +233,12 @@ class Rescorer(object):
         self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
+        zero_sc = lambda: {
+            'total': 0, 'accepted': 0, 'kl': 0, 'mse': 0, 'cpl': 0, 'rng': 0
+        }
+        self.sample_counts = zero_sc()
+        self.sample_counts_window = zero_sc()
+
         self.intake = deque()
         self.pending = {}
         self.req_map = {}
@@ -460,7 +466,8 @@ class Rescorer(object):
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
             'use_collar_rescoring', 'rescore_analyze_batch',
             'draw_value_scale',
-            'rescore_kl_threshold', 'rescore_mse_threshold', 'rescore_sample_floor'
+            'rescore_kl_threshold', 'rescore_mse_threshold', 'rescore_sample_floor',
+            'vscale'
         )
         game_state = {
             'gid': gid,
@@ -943,16 +950,48 @@ class Rescorer(object):
             Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
 
             # accept into retraining based on accuracy + random sampling
+            # MSE vs sf_wdl (STM-POV, continuous) rather than Y to avoid
+            # oversampling early-game positions where NN correctly eval ~0
+            # but outcome Z is +-1
             nn_val = meta['nn_value']
-            mse = (nn_val - Y) ** 2 if nn_val is not None else 0.0
+            sf_wdl = meta['sf_wdl']
+            stm_sign = 1.0 if is_white else -1.0
+            if nn_val is not None and sf_wdl is not None:
+                nn_stm = (nn_val / cfg.vscale) * stm_sign
+                mse = (nn_stm - sf_wdl) ** 2
+            else:
+                mse = 0.0
             kl = meta['kl']
+            hit_kl = kl > kl_t
+            hit_mse = mse > mse_t
+            hit_cpl = meta['cpl'] >= cpl_t
 
-            if kl > kl_t or mse > mse_t or meta['cpl'] >= cpl_t:
+            sc = self.sample_counts
+            scw = self.sample_counts_window
+            sc['total'] += 1
+            scw['total'] += 1
+
+            if hit_kl or hit_mse or hit_cpl:
                 self.training_data.append((x, mask, policy, Y, vwht, pwht))
+                sc['accepted'] += 1
+                scw['accepted'] += 1
+                if hit_kl:
+                    sc['kl'] += 1
+                    scw['kl'] += 1
+                if hit_mse:
+                    sc['mse'] += 1
+                    scw['mse'] += 1
+                if hit_cpl:
+                    sc['cpl'] += 1
+                    scw['cpl'] += 1
             else:
                 score = max(kl / kl_t, mse / mse_t)
                 if random.random() < max(cfg.rescore_sample_floor, score):
                     self.training_data.append((x, mask, policy, Y, vwht, pwht))
+                    sc['accepted'] += 1
+                    scw['accepted'] += 1
+                    sc['rng'] += 1
+                    scw['rng'] += 1
 
             self.pending_metrics.append({**meta, 'target_y': float(Y)})
         
@@ -1029,11 +1068,14 @@ class Rescorer(object):
 
     def print_stop_stats(self):
         stops = ("rsc", "jsd", "full")
+        W = 12
+
+        def col(val):
+            return f"  {val:>{W}}  |"
 
         def pct(acc, st):
             total_n = sum(acc[s]['n'] for s in stops)
-            n = acc[st]['n']
-            return n / total_n if total_n else 0.0
+            return acc[st]['n'] / total_n if total_n else 0.0
 
         def cpl(acc, st):
             n = acc[st]['n']
@@ -1048,24 +1090,25 @@ class Rescorer(object):
             return round(acc[st]['sims'] / n) if n else 0
 
         def rows(label, acc):
-            hdr  = f"{RS}  {'':<12} |" + "".join(f"  {st:<4}({pct(acc,st):.0%})  |" for st in stops)
-            crow = f"{RS}  {label:<12} |" + "".join(f"  CPL {cpl(acc,st):5.2f}  |" for st in stops)
-            brow = f"{RS}  {label:<12} |" + "".join(f"  BMR {bmr(acc,st):.3f}  |" for st in stops)
-            return hdr, crow, brow
+            hdr  = f"{RS}  {'':<12} |"
+            crow = f"{RS}  {label:<12} |"
+            brow = f"{RS}  {label:<12} |"
+            srow = f"{RS}  {'avg sims':<12} |"
+            for st in stops:
+                hdr  += col(f"{st} ({pct(acc, st):.0%})")
+                crow += col(f"CPL {cpl(acc, st):5.2f}")
+                brow += col(f"BMR {bmr(acc, st):.3f}")
+                srow += col(avg_sims(acc, st))
+            return hdr, srow, crow, brow
 
-        wh, wc, wb = rows("last 100", self.window_stop)
-        th, tc, tb = rows("overall",  self.total_stop)
-        tph = (f"{RS}  {'':<12} |"
-               + "".join(f"  {st:<4}({pct(self.total_stop,st):.0%})  |" for st in stops))
-        
-        srow = (f"{RS}  {'avg sims':<12} |"
-                + "".join(f"    {avg_sims(self.window_stop,st):5d}    |" for st in stops))
+        wh, ws, wc, wb = rows("last 100", self.window_stop)
+        th, _,  tc, tb = rows("overall",  self.total_stop)
         print(wh)
-        print(srow)
+        print(ws)
         print(wc)
         print(wb)
         print()
-        print(tph)
+        print(th)
         print(tc)
         print(tb)
 
@@ -1074,25 +1117,66 @@ class Rescorer(object):
 
     def print_collar_stats(self):
         dry = "" if self.config.use_collar_rescoring else " [dry]"
+        tag = f"Collar{dry}"
+        W = 10
 
-        def fmt_row(label, s):
-            pos_pct = (s['positions'] / s['total_pos'] * 100) if s['total_pos'] else 0.0
-            return (
-                f"{RS} Collar{dry}  {label:<12}"
-                f"  trigs {s['triggers']:>4}"
-                f"  collar_games {s['games']:>3}/{s['seen']:<3}"
-                f"  pos {s['positions']:>5} ({pos_pct:.1f}%)"
-            )
+        def col(val):
+            return f"  {val:>{W}}  |"
 
+        def row(label, s):
+            pos_pct = s['positions'] / s['total_pos'] if s['total_pos'] else 0.0
+            games_str = f"{s['games']}/{s['seen']}"
+            pos_str = f"{s['positions']} ({pos_pct:.1%})"
+            return (f"{RS}  {label:<12} |"
+                    + col(s['triggers'])
+                    + col(games_str)
+                    + col(pos_str))
+
+        hdr = (f"{RS}  {tag:<12} |"
+               + col("trigs")
+               + col("games")
+               + col("pos (%)"))
         w = self.collar_window
-        print(fmt_row(f"batch {w['seen']:>3}:", w))
+        print(hdr)
+        print(row(f"batch {w['seen']:>3}", w))
 
         if len(self.collar_history) >= 10:
-            combined = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+            combined = {
+                'games': 0, 'triggers': 0, 'positions': 0,
+                'total_pos': 0, 'seen': 0
+            }
             for h in self.collar_history[-10:]:
                 for k in combined:
                     combined[k] += h[k]
-            print(fmt_row("last 300:", combined))
+            print(row("last 300", combined))
+
+    def print_sample_stats(self):
+        cats = ("cpl", "kl", "mse", "rng")
+        labels = ("CPL", "KL", "MSE", "rng")
+        W = 10
+
+        def col(val):
+            return f"  {val:>{W}}  |"
+
+        def row(label, sc):
+            acc = sc['accepted']
+            ratio = acc / sc['total'] if sc['total'] else 0.0
+            lbl = f"{label} {ratio:.0%}"
+            out = f"{RS}  {lbl:<12} |"
+            for c in cats:
+                val = f"{sc[c] / acc:.1%}" if acc else "--"
+                out += col(val)
+            return out
+
+        hdr = f"{RS}  {'':<12} |" + "".join(col(lbl) for lbl in labels)
+        print(hdr)
+        print(row("batch", self.sample_counts_window))
+        print(row("total", self.sample_counts))
+
+        zero_sc = lambda: {
+            'total': 0, 'accepted': 0, 'kl': 0, 'mse': 0, 'cpl': 0, 'rng': 0
+        }
+        self.sample_counts_window = zero_sc()
 
     def aggregate_metrics(self, epoch, vscale, progress_csv_path, size=None):
         if len(self.pending_metrics) < self.config.retrain_size // 2:
@@ -1282,12 +1366,27 @@ class Rescorer(object):
                 1000 * self.sf_compute_time / self.sf_compute_count
                 if self.sf_compute_count else 0.0
             )
-            print(
-                f"{RS} SF requests: {self.n_sf_submitted} submitted,"
-                f" {self.n_cache_hits} cache hits, cache size {cache_stats['size']}\n"
-                f"{RS} compute {avg_compute_ms:.0f}ms  total {avg_total_ms:.0f}ms,"
-                f" req_q {self.req_q.qsize()}  pending {len(self.pending)}"
-            )
+            sz = cache_stats['size']
+            pend = len(self.pending)
+            compute_str = f"{avg_compute_ms:.0f}ms"
+            W = 10
+
+            def col(val):
+                return f"  {val:>{W}}  |"
+
+            sf_cols = [
+                ("submitted", str(self.n_sf_submitted)),
+                ("hits",      str(self.n_cache_hits)),
+                ("cache sz",  str(sz)),
+                ("compute",   compute_str),
+                ("pending",   str(pend)),
+            ]
+            sf_hdr = (f"{RS}  {'SF':<12} |"
+                      + "".join(col(h) for h, _ in sf_cols))
+            sf_row = (f"{RS}  {'':<12} |"
+                      + "".join(col(v) for _, v in sf_cols))
+            print(sf_hdr)
+            print(sf_row)
             self.sf_call_time = 0.0
             self.sf_call_count = 0
             self.sf_compute_time = 0.0
@@ -1295,6 +1394,8 @@ class Rescorer(object):
             print()
 
             self.print_collar_stats()
+            print()
+            self.print_sample_stats()
 
             w_this = self.written_this_round
             wtot = self.written_total

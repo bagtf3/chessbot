@@ -459,7 +459,8 @@ class Rescorer(object):
             'uniform_eps', 'prior_clip_max',
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
             'use_collar_rescoring', 'rescore_analyze_batch',
-            'draw_value_scale'
+            'draw_value_scale',
+            'rescore_kl_threshold', 'rescore_mse_threshold', 'rescore_sample_floor'
         )
         game_state = {
             'gid': gid,

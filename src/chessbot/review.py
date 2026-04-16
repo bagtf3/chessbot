@@ -1767,7 +1767,7 @@ class RecordKeeper(object):
         avoided_r = tot_skip / s_puct if s_puct else 0.0
         skip_to_prune = s_skipped / s_pruned if s_pruned else 0.0
         avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
-        left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.2f}"
+        left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.1f}"
         right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
 
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"

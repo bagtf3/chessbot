@@ -504,7 +504,7 @@ def moving_average_pd(arr, window=15):
     return s.rolling(window, center=True, min_periods=1).mean().values
 
 
-def plot_training_progress(metrics_history, epoch=None, save_path=None):
+def plot_training_progress(metrics_history, epoch=None, save_path=None, ma_max=50):
     """
     metrics_history: pd.DataFrame or dict-like with columns used below.
     If epoch is None, try to infer from metrics_history['model_epoch'].max(),
@@ -542,7 +542,7 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None):
     if epoch < 12:
         return
 
-    ma_window = min(100, max(3, int(epoch * 0.2)))
+    ma_window = min(ma_max, max(3, int(epoch * 0.2)))
     if ma_window % 2 == 0:
         ma_window += 1
 

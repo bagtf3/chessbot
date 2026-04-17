@@ -914,11 +914,14 @@ class Rescorer(object):
                 self.blunder_replay_counts['mismatch'] += 1
                 continue  
 
+            if blunder_type == 'neutral' and random.random() > 0.25:
+                continue
+
             actual_stm_is_white = turn_at.get(blunder_ply)
             if actual_stm_is_white is None:
                 self.blunder_replay_counts['mismatch'] += 1
-                continue  
-            
+                continue
+
             self.blunder_replay_specs.append({
                 'fen': game_data['start_fen'],
                 'moves': game_data['moves_played'][:blunder_ply],

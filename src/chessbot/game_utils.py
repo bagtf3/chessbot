@@ -268,8 +268,7 @@ class GameGenerator:
         self.sf_count = 0
         self.used_fens = set()
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
-        n_workers = max(1, getattr(cfg, 'n_workers', 1))
-        self.sf_cap = int(cfg.play_vs_sf_prob * cfg.n_games * n_workers)
+        self.sf_cap = int(cfg.play_vs_sf_prob * cfg.n_games)
 
     def generate(self, game_type):
         """Returns (fen, moves, meta). fen is the starting position; moves are

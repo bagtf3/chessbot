@@ -41,6 +41,7 @@ class GameLooper(object):
         self.game_queue = game_queue
         self.sf_queue = sf_queue
         self.unpause_queued = False
+        self.stop_at_empty = False
         self.games_finished = 0
         self.active_games = []
         self.sf_games = {}
@@ -125,12 +126,10 @@ class GameLooper(object):
                 self.unpause_queued = True
                 continue
 
-            if cmd == "add_games":
-                n = msg.get("n", 1) if isinstance(msg, dict) else 1
-                self.config.n_games += n
+            if cmd == "drain_and_stop":
+                self.stop_at_empty = True
                 continue
 
-            # ignore everything else
             continue
 
     def pause_wait_and_reload(self):
@@ -204,9 +203,9 @@ class GameLooper(object):
 
     def pull_from_queue(self):
         from pyfastchess import Board as fastboard
-        coast_limit = self.config.n_games + 3
-        while (len(self.active_games) < self.config.games_at_once and
-               len(self.active_games) + self.games_finished < coast_limit):
+        games_at_once = self.config.games_at_once
+        # stop_at_empty means drain_and_stop was received; don't pull any more games
+        while not self.stop_at_empty and len(self.active_games) < games_at_once:
             spec = None
             if self.sf_queue is not None:
                 try:
@@ -246,23 +245,32 @@ class GameLooper(object):
         pred_fill, counts = [], []
         finished_ids = set()
         #passes_since_trigger = 0
-        while self.games_finished < cfg.n_games:
+        while True:
             # check a few stopping conditions 
             if stop_event is not None:
                 if stop_event.is_set():
                     return
             
-            # remove any finished games
             if finished_ids:
                 self.active_games = [
-                    g for g in self.active_games if g.game_id not in finished_ids
+                    g for g in self.active_games
+                    if g.game_id not in finished_ids
                 ]
             
             # add in more games if needed
             self.pull_from_queue()
 
             if not self.active_games:
-                break
+                if self.stop_at_empty:
+                    break
+                # queue transiently empty — wait up to 30s for parent to refill
+                for _ in range(60):
+                    time.sleep(0.5)
+                    self.pull_from_queue()
+                    if self.active_games:
+                        break
+                if not self.active_games:
+                    break
             
             if self.check_for_pause():
                 self.pause_wait_and_reload()

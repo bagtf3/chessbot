@@ -118,9 +118,31 @@ def child_looper(
         looper.run(stop_ev)
 
 
-def top_up_queues(game_queue, sf_queue, game_gen, target=GAME_QUEUE_MIN * 2):
+def top_up_queues(game_queue, sf_queue, game_gen, rescorer=None, budget=None, target=GAME_QUEUE_MIN * 2):
+    added = 0
     sf_target = target // 2
-    for _ in range(target * 3):
+
+    # drain pending blunder replays onto sf_queue before filling with regular games
+    if rescorer is not None and sf_queue is not None:
+        while rescorer.blunder_replay_specs:
+            if budget is not None and added >= budget:
+                break
+            spec_data = rescorer.blunder_replay_specs.pop(0)
+            meta = {
+                'scenario': 'blunder_replay',
+                'vs_stockfish': True,
+                'stockfish_is_white': spec_data['stockfish_is_white'],
+            }
+            game_spec_cfg = resolve_cfg(game_gen.config)
+            game_spec_cfg.sample_moves = False
+            game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
+            sf_queue.put(GameSpec(
+                fen=spec_data['fen'], moves=spec_data['moves'],
+                meta=meta, cfg=game_spec_cfg,
+            ))
+            added += 1
+
+    while budget is None or added < budget:
         game_ok = game_queue.qsize() >= target
         sf_ok = sf_queue is None or sf_queue.qsize() >= sf_target
         if game_ok and sf_ok:
@@ -130,6 +152,9 @@ def top_up_queues(game_queue, sf_queue, game_gen, target=GAME_QUEUE_MIN * 2):
             sf_queue.put(spec)
         else:
             game_queue.put(spec)
+        added += 1
+
+    return added
 
 
 def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
@@ -374,20 +399,24 @@ def main(run_tag):
                 for spec in game_gen.validation_games():
                     game_queue.put(spec)
                 procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
+                for w in procs:
+                    w["msg_q"].put("drain_and_stop")
             else:
                 game_queue = ctx.Queue()
                 sf_queue = ctx.Queue()
                 n_workers = max(1, working_cfg.n_workers)
+                n_games = working_cfg.n_games
                 initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
-                top_up_queues(game_queue, sf_queue, game_gen, target=initial_target)
+                total_queued = top_up_queues(
+                    game_queue, sf_queue, game_gen, rescorer,
+                    budget=n_games, target=initial_target,
+                )
                 procs = spawn_workers(
                     working_cfg, recent_q, telemetry_q, game_queue, sf_queue
                 )
 
-            sf_worker_msg_q = procs[0]['msg_q'] if procs and not is_validation else None
-            sf_worker_bonus = 0
-            sf_last_idle_bump = -100
-            main_loop_iter = 0
+            # validation is pre-filled and already signaled; training tracks budget below
+            stop_signal_sent = is_validation
 
             # infer n_retrains
             if os.path.exists(working_cfg.progress_csv_path):
@@ -410,13 +439,22 @@ def main(run_tag):
                 if not procs and len(finished_games) < MAX_BACKLOG:
                     break
 
-                # top up queues if running low (training rounds only)
-                if not is_validation:
-                    if game_queue.qsize() < GAME_QUEUE_MIN:
-                        top_up_queues(game_queue, sf_queue, game_gen)
-                    
-                    if sf_queue.qsize() < GAME_QUEUE_MIN // 2:
-                        top_up_queues(game_queue, sf_queue, game_gen)
+                # refill queues; blunder replays trigger a top-up even if queues aren't low
+                if not stop_signal_sent:
+                    has_blunders = bool(rescorer.blunder_replay_specs)
+                    sf_low = sf_queue is not None and sf_queue.qsize() < GAME_QUEUE_MIN // 2
+                    game_low = game_queue.qsize() < GAME_QUEUE_MIN
+                    if has_blunders or sf_low or game_low:
+                        added = top_up_queues(
+                            game_queue, sf_queue, game_gen, rescorer,
+                            budget=n_games - total_queued,
+                        )
+                        total_queued += added
+                        # n_games reached — tell all workers to drain and exit
+                        if total_queued >= n_games:
+                            for w in procs:
+                                w["msg_q"].put("drain_and_stop")
+                            stop_signal_sent = True
 
                 # check telemetry
                 msgs = drain_queue(telemetry_q)
@@ -437,47 +475,6 @@ def main(run_tag):
                     to_process = finished_games.popleft()
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
-                main_loop_iter += 1
-
-                # drain blunder replays onto sf_queue
-                if sf_queue is not None and sf_worker_msg_q is not None:
-                    while rescorer.blunder_replay_specs:
-                        spec_data = rescorer.blunder_replay_specs.pop(0)
-                        meta = {
-                            'scenario': 'blunder_replay',
-                            'vs_stockfish': True,
-                            'stockfish_is_white': spec_data['stockfish_is_white']
-                        }
-
-                        game_spec_cfg = resolve_cfg(working_cfg)
-                        game_spec_cfg.sample_moves = False
-                        game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
-                        
-                        sf_queue.put(GameSpec(
-                            fen=spec_data['fen'], moves=spec_data['moves'],
-                            meta=meta, cfg=game_spec_cfg
-                        ))
-
-                        if sf_worker_bonus < working_cfg.blunder_replay_max_bonus:
-                            sf_worker_msg_q.put({"cmd": "add_games", "n": 1})
-                            sf_worker_bonus += 1
-
-                    # bump SF worker if queue drained while >100 games remain in round
-                    round_target = working_cfg.n_games * max(1, working_cfg.n_workers)
-                    games_remaining = round_target - recorder.games_finished
-                    if (games_remaining > 100
-                            and main_loop_iter - sf_last_idle_bump >= 60
-                            and sf_queue.qsize() == 0):
-                        
-                        sf_worker = next((w for w in procs if w['id'] == 'w0'), None)
-                        if sf_worker and sf_worker['p'].is_alive():
-                            n_add = min(
-                                10,
-                                working_cfg.blunder_replay_max_bonus - sf_worker_bonus)
-                            
-                            sf_worker_msg_q.put({"cmd": "add_games", "n": n_add})
-                            sf_worker_bonus += n_add
-                            sf_last_idle_bump = main_loop_iter
 
                 recorder.training_queue = rescorer.training_data_size
 

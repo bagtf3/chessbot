@@ -389,7 +389,7 @@ class GameGenerator:
     def validation_games(self, cfg=None):
         if cfg is None:
             cfg = self.config
-        n = cfg.n_games * max(1, cfg.n_workers) // 2  # number of pairs needed, across all workers
+        n = cfg.n_games // 2  # pairs needed; each pair = 2 games, total = n_games
 
         val_probs = cfg.validation_game_probs
         types = list(val_probs.keys())

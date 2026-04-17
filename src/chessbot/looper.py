@@ -204,8 +204,8 @@ class GameLooper(object):
     def pull_from_queue(self):
         from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
-        # stop_at_empty means drain_and_stop was received; don't pull any more games
-        while not self.stop_at_empty and len(self.active_games) < games_at_once:
+        # keep draining until full or both queues empty; stop_at_empty means no refill after empty
+        while len(self.active_games) < games_at_once:
             spec = None
             if self.sf_queue is not None:
                 try:
@@ -263,8 +263,8 @@ class GameLooper(object):
             if not self.active_games:
                 if self.stop_at_empty:
                     break
-                # queue transiently empty — wait up to 30s for parent to refill
-                for _ in range(60):
+                # queue transiently empty — wait up to 2min for parent to refill
+                for _ in range(240):
                     time.sleep(0.5)
                     self.pull_from_queue()
                     if self.active_games:

@@ -139,7 +139,7 @@ def top_up_queues(game_queue, sf_queue, game_gen, rescorer=None, budget=None, ta
 
             # update config on blunder replay for deeper search
             game_spec_cfg.sample_moves = False
-            game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
+            game_spec_cfg.sf_move_sims = max(300, game_spec_cfg.sf_move_sims)
             game_spec_cfg.sims_floor = int(1.5*game_spec_cfg.sims_floor)
             if not isinstance(game_spec_cfg.sims_ceiling, dict):
                 game_spec_cfg.sims_ceiling = int(1.5*game_spec_cfg.sims_ceiling)

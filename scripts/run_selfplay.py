@@ -127,15 +127,23 @@ def top_up_queues(game_queue, sf_queue, game_gen, rescorer=None, budget=None, ta
         while rescorer.blunder_replay_specs:
             if budget is not None and added >= budget:
                 break
+
             spec_data = rescorer.blunder_replay_specs.pop(0)
             meta = {
                 'scenario': 'blunder_replay',
                 'vs_stockfish': True,
                 'stockfish_is_white': spec_data['stockfish_is_white'],
             }
+
             game_spec_cfg = resolve_cfg(game_gen.config)
+
+            # update config on blunder replay for deeper search
             game_spec_cfg.sample_moves = False
             game_spec_cfg.sf_move_sims = min(300, game_spec_cfg.sf_move_sims)
+            game_spec_cfg.sims_floor = int(1.5*game_spec_cfg.sims_floor)
+            if not isinstance(game_spec_cfg.sims_ceiling, dict):
+                game_spec_cfg.sims_ceiling = int(1.5*game_spec_cfg.sims_ceiling)
+            
             sf_queue.put(GameSpec(
                 fen=spec_data['fen'], moves=spec_data['moves'],
                 meta=meta, cfg=game_spec_cfg,

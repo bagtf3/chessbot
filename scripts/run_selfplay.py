@@ -118,17 +118,20 @@ def child_looper(
         looper.run(stop_ev)
 
 
-def top_up_queues(game_queue, sf_queue, game_gen, rescorer=None, budget=None, target=GAME_QUEUE_MIN * 2):
+def top_up_queues(game_queue, sf_queue, game_gen, rscr=None, budget=None, target=None):
     added = 0
+    if target is None:
+        target = GAME_QUEUE_MIN * 2
+
     sf_target = target // 2
 
     # drain pending blunder replays onto sf_queue before filling with regular games
-    if rescorer is not None and sf_queue is not None:
-        while rescorer.blunder_replay_specs:
+    if rscr is not None and sf_queue is not None:
+        while rscr.blunder_replay_specs:
             if budget is not None and added >= budget:
                 break
 
-            spec_data = rescorer.blunder_replay_specs.pop(0)
+            spec_data = rscr.blunder_replay_specs.pop(0)
             meta = {
                 'scenario': 'blunder_replay',
                 'vs_stockfish': True,
@@ -140,14 +143,12 @@ def top_up_queues(game_queue, sf_queue, game_gen, rescorer=None, budget=None, ta
             # update config on blunder replay for deeper search
             game_spec_cfg.sample_moves = False
             game_spec_cfg.sf_move_sims = max(300, game_spec_cfg.sf_move_sims)
-            game_spec_cfg.sims_floor = int(1.5*game_spec_cfg.sims_floor)
-            if not isinstance(game_spec_cfg.sims_ceiling, dict):
-                game_spec_cfg.sims_ceiling = int(1.5*game_spec_cfg.sims_ceiling)
             
             sf_queue.put(GameSpec(
                 fen=spec_data['fen'], moves=spec_data['moves'],
                 meta=meta, cfg=game_spec_cfg,
             ))
+            
             added += 1
 
     while budget is None or added < budget:
@@ -329,12 +330,15 @@ def main(run_tag):
         SFRescoreThread(req_q, res_q, base_cfg)
         for _ in range(max(1, base_cfg.rescore_n_sf_threads))
     ]
+
     for t in sf_rescore_threads:
         t.start()
+
     cache = SFCache(
         eviction_window=base_cfg.rescore_eviction_window,
         max_size=base_cfg.rescore_cache_size,
     )
+
     if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
         cache.load_seed(SF_SEED_CACHE)
     rescorer = Rescorer(base_cfg, req_q, res_q, cache)
@@ -385,14 +389,14 @@ def main(run_tag):
                 print(f"[main loop] Run Time: {format_time(run_time)}")
                 print(f"[main loop] Games Completed {total_games} ({gph:.2f} per hour)")
                 print(f"[main loop] {len(finished_games)} unprocessed games in the queue")
-            
+
+            # fresh reload each pass
+            working_cfg = Config.from_yaml(yaml_path, init=True)
+            is_validation = False
+
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
-                working_cfg = create_validation_config(base_cfg, val_yaml_path)
-
-            else:
-                is_validation = False
-                working_cfg = Config.from_yaml(yaml_path, init=True)
+                working_cfg = create_validation_config(working_cfg, val_yaml_path)
             
             # update the rescorer config
             rescorer.config = working_cfg
@@ -419,6 +423,7 @@ def main(run_tag):
                     game_queue, sf_queue, game_gen, rescorer,
                     budget=n_games, target=initial_target,
                 )
+
                 procs = spawn_workers(
                     working_cfg, recent_q, telemetry_q, game_queue, sf_queue
                 )

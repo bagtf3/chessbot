@@ -1,0 +1,501 @@
+WDL HEAD MIGRATION - XERCES / CHESSBOT
+=======================================
+Scalar value head (-1 to 1) → 3-vec WDL head [w, d, l]
+Q = w - l  |  contempt = -c * p_draw when STM is winning
+vscale moves from Python inference to C++ (applied to Q = w-l, not to draw prob)
+
+All existing .tfrecord.gz training data is INCOMPATIBLE and must be regenerated.
+All existing model checkpoints (.pt files) are INCOMPATIBLE (output shape changes).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — pyfastchess (C++)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1: Data structures
+-----------------------
+src/singleton_registry.hpp — RawEntry
+  CHANGE: float value  →  std::array<float,3> wdl   (w, d, l — STM-POV from inference)
+  CHANGE: bool has_value stays, semantics unchanged
+
+src/cache.hpp — CacheEntry
+  CHANGE: float value = 0.0f  →  std::array<float,3> wdl = {0.f, 0.f, 0.f}
+
+src/mcts.hpp — MCTSNode (lines 90-94, 211)
+  ADD:    float W_draw = 0.0f      // accumulated draw probability
+  ADD:    float Q_draw = 0.0f      // mean draw probability
+  CHANGE: float value = 0.0f  →  std::array<float,3> wdl = {0.f,0.f,0.f}
+            (leaf WDL at expansion, STM-POV)
+  KEEP:   W, Q, Qema, Qdelta_sign unchanged — they now receive (w-l) instead of scalar
+
+src/mcts.hpp — ChildDetail (lines 54-67)
+  ADD:    float Q_draw = 0.0f
+  ADD:    std::array<float,3> wdl = {0.f,0.f,0.f}   // leaf WDL for this child
+
+src/mcts.hpp — MCTSTree private (line 357 area)
+  ADD:    float vscale_ = 0.9f     // applied to Q = w-l at selection time
+  ADD:    float contempt_ = 0.0f   // draw penalty when STM is winning
+  ADD:    set_vscale/vscale() and set_contempt/contempt() accessors (same pattern as set_cpuct)
+
+src/mcts.hpp — NNResult (line 344)
+  ADD:    std::array<float,3> wdl = {0.f,0.f,0.f}
+  KEEP:   float value (computed as w-l for backwards compat)
+
+
+Step 2: backend — terminal value
+---------------------------------
+src/backend.cpp — terminal_value_white_pov (lines 783-794)
+  CHANGE return type: std::optional<float>  →  std::optional<std::array<float,3>>
+  win  (white):  return {{1.f, 0.f, 0.f}}
+  draw:          return {{0.f, 1.f, 0.f}}
+  loss (white):  return {{0.f, 0.f, 1.f}}
+
+  Update declaration in backend.hpp to match.
+
+  binding.cpp terminal_value_white_pov wrapper (line 219):
+    Return (w, d, l) tuple or None.
+
+
+Step 3: Backpropagation
+-----------------------
+src/mcts.hpp — back_up_along_path signatures
+  CHANGE: void back_up_along_path(MCTSNode* leaf, float v)
+        → void back_up_along_path(MCTSNode* leaf, float v, float d_prob)
+  Same for _nolock variant.
+
+src/mcts.cpp — back_up_along_path_nolock body (lines 497-541)
+  In the loop, after:  n->W += v;  n->Q = n->W / nv;
+  ADD:
+    n->W_draw += d_prob;
+    n->Q_draw = (nv > 0) ? (n->W_draw / static_cast<float>(nv)) : 0.0f;
+  Everything else (Qdelta_sign, Qema, terminal must-visit logic) unchanged.
+
+  Update all 4 call sites:
+    collect_one_leaf_tagged: terminal known   (line 289) — pass node->wdl[1]
+    collect_one_leaf_tagged: fresh terminal   (line 300) — pass wdl[1]
+    collect_one_leaf_tagged: priors cache hit (line 319) — pass pe->wdl[1]
+    apply_result                              (line 484) — pass d extracted from wdl arg
+
+
+Step 4: apply_result
+---------------------
+src/mcts.cpp — apply_result (line 436) and declaration in mcts.hpp (line 272)
+  CHANGE signature: float value_white_pov  →  std::array<float,3> wdl_white_pov
+  Internally:
+    const float q = wdl_white_pov[0] - wdl_white_pov[2];   // scalar for W/Q/Qema
+    const float d = wdl_white_pov[1];
+    node->wdl   = wdl_white_pov;
+    node->Qema  = q;
+    e.wdl       = wdl_white_pov;   // CacheEntry
+    back_up_along_path_nolock(node, q, d);
+
+  Python binding (binding.cpp lines 389-399):
+    CHANGE: float value_white_pov  →  py::tuple or std::array<float,3>
+    Accept (w, d, l) tuple from Python.
+
+
+Step 5: Raw cache fast-paths — STM flip
+-----------------------------------------
+Two sites read RawEntry and convert to white-POV before calling apply_result.
+Both currently do:
+    const float value_white_pov = node->get_stm_pov() * re->value;
+
+CHANGE to:
+    auto wdl = re->wdl;  // copy
+    if (node->get_stm_pov() < 0.f) std::swap(wdl[0], wdl[2]);  // flip w/l for black STM
+    // wdl is now white-POV
+
+Sites:
+  src/mcts.cpp line 331  (collect_one_leaf_tagged raw cache fast-path)
+  src/mcts.cpp line 791  (resolve_inflight)
+
+
+Step 6: PUCT selection — vscale + contempt
+-------------------------------------------
+src/mcts.hpp / mcts.cpp — select_child_lazy_ptr signature (line 233)
+  ADD parameter: float contempt = 0.f
+  ADD parameter: float vscale   = 1.f   (MCTSTree passes vscale_ here)
+
+In the scoring loop (after line 181, score = q + u * (1.f + attn)):
+
+  // vscale: compress Q range (same role as old Python vscale * tanh scalar)
+  float q_scaled = q * vscale;
+
+  // contempt: penalise draws when STM is winning
+  float q_eff = q_scaled;
+  if (contempt != 0.f && ch && parent_q > 0.f)
+      q_eff -= contempt * ch->Q_draw;
+
+  float score = q_eff + u * (1.f + attn);
+
+NOTE: parent_q must also be scaled for the gate to be consistent:
+  const float parent_q = pov_sign * this->Q * vscale;
+
+Update collect_one_leaf_tagged call site (line 265) to pass c_puct_, contempt_, vscale_.
+
+Add set_vscale/vscale and set_contempt/contempt accessors on MCTSTree.
+
+
+Step 7: New child initialisation
+----------------------------------
+src/mcts.cpp — get_or_create_child lambda (line 77)
+  ADD after up->Q = this->Q:
+    up->Q_draw = this->Q_draw;
+
+
+Step 8: root_child_details
+----------------------------
+src/mcts.cpp — root_child_details (line 1080 area)
+  ADD after cd.value = ch->value:
+    cd.Q_draw = ch->Q_draw;
+    cd.wdl    = ch->wdl;
+
+
+Step 9: emulate_nn_result
+--------------------------
+src/mcts.cpp — NNResult struct and emulate_nn_result (line 1351)
+  Populate result.wdl from root_->wdl.
+  Keep result.value = wdl[0] - wdl[2] for backward compat.
+
+binding.cpp emulate_nn_result lambda (line 401):
+  out["wdl"]   = py::make_tuple(res.wdl[0], res.wdl[1], res.wdl[2]);
+  out["value"] = res.wdl[0] - res.wdl[2];   // keep for anything still reading it
+
+
+Step 10: Python bindings
+-------------------------
+binding.cpp — ChildDetail binding (lines 228-238)
+  ADD: .def_readonly("Q_draw", &ChildDetail::Q_draw)
+  ADD: .def_readonly("wdl",    &ChildDetail::wdl)
+
+binding.cpp — MCTSNode binding (lines 258-268)
+  ADD: .def_property_readonly("Q_draw", ...)
+  ADD: .def_property_readonly("wdl", ...)   // returns (w,d,l) tuple
+
+binding.cpp — raw_cache_bulk_insert (line 558)
+  CHANGE: t[1].cast<float>()  → accept (w,d,l) tuple/array, unpack to std::array<float,3>
+  Validate that WDL sums to ~1.0 (optional, good for debugging).
+
+binding.cpp — raw_cache_lookup (line 592)
+  CHANGE: returns (value, policy)  →  ((w,d,l), policy)
+  Or keep backwards compat by returning (w-l, policy) and adding a separate wdl field.
+
+binding.cpp — MCTSTree constructor binding (line 303)
+  ADD: py::arg("vscale") = 0.9f
+  ADD: py::arg("contempt") = 0.0f
+
+binding.cpp — MCTSTree — expose new tunables:
+  ADD: .def("set_vscale", ...) .def("vscale", ...)
+  ADD: .def("set_contempt", ...) .def("contempt", ...)
+
+binding.cpp — terminal_value_white_pov (line 219)
+  Return (w,d,l) tuple or None.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — chessbot (Python)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 11: Model architecture
+-----------------------------
+scripts/bootstrap_model_async_tfrec_pt.py
+
+All three model builders (build_pt_transformer_16m, build_pt_conformer_interweaved,
+build_pt_conformer_transheavy) have the same value head pattern:
+
+  self.vout = nn.Linear(128, 1)          →  nn.Linear(128, 3)
+  return pol, torch.tanh(self.vout(v))   →  return pol, self.vout(v)  # raw logits
+
+No activation. Softmax is applied at inference time in Python (looper.py), not here.
+
+If TF models (model.py) are still used:
+  layers.Dense(1, activation="tanh", name="value_out")
+  → layers.Dense(3, name="value_out")   # no activation
+  (lines 247, 337, 510, 657 in model.py)
+
+
+Step 12: Training loss
+-----------------------
+scripts/bootstrap_model_async_tfrec_pt.py — fit_epoch (lines 446-448)
+
+  CHANGE:
+    v_loss = (F.mse_loss(val.squeeze(-1), vt.squeeze(-1), reduction="none") * wi).mean()
+  TO:
+    # vt: [B, 3] soft WDL targets   val: [B, 3] raw logits
+    v_loss = (F.cross_entropy(val, vt, reduction="none") * wi).mean()
+
+  F.cross_entropy accepts soft (non-integer) targets directly in PyTorch >= 1.10.
+  vt must be float and sum to 1 along dim=1.
+
+
+Step 13: Eval metrics
+----------------------
+scripts/bootstrap_model_async_tfrec_pt.py — do_eval (lines 483-489)
+
+  CHANGE:
+    val_preds = ...ravel()             # was scalar
+    value_mse = mean((val_preds - ystack)**2)
+    value_corr = corrcoef(val_preds, ystack)
+  TO:
+    val_probs = scipy.special.softmax(val_preds, axis=1)  # [N,3]
+    val_q  = val_probs[:,0] - val_probs[:,2]   # Q scalar for comparison
+    tgt_q  = ystack[:,0]   - ystack[:,2]       # same from targets
+    value_mse  = mean((val_q - tgt_q)**2)
+    value_corr = corrcoef(val_q, tgt_q)[0,1]
+
+  Optionally add mean cross-entropy as primary metric (more meaningful than MSE on WDL).
+
+
+Step 14: TFRecord schema — pretrain.py
+---------------------------------------
+src/chessbot/pretrain.py — make_dataset feature_spec (line 107)
+
+  CHANGE:
+    "value_out": tf.io.FixedLenFeature([], tf.float32)
+  TO:
+    "value_out": tf.io.FixedLenFeature([3], tf.float32)
+
+  Also update parse_record (line 123):
+  CHANGE:
+    value = tf.reshape(feat["value_out"], [1])
+  TO:
+    value = feat["value_out"]   # shape [3], already correct
+
+
+Step 15: TFRecord writing — build_bootstrap_tfrecords.py
+----------------------------------------------------------
+scripts/build_bootstrap_tfrecords.py
+
+ADD helper function (after imports):
+  def to_wdl(x):
+      """Convert scalar x in [-1,1] to soft WDL [w, d, l]."""
+      return np.array([max(float(x), 0.0),
+                       1.0 - abs(float(x)),
+                       max(-float(x), 0.0)], dtype=np.float32)
+
+CHANGE make_example (lines 102-126):
+  CHANGE signature: value: float  →  value: np.ndarray  (shape [3])
+  CHANGE feature:
+    "value_out": float_feature(value)
+  TO:
+    "value_out": tf.train.Feature(float_list=tf.train.FloatList(value=value.tolist()))
+
+CHANGE iter_game_records (line 160):
+  FROM:
+    value = 0.9 * z + 0.1 * v
+    yield make_example(enc_in, mask, policy, value, weight)
+  TO:
+    wdl_from_tree = wdl   # WDL vector if available from generate_training_data (see Step 17)
+    if wdl_from_tree is not None:
+        z_wdl = np.array(wdl_from_tree, dtype=np.float32)
+    else:
+        z_wdl = to_wdl(z)      # fallback: z is +1/0/-1
+    v_wdl = to_wdl(v)          # v is MCTS Q scalar
+    wdl_target = 0.9 * z_wdl + 0.1 * v_wdl   # sums to 1
+    yield make_example(enc_in, mask, policy, wdl_target, weight)
+
+  Update the zip in iter_game_records (line 159) to unpack the new WDL return value:
+    for enc_in, mask, policy, z, v, wdl, r in zip(x_list, m_list, p_list, z_list, v_list, wdl_list, r_list):
+
+
+Step 16: Inference → C++ — looper.py
+--------------------------------------
+src/chessbot/looper.py — format_and_predict (lines 439-459)
+
+  vscale is now applied in C++ (see Step 6), NOT here.
+
+  CHANGE inference output handling:
+    FROM:
+      v = np.asarray(vals_np[i]).reshape(())          # scalar
+      to_raw_cache.append((k, v, p))
+    TO:
+      wdl_logits = np.asarray(vals_np[i], dtype=np.float32)  # shape (3,)
+      wdl = scipy.special.softmax(wdl_logits)                 # probabilities, shape (3,)
+      to_raw_cache.append((k, wdl, p))
+
+  Also save root_wdl at each ply when building node data for the pkl:
+    root_wdl_result = tree.emulate_nn_result()
+    node_data["root_wdl"] = root_wdl_result.get("wdl")   # (w, d, l) tuple or None
+
+
+Step 17: review.py — generate_training_data
+---------------------------------------------
+src/chessbot/review.py — generate_training_data (line 1043)
+
+  ADD WDL to accumulator lists (line 1055):
+    X, M, P, Z, V, WDL, R = [], [], [], [], [], [], []
+
+  ADD WDL extraction (line 1146 area):
+    this_wdl = node.get("root_wdl")   # (w,d,l) STM-POV saved by looper, or None for old games
+
+  ADD to append block:
+    WDL.append(this_wdl)
+
+  CHANGE return (line 1165):
+    FROM:  return X, M, P, Z, V, R
+    TO:    return X, M, P, Z, V, WDL, R
+
+  All callers of generate_training_data must be updated to unpack the new WDL return value.
+  Primary caller: build_bootstrap_tfrecords.py iter_game_records (line 151).
+
+
+Step 18: review.py — display (optional but useful)
+----------------------------------------------------
+src/chessbot/review.py — print_header (line 483)
+  ADD ("D", 6) column between dS and P columns
+
+src/chessbot/review.py — print_row (line 512)
+  ADD:  q_draw = c.get("Q_draw", float("nan"))
+  ADD to parts: f"{q_draw:^6.3f}"
+
+  This shows tree-averaged draw probability per child in the move table.
+
+
+Step 19: config.py — vscale
+-----------------------------
+src/chessbot/config.py
+  vscale is now a C++ tree parameter (set at MCTSTree construction / set_vscale).
+  It should stay in config.py as the canonical value, but is no longer applied in
+  Python inference. It should be passed to MCTSTree(vscale=cfg.vscale) in looper.py.
+
+  KEEP:  vscale = 0.9   (still the source of truth, passed to C++)
+  REMOVE from inference path (infer_ort.py / looper inference step)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3 — Retraining Plan
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Model compatibility:
+  - All existing .pt checkpoints are INCOMPATIBLE. The value head output shape
+    changes from (B,1) to (B,3) and the final layer loses tanh. Cannot fine-tune;
+    must train from scratch on new TFRecords.
+
+  - Strategy: save existing best checkpoint as a "policy-only" baseline.
+    The policy head is identical and unchanged — weights can be transferred
+    manually if desired (load checkpoint, replace vout layer, train only value
+    head for a few epochs, then unfreeze all).
+
+TFRecord data:
+  - All existing .tfrecord.gz files are INCOMPATIBLE. The value_out feature
+    changes from a scalar float32 to a 3-float float32. The TF dataset pipeline
+    will fail to parse old files with the new schema.
+
+  - DO NOT mix old and new .tfrecord.gz files in the same BOOTSTRAP_TFREC_DIR.
+    Use a new output directory.
+
+  - Old game .pkl.gz files are COMPATIBLE and can be reprocessed. They will
+    not have root_wdl (that field is only written by the new looper), so
+    build_bootstrap_tfrecords.py will fall back to to_wdl(z) for value targets.
+    This is fine for bootstrapping the first new model.
+
+  - New self-play games generated with the new engine will have root_wdl saved
+    in the pkl, giving richer WDL targets blended with the game outcome.
+
+Recommended sequence:
+  1. Implement and test C++ changes (pyfastchess). Rebuild.
+  2. Implement looper.py and model changes. Verify raw_cache_bulk_insert accepts WDL.
+  3. Run build_bootstrap_tfrecords.py against existing pkl.gz game data into a
+     NEW tfrec dir. This regenerates all training data with WDL targets.
+  4. Train a new model from scratch with bootstrap_model_async_tfrec_pt.py.
+  5. Once the new model is deployed in self-play, new games will have root_wdl
+     in pkls, improving training signal over time.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4 — Training Data Pipeline (how old games become training data)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+xc0 (Xerces self-play games):
+  1. looper.py plays games, writes .pkl.gz per game into SP_DIR/<run_tag>/
+     Each pkl contains moves_played, tree_search_data (per-ply MCTS stats), result.
+  2. analyze_with_sf (review.py) runs Stockfish on completed games, writes
+     analysis_staging/ chunk pickles, combined into analyze_results_combined.pkl
+     via combine_analysis_staging().
+  3. clean_training_data.py filters by CPL (>= CPL_MIN), converts JSON→PKL, prunes
+     bad games from game_index.json, deletes their pkl files.
+  4. build_bootstrap_tfrecords.py loads surviving games via load_game_index(),
+     calls GameViewer.generate_training_data() per game, writes .tfrecord.gz shards.
+  5. bootstrap_model_async_tfrec_pt.py reads .tfrecord.gz via pretrain.make_dataset(),
+     trains the PyTorch model.
+
+lc0 (Leela Chess Zero games used for bootstrapping):
+  - lc0 games are loaded the same way via GameViewer (they have the same pkl format).
+  - The lc0_analyze() function in engines.py is used for the show_lc0_overlay display
+    in review.py, NOT for generating training data. lc0 games in training come from
+    pre-collected pkls in a run_tag directory, processed identically to xc0 games.
+  - DRAW_RATE = 0.5 in build_bootstrap_tfrecords.py subsamples draw games at 50%
+    to prevent overrepresentation. This is already appropriate for WDL training.
+
+Key scripts summary:
+  clean_training_data.py          — pre-filter: CPL gate + JSON→PKL (NO changes needed)
+  build_bootstrap_tfrecords.py    — CHANGED: WDL targets, make_example, iter_game_records
+  scripts/bootstrap_model_async_tfrec_pt.py  — CHANGED: model head, loss, eval metrics
+  src/chessbot/pretrain.py        — CHANGED: TFRecord schema (feature_spec, parse_record)
+  src/chessbot/review.py          — CHANGED: generate_training_data return sig + WDL field
+  src/chessbot/looper.py          — CHANGED: inference output (WDL), save root_wdl to pkl
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5 — Watch out for
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. STM flip correctness
+   RawEntry stores WDL in STM-POV (inference is always STM-made-white).
+   CacheEntry and backprop use WHITE-POV. The flip (swap wdl[0]/wdl[2]) must
+   happen exactly once, at the two raw-cache read sites (Step 5). Do not flip
+   twice. Terminal values are already white-POV and do not need flipping.
+
+2. vscale is no longer applied in Python
+   The old line `value = np.clip(outs[1] * vscale, -1, 1)` must be removed from
+   the inference path entirely. If left in, vscale is applied twice (Python + C++),
+   collapsing the effective Q range toward 0. Verify by checking that raw WDL
+   values from inference arrive at C++ as softmax probabilities summing to 1.
+
+3. Priors cache (CacheEntry) invalidation
+   CacheEntry.wdl replaces CacheEntry.value. The in-memory cache is cleared on
+   engine restart, so no migration is needed. But if any code serialises/deserialises
+   CacheEntry to disk it will break. Verify no persistent priors cache is in use.
+
+4. PyTorch cross_entropy with soft targets
+   F.cross_entropy(input, target) with float target requires PyTorch >= 1.10.
+   Target shape must be [B, 3] float, NOT [B] int (class indices).
+   If target does not sum to 1 the loss is still valid but interpretation changes.
+   Add an assertion or normalise targets during data loading as a safeguard.
+
+5. contempt gate uses parent Q, not child Q
+   The gate (parent_q > 0) checks whether the SELECTING node thinks it is winning,
+   not the child being evaluated. This is intentional: contempt is a property of
+   the position's overall evaluation, not a per-move decision. Do not change this
+   to (q > 0) — it would cause contempt to apply inconsistently to different lines.
+
+6. to_wdl(x) for scalar MCTS Q fallback
+   to_wdl(x) = [max(x,0), 1-|x|, max(-x,0)] is valid for x in [-1,1] but
+   saturates at the extremes (Q=1.0 → [1,0,0] with zero draw mass). This is
+   intentional and correct. For positions the tree thinks are nearly decided, the
+   draw component of the training target should be near zero.
+
+7. Old games missing root_wdl
+   Games played before this migration have no root_wdl in their pkl. The fallback
+   to_wdl(z) uses the GAME OUTCOME, not the tree's belief at that ply. This is
+   a coarser signal but was the only signal available under the scalar head too.
+   It is safe to mix old and new game pkls in the same build_bootstrap run.
+
+8. draw probability in Q_draw vs wdl[1]
+   ChildDetail.Q_draw is the TREE-AVERAGED draw probability (accumulated over all
+   backprops through that node). ChildDetail.wdl is the LEAF WDL (what the NN
+   returned at that node's expansion). They are different. For contempt, C++ uses
+   Q_draw (tree-averaged, more stable). For training targets, use root_wdl (leaf
+   WDL at root expansion). For display/telemetry, both are useful.
+
+9. TFRecord shard mixing
+   Do NOT point BOOTSTRAP_TFREC_DIR at a directory containing a mix of old
+   (scalar value_out) and new (3-float value_out) shards. TF's FixedLenFeature
+   will silently parse old scalar shards as if value_out=[scalar, 0, 0] is wrong
+   but may not crash immediately. Use a clean output directory.
+
+10. Weight transfer from old models
+    The policy head weights (emb/pos/blocks/pol) are identical between old and new
+    models. If you want a head-start, you can load an old checkpoint, add the new
+    vout layer (3 outputs), and fine-tune with value loss only for a few epochs
+    before full training. This is optional but can save several epochs of warmup.

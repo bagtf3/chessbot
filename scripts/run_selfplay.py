@@ -154,7 +154,7 @@ def top_up_queues(game_queue, sf_queue, game_gen, rscr=None, budget=None, target
     while budget is None or added < budget:
         game_ok = game_queue.qsize() >= target
         sf_ok = sf_queue is None or sf_queue.qsize() >= sf_target
-        if game_ok and sf_ok:
+        if game_ok or sf_ok:
             break
         spec = game_gen.next_game()
         if spec.meta.get("vs_stockfish") and sf_queue is not None:

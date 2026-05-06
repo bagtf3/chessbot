@@ -9,7 +9,6 @@ from pyfastchess import MCTSTree as fasttree
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
-from chessbot.review import score_to_value_stm_pov
 from chessbot.utils import rnd
 import chessbot.utils as cbu
 from collections import namedtuple
@@ -585,27 +584,6 @@ class ChessGame(object):
         data["nn_mass_on_legal"] = nn["mass_on_legal"]
 
         self.tree_data[self.plies] = data
-    
-    def make_move_with_stockfish(self, eng):
-        """ Stockfish plays one move. Record depth if not using depth limit """
-        legal = self.board.legal_moves()
-        if not legal:
-            return self.check_for_terminal()
-
-        # get SF move + signed eval (white POV)
-        res_tup = cbu.sf_eval(
-            self.python_chess_board, score_fn=score_to_value_stm_pov,
-            depth=self.config.sf_depth, engine=eng
-        )
-
-        if len(res_tup) == 2:
-            sf_v, best_move = res_tup
-        else:
-            sf_v, best_move, searched = res_tup
-            self.sf_search_depth.append(searched)
-
-        self.sf_eval = sf_v
-        return self.push_move(best_move, "stockfish", None)
     
     def set_stockfish_result(self, res_tup):
         self.sf_res_tup = res_tup

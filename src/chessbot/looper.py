@@ -9,7 +9,7 @@ from queue import Queue, Empty
 import chess
 import chess.engine
 
-from chessbot.review import score_to_value_stm_pov
+from chessbot.review import score_to_value_stm_pov_tanh
 
 _now = time.time
 
@@ -518,12 +518,15 @@ class GameLooper(object):
         res.update(game.meta)
 
         # unscale Q values from inference vscale before saving
+        # SF-played plies store Q_stm/Q_white as tanh-based evals (not vscale-scaled)
         vs = cfg.vscale
         if vs and vs != 1.0:
             q_keys = ("Q_stm", "Q_white", "best_Q", "visit_weighted_Q")
+            sf_only = {"Q_stm", "Q_white"}
             for td in game.tree_data.values():
+                is_sf = td.get('selection_method') == 'stockfish'
                 for k in q_keys:
-                    if k in td:
+                    if k in td and not (is_sf and k in sf_only):
                         td[k] = np.clip(td[k] / vs, -1.0, 1.0)
 
         # attach tree search data to disk record
@@ -731,7 +734,7 @@ class StockfishThread(object):
 
             try:
                 res_tup = sf_eval(
-                    board, score_fn=score_to_value_stm_pov,
+                    board, score_fn=score_to_value_stm_pov_tanh,
                     depth=self.depth, engine=self.eng
                 )
 

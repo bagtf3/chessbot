@@ -56,9 +56,17 @@ def score_to_value_white(board_score):
 
 
 def score_to_value_stm_pov(board_score):
-    # always look from whites perspective
     rel_score = board_score.relative
     return cp_to_value(rel_score)
+
+
+def score_to_value_stm_pov_tanh(board_score, mid_cp=100.0):
+    # tanh scale: +mid_cp -> 0.5 win probability
+    rel_score = board_score.relative
+    raw = rel_score.score()
+    if raw is None:
+        raw = rel_score.score(mate_score=3000)
+    return cp_to_value_tanh(raw, mid_cp=mid_cp)
 
 # another method of converting scores
 def score_clipped(x, clip_max=CLIP_MAX):

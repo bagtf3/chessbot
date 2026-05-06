@@ -271,7 +271,8 @@ class Rescorer(object):
         halfmoves = 0 if hmc < 45 else hmc
         cache_key = (short_fen, reps, halfmoves)
         if self.cache.get(cache_key) is None:
-            best_cp = int(Q_stm * 1000)
+            # invert tanh (mid_cp=100) back to centipawns
+            best_cp = int(np.arctanh(np.clip(Q_stm, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5))
             best_abs = best_cp if turn else -best_cp
             self.cache.set_best(
                 cache_key, mv, best_cp, best_abs, None, self.games_processed
@@ -532,8 +533,8 @@ class Rescorer(object):
                     'nn_value': tr.get('nn_value'),
                     'nn_raw_priors': tr.get('nn_raw_priors', []),
                     'mass_on_legal': tr.get('nn_mass_on_legal'),
-                    'sf_cp': int(Q * 1000),
-                    'sf_wdl': np.tanh(Q * 10 * np.arctanh(0.5)),
+                    'sf_cp': int(np.arctanh(np.clip(Q, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5)),
+                    'sf_wdl': Q,
                     'candidate_visits': [(c['uci'], c['visits']) for c in cm],
                     'result_z_stm': Z_stm,
                     'target_y': Y_init,

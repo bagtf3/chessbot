@@ -15,7 +15,8 @@ from chessbot import SF_LOC
 from chessbot.engines import lc0_analyze
 from chessbot.utils import print_recent_summary, format_time
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov, rnd,
+    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
+    score_to_value_stm_pov_tanh, rnd,
     calc_entropy, kl_divergence_bits
 )
 

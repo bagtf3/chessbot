@@ -161,7 +161,7 @@ def worker_main(wargs: dict) -> None:
     model._default_opt = opt
     model._default_loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out":     tf.keras.losses.MeanSquaredError(),
+        "value_out":     tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
     current_lw: dict | None = None
@@ -219,18 +219,30 @@ def worker_main(wargs: dict) -> None:
         if "mask" in model.input_names:
             x["mask"] = bundle["mask"]
 
-        preds     = model.predict(x, verbose=0, batch_size=64)
-        pol_preds = preds[0]
-        val_preds = preds[1].ravel()
-        pstack    = bundle["policy_logits"].numpy()
-        ystack    = bundle["value_out"].numpy().ravel()
-        mstack    = bundle["mask"].numpy()
+        preds      = model.predict(x, verbose=0, batch_size=64)
+        pol_preds  = preds[0]
+        val_logits = preds[1]                         # (N, 3) raw WDL logits
+        pstack     = bundle["policy_logits"].numpy()
+        target_wdl = bundle["value_out"].numpy()      # (N, 3)
+        mstack     = bundle["mask"].numpy()
 
-        pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
-        value_mse  = float(np.mean((val_preds - ystack) ** 2))
-        value_corr = float(np.corrcoef(val_preds, ystack)[0, 1])
+        shifted  = val_logits - val_logits.max(axis=1, keepdims=True)
+        val_wdl  = np.exp(shifted) / np.exp(shifted).sum(axis=1, keepdims=True)
 
-        row = {"training_epoch": ep, "value_mse": value_mse, "value_corr": value_corr}
+        pred_q   = val_wdl[:, 0] - val_wdl[:, 2]
+        target_q = target_wdl[:, 0] - target_wdl[:, 2]
+
+        value_mse  = float(np.mean((pred_q - target_q) ** 2))
+        value_corr = float(np.corrcoef(pred_q, target_q)[0, 1])
+        value_ce   = float(-np.mean(
+            np.sum(target_wdl * np.log(np.clip(val_wdl, 1e-9, None)), axis=1)
+        ))
+
+        pol_stats = batch_policy_metrics(pol_preds, pstack, mstack)
+        row = {
+            "training_epoch": ep,
+            "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
+        }
         row.update(pol_stats)
         new_row = pd.DataFrame([row])
         eval_df = (
@@ -240,10 +252,11 @@ def worker_main(wargs: dict) -> None:
         eval_df.round(4).to_csv(progress_file, index=False)
 
         print_metrics = {
-            "value_mse": value_mse, "value_corr": value_corr, **pol_stats
+            "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
+            **pol_stats
         }
         print_validation(ep, print_metrics)
-        return eval_df, ystack, val_preds
+        return eval_df, target_q, pred_q
 
     begin          = time.time()
     epoch_times: list[float] = []

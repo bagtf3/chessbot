@@ -32,7 +32,7 @@ DRAW_DROP_RATE   = 0.75
 Z_BLEND          = 0.5
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
-DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0\040126"
+DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\staging"
 
 OPTIONS = tf.io.TFRecordOptions(compression_type="GZIP")
 
@@ -46,7 +46,7 @@ def scan_chunks(lc0_dir):
     )
     for d in run_dirs:
         full = os.path.join(lc0_dir, d)
-        gz_files = sorted(f for f in os.listdir(full) if f.endswith(".gz"))
+        gz_files = sorted(f for f in os.listdir(full) if f.endswith(".gz") and not f.endswith(".tfrecord.gz"))
         print(f"[scan]  {d}: {len(gz_files):,} files")
         chunks.extend(os.path.join(full, f) for f in gz_files)
     print(f"[scan]  total: {len(chunks):,} chunk files")
@@ -128,9 +128,11 @@ def writer_thread(write_q, out_dir, begin):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lc0-dir",  default=DEFAULT_LC0_DIR)
-    ap.add_argument("--out-dir",  default=DEFAULT_OUT_DIR)
-    ap.add_argument("--workers",  type=int, default=max(1, os.cpu_count() - 2))
+    ap.add_argument("--lc0-dir",    default=DEFAULT_LC0_DIR)
+    ap.add_argument("--out-dir",    default=DEFAULT_OUT_DIR)
+    ap.add_argument("--workers",    type=int, default=max(1, os.cpu_count() - 2))
+    ap.add_argument("--target-pos", type=int, default=0,
+                    help="stop after this many records (0 = no limit)")
     args = ap.parse_args()
 
     chunks = scan_chunks(args.lc0_dir)
@@ -143,9 +145,11 @@ def main():
     n_workers     = args.workers
     chunk_subsets = [chunks[i::n_workers] for i in range(n_workers)]
 
+    target_pos = args.target_pos or float("inf")
+
     print(f"[config] workers={n_workers}  buffer={BUFFER_SIZE:,}  records_per_file={RECORDS_PER_FILE:,}")
     print(f"[config] policy_max_clip={POLICY_MAX_CLIP}  draw_drop={DRAW_DROP_RATE}")
-    print(f"[config] out_dir={args.out_dir}")
+    print(f"[config] target_pos={args.target_pos or 'unlimited'}  out_dir={args.out_dir}")
     for i, sub in enumerate(chunk_subsets):
         print(f"[config] worker {i}: {len(sub):,} chunks")
 
@@ -193,6 +197,7 @@ def main():
             print(f"[main] worker done, {active} remaining")
             continue
 
+        hit_target = False
         for rec in item:
             total_in += 1
             if len(buffer) < BUFFER_SIZE:
@@ -209,6 +214,14 @@ def main():
                 output_batch.append(buffer[idx])
                 buffer[idx] = rec
                 flush()
+            if total_in >= target_pos:
+                hit_target = True
+                break
+        if hit_target:
+            print(f"[main] target_pos={args.target_pos:,} reached, stopping")
+            for p in processes:
+                p.terminate()
+            break
 
     print(f"[main] all workers done ({total_in:,} records), draining buffer ({len(buffer):,})...")
     random.shuffle(buffer)
@@ -224,7 +237,7 @@ def main():
     wt.join()
 
     for p in processes:
-        p.join()
+        p.join(timeout=5)
 
     elapsed = time.time() - begin
     total_M = total_in / 1_000_000

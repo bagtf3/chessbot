@@ -228,7 +228,6 @@ def save_plot(
     for ax, key, title in [
         (axes[0, 0], "policy_ce",  "policy CE (nats)"),
         (axes[0, 1], "ce_gain",    "CE gain vs uniform"),
-        (axes[0, 2], "value_mse",  "value MSE"),
         (axes[1, 0], "value_corr", "value corr"),
         (axes[1, 1], "top1_exact", "top1 exact"),
     ]:
@@ -241,6 +240,30 @@ def save_plot(
         ax.set_title(title)
         ax.legend()
 
+    # value MSE (left axis) + CE (right axis) on shared subplot
+    ax_val = axes[0, 2]
+    ax_ce  = ax_val.twinx()
+    has_mse = "value_mse" in eval_df.columns
+    has_ce  = "value_ce"  in eval_df.columns
+    if has_mse:
+        raw = eval_df["value_mse"].to_numpy()[hide:]
+        ma  = moving_average(eval_df["value_mse"].to_numpy(), window=win)[hide:]
+        ax_val.plot(xs_show, raw, alpha=0.6, lw=1, color="tab:blue",   label="MSE")
+        ax_val.plot(xs_show, ma,  lw=2,            color="tab:blue",   label=f"MSE MA{win}")
+        ax_val.set_ylabel("MSE (Q)", color="tab:blue")
+        ax_val.tick_params(axis="y", labelcolor="tab:blue")
+    if has_ce:
+        raw = eval_df["value_ce"].to_numpy()[hide:]
+        ma  = moving_average(eval_df["value_ce"].to_numpy(), window=win)[hide:]
+        ax_ce.plot(xs_show, raw, alpha=0.6, lw=1, color="tab:orange", label="CE")
+        ax_ce.plot(xs_show, ma,  lw=2,             color="tab:orange", label=f"CE MA{win}")
+        ax_ce.set_ylabel("CE (nats)", color="tab:orange")
+        ax_ce.tick_params(axis="y", labelcolor="tab:orange")
+    ax_val.set_title("value MSE + CE")
+    lines  = ax_val.get_legend_handles_labels()
+    lines2 = ax_ce.get_legend_handles_labels()
+    ax_val.legend(lines[0] + lines2[0], lines[1] + lines2[1], fontsize=7)
+
     ax_sc = axes[1, 2]
     if ystack is not None and val_preds is not None:
         corr = float(np.corrcoef(val_preds, ystack)[0, 1])
@@ -250,9 +273,9 @@ def save_plot(
             max(ystack.max(), val_preds.max()),
         ]
         ax_sc.plot(lims, lims, "r--", lw=1)
-        ax_sc.set_xlabel("target")
-        ax_sc.set_ylabel("pred")
-        ax_sc.set_title(f"value scatter  (r={corr:.3f})")
+        ax_sc.set_xlabel("target Q")
+        ax_sc.set_ylabel("pred Q")
+        ax_sc.set_title(f"value Q scatter  (r={corr:.3f})")
 
     fig.tight_layout()
     fig.savefig(plot_file, dpi=100)

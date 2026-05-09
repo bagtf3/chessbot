@@ -104,7 +104,7 @@ def make_dataset(file_list: list[str], shuffle_buffer: int):
         "enc_in":        tf.io.FixedLenFeature([], tf.string),
         "mask":          tf.io.FixedLenFeature([], tf.string),
         "policy_logits": tf.io.FixedLenFeature([], tf.string),
-        "value_out":     tf.io.FixedLenFeature([], tf.float32),
+        "value_out":     tf.io.FixedLenFeature([3], tf.float32),
         "weight":        tf.io.FixedLenFeature([], tf.float32),
     }
 
@@ -120,7 +120,7 @@ def make_dataset(file_list: list[str], shuffle_buffer: int):
         policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
         policy  = tf.minimum(policy, POLICY_MAX_CLIP)
         policy  = policy / tf.reduce_sum(policy)
-        value   = tf.reshape(feat["value_out"], [1])
+        value   = feat["value_out"]
         weight  = feat["weight"]
         return (
             {"enc_in": enc_in, "mask": mask},

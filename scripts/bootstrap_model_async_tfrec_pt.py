@@ -27,6 +27,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import scipy.special
 from torch.amp import GradScaler, autocast
 
 from chessbot.pretrain import (
@@ -117,7 +118,7 @@ def build_pt_transformer_16m(cfg):
             self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             B   = t.shape[0]
@@ -147,7 +148,7 @@ def build_pt_transformer_16m(cfg):
                 0.01,
             )
             pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -210,7 +211,7 @@ def build_pt_conformer_interweaved(cfg):
             self.ap   = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             b = t.shape[0]
@@ -227,7 +228,7 @@ def build_pt_conformer_interweaved(cfg):
             v = pt_attn_pool(s, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -304,7 +305,7 @@ def build_pt_conformer_transheavy(cfg):
             self.ap   = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             b = t.shape[0]
@@ -328,7 +329,7 @@ def build_pt_conformer_transheavy(cfg):
             v = pt_attn_pool(s, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -444,7 +445,7 @@ def fit_epoch(ms, bundle, lw, device):
             pol, val = model(x)
             p_loss = F.cross_entropy(pol, pt) * lw["policy_logits"]
             v_loss = (
-                F.mse_loss(val.squeeze(-1), vt.squeeze(-1), reduction="none") * wi
+                F.cross_entropy(val, vt, reduction="none") * wi
             ).mean() * lw["value_out"]
             loss = p_loss + v_loss
 
@@ -480,14 +481,18 @@ def do_eval(ms, bundle, device):
             all_val.append(val.float().cpu().numpy())
 
     pol_preds  = np.concatenate(all_pol, axis=0)
-    val_preds  = np.concatenate(all_val, axis=0).ravel()
+    val_logits = np.concatenate(all_val, axis=0)
     pstack     = bundle["policy_logits"].numpy()
-    ystack     = bundle["value_out"].numpy().ravel()
+    ystack     = bundle["value_out"].numpy()
     mstack     = bundle["mask"].numpy()
 
+    val_probs = scipy.special.softmax(val_logits, axis=1)
+    val_q     = val_probs[:, 0] - val_probs[:, 2]
+    tgt_q     = ystack[:, 0] - ystack[:, 2]
+
     pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
-    value_mse  = float(np.mean((val_preds - ystack) ** 2))
-    value_corr = float(np.corrcoef(val_preds, ystack)[0, 1])
+    value_mse  = float(np.mean((val_q - tgt_q) ** 2))
+    value_corr = float(np.corrcoef(val_q, tgt_q)[0, 1])
 
     mh = ms["metrics_history"]
     for k, v in pol_stats.items():
@@ -514,7 +519,7 @@ def do_eval(ms, bundle, device):
     print_validation(epoch, {"value_mse": value_mse, "value_corr": value_corr,
                               **pol_stats})
 
-    save_plot(eval_df, f"{name}  [PT]", epoch, ms["plot_file"], ystack, val_preds)
+    save_plot(eval_df, f"{name}  [PT]", epoch, ms["plot_file"], tgt_q, val_q)
 
 
 # ---------------------------------------------------------------------------

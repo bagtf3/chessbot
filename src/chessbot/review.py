@@ -484,7 +484,7 @@ class GameViewer:
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
             ("|", 1),
-            ("Q", 7), ("Qe", 7), ("dS", 7),
+            ("Q", 7), ("Qe", 7), ("dS", 7), ("D", 6),
             ("|", 1),
             ("P", 7), ("U", 7), ("PUCT", 8),
             ("|", 1),
@@ -545,10 +545,11 @@ class GameViewer:
 
         flags_txt = ", ".join([f for f in flags if f])
 
+        q_draw = c.get("Q_draw", float("nan"))
         parts = [
             f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
             "|",
-            f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}",
+            f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}", f"{q_draw:^6.3f}",
             "|",
             f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
             "|",
@@ -1053,7 +1054,7 @@ class GameViewer:
           the played move's CPL (loss column) exceeds cpl_threshold are skipped.
           Plies with no matching SF row are also skipped when SF data is present.
         """
-        X, M, P, Z, V, R = [], [], [], [], [], []
+        X, M, P, Z, V, WDL, R = [], [], [], [], [], [], []
         result = self.result
         self.reset()
 
@@ -1153,17 +1154,19 @@ class GameViewer:
             else:
                 z = 0
             
+            this_wdl = node.get("root_wdl")
             X.append(x)
             M.append(mask)
             P.append(policy)
             Z.append(z)
             V.append(this_q_stm)
+            WDL.append(this_wdl)
             R.append(len(self.moves_uci) - int(self.ply))
 
             # advance to next ply using existing helper
             self.next()
 
-        return X, M, P, Z, V, R
+        return X, M, P, Z, V, WDL, R
 
 
 def load_json(path):

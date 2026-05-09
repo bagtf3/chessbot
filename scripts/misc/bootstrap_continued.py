@@ -105,7 +105,7 @@ def top_up_sliding_buffer(
                 continue
             
             # X, Mask, Pi, result (Z), Vwq, moves remaining
-            X, M, P, Z, V, R = gv.generate_training_data(
+            X, M, P, Z, V, WDL, R = gv.generate_training_data(
                 sf_skip=False, check_boost=0, capture_boost=0
             )
             if not X:

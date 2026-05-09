@@ -13,21 +13,27 @@ from chessbot.review import GameViewer, load_game_index, ANALYZE_PKL
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 
-TARGET_WRITTEN_POSITIONS = 3_500_000
+TARGET_WRITTEN_POSITIONS = 5_000_000
 OUT_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
-#RUN_TAGS = [
-#    "cf_10x256x5_full_sims3",
-#    "cf_10x256x5_full_sims4",
-#    "cf_10x256x5_deep_sims1",
-#    "film_16M_low_sims1",
-#]
 
-RUN_TAGS = ["cf_10x256x5_full_sims2", "film_16M_low_sims1"]
-DRAW_RATE = 0.5
-MAX_CPL = 45       # game-level CPL filter (mean clipped loss across game)
-CPL_THRESHOLD = 60 # per-ply CPL filter passed to generate_training_data
+RUN_TAGS = [
+    "cfiw_pretrained_run4", "cfiw_pretrained_run5",
+    "cfiw_pretrained_run6", "cfiw_pretrained_run7"
+    ]
+
+DRAW_RATE = 0.75
+MAX_CPL = 60       # game-level CPL filter (mean clipped loss across game)
+CPL_THRESHOLD = 20 # per-ply CPL filter passed to generate_training_data
 SHARD_GAMES = 50
 N_WORKERS = max([1, os.cpu_count() - 2])
+Z_BLEND = 0.8      # weight on game result (Z); remainder goes to search WDL
+
+
+def to_wdl(x):
+    """Convert scalar x in [-1,1] to soft WDL [w, d, l]."""
+    return np.array([max(float(x), 0.0),
+                     1.0 - abs(float(x)),
+                     max(-float(x), 0.0)], dtype=np.float32)
 
 
 def bytes_feature(value):
@@ -99,7 +105,7 @@ def load_training_games():
     return games_by_run
 
 
-def make_example(enc_in, mask, policy, value, weight):
+def make_example(enc_in, mask, policy, value: np.ndarray, weight):
     enc_bytes = tf.io.serialize_tensor(
         tf.convert_to_tensor(enc_in)
     ).numpy()
@@ -118,7 +124,9 @@ def make_example(enc_in, mask, policy, value, weight):
                 "enc_in": bytes_feature(enc_bytes),
                 "mask": bytes_feature(mask_bytes),
                 "policy_logits": bytes_feature(pol_bytes),
-                "value_out": float_feature(value),
+                "value_out": tf.train.Feature(
+                    float_list=tf.train.FloatList(value=value.tolist())
+                ),
                 "weight": float_feature(weight),
             }
         )
@@ -148,17 +156,20 @@ def iter_game_records(game, sf_df):
     if len(gv.moves_uci) < 10:
         return
 
-    x_list, m_list, p_list, z_list, v_list, r_list = gv.generate_training_data(
+    x_list, m_list, p_list, z_list, v_list, wdl_list, r_list = gv.generate_training_data(
         cpl_threshold=CPL_THRESHOLD
     )
     if not x_list:
         return
 
-    weight = 0.5 if gv.result == 0 else 1.0
+    weight = 1.0
 
-    for enc_in, mask, policy, z, v in zip(x_list, m_list, p_list, z_list, v_list):
-        value = 0.9 * z + 0.1 * v
-        yield make_example(enc_in, mask, policy, value, weight)
+    for enc_in, mask, policy, z, v, wdl in zip(
+        x_list, m_list, p_list, z_list, v_list, wdl_list
+    ):
+        search_wdl = np.array(wdl, dtype=np.float32) if wdl is not None else to_wdl(v)
+        wdl_target = Z_BLEND * to_wdl(z) + (1 - Z_BLEND) * search_wdl
+        yield make_example(enc_in, mask, policy, wdl_target, weight)
 
 
 def make_jobs(games_by_run):

@@ -244,7 +244,7 @@ def build_conv_64pv(
     v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
     v = layers.Dense(FL // 2, activation="relu", name="v_fc1")(v_pool)
     v = layers.Dense(FL // 4, activation="relu", name="v_fc2")(v)
-    value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
+    value_out = layers.Dense(3, name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
@@ -253,7 +253,7 @@ def build_conv_64pv(
     
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
@@ -334,7 +334,7 @@ def build_conv_flat_64x67(
     v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
     v = layers.Dense(fl // 2, activation="relu", name="v_fc1")(v_pool)
     v = layers.Dense(fl // 4, activation="relu", name="v_fc2")(v)
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
+    value_out = layers.Dense(3, dtype="float32", name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
@@ -343,7 +343,7 @@ def build_conv_flat_64x67(
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
 
     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
@@ -507,7 +507,7 @@ def build_conv_flat_64x67SE(
 
     v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
     v = layers.Dense(128, activation="relu", name="v_fc1")(v_pool)
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
+    value_out = layers.Dense(3, dtype="float32", name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
@@ -516,7 +516,7 @@ def build_conv_flat_64x67SE(
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
 
     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
@@ -654,7 +654,7 @@ def build_conformer_64x67(
 
     # final value output (float32 for numerical stability)
     value_out = layers.Dense(
-        1, activation="tanh", dtype="float32", name="value_out")(v)
+        3, dtype="float32", name="value_out")(v)
 
     model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
 
@@ -663,7 +663,7 @@ def build_conformer_64x67(
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
     model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
@@ -775,7 +775,7 @@ def build_pt_conformer_interweaved(cfg=None):
             self.ap     = nn.Linear(cf, 1)
             self.vfc1   = nn.Linear(cf, 256)
             self.vfc2   = nn.Linear(256, 128)
-            self.vout   = nn.Linear(128, 1)
+            self.vout   = nn.Linear(128, 3)
 
         def forward(self, t):
             b = t.shape[0]
@@ -792,7 +792,7 @@ def build_pt_conformer_interweaved(cfg=None):
             v = _pt_attn_pool(s, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -872,7 +872,7 @@ def build_pt_transformer_16m(cfg=None):
             self.ap       = nn.Linear(de, 1)
             self.vfc1     = nn.Linear(de, 256)
             self.vfc2     = nn.Linear(256, 128)
-            self.vout     = nn.Linear(128, 1)
+            self.vout     = nn.Linear(128, 3)
 
         def forward(self, t):
             B   = t.shape[0]
@@ -892,7 +892,7 @@ def build_pt_transformer_16m(cfg=None):
             x = F.leaky_relu(self.pol_lnd(self.pol_down(x)), 0.01)
             r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
             pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")

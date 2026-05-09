@@ -202,7 +202,7 @@ def describe_variant(name, cfg):
         print(f"  Architecture : Gated-Ctx — x-sigmoid gate controls context absorption")
         print(f"  ctx encoder  : {cfg['mha_layers']} × bare-MHA(heads={cfg['mha_heads']}, d={C})")
         print(f"  conv blocks  : {cfg['conv_blocks']} × [ConvResBlock + sigmoid(x)·ctx_proj(g)]")
-    print(f"  value head   : attention pooling → Dense(256) → Dense(128) → tanh")
+    print(f"  value head   : attention pooling -> Dense(256) -> Dense(128) -> WDL [3] (raw logits)")
     print(f"  {'─'*60}")
 
 
@@ -241,7 +241,7 @@ def _tf_compile(model):
     opt = tf.keras.mixed_precision.LossScaleOptimizer(opt)
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     model.compile(optimizer=opt, loss=loss_dict,
                   loss_weights={"policy_logits": 1.0, "value_out": 1.0})
@@ -264,7 +264,7 @@ def _tf_attn_pool_value_head(x, C, layers, activation="relu"):
     v = layers.Reshape((C,), name="v_squeeze")(v)
     v = layers.Dense(256, activation=activation, name="v_fc1")(v)
     v = layers.Dense(128, activation=activation, name="v_fc2")(v)
-    return layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
+    return layers.Dense(3, dtype="float32", name="value_out")(v)
 
 
 def _tf_context_encoder(proj, C, nh, nl, layers, tf):
@@ -834,7 +834,7 @@ def build_pt_pure_conv(cfg):
             self.ap   = nn.Linear(C, 1)
             self.vfc1 = nn.Linear(C, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def _blk(self):
             return nn.Sequential(
@@ -851,7 +851,7 @@ def build_pt_pure_conv(cfg):
             s   = x.permute(0, 2, 3, 1).reshape(B, 64, C)
             v   = _pt_attn_pool(s, self.ap)
             v   = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -897,7 +897,7 @@ def build_pt_conformer(cfg):
             self.ap   = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def _cblk(self):
             return nn.Sequential(
@@ -923,7 +923,7 @@ def build_pt_conformer(cfg):
             w     = torch.softmax(self.ap(x_seq), dim=1)
             v     = (x_seq * w).sum(dim=1)
             v     = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -1004,7 +1004,7 @@ def build_pt_conformer_interweaved(cfg):
             self.ap = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             b = t.shape[0]
@@ -1030,7 +1030,7 @@ def build_pt_conformer_interweaved(cfg):
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
 
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
@@ -1086,7 +1086,7 @@ def build_pt_transformer(cfg):
             self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             B   = t.shape[0]
@@ -1111,7 +1111,7 @@ def build_pt_transformer(cfg):
             r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
             pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
 
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
@@ -1169,7 +1169,7 @@ def build_pt_transformer_16m(cfg):
             self.ap   = nn.Linear(de, 1)
             self.vfc1 = nn.Linear(de, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             B   = t.shape[0]
@@ -1194,7 +1194,7 @@ def build_pt_transformer_16m(cfg):
             r = x; x = F.leaky_relu(r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))), 0.01)
             pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
 
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
@@ -1220,7 +1220,7 @@ def build_pt_film(cfg):
             self.ap    = nn.Linear(C, 1)
             self.vfc1  = nn.Linear(C, 256)
             self.vfc2  = nn.Linear(256, 128)
-            self.vout  = nn.Linear(128, 1)
+            self.vout  = nn.Linear(128, 3)
 
         def _blk(self):
             # Returns a ModuleList so we can apply each op separately
@@ -1249,7 +1249,7 @@ def build_pt_film(cfg):
             s   = x.permute(0, 2, 3, 1).reshape(B, 64, C)
             v   = _pt_attn_pool(s, self.ap)
             v   = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -1292,7 +1292,7 @@ def build_pt_concat_fusion(cfg):
             self.ap   = nn.Linear(C, 1)
             self.vfc1 = nn.Linear(C, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             B = t.shape[0]
@@ -1308,7 +1308,7 @@ def build_pt_concat_fusion(cfg):
             s   = x.permute(0, 2, 3, 1).reshape(B, 64, C)
             v   = _pt_attn_pool(s, self.ap)
             v   = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -1348,7 +1348,7 @@ def build_pt_gated_ctx(cfg):
             self.ap   = nn.Linear(C, 1)
             self.vfc1 = nn.Linear(C, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             B = t.shape[0]
@@ -1364,7 +1364,7 @@ def build_pt_gated_ctx(cfg):
             s   = x.permute(0, 2, 3, 1).reshape(B, 64, C)
             v   = _pt_attn_pool(s, self.ap)
             v   = F.relu(self.vfc1(v)); v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -1450,7 +1450,7 @@ def build_pt_conformer_transheavy(cfg):
             self.ap   = nn.Linear(cf, 1)
             self.vfc1 = nn.Linear(cf, 256)
             self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 1)
+            self.vout = nn.Linear(128, 3)
 
         def forward(self, t):
             b = t.shape[0]
@@ -1475,7 +1475,7 @@ def build_pt_conformer_transheavy(cfg):
             v = _pt_attn_pool(s, self.ap)
             v = F.relu(self.vfc1(v))
             v = F.relu(self.vfc2(v))
-            return pol, torch.tanh(self.vout(v))
+            return pol, self.vout(v)
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")

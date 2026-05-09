@@ -234,7 +234,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
+        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     head_weights = {
         "policy_logits": cfg.policy_loss_weight,

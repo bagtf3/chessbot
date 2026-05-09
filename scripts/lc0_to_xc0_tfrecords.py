@@ -29,6 +29,7 @@ BUFFER_SIZE      = 300_000
 POLICY_MAX_CLIP  = 0.6
 CHUNK_BATCH_SIZE = 512
 DRAW_DROP_RATE   = 0.75
+Z_BLEND          = 0.5
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
 DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0\040126"
@@ -52,7 +53,7 @@ def scan_chunks(lc0_dir):
     return chunks
 
 
-def make_example(enc_in, mask, policy, value):
+def make_example(enc_in, mask, policy, value: np.ndarray):
     enc_bytes = tf.io.serialize_tensor(tf.constant(enc_in.astype(np.int16))).numpy()
     mask_bytes = tf.io.serialize_tensor(tf.constant(mask.astype(np.int32))).numpy()
     pol_bytes  = tf.io.serialize_tensor(tf.constant(policy.astype(np.float32))).numpy()
@@ -60,7 +61,7 @@ def make_example(enc_in, mask, policy, value):
         "enc_in":        tf.train.Feature(bytes_list=tf.train.BytesList(value=[enc_bytes])),
         "mask":          tf.train.Feature(bytes_list=tf.train.BytesList(value=[mask_bytes])),
         "policy_logits": tf.train.Feature(bytes_list=tf.train.BytesList(value=[pol_bytes])),
-        "value_out":     tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)])),
+        "value_out":     tf.train.Feature(float_list=tf.train.FloatList(value=value.tolist())),
         "weight":        tf.train.Feature(float_list=tf.train.FloatList(value=[1.0])),
     }))
     return ex.SerializeToString()
@@ -85,15 +86,16 @@ def conversion_worker(chunk_subset, out_queue, worker_id):
     )
 
     n_sent = 0
-    for tokens_b, masks_b, policies_b, values_b in parser.sequential():
+    for tokens_b, masks_b, policies_b, result_wdl_b, search_wdl_b in parser.sequential():
         clipped = np.minimum(policies_b, POLICY_MAX_CLIP)
         sums = clipped.sum(axis=1, keepdims=True)
         sums = np.where(sums > 0, sums, 1.0)
         clipped /= sums
 
+        wdl_targets = Z_BLEND * result_wdl_b + (1 - Z_BLEND) * search_wdl_b
         records = [
-            make_example(tokens_b[i], masks_b[i], clipped[i], values_b[i])
-            for i in range(len(values_b))
+            make_example(tokens_b[i], masks_b[i], clipped[i], wdl_targets[i])
+            for i in range(len(result_wdl_b))
         ]
         out_queue.put(records)
         n_sent += len(records)

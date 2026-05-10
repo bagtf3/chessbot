@@ -192,8 +192,7 @@ class XercesEngine:
         if details:
             q_white = details[0].Q
             q_stm = q_white * sign
-            vwq = tree.visit_weighted_Q()
-            print(f"Q(stm): {q_stm:+.3f}  Q(white): {q_white:+.3f}  Q(vw): {vwq:+.3f}")
+            print(f"Q(stm): {q_stm:+.3f}  Q(white): {q_white:+.3f}")
 
         total_n = sum([d.N for d in details]) if details else 1
 

@@ -509,7 +509,8 @@ class Rescorer(object):
             if 'Q_stm' in tr:
                 Q = tr['Q_stm']
             else:
-                this_q = tr.get('best_Q', tr.get('visit_weighted_Q'))
+                wdl = tr.get('best_wdl')
+                this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q if turn else -this_q
 
             Y_init = np.clip(cfg.z_mix * Z_stm + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
@@ -896,6 +897,7 @@ class Rescorer(object):
                 'nn_value': tr.get('nn_value'),
                 'nn_raw_priors': tr.get('nn_raw_priors', []),
                 'mass_on_legal': tr.get('nn_mass_on_legal'),
+                'best_wdl': tr.get('best_wdl'),
                 'sf_cp': best_cp,
                 'sf_wdl': sf_wdl,
                 'candidate_visits': list(zip(mvs, vis)),

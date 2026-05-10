@@ -761,12 +761,9 @@ class GameViewer:
                 )
                 shown_ucis.add(chosen)
 
-        this_q = node.get("best_Q")
-        if this_q is None:
-            this_q = node.get("visit_weighted_Q")
-            if this_q is not None:
-                print(f"\nvisit-weighted Q={this_q:+.4f}")
-        else:
+        wdl = node.get("best_wdl")
+        this_q = (wdl[0] - wdl[2]) if wdl is not None else None
+        if this_q is not None:
             print(f"\nBest Q={this_q:+.4f}")
 
         r = self.sf_row_for_ply(self.ply)
@@ -1145,7 +1142,8 @@ class GameViewer:
             mask = rb.legal_move_mask()
 
             # value target 0.5*Z + 0.5*best_q (q of most visited child)
-            this_q = node.get("best_Q", node.get("visit_weighted_Q"))
+            wdl = node.get("best_wdl")
+            this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
             this_q_stm = this_q if is_white_move else -this_q
             if result > 0:
                 z = 1 if is_white_move else -1
@@ -1154,7 +1152,7 @@ class GameViewer:
             else:
                 z = 0
             
-            this_wdl = node.get("root_wdl")
+            this_wdl = node.get("best_wdl")
             X.append(x)
             M.append(mask)
             P.append(policy)

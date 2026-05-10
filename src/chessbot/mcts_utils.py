@@ -2,7 +2,6 @@ import uuid
 from time import time as _now
 
 import chess, chess.syzygy
-import tl2cgen as tl2
 import numpy as np
 
 from pyfastchess import MCTSTree as fasttree
@@ -65,7 +64,7 @@ class MCTSTree(fasttree):
         if cfg.add_root_noise:
             self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
         self.set_reuse_tree(bool(cfg.reuse_tree))
-        self.set_use_u_attn(bool(cfg.use_u_attn))
+        self.set_vscale(float(cfg.vscale))
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -534,16 +533,16 @@ class ChessGame(object):
         }
         
         # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
-        vwq = rnd(self.tree.visit_weighted_Q(), 4)
-        best_q = rnd(details[0].Q, 4)
+        best_d = details[0]
+        best_wdl = (rnd(best_d.win, 4), rnd(best_d.draw, 4), rnd(best_d.loss, 4))
+        best_q = rnd(best_d.Q, 4)
         Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
         if self.is_stockfish_turn():
             Q_stm = self.sf_eval
             Q_white = Q_stm if turn else -Q_stm
 
-        data["visit_weighted_Q"] = vwq
-        data['best_Q'] = best_q
+        data['best_wdl'] = best_wdl
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
         # keep a small list of items for gameplay checking

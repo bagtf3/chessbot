@@ -26,7 +26,6 @@ class Config(object):
 
     # MCTS
     c_puct = 2.0
-    use_u_attn = True
 
     use_smart_pruning = True
     pruning_factor = 1.33

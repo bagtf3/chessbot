@@ -356,7 +356,7 @@ def main():
     pwht    = np.array(pwht_list, dtype=np.float32)
     timings['load_shards'] = time.time() - t0
 
-    valid = ~np.isnan(Y_value)
+    valid = ~np.isnan(Y_value).any(axis=1) if Y_value.ndim == 2 else ~np.isnan(Y_value)
     n_invalid = int((~valid).sum())
     if n_invalid > 0:
         print(f"[retrain] {n_invalid} nan values found in Y, removing")

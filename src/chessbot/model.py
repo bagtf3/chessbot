@@ -359,21 +359,21 @@ def warm_conv_infer(graph, max_bs):
         _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
 
 
-def make_conv_infer(model, max_bs=1024, vscale=0.9):
+def make_conv_infer(model, max_bs=1024, vscale=None):
     """
-    Returns fwd((enc_np, _)) -> (logits_np, val_np).
-    Softmax, uniform_eps, and prior_clip_max are applied in C++ build_priors.
+    Returns fwd((enc_np,)) -> (logits_np, wdl_np).
+    logits_np: (B, 4288) float32 raw policy logits — softmax in C++ build_priors.
+    wdl_np:    (B, 3)    float32 STM-POV softmax probs [win, draw, loss].
+    vscale is applied in C++ during backprop (not here).
     """
-    value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
-
     @tf.function(input_signature=[
         tf.TensorSpec([None, 64], tf.int32),
     ], experimental_compile=True)
     def graph(enc):
         logits, value = model(enc, training=False)
         logits = tf.cast(tf.reshape(logits, [tf.shape(logits)[0], -1]), tf.float32)
-        value_f = tf.cast(value, tf.float32) * value_scale_c
-        return logits, value_f
+        wdl = tf.nn.softmax(tf.cast(value, tf.float32), axis=-1)
+        return logits, wdl
 
     def base_fwd(pair):
         if not isinstance(pair, (list, tuple)):

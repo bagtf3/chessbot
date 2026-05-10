@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from pyfastchess import raw_cache_bulk_insert, priors_cache_clear, priors_cache_stats
+from pyfastchess import (raw_cache_bulk_insert, raw_cache_bulk_insert_np,
+                         priors_cache_clear, priors_cache_stats)
 
 from chessbot import SF_LOC
 
@@ -448,15 +449,11 @@ class GameLooper(object):
             start = _now()
             probs_np, vals_np = self.infer((boards_np,))
         
-        # build raw_cache rows: (zobrist, {"value": v, "policy": probs})
-        to_raw_cache = []
-        for i, k in enumerate(keys):
-            v = np.asarray(vals_np[i]).reshape(())  # scalar
-            p = np.asarray(probs_np[i], dtype=np.float32)  # (4288,)
-            to_raw_cache.append((k, v, p))
-
-        # bulk insert
-        raw_cache_bulk_insert(to_raw_cache)
+        # bulk insert: pass batch arrays directly — zero Python loop
+        # vals_np: (B, 3) float32 WDL softmax probs (STM-POV)
+        # probs_np: (B, 4288) float32 raw policy logits
+        keys_np = np.array(keys, dtype=np.uint64)
+        raw_cache_bulk_insert_np(keys_np, vals_np[:B], probs_np[:B])
         stop = _now()
         self.prediction_times.append(stop-start)
         return new_target, B
@@ -516,18 +513,6 @@ class GameLooper(object):
         res.update(cfg.to_dict())
         res.update(mem_summary)
         res.update(game.meta)
-
-        # unscale Q values from inference vscale before saving
-        # SF-played plies store Q_stm/Q_white as tanh-based evals (not vscale-scaled)
-        vs = cfg.vscale
-        if vs and vs != 1.0:
-            q_keys = ("Q_stm", "Q_white", "best_Q", "visit_weighted_Q")
-            sf_only = {"Q_stm", "Q_white"}
-            for td in game.tree_data.values():
-                is_sf = td.get('selection_method') == 'stockfish'
-                for k in q_keys:
-                    if k in td and not (is_sf and k in sf_only):
-                        td[k] = np.clip(td[k] / vs, -1.0, 1.0)
 
         # attach tree search data to disk record
         res["tree_search_data"] = game.tree_data

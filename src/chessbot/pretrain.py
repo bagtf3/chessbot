@@ -33,7 +33,7 @@ UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
 DEFAULT_LR         = 2e-4
-DEFAULT_MAX_EPOCH  = 1201
+DEFAULT_MAX_EPOCH  = 2000
 
 
 # ---------------------------------------------------------------------------

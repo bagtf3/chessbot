@@ -380,7 +380,7 @@ def main() -> None:
         default="",
         help="second folder to blend 50/50 with --tfrec-dir",
     )
-    parser.add_argument("--max-epoch", type=int,   default=1201)
+    parser.add_argument("--max-epoch", type=int,   default=2000)
     parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
     args = parser.parse_args()
 

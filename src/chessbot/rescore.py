@@ -155,7 +155,9 @@ class SFRescoreThread:
                     best = info['pv'][0]
                     wdl = info.get('wdl')
                     wdl_val = (
-                        (wdl.relative.wins - wdl.relative.losses) / 1000.0
+                        (wdl.relative.wins / 1000.0,
+                         wdl.relative.draws / 1000.0,
+                         wdl.relative.losses / 1000.0)
                         if wdl is not None else None
                     )
                     self.res_q.put((req_id, {
@@ -513,17 +515,16 @@ class Rescorer(object):
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q if turn else -this_q
 
-            Y_init = np.clip(cfg.z_mix * Z_stm + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
-            if Y_init != Y_init:
-                board_ch.push(move_ch)
-                b_fast.push_uci(mv)
-                repetitions[b_fast.fen(include_counters=False)] += 1
-                continue
+            sf_wdl_tr = tr.get('sf_wdl')
+            if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
+                Y_init = (0.5 * z_to_wdl(Z_stm) + 0.5 * np.array(sf_wdl_tr, dtype=np.float32))
+            else:
+                Y_init = z_to_wdl(Z_stm)
 
             if is_sf_move:
                 if game_sf_depth and game_sf_depth >= cfg.rescore_depth:
                     self.maybe_seed_cache(b_fast, mv, Q, turn, repetitions)
-                
+
                 sf_pwht = 0.0 if is_validation_game else 1.0
                 self.training_data_from_sf(
                     b_fast, mv, cm, Y_init, is_draw, policy_weight=sf_pwht
@@ -535,10 +536,10 @@ class Rescorer(object):
                     'nn_raw_priors': tr.get('nn_raw_priors', []),
                     'mass_on_legal': tr.get('nn_mass_on_legal'),
                     'sf_cp': int(np.arctanh(np.clip(Q, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5)),
-                    'sf_wdl': Q,
+                    'sf_wdl': None,
                     'candidate_visits': [(c['uci'], c['visits']) for c in cm],
                     'result_z_stm': Z_stm,
-                    'target_y': Y_init,
+                    'target_y': float(Y_init[0] - Y_init[2]),
                     'policy_eligible': sf_pwht > 0
                 })
 
@@ -895,6 +896,7 @@ class Rescorer(object):
             pending_meta.append({
                 'stm': turn,
                 'nn_value': tr.get('nn_value'),
+                'nn_wdl': tr.get('nn_wdl'),
                 'nn_raw_priors': tr.get('nn_raw_priors', []),
                 'mass_on_legal': tr.get('nn_mass_on_legal'),
                 'best_wdl': tr.get('best_wdl'),
@@ -953,7 +955,7 @@ class Rescorer(object):
                 n_diff += 1
 
             z = z_eff if cfg.use_collar_rescoring else z_orig
-            Y = np.clip(cfg.z_mix * z + (1.0 - cfg.z_mix) * Q, -1.0, 1.0)
+            Y = blend_wdl(z, meta.get('best_wdl'), meta.get('sf_wdl'), is_white)
 
             # accept into retraining based on accuracy + random sampling
             # MSE vs sf_wdl (STM-POV, continuous) rather than Y to avoid
@@ -963,8 +965,9 @@ class Rescorer(object):
             sf_wdl = meta['sf_wdl']
             stm_sign = 1.0 if is_white else -1.0
             if nn_val is not None and sf_wdl is not None:
-                nn_stm = (nn_val / cfg.vscale) * stm_sign
-                mse = (nn_stm - sf_wdl) ** 2
+                nn_stm = nn_val * stm_sign
+                sf_scalar = sf_wdl[0] - sf_wdl[2]
+                mse = (nn_stm - sf_scalar) ** 2
             else:
                 mse = 0.0
             kl = meta['kl']
@@ -999,7 +1002,11 @@ class Rescorer(object):
                     sc['rng'] += 1
                     scw['rng'] += 1
 
-            self.pending_metrics.append({**meta, 'target_y': float(Y)})
+            self.pending_metrics.append({
+                **meta,
+                'target_y': Y[0] - Y[2],
+                'target_wdl': Y,
+            })
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
@@ -1198,24 +1205,32 @@ class Rescorer(object):
 
         nn_vals_stm, target_ys, sf_cps, sf_wdls, result_zs = [], [], [], [], []
         mol_vals, policy_samples = [], []
+        nn_wdls, target_wdls = [], []
 
         for m in chunk:
             nn_v = m.get('nn_value')
             if nn_v is None:
                 continue
             stm_sign = 1.0 if m['stm'] else -1.0
-            nn_stm = np.clip(nn_v * stm_sign / vscale, -1.0, 1.0)
+            nn_stm = np.clip(nn_v * stm_sign, -1.0, 1.0)
             nn_vals_stm.append(nn_stm)
             target_ys.append(m['target_y'])
             sf_cps.append(m['sf_cp'])
             wdl = m.get('sf_wdl')
-            sf_wdls.append(wdl if wdl is not None else float('nan'))
+            sf_wdls.append((wdl[0] - wdl[2]) if wdl is not None else float('nan'))
             result_zs.append(m['result_z_stm'])
             mol = m.get('mass_on_legal')
             mol_vals.append(mol if mol is not None else float('nan'))
             priors_map = {u: p for u, p in m.get('nn_raw_priors', [])}
             if m.get('policy_eligible', True):
                 policy_samples.append((priors_map, m.get('candidate_visits', [])))
+            nn_wdl = m.get('nn_wdl')
+            tgt_wdl = m.get('target_wdl')
+            if nn_wdl is not None and tgt_wdl is not None:
+                if not m['stm']:  # white-POV -> STM-POV for black: swap win/loss
+                    nn_wdl = (nn_wdl[2], nn_wdl[1], nn_wdl[0])
+                nn_wdls.append(nn_wdl)
+                target_wdls.append(tgt_wdl)
 
         nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
         target_ys   = np.array(target_ys,   dtype=np.float32)
@@ -1240,7 +1255,17 @@ class Rescorer(object):
         mol_est = float(np.mean(mol_vals[valid_m])) if valid_m.any() else float('nan')
         mol_cov = float(valid_m.mean()) if len(valid_m) else 0.0
 
-        stats = {'value_mse': val_mse, 'value_corr': val_corr}
+        if nn_wdls:
+            nn_wdl_arr  = np.array(nn_wdls,     dtype=np.float64)
+            tgt_wdl_arr = np.array(target_wdls, dtype=np.float64)
+            eps = 1e-7
+            nn_wdl_arr = np.clip(nn_wdl_arr, eps, 1.0 - eps)
+            nn_wdl_arr /= nn_wdl_arr.sum(axis=1, keepdims=True)
+            val_ce = -np.mean(np.sum(tgt_wdl_arr * np.log(nn_wdl_arr), axis=1))
+        else:
+            val_ce = float('nan')
+
+        stats = {'value_mse': val_mse, 'value_corr': val_corr, 'value_ce': val_ce}
         stats.update(pol_stats)
         stats['mass_on_legal'] = mol_est
         print_validation(epoch, stats, mass_on_legal=mol_est, mol_coverage=mol_cov)
@@ -1537,6 +1562,35 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
 
 def value_weight_for_game(cfg, is_draw):
     return cfg.draw_value_scale if is_draw else 1.0
+
+
+def z_to_wdl(z_stm):
+    if z_stm > 0:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    elif z_stm < 0:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+
+def blend_wdl(z_stm, best_wdl_white_pov, sf_wdl_stm, is_white):
+    """Build 3-component WDL training target.
+    50% game result, 25% search WDL, 25% SF WDL.
+    Falls back to 50/50 z/search when sf_wdl unavailable.
+    """
+    z_wdl = z_to_wdl(z_stm)
+
+    if best_wdl_white_pov is not None:
+        bw = np.array(best_wdl_white_pov, dtype=np.float32)
+        if not is_white:
+            bw = bw[[2, 1, 0]]
+    else:
+        bw = z_wdl
+
+    if sf_wdl_stm is not None and len(sf_wdl_stm) == 3:
+        sw = np.array(sf_wdl_stm, dtype=np.float32)
+        return (0.5 * z_wdl + 0.25 * bw + 0.25 * sw).astype(np.float32)
+
+    return (0.5 * z_wdl + 0.5 * bw).astype(np.float32)
 
 
 def save_pickle_atomic(obj, path, tries=0):

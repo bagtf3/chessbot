@@ -458,6 +458,7 @@ class ChessGame(object):
         self.mcts_sims_total = 0
         self.mcts_plies = 0
         self.sf_eval = None
+        self.sf_wdl = None
 
         self.sf_pending = False
         self.sf_ready = False
@@ -545,6 +546,8 @@ class ChessGame(object):
         data['best_wdl'] = best_wdl
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
+        if self.is_stockfish_turn() and self.sf_wdl is not None:
+            data['sf_wdl'] = self.sf_wdl
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 
@@ -579,6 +582,7 @@ class ChessGame(object):
 
         nn = self.tree.emulate_nn_result()
         data["nn_value"] = nn["value"]
+        data["nn_wdl"] = nn["wdl"]
         data["nn_raw_priors"] = nn["raw_priors"]
         data["nn_mass_on_legal"] = nn["mass_on_legal"]
 
@@ -589,11 +593,8 @@ class ChessGame(object):
         self.sf_ready = True
 
     def apply_stockfish_result(self, res_tup):
-        if len(res_tup) == 2:
-            sf_v, best_move = res_tup
-        else:
-            sf_v, best_move, searched = res_tup
-            self.sf_search_depth.append(searched)
+        sf_v, best_move = res_tup[0], res_tup[1]
+        self.sf_wdl = res_tup[2] if len(res_tup) > 2 else None
 
         self.sf_eval = sf_v
         self.sf_res_tup = None

@@ -110,16 +110,23 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         val = score_fn(info['score'])
         best_move = info.get("pv", [""])[0]
         search_depth = info['depth']
+        wdl_info = info.get('wdl')
+        wdl = (
+            (wdl_info.relative.wins / 1000.0,
+             wdl_info.relative.draws / 1000.0,
+             wdl_info.relative.losses / 1000.0)
+            if wdl_info is not None else None
+        )
     except Exception as e:
         print(e)
 
     finally:
         if new_eng:
             engine.quit()
-    
+
     # if time given, return search depth
     if time_lim is None:
-        return val, str(best_move)
+        return val, str(best_move), wdl
     else:
         return val, str(best_move), search_depth
 
@@ -587,17 +594,47 @@ def plot_training_progress(metrics_history, epoch=None, save_path=None, ma_max=5
     ax.set_title("CE gain vs uniform")
     ax.legend()
 
-    # value MSE
+    # value MSE (left) + optional value CE (right)
     ax = axes[1, 0]
     raw = np.array(col_vals("value_mse") or [])
     ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
     raw_seg = raw[start:] if raw.size else np.array([])
-    if raw_seg.size:
-        ax.plot(xs, mask_top_outliers(raw_seg, ma), label="mse", alpha=0.6, lw=1)
-    if ma.size:
-        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-    ax.set_title("value MSE")
-    ax.legend()
+    raw_ce = np.array(col_vals("value_ce") or [])
+    have_ce = raw_ce.size > 0 and not np.all(np.isnan(raw_ce))
+
+    if have_ce:
+        if raw_seg.size:
+            ax.plot(xs, mask_top_outliers(raw_seg, ma), color="tab:blue", alpha=0.4, lw=1)
+        l_mse = []
+        if ma.size:
+            l1, = ax.plot(xs, ma, color="tab:blue", label=f"MSE MA{ma_window}", lw=2)
+            l_mse.append(l1)
+        ax.set_ylabel("value MSE", color="tab:blue")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+
+        ax_ce = ax.twinx()
+        ma_ce = moving_average_pd(raw_ce, window=ma_window)[start:]
+        raw_ce_seg = raw_ce[start:]
+        l_ce = []
+        if raw_ce_seg.size:
+            ax_ce.plot(xs, mask_top_outliers(raw_ce_seg, ma_ce), color="tab:orange", alpha=0.4, lw=1)
+        if ma_ce.size:
+            l2, = ax_ce.plot(xs, ma_ce, color="tab:orange", label=f"CE MA{ma_window}", lw=2)
+            l_ce.append(l2)
+        ax_ce.set_ylabel("value CE", color="tab:orange")
+        ax_ce.tick_params(axis="y", labelcolor="tab:orange")
+
+        ax.set_title("value MSE / CE")
+        handles = l_mse + l_ce
+        if handles:
+            ax.legend(handles=handles, fontsize=8)
+    else:
+        if raw_seg.size:
+            ax.plot(xs, mask_top_outliers(raw_seg, ma), label="mse", alpha=0.6, lw=1)
+        if ma.size:
+            ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
+        ax.set_title("value MSE")
+        ax.legend()
 
     # value corr
     ax = axes[1, 1]

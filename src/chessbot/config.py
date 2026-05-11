@@ -128,6 +128,9 @@ class Config(object):
     value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
     draw_value_scale = 0.5        # multiplies value_loss_weight for drawn games
     vscale = 0.9
+    contempt_flip_q  = -0.22
+    contempt_fight_c = 0.06
+    contempt_save_c  = 0.12
     retrain_batch_size = 512
     retrain_size = 10240
     training_queue_buffer = 30720

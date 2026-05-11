@@ -65,6 +65,11 @@ class MCTSTree(fasttree):
             self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
+        self.set_contempt(
+            float(cfg.contempt_flip_q),
+            float(cfg.contempt_fight_c),
+            float(cfg.contempt_save_c),
+        )
 
         # early-stop rolling state
         self._es_last_checked_at = 0
@@ -561,7 +566,8 @@ class ChessGame(object):
                 "uci": cd.uci, "visits": cd.N,
                 "visit_share": cd.visit_share, "last_visit": cd.last_visit,
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
-                "Qema": rnd(cd.Qema, 4),"Qdelta_sign": rnd(cd.Qdelta_sign, 4),
+                "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
+                "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),
                 "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }
             

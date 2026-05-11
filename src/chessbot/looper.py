@@ -645,7 +645,10 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
     else:
         print(f"[init] Loading {config.init_model}")
         model = load_model(config.init_model)
-        save_model(model, model_path)
+        try:
+            save_model(model, model_path)
+        except OSError:
+            pass  # another worker won the race; model_path will exist on next run
 
     looper = GameLooper(
         model=model, cfg=config.copy(),

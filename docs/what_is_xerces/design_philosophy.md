@@ -2,7 +2,7 @@
 
 Xerces is built around the idea that chess strength emerges from the interaction between search and learning, not from neural scale alone.
 
-Rather than pursuing the largest possible networks, Xerces explores whether smaller, information-dense models paired with aggressive, adaptive search can produce strong and interesting play under real compute constraints.
+Rather than pursuing the largest possible networks, Xerces explores whether moderately-sized, information-dense models paired with aggressive, adaptive search can produce strong and interesting play under real compute constraints.
 
 The project emphasizes:
 

@@ -1,4 +1,4 @@
-# Selfplay Training
+# Selfplay Tools
 
 ## Selfplay Telemetry
 

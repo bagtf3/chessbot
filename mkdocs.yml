@@ -1,0 +1,44 @@
+site_name: Xerces Chess Engine
+site_description: MCTS neural network chess engine
+repo_url: https://github.com/bagtf3/chessbot
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+
+nav:
+  - Home: index.md
+  - What is Xerces?:
+    - what_is_xerces/index.md
+    - Engine Landscape: what_is_xerces/engine_landscape.md
+    - Design Philosophy: what_is_xerces/design_philosophy.md
+  - Architecture:
+    - architecture/index.md
+    - System Overview: architecture/system_overview.md
+    - Search: architecture/search.md
+    - Neural Network: architecture/neural_network.md
+    - Training Pipeline: architecture/training_pipeline.md
+    - Evaluation Pipeline: architecture/evaluation_pipeline.md
+    - Runtime & Inference: architecture/runtime_and_inference.md
+  - Experimental Features:
+    - experimental_features/index.md
+    - MateLock: experimental_features/matelock.md
+    - PolicyFocus: experimental_features/policyfocus.md
+    - QMM: experimental_features/qmm.md
+    - VScale: experimental_features/vscale.md
+    - U Attenuation: experimental_features/u_attenuation.md
+    - Iterative Deepening MCTS: experimental_features/iterative_deepening_mcts.md
+  - Results:
+    - results/index.md
+    - Validation: results/validation.md
+    - Benchmarks: results/benchmarks.md
+    - Telemetry: results/telemetry.md
+    - Lessons Learned: results/lessons_learned.md
+  - Setup:
+    - setup/index.md
+    - Installation: setup/installation.md
+    - Running Xerces: setup/running_xerces.md
+    - Lichess Bot: setup/lichess_bot.md

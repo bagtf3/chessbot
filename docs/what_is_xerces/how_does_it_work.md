@@ -24,15 +24,9 @@ For each simulation, MCTS does four things:
 3. **Evaluate** that position with the neural network.
 4. **Back up** the result through every node on the selected path.
 
-```text
-          ROOT
-         /    \
-        A      B          1. SELECT: follow best PUCT scores
-       / \      \
-      A1  A2     B1  <--- expand & evaluate this new node
-      
-  backup: +0.6 flows up through B -> B1 path
-```
+| | | |
+|:-:|:-:|:-:|
+| ![Select](../images/mcts_select.png) | ![Expand](../images/mcts_expand.png) | ![Backup](../images/mcts_backup.png) |
 
 Over many simulations, good moves tend to collect more visits. Bad moves may
 still be checked, but they receive less attention unless there is a reason to
@@ -62,6 +56,10 @@ policy: e4 28%, d4 22%, Nf3 12%, c4 10%, ...
 value:  W 45%  D 38%  L 17%
 ```
 
+The model is called at every new node in the tree — not just the root. Each time the search expands a position it hasn't seen before, the network evaluates it and returns a fresh set of priors and a WDL estimate for that specific position. This is how the policy adapts as the game progresses.
+
+![Policy diagram](../images/policy_diagram.png)
+
 The model gives the search a starting point. Those values are then tested by repeatedly running the expand, evaluate, and back up loop.
 
 ## How PUCT Guides the Search
@@ -73,20 +71,11 @@ two competing forces:
 - **Exploration:** search moves that the model thinks may be promising, even if
   they have not been visited much yet.
 
-Each candidate move receives a score made from two pieces:
+Each candidate move receives a score at every selection step:
 
-```text
-PUCT score = Q + U
-```
+![PUCT formula](../images/puct_formula.png)
 
-`Q` is the current average value of the move based on previous search results.
-If a move keeps leading to good evaluations, its `Q` rises. If it keeps leading
-to bad positions, its `Q` falls.
-
-`U` is the exploration bonus. It is larger for moves with strong policy priors
-and fewer visits. This is how the neural network gets injected into the search.
-A move with a high prior gets early attention, but that bonus shrinks as the move
-is visited more.
+`Q` is the running average value from previous visits — it rises if a move keeps leading to good positions, falls if it doesn't. `U` is the exploration bonus: proportional to the policy prior and inversely proportional to visit count, so high-prior moves get early attention but that bonus shrinks as visits stack up.
 
 The search repeatedly chooses the move with the highest `Q + U` score. Early in
 the search, policy matters a lot. Later in the search, accumulated evidence
@@ -130,79 +119,3 @@ That creates the core improvement loop:
 ```text
 better model -> better search -> better training targets -> better model
 ```
-
-## Pretraining
-
-Before self-play begins, the model is pretrained on static data. This gives it basic chess structure before it has to generate its own training data.
-
-Pretraining can include positions analyzed by Stockfish, existing game data, or
-other supervised targets. The goal is not to make a perfect engine immediately.
-The goal is to reduce the amount of self-play training required.
-
-A randomly initialized model gives weak priors and noisy values. Search can still
-run, but it wastes a lot of effort. A pretrained model gives the search better
-first guesses, which makes self-play refinement much more efficient.
-
-![Pretraining metrics](../images/pretraining_metrics.png)
-
-## Self-Play Refinement
-
-After pretraining, Xerces improves through self-play.
-
-In self-play, Xerces plays games against itself. For every move, it stores the
-position, the final search visit distribution, and eventually the game result.
-Those records become training examples.
-
-A simplified training row looks like this:
-
-```text
-position: board state before the move
-policy target: MCTS visit distribution
-value target: game outcome or refined value target
-```
-
-The policy target teaches the model to imitate the search. The value target
-teaches the model which positions are actually converting into wins, losses, or
-draws.
-
-After enough games are collected, the model is retrained. Then the updated model
-plays more self-play games, generating a stronger batch of data. The cycle
-repeats.
-
-![Self-play model metrics](../images/selfplay_model_metrics.png)
-
-![Self-play CPL and BMR](../images/selfplay_cpl_bmr.png)
-
-## Training Mode vs Competition Mode
-
-Xerces behaves differently depending on whether it is generating training data or
-trying to play the strongest possible move.
-
-### Training Mode
-
-In training mode, the goal is not only to win the current game. The goal is to
-produce useful data.
-
-Training mode may use more randomness, exploration, sampling, or noise. This
-helps the engine see a wider range of positions instead of repeating the same
-lines forever.
-
-The engine records search distributions, results, metadata, and later rescoring
-information. These outputs are more important than a single game's result,
-because they feed the next training cycle.
-
-Training mode is designed to be curious.
-
-### Competition Mode
-
-In competition mode, the goal is simple: play the strongest move available.
-
-Competition mode reduces randomness and uses the search result more directly.
-The engine usually chooses the most robust move from the root search, often the
-move with the strongest visit count or best final selection score.
-
-Exploration still exists inside the search through PUCT, but the final move
-choice is much more deterministic. The engine is no longer trying to create broad
-training data. It is trying to convert the current position.
-
-Competition mode is designed to be ruthless.

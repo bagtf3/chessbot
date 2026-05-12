@@ -1,48 +1,10 @@
 # What is Xerces?
 
-Xerces is an MCTS chess engine with a neural network policy/value head, trained on multiple data sources: published Lc0 game data, curated Xerces self-play data, and ongoing self-play with Stockfish rescoring.
+Xerces is an open-source, neural-network powered chess engine, trained on multiple data sources: published Lc0 game data, curated Xerces self-play data, and ongoing self-play with Stockfish rescoring.
 
 - Monte Carlo Tree Search with PUCT selection
 - Neural network evaluation (multiple architectures — currently a [conformer](https://arxiv.org/abs/2005.08100) ~16M params)
 - Stockfish post-hoc rescoring for blunder detection and visit redistribution
 - Async retrain loop running between self-play rounds
 
----
-
-## Selfplay Telemetry
-
-![Selfplay telemetry](../images/selfplay_telemetry.JPG)
-
-Live stats during self-play: moves/sec, leaf evals/sec, games/hour, cache hit rate, PUCT stats, per-scenario results.
-
----
-
-## Retrain Loop
-
-![Retrain loop](../images/retrain_loop.JPG)
-
-Retraining runs as a subprocess between self-play rounds. Tracks value MSE, value correlation, policy cross-entropy, top-1 accuracy, and CE gain vs uniform.
-
----
-
-## MCTS Move Analysis
-
-![Game viewer](../images/gameviewer.JPG)
-
-Post-hoc analysis via `GameViewer`. Per-move breakdown: visit counts, policy prior vs search distribution, Q/Qe values, PUCT contributions, entropy, KL divergence, and Stockfish comparison.
-
----
-
-## Lc0 Comparison
-
-![Lc0 comparison](../images/lc0_compare.JPG)
-
-Compare Xerces policy outputs against Leela Chess Zero to examine distribution differences and KL divergence.
-
----
-
-## Deeper Stockfish Evaluation
-
-![Stockfish eval](../images/stockfish_eval.JPG)
-
-Re-run Stockfish on any position during game review to search to an arbitrary depth.
+The [Python package](https://github.com/bagtf3/chessbot) handles training, search orchestration, and inference using TensorFlow and ONNX Runtime. It sits on top of a high-performance [C++ backend](https://github.com/bagtf3/pyfastchess) built on [Disservin's chess-library](https://github.com/Disservin/chess-library), which provides the core board representation, move generation, and MCTS tree.

@@ -14,6 +14,8 @@ nav:
   - What is Xerces?:
     - what_is_xerces/index.md
     - Engine Landscape: what_is_xerces/engine_landscape.md
+    - How Does it Work?: what_is_xerces/how_does_it_work.md
+    - Selfplay Training: what_is_xerces/selfplay_training.md
     - Design Philosophy: what_is_xerces/design_philosophy.md
   - Architecture:
     - architecture/index.md

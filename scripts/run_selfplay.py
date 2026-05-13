@@ -512,6 +512,10 @@ def main(run_tag):
                         if done:
                             retrain = None
                             recorder.n_retrains += 1
+                            working_cfg = Config.from_yaml(yaml_path, init=True)
+                            if is_validation:
+                                working_cfg = create_validation_config(working_cfg, val_yaml_path)
+                            rescorer.config = working_cfg
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
                                 working_cfg.progress_csv_path)

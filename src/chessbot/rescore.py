@@ -958,14 +958,16 @@ class Rescorer(object):
             Y = blend_wdl(z, meta.get('best_wdl'), meta.get('sf_wdl'), is_white)
 
             # accept into retraining based on accuracy + random sampling
-            # value CE between nn_wdl and sf_wdl (both white-pov) rather than Y to avoid
+            # value CE between nn_wdl and sf_wdl (both stm-pov) rather than Y to avoid
             # oversampling early-game positions where NN correctly eval ~0
             # but outcome Z is +-1
             nn_wdl = meta['nn_wdl']
             sf_wdl = meta['sf_wdl']
             if nn_wdl is not None and sf_wdl is not None:
                 eps = 1e-7
-                p = np.clip(nn_wdl, eps, 1 - eps)
+                # nn_wdl is white-pov; sf_wdl is stm-pov — align nn to stm
+                nw = nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0])
+                p = np.clip(nw, eps, 1 - eps)
                 p = p / p.sum()
                 ce = -float(np.dot(sf_wdl, np.log(p)))
             else:

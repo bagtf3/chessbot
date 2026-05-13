@@ -27,10 +27,9 @@ nav:
   - Experimental Features:
     - experimental_features/index.md
     - MateLock: experimental_features/matelock.md
-    - PolicyFocus: experimental_features/policyfocus.md
-    - QMM: experimental_features/qmm.md
     - VScale: experimental_features/vscale.md
-    - U Attenuation: experimental_features/u_attenuation.md
+    - Robust Selection Criteria: experimental_features/rsc.md
+    - Blunder Replay: experimental_features/blunder_replay.md
     - Iterative Deepening MCTS: experimental_features/iterative_deepening_mcts.md
   - Results:
     - results/index.md

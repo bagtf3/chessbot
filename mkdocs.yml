@@ -17,15 +17,14 @@ nav:
     - How Does it Work?: what_is_xerces/how_does_it_work.md
     - Model Training: what_is_xerces/model_training.md
     - Selfplay Tools: what_is_xerces/selfplay_tools.md
-    - Design Philosophy: what_is_xerces/design_philosophy.md
   - Architecture:
     - architecture/index.md
-    - System Overview: architecture/system_overview.md
+    - Stack Overview: architecture/system_overview.md
     - Search: architecture/search.md
     - Neural Network: architecture/neural_network.md
-    - Training Pipeline: architecture/training_pipeline.md
-    - Evaluation Pipeline: architecture/evaluation_pipeline.md
-    - Runtime & Inference: architecture/runtime_and_inference.md
+    - Selfplay Suite: architecture/training_pipeline.md
+    - Rescoring & Retraining: architecture/evaluation_pipeline.md
+    - Review Tools: architecture/runtime_and_inference.md
   - Experimental Features:
     - experimental_features/index.md
     - MateLock: experimental_features/matelock.md

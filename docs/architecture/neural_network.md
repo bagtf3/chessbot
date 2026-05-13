@@ -20,17 +20,27 @@ Vocabulary size is 21. This encoding is defined in C++ (`backend.hpp`) and is fi
 
 ## Conformer Architecture
 
-The active model is defined in `scripts/model_variant_speed_test.py` as a hybrid conv-transformer network with roughly 16M parameters.
+The active model is `16m-conformer-interweaved`, defined in `scripts/model_variant_speed_test.py`. It is a hybrid architecture where each of the 10 blocks interweaves a transformer attention step with a convolutional residual step, rather than stacking all conv blocks followed by all transformer layers.
 
-**Input and embedding.** The 64-token sequence is passed through an embedding layer (`vocab_size=21`, `d_model_embed=128`) and then reshaped to an 8×8 spatial grid.
+**Input and embedding.** The 64-token sequence is passed through a token embedding (`vocab_size=21 → d_embed=256`) and immediately reshaped to an 8×8 spatial grid.
 
-**Convolutional frontend.** 10 residual convolutional blocks (`conv_filters=256`) with LayerNorm (not BatchNorm — small and variable batch sizes make BatchNorm unstable during selfplay inference). This stage builds local spatial features.
+**Positional embedding — graduated drip.** A positional embedding (`64 → cf=256`) is injected at block entry, in sequence form, with decreasing strength at fixed intervals: full strength at block 0, then ×0.1 at block 2, ×0.05 at block 4, and ×0.025 at block 6. This graduated drip lets the model absorb positional structure early and gradually de-emphasizes it as the representation matures.
 
-**Transformer encoder.** The spatial map is flattened to a 64-token sequence with positional embeddings added, then passed through 5 transformer encoder layers (`num_heads=8`, `ff_dim=1024`, `dropout=0.025`, LayerNorm-before-attention). The transformer stage builds global, cross-square relationships.
+**10 interweaved blocks.** Each block processes the representation in two stages:
 
-**Policy head.** The sequence is reshaped back to 8×8, then a convolutional head produces a 64×67 logit map, flattened to 4288 values. The 67 slots per source square encode 64 destination squares plus 3 underpromotion slots (knight, bishop, rook; queen promotion falls on the destination square). At inference, illegal moves are masked to -inf before softmax.
+1. *Attention stage* — reshape to sequence (64, cf), prenorm MHA: `LayerNorm → MHA(num_heads=8, key_dim=32) → Dropout → residual`.
+2. *Conv stage* — reshape back to (8, 8, cf), conv residual: `Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LayerNorm → residual + LeakyReLU`.
 
-**Value head.** Attention pooling over the spatial sequence (learned per-square weights, summed) feeds into two dense layers and a `Dense(3, float32)` output producing raw WDL logits. The model is trained with `CategoricalCrossentropy(from_logits=True)` against a 3-component [win, draw, loss] target.
+No BatchNorm anywhere — small and variable batch sizes during selfplay make it unstable.
+
+**Policy head — relational bilinear.** The spatial output is flattened to a (64, cf) sequence. Two independent projection towers compute a 128-dim vector per square:
+
+- *From-tower*: `Dense(384, gelu) → Dense(256, gelu) → Dense(128)` — one vector per source square.
+- *To-tower*: `Dense(384, gelu) → Dense(256, gelu) → Dense(128)` — one vector per destination square.
+
+Normal move logits are computed as scaled dot products between from- and to-vectors: `(from · to^T) / sqrt(128)`, producing a (64, 64) logit matrix flattened to 4096 values. Underpromotion logits (192 values, encoding from-file × to-file × piece type) are produced by a separate small conv head and concatenated, giving 4288 total policy logits.
+
+**Value head.** A 1×1 conv mix + LayerNorm + LeakyReLU branch feeds into attention pooling (learned per-square weights), then `Dense(256) → Dense(128) → Dense(3, float32)` producing raw WDL logits. The model is trained with `CategoricalCrossentropy(from_logits=True)` against a 3-component [win, draw, loss] target.
 
 The model is trained with mixed float16 precision (`mixed_float16` global policy set at import time).
 

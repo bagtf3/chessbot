@@ -12,6 +12,10 @@ Workers communicate with the main process through several multiprocessing queues
 
 The main process also maintains the retrain trigger: when the `Rescorer` has accumulated enough training examples (`retrain_size`), it pauses all workers, launches the retrain subprocess, waits for completion, broadcasts the new model path, then unpauses workers.
 
+![Selfplay telemetry](../images/selfplay_telemetry.JPG)
+
+The live telemetry view aggregates across all workers and updates each reporting interval. Key metrics: moves/sec (MPS) and leaf evaluations/sec (LPS) reflect game and NN throughput respectively; games/hour gives the effective data generation rate; cache hit rate shows what fraction of leaf collections were resolved by the C++ priors cache without NN inference; PUCT stats and per-scenario W/D/L breakdowns make it easy to spot if one game type is producing systematically lopsided results.
+
 ## GameLooper
 
 `GameLooper` manages a pool of `active_games` (up to `games_at_once` concurrent `ChessGame` instances) and drives the inference loop.

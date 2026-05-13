@@ -31,12 +31,7 @@ nav:
     - Robust Selection Criteria: experimental_features/rsc.md
     - Blunder Replay: experimental_features/blunder_replay.md
     - Iterative Deepening MCTS: experimental_features/iterative_deepening_mcts.md
-  - Results:
-    - results/index.md
-    - Validation: results/validation.md
-    - Benchmarks: results/benchmarks.md
-    - Telemetry: results/telemetry.md
-    - Lessons Learned: results/lessons_learned.md
+  - FAQ: faq.md
   - Setup:
     - setup/index.md
     - Installation: setup/installation.md

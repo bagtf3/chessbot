@@ -95,7 +95,7 @@ class Config(object):
     z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
 
     rescore_kl_threshold = 0.75   # always include if KL exceeds this
-    rescore_mse_threshold = 0.3   # always include if MSE exceeds this
+    rescore_ce_threshold = 0.625  # always include if value CE exceeds this
     rescore_sample_floor = 0.2    # min probability for soft-include sampling
 
     KL_boost_threshold = 1.75
@@ -114,6 +114,7 @@ class Config(object):
     # priors
     uniform_eps = 0.25
     prior_clip_max = 0.75
+    fpu_reduction = 0.1
 
     # randomness
     add_root_noise = True

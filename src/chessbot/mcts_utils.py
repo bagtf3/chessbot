@@ -65,6 +65,7 @@ class MCTSTree(fasttree):
             self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
+        self.set_fpu_reduction(float(cfg.fpu_reduction))
         self.set_contempt(
             float(cfg.contempt_flip_q),
             float(cfg.contempt_fight_c),

@@ -236,7 +236,7 @@ class Rescorer(object):
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'mse': 0, 'cpl': 0, 'rng': 0
+            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0
         }
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
@@ -469,7 +469,7 @@ class Rescorer(object):
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
             'use_collar_rescoring', 'rescore_analyze_batch',
             'draw_value_scale',
-            'rescore_kl_threshold', 'rescore_mse_threshold', 'rescore_sample_floor',
+            'rescore_kl_threshold', 'rescore_ce_threshold', 'rescore_sample_floor',
             'vscale'
         )
         game_state = {
@@ -762,7 +762,7 @@ class Rescorer(object):
 
         # thresholds for retrain acceptance
         kl_t = cfg.rescore_kl_threshold
-        mse_t = cfg.rescore_mse_threshold
+        ce_t = cfg.rescore_ce_threshold
         cpl_t = cfg.rescore_inaccuracy_cp
 
         cpl_s = 0.0
@@ -958,21 +958,21 @@ class Rescorer(object):
             Y = blend_wdl(z, meta.get('best_wdl'), meta.get('sf_wdl'), is_white)
 
             # accept into retraining based on accuracy + random sampling
-            # MSE vs sf_wdl (STM-POV, continuous) rather than Y to avoid
+            # value CE between nn_wdl and sf_wdl (both white-pov) rather than Y to avoid
             # oversampling early-game positions where NN correctly eval ~0
             # but outcome Z is +-1
-            nn_val = meta['nn_value']
+            nn_wdl = meta['nn_wdl']
             sf_wdl = meta['sf_wdl']
-            stm_sign = 1.0 if is_white else -1.0
-            if nn_val is not None and sf_wdl is not None:
-                nn_stm = nn_val * stm_sign
-                sf_scalar = sf_wdl[0] - sf_wdl[2]
-                mse = (nn_stm - sf_scalar) ** 2
+            if nn_wdl is not None and sf_wdl is not None:
+                eps = 1e-7
+                p = np.clip(nn_wdl, eps, 1 - eps)
+                p = p / p.sum()
+                ce = -float(np.dot(sf_wdl, np.log(p)))
             else:
-                mse = 0.0
+                ce = 0.0
             kl = meta['kl']
             hit_kl = kl > kl_t
-            hit_mse = mse > mse_t
+            hit_ce = ce > ce_t
             hit_cpl = meta['cpl'] >= cpl_t
 
             sc = self.sample_counts
@@ -980,21 +980,21 @@ class Rescorer(object):
             sc['total'] += 1
             scw['total'] += 1
 
-            if hit_kl or hit_mse or hit_cpl:
+            if hit_kl or hit_ce or hit_cpl:
                 self.training_data.append((x, mask, policy, Y, vwht, pwht))
                 sc['accepted'] += 1
                 scw['accepted'] += 1
                 if hit_kl:
                     sc['kl'] += 1
                     scw['kl'] += 1
-                if hit_mse:
-                    sc['mse'] += 1
-                    scw['mse'] += 1
+                if hit_ce:
+                    sc['ce'] += 1
+                    scw['ce'] += 1
                 if hit_cpl:
                     sc['cpl'] += 1
                     scw['cpl'] += 1
             else:
-                score = max(kl / kl_t, mse / mse_t)
+                score = max(kl / kl_t, ce / ce_t)
                 if random.random() < max(cfg.rescore_sample_floor, score):
                     self.training_data.append((x, mask, policy, Y, vwht, pwht))
                     sc['accepted'] += 1
@@ -1164,8 +1164,8 @@ class Rescorer(object):
             print(row("last 300", combined))
 
     def print_sample_stats(self):
-        cats = ("cpl", "kl", "mse", "rng")
-        labels = ("CPL", "KL", "MSE", "rng")
+        cats = ("cpl", "kl", "ce", "rng")
+        labels = ("CPL", " KL", " CE", "rng")
         W = 10
 
         def col(val):
@@ -1187,7 +1187,7 @@ class Rescorer(object):
         print(row("total", self.sample_counts))
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'mse': 0, 'cpl': 0, 'rng': 0
+            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0
         }
         self.sample_counts_window = zero_sc()
 

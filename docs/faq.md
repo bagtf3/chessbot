@@ -21,7 +21,7 @@ things work is to build it myself. It's also fun to be able to experiment with n
 
 ## How strong is it?
 
-I estimate between 2600-2700 Elo (human scale). In validation mode it runs under 20 centipawn loss on average.
+I estimate between 2600-2700 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs under 20 centipawn loss on average.
 
 ---
 

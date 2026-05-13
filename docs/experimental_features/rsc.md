@@ -33,4 +33,4 @@ best_uci = max(
 
 ## Why Not Just Most-Visited
 
-Pure visit count can be gamed by PUCT: a move with high uncertainty gets a large U bonus and accumulates visits early, even if its Q ultimately converges to something mediocre. RSC requires multiple independent signals to agree. A move wins the RSC vote only if it's well-visited *and* has a good value *and* that value has been stable — not just because it looked exciting to explore early in the search.
+A move that accumulates a large visit lead early can be difficult to surpass within the remaining sim budget, even if a better move emerges later. RSC requires multiple independent signals to agree — a move wins the vote only if it's well-visited *and* has a good value *and* that value has been stable.

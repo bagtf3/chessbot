@@ -8,7 +8,7 @@ Xerces is an open-source chess engine built around Monte Carlo Tree Search and a
 
 ## Is Xerces an Lc0 clone or fork?
 
-No, I wrote the C++ and python myself from scratch. Interestingly though, the `chess-library` backend was provided by Disservin, the lead developer of Stockfish
+No, I wrote the C++ and python myself from scratch. Interestingly though, the `chess-library` backend was provided by Disservin, the lead developer of Stockfish.
 
 ---
 

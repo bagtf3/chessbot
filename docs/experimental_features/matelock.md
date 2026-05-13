@@ -1,6 +1,6 @@
 # MateLock
 
-When a forced mate is found anywhere in the tree during backpropagation, Xerces locks all future descents through the mating line — bypassing PUCT entirely until the game ends. Simultaneously, children that lead to the engine losing receive a decaying penalty on their PUCT score to discourage revisiting them.
+When a forced mate is found anywhere in the tree during backpropagation, Xerces locks the next visit through that mating line — bypassing PUCT entirely until the game ends or a non-mating solution is found. Simultaneously, children that lead to the engine losing receive a decaying penalty on their PUCT score to discourage revisiting them.
 
 ## How It Works
 
@@ -36,4 +36,5 @@ if (pen > 0) {
 }
 ```
 
-Once a mate is locked, the remaining sim budget deepens and confirms the mating line rather than exploring alternatives. Xerces won't second-guess a known forced win just because a different move has an attractive prior.
+## Effect
+The side that would deliver mate is forced to replay the moves leading to checkmate and the side the would lose via checkmate is encouraged to keep trying other moves to avoid losing. This effectively creates a forced checkmate test. If its possible for one side to force-checkmate the other, this feature will find it.

@@ -388,7 +388,8 @@ def main(run_tag):
                 gph = 3600 * total_games / run_time
                 print(f"[main loop] Run Time: {format_time(run_time)}")
                 print(f"[main loop] Games Completed {total_games} ({gph:.2f} per hour)")
-                print(f"[main loop] {len(finished_games)} unprocessed games in the queue")
+                rescorer_pending = len(rescorer.intake) + len(rescorer.pending)
+                print(f"[main loop] {len(finished_games)} unprocessed + {rescorer_pending} in rescorer queue")
 
             # fresh reload each pass
             working_cfg = Config.from_yaml(yaml_path, init=True)
@@ -581,6 +582,41 @@ def main(run_tag):
                 build_validation_summary(recorder)
                 # we do not train after validation currently
                 continue
+
+        # drain any remaining games before exit
+        remaining = len(finished_games) + len(rescorer.intake) + len(rescorer.pending)
+        if remaining and not STOP_REQUESTED.is_set():
+            print(f"[main] {remaining} games remaining after all rounds — continuing post-process")
+            while (finished_games or rescorer.intake or rescorer.pending) and not STOP_REQUESTED.is_set():
+                while finished_games:
+                    to_process = finished_games.popleft()
+                    rescorer.submit(pull_pkl(to_process))
+                rescorer.tick()
+                recorder.training_queue = rescorer.training_data_size
+                if recorder.training_queue >= needed_to_retrain:
+                    k = max(1, recorder.training_queue // working_cfg.retrain_size)
+                    rescorer.write_training_data_pkl(size=k * working_cfg.retrain_size, randomize=True)
+                    recorder.training_queue = rescorer.training_data_size
+                    if retrain is None:
+                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
+                        rescorer.reset_writer()
+                    while retrain is not None:
+                        done, rc = poll_retrain(retrain, print_output=True)
+                        if done:
+                            retrain = None
+                            recorder.n_retrains += 1
+                            working_cfg = Config.from_yaml(yaml_path, init=True)
+                            rescorer.config = working_cfg
+                            rescorer.aggregate_metrics(
+                                n_retrains, working_cfg.vscale, working_cfg.progress_csv_path)
+                            n_retrains += 1
+                        while finished_games:
+                            to_process = finished_games.popleft()
+                            rescorer.submit(pull_pkl(to_process))
+                        rescorer.tick()
+                        time.sleep(0.05)
+                else:
+                    time.sleep(0.1)
 
         # capture the return situation
         rescorer.tick()

@@ -66,6 +66,8 @@ class MCTSTree(fasttree):
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
         self.set_fpu_reduction(float(cfg.fpu_reduction))
+        self.set_qema_span(float(cfg.qema_span))
+        self.set_qdelta_span(float(cfg.qdelta_span))
         self.set_contempt(
             float(cfg.contempt_flip_q),
             float(cfg.contempt_fight_c),

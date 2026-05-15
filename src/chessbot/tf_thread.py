@@ -4,7 +4,7 @@ from queue import Queue, Empty
 from collections import deque
 
 import numpy as np
-from pyfastchess import raw_cache_bulk_insert
+from pyfastchess import raw_cache_bulk_insert_np
 
 KEY_PAD = -9999
 class Batcher(object):
@@ -18,6 +18,7 @@ class Batcher(object):
 
         self.total_seen = 0
         self.duplicate_removed = 0
+        self.starved_passes = 0
 
     def __len__(self):
         return len(self.boards)
@@ -41,7 +42,7 @@ class Batcher(object):
             self.keys.append(k)
             self.boards.append(np.asarray(b, dtype=np.int32))
 
-    def pop_batch(self, max_size=None, always_pad=False, never_pad=False):
+    def pop_batch(self, max_size=None, always_pad=False, never_pad=False, patience=None):
         """Pop a batch and return (keys, boards_np).
 
         Chooses the candidate batch size that minimizes waste:
@@ -62,7 +63,14 @@ class Batcher(object):
 
         n = len(self.boards)
         if n == 0:
+            self.starved_passes = 0
             return None
+
+        if patience is not None and n < cands[0]:
+            self.starved_passes += 1
+            if self.starved_passes < patience:
+                return None
+            self.starved_passes = 0
 
         best_s = None
         best_waste = None
@@ -118,6 +126,7 @@ class Batcher(object):
         self.currently_batched_keys.difference_update(real_keys)
         self.keys = self.keys[take:]
         self.boards = self.boards[take:]
+        self.starved_passes = 0
 
         return (out_keys, boards_np)
 
@@ -264,17 +273,11 @@ class TensorFlowThread(object):
 
                 probs_np, vals_np = infer((boards_np,))
 
-                to_raw_cache = []
-                for i, k in enumerate(keys):
-                    if k == KEY_PAD:
-                        continue
-
-                    v = np.asarray(vals_np[i]).reshape(())
-                    p = np.asarray(probs_np[i], dtype=np.float32)
-                    to_raw_cache.append((k, v, p))
-
-                if to_raw_cache:
-                    raw_cache_bulk_insert(to_raw_cache)
+                real_idx = [i for i, k in enumerate(keys) if k != KEY_PAD]
+                if real_idx:
+                    idx = np.array(real_idx)
+                    real_keys = np.array([keys[i] for i in real_idx], dtype=np.uint64)
+                    raw_cache_bulk_insert_np(real_keys, vals_np[idx], probs_np[idx])
                     with self.preds_lock:
                         self.last_preds_cached += 1
                         self.preds_ev.set()

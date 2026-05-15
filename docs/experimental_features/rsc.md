@@ -8,9 +8,9 @@ RSC considers the top-N candidates (up to 5, minimum 100 visits each). For each,
 
 - **Visit count** — raw simulation visits
 - **Q** — mean action value (white-POV, flipped for black)
-- **Qema** — exponential moving average of Q, smoothing out noisy early estimates
+- **Qema** — exponential moving average of Q, smoothing out noisy early estimates (span configurable via `qema_span`)
 - **Visit share** — EMA of how frequently this child was selected relative to siblings during search
-- **Qdelta_sign** — sign of the recent Q delta trend; positive means Q has been improving
+- **Qdelta_sign** — EMA of the sign of Q deltas relative to the side to move; positive means Q has been trending in the current player's favor (span configurable via `qdelta_span`)
 
 Each signal is min-max normalized to [0, 1] across the candidate set, then converted to a probability distribution. The final RSC score is an equal-weight sum:
 

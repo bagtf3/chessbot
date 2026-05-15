@@ -115,6 +115,8 @@ class Config(object):
     uniform_eps = 0.25
     prior_clip_max = 0.75
     fpu_reduction = 0.1
+    qema_span = 40
+    qdelta_span = 100
 
     # randomness
     add_root_noise = True

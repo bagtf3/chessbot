@@ -10,8 +10,8 @@ Each `MCTSNode` holds:
 
 - **Visit count** (`N`) — atomic, incremented during virtual loss and resolved on backprop.
 - **WDL accumulators** (`p_win`, `p_draw`, `p_loss`) — cumulative sums of backpropped WDL values (white-POV). `Q = (p_win - p_loss) / N`.
-- **Qema** — exponential moving average of Q over the last ~40 visits. Used in robust selection to smooth noisy early estimates.
-- **Qdelta_sign** — sign of Q delta trend over the last ~100 visits. Used to detect Q convergence in early stopping.
+- **Qema** — exponential moving average of Q. Span is configurable (`qema_span`, default 40). Used in robust selection to smooth noisy early estimates.
+- **Qdelta_sign** — EMA of the sign of Q deltas relative to the parent's STM POV; positive means Q has been trending in favor of the side to move. Span is configurable (`qdelta_span`, default 100). Used to detect Q convergence in early stopping.
 - **Children** (`ordered_children`) — vector of `ChildEntry` structs with `uci`, `prior` (post-fudge), `raw_prior`, and a lazily-allocated `unique_ptr<MCTSNode>`. Children are only allocated when first selected.
 - **State flags** — `is_expanded`, `is_pending`, `is_inflight`, `is_terminal`.
 - **Visit share** — EMA tracking how often this child is selected relative to its siblings.

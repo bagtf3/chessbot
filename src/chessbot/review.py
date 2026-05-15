@@ -529,7 +529,7 @@ class GameViewer:
         sign = 1 if self.board.side_to_move() == "w" else -1
         q = c.get("Q", 0.0) * sign
         qema = c.get("Qema", 0.0) * sign
-        ds = c.get("Qdelta_sign", 0.0) * sign
+        ds = c.get("Qdelta_sign", 0.0)
 
         p = c.get("P", 0.0)
         u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))

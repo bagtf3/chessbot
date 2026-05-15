@@ -575,9 +575,10 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # fast PV via C++
+        # fast PV via C++; for sampled moves trace from xc0's choice, not the sampled move
+        pv_start = "" if method == "stockfish" else (xc0_move or mv)
         pv = []
-        pv_items = self.tree.principal_variation(24)
+        pv_items = self.tree.principal_variation(24, pv_start)
         for x in pv_items:
             pv.append({
                 "uci": x.uci, "visits": int(x.visits),

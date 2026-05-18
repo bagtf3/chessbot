@@ -1,5 +1,6 @@
 site_name: Xerces Chess Engine
 site_description: MCTS neural network chess engine
+site_url: https://bagtf3.github.io/chessbot/
 repo_url: https://github.com/bagtf3/chessbot
 
 theme:

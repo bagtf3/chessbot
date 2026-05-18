@@ -36,6 +36,7 @@ from chessbot.mcts_utils import MCTSTree
 from chessbot.model import load_model, make_conv_infer
 from chessbot.tf_thread import Batcher, TensorFlowThread
 from chessbot.engines import lc0_analyze
+from chessbot.utils import random_init
 
 SF_LOC = os.getenv("SF_LOC", "")
 LC0_LOC = os.getenv("LC0_LOC", "")
@@ -53,9 +54,9 @@ ARROW_COLORS = ["#00c853", "#2196f3", "#ff6d00", "#9c27b0", "#607d8b"]
 
 
 class Cfg:
-    """Duck-typed config consumed by MCTSTree. Mirrors xerces.py's Cfg."""
+    """Duck-typed config consumed by MCTSTree."""
     c_puct           = 2.0
-    sims_floor       = 200
+    sims_floor       = 0
     sims_ceiling     = 800
     pruning_factor   = 1.2
     uniform_eps      = 0.05
@@ -72,15 +73,7 @@ class Cfg:
     dirichlet_alpha  = 0.3
     reuse_tree       = True
     sample_moves     = False
-    robust_only_above = 400
-    es_check_every   = 100
-    min_top_visits   = 100
-    min_delta        = 50
-    use_robust       = True
-    es_jsd_thresh    = 0.05
-    es_jsd_n_stable  = 3
-    es_jsd_min_delta = 50
-    jsd_min_sims     = 400
+    es_jsd_thresh    = 0.0
 
 
 def build_batch_candidates(min_batch, fwd_batch):
@@ -336,12 +329,21 @@ def make_handler(state):
     return Handler
 
 
+TEST_POSITIONS = [
+    "r4rk1/ppN3pp/4p3/3p2q1/4n3/4PQ1P/P5P1/2R2RK1 w - - 1 2",
+    "8/8/8/6pk/5p2/5P2/4K3/8 b - - 1 3",
+    "r6r/p3R1pp/n1p5/1p1p4/k7/2BB3P/2P2P2/5K2 w - - 1 2",
+    "q2k1b2/2r1ppp1/3p4/1B3r2/5B2/8/PPPQ1P2/2K4R w - - 2 2",
+    "8/8/5R2/p3k1K1/2r3P1/8/5P1P/8 b - - 1 1",
+]
+
+
 class XercesCLI:
-    def __init__(self, model_path, cfg_overrides=None, sims=800, port=8765,
-                 micro_batch=8, fwd_batch=32, min_batch=4):
+    def __init__(self, model_path, cfg_overrides=None, sims=6400, time_budget=float("inf"),
+                 port=8765, micro_batch=64, fwd_batch=128, min_batch=4):
         self.sims = sims
+        self.time_budget = time_budget
         self.fen = chess.STARTING_FEN
-        self.flipped = False
         self.stop_event = threading.Event()
 
         self.micro_batch = micro_batch
@@ -360,6 +362,10 @@ class XercesCLI:
         self._start_server(port)
         self._load_model(model_path)
         webbrowser.open(f"http://localhost:{port}/")
+
+    @property
+    def stm_flipped(self):
+        return chess.Board(self.fen).turn == chess.BLACK
 
     def _start_server(self, port):
         handler = make_handler(self.state)
@@ -387,10 +393,6 @@ class XercesCLI:
     def make_cfg(self, sims):
         cfg = Cfg()
         cfg.sims_ceiling = sims
-        cfg.sims_floor = max(50, sims // 8)
-        cfg.jsd_min_sims = max(100, sims // 4)
-        cfg.robust_only_above = max(100, sims // 4)
-        cfg.min_delta = max(20, sims // 20)
         for k, v in self.cfg_overrides.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
@@ -447,7 +449,7 @@ class XercesCLI:
         sps = sims / max(elapsed, 1e-6)
         pps = self.total_preds / max(elapsed, 1e-6)
 
-        svg = make_board_svg(self.fen, top_moves, flipped=self.flipped)
+        svg = make_board_svg(self.fen, top_moves, flipped=self.stm_flipped)
         info = {
             "status": status,
             "sims": sims,
@@ -529,45 +531,26 @@ class XercesCLI:
 
         print()
 
-    def do_analyze(self, sims_override=None):
-        if sims_override:
-            self.sims = sims_override
+    REBUILD_CHECKPOINTS = [500, 2000]
 
-        cboard = chess.Board(self.fen)
-        if not list(cboard.legal_moves):
-            print("  Position is terminal.")
-            return
-
-        self.sf_moves = []
-        self.lc0_moves = []
-        self.total_preds = 0
-        self.stop_event.clear()
-
-        cfg = self.make_cfg(self.sims)
-        priors_cache_clear()
-        board = Board(self.fen)
-        tree = MCTSTree(board, cfg)
-        tree._es_tripped = False
-        tree.sim_stop_reason = ""
-        tree.es_checks.clear()
-
-        micro_batch = self.micro_batch
-        max_fastpath = max(micro_batch * 4, 64)
-        max_unresolved = micro_batch * 4
-
-        t0 = time.time()
-        last_update = t0
+    def _run_sims(self, tree, board, target_sims, t0, time_budget):
+        """Run sims on tree until target_sims or time_budget. Returns when done or stop_event set."""
+        mb = self.micro_batch
+        max_fp = max(mb * 4, 1000)
+        max_unresolved = mb * 4
+        last_update = time.time()
         update_interval = 0.4
 
         while not self.stop_event.is_set():
-            if tree.stop_simulating():
+            elapsed = time.time() - t0
+            if tree.sims_completed_this_move >= target_sims or elapsed >= time_budget:
                 break
             tree.resolve_inflight()
             if tree.count_unresolved() >= max_unresolved:
                 time.sleep(0.0005)
                 continue
 
-            res = tree.collect_many_leaves(micro_batch, max_fastpath)
+            res = tree.collect_many_leaves(mb, max_fp)
             tree.sims_completed_this_move += (
                 res.count_new + res.count_terminal + res.count_cached
             )
@@ -582,8 +565,7 @@ class XercesCLI:
 
             now = time.time()
             if now - last_update >= update_interval:
-                sims = tree.sims_completed_this_move
-                self.update_display(tree, sims, now - t0, status="analyzing")
+                self.update_display(tree, tree.sims_completed_this_move, now - t0, status="analyzing")
                 last_update = now
 
         for _ in range(200):
@@ -591,6 +573,44 @@ class XercesCLI:
                 break
             tree.resolve_inflight()
             time.sleep(0.001)
+
+    def _fresh_tree(self, board, sims_budget):
+        cfg = self.make_cfg(sims_budget)
+        tree = MCTSTree(board, cfg)
+        tree.sim_stop_reason = ""
+        return tree
+
+    def do_analyze(self, sims_override=None, time_override=None):
+        sims_budget = sims_override if sims_override is not None else self.sims
+        time_budget = time_override if time_override is not None else self.time_budget
+
+        cboard = chess.Board(self.fen)
+        if not list(cboard.legal_moves):
+            print("  Position is terminal.")
+            return
+
+        self.sf_moves = []
+        self.lc0_moves = []
+        self.total_preds = 0
+        self.stop_event.clear()
+
+        priors_cache_clear()
+        board = Board(self.fen)
+        tree = self._fresh_tree(board, sims_budget)
+
+        t0 = time.time()
+
+        for checkpoint in self.REBUILD_CHECKPOINTS:
+            if self.stop_event.is_set() or checkpoint >= sims_budget:
+                break
+            self._run_sims(tree, board, checkpoint, t0, time_budget)
+            if self.stop_event.is_set() or time.time() - t0 >= time_budget:
+                break
+            tree = self._fresh_tree(board, sims_budget)
+            self._run_sims(tree, board, checkpoint, t0, time_budget)
+
+        # run to budget with no further resets
+        self._run_sims(tree, board, sims_budget, t0, time_budget)
 
         elapsed = time.time() - t0
         sims = tree.sims_completed_this_move
@@ -686,13 +706,24 @@ class XercesCLI:
             if tokens[0] == "startpos":
                 b = chess.Board()
                 moves = tokens[2:] if len(tokens) > 2 and tokens[1] == "moves" else []
+            elif tokens[0] == "testpos":
+                idx = int(tokens[1]) - 1 if len(tokens) > 1 and tokens[1].isdigit() else None
+                if idx is None or not (0 <= idx < len(TEST_POSITIONS)):
+                    print(f"  Usage: pos testpos <1-{len(TEST_POSITIONS)}>")
+                    return
+                b = chess.Board(TEST_POSITIONS[idx])
+                moves = []
+            elif tokens[0] == "random":
+                plies = int(tokens[1]) if len(tokens) > 1 else 10
+                b = chess.Board(random_init(plies=plies).fen())
+                moves = []
             elif tokens[0] == "fen":
                 rest = tokens[1:]
                 mi = rest.index("moves") if "moves" in rest else len(rest)
                 b = chess.Board(" ".join(rest[:mi]))
                 moves = rest[mi + 1:]
             else:
-                print("  Usage: pos startpos [moves ...]  |  pos fen <FEN> [moves ...]")
+                print("  Usage: pos startpos [moves ...]  |  pos fen <FEN> [moves ...]  |  pos random [plies]")
                 return
             for mv in moves:
                 b.push_uci(mv)
@@ -705,7 +736,7 @@ class XercesCLI:
         self.lc0_moves = []
         self.last_info = {}
         side = "White" if chess.Board(self.fen).turn == chess.WHITE else "Black"
-        self.state.update(svg=chess.svg.board(chess.Board(self.fen), flipped=self.flipped, size=480))
+        self.state.update(svg=chess.svg.board(chess.Board(self.fen), flipped=self.stm_flipped, size=480))
         print(f"  Position set. {side} to move.")
 
     def do_move(self, mv_str):
@@ -722,30 +753,34 @@ class XercesCLI:
             self.lc0_moves = []
             self.last_info = {}
             side = "White" if b.turn == chess.WHITE else "Black"
-            self.state.update(svg=chess.svg.board(b, flipped=self.flipped, size=480))
+            self.state.update(svg=chess.svg.board(b, flipped=self.stm_flipped, size=480))
             print(f"  Played {move.uci()}. {side} to move.")
         except Exception as e:
             print(f"  Illegal move: {e}")
 
-    # option name -> (self attr, type, description)
+    # name -> (attr_or_key, type, description)
     OPTIONS = {
-        "SimsCeiling":  ("sims",        int,   "default sim budget"),
+        "Sims":         ("sims",        int,   "default sim budget"),
+        "TimeBudget":   ("time_budget", float, "default time budget (seconds)"),
         "MicroBatch":   ("micro_batch", int,   "leaves collected per MCTS step"),
-        "CPuct":        ("cfg_overrides", float, "exploration constant"),
-        "UniformEps":   ("cfg_overrides", float, "prior smoothing epsilon"),
-        "PriorClipMax": ("cfg_overrides", float, "prior clip ceiling"),
-        "Vscale":       ("cfg_overrides", float, "value head output scale"),
-        "FpuReduction": ("cfg_overrides", float, "first-play urgency reduction"),
+        "CPuct":        ("c_puct",      float, "exploration constant"),
+        "UniformEps":   ("uniform_eps", float, "prior smoothing epsilon"),
+        "PriorClipMax": ("prior_clip_max", float, "prior clip ceiling"),
     }
+    CFG_OPTS = {"CPuct", "UniformEps", "PriorClipMax"}
+    CFG_KEYS = {"CPuct": "c_puct", "UniformEps": "uniform_eps", "PriorClipMax": "prior_clip_max"}
 
-    # cfg_overrides key for options that route there
-    OPT_CFG_KEY = {
-        "CPuct":        "c_puct",
-        "UniformEps":   "uniform_eps",
-        "PriorClipMax": "prior_clip_max",
-        "Vscale":       "vscale",
-        "FpuReduction": "fpu_reduction",
-    }
+    def show_uci_options(self):
+        print(f"\n  {BOLD}Options{RESET}  (set with: setoption name <Name> value <val>)\n")
+        for name, (attr, typ, desc) in self.OPTIONS.items():
+            if name in self.CFG_OPTS:
+                cfg = self.make_cfg(self.sims)
+                cur = self.cfg_overrides.get(self.CFG_KEYS[name], getattr(cfg, self.CFG_KEYS[name]))
+            else:
+                cur = getattr(self, attr)
+            tname = "spin" if typ is int else "string"
+            print(f"  option name {name:<14} type {tname:<7} current {cur}   # {desc}")
+        print()
 
     def handle_setoption(self, tokens):
         try:
@@ -766,42 +801,29 @@ class XercesCLI:
         except ValueError:
             print(f"  Bad value for {canon}: '{value}'")
             return
-        if canon in self.OPT_CFG_KEY:
-            self.cfg_overrides[self.OPT_CFG_KEY[canon]] = val
-        elif canon == "SimsCeiling":
-            self.sims = val
-        elif canon == "MicroBatch":
-            self.micro_batch = val
+        if canon in self.CFG_OPTS:
+            self.cfg_overrides[self.CFG_KEYS[canon]] = val
+        else:
+            setattr(self, self.OPTIONS[canon][0], val)
         print(f"  {canon} = {val}")
 
-    def show_uci_options(self):
-        cfg = self.make_cfg(self.sims)
-        print(f"\n  {BOLD}Options{RESET}  (set with: setoption name <Name> value <val>)\n")
-        for name, (attr, typ, desc) in self.OPTIONS.items():
-            if name in self.OPT_CFG_KEY:
-                cur = self.cfg_overrides.get(self.OPT_CFG_KEY[name],
-                                             getattr(cfg, self.OPT_CFG_KEY[name]))
-            elif name == "SimsCeiling":
-                cur = self.sims
-            else:
-                cur = getattr(self, attr)
-            tname = "spin" if typ is int else "string"
-            print(f"  option name {name:<16} type {tname:<7} default {cur}   # {desc}")
-        print()
-
     def show_help(self):
+        t = f"{self.time_budget:.0f}s" if self.time_budget != float("inf") else "inf"
         print(f"""
   {BOLD}Commands:{RESET}
     pos startpos [moves e2e4 ...]     set position from start
     pos fen <FEN> [moves ...]         set position from FEN
-    go [N]                            analyze (N sims, default {self.sims})
+    pos testpos <1-5>                 load a test position
+    pos random [plies]                set a random position (default 10 plies)
+    go [sims [time]]                  analyze; stops at sims OR time (s)
+                                      defaults: sims={self.sims}  time={t}
     sf [depth D]                      Stockfish comparison  (default d16)
     lc0 [nodes N]                     LC0 comparison  (default 4000 nodes)
     move <san|uci>                    play a move  (e.g. e2e4  or  Nf3)
     setoption name <Name> value <V>   update a tunable option
     uci                               list all options with current values
-    flip                              flip board orientation
     fen                               print current FEN
+    clear                             clear the priors cache
     stop                              stop ongoing analysis
     quit / exit                       exit
 """)
@@ -826,19 +848,12 @@ class XercesCLI:
                 self.show_help()
             elif verb == "fen":
                 print(f"  {self.fen}")
-            elif verb == "flip":
-                self.flipped = not self.flipped
-                b = chess.Board(self.fen)
-                top = self.last_info.get("top_moves", [])
-                svg = make_board_svg(self.fen, top, flipped=self.flipped) if top else \
-                    chess.svg.board(b, flipped=self.flipped, size=480)
-                self.state.update(svg=svg)
-                print(f"  Board {'flipped' if self.flipped else 'unflipped'}.")
             elif verb in ("pos", "position"):
                 self.do_set_position(rest)
             elif verb in ("go", "analyze", "analyse"):
-                n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
-                self.do_analyze(sims_override=n)
+                sims_ovr = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                time_ovr = float(parts[2]) if len(parts) > 2 else None
+                self.do_analyze(sims_override=sims_ovr, time_override=time_ovr)
             elif verb == "sf":
                 depth = 16
                 if len(parts) > 1 and parts[1].isdigit():
@@ -862,6 +877,9 @@ class XercesCLI:
                 self.show_uci_options()
             elif verb == "stop":
                 self.stop_event.set()
+            elif verb in ("clear", "clearcache"):
+                priors_cache_clear()
+                print("  Cache cleared.")
             else:
                 # try as move (SAN or UCI)
                 try:
@@ -890,7 +908,7 @@ def main():
         sys.exit(1)
 
     cfg_overrides = {}
-    sims = args.sims or 800
+    sims = args.sims or 6400
     if config_path and os.path.exists(config_path):
         from chessbot.config import Config
         ext = os.path.splitext(config_path)[1].lower()

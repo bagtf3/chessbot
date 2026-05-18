@@ -75,3 +75,13 @@ choice is much more deterministic. The engine is no longer trying to create broa
 training data. It is trying to convert the current position.
 
 Competition mode is designed to be ruthless.
+
+### Validation Mode
+
+Validation mode is used to measure how strong the engine has become. Xerces plays
+a set of test games from fixed opening positions, scored against a reference
+opponent, usually Stockfish at a fixed depth. The result is a pass/fail score that
+determines whether the engine has improved enough to advance to the next difficulty
+level.
+
+![Validation plot](../images/validation_plot_example.png)

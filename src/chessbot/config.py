@@ -89,14 +89,13 @@ class Config(object):
     collar_n_consec = 5
     collar_reset_cp = 50
     train_on_stockfish = True
-    train_on_validation = False
-    validation_min_training_depth = 9
 
     z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
 
     rescore_kl_threshold = 0.75   # always include if KL exceeds this
     rescore_ce_threshold = 0.625  # always include if value CE exceeds this
     rescore_sample_floor = 0.2    # min probability for soft-include sampling
+    rescore_target_acceptance = 0.5
 
     KL_boost_threshold = 1.75
     KL_weight_boost = 1.0

@@ -240,6 +240,7 @@ class Rescorer(object):
         }
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
+        self.rng_scale = 1.0
 
         self.intake = deque()
         self.pending = {}
@@ -456,9 +457,7 @@ class Rescorer(object):
         is_draw = (result == 0) or (result == 0.0)
 
         is_validation_game = 'validation' in game_data.get('scenario', '').lower()
-        skip_all_training = False
-        if not cfg.train_on_validation and is_validation_game:
-            skip_all_training = True
+        skip_all_training = is_validation_game
 
         game_cfg_keys = (
             'train_on_stockfish', 'z_mix',
@@ -997,7 +996,7 @@ class Rescorer(object):
                     scw['cpl'] += 1
             else:
                 score = max(kl / kl_t, ce / ce_t)
-                if random.random() < max(cfg.rescore_sample_floor, score):
+                if random.random() < max(cfg.rescore_sample_floor, score * self.rng_scale):
                     self.training_data.append((x, mask, policy, Y, vwht, pwht))
                     sc['accepted'] += 1
                     scw['accepted'] += 1
@@ -1054,6 +1053,8 @@ class Rescorer(object):
         self.games_processed += 1
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
+        if self.games_processed % 30 == 0:
+            self.autotune_rng_scale()
         if self.games_processed % 100 == 0:
             self.print_stop_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
@@ -1164,6 +1165,16 @@ class Rescorer(object):
                 for k in combined:
                     combined[k] += h[k]
             print(row("last 300", combined))
+
+    def autotune_rng_scale(self):
+        sc = self.sample_counts
+        if sc['total'] == 0:
+            return
+        hard_rate = (sc['accepted'] - sc['rng']) / sc['total']
+        rng_rate = sc['rng'] / sc['total']
+        target_rng = max(0.0, self.config.rescore_target_acceptance - hard_rate)
+        if rng_rate > 0:
+            self.rng_scale = min(1.0, self.rng_scale * (target_rng / rng_rate))
 
     def print_sample_stats(self):
         cats = ("cpl", "kl", "ce", "rng")

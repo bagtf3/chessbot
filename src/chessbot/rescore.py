@@ -1053,7 +1053,7 @@ class Rescorer(object):
         self.games_processed += 1
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
-        if self.games_processed % 30 == 0:
+        if self.games_processed % 30 == 0 and self.games_processed > 0:
             self.autotune_rng_scale()
         if self.games_processed % 100 == 0:
             self.print_stop_stats()

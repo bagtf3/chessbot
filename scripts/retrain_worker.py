@@ -229,6 +229,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
         base_cfg = {}
 
     base_cfg['learning_rate'] = cfg.learning_rate
+    base_cfg['beta_2'] = cfg.adam_beta2
     inner_opt = base_cls.from_config(base_cfg)
     opt = tf.keras.mixed_precision.LossScaleOptimizer(inner_opt)
 
@@ -249,7 +250,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
     train_ckpts_dir = os.path.join(cfg.run_dir, "train_ckpts", model_stem)
     os.makedirs(train_ckpts_dir, exist_ok=True)
     epoch_var = tf.Variable(epoch, trainable=False, dtype=tf.int64)
-    tf_ckpt   = tf.train.Checkpoint(model=model, optimizer=opt, epoch=epoch_var)
+    tf_ckpt   = tf.train.Checkpoint(optimizer=inner_opt, epoch=epoch_var)
     manager   = tf.train.CheckpointManager(tf_ckpt, train_ckpts_dir, max_to_keep=2)
     if manager.latest_checkpoint:
         tf_ckpt.restore(manager.latest_checkpoint)

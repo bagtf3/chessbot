@@ -126,9 +126,10 @@ class Config(object):
     move_sample_temp_range = [0.000001, 1.25]
     
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
     policy_loss_weight = 0.25     # per-sample weight for policy head
     value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
-    draw_value_scale = 0.5        # multiplies value_loss_weight for drawn games
+    draw_value_scale = 1.0        # multiplies value_loss_weight for drawn games
     vscale = 0.9
     contempt_flip_q  = -0.22
     contempt_fight_c = 0.06

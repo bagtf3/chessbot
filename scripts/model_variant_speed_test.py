@@ -450,11 +450,11 @@ def build_tf_conformer_interweaved(cfg):
 
         x = layers.Reshape((8, 8, cf), name=f"b{i}_to_2d")(s)
         r = x
-        h = layers.Conv2D(cf,3, use_bias=False, padding="same", name=f"b{i}_c1")(x)
+        h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(x)
+        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c1")(h)
         h = layers.LeakyReLU(0.01, name=f"b{i}_lr1")(h)
         h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c2")(h)
-        h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(h)
-        x = layers.LeakyReLU(0.01, name=f"b{i}_out")(r + h)
+        x = r + h
     
     # VALUE HEAD
     v = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="value_mix")(x)

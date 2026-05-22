@@ -413,7 +413,7 @@ def build_tf_conformer_interweaved(cfg):
     if de != cf:
         x = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="conv_proj")(x)
         x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
-        x = layers.LeakyReLU(0.01, name="lrelu_proj")(x)
+        x = layers.LeakyReLU(0.02, name="lrelu_proj")(x)
 
     pos = layers.Embedding(64, cf, name="pos_emb")(
         tf.keras.backend.arange(0, 64, dtype="int32")
@@ -428,14 +428,9 @@ def build_tf_conformer_interweaved(cfg):
         if i == 0:
             s = s + pos
 
-        if i == 2:
-            s = s + 0.1 * pos
-
-        if i == 4:
+        # re-inject the original pos to keep things lined up
+        if i == 5:
             s = s + 0.05 * pos
-        
-        if i == 6:
-            s = s + 0.025 * pos
         
         r = s
         s = layers.LayerNormalization(axis=-1, name=f"b{i}_ln1")(s)
@@ -452,14 +447,14 @@ def build_tf_conformer_interweaved(cfg):
         r = x
         h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(x)
         h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c1")(h)
-        h = layers.LeakyReLU(0.01, name=f"b{i}_lr1")(h)
+        h = layers.LeakyReLU(0.02, name=f"b{i}_lr1")(h)
         h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c2")(h)
         x = r + h
     
     # VALUE HEAD
     v = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="value_mix")(x)
     v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
-    v = layers.LeakyReLU(0.01, name="value_mix_act")(v)
+    v = layers.LeakyReLU(0.02, name="value_mix_act")(v)
 
     value = _tf_attn_pool_value_head(v, cf, layers)
 
@@ -468,17 +463,13 @@ def build_tf_conformer_interweaved(cfg):
     x_seq = layers.Reshape((64, cf), name="pol_to_seq")(x)
 
     # normal move head: 64 x 64
-    from_h = layers.Dense(384, activation="gelu", name="pol_from_fc1")(x_seq)
-    from_h = layers.Dense(256, activation="gelu", name="pol_from_fc2")(from_h)
-    from_vec = layers.Dense(128, name="pol_from_proj")(from_h)
+    from_h = layers.Dense(256, activation="gelu", name="pol_from_fc1")(x_seq)
+    from_vec = layers.LayerNormalization(name="pol_from_ln")(from_h)
 
-    to_h = layers.Dense(384, activation="gelu", name="pol_to_fc1")(x_seq)
-    to_h = layers.Dense(256, activation="gelu", name="pol_to_fc2")(to_h)
-    to_vec = layers.Dense(128, name="pol_to_proj")(to_h)
+    to_h = layers.Dense(256, activation="gelu", name="pol_to_fc1")(x_seq)
+    to_vec = layers.LayerNormalization(name="pol_to_ln")(to_h)
 
     normal_logits = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
-    normal_logits = layers.Lambda(
-        lambda t: t / (128 ** 0.5), name="pol_qk_scale")(normal_logits)
 
     # (B, 4096)
     normal_logits = layers.Reshape((64 * 64,), name="pol_normal_flat")(normal_logits)
@@ -488,17 +479,18 @@ def build_tf_conformer_interweaved(cfg):
     p = layers.Conv2D(
         64, 1, use_bias=False, padding="same", name="pol_promo_mix",
     )(x) # (B, 8, 8, 64)
-
     p = layers.LayerNormalization(axis=-1, name="pol_promo_mix_ln")(p)
-    p = layers.LeakyReLU(0.01, name="pol_promo_mix_act")(p)
+    p = layers.LeakyReLU(0.02, name="pol_promo_mix_act")(p)
+    p_skip = p
 
     # (B, 8, 8, 64)
-    p = layers.Conv2D(64, 3, use_bias=False, padding="same", name="pol_promo_c1",)(p)
+    p = layers.Conv2D(64, 3, use_bias=False, padding="same", name="pol_promo_c1")(p)
     p = layers.LayerNormalization(axis=-1, name="pol_promo_ln")(p)
-    p = layers.LeakyReLU(0.01, name="pol_promo_act")(p)
+    p = layers.LeakyReLU(0.02, name="pol_promo_act")(p)
+    p = layers.Add(name="pol_promo_skip")([p, p_skip])
 
     # (B, 8, 8, 3)
-    promo_logits = layers.Conv2D(3, 1, padding="same", name="pol_promo_conv",)(p)
+    promo_logits = layers.Conv2D(3, 1, padding="same", name="pol_promo_conv")(p)
 
     # (B, 192)
     promo_logits = layers.Reshape((8 * 8 * 3,), name="pol_promo_flat")(promo_logits)

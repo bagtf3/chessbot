@@ -228,10 +228,14 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
         base_cls = tf.keras.optimizers.Adam
         base_cfg = {}
 
-    base_cfg['learning_rate'] = cfg.learning_rate
+    base_cfg['learning_rate'] = cfg.learning_rate / 1.5
     base_cfg['beta_2'] = cfg.adam_beta2
     inner_opt = base_cls.from_config(base_cfg)
     opt = tf.keras.mixed_precision.LossScaleOptimizer(inner_opt)
+
+    def fp32_ce(y_true, y_pred):
+        return tf.keras.losses.categorical_crossentropy(
+            tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), from_logits=True)
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
@@ -265,10 +269,11 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
 
     t0 = time.time()
     history = model.fit(
-        {"enc_in": X}, Y, epochs=args.epochs, batch_size=args.batch_size,
+        {"enc_in": X}, Y, epochs=2, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
+    print_fit_history(history, epoch, label=label)
 
     t0 = time.time()
     bak_path = model_path.replace(".h5", "_backup.h5")
@@ -370,6 +375,16 @@ def main():
 
     Y     = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht,    "policy_logits": pwht}
+
+    # DEBUG: snapshot training data for gradient tape experiments
+    debug_path = os.path.join(run_dir, "debug_training_snapshot.pkl")
+    try:
+        import pickle as _pkl
+        with open(debug_path, "wb") as _f:
+            _pkl.dump({"X": X, "P": P, "Y_value": Y_value, "vwht": vwht, "pwht": pwht}, _f)
+        print(f"[retrain] debug snapshot -> {os.path.basename(debug_path)}")
+    except Exception as _e:
+        print(f"[retrain] debug snapshot failed: {_e}")
 
     kl_str = (
         f"KL boost x{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"

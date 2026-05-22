@@ -31,7 +31,7 @@ import pandas as pd
 from chessbot.pretrain import (
     BATCH_SIZE, STEPS_PER_EPOCH, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_LR, DEFAULT_MAX_EPOCH,
-    LW_SCHEDULE, lw_for_epoch,
+    LW_SCHEDULE, lw_for_epoch, lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     moving_average, save_plot,
@@ -156,7 +156,7 @@ def worker_main(wargs: dict) -> None:
     print(f"[worker] loading {load_from}")
 
     model = keras.models.load_model(load_from, compile=False)
-    opt   = tf.keras.optimizers.Adam(learning_rate=lr)
+    opt   = tf.keras.optimizers.Adam(learning_rate=lr_for_epoch(start_epoch, max_epoch))
     opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt
     model._default_loss_dict = {
@@ -164,7 +164,8 @@ def worker_main(wargs: dict) -> None:
         "value_out":     tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
     set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
-    current_lw: dict | None = None
+    current_lw: dict | None  = None
+    current_lr: float | None = None
 
     train_ckpts_dir = os.path.join(run_dir, "train_ckpts")
     os.makedirs(train_ckpts_dir, exist_ok=True)
@@ -272,6 +273,12 @@ def worker_main(wargs: dict) -> None:
             current_lw = target_lw
             lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
             print(f"[lw update] epoch {ep}: {lw_str}")
+
+        target_lr = lr_for_epoch(ep, max_epoch)
+        if target_lr != current_lr:
+            current_lr = target_lr
+            opt.inner_optimizer.learning_rate.assign(target_lr)
+            print(f"[lr update] epoch {ep}: lr={target_lr:.4e}")
 
         epoch_start = time.time()
         print("-" * 89)

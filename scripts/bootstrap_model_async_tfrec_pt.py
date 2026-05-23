@@ -1,397 +1,180 @@
-"""bootstrap_model_async_tfrec_pt.py
+"""bootstrap_model_async_tfrec_pt.py — OOM-robust PyTorch bootstrap trainer
 
-PyTorch training on TFRecord data.  Structurally identical to
-bootstrap_model_async_tfrec.py — same loop, same LW schedule, same plots,
-same timing output.  Only training and eval are PyTorch.
+The supervisor spawns a fresh subprocess for each block of epochs.
+On crash the supervisor rolls back to the last checkpoint and restarts.
 
-TF is imported but restricted to CPU so it never touches the GPU.
-PyTorch owns CUDA entirely.
+PyTorch owns CUDA entirely.  TF is restricted to CPU (tfrecord reading only).
 
 Pre-saved .pt source models must exist in MODEL_DIR before running.
 
-Run from the repo root or from scripts/:
-    python scripts/bootstrap_model_async_tfrec_pt.py
+Usage:
+    python scripts/bootstrap_model_async_tfrec_pt.py [options]
+
+Options:
+    --model      Model name            (default: 16m-transformer)
+    --run-tag    Sub-dir under SP_DIR  (default: val_test_multi)
+    --run-dir    Explicit run dir (overrides --run-tag)
+    --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
+    --max-epoch  Total epochs to train        (default: 2000)
+    --lr         Peak learning rate           (default: 1e-2)
 """
+from __future__ import annotations
 
+import argparse
+import math
+import multiprocessing as mp
 import os
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-import tensorflow as tf
-tf.config.set_visible_devices([], "GPU")
-
-import gc
+import re
 import time
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import scipy.special
-from torch.amp import GradScaler, autocast
 
 from chessbot.pretrain import (
-    BATCH_SIZE, EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
-    STEPS_PER_EPOCH, PLOT_EVERY, DEFAULT_LR, DEFAULT_MAX_EPOCH,
+    EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
+    PLOT_EVERY, DEFAULT_MAX_EPOCH,
     lw_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     save_plot,
 )
-from chessbot import SP_DIR, MODEL_DIR
-from chessbot.utils import batch_policy_metrics, format_time, print_validation
+from chessbot.model import (
+    VOCAB_SIZE, SEQ_LEN,
+    VARIANTS,
+    PT_BUILDERS,
+)
+
+# ---------------------------------------------------------------------------
+# PT-specific training constants
+# Batch 512 = 2× base; LR scaled linearly: MIN 2e-4, MAX 1e-2.
+# Epoch size doubled to keep ~40 gradient steps/epoch at the larger batch.
+# ---------------------------------------------------------------------------
+
+PT_BATCH_SIZE      = 512
+PT_EPOCH_SIZE      = EPOCH_SIZE * 2          # 20 480 samples/epoch
+PT_STEPS_PER_EPOCH = PT_EPOCH_SIZE // PT_BATCH_SIZE   # 40
+
+PT_LR_MIN        = 2e-4
+PT_LR_MAX        = 1e-2
+PT_LR_WARMUP     = 3
+PT_LR_HOLD       = 100
+PT_LR_DECAY      = 300
+PT_LR_STEP_SIZE  = 100
+
+EPOCHS_PER_WORKER = 100
+CHECKPOINT_EVERY  = 20
+DEFAULT_MODEL     = "16m-transformer"
+DEFAULT_RUN_TAG   = "val_test_multi"
+
+def pt_lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH) -> float:
+    decay_end = max_epoch - PT_LR_DECAY
+    if ep < PT_LR_WARMUP:
+        return PT_LR_MIN + (PT_LR_MAX - PT_LR_MIN) * (ep / PT_LR_WARMUP)
+    if ep < PT_LR_HOLD:
+        return PT_LR_MAX
+    if ep >= decay_end:
+        return PT_LR_MIN
+    step        = (ep - PT_LR_HOLD) // PT_LR_STEP_SIZE
+    total_steps = (decay_end - PT_LR_HOLD) // PT_LR_STEP_SIZE
+    t = (step + 1) / total_steps
+    return PT_LR_MIN + 0.5 * (PT_LR_MAX - PT_LR_MIN) * (1.0 + math.cos(math.pi * t))
+
 
 
 # ---------------------------------------------------------------------------
-# PT model builders
-# (self-contained; keep in sync with model_variant_speed_test.py)
+# Checkpoint utilities
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE = 21
-SEQ_LEN    = 64
+def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
+    return os.path.join(run_dir, f"{name}_pt_ckpt{epoch:04d}.pt")
 
 
-def make_ln2d(ch):
-    class Ln2d(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.w = nn.Parameter(torch.ones(ch))
-            self.b = nn.Parameter(torch.zeros(ch))
-
-        def forward(self, x):
-            c = x - x.mean(1, keepdim=True)
-            return (
-                c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
-                * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1)
-            )
-    return Ln2d()
+def find_last_checkpoint(run_dir: str, name: str) -> int:
+    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d{{4}})\.pt$")
+    best = -1
+    try:
+        for fname in os.listdir(run_dir):
+            m = pat.match(fname)
+            if m:
+                best = max(best, int(m.group(1)))
+    except FileNotFoundError:
+        pass
+    return best
 
 
-def pt_attn_pool(x_seq, linear):
-    w = torch.softmax(linear(x_seq), dim=1)
-    return (x_seq * w).sum(dim=1)
+def delete_old_checkpoints(run_dir: str, name: str, keep_epoch: int) -> None:
+    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d{{4}})\.pt$")
+    try:
+        for fname in os.listdir(run_dir):
+            m = pat.match(fname)
+            if m and int(m.group(1)) != keep_epoch:
+                path = os.path.join(run_dir, fname)
+                os.remove(path)
+                print(f"[ckpt] removed old checkpoint {fname}")
+    except FileNotFoundError:
+        pass
 
 
-def build_pt_transformer_16m(cfg):
-    """Pure transformer with steady pos drip.
-    Tapered policy head: 256->192->67."""
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    class TxLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1   = nn.LayerNorm(de)
-            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
-            self.drop1 = nn.Dropout(dr)
-            self.ln2   = nn.LayerNorm(de)
-            self.ff1   = nn.Linear(de, fd)
-            self.drop2 = nn.Dropout(dr)
-            self.ff2   = nn.Linear(fd, de)
-
-        def forward(self, x):
-            n = self.ln1(x)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            x = x + self.drop1(h)
-            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb      = nn.Embedding(VOCAB_SIZE, de)
-            self.pos      = nn.Embedding(64, de)
-            self.txs      = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.pol_mix  = nn.Conv2d(de, 256, 1, bias=False)
-            self.pol_ln0  = make_ln2d(256)
-            self.pol_c1a  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
-            self.pol_c1b  = nn.Conv2d(256, 256, 3, padding=1, bias=False)
-            self.pol_ln1  = make_ln2d(256)
-            self.pol_down = nn.Conv2d(256, 192, 1, bias=False)
-            self.pol_lnd  = make_ln2d(192)
-            self.pol_c2a  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
-            self.pol_c2b  = nn.Conv2d(192, 192, 3, padding=1, bias=False)
-            self.pol_ln2  = make_ln2d(192)
-            self.pol_out  = nn.Conv2d(192, 67, 1)
-            self.ap   = nn.Linear(de, 1)
-            self.vfc1 = nn.Linear(de, 256)
-            self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 3)
-
-        def forward(self, t):
-            B   = t.shape[0]
-            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x   = self.emb(t) + pos
-            for i, tx in enumerate(self.txs):
-                if i > 0:
-                    x = x + 0.1 * pos
-                x = tx(x)
-
-            v = pt_attn_pool(x, self.ap)
-            v = F.gelu(self.vfc1(v))
-            v = F.gelu(self.vfc2(v))
-
-            x = x + 0.2 * pos
-            x = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
-            x = F.leaky_relu(self.pol_ln0(self.pol_mix(x)), 0.01)
-            r = x
-            x = F.leaky_relu(
-                r + self.pol_ln1(self.pol_c1b(F.leaky_relu(self.pol_c1a(x), 0.01))),
-                0.01,
-            )
-            x = F.leaky_relu(self.pol_lnd(self.pol_down(x)), 0.01)
-            r = x
-            x = F.leaky_relu(
-                r + self.pol_ln2(self.pol_c2b(F.leaky_relu(self.pol_c2a(x), 0.01))),
-                0.01,
-            )
-            pol = self.pol_out(x).permute(0, 2, 3, 1).reshape(B, SEQ_LEN * 67)
-            return pol, self.vout(v)
-
-    m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
-    return m
+def trim_progress_csv(progress_file: str, max_training_epoch: int) -> None:
+    if not os.path.exists(progress_file):
+        return
+    df = pd.read_csv(progress_file)
+    if "training_epoch" not in df.columns:
+        os.remove(progress_file)
+        return
+    df = df[df["training_epoch"] <= max_training_epoch]
+    if df.empty:
+        os.remove(progress_file)
+    else:
+        df.to_csv(progress_file, index=False)
 
 
-def build_pt_conformer_interweaved(cfg):
-    """Interweaved conformer: 10 x [MHA -> Conv -> Conv].
-    Graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none.
-    """
-    de = cfg["d_embed"]
-    cf = cfg["conv_filters"]
-    cb = cfg["conv_blocks"]
-    nh = cfg["num_heads"]
-    dr = cfg["dropout"]
+def get_resume_epoch(run_dir: str, name: str) -> int:
+    os.makedirs(run_dir, exist_ok=True)
+    progress_file = os.path.join(run_dir, f"{name}_pt_eval_progress.csv")
+    last_ckpt = find_last_checkpoint(run_dir, name)
 
-    POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
+    if last_ckpt < 0:
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+            print(f"[recovery] no checkpoints found; cleared {progress_file}")
+        return 0
 
-    class Block(nn.Module):
-        def __init__(self, pos_scale):
-            super().__init__()
-            self.pos_scale = pos_scale
-            self.ln1  = nn.LayerNorm(cf)
-            self.attn = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
-            self.drop1 = nn.Dropout(dr)
-            self.c1   = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.lr1  = nn.LeakyReLU(0.01, True)
-            self.c2   = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.ln2  = make_ln2d(cf)
-
-        def forward(self, x, pos):
-            b = x.shape[0]
-            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-            if self.pos_scale != 0.0:
-                s = s + self.pos_scale * pos
-            r = s
-            n = self.ln1(s)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            s = r + self.drop1(h)
-            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
-            r = x
-            h = self.lr1(self.c1(x))
-            h = self.ln2(self.c2(h))
-            return F.leaky_relu(r + h, 0.01)
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb    = nn.Embedding(VOCAB_SIZE, de)
-            self.proj   = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
-            self.lnp    = make_ln2d(cf) if de != cf else None
-            self.pos    = nn.Embedding(64, cf)
-            self.blocks = nn.ModuleList(
-                [Block(POS_SCALES.get(i, 0.0)) for i in range(cb)]
-            )
-            self.mix  = nn.Conv2d(cf, cf, 1, bias=False)
-            self.lnm  = make_ln2d(cf)
-            self.pol  = nn.Conv2d(cf, 67, 1)
-            self.v_ln = nn.LayerNorm(cf)
-            self.ap   = nn.Linear(cf, 1)
-            self.vfc1 = nn.Linear(cf, 256)
-            self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 3)
-
-        def forward(self, t):
-            b = t.shape[0]
-            x = self.emb(t).reshape(b, 8, 8, de).permute(0, 3, 1, 2).contiguous()
-            if self.proj is not None:
-                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
-            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            for block in self.blocks:
-                x = block(x, pos)
-            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
-            pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
-            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-            s = self.v_ln(s)
-            v = pt_attn_pool(s, self.ap)
-            v = F.relu(self.vfc1(v))
-            v = F.relu(self.vfc2(v))
-            return pol, self.vout(v)
-
-    m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
-    return m
-
-
-def build_pt_conformer_transheavy(cfg):
-    """Alternating ConvBlock (MHA+Conv+Conv) and TxBlock (MHA+FF), odd total.
-    Pattern for 11 blocks: Conv Tx Conv Tx Conv Tx Conv Tx Conv Tx Conv.
-    Pos: full inject at start; taper-drip before each TxBlock.
-    """
-    cf = cfg["conv_filters"]
-    nb = cfg["n_blocks"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    TX_POS = [0.1, 0.05, 0.025, 0.0, 0.0, 0.0]
-
-    class ConvBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1   = nn.LayerNorm(cf)
-            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
-            self.drop1 = nn.Dropout(dr)
-            self.c1    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.lr1   = nn.LeakyReLU(0.01, True)
-            self.c2    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.ln2   = make_ln2d(cf)
-
-        def forward(self, s):
-            b = s.shape[0]
-            r = s
-            n = self.ln1(s)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            s = r + self.drop1(h)
-            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
-            r = x
-            h = self.lr1(self.c1(x))
-            h = self.ln2(self.c2(h))
-            x = F.leaky_relu(r + h, 0.01)
-            return x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-
-    class TxBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1   = nn.LayerNorm(cf)
-            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
-            self.drop1 = nn.Dropout(dr)
-            self.ln2   = nn.LayerNorm(cf)
-            self.ff1   = nn.Linear(cf, fd)
-            self.drop2 = nn.Dropout(dr)
-            self.ff2   = nn.Linear(fd, cf)
-
-        def forward(self, x):
-            r = x
-            n = self.ln1(x)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            x = r + self.drop1(h)
-            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb    = nn.Embedding(VOCAB_SIZE, cf)
-            self.pos    = nn.Embedding(64, cf)
-            self.blocks = nn.ModuleList(
-                [ConvBlock() if i % 2 == 0 else TxBlock() for i in range(nb)]
-            )
-            self.mix  = nn.Conv2d(cf, cf, 1, bias=False)
-            self.lnm  = make_ln2d(cf)
-            self.pol  = nn.Conv2d(cf, 67, 1)
-            self.v_ln = nn.LayerNorm(cf)
-            self.ap   = nn.Linear(cf, 1)
-            self.vfc1 = nn.Linear(cf, 256)
-            self.vfc2 = nn.Linear(256, 128)
-            self.vout = nn.Linear(128, 3)
-
-        def forward(self, t):
-            b = t.shape[0]
-            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            s   = self.emb(t) + pos
-
-            tx_idx = 0
-            for block in self.blocks:
-                if isinstance(block, TxBlock):
-                    scale = TX_POS[tx_idx] if tx_idx < len(TX_POS) else 0.0
-                    if scale != 0.0:
-                        s = s + scale * pos
-                    tx_idx += 1
-                s = block(s)
-
-            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
-            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
-            pol = self.pol(x).permute(0, 2, 3, 1).reshape(b, SEQ_LEN * 67)
-            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-            s = self.v_ln(s)
-            v = pt_attn_pool(s, self.ap)
-            v = F.relu(self.vfc1(v))
-            v = F.relu(self.vfc2(v))
-            return pol, self.vout(v)
-
-    m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
-    return m
-
-
-VARIANTS = {
-    "16m-transformer": dict(
-        transformer=True,
-        d_embed=384, transformer_layers=8, num_heads=8, ff_dim=1536, dropout=0.05,
-    ),
-    "16m-conformer-interweaved": dict(
-        conformer_interweaved=True,
-        d_embed=256, conv_filters=256, conv_blocks=10,
-        num_heads=8, ff_dim=1024, dropout=0.05,
-    ),
-    "13m-conformer-transheavy": dict(
-        conformer_transheavy=True,
-        conv_filters=256, n_blocks=11,
-        num_heads=8, ff_dim=1024, dropout=0.05,
-    ),
-}
-
-PT_BUILDERS = {
-    "16m-transformer":          build_pt_transformer_16m,
-    "16m-conformer-interweaved": build_pt_conformer_interweaved,
-    "13m-conformer-transheavy":  build_pt_conformer_transheavy,
-}
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-TFREC_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
-RUN_DIR   = os.path.join(SP_DIR, "val_test_multi")
-DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-MODEL_DEFS = [
-    "16m-transformer",
-]
+    trim_progress_csv(progress_file, last_ckpt)
+    resume = last_ckpt + 1
+    print(
+        f"[recovery] last checkpoint epoch={last_ckpt}"
+        f"  ->  resuming from epoch {resume}"
+    )
+    return resume
 
 
 # ---------------------------------------------------------------------------
 # PT model load / save
 # ---------------------------------------------------------------------------
 
-def load_pt_model(path, name, device, lr=DEFAULT_LR):
-    """Load a saved .pt checkpoint.  Rebuilds model from VARIANTS/PT_BUILDERS,
-    then restores weights + optimizer + scaler state.
-    LR is always forced onto all param groups after loading."""
+def load_pt_model(path: str, name: str, device, lr: float, strict: bool = True):
+    import torch
+    from torch.amp import GradScaler
+
     cfg    = VARIANTS[name]
     model  = PT_BUILDERS[name](cfg).to(device)
     opt    = torch.optim.Adam(model.parameters(), lr=lr)
     scaler = GradScaler("cuda")
 
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    if "optimizer" in ckpt:
-        opt.load_state_dict(ckpt["optimizer"])
-    if "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
+    try:
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+    except RuntimeError as e:
+        if strict:
+            raise
+        print(f"[load] WARNING: state_dict mismatch ({e!s:.120})")
+        print("[load] starting from fresh random weights")
 
     for pg in opt.param_groups:
         pg["lr"] = lr
@@ -399,26 +182,26 @@ def load_pt_model(path, name, device, lr=DEFAULT_LR):
     return model, opt, scaler
 
 
-def save_pt_model(ms):
+def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
+    import torch
     torch.save({
-        "model":     ms["model"].state_dict(),
-        "optimizer": ms["optimizer"].state_dict(),
-        "scaler":    ms["scaler"].state_dict(),
-        "epoch":     ms["epoch"],
-        "arch":      ms["name"],
-    }, ms["model_file"])
-    print(f"[save] {ms['name']} -> {ms['model_file']}")
+        "model":     model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler":    scaler.state_dict(),
+        "epoch":     epoch,
+        "arch":      name,
+    }, path)
+    print(f"[ckpt] epoch {epoch} -> {path}")
 
 
 # ---------------------------------------------------------------------------
-# Training step
+# Training and eval (called inside worker subprocess)
 # ---------------------------------------------------------------------------
 
-def fit_epoch(ms, bundle, lw, device):
-    """One epoch of PT training over the pre-fetched bundle."""
-    model  = ms["model"]
-    opt    = ms["optimizer"]
-    scaler = ms["scaler"]
+def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
+    import torch
+    import torch.nn.functional as F
+    from torch.amp import autocast
 
     enc      = torch.as_tensor(bundle["enc_in"].numpy(),        dtype=torch.long).to(device)
     policy_t = torch.as_tensor(bundle["policy_logits"].numpy(), dtype=torch.float32).to(device)
@@ -427,32 +210,23 @@ def fit_epoch(ms, bundle, lw, device):
 
     n    = enc.shape[0]
     perm = torch.randperm(n, device=device)
-
     model.train()
     total_p = total_v = total = 0.0
     n_batches = 0
 
-    for start in range(0, n, BATCH_SIZE):
-        idx = perm[start:start + BATCH_SIZE]
-        x   = enc[idx]
-        pt  = policy_t[idx]
-        vt  = value_t[idx]
-        wi  = w[idx]
-
+    for start in range(0, n, PT_BATCH_SIZE):
+        idx = perm[start:start + PT_BATCH_SIZE]
         opt.zero_grad(set_to_none=True)
-
         with autocast("cuda"):
-            pol, val = model(x)
-            p_loss = F.cross_entropy(pol, pt) * lw["policy_logits"]
+            pol, val = model(enc[idx])
+            p_loss = F.cross_entropy(pol, policy_t[idx]) * lw["policy_logits"]
             v_loss = (
-                F.cross_entropy(val, vt, reduction="none") * wi
+                F.cross_entropy(val, value_t[idx], reduction="none") * w[idx]
             ).mean() * lw["value_out"]
             loss = p_loss + v_loss
-
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
-
         total_p   += p_loss.item()
         total_v   += v_loss.item()
         total     += loss.item()
@@ -461,222 +235,315 @@ def fit_epoch(ms, bundle, lw, device):
     return total_p / n_batches, total_v / n_batches, total / n_batches
 
 
-# ---------------------------------------------------------------------------
-# Eval + plotting
-# ---------------------------------------------------------------------------
-
-def do_eval(ms, bundle, device):
-    model = ms["model"]
-    name  = ms["name"]
-    epoch = ms["epoch"]
+def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device):
+    import torch
+    from torch.amp import autocast
+    from chessbot.utils import batch_policy_metrics, print_validation
 
     enc = torch.as_tensor(bundle["enc_in"].numpy(), dtype=torch.long).to(device)
-
     model.eval()
     all_pol, all_val = [], []
     with torch.no_grad(), autocast("cuda"):
-        for start in range(0, enc.shape[0], BATCH_SIZE):
-            pol, val = model(enc[start:start + BATCH_SIZE])
+        for start in range(0, enc.shape[0], PT_BATCH_SIZE):
+            pol, val = model(enc[start:start + PT_BATCH_SIZE])
             all_pol.append(pol.float().cpu().numpy())
             all_val.append(val.float().cpu().numpy())
 
     pol_preds  = np.concatenate(all_pol, axis=0)
     val_logits = np.concatenate(all_val, axis=0)
+    target_wdl = bundle["value_out"].numpy()
     pstack     = bundle["policy_logits"].numpy()
-    ystack     = bundle["value_out"].numpy()
     mstack     = bundle["mask"].numpy()
 
-    val_probs = scipy.special.softmax(val_logits, axis=1)
-    val_q     = val_probs[:, 0] - val_probs[:, 2]
-    tgt_q     = ystack[:, 0] - ystack[:, 2]
+    val_wdl    = scipy.special.softmax(val_logits, axis=1)
+    val_q      = val_wdl[:, 0] - val_wdl[:, 2]
+    tgt_q      = target_wdl[:, 0] - target_wdl[:, 2]
 
-    pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
     value_mse  = float(np.mean((val_q - tgt_q) ** 2))
     value_corr = float(np.corrcoef(val_q, tgt_q)[0, 1])
+    value_ce   = float(-np.mean(
+        np.sum(target_wdl * np.log(np.clip(val_wdl, 1e-9, None)), axis=1)
+    ))
+    pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
 
-    mh = ms["metrics_history"]
-    for k, v in pol_stats.items():
-        mh.setdefault(k, []).append(v)
-    mh["value_mse"].append(value_mse)
-    mh["value_corr"].append(value_corr)
+    row = {
+        "training_epoch": epoch,
+        "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
+        **pol_stats,
+    }
+    new_row = pd.DataFrame([row])
+    eval_df = new_row if eval_df is None else pd.concat([eval_df, new_row], ignore_index=True)
+    eval_df.round(4).to_csv(progress_file, index=False)
 
-    eval_df  = ms["eval_df"]
-    new_row  = pd.DataFrame(mh).iloc[[-1], :]
-    n_samp   = bundle["enc_in"].shape[0] * (PLOT_EVERY if epoch > 0 else 1)
-    new_row["n_samples"] = n_samp
-    if eval_df is None:
-        new_row["model_epoch"] = 0
-        eval_df = new_row.copy()
-    else:
-        new_row["model_epoch"] = eval_df.tail(1)["model_epoch"].item() + 1
-        new_row = new_row.reindex(columns=eval_df.columns)
-        eval_df = pd.concat([eval_df, new_row])
-
-    eval_df.round(4).to_csv(ms["progress_file"], index=False)
-    ms["eval_df"] = eval_df
-
-    print(f"[eval] {name}")
-    print_validation(epoch, {"value_mse": value_mse, "value_corr": value_corr,
-                              **pol_stats})
-
-    save_plot(eval_df, f"{name}  [PT]", epoch, ms["plot_file"], tgt_q, val_q)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-model_states = []
-for name in MODEL_DEFS:
-    src_model_file = os.path.join(MODEL_DIR, f"{name}_pt_model.pt")
-    run_model_file = os.path.join(RUN_DIR,   f"{name}_pt_model.pt")
-    print(f"[init] {name}: loading fresh from MODEL_DIR")
-    model_states.append({
-        "name":            name,
-        "load_from":       src_model_file,
-        "model_file":      run_model_file,
-        "progress_file":   os.path.join(RUN_DIR, f"{name}_pt_eval_progress.csv"),
-        "plot_file":       os.path.join(RUN_DIR, f"{name}_pt_plot.png"),
-        "model":           None,
-        "optimizer":       None,
-        "scaler":          None,
-        "eval_df":         None,
-        "metrics_history": {"value_mse": [], "value_corr": []},
-        "current_lw":      None,
-        "epoch":           0,
+    print_validation(epoch, {
+        "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
+        **pol_stats,
     })
+    save_plot(eval_df, f"{name}  [PT]", epoch, plot_file, tgt_q, val_q)
+    return eval_df, tgt_q, val_q
 
-all_files = list_tfrecord_files(TFREC_DIR)
-if not all_files:
-    raise RuntimeError(f"No .tfrecord.gz files in {TFREC_DIR}")
 
-train_files, val_files = split_train_val(all_files)
-print(
-    f"[tfrec] train={len(train_files)}  val={len(val_files)}"
-    f"  shuffle_buffer={SHUFFLE_BUFFER}  val_shuffle_buffer={VAL_SHUFFLE_BUFFER}"
-    f"  epoch_size={EPOCH_SIZE}  steps_per_epoch={STEPS_PER_EPOCH}"
-    f"  batch_size={BATCH_SIZE}"
-)
-print(f"[device] {DEVICE}")
+# ---------------------------------------------------------------------------
+# Worker — runs one block of EPOCHS_PER_WORKER epochs in a fresh subprocess
+# ---------------------------------------------------------------------------
 
-try:
-    for ms in model_states:
-        name = ms["name"]
+def worker_main(wargs: dict) -> None:
+    import gc
+    import torch
+    from dotenv import load_dotenv
+    load_dotenv()
 
-        print(f"\n{'#' * 72}")
-        print(f"  Training: {name}  [PyTorch]  ".center(72, "#"))
-        print(f"{'#' * 72}\n")
+    from chessbot import MODEL_DIR
+    from chessbot.utils import format_time
 
-        ms["model"], ms["optimizer"], ms["scaler"] = load_pt_model(
-            ms["load_from"], name, DEVICE
-        )
-        ms["current_lw"]      = None
-        ms["metrics_history"] = {"value_mse": [], "value_corr": []}
-        ms["epoch"]           = 0
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
 
-        worker = EpochBufferThread(
-            make_dataset(train_files, SHUFFLE_BUFFER), STEPS_PER_EPOCH, max_ready=2
-        )
-        val_worker = EpochBufferThread(
-            make_dataset(val_files, VAL_SHUFFLE_BUFFER), STEPS_PER_EPOCH, max_ready=1
-        )
-        worker.start()
-        val_worker.start()
+    name        = wargs["name"]
+    run_dir     = wargs["run_dir"]
+    train_files = wargs["train_files"]
+    val_files   = wargs["val_files"]
+    start_epoch = wargs["start_epoch"]
+    end_epoch   = wargs["end_epoch"]
+    lr          = wargs["lr"]
+    max_epoch   = wargs["max_epoch"]
+    model_dir   = wargs.get("model_dir", MODEL_DIR)
 
-        epoch           = 0
-        epoch_time_list = []
-        begin           = time.time()
-        t_fetch = t_eval = t_fit = 0.0
-        total_samples = window_samples = 0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        while epoch <= DEFAULT_MAX_EPOCH:
-            ep          = ms["epoch"]
-            do_plot     = (ep % PLOT_EVERY == 0)
-            epoch_start = time.time()
+    progress_file = os.path.join(run_dir, f"{name}_pt_eval_progress.csv")
+    plot_file     = os.path.join(run_dir, f"{name}_pt_plot.png")
 
-            target_lw = lw_for_epoch(ep)
-            if target_lw is not ms["current_lw"]:
-                ms["current_lw"] = target_lw
-                lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
-                print(f"[lw update] {name} epoch {ep}: {lw_str}")
+    print(f"\n{'#' * 72}")
+    print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
+    print(f"{'#' * 72}\n")
 
-            print("-" * 89)
-
-            if do_plot:
-                t0 = time.time()
-                val_bundle = val_worker.get()
-                do_eval(ms, val_bundle, DEVICE)
-                t_eval += time.time() - t0
-
-            t0 = time.time()
-            bundle = worker.get()
-            t_fetch += time.time() - t0
-
-            t0 = time.time()
-            p_loss, v_loss, t_loss = fit_epoch(ms, bundle, target_lw, DEVICE)
-            t_fit += time.time() - t0
-
-            n_this          = bundle["enc_in"].shape[0]
-            total_samples  += n_this
-            window_samples += n_this
-
-            print(
-                f"[epoch {ep:4d}] [{name}] "
-                f"policy_loss: {p_loss:.4f}  "
-                f"value_loss: {v_loss:.4f}  "
-                f"total: {t_loss:.4f}  "
-                f"samples: {total_samples:,}"
+    lr0 = pt_lr_for_epoch(start_epoch, max_epoch)
+    if start_epoch == 0:
+        import torch
+        from torch.amp import GradScaler
+        cfg    = VARIANTS[name]
+        model  = PT_BUILDERS[name](cfg).to(device)
+        opt    = torch.optim.Adam(model.parameters(), lr=lr0)
+        scaler = GradScaler("cuda")
+        print(f"[worker] fresh init  lr={lr0:.4e}")
+    else:
+        last_ckpt = find_last_checkpoint(run_dir, name)
+        if last_ckpt < 0:
+            raise RuntimeError(
+                f"start_epoch={start_epoch} but no checkpoint found in {run_dir}"
             )
+        load_from = ckpt_path(run_dir, name, last_ckpt)
+        print(f"[worker] loading {load_from}")
+        model, opt, scaler = load_pt_model(load_from, name, device, lr=lr0)
 
-            ms["epoch"] += 1
-            epoch        += 1
+    eval_df: pd.DataFrame | None = None
+    if os.path.exists(progress_file):
+        existing = pd.read_csv(progress_file)
+        eval_df = existing if not existing.empty else None
 
-            if ep > 0 and ep % 25 == 0:
-                save_pt_model(ms)
+    print(
+        f"[tfrec] train={len(train_files)}  val={len(val_files)}"
+        f"  batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
+    )
 
-            if ep > 0 and ep % 50 == 0:
-                save_pt_model(ms)
-                del ms["model"], ms["optimizer"], ms["scaler"]
-                ms["model"] = ms["optimizer"] = ms["scaler"] = None
-                gc.collect()
-                torch.cuda.empty_cache()
-                print(f"[reload] {name} VRAM cleared at epoch {ep}, reloading...")
-                ms["model"], ms["optimizer"], ms["scaler"] = load_pt_model(
-                    ms["model_file"], name, DEVICE
-                )
-                ms["current_lw"] = None
-                print(f"[reload] {name} ready, resuming from epoch {ep + 1}")
+    prefetcher = EpochBufferThread(
+        make_dataset(train_files, SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE),
+        PT_STEPS_PER_EPOCH, max_ready=2,
+    )
+    val_prefetcher = EpochBufferThread(
+        make_dataset(val_files, VAL_SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE),
+        PT_STEPS_PER_EPOCH, max_ready=1,
+    )
+    prefetcher.start()
+    val_prefetcher.start()
 
-            epoch_time = time.time() - epoch_start
-            epoch_time_list.append(epoch_time)
+    current_lw: dict | None  = None
+    current_lr: float | None = None
+    begin          = time.time()
+    epoch_times: list[float] = []
+    t_fetch = t_fit = t_eval = 0.0
+    total_samples  = 0
+    window_samples = 0
+    last_tgt_q: np.ndarray | None = None
+    last_val_q: np.ndarray | None = None
 
-            print("-" * 89)
-            print(
-                f"[time check] last: {format_time(epoch_time)}  "
-                f"avg: {format_time(np.mean(epoch_time_list))}  "
-                f"total: {format_time(time.time() - begin)}"
+    for ep in range(start_epoch, end_epoch):
+        target_lw = lw_for_epoch(ep)
+        if target_lw is not current_lw:
+            current_lw = target_lw
+            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
+            print(f"[lw update] epoch {ep}: {lw_str}")
+
+        target_lr = pt_lr_for_epoch(ep, max_epoch)
+        if target_lr != current_lr:
+            current_lr = target_lr
+            for pg in opt.param_groups:
+                pg["lr"] = target_lr
+            print(f"[lr update] epoch {ep}: lr={target_lr:.4e}")
+
+        epoch_start = time.time()
+        print("-" * 89)
+
+        if ep % PLOT_EVERY == 0:
+            t0 = time.time()
+            val_bundle = val_prefetcher.get()
+            eval_df, last_tgt_q, last_val_q = do_eval(
+                model, name, ep, val_bundle, eval_df,
+                progress_file, plot_file, device,
             )
+            t_eval += time.time() - t0
 
-            if do_plot and epoch > 0:
-                print(
-                    f"[timing/{PLOT_EVERY}ep] fetch: {t_fetch:.2f}s  "
-                    f"fit: {t_fit:.2f}s  eval: {t_eval:.2f}s  "
-                    f"samples_window: {window_samples:,}  "
-                    f"samples_total: {total_samples:,}"
-                )
-                t_fetch = t_eval = t_fit = 0.0
-                window_samples = 0
+        t0 = time.time()
+        bundle = prefetcher.get()
+        t_fetch += time.time() - t0
 
-            print()
+        t0 = time.time()
+        p_loss, v_loss, t_loss = fit_epoch(model, opt, scaler, bundle, target_lw, device)
+        t_fit += time.time() - t0
 
-        worker.stop()
-        val_worker.stop()
-        save_pt_model(ms)
+        n_this          = int(bundle["enc_in"].shape[0])
+        total_samples  += n_this
+        window_samples += n_this
 
-        del ms["model"], ms["optimizer"], ms["scaler"]
-        ms["model"] = ms["optimizer"] = ms["scaler"] = None
-        gc.collect()
-        torch.cuda.empty_cache()
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"policy_loss: {p_loss:.4f}  value_loss: {v_loss:.4f}  "
+            f"total: {t_loss:.4f}  samples: {total_samples:,}"
+        )
 
-except KeyboardInterrupt:
-    print("\n[bootstrap_pt] KeyboardInterrupt")
+        is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1
+        if is_ckpt:
+            cp = ckpt_path(run_dir, name, ep)
+            save_pt_ckpt(model, opt, scaler, ep, name, cp)
+            delete_old_checkpoints(run_dir, name, keep_epoch=ep)
+            save_plot(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
+
+        elapsed = time.time() - epoch_start
+        epoch_times.append(elapsed)
+        print(
+            f"[time check] last: {format_time(elapsed)}  "
+            f"avg: {format_time(np.mean(epoch_times))}  "
+            f"total: {format_time(time.time() - begin)}"
+        )
+
+        if ep % PLOT_EVERY == 0 and ep > start_epoch:
+            print(
+                f"[timing/{PLOT_EVERY}ep] fetch: {t_fetch:.2f}s  "
+                f"fit: {t_fit:.2f}s  eval: {t_eval:.2f}s  "
+                f"samples_window: {window_samples:,}  "
+                f"samples_total: {total_samples:,}"
+            )
+            t_fetch = t_fit = t_eval = 0.0
+            window_samples = 0
+
+        print()
+
+    prefetcher.stop()
+    val_prefetcher.stop()
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(f"[worker] {name}: block complete (epochs {start_epoch}..{end_epoch - 1})")
+
+
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+
+def spawn_block(wargs: dict) -> int:
+    ctx = mp.get_context("spawn")
+    p   = ctx.Process(target=worker_main, args=(wargs,), daemon=False)
+    p.start()
+    p.join()
+    return p.exitcode if p.exitcode is not None else -1
+
+
+def main() -> None:
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    from chessbot import SP_DIR, MODEL_DIR
+
+    parser = argparse.ArgumentParser(
+        description="OOM-robust PyTorch bootstrap trainer for Xerces",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--model",    default=DEFAULT_MODEL,   help="model name")
+    parser.add_argument("--run-tag",  default=DEFAULT_RUN_TAG, help="run tag under SP_DIR")
+    parser.add_argument(
+        "--run-dir", default=None, help="explicit run dir (overrides --run-tag)"
+    )
+    parser.add_argument(
+        "--tfrec-dir",
+        default=os.getenv(
+            "BOOTSTRAP_TFREC_DIR",
+            r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl",
+        ),
+        help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
+    )
+    parser.add_argument("--max-epoch", type=int,   default=DEFAULT_MAX_EPOCH)
+    parser.add_argument("--lr",        type=float, default=PT_LR_MAX,
+                        help="peak learning rate")
+    args = parser.parse_args()
+
+    if not args.tfrec_dir:
+        parser.error("--tfrec-dir is required (or set $BOOTSTRAP_TFREC_DIR)")
+
+    run_dir = args.run_dir or os.path.join(SP_DIR, args.run_tag)
+    os.makedirs(run_dir, exist_ok=True)
+
+    name = args.model
+    print(f"[supervisor] model={name}")
+    print(f"[supervisor] run_dir={run_dir}")
+    print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
+    print(f"[supervisor] max_epoch={args.max_epoch}  lr={args.lr}")
+    print(f"[supervisor] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
+          f"  lr_range=[{PT_LR_MIN:.1e}, {PT_LR_MAX:.1e}]")
+
+    all_files = list_tfrecord_files(args.tfrec_dir)
+    if not all_files:
+        parser.error(f"no .tfrecord.gz files found in {args.tfrec_dir}")
+
+    train_files, val_files = split_train_val(all_files)
+    print(f"[supervisor] train_files={len(train_files)}  val_files={len(val_files)}")
+
+    resume = get_resume_epoch(run_dir, name)
+
+    while resume < args.max_epoch:
+        block_start = (resume // EPOCHS_PER_WORKER) * EPOCHS_PER_WORKER
+        end_epoch   = min(block_start + EPOCHS_PER_WORKER, args.max_epoch)
+
+        print(
+            f"\n[supervisor] block {block_start // EPOCHS_PER_WORKER}"
+            f"  epochs {resume}..{end_epoch - 1}"
+        )
+
+        wargs = {
+            "name":        name,
+            "run_dir":     run_dir,
+            "train_files": train_files,
+            "val_files":   val_files,
+            "model_dir":   MODEL_DIR,
+            "start_epoch": resume,
+            "end_epoch":   end_epoch,
+            "lr":          args.lr,
+            "max_epoch":   args.max_epoch,
+        }
+
+        exit_code = spawn_block(wargs)
+
+        if exit_code == 0:
+            resume = end_epoch
+            print(f"[supervisor] block complete  ->  resume={resume}")
+        else:
+            print(f"[supervisor] worker crashed (exit={exit_code}), recovering ...")
+            time.sleep(5)
+            resume = get_resume_epoch(run_dir, name)
+            print(f"[supervisor] will retry from epoch {resume}")
+
+    print(f"\n[supervisor] training complete ({args.max_epoch} epochs)")
+
+
+if __name__ == "__main__":
+    main()

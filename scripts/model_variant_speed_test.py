@@ -68,8 +68,24 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 
-VOCAB_SIZE  = 21
-SEQ_LEN     = 64
+from chessbot.model import (
+    VOCAB_SIZE, SEQ_LEN,
+    VARIANTS as BASE_VARIANTS,
+    TF_BUILDERS as BASE_TF_BUILDERS,
+    PT_BUILDERS as BASE_PT_BUILDERS,
+    make_ln2d,
+    make_pt_attn_pool_value_head,
+    make_pt_relational_policy_head,
+    tf_compile,
+    tf_attn_pool_value_head,
+    tf_relational_policy_head,
+    build_tf_transformer,
+    build_tf_conformer_interweaved,
+    build_tf_transformer_branched,
+    build_pt_transformer_16m,
+    build_pt_conformer_interweaved,
+)
+
 N_WARMUP    = 50
 N_ITERS     = 100
 MODEL_DIR   = os.getenv("MODEL_DIR", "")
@@ -107,31 +123,7 @@ VARIANTS = {
         d_embed=256, conv_filters=256, conv_blocks=12,
         mha_heads=8, mha_layers=2, dropout=0.05,
     ),
-    "16m-conformer-interweaved": dict(
-        conformer_interweaved=True,
-        d_embed=256,
-        conv_filters=256,
-        conv_blocks=10,
-        num_heads=8,
-        ff_dim=1024,
-        dropout=0.05,
-    ),
-    "16m-transformer": dict(
-        transformer=True,
-        d_embed=512,
-        transformer_layers=7,
-        num_heads=16,
-        ff_dim=1024,
-        dropout=0.05,
-    ),
-    "16m-transformer-branched": dict(
-        transformer_branched=True,
-        d_embed=512,
-        transformer_layers=4,
-        num_heads=16,
-        ff_dim=1024,
-        dropout=0.05,
-    ),
+    **BASE_VARIANTS,
 }
 
 VARIANT_ORDER = list(VARIANTS.keys())
@@ -224,81 +216,8 @@ def save_csv_incremental(csv_rows, model_dir):
     except Exception as e:
         print(f"  [WARN] CSV save failed: {e}")
 
-# ---------------------------------------------------------------------------
-# Shared TF helpers
-# ---------------------------------------------------------------------------
-
-def tf_compile(model):
-    import tensorflow as tf
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = tf.keras.mixed_precision.LossScaleOptimizer(opt)
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-    }
-    model.compile(optimizer=opt, loss=loss_dict,
-                  loss_weights={"policy_logits": 1.0, "value_out": 1.0})
-    model._default_opt       = opt
-    model._default_loss_dict = loss_dict
-    return model
-
-
-def tf_attn_pool_value_head(x, C, layers, activation="gelu"):
-    """Attention pooling value head. x: (B,8,8,C) or (B,64,C)."""
-    if len(x.shape) == 4:
-        x_seq = layers.Reshape((64, C), name="v_seq")(x)
-    else:
-        x_seq = x
-
-    x_seq   = layers.LayerNormalization(axis=-1, name="v_ln")(x_seq)
-    attn_w  = layers.Dense(1, name="attn_w")(x_seq)
-    attn_w  = layers.Softmax(axis=1, name="attn_softmax")(attn_w)
-    attn_wT = layers.Permute((2, 1), name="attn_w_T")(attn_w)
-
-    v = layers.Dot(axes=[2, 1], name="v_pool")([attn_wT, x_seq])
-    v = layers.Reshape((C,), name="v_squeeze")(v)
-    v = layers.Dense(256, activation=activation, name="v_fc1")(v)
-    v = layers.Dense(128, activation=activation, name="v_fc2")(v)
-    return layers.Dense(3, dtype="float32", name="value_out")(v)
-
-
-def tf_relational_policy_head(x, C, layers):
-    """Relational policy head. x: (B,8,8,C) or (B,64,C).
-    Returns policy_logits (B,4288): 4096 normal moves + 192 underpromotions."""
-    if len(x.shape) == 3:
-        x_seq = x
-        x_2d  = layers.Reshape((8, 8, C), name="pol_x_to_2d")(x)
-    else:
-        x_seq = layers.Reshape((64, C), name="pol_to_seq")(x)
-        x_2d  = x
-
-    from_h   = layers.Dense(256, activation="gelu", name="pol_from_fc1")(x_seq)
-    from_h   = layers.LayerNormalization(name="pol_from_ln1")(from_h)
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(from_h)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
-
-    to_h     = layers.Dense(256, activation="gelu", name="pol_to_fc1")(x_seq)
-    to_h     = layers.LayerNormalization(name="pol_to_ln1")(to_h)
-    to_vec   = layers.Dense(256)(to_h)
-    to_vec   = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
-
-    normal_logits = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
-    normal_logits = layers.Reshape((64 * 64,), name="pol_normal_flat")(normal_logits)
-
-    p      = layers.Conv2D(64, 1, use_bias=False, padding="same", name="pol_promo_mix")(x_2d)
-    p      = layers.LayerNormalization(axis=-1, name="pol_promo_mix_ln")(p)
-    p      = layers.LeakyReLU(0.02, name="pol_promo_mix_act")(p)
-    p_skip = p
-
-    p      = layers.Conv2D(64, 3, use_bias=False, padding="same", name="pol_promo_c1")(p)
-    p      = layers.LayerNormalization(axis=-1, name="pol_promo_ln")(p)
-    p      = layers.LeakyReLU(0.02, name="pol_promo_act")(p)
-    p      = layers.Add(name="pol_promo_skip")([p, p_skip])
-    
-    promo_logits = layers.Conv2D(3, 1, padding="same", name="pol_promo_conv")(p)
-    promo_logits = layers.Reshape((8 * 8 * 3,), name="pol_promo_flat")(promo_logits)
-
-    return layers.Concatenate(axis=1, name="policy_logits")([normal_logits, promo_logits])
+# Shared TF helpers (tf_compile, tf_attn_pool_value_head, tf_relational_policy_head)
+# and canonical builders are imported from chessbot.model above.
 
 
 def tf_context_encoder(proj, C, nh, nl, layers, tf):
@@ -426,134 +345,6 @@ def build_tf_conformer(cfg):
     return tf_compile(model)
 
 
-def build_tf_conformer_interweaved(cfg):
-    """Interweaved conformer: 10 x [MHA -> Conv -> Conv]."""
-    import tensorflow as tf
-    from tensorflow.keras import layers, Input, Model
-
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-
-    de = cfg["d_embed"]
-    cf = cfg["conv_filters"]
-    cb = cfg["conv_blocks"]
-    nh = cfg["num_heads"]
-    dr = cfg["dropout"]
-
-    inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
-    x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
-    x = layers.Reshape((8, 8, de), name="to_2d")(x)
-
-    if de != cf:
-        x = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="conv_proj")(x)
-        x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
-        x = layers.LeakyReLU(0.02, name="lrelu_proj")(x)
-
-    pos = layers.Embedding(64, cf, name="pos_emb")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-
-    pos = layers.Lambda(
-        lambda t: tf.expand_dims(t, axis=0),
-        name="pos_expand",
-    )(pos)
-    
-    for i in range(cb):
-        s = layers.Reshape((64, cf), name=f"b{i}_to_seq")(x)
-        if i == 0:
-            s = s + pos
-        
-        r = s
-        s = layers.LayerNormalization(axis=-1, name=f"b{i}_ln1")(s)
-        s = layers.MultiHeadAttention(
-            num_heads=nh,
-            key_dim=cf // nh,
-            dropout=0.0,
-            name=f"b{i}_mha",
-        )(s, s)
-        s = layers.Dropout(dr, name=f"b{i}_drop1")(s)
-        s = s + r
-
-        x = layers.Reshape((8, 8, cf), name=f"b{i}_to_2d")(s)
-        r = x
-        h = layers.LayerNormalization(axis=-1, name=f"b{i}_ln2")(x)
-        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c1")(h)
-        h = layers.LeakyReLU(0.02, name=f"b{i}_lr1")(h)
-        h = layers.Conv2D(cf, 3, use_bias=False, padding="same", name=f"b{i}_c2")(h)
-        x = r + h
-    
-    # VALUE HEAD
-    v = layers.Conv2D(cf, 1, use_bias=False, padding="same", name="value_mix")(x)
-    v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
-    v = layers.LeakyReLU(0.02, name="value_mix_act")(v)
-
-    value = tf_attn_pool_value_head(v, cf, layers)
-
-    policy = tf_relational_policy_head(x, cf, layers)
-
-    model = Model(inp, [policy, value])
-    print(f"  TF params: {model.count_params():,}")
-    return tf_compile(model)
-
-def build_tf_2(cfg):
-    import tensorflow as tf
-    from tensorflow.keras import layers, Input, Model
-
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
-    x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
-
-    pos = layers.Embedding(64, de, name="pos_emb")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-    pos = layers.Lambda(
-        lambda t: tf.expand_dims(t, axis=0),
-        name="pos_expand",
-    )(pos)
-
-    x = x + pos
-
-    for i in range(tl):
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln1")(x)
-        x = layers.MultiHeadAttention(
-            num_heads=nh,
-            key_dim=de // nh,
-            dropout=0.0,
-            name=f"t{i}_mha",
-        )(x, x)
-        x = layers.Dropout(dr, name=f"t{i}_drop1")(x)
-        x = x + r
-
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln2")(x)
-        x = layers.Dense(fd, activation="gelu", name=f"t{i}_ff1")(x)
-        x = layers.Dropout(dr, name=f"t{i}_drop2")(x)
-        x = layers.Dense(de, name=f"t{i}_ff2")(x)
-        x = x + r
-
-    # x is (B, 64, de) — reshape once, shared by both heads
-    x_2d = layers.Reshape((8, 8, de), name="x_to_2d")(x)
-
-    # value head (matching conformer-interweaved)
-    v = layers.Conv2D(de, 1, use_bias=False, padding="same", name="value_mix")(x_2d)
-    v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
-    v = layers.LeakyReLU(0.02, name="value_mix_act")(v)
-    value = tf_attn_pool_value_head(v, de, layers)
-
-    policy = tf_relational_policy_head(x_2d, de, layers)
-
-    model = Model(inp, [policy, value])
-    print(f"  TF params: {model.count_params():,}")
-    return tf_compile(model)
-
-
 def build_tf_film(cfg):
     """2×MHA context encoder → FiLM gammas/betas computed upfront → conv stack.
     Note: ff_dim key in preset is vestigial — context encoder has no FF layers."""
@@ -648,177 +439,22 @@ def build_tf_gated_ctx(cfg):
     return tf_compile(model)
 
 
-def build_tf_transformer(cfg):
-    import tensorflow as tf
-    from tensorflow.keras import layers, Input, Model
-
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
-    x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
-    pos = layers.Embedding(64, de, name="pos_emb")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-    pos = layers.Lambda(
-        lambda t: tf.expand_dims(t, axis=0), name="pos_expand"
-    )(pos)
-    x = x + pos
-
-    for i in range(tl):
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln1")(x)
-        x = layers.MultiHeadAttention(
-            num_heads=nh, key_dim=de // nh, dropout=0.0, name=f"t{i}_mha"
-        )(x, x)
-        x = layers.Dropout(dr, name=f"t{i}_drop1")(x)
-        x = x + r
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"t{i}_ln2")(x)
-        x = layers.Dense(fd, activation="gelu", name=f"t{i}_ff1")(x)
-        x = layers.Dropout(dr, name=f"t{i}_drop2")(x)
-        x = layers.Dense(de, name=f"t{i}_ff2")(x)
-        x = x + r
-
-    x_2d = layers.Reshape((8, 8, de), name="x_to_2d")(x)
-    v = layers.Conv2D(de, 1, use_bias=False, padding="same", name="value_mix")(x_2d)
-    v = layers.LayerNormalization(axis=-1, name="value_mix_ln")(v)
-    v = layers.LeakyReLU(0.02, name="value_mix_act")(v)
-    value  = tf_attn_pool_value_head(v, de, layers)
-    policy = tf_relational_policy_head(x_2d, de, layers)
-
-    model = Model(inp, [policy, value])
-    print(f"  TF params: {model.count_params():,}")
-    return tf_compile(model)
-
-
-def build_tf_transformer_branched(cfg):
-    """7-layer shared trunk splits into 3 independent branch MHAs:
-      - value branch:   1 MHA -> attn-pool value head
-      - policy-from:    1 MHA -> de->384->256 projection -> from_vec (B,64,256)
-      - policy-to:      1 MHA -> de->384->256 projection -> to_vec (B,64,256)
-    Cross-bilinear dot(from_vec, to_vec) -> (B,4096) + promo conv -> (B,4288).
-    """
-    import tensorflow as tf
-    from tensorflow.keras import layers, Input, Model
-
-    tf.keras.mixed_precision.set_global_policy("mixed_float16")
-
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    def prenorm_mha(x, tag):
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"{tag}_ln")(x)
-        x = layers.MultiHeadAttention(
-            num_heads=nh, key_dim=de // nh, dropout=0.0, name=f"{tag}_mha"
-        )(x, x)
-        x = layers.Dropout(dr, name=f"{tag}_drop")(x)
-        return x + r
-
-    def prenorm_dense(x, final_dense, tag):
-        r = x
-        x = layers.LayerNormalization(axis=-1, name=f"{tag}_ln2")(x)
-        x = layers.Dense(fd, activation="gelu", name=f"{tag}_ff1")(x)
-        x = layers.Dropout(dr, name=f"{tag}_drop2")(x)
-        x = layers.Dense(final_dense, name=f"{tag}_ff2")(x)
-        return x + r if final_dense == de else x
-
-    inp = Input(shape=(SEQ_LEN,), dtype=tf.int32, name="enc_in")
-    x = layers.Embedding(VOCAB_SIZE, de, name="token_emb")(inp)
-    pos = layers.Embedding(64, de, name="pos_emb")(
-        tf.keras.backend.arange(0, 64, dtype="int32")
-    )
-    pos = layers.Lambda(lambda t: tf.expand_dims(t, axis=0), name="pos_expand")(pos)
-    x = x + pos
-
-    for i in range(tl):
-        x = prenorm_mha(x, f"t{i}")
-        x = prenorm_dense(x, de, f"t{i}")
-
-    # 3 independent branch MHAs
-    v_seq  = prenorm_mha(x, "bv")
-    v_seq  = prenorm_dense(v_seq, de, "bv")
-
-    pf_seq = x
-    pt_seq = x
-    for j in range(1):
-        pf_seq = prenorm_mha(pf_seq, f"bf{j}")
-        pf_seq = prenorm_dense(pf_seq, de, f"bf{j}")
-
-        pt_seq = prenorm_mha(pt_seq, f"bt{j}")
-        pt_seq = prenorm_dense(pt_seq, de, f"bt{j}")
-
-    # value branch
-    v_2d  = layers.Reshape((8, 8, de), name="v_to_2d")(v_seq)
-    value = tf_attn_pool_value_head(v_2d, de, layers)
-
-    # cross-bilinear policy: from-branch and to-branch project independently
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(pf_seq)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
-
-    to_vec = layers.Dense(256, activation="gelu", name="pol_to_fc2")(pt_seq)
-    to_vec = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
-
-    normal_logits = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
-    normal_logits = layers.Reshape((64 * 64,), name="pol_normal_flat")(normal_logits)
-
-    # promo from shared trunk output
-    x_2d   = layers.Reshape((8, 8, de), name="x_to_2d")(x)
-    p      = layers.Conv2D(64, 1, use_bias=False, padding="same", name="pol_promo_mix")(x_2d)
-    p      = layers.LayerNormalization(axis=-1, name="pol_promo_mix_ln")(p)
-    p      = layers.LeakyReLU(0.02, name="pol_promo_mix_act")(p)
-    p_skip = p
-    p      = layers.Conv2D(64, 3, use_bias=False, padding="same", name="pol_promo_c1")(p)
-    p      = layers.LayerNormalization(axis=-1, name="pol_promo_ln")(p)
-    p      = layers.LeakyReLU(0.02, name="pol_promo_act")(p)
-    p      = layers.Add(name="pol_promo_skip")([p, p_skip])
-    promo_logits = layers.Conv2D(3, 1, padding="same", name="pol_promo_conv")(p)
-    promo_logits = layers.Reshape((8 * 8 * 3,), name="pol_promo_flat")(promo_logits)
-
-    policy = layers.Concatenate(axis=1, name="policy_logits")([normal_logits, promo_logits])
-
-    model = Model(inp, [policy, value])
-    print(f"  TF params: {model.count_params():,}")
-    return tf_compile(model)
 
 
 TF_BUILDERS = {
-    "16m-pure-conv":               build_tf_pure_conv,
-    "16m-conformer":               build_tf_conformer,
-    "16m-conformer-interweaved":   build_tf_conformer_interweaved,
-    "16m-film":                    build_tf_film,
-    "16m-concat-fusion":           build_tf_concat_fusion,
-    "16m-gated-ctx":               build_tf_gated_ctx,
-    "16m-transformer":             build_tf_transformer,
-    "16m-transformer-branched":    build_tf_transformer_branched,
+    "16m-pure-conv":             build_tf_pure_conv,
+    "16m-conformer":             build_tf_conformer,
+    "16m-film":                  build_tf_film,
+    "16m-concat-fusion":         build_tf_concat_fusion,
+    "16m-gated-ctx":             build_tf_gated_ctx,
+    **BASE_TF_BUILDERS,
 }
 
 # ---------------------------------------------------------------------------
-# PyTorch shared helpers
+# PyTorch shared helpers (speed-test-only: bare attn for film/concat/gated)
+# make_ln2d, make_pt_attn_pool_value_head, make_pt_relational_policy_head
+# are imported from chessbot.model above.
 # ---------------------------------------------------------------------------
-
-def make_ln2d(ch):
-    import torch, torch.nn as nn
-    class Ln2d(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.w = nn.Parameter(torch.ones(ch))
-            self.b = nn.Parameter(torch.zeros(ch))
-        def forward(self, x):
-            c = x - x.mean(1, keepdim=True)
-            return c * torch.rsqrt((c*c).mean(1, keepdim=True) + 1e-5) \
-                   * self.w.view(1,-1,1,1) + self.b.view(1,-1,1,1)
-    return Ln2d()
-
 
 def make_bare_attn(d, heads):
     import torch.nn as nn
@@ -834,69 +470,6 @@ def make_bare_attn(d, heads):
     return BareAttn()
 
 
-def pt_attn_pool(x_seq, linear):
-    import torch
-    w = torch.softmax(linear(x_seq), dim=1)
-    return (x_seq * w).sum(dim=1)
-
-
-def make_pt_attn_pool_value_head(C):
-    """Attn-pool value head. Accepts (B,C,8,8) or (B,64,C). Returns value_out (B,3)."""
-    import torch.nn as nn, torch.nn.functional as F
-    class AttnPoolValueHead(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln  = nn.LayerNorm(C)
-            self.ap  = nn.Linear(C, 1)
-            self.fc1 = nn.Linear(C, 256)
-            self.fc2 = nn.Linear(256, 128)
-            self.out = nn.Linear(128, 3)
-        def forward(self, x):
-            import torch
-            if x.dim() == 4:
-                B = x.shape[0]
-                x = x.permute(0, 2, 3, 1).reshape(B, 64, C)
-            x = self.ln(x)
-            w = torch.softmax(self.ap(x), dim=1)
-            v = (x * w).sum(dim=1)
-            v = F.relu(self.fc1(v))
-            v = F.relu(self.fc2(v))
-            return self.out(v)
-    return AttnPoolValueHead()
-
-
-def make_pt_relational_policy_head(C):
-    """Relational policy head. Accepts (B,C,8,8). Returns policy_logits (B,4288)."""
-    import torch.nn as nn, torch.nn.functional as F
-    class RelationalPolicyHead(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.from_fc   = nn.Linear(C, 256)
-            self.from_ln1  = nn.LayerNorm(256)
-            self.from_fc2  = nn.Linear(256, 128)
-            self.from_ln2  = nn.LayerNorm(128)
-            self.to_fc     = nn.Linear(C, 256)
-            self.to_ln1    = nn.LayerNorm(256)
-            self.to_fc2    = nn.Linear(256, 128)
-            self.to_ln2    = nn.LayerNorm(128)
-            self.promo_mix = nn.Conv2d(C, 64, 1, bias=False)
-            self.promo_mln = make_ln2d(64)
-            self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)
-            self.promo_ln  = make_ln2d(64)
-            self.promo_out = nn.Conv2d(64, 3, 1)
-        def forward(self, x):
-            import torch
-            B = x.shape[0]
-            s        = x.permute(0, 2, 3, 1).reshape(B, 64, C)
-            from_vec = self.from_ln2(F.gelu(self.from_fc2(self.from_ln1(F.gelu(self.from_fc(s))))))
-            to_vec   = self.to_ln2(F.gelu(self.to_fc2(self.to_ln1(F.gelu(self.to_fc(s))))))
-            normal   = torch.bmm(from_vec, to_vec.transpose(1, 2)).reshape(B, 64 * 64)
-            p        = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
-            p_skip   = p
-            p        = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
-            promo    = self.promo_out(p + p_skip).permute(0, 2, 3, 1).reshape(B, 8 * 8 * 3)
-            return torch.cat([normal, promo], dim=1)
-    return RelationalPolicyHead()
 
 # ---------------------------------------------------------------------------
 # PyTorch builders
@@ -991,160 +564,6 @@ def build_pt_conformer(cfg):
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
-    return m
-
-
-def build_pt_conformer_interweaved(cfg):
-    """Interweaved conformer: 10 x [MHA -> Conv -> Conv].
-    Op-for-op identical to build_tf_conformer_interweaved:
-      - graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none
-      - LayerNorm before attention pooling in value head
-    """
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    de = cfg["d_embed"]
-    cf = cfg["conv_filters"]
-    cb = cfg["conv_blocks"]
-    nh = cfg["num_heads"]
-    dr = cfg["dropout"]
-
-    # Graduated pos injection scales matching TF: {block_idx: scale}
-    _POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
-
-    class Block(nn.Module):
-        def __init__(self, pos_scale):
-            super().__init__()
-            self.pos_scale = pos_scale
-            self.ln1 = nn.LayerNorm(cf)
-            self.attn = nn.MultiheadAttention(
-                cf,
-                nh,
-                dropout=0.0,
-                batch_first=True,
-            )
-            self.drop1 = nn.Dropout(dr)
-            self.c1 = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.lr1 = nn.LeakyReLU(0.01, True)
-            self.c2 = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
-            self.ln2 = make_ln2d(cf)
-
-        def forward(self, x, pos):
-            b = x.shape[0]
-
-            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
-            if self.pos_scale != 0.0:
-                s = s + self.pos_scale * pos
-
-            r = s
-            n = self.ln1(s)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            s = r + self.drop1(h)
-
-            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
-
-            r = x
-            h = self.lr1(self.c1(x))
-            h = self.ln2(self.c2(h))
-            x = F.leaky_relu(r + h, 0.01)
-
-            return x
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb = nn.Embedding(VOCAB_SIZE, de)
-            self.proj = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
-            self.lnp = make_ln2d(cf) if de != cf else None
-            self.pos = nn.Embedding(64, cf)
-            self.blocks = nn.ModuleList(
-                [Block(_POS_SCALES.get(i, 0.0)) for i in range(cb)]
-            )
-            self.mix         = nn.Conv2d(cf, cf, 1, bias=False)
-            self.lnm         = make_ln2d(cf)
-            self.policy_head = make_pt_relational_policy_head(cf)
-            self.value_head  = make_pt_attn_pool_value_head(cf)
-
-        def forward(self, t):
-            b = t.shape[0]
-
-            x = self.emb(t).reshape(b, 8, 8, de).permute(0, 3, 1, 2)
-            x = x.contiguous()
-
-            if self.proj is not None:
-                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
-
-            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-
-            for block in self.blocks:
-                x = block(x, pos)
-
-            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
-            return self.policy_head(x), self.value_head(x)
-
-    m = M()
-    print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
-    return m
-
-
-def build_pt_transformer_16m(cfg):
-    """Pure transformer with flat pos reinjection (0.1 per layer after first).
-    Heads match TF: relational bilinear policy (4288), value_mix + attn pool value.
-    Default config: d_embed=384, 8 layers, 8 heads, ff_dim=1536 (~16M params).
-    """
-    import torch, torch.nn as nn, torch.nn.functional as F
-
-    de = cfg["d_embed"]
-    tl = cfg["transformer_layers"]
-    nh = cfg["num_heads"]
-    fd = cfg["ff_dim"]
-    dr = cfg["dropout"]
-
-    class TxLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ln1   = nn.LayerNorm(de)
-            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
-            self.drop1 = nn.Dropout(dr)
-            self.ln2   = nn.LayerNorm(de)
-            self.ff1   = nn.Linear(de, fd)
-            self.drop2 = nn.Dropout(dr)
-            self.ff2   = nn.Linear(fd, de)
-
-        def forward(self, x):
-            n = self.ln1(x)
-            h, _ = self.attn(n, n, n, need_weights=False)
-            x = x + self.drop1(h)
-            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb  = nn.Embedding(VOCAB_SIZE, de)
-            self.pos  = nn.Embedding(64, de)
-            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
-            self.val_mix     = nn.Conv2d(de, de, 1, bias=False)
-            self.val_mix_ln  = make_ln2d(de)
-            self.policy_head = make_pt_relational_policy_head(de)
-            self.value_head  = make_pt_attn_pool_value_head(de)
-
-        def forward(self, t):
-            B   = t.shape[0]
-            pos = self.pos(torch.arange(64, device=t.device)).unsqueeze(0)
-            x   = self.emb(t) + pos
-            for i, tx in enumerate(self.txs):
-                if i > 0:
-                    x = x + 0.1 * pos
-                x = tx(x)
-            # x: (B, 64, de)
-
-            x_2d = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
-            v_2d = F.leaky_relu(self.val_mix_ln(self.val_mix(x_2d)), 0.02)
-            return self.policy_head(x_2d), self.value_head(v_2d)
-
-    m = M()
-    print(f"  PT params: {sum([p.numel() for p in m.parameters()]):,}")
     return m
 
 
@@ -1298,13 +717,12 @@ def build_pt_gated_ctx(cfg):
 
 
 PT_BUILDERS = {
-    "16m-pure-conv":             build_pt_pure_conv,
-    "16m-conformer":             build_pt_conformer,
-    "16m-film":                  build_pt_film,
-    "16m-concat-fusion":         build_pt_concat_fusion,
-    "16m-gated-ctx":             build_pt_gated_ctx,
-    "16m-transformer":           build_pt_transformer_16m,
-    "16m-conformer-interweaved": build_pt_conformer_interweaved,
+    "16m-pure-conv":   build_pt_pure_conv,
+    "16m-conformer":   build_pt_conformer,
+    "16m-film":        build_pt_film,
+    "16m-concat-fusion": build_pt_concat_fusion,
+    "16m-gated-ctx":   build_pt_gated_ctx,
+    **BASE_PT_BUILDERS,
 }
 
 # ---------------------------------------------------------------------------

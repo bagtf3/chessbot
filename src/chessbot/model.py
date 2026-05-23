@@ -155,14 +155,17 @@ def tf_compile(model):
 def tf_attn_pool_value_head(x, C, layers, activation="gelu"):
     """Attention-pool value head for TF functional API.
     x: (B, 8, 8, C) or (B, 64, C). Returns value_out (B, 3) float32."""
+    
     if len(x.shape) == 4:
         x_seq = layers.Reshape((64, C), name="v_seq")(x)
     else:
         x_seq = x
+
     x_seq   = layers.LayerNormalization(axis=-1, name="v_ln")(x_seq)
     attn_w  = layers.Dense(1, name="attn_w")(x_seq)
     attn_w  = layers.Softmax(axis=1, name="attn_softmax")(attn_w)
     attn_wT = layers.Permute((2, 1), name="attn_w_T")(attn_w)
+
     v = layers.Dot(axes=[2, 1], name="v_pool")([attn_wT, x_seq])
     v = layers.Reshape((C,), name="v_squeeze")(v)
     v = layers.Dense(256, activation=activation, name="v_fc1")(v)
@@ -173,7 +176,7 @@ def tf_attn_pool_value_head(x, C, layers, activation="gelu"):
 def tf_relational_policy_head(x, C, layers):
     """Bilinear from/to policy head for TF functional API.
     x: (B, 8, 8, C) or (B, 64, C). Returns policy_logits (B, 4288)."""
-    
+
     if len(x.shape) == 3:
         x_seq = x
         x_2d  = layers.Reshape((8, 8, C), name="pol_x_to_2d")(x)

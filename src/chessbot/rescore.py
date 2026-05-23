@@ -240,7 +240,6 @@ class Rescorer(object):
         }
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
-        self.rng_scale = 1.0
 
         self.intake = deque()
         self.pending = {}
@@ -469,6 +468,7 @@ class Rescorer(object):
             'use_collar_rescoring', 'rescore_analyze_batch',
             'draw_value_scale',
             'rescore_kl_threshold', 'rescore_ce_threshold', 'rescore_sample_floor',
+            'rescore_target_acceptance',
             'vscale'
         )
         game_state = {
@@ -771,6 +771,7 @@ class Rescorer(object):
         turn_at = {}
         pending = []
         pending_meta = []
+        kl_map = {}
 
         for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
             i = ply['ply_idx']
@@ -816,6 +817,7 @@ class Rescorer(object):
                 best_abs, played_abs,
                 turn, loss_this,
                 tr.get('stop_reason', ''), tr.get('sims', 0),
+                sf_wdl,
             ])
 
             if ply['skip_training']:
@@ -873,6 +875,7 @@ class Rescorer(object):
             vwht = value_weight_for_game(cfg, is_draw)
             pwht = 1.0
             kl = kl_divergence(priors, vis)
+            kl_map[i] = kl
             if kl_eligible and do_KL_boost:
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
@@ -944,6 +947,11 @@ class Rescorer(object):
                 )
         
         n_diff = 0
+        hard_accepted = []
+        soft_pool = []
+        sc = self.sample_counts
+        scw = self.sample_counts_window
+
         for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), meta in zip(
             pending, pending_meta
         ):
@@ -956,19 +964,13 @@ class Rescorer(object):
             z = z_eff if cfg.use_collar_rescoring else z_orig
             Y = blend_wdl(z, meta.get('best_wdl'), meta.get('sf_wdl'), is_white)
 
-            # accept into retraining based on accuracy + random sampling
-            # value CE between nn_wdl and sf_wdl (both stm-pov) rather than Y to avoid
-            # oversampling early-game positions where NN correctly eval ~0
-            # but outcome Z is +-1
             nn_wdl = meta['nn_wdl']
-            sf_wdl = meta['sf_wdl']
-            if nn_wdl is not None and sf_wdl is not None:
+            if nn_wdl is not None:
                 eps = 1e-7
-                # nn_wdl is white-pov; sf_wdl is stm-pov — align nn to stm
                 nw = nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0])
                 p = np.clip(nw, eps, 1 - eps)
                 p = p / p.sum()
-                ce = -float(np.dot(sf_wdl, np.log(p)))
+                ce = -float(np.dot(Y, np.log(p)))
             else:
                 ce = 0.0
             kl = meta['kl']
@@ -976,49 +978,63 @@ class Rescorer(object):
             hit_ce = ce > ce_t
             hit_cpl = meta['cpl'] >= cpl_t
 
-            sc = self.sample_counts
-            scw = self.sample_counts_window
             sc['total'] += 1
             scw['total'] += 1
 
+            entry = (x, mask, policy, Y, vwht, pwht)
+            flags = (hit_kl, hit_ce, hit_cpl)
             if hit_kl or hit_ce or hit_cpl:
-                self.training_data.append((x, mask, policy, Y, vwht, pwht))
-                sc['accepted'] += 1
-                scw['accepted'] += 1
-                if hit_kl:
-                    sc['kl'] += 1
-                    scw['kl'] += 1
-                if hit_ce:
-                    sc['ce'] += 1
-                    scw['ce'] += 1
-                if hit_cpl:
-                    sc['cpl'] += 1
-                    scw['cpl'] += 1
+                hard_accepted.append((entry, flags))
             else:
-                score = max(kl / kl_t, ce / ce_t)
-                if random.random() < max(cfg.rescore_sample_floor, score * self.rng_scale):
-                    self.training_data.append((x, mask, policy, Y, vwht, pwht))
-                    sc['accepted'] += 1
-                    scw['accepted'] += 1
-                    sc['rng'] += 1
-                    scw['rng'] += 1
+                soft_pool.append(entry)
 
             self.pending_metrics.append({
                 **meta,
                 'target_y': Y[0] - Y[2],
                 'target_wdl': Y,
             })
+
+        for entry, (hit_kl, hit_ce, hit_cpl) in hard_accepted:
+            self.training_data.append(entry)
+            sc['accepted'] += 1
+            scw['accepted'] += 1
+            if hit_kl:
+                sc['kl'] += 1
+                scw['kl'] += 1
+            if hit_ce:
+                sc['ce'] += 1
+                scw['ce'] += 1
+            if hit_cpl:
+                sc['cpl'] += 1
+                scw['cpl'] += 1
+
+        n_hard = len(hard_accepted)
+        n_soft = len(soft_pool)
+        n_total = n_hard + n_soft
+        target_n = int(cfg.rescore_target_acceptance * n_total)
+        n_need = max(0, target_n - n_hard)
+        n_sample = min(n_soft, max(int(cfg.rescore_sample_floor * n_soft), n_need))
+        if n_sample > 0 and n_soft > 0:
+            chosen = np.random.choice(n_soft, size=n_sample, replace=False)
+            for i in chosen:
+                self.training_data.append(soft_pool[i])
+                sc['accepted'] += 1
+                scw['accepted'] += 1
+                sc['rng'] += 1
+                scw['rng'] += 1
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
-            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims'
+            'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
+            'sf_wdl',
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
         out_df['played_best_move'] = out_df['delta'] <= 0
+        out_df['rescore_kl'] = out_df['move_num'].map(kl_map)
 
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
 
@@ -1053,8 +1069,6 @@ class Rescorer(object):
         self.games_processed += 1
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
-        if self.games_processed % 30 == 0 and self.games_processed > 0:
-            self.autotune_rng_scale()
         if self.games_processed % 100 == 0:
             self.print_stop_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
@@ -1166,16 +1180,6 @@ class Rescorer(object):
                     combined[k] += h[k]
             print(row("last 300", combined))
 
-    def autotune_rng_scale(self):
-        sc = self.sample_counts
-        if sc['total'] == 0:
-            return
-        hard_rate = (sc['accepted'] - sc['rng']) / sc['total']
-        rng_rate = sc['rng'] / sc['total']
-        target_rng = max(0.0, self.config.rescore_target_acceptance - hard_rate)
-        if rng_rate > 0:
-            self.rng_scale = min(1.0, self.rng_scale * (target_rng / rng_rate))
-
     def print_sample_stats(self):
         cats = ("cpl", "kl", "ce", "rng")
         labels = ("CPL", " KL", " CE", "rng")
@@ -1212,11 +1216,7 @@ class Rescorer(object):
         chunk = self.pending_metrics[:chunk_size]
         self.pending_metrics = self.pending_metrics[chunk_size:]
 
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-
-        nn_vals_stm, target_ys, sf_cps, sf_wdls, result_zs = [], [], [], [], []
+        nn_vals_stm, target_ys, sf_cps, result_zs = [], [], [], []
         mol_vals, policy_samples = [], []
         nn_wdls, target_wdls = [], []
 
@@ -1229,8 +1229,6 @@ class Rescorer(object):
             nn_vals_stm.append(nn_stm)
             target_ys.append(m['target_y'])
             sf_cps.append(m['sf_cp'])
-            wdl = m.get('sf_wdl')
-            sf_wdls.append((wdl[0] - wdl[2]) if wdl is not None else float('nan'))
             result_zs.append(m['result_z_stm'])
             mol = m.get('mass_on_legal')
             mol_vals.append(mol if mol is not None else float('nan'))
@@ -1248,7 +1246,6 @@ class Rescorer(object):
         nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
         target_ys   = np.array(target_ys,   dtype=np.float32)
         sf_cps      = np.array(sf_cps,      dtype=np.float32)
-        sf_wdls     = np.array(sf_wdls,     dtype=np.float32)
         result_zs   = np.array(result_zs,   dtype=np.float32)
         mol_vals    = np.array(mol_vals,     dtype=np.float32)
 
@@ -1275,12 +1272,22 @@ class Rescorer(object):
             nn_wdl_arr = np.clip(nn_wdl_arr, eps, 1.0 - eps)
             nn_wdl_arr /= nn_wdl_arr.sum(axis=1, keepdims=True)
             val_ce = -np.mean(np.sum(tgt_wdl_arr * np.log(nn_wdl_arr), axis=1))
+            wdl_bias = np.mean(nn_wdl_arr - tgt_wdl_arr, axis=0)
+            ce_components = -np.mean(tgt_wdl_arr * np.log(nn_wdl_arr), axis=0)
         else:
             val_ce = float('nan')
+            wdl_bias = np.array([float('nan')] * 3)
+            ce_components = np.array([float('nan')] * 3)
 
         stats = {'value_mse': val_mse, 'value_corr': val_corr, 'value_ce': val_ce}
         stats.update(pol_stats)
         stats['mass_on_legal'] = mol_est
+        stats['wdl_bias_w'] = float(wdl_bias[0])
+        stats['wdl_bias_d'] = float(wdl_bias[1])
+        stats['wdl_bias_l'] = float(wdl_bias[2])
+        stats['ce_w'] = float(ce_components[0])
+        stats['ce_d'] = float(ce_components[1])
+        stats['ce_l'] = float(ce_components[2])
         print_validation(epoch, stats, mass_on_legal=mol_est, mol_coverage=mol_cov)
 
         row = {**stats, 'model_epoch': epoch, 'n_samples': n,
@@ -1293,70 +1300,23 @@ class Rescorer(object):
             all_df = row_df
         all_df.round(5).to_csv(progress_csv_path, index=False)
 
-        MAX_SC = 5000
-        n_pts = len(nn_vals_stm)
-        idx = (np.random.choice(n_pts, MAX_SC, replace=False)
-               if n_pts > MAX_SC
-               else np.arange(n_pts))
-
-        xv   = nn_vals_stm[idx]
-        ytgt = target_ys[idx]
-        ycp  = sf_cps[idx]
-        ywdl = sf_wdls[idx]
-        zc   = result_zs[idx]
-
-        z_palette = {1.0: "#3cb371", 0.0: "#ffd700", -1.0: "#ff8c00"}
-        c_all = [z_palette.get(round(float(z)), "#999999") for z in zc]
-
-        import matplotlib.patches as mpatches
-        legend = [
-            mpatches.Patch(color="#3cb371", label="win"),
-            mpatches.Patch(color="#ffd700", label="draw"),
-            mpatches.Patch(color="#ff8c00", label="loss"),
-        ]
-
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-        axes[0].scatter(ytgt, xv, s=4, alpha=0.3, c='steelblue')
-        axes[0].set_xlabel("target Y")
-        axes[0].set_ylabel("NN value (STM-POV)")
-        axes[0].set_title(f"Epoch {epoch}: NN value vs target  MSE={val_mse:.2f} r={val_corr:.2f}")
-
-        valid2 = ~np.isnan(ycp)
-        xv2, ycp2 = xv[valid2], ycp[valid2]
-        ycp2_tanh = np.tanh(ycp2 * (np.arctanh(0.8) / 500.0))
-        mse2 = np.mean((xv2 - ycp2_tanh) ** 2) if len(xv2) > 1 else float('nan')
-        corr2 = np.corrcoef(xv2, ycp2)[0, 1] if len(xv2) > 1 else float('nan')
-        c2 = [c_all[i] for i in range(len(xv)) if valid2[i]]
-        axes[1].scatter(ycp2, xv2, s=4, alpha=0.3, c=c2)
-        axes[1].set_xlabel("SF CP (STM-POV)")
-        axes[1].set_ylabel("NN value (STM-POV)")
-        axes[1].set_title(f"NN value vs SF centipawns  MSE={mse2:.2f} r={corr2:.2f}")
-        axes[1].legend(handles=legend, fontsize=8)
-
-        valid3 = ~np.isnan(ywdl)
-        xv3_raw, ywdl3_raw = xv[valid3], ywdl[valid3]
-        mse3 = np.mean((xv3_raw - ywdl3_raw) ** 2) if len(xv3_raw) > 1 else float('nan')
-        corr3 = np.corrcoef(xv3_raw, ywdl3_raw)[0, 1] if len(xv3_raw) > 1 else float('nan')
-        c3 = [c_all[i] for i in range(len(xv)) if valid3[i]]
-
-        def boundary_jitter(arr, scale=0.05):
-            j = np.random.uniform(-scale, scale, size=arr.shape).astype(arr.dtype)
-            j = np.where(arr + j > 1.0, -np.abs(j), np.where(arr + j < -1.0, np.abs(j), j))
-            return arr + j
-
-        xv3   = boundary_jitter(xv3_raw)
-        ywdl3 = boundary_jitter(ywdl3_raw)
-        axes[2].scatter(ywdl3, xv3, s=4, alpha=0.3, c=c3)
-        axes[2].set_xlabel("SF WDL score (STM-POV)")
-        axes[2].set_ylabel("NN value (STM-POV)")
-        axes[2].set_title(f"NN value vs SF WDL  MSE={mse3:.2f} r={corr3:.2f}")
-        axes[2].legend(handles=legend, fontsize=8)
-
-        fig.tight_layout()
+        from chessbot.plot_utils import plot_validation
         plot_path = os.path.join(os.path.dirname(progress_csv_path), "validation_latest.png")
-        fig.savefig(plot_path, dpi=120)
-        plt.close(fig)
+        plot_validation(
+            epoch=epoch,
+            plot_path=plot_path,
+            nn_vals_stm=nn_vals_stm,
+            target_ys=target_ys,
+            sf_cps=sf_cps,
+            result_zs=result_zs,
+            val_mse=val_mse,
+            val_corr=val_corr,
+            val_ce=val_ce,
+            nn_wdl_arr=nn_wdl_arr if nn_wdls else None,
+            tgt_wdl_arr=tgt_wdl_arr if nn_wdls else None,
+            wdl_bias=wdl_bias,
+            ce_components=ce_components,
+        )
         print(f"[metrics] plot saved")
 
     def push_analyzed(self, report=True):

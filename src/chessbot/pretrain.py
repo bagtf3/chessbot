@@ -111,7 +111,7 @@ def split_train_val(
 # TFRecord data pipeline
 # ---------------------------------------------------------------------------
 
-def make_dataset(file_list: list[str], shuffle_buffer: int):
+def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BATCH_SIZE):
     """Build a repeating, shuffled TF dataset from .tfrecord.gz files.
 
     Imports TF lazily so the supervisor process stays GPU-free.
@@ -157,7 +157,7 @@ def make_dataset(file_list: list[str], shuffle_buffer: int):
     )
     ds = ds.map(parse_record, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
-    ds = ds.batch(BATCH_SIZE, drop_remainder=True)
+    ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 

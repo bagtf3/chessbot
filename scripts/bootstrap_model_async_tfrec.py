@@ -10,7 +10,7 @@ Usage:
     python scripts/bootstrap_model_async_tfrec.py [options]
 
 Options:
-    --model      Model name          (default: 16m-conformer-interweaved)
+    --model      Model name          (default: 16m-transformer)
     --run-tag    Sub-dir under SP_DIR (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
@@ -39,7 +39,7 @@ from chessbot.pretrain import (
 
 EPOCHS_PER_WORKER = 100
 CHECKPOINT_EVERY  = 20    # must be a multiple of PLOT_EVERY
-DEFAULT_MODEL     = "16m-conformer-interweaved"
+DEFAULT_MODEL     = "16m-transformer"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
 
@@ -379,7 +379,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--tfrec-dir",
-        default=os.getenv("BOOTSTRAP_TFREC_DIR", ""),
+        default=os.getenv("BOOTSTRAP_TFREC_DIR",
+                          r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl"),
         help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
     )
     parser.add_argument(

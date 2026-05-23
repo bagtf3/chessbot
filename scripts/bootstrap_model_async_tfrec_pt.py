@@ -34,7 +34,7 @@ import scipy.special
 from chessbot.pretrain import (
     EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_MAX_EPOCH,
-    lw_for_epoch,
+    POLICY_LW, VALUE_LW,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     save_plot,
@@ -47,22 +47,24 @@ from chessbot.model import (
 
 # ---------------------------------------------------------------------------
 # PT-specific training constants
-# Batch 512 = 2× base; LR scaled linearly: MIN 2e-4, MAX 1e-2.
-# Epoch size doubled to keep ~40 gradient steps/epoch at the larger batch.
+# Batch 512 = 2x base; epoch size doubled for ~40 steps/epoch.
+# SGD+Nesterov: LR_MAX=0.1 (textbook), LR_MIN=1e-3 (finetune tail).
 # ---------------------------------------------------------------------------
 
 PT_BATCH_SIZE      = 512
-PT_EPOCH_SIZE      = EPOCH_SIZE * 2          # 20 480 samples/epoch
+PT_EPOCH_SIZE      = EPOCH_SIZE * 2
 PT_STEPS_PER_EPOCH = PT_EPOCH_SIZE // PT_BATCH_SIZE   # 40
 
-PT_LR_MIN        = 2e-4
-PT_LR_MAX        = 1e-2
-PT_LR_WARMUP     = 3
+PT_LR_MIN        = 1e-3
+PT_LR_MAX        = 0.1
+PT_MOMENTUM      = 0.9
+PT_WEIGHT_DECAY  = 1e-4
+PT_LR_WARMUP     = 50
 PT_LR_HOLD       = 100
 PT_LR_DECAY      = 300
 PT_LR_STEP_SIZE  = 100
 
-EPOCHS_PER_WORKER = 100
+EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
 DEFAULT_MODEL     = "16m-transformer"
 DEFAULT_RUN_TAG   = "val_test_multi"
@@ -154,30 +156,37 @@ def get_resume_epoch(run_dir: str, name: str) -> int:
 # PT model load / save
 # ---------------------------------------------------------------------------
 
-def load_pt_model(path: str, name: str, device, lr: float, strict: bool = True):
+def make_sgd(model, lr: float):
+    import torch
+    return torch.optim.SGD(
+        model.parameters(),
+        lr=lr,
+        momentum=PT_MOMENTUM,
+        weight_decay=PT_WEIGHT_DECAY,
+        nesterov=True,
+    )
+
+
+def load_pt_model(path: str, name: str, device, lr: float):
     import torch
     from torch.amp import GradScaler
 
     cfg    = VARIANTS[name]
     model  = PT_BUILDERS[name](cfg).to(device)
-    opt    = torch.optim.Adam(model.parameters(), lr=lr)
+    opt    = make_sgd(model, lr)
     scaler = GradScaler("cuda")
 
     ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
     try:
-        model.load_state_dict(ckpt["model"])
         if "optimizer" in ckpt:
             opt.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
-    except RuntimeError as e:
-        if strict:
-            raise
-        print(f"[load] WARNING: state_dict mismatch ({e!s:.120})")
-        print("[load] starting from fresh random weights")
-
-    for pg in opt.param_groups:
-        pg["lr"] = lr
+            for pg in opt.param_groups:
+                pg["lr"] = lr
+    except Exception:
+        print("[load] optimizer state incompatible (optimizer change?), starting fresh")
 
     return model, opt, scaler
 
@@ -225,6 +234,8 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
             ).mean() * lw["value_out"]
             loss = p_loss + v_loss
         scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
         total_p   += p_loss.item()
@@ -325,7 +336,7 @@ def worker_main(wargs: dict) -> None:
         from torch.amp import GradScaler
         cfg    = VARIANTS[name]
         model  = PT_BUILDERS[name](cfg).to(device)
-        opt    = torch.optim.Adam(model.parameters(), lr=lr0)
+        opt    = make_sgd(model, lr0)
         scaler = GradScaler("cuda")
         print(f"[worker] fresh init  lr={lr0:.4e}")
     else:
@@ -359,7 +370,7 @@ def worker_main(wargs: dict) -> None:
     prefetcher.start()
     val_prefetcher.start()
 
-    current_lw: dict | None  = None
+    fixed_lw = {"policy_logits": POLICY_LW, "value_out": VALUE_LW}
     current_lr: float | None = None
     begin          = time.time()
     epoch_times: list[float] = []
@@ -370,12 +381,6 @@ def worker_main(wargs: dict) -> None:
     last_val_q: np.ndarray | None = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lw = lw_for_epoch(ep)
-        if target_lw is not current_lw:
-            current_lw = target_lw
-            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
-            print(f"[lw update] epoch {ep}: {lw_str}")
-
         target_lr = pt_lr_for_epoch(ep, max_epoch)
         if target_lr != current_lr:
             current_lr = target_lr
@@ -400,7 +405,7 @@ def worker_main(wargs: dict) -> None:
         t_fetch += time.time() - t0
 
         t0 = time.time()
-        p_loss, v_loss, t_loss = fit_epoch(model, opt, scaler, bundle, target_lw, device)
+        p_loss, v_loss, t_loss = fit_epoch(model, opt, scaler, bundle, fixed_lw, device)
         t_fit += time.time() - t0
 
         n_this          = int(bundle["enc_in"].shape[0])

@@ -32,39 +32,22 @@ VAL_SPLIT_SEED     = 42
 UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
-DEFAULT_LR         = 1e-4
 DEFAULT_MAX_EPOCH  = 2000
-
-
-# ---------------------------------------------------------------------------
-# Loss-weight schedule — fixed 4:1 value:policy after warmup
-# ---------------------------------------------------------------------------
 
 POLICY_LW = 1.0
 VALUE_LW  = 4.0
 
-LW_SCHEDULE: dict[int, dict[str, float]] = {
-    0:  {"policy_logits": 0.10, "value_out": 0.10},
-    3:  {"policy_logits": 0.75, "value_out": 1.50},
-    10: {"policy_logits": POLICY_LW, "value_out": VALUE_LW},
-}
-
-
-def lw_for_epoch(epoch: int) -> dict[str, float]:
-    return LW_SCHEDULE[max(k for k in LW_SCHEDULE if k <= epoch)]
-
-
 # ---------------------------------------------------------------------------
-# Learning-rate schedule
-#   0-9:   warmup LR_MIN -> LR_MAX
-#   10-99: flat at LR_MAX
-#   100+:  cosine steps every LR_STEP_SIZE epochs down to LR_MIN
-#   last LR_DECAY_EPOCHS: flat at LR_MIN (finetune)
+# Learning-rate schedule (SGD+Nesterov)
+#   0..LR_WARMUP_EPOCHS:   linear warmup LR_MIN -> LR_MAX
+#   warmup..LR_HOLD_EPOCHS: flat at LR_MAX
+#   hold..decay_end:        cosine steps every LR_STEP_SIZE epochs
+#   decay_end..end:         flat at LR_MIN
 # ---------------------------------------------------------------------------
 
-LR_MIN          = 1e-4
-LR_MAX          = 5e-3
-LR_WARMUP_EPOCHS = 3
+LR_MIN           = 1e-3
+LR_MAX           = 0.1
+LR_WARMUP_EPOCHS = 20
 LR_HOLD_EPOCHS   = 100
 LR_DECAY_EPOCHS  = 300
 LR_STEP_SIZE     = 100

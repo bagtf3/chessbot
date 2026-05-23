@@ -30,17 +30,18 @@ import pandas as pd
 
 from chessbot.pretrain import (
     BATCH_SIZE, STEPS_PER_EPOCH, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
-    PLOT_EVERY, DEFAULT_LR, DEFAULT_MAX_EPOCH,
-    LW_SCHEDULE, lw_for_epoch, lr_for_epoch,
+    PLOT_EVERY, DEFAULT_MAX_EPOCH,
+    POLICY_LW, VALUE_LW, lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     moving_average, save_plot,
 )
 
-EPOCHS_PER_WORKER = 100
+EPOCHS_PER_WORKER = 200
 CHECKPOINT_EVERY  = 20    # must be a multiple of PLOT_EVERY
-DEFAULT_MODEL     = "16m-transformer"
+DEFAULT_MODEL     = "16m-conformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
+DEFAULT_LR        = 1e-4
 
 
 def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
@@ -156,15 +157,20 @@ def worker_main(wargs: dict) -> None:
     print(f"[worker] loading {load_from}")
 
     model = keras.models.load_model(load_from, compile=False)
-    opt   = tf.keras.optimizers.Adam(learning_rate=lr_for_epoch(start_epoch, max_epoch))
+    opt   = tf.keras.optimizers.SGD(
+        learning_rate=lr_for_epoch(start_epoch, max_epoch),
+        momentum=0.9,
+        nesterov=True,
+        weight_decay=1e-4,
+    )
     opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt
     model._default_loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out":     tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
-    set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
-    current_lw: dict | None  = None
+    fixed_lw = {"policy_logits": POLICY_LW, "value_out": VALUE_LW}
+    set_loss_weights(model, fixed_lw, jit=False)
     current_lr: float | None = None
 
     train_ckpts_dir = os.path.join(run_dir, "train_ckpts")
@@ -268,12 +274,6 @@ def worker_main(wargs: dict) -> None:
     last_val_preds: np.ndarray | None = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lw = lw_for_epoch(ep)
-        if target_lw is not current_lw:
-            current_lw = target_lw
-            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
-            print(f"[lw update] epoch {ep}: {lw_str}")
-
         target_lr = lr_for_epoch(ep, max_epoch)
         if target_lr != current_lr:
             current_lr = target_lr
@@ -294,7 +294,7 @@ def worker_main(wargs: dict) -> None:
         t_fetch += time.time() - t0
 
         t0   = time.time()
-        hist = fit_epoch(bundle, target_lw)
+        hist = fit_epoch(bundle, fixed_lw)
         t_fit += time.time() - t0
 
         n_this          = int(bundle["enc_in"].shape[0])

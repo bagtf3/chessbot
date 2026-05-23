@@ -162,6 +162,7 @@ def worker_main(wargs: dict) -> None:
         momentum=0.9,
         nesterov=True,
         weight_decay=1e-4,
+        clipnorm=5.0,
     )
     opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt
@@ -273,12 +274,21 @@ def worker_main(wargs: dict) -> None:
     last_ystack: np.ndarray | None    = None
     last_val_preds: np.ndarray | None = None
 
+    TF_LR_WARMUP = 20
+    current_clipnorm: float | None = None
+
     for ep in range(start_epoch, end_epoch):
         target_lr = lr_for_epoch(ep, max_epoch)
         if target_lr != current_lr:
             current_lr = target_lr
             opt.inner_optimizer.learning_rate.assign(target_lr)
             print(f"[lr update] epoch {ep}: lr={target_lr:.4e}")
+
+        target_clipnorm = 1.0 if ep < TF_LR_WARMUP else 2.5
+        if target_clipnorm != current_clipnorm:
+            current_clipnorm = target_clipnorm
+            opt.inner_optimizer.clipnorm = target_clipnorm
+            print(f"[clipnorm ] epoch {ep}: clipnorm={target_clipnorm}")
 
         epoch_start = time.time()
         print("-" * 89)

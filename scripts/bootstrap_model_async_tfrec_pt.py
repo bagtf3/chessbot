@@ -59,7 +59,7 @@ PT_LR_MIN        = 1e-3
 PT_LR_MAX        = 0.1
 PT_MOMENTUM      = 0.9
 PT_WEIGHT_DECAY  = 1e-4
-PT_LR_WARMUP     = 50
+PT_LR_WARMUP     = 10
 PT_LR_HOLD       = 100
 PT_LR_DECAY      = 300
 PT_LR_STEP_SIZE  = 100
@@ -207,7 +207,11 @@ def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
 # Training and eval (called inside worker subprocess)
 # ---------------------------------------------------------------------------
 
-def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
+def pt_clipnorm_for_epoch(ep: int) -> float:
+    return 1.0 if ep < PT_LR_WARMUP else 2.5
+
+
+def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -221,7 +225,9 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
     perm = torch.randperm(n, device=device)
     model.train()
     total_p = total_v = total = 0.0
-    n_batches = 0
+    grad_norms = []
+    clip_count = 0
+    n_batches  = 0
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
@@ -235,7 +241,13 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
             loss = p_loss + v_loss
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        for p in model.parameters():
+            if p.grad is not None:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm).item()
+        grad_norms.append(raw_norm)
+        if raw_norm > max_norm or math.isnan(raw_norm):
+            clip_count += 1
         scaler.step(opt)
         scaler.update()
         total_p   += p_loss.item()
@@ -243,7 +255,16 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, device):
         total     += loss.item()
         n_batches += 1
 
-    return total_p / n_batches, total_v / n_batches, total / n_batches
+    gn = np.array(grad_norms)
+    grad_stats = {
+        "gn_mean":  gn.mean(),
+        "gn_median": np.median(gn),
+        "gn_min":   gn.min(),
+        "gn_max":   gn.max(),
+        "gn_clips": clip_count,
+        "gn_steps": n_batches,
+    }
+    return total_p / n_batches, total_v / n_batches, total / n_batches, grad_stats
 
 
 def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device):
@@ -270,11 +291,11 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
     val_q      = val_wdl[:, 0] - val_wdl[:, 2]
     tgt_q      = target_wdl[:, 0] - target_wdl[:, 2]
 
-    value_mse  = float(np.mean((val_q - tgt_q) ** 2))
-    value_corr = float(np.corrcoef(val_q, tgt_q)[0, 1])
-    value_ce   = float(-np.mean(
+    value_mse  = np.mean((val_q - tgt_q) ** 2)
+    value_corr = np.corrcoef(val_q, tgt_q)[0, 1]
+    value_ce   = -np.mean(
         np.sum(target_wdl * np.log(np.clip(val_wdl, 1e-9, None)), axis=1)
-    ))
+    )
     pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
 
     row = {
@@ -405,7 +426,8 @@ def worker_main(wargs: dict) -> None:
         t_fetch += time.time() - t0
 
         t0 = time.time()
-        p_loss, v_loss, t_loss = fit_epoch(model, opt, scaler, bundle, fixed_lw, device)
+        max_norm = pt_clipnorm_for_epoch(ep)
+        p_loss, v_loss, t_loss, gns = fit_epoch(model, opt, scaler, bundle, fixed_lw, max_norm, device)
         t_fit += time.time() - t0
 
         n_this          = int(bundle["enc_in"].shape[0])
@@ -416,6 +438,12 @@ def worker_main(wargs: dict) -> None:
             f"[epoch {ep:4d}] [{name}] "
             f"policy_loss: {p_loss:.4f}  value_loss: {v_loss:.4f}  "
             f"total: {t_loss:.4f}  samples: {total_samples:,}"
+        )
+        print(
+            f"[grad norms ] "
+            f"mean: {gns['gn_mean']:.3f}  median: {gns['gn_median']:.3f}  "
+            f"min: {gns['gn_min']:.3f}  max: {gns['gn_max']:.3f}  "
+            f"clips: {gns['gn_clips']}/{gns['gn_steps']}"
         )
 
         is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1

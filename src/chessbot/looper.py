@@ -148,7 +148,7 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        if self.config.inference_backend == "pytorch":
+        if self.config.inference_backend.lower() in ("pytorch", "pt_eager"):
             import torch
             torch.cuda.empty_cache()
         else:

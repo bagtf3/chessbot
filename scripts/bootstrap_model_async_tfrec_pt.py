@@ -161,8 +161,9 @@ def load_pt_model(path: str, name: str, device, lr: float):
             opt.load_state_dict(ckpt["optimizer"])
             for pg in opt.param_groups:
                 pg["lr"] = lr
-    except Exception:
-        print("[load] optimizer state incompatible (optimizer change?), starting fresh")
+    except Exception as e:
+        print("[load] optimizer state incompatible (optimizer change?), starting fresh:", e)
+        raise
 
     return model, opt, scaler
 

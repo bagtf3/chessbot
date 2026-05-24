@@ -376,16 +376,6 @@ def main():
     Y     = {"value_out": Y_value, "policy_logits": P}
     s_wts = {"value_out": vwht,    "policy_logits": pwht}
 
-    # DEBUG: snapshot training data for gradient tape experiments
-    debug_path = os.path.join(run_dir, "debug_training_snapshot.pkl")
-    try:
-        import pickle as _pkl
-        with open(debug_path, "wb") as _f:
-            _pkl.dump({"X": X, "P": P, "Y_value": Y_value, "vwht": vwht, "pwht": pwht}, _f)
-        print(f"[retrain] debug snapshot -> {os.path.basename(debug_path)}")
-    except Exception as _e:
-        print(f"[retrain] debug snapshot failed: {_e}")
-
     kl_str = (
         f"KL boost x{cfg.KL_weight_boost} when KL>{cfg.KL_boost_threshold}"
         if cfg.KL_weight_boost != 1.0 else "KL boost disabled"

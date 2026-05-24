@@ -74,55 +74,6 @@ def save_pt_model(model, path, arch=None, opt=None):
     print(f"[pytorch] checkpoint saved -> {path}")
 
 
-def train_pt_model(model, X, M, P, Y_wdl, vwht, pwht, cfg, args):
-    """Train PT model. Y_wdl: (N, 3) WDL probabilities."""
-    device = torch.device("cuda")
-    model  = model.to(device).train()
-    opt    = torch.optim.SGD(
-        model.parameters(), lr=cfg.learning_rate,
-        momentum=0.9, weight_decay=1e-4, nesterov=True,
-    )
-
-    n      = len(X)
-    X_t    = torch.from_numpy(X).long().to(device)
-    P_t    = torch.from_numpy(P).float().to(device)
-    Y_t    = torch.from_numpy(Y_wdl).float().to(device)
-    vwht_t = torch.from_numpy(vwht).float().to(device)
-    pwht_t = torch.from_numpy(pwht).float().to(device)
-
-    for epoch in range(args.epochs):
-        idx        = torch.randperm(n, device=device)
-        total_loss = 0.0
-        steps      = 0
-
-        for start in range(0, n, args.batch_size):
-            batch_idx = idx[start:start + args.batch_size]
-            xb  = X_t[batch_idx]
-            pb  = P_t[batch_idx]
-            yb  = Y_t[batch_idx]
-            vwb = vwht_t[batch_idx]
-            pwb = pwht_t[batch_idx]
-
-            policy_logits, value_out = model(xb)
-
-            log_probs   = F.log_softmax(policy_logits, dim=-1)
-            policy_loss = -(pb * log_probs).sum(dim=-1)
-            policy_loss = (policy_loss * pwb).mean()
-
-            log_wdl    = F.log_softmax(value_out, dim=-1)
-            value_loss = -(yb * log_wdl).sum(dim=-1)
-            value_loss = (value_loss * vwb).mean()
-
-            loss = policy_loss + value_loss
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-            total_loss += loss.item()
-            steps += 1
-
-        print(f"[pytorch] epoch {epoch}  loss={total_loss / max(1, steps):.4f}")
-
 
 def print_pt_fit_history(epoch_losses, epoch, label=""):
     """epoch_losses: list of dicts with keys 'loss','policy','value' (one per epoch)."""

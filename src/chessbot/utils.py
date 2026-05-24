@@ -455,23 +455,25 @@ def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
 
     # name_w derived from actual display labels so columns align
     keys = [
-        "value_mse", "value_corr",
+        "value_mse", "value_corr", "value_ce",
         "policy_ce", "uniform_ce",
         "top1_exact", "avg_top",
         "top1_mass",  "true ratio",
     ]
     name_w = max(len(k) for k in keys)
-    num_w = 8
-    fmt_num = f"{{value:{num_w}.4f}}"
+    num_w = 7
+    fmt_num = f"{{value:{num_w}.3f}}"
     def pair(k, v):
         return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
     ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
     pfx = f"[epoch {epoch:4d}] [validation]"
 
+    value_ce = stats.get("value_ce", float("nan"))
     print(f"{pfx} {pair('value_mse', stats['value_mse'])}  "
-          f"{pair('value_corr', stats['value_corr'])}")
+          f"{pair('value_corr', stats['value_corr'])}  "
+          f"{pair('value_ce', value_ce)}")
     print(f"{pfx} {pair('policy_ce', stats['policy_ce'])}  "
-          f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
+          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
     print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
           f"{pair('avg_top', stats['avg_top_prob'])}")
     print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "

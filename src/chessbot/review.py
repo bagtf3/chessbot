@@ -529,7 +529,7 @@ class GameViewer:
         sign = 1 if self.board.side_to_move() == "w" else -1
         q = c.get("Q", 0.0) * sign
         qema = c.get("Qema", 0.0) * sign
-        ds = c.get("Qdelta_sign", 0.0) * sign
+        ds = c.get("Qdelta_sign", 0.0)
 
         p = c.get("P", 0.0)
         u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
@@ -608,10 +608,70 @@ class GameViewer:
         norm_pri, p_pri = self.compute_norm_entropy(priors_list)
         kl = kl_divergence_bits(p_vis, p_pri)
 
+        r_sf = self.sf_row_for_ply(self.ply)
+        ce_str = "n/a"
+        mse_str = "n/a"
+
+        sf_wdl = None
+        if r_sf is not None:
+            raw = r_sf.get('sf_wdl')
+            if raw is not None:
+                sf_wdl = raw
+
+        nn_wdl = node.get('nn_wdl')
+        nn_value = node.get('nn_value')
+        best_wdl = node.get('best_wdl')
+        is_white = self.turn()
+        sign = 1 if is_white else -1
+
+        nn_wdl_stm = None
+        if nn_wdl is not None:
+            nw = np.array(nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0]), dtype=np.float64)
+            nn_wdl_stm = nw / nw.sum() if nw.sum() > 0 else nw
+
+        Y = None
+        z_stm = None
+        if nn_value is not None:
+            z_stm = self.result * sign
+            if z_stm > 0:
+                z_wdl = np.array([1.0, 0.0, 0.0])
+            elif z_stm < 0:
+                z_wdl = np.array([0.0, 0.0, 1.0])
+            else:
+                z_wdl = np.array([0.0, 1.0, 0.0])
+            if best_wdl is not None:
+                bw = np.array(best_wdl, dtype=np.float64)
+                if not is_white:
+                    bw = bw[[2, 1, 0]]
+            else:
+                bw = z_wdl
+            if sf_wdl is not None:
+                Y = 0.5 * z_wdl + 0.25 * bw + 0.25 * np.array(sf_wdl, dtype=np.float64)
+            else:
+                Y = 0.5 * z_wdl + 0.5 * bw
+            target_y = float(Y[0] - Y[2])
+            nn_value_stm = float(np.clip(nn_value * sign, -1.0, 1.0))
+            mse = (nn_value_stm - target_y) ** 2
+            mse_str = f"{mse:.4f}"
+            if nn_wdl_stm is not None:
+                eps = 1e-7
+                p_ce = np.clip(nn_wdl_stm, eps, 1 - eps)
+                p_ce = p_ce / p_ce.sum()
+                ce = -float(np.dot(Y, np.log(p_ce)))
+                ce_str = f"{ce:.3f}"
+
+        kl_nats = kl * 0.693
         print(
             f"  entropy (norm'd): visits = {norm_vis:.3f} "
-            f" priors = {norm_pri:.3f}  KL(vis||pr) = {kl:.3f} bits"
+            f" priors = {norm_pri:.3f}  KL = {kl_nats:.3f}"
+            f"  CE = {ce_str}  MSE = {mse_str}"
         )
+        if nn_wdl_stm is not None or Y is not None:
+            nn_wdl_str = (f"W = {nn_wdl_stm[0]:.3f}  D = {nn_wdl_stm[1]:.3f}  L = {nn_wdl_stm[2]:.3f}"
+                          if nn_wdl_stm is not None else "n/a")
+            tgt_wdl_str = (f"W = {Y[0]:.3f}  D = {Y[1]:.3f}  L = {Y[2]:.3f}"
+                           if Y is not None else "n/a")
+            print(f"  nn WDL (STM): {nn_wdl_str}  |  tgt WDL: {tgt_wdl_str}")
 
         cands_sorted = sorted(
             cands, key=lambda x: x.get("visits", 0), reverse=True

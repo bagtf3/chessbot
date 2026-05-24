@@ -228,9 +228,14 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
         base_cls = tf.keras.optimizers.Adam
         base_cfg = {}
 
-    base_cfg['learning_rate'] = cfg.learning_rate
+    base_cfg['learning_rate'] = cfg.learning_rate / 1.5
+    base_cfg['beta_2'] = cfg.adam_beta2
     inner_opt = base_cls.from_config(base_cfg)
     opt = tf.keras.mixed_precision.LossScaleOptimizer(inner_opt)
+
+    def fp32_ce(y_true, y_pred):
+        return tf.keras.losses.categorical_crossentropy(
+            tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), from_logits=True)
 
     loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
@@ -249,7 +254,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
     train_ckpts_dir = os.path.join(cfg.run_dir, "train_ckpts", model_stem)
     os.makedirs(train_ckpts_dir, exist_ok=True)
     epoch_var = tf.Variable(epoch, trainable=False, dtype=tf.int64)
-    tf_ckpt   = tf.train.Checkpoint(model=model, optimizer=opt, epoch=epoch_var)
+    tf_ckpt   = tf.train.Checkpoint(optimizer=inner_opt, epoch=epoch_var)
     manager   = tf.train.CheckpointManager(tf_ckpt, train_ckpts_dir, max_to_keep=2)
     if manager.latest_checkpoint:
         tf_ckpt.restore(manager.latest_checkpoint)
@@ -264,10 +269,11 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
 
     t0 = time.time()
     history = model.fit(
-        {"enc_in": X}, Y, epochs=args.epochs, batch_size=args.batch_size,
+        {"enc_in": X}, Y, epochs=2, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
+    print_fit_history(history, epoch, label=label)
 
     t0 = time.time()
     bak_path = model_path.replace(".h5", "_backup.h5")
@@ -317,7 +323,7 @@ def main():
     cfg = Config.from_yaml(config_file)
 
     t0 = time.time()
-    if cfg.retrain_backend == "pytorch":
+    if cfg.retrain_backend == "pt_eager":
         tf.config.set_visible_devices([], 'GPU')
         from chessbot.train_pytorch import enforce_pytorch_gpu_or_die
         enforce_pytorch_gpu_or_die()
@@ -386,12 +392,10 @@ def main():
 
     epoch = args.epoch
 
-    if cfg.retrain_backend == "pytorch":
-        from chessbot.train_pytorch import load_pt_model, train_pt_model, save_pt_model
-        model, arch = load_pt_model(cfg.pytorch_model_path)
-        train_pt_model(model, X, P, Y_value, vwht, pwht, cfg, args)
-        save_pt_model(model, cfg.pytorch_model_path, arch)
-        print(f"[retrain] pytorch checkpoint saved -> {cfg.pytorch_model_path}")
+    if cfg.retrain_backend == "pt_eager":
+        from chessbot.train_pytorch import retrain_pt
+        retrain_pt(cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
+                   label="", timings=timings)
     else:
         retrain_one_model(
             cfg.model_path, X, Y, s_wts, cfg, epoch, args,

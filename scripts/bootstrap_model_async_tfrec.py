@@ -10,7 +10,7 @@ Usage:
     python scripts/bootstrap_model_async_tfrec.py [options]
 
 Options:
-    --model      Model name          (default: 16m-conformer-interweaved)
+    --model      Model name          (default: 16m-transformer)
     --run-tag    Sub-dir under SP_DIR (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
@@ -30,14 +30,14 @@ import pandas as pd
 
 from chessbot.pretrain import (
     BATCH_SIZE, STEPS_PER_EPOCH, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
-    PLOT_EVERY, DEFAULT_LR, DEFAULT_MAX_EPOCH,
-    LW_SCHEDULE, lw_for_epoch,
+    PLOT_EVERY, DEFAULT_MAX_EPOCH,
+    POLICY_LW, VALUE_LW, LR_WARMUP_EPOCHS, lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     moving_average, save_plot,
 )
 
-EPOCHS_PER_WORKER = 100
+EPOCHS_PER_WORKER = 200
 CHECKPOINT_EVERY  = 20    # must be a multiple of PLOT_EVERY
 DEFAULT_MODEL     = "16m-conformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
@@ -134,7 +134,6 @@ def worker_main(wargs: dict) -> None:
     model_dir   = wargs.get("model_dir", MODEL_DIR)
     start_epoch = wargs["start_epoch"]
     end_epoch   = wargs["end_epoch"]
-    lr          = wargs.get("lr", DEFAULT_LR)
     max_epoch   = wargs["max_epoch"]
 
     progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
@@ -156,15 +155,22 @@ def worker_main(wargs: dict) -> None:
     print(f"[worker] loading {load_from}")
 
     model = keras.models.load_model(load_from, compile=False)
-    opt   = tf.keras.optimizers.Adam(learning_rate=lr)
+    opt   = tf.keras.optimizers.SGD(
+        learning_rate=lr_for_epoch(start_epoch, max_epoch),
+        momentum=0.9,
+        nesterov=True,
+        weight_decay=1e-4,
+        clipnorm=5.0,
+    )
     opt   = mixed_precision.LossScaleOptimizer(opt)
     model._default_opt = opt
     model._default_loss_dict = {
         "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
         "value_out":     tf.keras.losses.CategoricalCrossentropy(from_logits=True),
     }
-    set_loss_weights(model, {"policy_logits": 1.0, "value_out": 1.0}, jit=False)
-    current_lw: dict | None = None
+    fixed_lw = {"policy_logits": POLICY_LW, "value_out": VALUE_LW}
+    set_loss_weights(model, fixed_lw, jit=False)
+    current_lr: float | None = None
 
     train_ckpts_dir = os.path.join(run_dir, "train_ckpts")
     os.makedirs(train_ckpts_dir, exist_ok=True)
@@ -266,12 +272,21 @@ def worker_main(wargs: dict) -> None:
     last_ystack: np.ndarray | None    = None
     last_val_preds: np.ndarray | None = None
 
+
+    current_clipnorm: float | None = None
+
     for ep in range(start_epoch, end_epoch):
-        target_lw = lw_for_epoch(ep)
-        if target_lw is not current_lw:
-            current_lw = target_lw
-            lw_str = "  ".join(f"{k}={v}" for k, v in target_lw.items())
-            print(f"[lw update] epoch {ep}: {lw_str}")
+        target_lr = lr_for_epoch(ep, max_epoch)
+        if target_lr != current_lr:
+            current_lr = target_lr
+            opt.inner_optimizer.learning_rate.assign(target_lr)
+            print(f"[lr update] epoch {ep}: lr={target_lr:.4e}")
+
+        target_clipnorm = 1.0 if ep < LR_WARMUP_EPOCHS else 2.5
+        if target_clipnorm != current_clipnorm:
+            current_clipnorm = target_clipnorm
+            opt.inner_optimizer.clipnorm = target_clipnorm
+            print(f"[clipnorm ] epoch {ep}: clipnorm={target_clipnorm}")
 
         epoch_start = time.time()
         print("-" * 89)
@@ -287,7 +302,7 @@ def worker_main(wargs: dict) -> None:
         t_fetch += time.time() - t0
 
         t0   = time.time()
-        hist = fit_epoch(bundle, target_lw)
+        hist = fit_epoch(bundle, fixed_lw)
         t_fit += time.time() - t0
 
         n_this          = int(bundle["enc_in"].shape[0])
@@ -372,7 +387,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--tfrec-dir",
-        default=os.getenv("BOOTSTRAP_TFREC_DIR", ""),
+        default=os.getenv("BOOTSTRAP_TFREC_DIR",
+                          r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl"),
         help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
     )
     parser.add_argument(
@@ -381,7 +397,6 @@ def main() -> None:
         help="second folder to blend 50/50 with --tfrec-dir",
     )
     parser.add_argument("--max-epoch", type=int,   default=2000)
-    parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
     args = parser.parse_args()
 
     if not args.tfrec_dir:
@@ -438,7 +453,6 @@ def main() -> None:
             "model_dir":   MODEL_DIR,
             "start_epoch": resume,
             "end_epoch":   end_epoch,
-            "lr":          args.lr,
             "max_epoch":   args.max_epoch,
         }
 

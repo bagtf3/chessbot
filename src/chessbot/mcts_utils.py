@@ -65,6 +65,9 @@ class MCTSTree(fasttree):
             self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
+        self.set_fpu_reduction(float(cfg.fpu_reduction))
+        self.set_qema_span(float(cfg.qema_span))
+        self.set_qdelta_span(float(cfg.qdelta_span))
         self.set_contempt(
             float(cfg.contempt_flip_q),
             float(cfg.contempt_fight_c),
@@ -574,9 +577,10 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # fast PV via C++
+        # fast PV via C++; for sampled moves trace from xc0's choice, not the sampled move
+        pv_start = "" if method == "stockfish" else (xc0_move or mv)
         pv = []
-        pv_items = self.tree.principal_variation(24)
+        pv_items = self.tree.principal_variation(24, pv_start)
         for x in pv_items:
             pv.append({
                 "uci": x.uci, "visits": int(x.visits),

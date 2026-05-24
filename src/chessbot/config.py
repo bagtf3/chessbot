@@ -89,14 +89,13 @@ class Config(object):
     collar_n_consec = 5
     collar_reset_cp = 50
     train_on_stockfish = True
-    train_on_validation = False
-    validation_min_training_depth = 9
 
     z_mix = 0.9  # Y = z_mix * Z_stm + (1 - z_mix) * Q
 
     rescore_kl_threshold = 0.75   # always include if KL exceeds this
-    rescore_mse_threshold = 0.3   # always include if MSE exceeds this
+    rescore_ce_threshold = 0.625  # always include if value CE exceeds this
     rescore_sample_floor = 0.2    # min probability for soft-include sampling
+    rescore_target_acceptance = 0.5
 
     KL_boost_threshold = 1.75
     KL_weight_boost = 1.0
@@ -114,6 +113,9 @@ class Config(object):
     # priors
     uniform_eps = 0.25
     prior_clip_max = 0.75
+    fpu_reduction = 0.1
+    qema_span = 40
+    qdelta_span = 100
 
     # randomness
     add_root_noise = True
@@ -124,9 +126,10 @@ class Config(object):
     move_sample_temp_range = [0.000001, 1.25]
     
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
     policy_loss_weight = 0.25     # per-sample weight for policy head
     value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
-    draw_value_scale = 0.5        # multiplies value_loss_weight for drawn games
+    draw_value_scale = 1.0        # multiplies value_loss_weight for drawn games
     vscale = 0.9
     contempt_flip_q  = -0.22
     contempt_fight_c = 0.06
@@ -136,11 +139,8 @@ class Config(object):
     training_queue_buffer = 30720
 
     # inference / retrain backend selection
-    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt"
-    retrain_backend = "tf"        # "tf" | "pytorch"
-
-    # PyTorch retrain (only used when retrain_backend = "pytorch")
-    pytorch_model_path = ""
+    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt" | "pt_eager"
+    retrain_backend = "tf"        # "tf" | "pt_eager"
 
     def __init__(self):
         self.init_paths()
@@ -164,7 +164,8 @@ class Config(object):
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
 
-        model_name = f"{self.run_tag}_model.h5"
+        ext = ".ts" if self.inference_backend == "pt_eager" else ".h5"
+        model_name = f"{self.run_tag}_model{ext}"
         self.model_path = os.path.join(self.run_dir, model_name)
 
         if 'dummy' not in self.run_dir:

@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-xerces.py — UCI interface for the Xerces chess engine.
-
-Usage:
-    python xerces.py [--model PATH] [--config PATH]
-
-Communicates with a GUI via stdin/stdout using the UCI protocol.
-Model: PyTorch checkpoint (load_pt_model / make_pt_infer).
-"""
+"""Xerces UCI chess engine."""
 
 import argparse
 import os
@@ -20,30 +12,50 @@ from dotenv import load_dotenv
 
 load_dotenv()
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
-from pyfastchess import Board, raw_cache_bulk_insert
+from pyfastchess import Board
 from chessbot.mcts_utils import MCTSTree
-from chessbot.train_pytorch import load_pt_model, make_pt_infer
+from chessbot.model import load_model, make_conv_infer
+from chessbot.tf_thread import Batcher, TensorFlowThread
 
 ENGINE_NAME = "Xerces"
 ENGINE_AUTHOR = "Bryan Goggin"
 
 
-class _Cfg:
-    """Minimal duck-typed config for MCTSTree."""
+def build_batch_candidates(min_batch, fwd_batch):
+    sizes = {min_batch, fwd_batch}
+    bs = min_batch
+    while bs <= fwd_batch:
+        sizes.add(bs)
+        bs *= 2
+    if len(sizes) >= 2 and fwd_batch >= 128:
+        s = sorted(sizes)
+        sizes.add(s[-2] + (s[-1] - s[-2]) // 2)
+    return sorted(sizes)
+
+
+class Cfg:
+    """Duck-typed config consumed by MCTSTree."""
     c_puct = 2.0
     sims_floor = 400
     sims_ceiling = 800
     pruning_factor = 1.2
     uniform_eps = 0.05
     prior_clip_max = 0.65
+    vscale = 0.9
+    fpu_reduction = 0.1
+    contempt_flip_q = 0.0
+    contempt_fight_c = 0.0
+    contempt_save_c = 0.0
+    qema_span = 40
+    qdelta_span = 100
     add_root_noise = False
     dirichlet_eps = 0.25
     dirichlet_alpha = 0.3
     reuse_tree = True
-    use_u_attn = True
     sample_moves = False
-    robust_only_above = 999999   # disable sampling; always most_visited
+    robust_only_above = 400
     es_check_every = 100
     min_top_visits = 300
     min_delta = 100
@@ -52,153 +64,160 @@ class _Cfg:
     es_jsd_n_stable = 3
     es_jsd_min_delta = 100
     jsd_min_sims = 600
-    move_sample_temp_range = (0.000001, 1.25)
 
 
 class XercesUCI:
     def __init__(self):
-        # setoption-settable params (mirrors _Cfg defaults + model path)
         self.model_path = os.getenv("XERCES_MODEL", "")
         self.sims_floor = 400
         self.sims_ceiling = 800
         self.c_puct = 2.0
         self.micro_batch = 8
+        self.fwd_batch = 32
+        self.min_batch = 4
+        self.max_inflight = 2
         self.uniform_eps = 0.05
         self.prior_clip_max = 0.65
-        self.pruning_factor = 1.2
         self.vscale = 0.9
-        self.use_u_attn = True
+        self.pruning_factor = 1.2
+        self.fpu_reduction = 0.1
 
-        # runtime state
-        self.board: Board | None = None
-        self.tree: MCTSTree | None = None
-        self.infer_fn = None
-        self._model_loaded = False
+        self.board = None
+        self.tree = None
+        self.infer = None
+        self.batcher = None
+        self.tf_thread = None
+        self.model_loaded = False
 
-        # search thread control
-        self._stop_event = threading.Event()
-        self._search_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.search_thread = None
 
-    # ------------------------------------------------------------------ I/O
-
-    def send(self, line: str):
+    def send(self, line):
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
-    def info(self, msg: str):
+    def uci_info(self, msg):
         self.send(f"info string {msg}")
 
-    # --------------------------------------------------------- Model loading
+    def setup_inference(self):
+        if self.tf_thread is not None:
+            self.tf_thread.close()
+            self.tf_thread = None
 
-    def _load_model(self):
         if not self.model_path:
-            self.info("WARNING: ModelPath not set; engine will not evaluate positions")
-            self._model_loaded = True
+            self.uci_info("WARNING: ModelPath not set")
+            self.model_loaded = True
             return
-        self.info(f"loading model: {self.model_path}")
-        model, arch = load_pt_model(self.model_path)
-        _, self.infer_fn = make_pt_infer(model, max_bs=256, vscale=self.vscale)
-        self.info(f"model ready  arch={arch}")
-        self._model_loaded = True
 
-    # --------------------------------------------------------- Tree creation
+        self.uci_info(f"loading model: {self.model_path}")
+        model = load_model(self.model_path)
+        self.infer = make_conv_infer(model, max_bs=self.fwd_batch, vscale=self.vscale)
 
-    def _make_cfg(self) -> _Cfg:
-        cfg = _Cfg()
-        cfg.c_puct = float(self.c_puct)
-        cfg.sims_floor = int(self.sims_floor)
-        cfg.sims_ceiling = int(self.sims_ceiling)
-        cfg.pruning_factor = float(self.pruning_factor)
-        cfg.uniform_eps = float(self.uniform_eps)
-        cfg.prior_clip_max = float(self.prior_clip_max)
-        cfg.use_u_attn = bool(self.use_u_attn)
+        candidates = build_batch_candidates(self.min_batch, self.fwd_batch)
+        self.batcher = Batcher(None, candidates)
+        self.tf_thread = TensorFlowThread(None, self.infer, max_inflight=self.max_inflight)
+        self.tf_thread.start()
+
+        for bs in candidates:
+            enc = (np.random.rand(bs, 64) * 18).astype(np.int32)
+            self.infer((enc,))
+
+        self.uci_info("model ready")
+        self.model_loaded = True
+
+    def make_tree_cfg(self):
+        cfg = Cfg()
+        cfg.c_puct = self.c_puct
+        cfg.sims_floor = self.sims_floor
+        cfg.sims_ceiling = self.sims_ceiling
+        cfg.pruning_factor = self.pruning_factor
+        cfg.uniform_eps = self.uniform_eps
+        cfg.prior_clip_max = self.prior_clip_max
+        cfg.vscale = self.vscale
+        cfg.fpu_reduction = self.fpu_reduction
+        cfg.robust_only_above = self.sims_floor
         return cfg
 
-    def _build_tree(self, board: Board):
+    def build_tree(self, board):
         self.board = board
-        self.tree = MCTSTree(board, self._make_cfg())
-
-    # ---------------------------------------------------- UCI command handlers
+        self.tree = MCTSTree(board, self.make_tree_cfg())
 
     def handle_uci(self):
         self.send(f"id name {ENGINE_NAME}")
         self.send(f"id author {ENGINE_AUTHOR}")
         self.send("option name ModelPath type string default")
         self.send(f"option name SimsCeiling type spin default {self.sims_ceiling} min 1 max 1000000")
-        self.send(f"option name SimsFloor   type spin default {self.sims_floor}   min 1 max 100000")
-        self.send(f"option name CPuct       type string default {self.c_puct}")
-        self.send(f"option name MicroBatch  type spin default {self.micro_batch}  min 1 max 512")
-        self.send(f"option name Vscale      type string default {self.vscale}")
+        self.send(f"option name SimsFloor type spin default {self.sims_floor} min 1 max 100000")
+        self.send(f"option name CPuct type string default {self.c_puct}")
+        self.send(f"option name MicroBatch type spin default {self.micro_batch} min 1 max 512")
+        self.send(f"option name FwdBatch type spin default {self.fwd_batch} min 1 max 512")
+        self.send(f"option name Vscale type string default {self.vscale}")
+        self.send(f"option name FpuReduction type string default {self.fpu_reduction}")
         self.send("uciok")
 
     def handle_isready(self):
-        if not self._model_loaded:
-            self._load_model()
+        if not self.model_loaded:
+            self.setup_inference()
         self.send("readyok")
 
     def handle_ucinewgame(self):
         self.tree = None
         self.board = None
 
-    def handle_setoption(self, tokens: list[str]):
-        # setoption name <name> value <value>
+    def handle_setoption(self, tokens):
         try:
             ni = tokens.index("name")
             vi = tokens.index("value")
         except ValueError:
             return
-        name = " ".join(tokens[ni + 1 : vi]).strip().lower().replace(" ", "")
-        value = " ".join(tokens[vi + 1 :]).strip()
+        name = "".join(tokens[ni + 1:vi]).lower()
+        value = " ".join(tokens[vi + 1:]).strip()
 
-        _map = {
+        options = {
             "modelpath":    ("model_path",    str),
             "simscelling":  ("sims_ceiling",  int),
             "simsfloor":    ("sims_floor",    int),
             "cpuct":        ("c_puct",        float),
             "microbatch":   ("micro_batch",   int),
+            "fwdbatch":     ("fwd_batch",     int),
             "vscale":       ("vscale",        float),
             "uniformeps":   ("uniform_eps",   float),
-            "priorclipmmax":("prior_clip_max",float),
+            "priorclipmax": ("prior_clip_max", float),
+            "fpureduction": ("fpu_reduction", float),
         }
-        if name in _map:
-            attr, typ = _map[name]
-            setattr(self, attr, typ(value))
-            if name == "modelpath":
-                self._model_loaded = False  # will reload on next isready
+        if name not in options:
+            return
+        attr, typ = options[name]
+        setattr(self, attr, typ(value))
+        if name == "modelpath":
+            self.model_loaded = False
 
-    def handle_position(self, tokens: list[str]):
+    def handle_position(self, tokens):
         if not tokens:
             return
-
-        startpos_fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        startpos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         if tokens[0] == "startpos":
-            fen = startpos_fen
-            rest = tokens[1:]
+            fen, rest = startpos, tokens[1:]
         elif tokens[0] == "fen":
             try:
                 mi = tokens.index("moves")
-                fen = " ".join(tokens[1:mi])
-                rest = tokens[mi:]
+                fen, rest = " ".join(tokens[1:mi]), tokens[mi:]
             except ValueError:
-                fen = " ".join(tokens[1:])
-                rest = []
+                fen, rest = " ".join(tokens[1:]), []
         else:
             return
-
-        move_list = rest[1:] if rest and rest[0] == "moves" else []
-
+        moves = rest[1:] if rest and rest[0] == "moves" else []
         board = Board(fen)
-        for mv in move_list:
+        for mv in moves:
             board.push_uci(mv)
+        self.build_tree(board)
 
-        self._build_tree(board)
-
-    def handle_go(self, tokens: list[str]):
+    def handle_go(self, tokens):
         if self.board is None or self.tree is None:
             self.send("bestmove 0000")
             return
 
-        params: dict = {}
+        params = {}
         i = 0
         while i < len(tokens):
             t = tokens[i]
@@ -218,77 +237,76 @@ class XercesUCI:
             else:
                 i += 1
 
-        time_budget_ms = self._compute_time_budget(params)
-
+        budget_ms = self.compute_time_budget(params)
         if "nodes" in params:
             n = params["nodes"]
             self.tree.sims_ceiling = n
             self.tree.set_sim_budget(float(n))
 
-        self._stop_event.clear()
-        self._search_thread = threading.Thread(
-            target=self._search_worker,
-            args=(time_budget_ms, params.get("infinite", False)),
+        self.stop_event.clear()
+        self.search_thread = threading.Thread(
+            target=self.search_worker,
+            args=(budget_ms,),
             daemon=True,
         )
-        self._search_thread.start()
+        self.search_thread.start()
 
-    def _compute_time_budget(self, params: dict) -> int | None:
-        """Return milliseconds to search, or None if infinite."""
+    def compute_time_budget(self, params):
         if params.get("infinite"):
             return None
         if "movetime" in params:
             return max(50, params["movetime"] - 20)
-
         stm = self.board.side_to_move() if self.board else "w"
         my_time = params.get("wtime" if stm == "w" else "btime")
         if my_time is None:
-            return None  # no time info → sim ceiling governs
-
+            return None
         inc = params.get("winc" if stm == "w" else "binc", 0)
         movestogo = params.get("movestogo", 30)
-
-        # 1/movestogo of remaining time, plus most of the increment
         budget = my_time / movestogo + inc * 0.8
-        # never burn more than 1/4 of the clock; always at least 50 ms
-        budget = max(50, min(budget, my_time / 4))
-        return int(budget)
+        return int(max(50, min(budget, my_time / 4)))
 
-    def _search_worker(self, time_budget_ms: int | None, infinite: bool):
+    def emit_info(self, elapsed):
         tree = self.tree
         board = self.board
-        infer = self.infer_fn
+        if tree is None or board is None:
+            return
+        sims = tree.sims_completed_this_move
+        sps = sims / max(elapsed, 1e-9)
+        sign = 1 if board.side_to_move() == "w" else -1
+        _, details = tree.robust_selection_criteria(5, 100)
+        if not details:
+            return
+        cp = int(details[0].Q * sign * 100)
+        depth = max(1, tree.depth_stats()[1])
+        mv, _, _ = tree.best()
+        self.send(
+            f"info depth {depth} score cp {cp} nodes {sims}"
+            f" nps {int(sps)} time {int(elapsed * 1000)} pv {mv or '0000'}"
+        )
+
+    def search_worker(self, budget_ms):
+        tree = self.tree
+        board = self.board
+        batcher = self.batcher
+        tf_thread = self.tf_thread
 
         micro_batch = self.micro_batch
         max_fastpath = max(micro_batch * 4, 64)
         max_unresolved = micro_batch * 4
 
-        # reset early-stop state so go always starts fresh
         tree._es_tripped = False
         tree._es_last_checked_at = tree.sims_completed_this_move
         tree.sim_stop_reason = ""
         tree.es_checks.clear()
 
         t0 = time.time()
-        deadline = (t0 + time_budget_ms / 1000.0) if time_budget_ms is not None else None
+        deadline = (t0 + budget_ms / 1000) if budget_ms is not None else None
+        last_info_t = t0
 
-        def _over_time():
-            return deadline is not None and time.time() >= deadline
-
-        def _infer_and_cache(pending):
-            boards_np = np.stack(
-                [np.asarray(b, dtype=np.int32) for _, b in pending], axis=0
-            )
-            logits, vals = infer((boards_np,))
-            entries = []
-            for idx, (k, _) in enumerate(pending):
-                v = float(np.asarray(vals[idx]).reshape(()))
-                p = np.asarray(logits[idx], dtype=np.float32)
-                entries.append((k, v, p))
-            raw_cache_bulk_insert(entries)
-
-        while not self._stop_event.is_set() and not _over_time():
+        while not self.stop_event.is_set():
             if tree.stop_simulating():
+                break
+            if deadline is not None and time.time() >= deadline:
                 break
 
             tree.resolve_inflight()
@@ -298,54 +316,39 @@ class XercesUCI:
                 continue
 
             res = tree.collect_many_leaves(micro_batch, max_fastpath)
-            n_leafs = res.count_new + res.count_terminal + res.count_cached
-            tree.sims_completed_this_move += n_leafs
+            tree.sims_completed_this_move += (
+                res.count_new + res.count_terminal + res.count_cached
+            )
 
-            if res.count_new > 0 and infer is not None:
-                pending = tree.pending_encoded_64_tokens()
-                if pending:
-                    _infer_and_cache(pending)
+            if res.count_new > 0 and batcher is not None:
+                batcher.submit(tree.pending_encoded_64_tokens())
 
-        # drain any nodes still in flight
+            if batcher is not None and tf_thread is not None:
+                batch = batcher.pop_batch(never_pad=True, patience=3)
+                if batch is not None:
+                    tf_thread.submit(batch)
+
+            now = time.time()
+            if now - last_info_t >= 1.0:
+                self.emit_info(now - t0)
+                last_info_t = now
+
         for _ in range(200):
             if tree.count_unresolved() == 0:
                 break
-            pending = tree.pending_encoded_64_tokens()
-            if pending and infer is not None:
-                _infer_and_cache(pending)
             tree.resolve_inflight()
             time.sleep(0.001)
 
         elapsed = time.time() - t0
-        sims = tree.sims_completed_this_move
-        sps = sims / max(elapsed, 1e-9)
-
-        mv, _method, _ = tree.best()
-        if not mv:
-            mv = "0000"
-
-        # emit one info line
-        stm = board.side_to_move()
-        sign = 1 if stm == "w" else -1
-        _, details = tree.robust_selection_criteria(5, 100)
-        if details:
-            q_stm = details[0].Q * sign
-            cp = int(q_stm * 100)
-            depth = max(1, tree.depth_stats()[1])
-            self.send(
-                f"info depth {depth} score cp {cp} nodes {sims} "
-                f"nps {int(sps)} time {int(elapsed * 1000)} pv {mv}"
-            )
-
-        self.send(f"bestmove {mv}")
+        self.emit_info(elapsed)
+        mv, _, _ = tree.best()
+        self.send(f"bestmove {mv or '0000'}")
 
     def handle_stop(self):
-        self._stop_event.set()
-        if self._search_thread is not None:
-            self._search_thread.join(timeout=2.0)
-            self._search_thread = None
-
-    # --------------------------------------------------------------- Main loop
+        self.stop_event.set()
+        if self.search_thread is not None:
+            self.search_thread.join(timeout=2.0)
+            self.search_thread = None
 
     def run(self):
         for raw in sys.stdin:
@@ -354,7 +357,6 @@ class XercesUCI:
                 continue
             tokens = line.split()
             cmd = tokens[0]
-
             if cmd == "uci":
                 self.handle_uci()
             elif cmd == "isready":
@@ -371,16 +373,21 @@ class XercesUCI:
                 self.handle_stop()
             elif cmd == "quit":
                 self.handle_stop()
+                if self.tf_thread is not None:
+                    self.tf_thread.close()
                 break
             elif cmd == "d":
                 if self.board:
-                    self.info(self.board.fen())
+                    self.uci_info(self.board.fen())
+
+        if self.search_thread is not None:
+            self.search_thread.join(timeout=30.0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Xerces UCI chess engine")
-    parser.add_argument("--model", help="PyTorch model checkpoint path")
-    parser.add_argument("--config", help="YAML or JSON config file")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model")
+    parser.add_argument("--config")
     args, _ = parser.parse_known_args()
 
     engine = XercesUCI()
@@ -391,14 +398,12 @@ def main():
     if args.config:
         from chessbot.config import Config
         ext = os.path.splitext(args.config)[1].lower()
-        cfg = Config.from_yaml(args.config) if ext in (".yaml", ".yml") else Config.from_json(args.config)
-        engine.sims_floor = cfg.sims_floor
-        engine.sims_ceiling = cfg.sims_ceiling
-        engine.c_puct = cfg.c_puct
-        engine.vscale = cfg.vscale
-        engine.uniform_eps = cfg.uniform_eps
-        engine.prior_clip_max = cfg.prior_clip_max
-        engine.pruning_factor = cfg.pruning_factor
+        cfg = (Config.from_yaml(args.config) if ext in (".yaml", ".yml")
+               else Config.from_json(args.config))
+        for attr in ("sims_floor", "sims_ceiling", "c_puct", "vscale",
+                     "uniform_eps", "prior_clip_max", "pruning_factor", "fpu_reduction"):
+            if hasattr(cfg, attr):
+                setattr(engine, attr, getattr(cfg, attr))
 
     engine.run()
 

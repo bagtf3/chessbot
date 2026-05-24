@@ -28,42 +28,41 @@ SHUFFLE_BUFFER     = 256_000
 VAL_SHUFFLE_BUFFER = 16_000
 STEPS_PER_EPOCH    = EPOCH_SIZE // BATCH_SIZE
 VAL_FRACTION       = 0.05
-VAL_SPLIT_SEED     = 42
+VAL_SPLIT_SEED     = 69
 UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
-DEFAULT_LR         = 2e-4
-DEFAULT_MAX_EPOCH  = 2000
+DEFAULT_MAX_EPOCH  = 2001
 
+POLICY_LW = 1.0
+VALUE_LW  = 5.0
 
 # ---------------------------------------------------------------------------
-# Loss-weight schedule with cosine decay
+# Learning-rate schedule (SGD+Nesterov)
+#   0..LR_WARMUP_EPOCHS: linear warmup LR_MIN -> LR_MAX
+#   warmup..decay_end:   cosine steps every LR_STEP_SIZE epochs
+#   decay_end..end:      flat at LR_MIN
 # ---------------------------------------------------------------------------
 
-VALUE_POLICY_RATIO = 8.0
-LW_DECAY_START     = 1.00   # policy weight at epoch 10
-LW_DECAY_END       = 0.15   # policy weight at DEFAULT_MAX_EPOCH
-
-LW_SCHEDULE: dict[int, dict[str, float]] = {
-    0:  {"policy_logits": 0.10, "value_out": 0.10},
-    3:  {"policy_logits": 0.75, "value_out": 1.50},
-    10: {"policy_logits": LW_DECAY_START,
-         "value_out":     round(LW_DECAY_START * VALUE_POLICY_RATIO, 4)},
-}
-for ep in range(60, DEFAULT_MAX_EPOCH + 1, 50):
-    t = (ep - 10) / (DEFAULT_MAX_EPOCH - 10)
-    p = LW_DECAY_END + 0.5 * (LW_DECAY_START - LW_DECAY_END) * (
-        1 + math.cos(math.pi * t)
-    )
-    LW_SCHEDULE[ep] = {
-        "policy_logits": round(p, 4),
-        "value_out":     round(p * VALUE_POLICY_RATIO, 4),
-    }
-del ep, t, p
+LR_MIN           = 5e-4
+LR_MAX           = 0.025
+LR_WARMUP_EPOCHS = 30
+LR_DECAY_EPOCHS  = 300
+LR_STEP_SIZE     = 50
 
 
-def lw_for_epoch(epoch: int) -> dict[str, float]:
-    return LW_SCHEDULE[max(k for k in LW_SCHEDULE if k <= epoch)]
+def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH, scale: float = 1.0) -> float:
+    decay_end   = max_epoch - LR_DECAY_EPOCHS
+    total_steps = decay_end // LR_STEP_SIZE
+    if ep >= decay_end:
+        lr = LR_MIN
+    else:
+        step = ep // LR_STEP_SIZE
+        t    = (step + 1) / total_steps
+        lr   = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + math.cos(math.pi * t))
+    if ep < LR_WARMUP_EPOCHS:
+        lr = min(lr, LR_MIN + (LR_MAX - LR_MIN) * (ep / LR_WARMUP_EPOCHS))
+    return lr * scale
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,7 @@ def split_train_val(
 # TFRecord data pipeline
 # ---------------------------------------------------------------------------
 
-def make_dataset(file_list: list[str], shuffle_buffer: int):
+def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BATCH_SIZE):
     """Build a repeating, shuffled TF dataset from .tfrecord.gz files.
 
     Imports TF lazily so the supervisor process stays GPU-free.
@@ -139,7 +138,7 @@ def make_dataset(file_list: list[str], shuffle_buffer: int):
     )
     ds = ds.map(parse_record, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
-    ds = ds.batch(BATCH_SIZE, drop_remainder=True)
+    ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 

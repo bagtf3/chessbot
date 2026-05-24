@@ -111,6 +111,9 @@ def child_looper(
     game_queue,
     sf_queue=None,
 ):
+    if cfg.inference_backend == "pt_eager":
+        import torch
+        torch.backends.cudnn.benchmark = True
     with init_selfplay(
         cfg, recent_games_q, telemetry_q, msg_q,
         game_queue=game_queue, sf_queue=sf_queue,

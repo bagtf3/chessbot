@@ -81,8 +81,7 @@ def make_pt_attn_pool_value_head(C: int):
 
         def forward(self, x):
             if x.dim() == 4:
-                B = x.shape[0]
-                x = x.permute(0, 2, 3, 1).reshape(B, 64, C)
+                x = x.permute(0, 2, 3, 1).reshape(-1, 64, C)
             x = self.ln(x)
             w = torch.softmax(self.ap(x), dim=1)
             v = (x * w).sum(dim=1)
@@ -118,15 +117,14 @@ def make_pt_relational_policy_head(C: int):
             self.promo_out = nn.Conv2d(64, 3, 1)
 
         def forward(self, x):
-            B    = x.shape[0]
-            s    = x.permute(0, 2, 3, 1).reshape(B, 64, C)
+            s    = x.permute(0, 2, 3, 1).reshape(-1, 64, C)
             fv   = self.from_ln2(F.gelu(self.from_fc2(self.from_ln1(F.gelu(self.from_fc(s))))))
             tv   = self.to_ln2(self.to_fc2(self.to_ln1(F.gelu(self.to_fc(s)))))
-            norm = torch.bmm(fv, tv.transpose(1, 2)).reshape(B, 64 * 64)
+            norm = torch.bmm(fv, tv.transpose(1, 2)).reshape(-1, 64 * 64)
             p    = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
             sk   = p
             p    = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
-            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(B, 8 * 8 * 3)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3)
             return torch.cat([norm, promo], dim=1)
 
     return RelationalPolicyHead()
@@ -448,12 +446,11 @@ def build_pt_transformer_16m(cfg: dict):
             self.value_head  = make_pt_attn_pool_value_head(de)
 
         def forward(self, t):
-            B   = t.shape[0]
             pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
             x   = self.emb(t) + pos
             for tx in self.txs:
                 x = tx(x)
-            x_2d = x.reshape(B, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            x_2d = x.reshape(-1, 8, 8, de).permute(0, 3, 1, 2).contiguous()
             v_2d = F.leaky_relu(self.val_mix_ln(self.val_mix(x_2d)), 0.02)
             return self.policy_head(x_2d), self.value_head(v_2d)
 

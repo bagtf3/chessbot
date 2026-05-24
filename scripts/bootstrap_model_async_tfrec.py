@@ -31,7 +31,7 @@ import pandas as pd
 from chessbot.pretrain import (
     BATCH_SIZE, STEPS_PER_EPOCH, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_MAX_EPOCH,
-    POLICY_LW, VALUE_LW, lr_for_epoch,
+    POLICY_LW, VALUE_LW, LR_WARMUP_EPOCHS, lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     moving_average, save_plot,
@@ -41,7 +41,6 @@ EPOCHS_PER_WORKER = 200
 CHECKPOINT_EVERY  = 20    # must be a multiple of PLOT_EVERY
 DEFAULT_MODEL     = "16m-conformer-interweaved"
 DEFAULT_RUN_TAG   = "val_test_multi"
-DEFAULT_LR        = 1e-4
 
 
 def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
@@ -135,7 +134,6 @@ def worker_main(wargs: dict) -> None:
     model_dir   = wargs.get("model_dir", MODEL_DIR)
     start_epoch = wargs["start_epoch"]
     end_epoch   = wargs["end_epoch"]
-    lr          = wargs.get("lr", DEFAULT_LR)
     max_epoch   = wargs["max_epoch"]
 
     progress_file = os.path.join(run_dir, f"{name}_eval_progress.csv")
@@ -274,7 +272,7 @@ def worker_main(wargs: dict) -> None:
     last_ystack: np.ndarray | None    = None
     last_val_preds: np.ndarray | None = None
 
-    TF_LR_WARMUP = 20
+
     current_clipnorm: float | None = None
 
     for ep in range(start_epoch, end_epoch):
@@ -284,7 +282,7 @@ def worker_main(wargs: dict) -> None:
             opt.inner_optimizer.learning_rate.assign(target_lr)
             print(f"[lr update] epoch {ep}: lr={target_lr:.4e}")
 
-        target_clipnorm = 1.0 if ep < TF_LR_WARMUP else 2.5
+        target_clipnorm = 1.0 if ep < LR_WARMUP_EPOCHS else 2.5
         if target_clipnorm != current_clipnorm:
             current_clipnorm = target_clipnorm
             opt.inner_optimizer.clipnorm = target_clipnorm
@@ -399,7 +397,6 @@ def main() -> None:
         help="second folder to blend 50/50 with --tfrec-dir",
     )
     parser.add_argument("--max-epoch", type=int,   default=2000)
-    parser.add_argument("--lr",        type=float, default=DEFAULT_LR)
     args = parser.parse_args()
 
     if not args.tfrec_dir:
@@ -456,7 +453,6 @@ def main() -> None:
             "model_dir":   MODEL_DIR,
             "start_epoch": resume,
             "end_epoch":   end_epoch,
-            "lr":          args.lr,
             "max_epoch":   args.max_epoch,
         }
 

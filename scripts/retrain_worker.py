@@ -323,7 +323,7 @@ def main():
     cfg = Config.from_yaml(config_file)
 
     t0 = time.time()
-    if cfg.retrain_backend == "pytorch":
+    if cfg.retrain_backend == "pt_eager":
         tf.config.set_visible_devices([], 'GPU')
         from chessbot.train_pytorch import enforce_pytorch_gpu_or_die
         enforce_pytorch_gpu_or_die()
@@ -402,12 +402,10 @@ def main():
 
     epoch = args.epoch
 
-    if cfg.retrain_backend == "pytorch":
-        from chessbot.train_pytorch import load_pt_model, train_pt_model, save_pt_model
-        model, arch = load_pt_model(cfg.pytorch_model_path)
-        train_pt_model(model, X, P, Y_value, vwht, pwht, cfg, args)
-        save_pt_model(model, cfg.pytorch_model_path, arch)
-        print(f"[retrain] pytorch checkpoint saved -> {cfg.pytorch_model_path}")
+    if cfg.retrain_backend == "pt_eager":
+        from chessbot.train_pytorch import retrain_pt
+        retrain_pt(cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
+                   label="", timings=timings)
     else:
         retrain_one_model(
             cfg.model_path, X, Y, s_wts, cfg, epoch, args,

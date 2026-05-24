@@ -88,14 +88,11 @@ class GameLooper(object):
 
     def load_reload_model(self):
         cfg = self.config
-        if cfg.inference_backend == "pytorch":
-            from chessbot.train_pytorch import load_pt_model, make_pt_infer
-            model, _ = load_pt_model(cfg.pytorch_model_path)
-            self.model, self.infer = make_pt_infer(
-                model,
-                max_bs=cfg.fwd_batch,
-                vscale=cfg.vscale,
-            )
+        if cfg.inference_backend == "pt_eager":
+            import torch
+            from chessbot.train_pytorch import make_pt_infer
+            model = torch.jit.load(cfg.model_path, map_location="cpu")
+            self.model, self.infer = make_pt_infer(model, max_bs=cfg.fwd_batch)
         else:
             self.model = load_model(cfg.model_path)
             self.infer = make_conv_infer(
@@ -637,8 +634,8 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
     else:
         model_path = config.model_path
 
-    if config.inference_backend == "pytorch":
-        model = None
+    if config.inference_backend == "pt_eager":
+        model = None  # loaded per-worker in load_reload_model
     elif os.path.exists(model_path):
         print(f"[init] Loading {model_name}")
         model = load_model(model_path)

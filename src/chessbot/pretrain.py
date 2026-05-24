@@ -28,43 +28,41 @@ SHUFFLE_BUFFER     = 256_000
 VAL_SHUFFLE_BUFFER = 16_000
 STEPS_PER_EPOCH    = EPOCH_SIZE // BATCH_SIZE
 VAL_FRACTION       = 0.05
-VAL_SPLIT_SEED     = 42
+VAL_SPLIT_SEED     = 69
 UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
-DEFAULT_MAX_EPOCH  = 2000
+DEFAULT_MAX_EPOCH  = 2001
 
 POLICY_LW = 1.0
-VALUE_LW  = 4.0
+VALUE_LW  = 5.0
 
 # ---------------------------------------------------------------------------
 # Learning-rate schedule (SGD+Nesterov)
-#   0..LR_WARMUP_EPOCHS:   linear warmup LR_MIN -> LR_MAX
-#   warmup..LR_HOLD_EPOCHS: flat at LR_MAX
-#   hold..decay_end:        cosine steps every LR_STEP_SIZE epochs
-#   decay_end..end:         flat at LR_MIN
+#   0..LR_WARMUP_EPOCHS: linear warmup LR_MIN -> LR_MAX
+#   warmup..decay_end:   cosine steps every LR_STEP_SIZE epochs
+#   decay_end..end:      flat at LR_MIN
 # ---------------------------------------------------------------------------
 
-LR_MIN           = 1e-3
-LR_MAX           = 0.1
-LR_WARMUP_EPOCHS = 20
-LR_HOLD_EPOCHS   = 100
+LR_MIN           = 5e-4
+LR_MAX           = 0.025
+LR_WARMUP_EPOCHS = 30
 LR_DECAY_EPOCHS  = 300
-LR_STEP_SIZE     = 100
+LR_STEP_SIZE     = 50
 
 
-def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH) -> float:
-    decay_end = max_epoch - LR_DECAY_EPOCHS
-    if ep < LR_WARMUP_EPOCHS:
-        return LR_MIN + (LR_MAX - LR_MIN) * (ep / LR_WARMUP_EPOCHS)
-    if ep < LR_HOLD_EPOCHS:
-        return LR_MAX
+def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH, scale: float = 1.0) -> float:
+    decay_end   = max_epoch - LR_DECAY_EPOCHS
+    total_steps = decay_end // LR_STEP_SIZE
     if ep >= decay_end:
-        return LR_MIN
-    step        = (ep - LR_HOLD_EPOCHS) // LR_STEP_SIZE
-    total_steps = (decay_end - LR_HOLD_EPOCHS) // LR_STEP_SIZE
-    t = (step + 1) / total_steps
-    return LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + math.cos(math.pi * t))
+        lr = LR_MIN
+    else:
+        step = ep // LR_STEP_SIZE
+        t    = (step + 1) / total_steps
+        lr   = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + math.cos(math.pi * t))
+    if ep < LR_WARMUP_EPOCHS:
+        lr = min(lr, LR_MIN + (LR_MAX - LR_MIN) * (ep / LR_WARMUP_EPOCHS))
+    return lr * scale
 
 
 # ---------------------------------------------------------------------------

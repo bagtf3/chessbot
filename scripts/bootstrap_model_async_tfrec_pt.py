@@ -34,7 +34,8 @@ import scipy.special
 from chessbot.pretrain import (
     EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_MAX_EPOCH,
-    POLICY_LW, VALUE_LW,
+    POLICY_LW, VALUE_LW, LR_WARMUP_EPOCHS,
+    lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     save_plot,
@@ -45,42 +46,17 @@ from chessbot.model import (
     PT_BUILDERS,
 )
 
-# ---------------------------------------------------------------------------
-# PT-specific training constants
-# Batch 512 = 2x base; epoch size doubled for ~40 steps/epoch.
-# SGD+Nesterov: LR_MAX=0.1 (textbook), LR_MIN=1e-3 (finetune tail).
-# ---------------------------------------------------------------------------
-
+# PT uses 2x batch vs TF -> same epoch size, 2x LR (linear scaling rule)
 PT_BATCH_SIZE      = 512
-PT_EPOCH_SIZE      = EPOCH_SIZE * 2
-PT_STEPS_PER_EPOCH = PT_EPOCH_SIZE // PT_BATCH_SIZE   # 40
-
-PT_LR_MIN        = 1e-3
-PT_LR_MAX        = 0.1
-PT_MOMENTUM      = 0.9
-PT_WEIGHT_DECAY  = 1e-4
-PT_LR_WARMUP     = 10
-PT_LR_HOLD       = 100
-PT_LR_DECAY      = 300
-PT_LR_STEP_SIZE  = 100
+PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
+PT_LR_SCALE        = 2.0
+PT_MOMENTUM        = 0.9
+PT_WEIGHT_DECAY    = 1e-4
 
 EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
 DEFAULT_MODEL     = "16m-transformer"
 DEFAULT_RUN_TAG   = "val_test_multi"
-
-def pt_lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH) -> float:
-    decay_end = max_epoch - PT_LR_DECAY
-    if ep < PT_LR_WARMUP:
-        return PT_LR_MIN + (PT_LR_MAX - PT_LR_MIN) * (ep / PT_LR_WARMUP)
-    if ep < PT_LR_HOLD:
-        return PT_LR_MAX
-    if ep >= decay_end:
-        return PT_LR_MIN
-    step        = (ep - PT_LR_HOLD) // PT_LR_STEP_SIZE
-    total_steps = (decay_end - PT_LR_HOLD) // PT_LR_STEP_SIZE
-    t = (step + 1) / total_steps
-    return PT_LR_MIN + 0.5 * (PT_LR_MAX - PT_LR_MIN) * (1.0 + math.cos(math.pi * t))
 
 
 
@@ -208,7 +184,7 @@ def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def pt_clipnorm_for_epoch(ep: int) -> float:
-    return 1.0 if ep < PT_LR_WARMUP else 2.5
+    return 1.0 if ep < LR_WARMUP_EPOCHS else 2.5
 
 
 def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
@@ -338,7 +314,6 @@ def worker_main(wargs: dict) -> None:
     val_files   = wargs["val_files"]
     start_epoch = wargs["start_epoch"]
     end_epoch   = wargs["end_epoch"]
-    lr          = wargs["lr"]
     max_epoch   = wargs["max_epoch"]
     model_dir   = wargs.get("model_dir", MODEL_DIR)
 
@@ -351,7 +326,7 @@ def worker_main(wargs: dict) -> None:
     print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
     print(f"{'#' * 72}\n")
 
-    lr0 = pt_lr_for_epoch(start_epoch, max_epoch)
+    lr0 = lr_for_epoch(start_epoch, max_epoch, scale=PT_LR_SCALE)
     if start_epoch == 0:
         import torch
         from torch.amp import GradScaler
@@ -402,7 +377,7 @@ def worker_main(wargs: dict) -> None:
     last_val_q: np.ndarray | None = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lr = pt_lr_for_epoch(ep, max_epoch)
+        target_lr = lr_for_epoch(ep, max_epoch, scale=PT_LR_SCALE)
         if target_lr != current_lr:
             current_lr = target_lr
             for pg in opt.param_groups:
@@ -516,8 +491,6 @@ def main() -> None:
         help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
     )
     parser.add_argument("--max-epoch", type=int,   default=DEFAULT_MAX_EPOCH)
-    parser.add_argument("--lr",        type=float, default=PT_LR_MAX,
-                        help="peak learning rate")
     args = parser.parse_args()
 
     if not args.tfrec_dir:
@@ -530,9 +503,10 @@ def main() -> None:
     print(f"[supervisor] model={name}")
     print(f"[supervisor] run_dir={run_dir}")
     print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
-    print(f"[supervisor] max_epoch={args.max_epoch}  lr={args.lr}")
+    from chessbot.pretrain import LR_MIN, LR_MAX
+    print(f"[supervisor] max_epoch={args.max_epoch}")
     print(f"[supervisor] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
-          f"  lr_range=[{PT_LR_MIN:.1e}, {PT_LR_MAX:.1e}]")
+          f"  lr_range=[{LR_MIN * PT_LR_SCALE:.1e}, {LR_MAX * PT_LR_SCALE:.1e}]")
 
     all_files = list_tfrecord_files(args.tfrec_dir)
     if not all_files:
@@ -560,7 +534,6 @@ def main() -> None:
             "model_dir":   MODEL_DIR,
             "start_epoch": resume,
             "end_epoch":   end_epoch,
-            "lr":          args.lr,
             "max_epoch":   args.max_epoch,
         }
 

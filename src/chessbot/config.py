@@ -139,11 +139,8 @@ class Config(object):
     training_queue_buffer = 30720
 
     # inference / retrain backend selection
-    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt"
-    retrain_backend = "tf"        # "tf" | "pytorch"
-
-    # PyTorch retrain (only used when retrain_backend = "pytorch")
-    pytorch_model_path = ""
+    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt" | "pt_eager"
+    retrain_backend = "tf"        # "tf" | "pt_eager"
 
     def __init__(self):
         self.init_paths()
@@ -167,7 +164,8 @@ class Config(object):
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
 
-        model_name = f"{self.run_tag}_model.h5"
+        ext = ".ts" if self.inference_backend == "pt_eager" else ".h5"
+        model_name = f"{self.run_tag}_model{ext}"
         self.model_path = os.path.join(self.run_dir, model_name)
 
         if 'dummy' not in self.run_dir:

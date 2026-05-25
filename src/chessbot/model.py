@@ -106,10 +106,12 @@ def make_pt_relational_policy_head(C: int):
             self.from_ln1  = nn.LayerNorm(256)
             self.from_fc2  = nn.Linear(256, 256)
             self.from_ln2  = nn.LayerNorm(256)
+
             self.to_fc     = nn.Linear(C, 256)
             self.to_ln1    = nn.LayerNorm(256)
             self.to_fc2    = nn.Linear(256, 256)
             self.to_ln2    = nn.LayerNorm(256)
+            
             self.promo_mix = nn.Conv2d(C, 64, 1, bias=False)
             self.promo_mln = make_ln2d(64)
             self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)

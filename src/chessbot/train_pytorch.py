@@ -55,9 +55,9 @@ def save_pt_model(model, path, arch=None, opt=None):
     .pt path: state_dict dict only.
     """
     if path.endswith(".ts"):
-        device = next(model.parameters()).device
-        model.eval()
-        dummy = torch.zeros(1, 64, dtype=torch.long, device=device)
+        trace_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(trace_device).eval()
+        dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
         with torch.no_grad():
             traced = torch.jit.trace(model, dummy)
         torch.jit.save(traced, path)
@@ -73,6 +73,14 @@ def save_pt_model(model, path, arch=None, opt=None):
     torch.save(payload, path)
     print(f"[pytorch] checkpoint saved -> {path}")
 
+
+
+RETRAIN_CLIP_NORM = 1.0
+
+
+def pt_opt_state_path(model_path: str, run_dir: str) -> str:
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(run_dir, "train_ckpts", stem + "_opt_state.pt")
 
 
 def print_pt_fit_history(epoch_losses, epoch, label=""):
@@ -100,9 +108,28 @@ def print_pt_fit_history(epoch_losses, epoch, label=""):
         print(fmt.format(name=name, start=start, end=end, delta=delta, mark=mark))
 
 
+def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
+    if not epoch_grad_stats:
+        return
+    etag    = f"[epoch {epoch:4d}]{(' ' + label) if label else ''}"
+    clips   = [gs['gn_clips'] for gs in epoch_grad_stats]
+    steps   = [gs['gn_steps'] for gs in epoch_grad_stats]
+    means   = [gs['gn_mean']   for gs in epoch_grad_stats]
+    medians = [gs['gn_median'] for gs in epoch_grad_stats]
+    mins    = [gs['gn_min']    for gs in epoch_grad_stats]
+    maxs    = [gs['gn_max']    for gs in epoch_grad_stats]
+    breakdown = "  ".join(f"ep{i}: {c}" for i, c in enumerate(clips))
+    print(
+        f"{etag} [grad stats] "
+        f"mean={np.mean(means):.2f}  median={np.mean(medians):.2f}  "
+        f"min={min(mins):.2f}  max={max(maxs):.2f}  "
+        f"clips={sum(clips)}/{sum(steps)} ({breakdown})"
+    )
+
+
 def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                label="", timings=None):
-    """Load, train 2 epochs (LR halved on epoch 2), save. Mirrors retrain_one_model."""
+    """Load, train 2 epochs at LR/1.5, save. Mirrors retrain_one_model."""
     if timings is None:
         timings = {}
     tag = f"[retrain{(' ' + label) if label else ''}]"
@@ -124,18 +151,34 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     vwht_t = torch.from_numpy(vwht).float().to(device)
     pwht_t = torch.from_numpy(pwht).float().to(device)
 
-    opt = torch.optim.SGD(
-        model.parameters(), lr=cfg.learning_rate / 1.5,
-        momentum=0.9, weight_decay=1e-4, nesterov=True,
+    lr = cfg.learning_rate
+    opt = torch.optim.Adam(
+        model.parameters(), lr=lr,
+        betas=(0.9, cfg.adam_beta2), weight_decay=1e-4,
     )
+    opt_state_path = pt_opt_state_path(model_path, cfg.run_dir)
+    if os.path.exists(opt_state_path):
+        state = torch.load(opt_state_path, map_location="cpu")
+        opt.load_state_dict(state)
+        for pg in opt.param_groups:
+            pg['lr'] = lr
+        for param_state in opt.state.values():
+            for k, v in param_state.items():
+                if isinstance(v, torch.Tensor):
+                    param_state[k] = v.to(device)
+        print(f"{tag} restored Adam state")
+    else:
+        print(f"{tag} no prior Adam state - starting fresh")
 
-    epoch_losses = []
+    epoch_losses     = []
+    epoch_grad_stats = []
     t0 = time.time()
     for ep_idx in range(2):
-
-        idx   = torch.randperm(n, device=device)
-        total = value_total = policy_total = 0.0
-        steps = 0
+        idx          = torch.randperm(n, device=device)
+        total        = value_total = policy_total = 0.0
+        steps        = 0
+        grad_norms   = []
+        clip_count   = 0
 
         for start in range(0, n, args.batch_size):
             batch_idx = idx[start:start + args.batch_size]
@@ -156,6 +199,10 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
             opt.zero_grad()
             loss.backward()
+            raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), RETRAIN_CLIP_NORM).item()
+            grad_norms.append(raw_norm)
+            if raw_norm > RETRAIN_CLIP_NORM:
+                clip_count += 1
             opt.step()
 
             total        += loss.item()
@@ -163,14 +210,28 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             value_total  += value_loss.item()
             steps        += 1
 
+        gn = np.array(grad_norms)
         epoch_losses.append({
             'loss':   total        / max(1, steps),
             'policy': policy_total / max(1, steps),
             'value':  value_total  / max(1, steps),
         })
+        epoch_grad_stats.append({
+            'gn_mean':   float(gn.mean()),
+            'gn_median': float(np.median(gn)),
+            'gn_min':    float(gn.min()),
+            'gn_max':    float(gn.max()),
+            'gn_clips':  clip_count,
+            'gn_steps':  steps,
+        })
 
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
     print_pt_fit_history(epoch_losses, epoch, label=label)
+    print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
+
+    os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
+    torch.save(opt.state_dict(), opt_state_path)
+    print(f"{tag} saved Adam state")
 
     t0 = time.time()
     if model_path.endswith(".ts"):

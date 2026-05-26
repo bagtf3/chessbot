@@ -32,20 +32,20 @@ VAL_SPLIT_SEED     = 69
 UNIFORM_BLEND      = 0.05
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
-DEFAULT_MAX_EPOCH  = 2001
+DEFAULT_MAX_EPOCH  = 2000
 
 POLICY_LW = 1.0
-VALUE_LW  = 5.0
+VALUE_LW  = 4.0
 
 # ---------------------------------------------------------------------------
-# Learning-rate schedule (SGD+Nesterov)
+# Learning-rate schedule (Adam)
 #   0..LR_WARMUP_EPOCHS: linear warmup LR_MIN -> LR_MAX
 #   warmup..decay_end:   cosine steps every LR_STEP_SIZE epochs
 #   decay_end..end:      flat at LR_MIN
 # ---------------------------------------------------------------------------
 
-LR_MIN           = 5e-4
-LR_MAX           = 0.025
+LR_MIN           = 2e-5
+LR_MAX           = 3e-4
 LR_WARMUP_EPOCHS = 30
 LR_DECAY_EPOCHS  = 300
 LR_STEP_SIZE     = 50

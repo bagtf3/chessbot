@@ -11,7 +11,6 @@ retrain_worker.py
 """
 
 import argparse
-import math
 import os, sys
 import time
 import gc
@@ -19,18 +18,6 @@ import gc
 import numpy as np
 
 
-OSCILLATION_PERIOD = 20
-OSCILLATION_VW_MIN = 1.0
-OSCILLATION_VW_MAX = 3.0
-
-
-def oscillated_value_loss_weight(epoch):
-    """Cosine oscillation of value head weight over OSCILLATION_PERIOD retrains.
-    Starts at VW_MIN (1:1 ratio), peaks at VW_MAX (2.5:1) at mid-period."""
-    t = (epoch % OSCILLATION_PERIOD) / OSCILLATION_PERIOD
-    return OSCILLATION_VW_MIN + (OSCILLATION_VW_MAX - OSCILLATION_VW_MIN) * 0.5 * (
-        1.0 - math.cos(2.0 * math.pi * t)
-    )
 
 import tensorflow as tf
 
@@ -407,9 +394,8 @@ def main():
 
     epoch = args.epoch
 
-    cfg.value_loss_weight = oscillated_value_loss_weight(epoch)
-    print(f"[retrain] oscillation  epoch={epoch}  period={OSCILLATION_PERIOD}  "
-          f"value_wt={cfg.value_loss_weight:.4f}  policy_wt={cfg.policy_loss_weight:.4f}  "
+    print(f"[retrain] loss weights  value={cfg.value_loss_weight:.4f}  "
+          f"policy={cfg.policy_loss_weight:.4f}  "
           f"ratio={cfg.value_loss_weight / cfg.policy_loss_weight:.4f}:1")
 
     if cfg.retrain_backend == "pt_eager":

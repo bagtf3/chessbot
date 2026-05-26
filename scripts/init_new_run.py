@@ -32,13 +32,12 @@ def load_yaml(path):
 
 
 def find_model_in_dir(d):
-    # prefer exact-named model <tag>_model.h5 handled by caller,
-    # else pick newest .h5
     p = Path(d)
-    h5s = sorted(p.glob("*.h5"), key=lambda x: x.stat().st_mtime, reverse=True)
-    if not h5s:
-        return None
-    return str(h5s[0])
+    for ext in ("*.pt", "*.ts", "*.h5"):
+        matches = sorted(p.glob(ext), key=lambda x: x.stat().st_mtime, reverse=True)
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
@@ -95,17 +94,36 @@ def main():
             print(f"[clone] source run not found: {src_dir}")
             sys.exit(1)
 
-        # find source model: prefer exact-named <clone_tag>_model.h5 else newest .h5
-        src_model = os.path.join(src_dir, f"{clone_tag}_model.h5")
-        if not os.path.exists(src_model):
+        # find source model: prefer exact-named <clone_tag>_model.{ext} else newest
+        src_model = None
+        for ext in ("pt", "ts", "h5"):
+            candidate = os.path.join(src_dir, f"{clone_tag}_model.{ext}")
+            if os.path.exists(candidate):
+                src_model = candidate
+                break
+        if src_model is None:
             src_model = find_model_in_dir(src_dir)
 
-        # if found, copy into new run_dir as <run_tag>_model.h5 and set cfg.init_model
+        # if found, copy into new run_dir preserving extension and set cfg.init_model
         if src_model and os.path.exists(src_model):
-            dest_model = os.path.join(dest_dir, f"{run_tag}_model.h5")
-            shutil.copy2(src_model, dest_model)
-            cfg.init_model = dest_model
-            print(f"[clone] copied model {src_model} -> {dest_model}")
+            src_ext = Path(src_model).suffix
+            if src_ext in (".pt", ".ts"):
+                # copy all .pt and .ts files; init_model points to .pt
+                pt_files = list(Path(src_dir).glob("*.pt")) + list(Path(src_dir).glob("*.ts"))
+                cfg.init_model = None
+                for f in pt_files:
+                    dst = os.path.join(dest_dir, f"{run_tag}_model{f.suffix}")
+                    shutil.copy2(f, dst)
+                    print(f"[clone] copied model {f} -> {dst}")
+                    if f.suffix == ".pt":
+                        cfg.init_model = dst
+                if cfg.init_model is None:
+                    cfg.init_model = os.path.join(dest_dir, f"{run_tag}_model{src_ext}")
+            else:
+                dest_model = os.path.join(dest_dir, f"{run_tag}_model{src_ext}")
+                shutil.copy2(src_model, dest_model)
+                cfg.init_model = dest_model
+                print(f"[clone] copied model {src_model} -> {dest_model}")
         else:
             # no source model found; leave cfg.init_model as default (may be configured)
             print("[clone] no model found in source; using default init_model in config")

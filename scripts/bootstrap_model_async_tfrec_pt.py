@@ -16,7 +16,6 @@ Options:
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
     --max-epoch  Total epochs to train        (default: 2000)
-    --lr         Peak learning rate           (default: 1e-2)
 """
 from __future__ import annotations
 
@@ -46,12 +45,9 @@ from chessbot.model import (
     PT_BUILDERS,
 )
 
-# PT uses 2x batch vs TF -> same epoch size, 2x LR (linear scaling rule)
 PT_BATCH_SIZE      = 512
 PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
-PT_LR_SCALE        = 2.0
-PT_MOMENTUM        = 0.9
-PT_WEIGHT_DECAY    = 1e-4
+PT_ADAM_BETA2      = 0.995
 
 EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
@@ -132,14 +128,13 @@ def get_resume_epoch(run_dir: str, name: str) -> int:
 # PT model load / save
 # ---------------------------------------------------------------------------
 
-def make_sgd(model, lr: float):
+def make_adam(model, lr: float):
     import torch
-    return torch.optim.SGD(
+    return torch.optim.Adam(
         model.parameters(),
         lr=lr,
-        momentum=PT_MOMENTUM,
-        weight_decay=PT_WEIGHT_DECAY,
-        nesterov=True,
+        betas=(0.9, PT_ADAM_BETA2),
+        weight_decay=1e-6,
     )
 
 
@@ -149,7 +144,7 @@ def load_pt_model(path: str, name: str, device, lr: float):
 
     cfg    = VARIANTS[name]
     model  = PT_BUILDERS[name](cfg).to(device)
-    opt    = make_sgd(model, lr)
+    opt    = make_adam(model, lr)
     scaler = GradScaler("cuda")
 
     ckpt = torch.load(path, map_location=device)
@@ -185,7 +180,11 @@ def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def pt_clipnorm_for_epoch(ep: int) -> float:
-    return 1.0 if ep < LR_WARMUP_EPOCHS else 2.5
+    if ep < 10:  return 1.0
+    if ep < 20:  return 2.5
+    if ep < 30:  return 5.0
+    if ep < 40:  return 10.0
+    return 20.0
 
 
 def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
@@ -244,7 +243,8 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
     return total_p / n_batches, total_v / n_batches, total / n_batches, grad_stats
 
 
-def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device):
+def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device,
+            train_loss=None, gn_mean=None):
     import torch
     from torch.amp import autocast
     from chessbot.utils import batch_policy_metrics, print_validation
@@ -277,6 +277,7 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
 
     row = {
         "training_epoch": epoch,
+        "train_loss": train_loss, "gn_mean": gn_mean,
         "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
         **pol_stats,
     }
@@ -327,13 +328,13 @@ def worker_main(wargs: dict) -> None:
     print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
     print(f"{'#' * 72}\n")
 
-    lr0 = lr_for_epoch(start_epoch, max_epoch, scale=PT_LR_SCALE)
+    lr0 = lr_for_epoch(start_epoch, max_epoch)
     if start_epoch == 0:
         import torch
         from torch.amp import GradScaler
         cfg    = VARIANTS[name]
         model  = PT_BUILDERS[name](cfg).to(device)
-        opt    = make_sgd(model, lr0)
+        opt    = make_adam(model, lr0)
         scaler = GradScaler("cuda")
         print(f"[worker] fresh init  lr={lr0:.4e}")
     else:
@@ -374,11 +375,14 @@ def worker_main(wargs: dict) -> None:
     t_fetch = t_fit = t_eval = 0.0
     total_samples  = 0
     window_samples = 0
+    window_loss_sum = 0.0
+    window_gn_sum   = 0.0
+    window_count    = 0
     last_tgt_q: np.ndarray | None = None
     last_val_q: np.ndarray | None = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lr = lr_for_epoch(ep, max_epoch, scale=PT_LR_SCALE)
+        target_lr = lr_for_epoch(ep, max_epoch)
         if target_lr != current_lr:
             current_lr = target_lr
             for pg in opt.param_groups:
@@ -388,13 +392,19 @@ def worker_main(wargs: dict) -> None:
         epoch_start = time.time()
         print("-" * 89)
 
-        if ep % PLOT_EVERY == 0:
+        if ep % PLOT_EVERY == 0 or ep == end_epoch - 1:
             t0 = time.time()
             val_bundle = val_prefetcher.get()
+            avg_loss = window_loss_sum / window_count if window_count > 0 else None
+            avg_gn   = window_gn_sum   / window_count if window_count > 0 else None
             eval_df, last_tgt_q, last_val_q = do_eval(
                 model, name, ep, val_bundle, eval_df,
                 progress_file, plot_file, device,
+                train_loss=avg_loss, gn_mean=avg_gn,
             )
+            window_loss_sum = 0.0
+            window_gn_sum   = 0.0
+            window_count    = 0
             t_eval += time.time() - t0
 
         t0 = time.time()
@@ -406,9 +416,17 @@ def worker_main(wargs: dict) -> None:
         p_loss, v_loss, t_loss, gns = fit_epoch(model, opt, scaler, bundle, fixed_lw, max_norm, device)
         t_fit += time.time() - t0
 
-        n_this          = int(bundle["enc_in"].shape[0])
-        total_samples  += n_this
-        window_samples += n_this
+        n_this           = int(bundle["enc_in"].shape[0])
+        total_samples   += n_this
+        window_samples  += n_this
+        window_loss_sum += t_loss
+        window_gn_sum   += gns['gn_mean']
+        window_count    += 1
+
+        if ep == start_epoch and ep % PLOT_EVERY == 0 and eval_df is not None:
+            eval_df.loc[eval_df.index[-1], 'train_loss'] = t_loss
+            eval_df.loc[eval_df.index[-1], 'gn_mean']   = gns['gn_mean']
+            eval_df.round(4).to_csv(progress_file, index=False)
 
         print(
             f"[epoch {ep:4d}] [{name}] "
@@ -507,7 +525,7 @@ def main() -> None:
     from chessbot.pretrain import LR_MIN, LR_MAX
     print(f"[supervisor] max_epoch={args.max_epoch}")
     print(f"[supervisor] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
-          f"  lr_range=[{LR_MIN * PT_LR_SCALE:.1e}, {LR_MAX * PT_LR_SCALE:.1e}]")
+          f"  lr_range=[{LR_MIN:.1e}, {LR_MAX:.1e}]")
 
     all_files = list_tfrecord_files(args.tfrec_dir)
     if not all_files:
@@ -550,6 +568,21 @@ def main() -> None:
             print(f"[supervisor] will retry from epoch {resume}")
 
     print(f"\n[supervisor] training complete ({args.max_epoch} epochs)")
+
+    last_ckpt = find_last_checkpoint(run_dir, name)
+    if last_ckpt >= 0:
+        import torch
+        from chessbot.train_pytorch import save_pt_model as export_ts
+        src = ckpt_path(run_dir, name, last_ckpt)
+        print(f"[supervisor] exporting final model from {os.path.basename(src)}")
+        raw = torch.load(src, map_location="cpu")
+        arch_name = raw.get("arch", name) if isinstance(raw, dict) else name
+        cfg = VARIANTS[arch_name]
+        model = PT_BUILDERS[arch_name](cfg)
+        model.load_state_dict(raw["model"])
+        ts_path = os.path.join(run_dir, f"{name}.ts")
+        export_ts(model, ts_path, arch=arch_name)
+        print(f"[supervisor] export complete -> {ts_path}")
 
 
 if __name__ == "__main__":

@@ -22,12 +22,14 @@ Flags:
   --dry-run      Build all models, print param counts, skip speed tests and saving
   --no-save      Run full speed test but do not save TF models or CSV
   --skip-trt     Skip ORT+TensorRT (fastest way to get TF+PT numbers)
+  --skip-tf      Skip TF+XLA (fastest way to get PT-only numbers)
   --batch-sizes  Space-separated list (default: 1 4 8 16 32 64 128 256)
 
 Usage:
   python model_variant_speed_test.py
   python model_variant_speed_test.py --dry-run
   python model_variant_speed_test.py --skip-trt
+  python model_variant_speed_test.py --skip-tf
   python model_variant_speed_test.py --no-save
   python model_variant_speed_test.py --batch-sizes 1 32 64 256
 """
@@ -143,6 +145,8 @@ def parse_args():
                    help="Run full speed test but skip saving TF models and CSV")
     p.add_argument("--skip-trt",   action="store_true",
                    help="Skip ORT+TensorRT benchmark (TF+XLA and PT still run)")
+    p.add_argument("--skip-tf",    action="store_true",
+                   help="Skip TF+XLA benchmark (PT eager and PT compiled still run)")
     p.add_argument("--batch-sizes", nargs="+", type=int, default=DEFAULT_BATCH_SIZES,
                    metavar="B", help="Batch sizes to benchmark")
     p.add_argument("--model-dir",  default=MODEL_DIR,
@@ -968,7 +972,7 @@ def main():
             continue
 
         # ── TF + XLA ──────────────────────────────────────────────────────
-        if name in TF_BUILDERS:
+        if name in TF_BUILDERS and not args.skip_tf:
             try:
                 init_tf_gpu()
                 import tensorflow as tf

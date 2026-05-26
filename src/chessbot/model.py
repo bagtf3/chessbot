@@ -94,40 +94,47 @@ def make_pt_attn_pool_value_head(C: int):
 
 def make_pt_relational_policy_head(C: int):
     """Bilinear from/to policy head. Accepts (B, C, 8, 8).
-    Returns (B, 4288): 4096 normal + 192 underpromotion logits."""
+    Returns (B, 4288): 4096 normal + 192 underpromotion logits.
+    Never-legal indices are masked to -1e9 so they carry no gradient."""
+    import math
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    import pyfastchess
 
     class RelationalPolicyHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.from_fc   = nn.Linear(C, 256)
-            self.from_ln1  = nn.LayerNorm(256)
-            self.from_fc2  = nn.Linear(256, 256)
-            self.from_ln2  = nn.LayerNorm(256)
+            inner_dim = 512
+            self.ln        = nn.LayerNorm(C)
+            self.from_fc1  = nn.Linear(C, inner_dim)
+            self.from_fc2  = nn.Linear(inner_dim, inner_dim)
 
-            self.to_fc     = nn.Linear(C, 256)
-            self.to_ln1    = nn.LayerNorm(256)
-            self.to_fc2    = nn.Linear(256, 256)
-            self.to_ln2    = nn.LayerNorm(256)
-            
+            self.to_fc1    = nn.Linear(C, inner_dim)
+            self.to_fc2    = nn.Linear(inner_dim, inner_dim)
+            self.scale     = 1.0 / math.sqrt(inner_dim)
+
             self.promo_mix = nn.Conv2d(C, 64, 1, bias=False)
             self.promo_mln = make_ln2d(64)
             self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)
             self.promo_ln  = make_ln2d(64)
             self.promo_out = nn.Conv2d(64, 3, 1)
 
+            mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("sometimes_legal", mask)
+
         def forward(self, x):
-            s    = x.permute(0, 2, 3, 1).reshape(-1, 64, C)
-            fv   = self.from_ln2(F.gelu(self.from_fc2(self.from_ln1(F.gelu(self.from_fc(s))))))
-            tv   = self.to_ln2(self.to_fc2(self.to_ln1(F.gelu(self.to_fc(s)))))
-            norm = torch.bmm(fv, tv.transpose(1, 2)).reshape(-1, 64 * 64)
-            p    = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
-            sk   = p
-            p    = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
-            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3)
-            return torch.cat([norm, promo], dim=1)
+            s     = self.ln(x.permute(0, 2, 3, 1).reshape(-1, 64, C))
+            fv    = self.from_fc2(F.gelu(self.from_fc1(s)))
+            tv    = self.to_fc2(F.gelu(self.to_fc1(s)))
+            dots  = torch.bmm(fv.float(), tv.float().transpose(1, 2)).mul(self.scale).reshape(-1, 64 * 64)
+            p     = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
+            sk    = p
+            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3).float()
+            logits = torch.cat([dots, promo], dim=1)
+            logits = logits.masked_fill(~self.sometimes_legal, -1e9)
+            return logits.to(x.dtype)
 
     return RelationalPolicyHead()
 
@@ -176,6 +183,7 @@ def tf_attn_pool_value_head(x, C, layers, activation="gelu"):
 def tf_relational_policy_head(x, C, layers):
     """Bilinear from/to policy head for TF functional API.
     x: (B, 8, 8, C) or (B, 64, C). Returns policy_logits (B, 4288)."""
+    import math
 
     if len(x.shape) == 3:
         x_seq = x
@@ -184,17 +192,15 @@ def tf_relational_policy_head(x, C, layers):
         x_seq = layers.Reshape((64, C), name="pol_to_seq")(x)
         x_2d  = x
 
+    x_seq    = layers.LayerNormalization(name="pol_prenorm")(x_seq)
     from_h   = layers.Dense(256, activation="gelu", name="pol_from_fc1")(x_seq)
-    from_h   = layers.LayerNormalization(name="pol_from_ln1")(from_h)
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(from_h)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
+    from_vec = layers.Dense(256, name="pol_from_fc2")(from_h)
 
     to_h   = layers.Dense(256, activation="gelu", name="pol_to_fc1")(x_seq)
-    to_h   = layers.LayerNormalization(name="pol_to_ln1")(to_h)
     to_vec = layers.Dense(256, name="pol_to_fc2")(to_h)
-    to_vec = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
 
     norm = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
+    norm = layers.Lambda(lambda t: t * (1.0 / math.sqrt(256)), name="pol_scale")(norm)
     norm = layers.Reshape((64 * 64,), name="pol_normal_flat")(norm)
 
     p    = layers.Conv2D(64, 1, use_bias=False, padding="same", name="pol_promo_mix")(x_2d)
@@ -370,12 +376,16 @@ def build_tf_transformer_branched(cfg: dict):
     v_2d  = layers.Reshape((8, 8, de), name="v_to_2d")(v_seq)
     value = tf_attn_pool_value_head(v_2d, de, layers)
 
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(pf_seq)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
-    to_vec   = layers.Dense(256, name="pol_to_fc2")(pt_seq)
-    to_vec   = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
+    import math
+    pf_n     = layers.LayerNormalization(name="pol_from_prenorm")(pf_seq)
+    from_h   = layers.Dense(256, activation="gelu", name="pol_from_fc1")(pf_n)
+    from_vec = layers.Dense(256, name="pol_from_fc2")(from_h)
+    pt_n     = layers.LayerNormalization(name="pol_to_prenorm")(pt_seq)
+    to_h     = layers.Dense(256, activation="gelu", name="pol_to_fc1")(pt_n)
+    to_vec   = layers.Dense(256, name="pol_to_fc2")(to_h)
 
     norm  = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
+    norm  = layers.Lambda(lambda t: t * (1.0 / math.sqrt(256)), name="pol_scale")(norm)
     norm  = layers.Reshape((64 * 64,), name="pol_normal_flat")(norm)
 
     x_2d  = layers.Reshape((8, 8, de), name="x_to_2d")(x)

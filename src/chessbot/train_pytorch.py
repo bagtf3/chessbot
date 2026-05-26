@@ -18,6 +18,18 @@ def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
 _FALLBACK_ARCH = "16m-conformer-interweaved"
 
 
+def log_policy_mask_status(model):
+    ph = getattr(model, "policy_head", None)
+    buf = getattr(ph, "sometimes_legal", None) if ph is not None else None
+    if buf is None:
+        print("[load_pt_model] policy_head.sometimes_legal: NOT FOUND")
+        return
+    n = int(buf.sum().item())
+    print(f"[load_pt_model] policy_head.sometimes_legal: dtype={buf.dtype} shape={buf.shape} "
+          f"sometimes-legal={n} never-legal={buf.numel()-n}"
+          + ("  OK" if n == 1858 else f"  WARN expected 1858 got {n}"))
+
+
 def _companion_pt(ts_path: str) -> str:
     """Return the state_dict companion path for a .ts file."""
     return ts_path[:-3] + ".pt"
@@ -25,14 +37,22 @@ def _companion_pt(ts_path: str) -> str:
 
 def load_pt_model(path):
     """Returns (model, arch_or_None).
-    .ts path: loads TorchScript for inference.
-              For training, loads companion .pt state_dict instead.
+    .ts path: loads ScriptModule directly (no architecture dependency).
+              arch read from companion .pt metadata if present.
     .pt path: loads state_dict checkpoint and rebuilds from VARIANTS.
     """
     if path.endswith(".ts"):
         pt_path = _companion_pt(path)
         if os.path.exists(pt_path):
-            return load_pt_model(pt_path)
+            meta = torch.load(pt_path, map_location="cpu")
+            if isinstance(meta, dict) and "model" in meta:
+                from chessbot.model import PT_BUILDERS, VARIANTS
+                arch = meta.get("arch", _FALLBACK_ARCH)
+                model = PT_BUILDERS[arch](VARIANTS[arch])
+                model.load_state_dict(meta["model"], strict=False)
+                log_policy_mask_status(model)
+                return model, arch
+        # fallback: ScriptModule (inference only, no backprop)
         return torch.jit.load(path, map_location="cpu"), None
     from chessbot.model import PT_BUILDERS, VARIANTS
     obj = torch.load(path, map_location="cpu")
@@ -42,7 +62,8 @@ def load_pt_model(path):
             return state_dict, _FALLBACK_ARCH
         arch = obj.get("arch", _FALLBACK_ARCH)
         model = PT_BUILDERS[arch](VARIANTS[arch])
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
+        log_policy_mask_status(model)
         return model, arch
     if isinstance(obj, torch.nn.Module):
         return obj, _FALLBACK_ARCH
@@ -57,10 +78,13 @@ def save_pt_model(model, path, arch=None, opt=None):
     if path.endswith(".ts"):
         trace_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(trace_device).eval()
-        dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
-        with torch.no_grad():
-            traced = torch.jit.trace(model, dummy)
-        torch.jit.save(traced, path)
+        if isinstance(model, torch.jit.ScriptModule):
+            torch.jit.save(model, path)
+        else:
+            dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
+            with torch.no_grad():
+                traced = torch.jit.trace(model, dummy)
+            torch.jit.save(traced, path)
         print(f"[pytorch] TorchScript saved -> {path}")
         pt_path = _companion_pt(path)
         payload = {"model": model.state_dict(), "arch": arch}
@@ -75,7 +99,7 @@ def save_pt_model(model, path, arch=None, opt=None):
 
 
 
-RETRAIN_CLIP_NORM = 1.0
+RETRAIN_CLIP_NORM = 20.0
 
 
 def pt_opt_state_path(model_path: str, run_dir: str) -> str:
@@ -154,7 +178,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     lr = cfg.learning_rate
     opt = torch.optim.Adam(
         model.parameters(), lr=lr,
-        betas=(0.9, cfg.adam_beta2), weight_decay=1e-4,
+        betas=(0.9, cfg.adam_beta2),
+        weight_decay=1e-6,
     )
     opt_state_path = pt_opt_state_path(model_path, cfg.run_dir)
     if os.path.exists(opt_state_path):

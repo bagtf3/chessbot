@@ -187,6 +187,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
         opt.load_state_dict(state)
         for pg in opt.param_groups:
             pg['lr'] = lr
+            pg['betas'] = (0.9, cfg.adam_beta2)
+            pg['weight_decay'] = 1e-6
         for param_state in opt.state.values():
             for k, v in param_state.items():
                 if isinstance(v, torch.Tensor):
@@ -198,7 +200,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     epoch_losses     = []
     epoch_grad_stats = []
     t0 = time.time()
-    for ep_idx in range(2):
+    for ep_idx in range(1):
         idx          = torch.randperm(n, device=device)
         total        = value_total = policy_total = 0.0
         steps        = 0

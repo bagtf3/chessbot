@@ -38,24 +38,14 @@ SEQ_LEN       = 64
 
 # --- param grouping ---
 
-LN_PAT = re.compile(
-    r"\.(ln\d?)\.(weight|bias)$"
-    r"|\.(val_mix_ln|lnm|lnp)\.(weight|bias)$"
-    r"|\.(val_mix_ln|lnm|lnp)\.[wb]$"
-    r"|\.([wb])$"
-    r"\.(from_ln\d?|to_ln\d?)\.(weight|bias)$"
-    r"\.(promo_mln|promo_ln)\.[wb]$"
-    r"|(value_head\.ln)\.(weight|bias)$"
-)
-
-
 def is_ln(name):
     if name.endswith(".w") or name.endswith(".b"):
         return True
-    if re.search(r"\.(ln1|ln2|val_mix_ln|lnm|lnp|from_ln1|from_ln2|to_ln1|to_ln2"
+    if re.search(r"\.(ln1|ln2|val_mix_ln|lnm|lnp"
+                 r"|from_ln\d*|to_ln\d*"
                  r"|promo_mln|promo_ln)\.(weight|bias)$", name):
         return True
-    if re.search(r"value_head\.ln\.(weight|bias)$", name):
+    if re.search(r"(policy_head|value_head)\.ln\.(weight|bias)$", name):
         return True
     return False
 
@@ -66,13 +56,24 @@ def param_group(name, skip_ln=True):
         return None
     if name in ("emb.weight", "pos.weight"):
         return "embed"
+    m = re.match(r"pre\.(\d+)\.(c1|c2)", name)
+    if m:
+        return f"pre{int(m.group(1)):02d}_conv"
+    m = re.match(r"blocks\.(\d+)\.(attn|ff1|ff2)", name)
+    if m:
+        blk = int(m.group(1))
+        kind = m.group(2)
+        return f"tx{blk:02d}_attn" if kind == "attn" else f"tx{blk:02d}_ff"
+    # legacy txs.* naming (older archs)
     m = re.match(r"txs\.(\d+)\.(attn|ff1|ff2)", name)
     if m:
         blk = int(m.group(1))
         kind = m.group(2)
         return f"tx{blk:02d}_attn" if kind == "attn" else f"tx{blk:02d}_ff"
+    if name.startswith("mix."):
+        return "mix"
     if name.startswith("val_mix."):
-        return "head_mix"
+        return "mix"
     if name.startswith("policy_head."):
         return "head_policy"
     if name.startswith("value_head."):
@@ -81,10 +82,14 @@ def param_group(name, skip_ln=True):
 
 
 def depth_key(g):
+    m = re.match(r"pre(\d+)_conv", g)
+    if m:
+        return (int(m.group(1)), 0)
     m = re.match(r"tx(\d+)_(attn|ff)", g)
     if m:
-        return (int(m.group(1)), 0 if m.group(2) == "attn" else 1)
-    order = {"embed": (-1, 0), "head_mix": (99, 0),
+        blk = int(m.group(1))
+        return (20 + blk, 0 if m.group(2) == "attn" else 1)
+    order = {"embed": (-1, 0), "mix": (90, 0),
              "head_policy": (99, 1), "head_value": (99, 2), "other": (99, 9)}
     return order.get(g, (50, g))
 

@@ -271,7 +271,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
 
     t0 = time.time()
     history = model.fit(
-        {"enc_in": X}, Y, epochs=2, batch_size=args.batch_size,
+        {"enc_in": X}, Y, epochs=1, batch_size=args.batch_size,
         verbose=0, sample_weight=s_wts, shuffle=True
     )
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)

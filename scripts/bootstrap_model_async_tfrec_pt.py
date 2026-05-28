@@ -33,17 +33,14 @@ import scipy.special
 from chessbot.pretrain import (
     EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_MAX_EPOCH,
-    POLICY_LW, VALUE_LW, LR_WARMUP_EPOCHS,
+    POLICY_LW, VALUE_LW,
     lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
     save_plot,
 )
-from chessbot.model import (
-    VOCAB_SIZE, SEQ_LEN,
-    VARIANTS,
-    PT_BUILDERS,
-)
+
+from chessbot.model import VARIANTS, PT_BUILDERS
 
 PT_BATCH_SIZE      = 512
 PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
@@ -53,7 +50,6 @@ EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
 DEFAULT_MODEL     = "16m-transformer"
 DEFAULT_RUN_TAG   = "val_test_multi"
-
 
 
 # ---------------------------------------------------------------------------

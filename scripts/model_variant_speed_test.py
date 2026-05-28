@@ -86,6 +86,7 @@ from chessbot.model import (
     build_tf_transformer_branched,
     build_pt_transformer_16m,
     build_pt_conformer_interweaved,
+    build_pt_precond_conformer,
 )
 
 N_WARMUP    = 50
@@ -165,7 +166,7 @@ def random_tokens(batch_size):
 
 def describe_variant(name, cfg):
     C = cfg.get("conv_filters", cfg.get("d_embed", 256))
-    print(f"\n  {'─'*60}")
+    print(f"\n  {'-'*60}")
     print(f"  Variant      : {name}")
     if cfg.get("pure_conv"):
         print(f"  Architecture : pure conv ResNet — no global context")
@@ -178,6 +179,11 @@ def describe_variant(name, cfg):
         print("  Architecture : interweaved conformer — per-block MHA + ConvRes")
         print(f"  blocks       : {cfg['conv_blocks']} × [MHA(heads={cfg['num_heads']})"
             f" + Conv({C},3) + Conv({C},3)]")
+    elif cfg.get("precond_conformer"):
+        CF = cfg["conv_filters"]
+        print(f"  Architecture : precond conformer (PT only)")
+        print(f"  pre_blocks   : {cfg['pre_blocks']} x Conv({CF},3x3) -> cat pos({CF}) -> {CF*2}d")
+        print(f"  mha_blocks   : {cfg['mha_blocks']} x [prenorm-MHA(heads={cfg['num_heads']}) -> FF({CF*2}->{CF*2}->{CF*2})]")
     elif cfg.get("transformer"):
         print(f"  Architecture : pure transformer")
         print(f"  layers       : {cfg['transformer_layers']}  heads: {cfg['num_heads']}  ff_dim: {cfg['ff_dim']}")
@@ -194,7 +200,7 @@ def describe_variant(name, cfg):
         print(f"  ctx encoder  : {cfg['mha_layers']} × bare-MHA(heads={cfg['mha_heads']}, d={C})")
         print(f"  conv blocks  : {cfg['conv_blocks']} × [ConvResBlock + sigmoid(x)·ctx_proj(g)]")
     print(f"  value head   : attention pooling -> Dense(256) -> Dense(128) -> WDL [3] (raw logits)")
-    print(f"  {'─'*60}")
+    print(f"  {'-'*60}")
 
 
 def make_cache_key(name, cfg):
@@ -206,6 +212,8 @@ def make_cache_key(name, cfg):
     if cfg.get("gated_ctx"):     return f"gated-ctx-cb{cfg['conv_blocks']}"
     if cfg.get("conformer_interweaved"):
         return f"conformer-interweaved-cb{cfg['conv_blocks']}-nh{cfg['num_heads']}"
+    if cfg.get("precond_conformer"):
+        return f"precond-conformer-pb{cfg['pre_blocks']}-mb{cfg['mha_blocks']}"
     return name.replace(" ", "-")
 
 
@@ -1001,7 +1009,8 @@ def main():
                 eager = make_pt_eager_infer(name, cfg, device)
                 res["PT eager"] = speed_test(f"{name}  PT eager [fp16]", eager, bs)
 
-                if save and ("transformer" in name or "conformer-interweaved" in name):
+                if save and ("transformer" in name or "conformer-interweaved" in name
+                            or "precond-conformer" in name):
                     pt_model = PT_BUILDERS[name](cfg).half().to(device)
                     pt_path  = os.path.join(args.model_dir, f"{name}_pt_model.pt")
                     torch.save({"model": pt_model.state_dict()}, pt_path)
@@ -1096,13 +1105,14 @@ def main():
             ordered_backends.append("ORT TRT")
 
         DISPLAY_NAMES = {
-            "16m-pure-conv":             "16m-pure-conv",
-            "16m-conformer":             "16m-conformer",
-            "16m-conformer-interweaved": "16m-conf-intwv",
-            "16m-film":                  "16m-film",
-            "16m-concat-fusion":         "16m-concat-fus",
-            "16m-gated-ctx":             "16m-gated-ctx",
-            "16m-transformer":           "16m-transformer",
+            "16m-pure-conv":              "16m-pure-conv",
+            "16m-conformer":              "16m-conformer",
+            "16m-conformer-interweaved":  "16m-conf-intwv",
+            "16m-film":                   "16m-film",
+            "16m-concat-fusion":          "16m-concat-fus",
+            "16m-gated-ctx":              "16m-gated-ctx",
+            "16m-transformer":            "16m-transformer",
+            "13m-precond-conformer":       "13m-precond-conf",
         }
 
         cw      = 12

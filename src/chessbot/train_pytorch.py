@@ -15,7 +15,7 @@ def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
     raise RuntimeError("PyTorch sees no CUDA GPU. Refusing to run on CPU.")
 
 
-_FALLBACK_ARCH = "16m-conformer-interweaved"
+FALLBACK_ARCH = "13m-precond-conformer"
 
 
 def log_policy_mask_status(model):
@@ -30,7 +30,7 @@ def log_policy_mask_status(model):
           + ("  OK" if n == 1858 else f"  WARN expected 1858 got {n}"))
 
 
-def _companion_pt(ts_path: str) -> str:
+def companion_pt(ts_path: str) -> str:
     """Return the state_dict companion path for a .ts file."""
     return ts_path[:-3] + ".pt"
 
@@ -42,12 +42,12 @@ def load_pt_model(path):
     .pt path: loads state_dict checkpoint and rebuilds from VARIANTS.
     """
     if path.endswith(".ts"):
-        pt_path = _companion_pt(path)
+        pt_path = companion_pt(path)
         if os.path.exists(pt_path):
             meta = torch.load(pt_path, map_location="cpu")
             if isinstance(meta, dict) and "model" in meta:
                 from chessbot.model import PT_BUILDERS, VARIANTS
-                arch = meta.get("arch", _FALLBACK_ARCH)
+                arch = meta.get("arch", FALLBACK_ARCH)
                 model = PT_BUILDERS[arch](VARIANTS[arch])
                 model.load_state_dict(meta["model"], strict=False)
                 log_policy_mask_status(model)
@@ -59,14 +59,14 @@ def load_pt_model(path):
     if isinstance(obj, dict) and "model" in obj:
         state_dict = obj["model"]
         if isinstance(state_dict, torch.nn.Module):
-            return state_dict, _FALLBACK_ARCH
-        arch = obj.get("arch", _FALLBACK_ARCH)
+            return state_dict, FALLBACK_ARCH
+        arch = obj.get("arch", FALLBACK_ARCH)
         model = PT_BUILDERS[arch](VARIANTS[arch])
         model.load_state_dict(state_dict, strict=False)
         log_policy_mask_status(model)
         return model, arch
     if isinstance(obj, torch.nn.Module):
-        return obj, _FALLBACK_ARCH
+        return obj, FALLBACK_ARCH
     raise ValueError(f"[pytorch] unrecognized checkpoint format in {path}")
 
 
@@ -86,7 +86,7 @@ def save_pt_model(model, path, arch=None, opt=None):
                 traced = torch.jit.trace(model, dummy)
             torch.jit.save(traced, path)
         print(f"[pytorch] TorchScript saved -> {path}")
-        pt_path = _companion_pt(path)
+        pt_path = companion_pt(path)
         payload = {"model": model.state_dict(), "arch": arch}
         torch.save(payload, pt_path)
         print(f"[pytorch] companion weights saved -> {pt_path}")
@@ -183,17 +183,20 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     )
     opt_state_path = pt_opt_state_path(model_path, cfg.run_dir)
     if os.path.exists(opt_state_path):
-        state = torch.load(opt_state_path, map_location="cpu")
-        opt.load_state_dict(state)
-        for pg in opt.param_groups:
-            pg['lr'] = lr
-            pg['betas'] = (0.9, cfg.adam_beta2)
-            pg['weight_decay'] = 1e-6
-        for param_state in opt.state.values():
-            for k, v in param_state.items():
-                if isinstance(v, torch.Tensor):
-                    param_state[k] = v.to(device)
-        print(f"{tag} restored Adam state")
+        try:
+            state = torch.load(opt_state_path, map_location="cpu")
+            opt.load_state_dict(state)
+            for pg in opt.param_groups:
+                pg['lr'] = lr
+                pg['betas'] = (0.9, cfg.adam_beta2)
+                pg['weight_decay'] = 1e-6
+            for param_state in opt.state.values():
+                for k, v in param_state.items():
+                    if isinstance(v, torch.Tensor):
+                        param_state[k] = v.to(device)
+            print(f"{tag} restored Adam state")
+        except Exception as e:
+            print(f"{tag} failed to load Adam state ({e}) - starting fresh")
     else:
         print(f"{tag} no prior Adam state - starting fresh")
 
@@ -323,14 +326,14 @@ def export_pt_to_onnx(model, onnx_path):
     device = next(model.parameters()).device
     model.eval()
 
-    class _Int32Wrapper(torch.nn.Module):
+    class Int32Wrapper(torch.nn.Module):
         def __init__(self, m):
             super().__init__()
             self.m = m
         def forward(self, t):
             return self.m(t.long())
 
-    export_model = _Int32Wrapper(model)
+    export_model = Int32Wrapper(model)
     dummy = torch.zeros(1, 64, dtype=torch.int32, device=device)
 
     for opset in (14, 16):

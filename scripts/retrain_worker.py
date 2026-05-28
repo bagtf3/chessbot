@@ -63,7 +63,7 @@ def load_shards_pkl(paths):
         try:
             with open(path, "rb") as f:
                 chunk = pickle.load(f)
-            for x, _mask, policy, Y, vwht, pwht in chunk:
+            for x, mask, policy, Y, vwht, pwht in chunk:
                 X_list.append(x)
                 P_list.append(policy)
                 Y_list.append(Y)

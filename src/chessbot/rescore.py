@@ -1390,7 +1390,7 @@ class Rescorer(object):
                 if self.sf_compute_count else 0.0
             )
             sz = cache_stats['size']
-            pend = len(self.pending)
+            backlog = self.game_q.qsize() + len(self.pending)
             compute_str = f"{avg_compute_ms:.0f}ms"
             W = 10
 
@@ -1402,7 +1402,7 @@ class Rescorer(object):
                 ("hits",      str(self.n_cache_hits)),
                 ("cache sz",  str(sz)),
                 ("compute",   compute_str),
-                ("pending",   str(pend)),
+                ("backlog",   str(backlog)),
             ]
             sf_hdr = (f"{RS}  {'SF':<12} |"
                       + "".join(col(h) for h, _ in sf_cols))

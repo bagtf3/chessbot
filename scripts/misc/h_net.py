@@ -24,6 +24,7 @@ HE = "he_normal"
 from chessbot.utils import format_time
 from chessbot.encoding import compute_move_priors
 import chessbot.utils as cbu
+from chessbot.plot_utils import plot_training_progress
 from chessbot.game_utils import get_pre_opened_game
 
 from chessbot import SF_LOC, ENDGAME_LOC
@@ -919,7 +920,7 @@ while ol <= 1500:
         all_evals = pd.concat([all_evals, eval_df])
     
         if len(all_evals) > 2:
-            cbu.plot_training_progress(all_evals.iloc[1:, :])
+            plot_training_progress(all_evals.iloc[1:, :])
     
     # train (no val)
     model.fit(

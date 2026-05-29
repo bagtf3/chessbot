@@ -444,6 +444,7 @@ def main(run_tag):
 
             procs = check_and_reap_procs(procs)
             needed_to_retrain = working_cfg.training_queue_buffer
+            sf_throttled = False
             while len(procs) or (recorder.training_queue < needed_to_retrain):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
@@ -493,6 +494,18 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
+                sf_backlog = len(rescorer.intake) + len(rescorer.pending)
+                if sf_backlog > 100 and not sf_throttled:
+                    for t in sf_rescore_threads:
+                        t.depth = max(1, t.base_depth - 1)
+                    sf_throttled = True
+                    print(f"[SF] backlog {sf_backlog}, depth -> {sf_rescore_threads[0].depth}")
+                elif sf_backlog == 0 and sf_throttled:
+                    for t in sf_rescore_threads:
+                        t.depth = t.base_depth
+                    sf_throttled = False
+                    print(f"[SF] backlog cleared, depth -> {sf_rescore_threads[0].depth}")
+
                 recorder.training_queue = rescorer.training_data_size
 
                 # check for a retrain
@@ -520,6 +533,9 @@ def main(run_tag):
                             if is_validation:
                                 working_cfg = create_validation_config(working_cfg, val_yaml_path)
                             rescorer.config = working_cfg
+                            for t in sf_rescore_threads:
+                                t.update_config(working_cfg)
+                            sf_throttled = False
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
                                 working_cfg.progress_csv_path)

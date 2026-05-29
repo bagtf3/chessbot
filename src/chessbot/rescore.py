@@ -115,11 +115,17 @@ class SFRescoreThread:
     def __init__(self, req_q, res_q, cfg):
         self.req_q = req_q
         self.res_q = res_q
-        self.depth = cfg.rescore_depth
+        self.base_depth = cfg.rescore_depth
+        self.depth = self.base_depth
         self.sf_config = {'Hash': 256, 'UCI_ShowWDL': True}
         self.stop_ev = threading.Event()
         self.t = None
         self.eng = None
+
+    def update_config(self, cfg):
+        self.base_depth = cfg.rescore_depth
+        if self.depth > self.base_depth:
+            self.depth = self.base_depth
 
     def start(self):
         self.t = threading.Thread(target=self.run, daemon=True)
@@ -137,7 +143,6 @@ class SFRescoreThread:
     def run(self):
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC)
         self.eng.configure(self.sf_config)
-        limit = chess.engine.Limit(depth=self.depth)
 
         while not self.stop_ev.is_set():
             try:
@@ -147,6 +152,7 @@ class SFRescoreThread:
             if item is None:
                 break
             req_id, board, move = item
+            limit = chess.engine.Limit(depth=self.depth)
             try:
                 t0 = time.time()
                 if move is None:

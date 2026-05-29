@@ -664,23 +664,24 @@ def build_pt_precond_conformer(cfg: dict):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb          = nn.Embedding(VOCAB_SIZE, CF)
-            self.pre          = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
-            self.pos          = nn.Embedding(SEQ_LEN, CF)
+            self.emb           = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre           = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+            self.pos           = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln       = nn.LayerNorm(CF)
             self.global_tokens = nn.Parameter(torch.randn(1, 4, D))
-            self.blocks       = nn.ModuleList(
-                [TxBlock()] + [TxBlock(ff_dim=768) for _ in range(2)] + [TxBlock()]
-            )
-            self.policy_head  = make_pt_mha_policy_head(D, n_heads=8)
-            self.value_head   = make_pt_attn_pool_value_head(D, n_heads=8)
+
+            ff_dims = [512, 768, 768, 512]
+            self.blocks        = nn.ModuleList([TxBlock(ff_dim=ffd) for ffd in ff_dims])
+            self.policy_head   = make_pt_mha_policy_head(D, n_heads=8)
+            self.value_head    = make_pt_attn_pool_value_head(D, n_heads=8)
 
         def forward(self, t):
             B = t.shape[0]
             x = self.emb(t).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
             for blk in self.pre:
                 x = blk(x)
-            
-            conv_seq = x.permute(0, 2, 3, 1).reshape(B, 64, CF)
+
+            conv_seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, 64, CF))
             pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0).expand(B, -1, -1)
             x = torch.cat([conv_seq, pos], dim=-1)
 

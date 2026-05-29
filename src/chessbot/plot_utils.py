@@ -1,4 +1,180 @@
 import numpy as np
+import pandas as pd
+
+
+def moving_average_pd(arr, window=15):
+    s = pd.Series(arr)
+    return s.rolling(window, center=True, min_periods=1).mean().values
+
+
+def plot_training_progress(metrics_history, epoch=None, ma_max=50):
+    """
+    metrics_history: pd.DataFrame or dict-like with columns used below.
+    Each panel shows raw data as a pale line and MA as a bold line.
+    """
+    import matplotlib.pyplot as plt
+
+    df = metrics_history.copy()
+
+    def col_vals(name):
+        if name in df.columns:
+            return df[name].tolist()
+        return []
+
+    if epoch is None:
+        if "model_epoch" in df.columns and len(df):
+            epoch = int(max(df["model_epoch"]))
+        else:
+            epoch = len(df)
+
+    hide_first = 10
+    if epoch < 12:
+        return
+
+    ma_window = min(ma_max, max(3, int(epoch * 0.2)))
+    if ma_window % 2 == 0:
+        ma_window += 1
+
+    N = len(df)
+    x_full = np.arange(N)
+    start = hide_first
+    xs = x_full[start:]
+
+    def plot_panel(ax, raw, label, color=None, title=None):
+        """Scatter raw points + MA line. raw is a full-length np array."""
+        ma = moving_average_pd(raw, window=ma_window)[start:]
+        raw_seg = raw[start:]
+        kw = dict(color=color) if color else {}
+        if raw_seg.size:
+            ax.plot(xs, raw_seg, alpha=0.25, lw=0.8, label=label, **kw)
+        if ma.size:
+            ax.plot(xs, ma, lw=2, label=f"MA{ma_window}", **kw)
+        if title:
+            ax.set_title(title)
+        ax.legend(fontsize=8)
+        return ma
+
+    # ---- figure 1: 2x2 ----
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # policy CE
+    raw = np.array(col_vals("policy_ce") or [])
+    if raw.size:
+        plot_panel(axes[0, 0], raw, "policy_ce", title="policy CE (nats)")
+
+    # CE gain vs uniform
+    raw = np.array(col_vals("ce_gain") or [])
+    if raw.size:
+        plot_panel(axes[0, 1], raw, "ce_gain", title="CE gain vs uniform")
+
+    # value MSE (+optional value CE on twin axis)
+    ax = axes[1, 0]
+    raw_mse = np.array(col_vals("value_mse") or [])
+    raw_ce  = np.array(col_vals("value_ce")  or [])
+    have_ce = raw_ce.size > 0 and not np.all(np.isnan(raw_ce))
+
+    if have_ce:
+        ma_mse = moving_average_pd(raw_mse, window=ma_window)[start:] if raw_mse.size else np.array([])
+        raw_mse_seg = raw_mse[start:] if raw_mse.size else np.array([])
+        l_handles = []
+        if raw_mse_seg.size:
+            ax.plot(xs, raw_mse_seg, alpha=0.25, lw=0.8, color="tab:blue")
+        if ma_mse.size:
+            l1, = ax.plot(xs, ma_mse, color="tab:blue", lw=2, label=f"MSE MA{ma_window}")
+            l_handles.append(l1)
+        ax.set_ylabel("value MSE", color="tab:blue")
+        ax.tick_params(axis="y", labelcolor="tab:blue")
+
+        ax_ce = ax.twinx()
+        ma_ce = moving_average_pd(raw_ce, window=ma_window)[start:]
+        raw_ce_seg = raw_ce[start:]
+        if raw_ce_seg.size:
+            ax_ce.plot(xs, raw_ce_seg, alpha=0.25, lw=0.8, color="tab:orange")
+        if ma_ce.size:
+            l2, = ax_ce.plot(xs, ma_ce, color="tab:orange", lw=2, label=f"CE MA{ma_window}")
+            l_handles.append(l2)
+        ax_ce.set_ylabel("value CE", color="tab:orange")
+        ax_ce.tick_params(axis="y", labelcolor="tab:orange")
+        ax.set_title("value MSE / CE")
+        if l_handles:
+            ax.legend(handles=l_handles, fontsize=8)
+    else:
+        if raw_mse.size:
+            plot_panel(ax, raw_mse, "mse", title="value MSE")
+
+    # value corr
+    raw = np.array(col_vals("value_corr") or [])
+    if raw.size:
+        plot_panel(axes[1, 1], raw, "corr", title="value corr")
+
+    plt.tight_layout()
+
+    # ---- figure 2: 1x3 ----
+    fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
+
+    # top1 / top3 / top5
+    ax = axs[0]
+    t1 = np.array(col_vals("top1_mass"))
+    t3 = np.array(col_vals("top3_mass"))
+    t5 = np.array(col_vals("top5_mass"))
+    any_top = any(a.size for a in (t1, t3, t5))
+    if not any_top:
+        ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        colors = ["tab:blue", "tab:orange", "tab:green"]
+        for arr, label, c in zip((t1, t3, t5), ("top1", "top3", "top5"), colors):
+            if arr.size:
+                x = np.arange(len(arr))
+                ax.plot(x, arr, alpha=0.25, lw=0.8, color=c)
+                ma = moving_average_pd(arr, window=ma_window)
+                ax.plot(np.arange(len(ma)), ma, lw=2, color=c, label=f"{label} MA{ma_window}")
+        ax.set_title("mean top-k mass")
+        ax.legend(fontsize=8)
+
+    # mass_on_legal
+    ax = axs[1]
+    mol = np.array(col_vals("mass_on_legal"))
+    if not mol.size:
+        ax.text(0.5, 0.5, "missing: mass_on_legal", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        x = np.arange(len(mol))
+        ax.plot(x, mol, alpha=0.25, lw=0.8, label="mass_on_legal")
+        ma_mol = moving_average_pd(mol, window=ma_window)
+        ax.plot(x, ma_mol, lw=2, label=f"MA{ma_window}")
+        ax.set_title("mass_on_legal")
+        ax.legend(fontsize=8)
+
+    # avg_top_prob & top1_exact
+    ax = axs[2]
+    avg_tp  = np.array(col_vals("avg_top_prob"))
+    t1_exact = np.array(col_vals("top1_exact"))
+    if not avg_tp.size and not t1_exact.size:
+        ax.text(0.5, 0.5, "missing: avg_top_prob / top1_exact", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        plotted = False
+        for arr, label, c in (
+            (avg_tp,   "avg_max_prob", "tab:blue"),
+            (t1_exact, "top1_exact",   "tab:orange"),
+        ):
+            if arr.size:
+                x = np.arange(len(arr))
+                ax.plot(x, arr, alpha=0.25, lw=0.8, color=c)
+                ma = moving_average_pd(arr, window=ma_window)
+                ax.plot(np.arange(len(ma)), ma, lw=2, color=c, label=f"{label} MA{ma_window}")
+                plotted = True
+        if plotted:
+            ax.set_title("avg_max_prob & top1_exact")
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center")
+            ax.set_axis_off()
+
+    plt.tight_layout()
+
+    plt.show()
 
 
 def plot_validation(

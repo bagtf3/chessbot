@@ -1390,7 +1390,7 @@ class Rescorer(object):
                 if self.sf_compute_count else 0.0
             )
             sz = cache_stats['size']
-            backlog = self.game_q.qsize() + len(self.pending)
+            backlog = len(self.intake) + len(self.pending)
             compute_str = f"{avg_compute_ms:.0f}ms"
             W = 10
 

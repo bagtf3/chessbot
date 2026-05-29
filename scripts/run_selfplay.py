@@ -494,19 +494,19 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
-                sf_backlog = sf_game_q.qsize() + len(rescorer.pending)
+                sf_backlog = len(rescorer.intake) + len(rescorer.pending)
                 if sf_backlog > 100 and not sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = max(1, t.base_depth - 1)
                     rescorer.current_depth = sf_rescore_threads[0].depth
                     sf_throttled = True
-                    print(f"[SF] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
+                    print(f"[rescore] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
                 elif sf_backlog == 0 and sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = t.base_depth
                     rescorer.current_depth = sf_rescore_threads[0].depth
                     sf_throttled = False
-                    print(f"[SF] backlog cleared, depth -> {rescorer.current_depth}")
+                    print(f"[rescore] backlog cleared, depth -> {rescorer.current_depth}")
 
                 recorder.training_queue = rescorer.training_data_size
 

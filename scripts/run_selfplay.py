@@ -327,10 +327,10 @@ def main(run_tag):
 
 
     # init the async SF worker(s) and rescorer
-    req_q = queue.Queue()
-    res_q = queue.Queue()
+    sf_game_q = queue.Queue()
+    sf_res_q  = queue.Queue()
     sf_rescore_threads = [
-        SFRescoreThread(req_q, res_q, base_cfg)
+        SFRescoreThread(sf_game_q, sf_res_q, base_cfg)
         for _ in range(max(1, base_cfg.rescore_n_sf_threads))
     ]
 
@@ -344,7 +344,7 @@ def main(run_tag):
 
     if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
         cache.load_seed(SF_SEED_CACHE)
-    rescorer = Rescorer(base_cfg, req_q, res_q, cache)
+    rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
@@ -494,7 +494,7 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
-                sf_backlog = len(rescorer.intake) + len(rescorer.pending)
+                sf_backlog = sf_game_q.qsize() + len(rescorer.pending)
                 if sf_backlog > 100 and not sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = max(1, t.base_depth - 1)

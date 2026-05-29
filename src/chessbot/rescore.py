@@ -236,7 +236,7 @@ class Rescorer(object):
         self.pending_metrics = []
 
 
-        self.start_time = time.time()
+        self.start_time = None  # set on first finalized game to exclude idle startup time
         self.games_seen = set()
         self.games_processed = 0
         self.written_total = 0
@@ -250,6 +250,8 @@ class Rescorer(object):
         self.n_cache_hits = 0
         self.sf_compute_time = 0.0
         self.sf_compute_count = 0
+        self.n_sf_threads = cfg.rescore_n_sf_threads
+        self.current_depth = cfg.rescore_depth
         self.last_10_cpls = []
         self.last_10_bmrs = []
         self.last_10_plies = []
@@ -762,6 +764,8 @@ class Rescorer(object):
         self.finalize_game(self.pending.pop(gid))
 
     def finalize_game(self, game_state):
+        if self.start_time is None:
+            self.start_time = time.time()
         cfg = game_state['cfg']
         game_data = game_state['game_data']
         gid = game_state['gid']
@@ -1372,9 +1376,13 @@ class Rescorer(object):
                 )
 
             n_tot = self.games_processed
-            if n_tot > self.config.rescore_analyze_batch:
-                rate = n_tot / (time.time() - self.start_time)
-                print(f"{RS} Total Games: {n_tot} ({rate:.3f} games/sec)")
+            if n_tot > self.config.rescore_analyze_batch and self.start_time is not None:
+                elapsed = time.time() - self.start_time
+                games_hr = n_tot / elapsed * 3600
+                moves_sec = self.total_plies / elapsed
+                print(f"{RS} Total Games: {n_tot}"
+                      f" ({games_hr:.1f} games/hr, {moves_sec:.2f} moves/sec)"
+                      f" ({self.n_sf_threads} workers, depth={self.current_depth})")
             
             cache_stats = self.cache.stats()
             avg_compute_ms = (

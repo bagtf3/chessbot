@@ -498,13 +498,15 @@ def main(run_tag):
                 if sf_backlog > 100 and not sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = max(1, t.base_depth - 1)
+                    rescorer.current_depth = sf_rescore_threads[0].depth
                     sf_throttled = True
-                    print(f"[SF] backlog {sf_backlog}, depth -> {sf_rescore_threads[0].depth}")
+                    print(f"[SF] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
                 elif sf_backlog == 0 and sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = t.base_depth
+                    rescorer.current_depth = sf_rescore_threads[0].depth
                     sf_throttled = False
-                    print(f"[SF] backlog cleared, depth -> {sf_rescore_threads[0].depth}")
+                    print(f"[SF] backlog cleared, depth -> {rescorer.current_depth}")
 
                 recorder.training_queue = rescorer.training_data_size
 

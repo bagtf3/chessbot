@@ -501,7 +501,7 @@ def main(run_tag):
                     rescorer.current_depth = sf_rescore_threads[0].depth
                     sf_throttled = True
                     print(f"[rescore] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
-                elif sf_backlog == 0 and sf_throttled:
+                elif sf_backlog < 10 and sf_throttled:
                     for t in sf_rescore_threads:
                         t.depth = t.base_depth
                     rescorer.current_depth = sf_rescore_threads[0].depth

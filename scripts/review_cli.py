@@ -958,6 +958,12 @@ class ReviewCLI:
     def _start_server(self, port):
         handler = make_handler(self.state, self)
         server  = HTTPServer(("localhost", port), handler)
+        def _handle_error(req, addr):
+            exc = sys.exc_info()[1]
+            if not isinstance(exc, (ConnectionAbortedError, BrokenPipeError,
+                                    ConnectionResetError)):
+                import traceback; traceback.print_exc()
+        server.handle_error = _handle_error
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
     def run(self):

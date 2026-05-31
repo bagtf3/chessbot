@@ -91,6 +91,42 @@ class SFCache:
         print(f"[SFCache] loaded seed: {added:,} entries (depth={depth}) from {path}")
         return added
 
+    def save(self, path):
+        """Save cache to disk as gzipped pickle, atomically."""
+        tmp = str(path) + ".tmp"
+        with gzip.open(tmp, "wb") as f:
+            pickle.dump({"data": self.data}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, str(path))
+
+    def roll_merge(self, path):
+        """Load a previously saved cache and merge into current.
+        For each key: higher-depth best wins; others dicts are unioned."""
+        with gzip.open(path, "rb") as f:
+            saved = pickle.load(f)
+        saved_data = saved.get("data", {})
+        added = updated = others_added = 0
+        for key, se in saved_data.items():
+            if key not in self.data:
+                se["last_seen"] = 0
+                self.data[key] = se
+                added += 1
+            else:
+                cur = self.data[key]
+                if (se.get("depth", 0) > cur.get("depth", 0)
+                        and se.get("best") is not None):
+                    cur["best"] = se["best"]
+                    cur["depth"] = se["depth"]
+                    updated += 1
+                for uci, val in se.get("others", {}).items():
+                    if uci not in cur["others"]:
+                        cur["others"][uci] = val
+                        others_added += 1
+        print(
+            f"[SFCache] roll_merge: {added:,} added, {updated:,} best upgraded,"
+            f" {others_added:,} other moves merged from {path}"
+        )
+        return added, updated
+
     def maybe_evict(self, game_num):
         if len(self.data) < self.max_size:
             return 0

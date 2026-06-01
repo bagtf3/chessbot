@@ -97,7 +97,7 @@ class MCTSTree(fasttree):
             sample = False
 
         # at/after the convergence ply, just use C++/base behavior
-        elif (self.n_plies >= 30) or (self.board.piece_count() <= 20):
+        elif (self.n_plies >= 20) or (self.board.piece_count() <= 20):
             sample = False
 
         else:

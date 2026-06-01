@@ -455,7 +455,11 @@ class ChessGame(object):
         
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
-        self.tree = MCTSTree(self.board, self.config)
+        tree_cfg = self.config
+        if meta.get('scenario') == 'UHO' and not self.config.is_validation_run:
+            tree_cfg = self.config.copy()
+            tree_cfg.move_sample_temp_range = [0.2, 0.2]
+        self.tree = MCTSTree(self.board, tree_cfg)
         self.tree_data = {}
         self.moves_played = []
         self.recents = []

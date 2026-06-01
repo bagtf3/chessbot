@@ -498,7 +498,14 @@ class GameLooper(object):
 
         # add any per-game sampled param values (specific value used, not the options list)
         for param in self.config.sampleable:
-            mem_summary[param] = getattr(cfg, param)
+            val = getattr(cfg, param)
+            if param == 'move_sample_temp_range' and isinstance(val, list):
+                mem_summary['move_sample_temp_min'] = val[0]
+                mem_summary['move_sample_temp_max'] = val[1]
+            elif isinstance(val, list):
+                mem_summary[param] = ','.join(str(v) for v in val)
+            else:
+                mem_summary[param] = val
 
         # on-disk record (full)
         res = {

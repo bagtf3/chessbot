@@ -8,6 +8,9 @@ each 2-ply prefix into 4-8 ply paths using Stockfish MultiPV, with
 controlled sampling so the final distribution matches FIRST_MOVE_WEIGHTS
 and REPLY_WEIGHTS rather than descendant count.
 
+4 worker threads run in parallel, each owning one prefix at a time with
+its own SF instance and local node/child counts. No shared state.
+
 Output: pre_opened_uci_paths_quota_4to8.pkl
 """
 
@@ -16,6 +19,7 @@ import math
 import random
 import pickle
 import collections
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import chess
 import chess.engine
@@ -31,18 +35,20 @@ OUT_PATH = (
     "C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_quota_4to8.pkl"
 )
 
-TOTAL_PATHS = 300
+TOTAL_PATHS = 6000
+N_WORKERS   = 4
 
-MULTIPV   = 10
+MULTIPV   = 8
 SF_DEPTH  = 12
 MAX_CPL   = 80
 TEMP_CP   = 45
-CHILD_CAP = 0.35
-UNIF_MIX  = 0.10
-POL_EXP   = 0.75
+CHILD_CAP     = 0.35
+UNIF_MIX      = 0.10
+POL_EXP       = 0.75
+MAX_ENDING_CP = 120
 
-DEPTH_CHOICES  = [4, 5, 6, 7, 8]
-DEPTH_WEIGHTS  = [0.15, 0.20, 0.25, 0.20, 0.20]
+DEPTH_CHOICES = [4, 5, 6, 7, 8]
+DEPTH_WEIGHTS = [0.15, 0.20, 0.25, 0.20, 0.20]
 
 FIRST_MOVE_WEIGHTS = {
     "e2e4": 0.24,
@@ -147,7 +153,6 @@ def is_legal_path(path):
 
 
 def get_available_prefixes(upto2_paths):
-    """Return set of 2-ply tuples from the seed pkl."""
     prefixes = set()
     for path in upto2_paths:
         if len(path) == 2:
@@ -156,10 +161,6 @@ def get_available_prefixes(upto2_paths):
 
 
 def add_manual_legal_prefixes(prefixes):
-    """
-    Ensure every (first_move, reply) pair in REPLY_WEIGHTS exists.
-    Adds it if legal and missing.
-    """
     added = []
     for w1, replies in REPLY_WEIGHTS.items():
         for w2 in replies:
@@ -173,16 +174,6 @@ def add_manual_legal_prefixes(prefixes):
 
 
 def make_prefix_quotas(total_paths, prefixes):
-    """
-    Compute integer path quota for each 2-ply prefix.
-
-    quota(w1, w2) = total * norm(first_weight[w1]) * norm(reply_weight[w1][w2])
-
-    Only prefixes present in `prefixes` receive quota. Weights are
-    re-normalized over the available set so missing prefixes don't silently
-    eat quota.
-    """
-    # normalise first-move weights over available first moves
     avail_first = {p[0] for p in prefixes}
     fw = {k: v for k, v in FIRST_MOVE_WEIGHTS.items() if k in avail_first}
     fw = normalize_weights(fw)
@@ -195,13 +186,11 @@ def make_prefix_quotas(total_paths, prefixes):
         rw = REPLY_WEIGHTS[w1]
         if w2 not in rw:
             continue
-        # normalise reply weights over replies that are actually in our prefix set
         avail_replies = {p[1] for p in prefixes if p[0] == w1}
         rw_avail = {k: v for k, v in rw.items() if k in avail_replies}
         rw_norm = normalize_weights(rw_avail)
         raw[prefix] = fw[w1] * rw_norm[w2]
 
-    # scale to integers, preserve total
     total_raw = sum(raw.values())
     quotas = {}
     remainder = 0.0
@@ -217,7 +206,6 @@ def make_prefix_quotas(total_paths, prefixes):
             assigned += 1
             remainder -= 1.0
 
-    # assign any leftover to largest-weight prefix
     shortfall = total_paths - assigned
     if shortfall > 0:
         top = max(raw, key=raw.get)
@@ -230,22 +218,17 @@ def sample_depth():
     return random.choices(DEPTH_CHOICES, weights=DEPTH_WEIGHTS, k=1)[0]
 
 
-def stockfish_top_moves(board, engine, multipv=MULTIPV, depth=SF_DEPTH):
-    """
-    Returns list of {"move": uci_str, "cp": int} dicts.
-    cp is from side-to-move perspective (positive = good for STM).
-    Mate scores are clamped to +/-3000.
-    """
-    limit = chess.engine.Limit(depth=depth)
+def stockfish_top_moves(board, engine):
+    limit = chess.engine.Limit(depth=SF_DEPTH)
     infos = engine.analyse(
-        board, limit, multipv=multipv, info=chess.engine.INFO_ALL
+        board, limit, multipv=MULTIPV, info=chess.engine.INFO_ALL
     )
     results = []
     for info in infos:
         if "pv" not in info or not info["pv"]:
             continue
         move = info["pv"][0].uci()
-        score = info["score"].relative  # STM-pov PovScore
+        score = info["score"].relative
         cp = score.score(mate_score=3000)
         if cp is None:
             continue
@@ -254,7 +237,6 @@ def stockfish_top_moves(board, engine, multipv=MULTIPV, depth=SF_DEPTH):
 
 
 def filter_candidates(candidates):
-    """Keep only candidates within MAX_CPL of the best move."""
     if not candidates:
         return []
     best_cp = candidates[0]["cp"]
@@ -262,13 +244,6 @@ def filter_candidates(candidates):
 
 
 def make_candidate_weights(candidates, policy_priors=None):
-    """
-    Compute sampling weight for each candidate.
-
-    sf_weight = exp(-cpl / TEMP_CP)
-    if policy_priors: multiply by prior ** POL_EXP
-    blend: 0.85 * normalised + 0.15 * uniform
-    """
     best_cp = candidates[0]["cp"]
     sf_weights = []
     for c in candidates:
@@ -289,24 +264,14 @@ def make_candidate_weights(candidates, policy_priors=None):
 
 
 def apply_child_cap(weights, candidates, parent_key, child_counts, node_counts):
-    """
-    Downweight any child whose share of parent visits exceeds CHILD_CAP.
-    Operates in-place on weights list.
-
-    parent_key: tuple of UCI moves up to current node
-    child_counts: Counter keyed by (parent_key, move_uci)
-    node_counts:  Counter keyed by parent_key
-    """
     parent_visits = node_counts[parent_key]
     if parent_visits == 0:
         return weights
     out = list(weights)
     for i, c in enumerate(candidates):
-        child_key = (parent_key, c["move"])
-        share = child_counts[child_key] / parent_visits
+        share = child_counts[(parent_key, c["move"])] / parent_visits
         if share > CHILD_CAP:
             out[i] *= 0.05
-    # renormalise
     total = sum(out)
     if total == 0:
         return weights
@@ -324,12 +289,9 @@ def sample_weighted(weights):
 
 
 def grow_path(prefix, engine, node_counts, child_counts, policy_priors=None):
-    """
-    Grow one prefix into a single path of target depth.
-    Returns tuple of UCI strings, or None if no legal continuation found.
-    """
     target_depth = sample_depth()
     path = list(prefix)
+    last_cp = 0
 
     while len(path) < target_depth:
         board = board_from_path(path)
@@ -349,62 +311,106 @@ def grow_path(prefix, engine, node_counts, child_counts, policy_priors=None):
 
         idx = sample_weighted(weights)
         chosen = candidates[idx]["move"]
+        last_cp = candidates[idx]["cp"]
 
         node_counts[parent_key] += 1
         child_counts[(parent_key, chosen)] += 1
-
         path.append(chosen)
 
     if len(path) < 4:
-        return None
-    return tuple(path)
+        return None, 0
+    return tuple(path), last_cp
 
 
-def build_book(total_paths, upto2_paths, engine, policy_priors=None):
+def generate_prefix_paths(prefix, quota, seen_fen, policy_priors=None):
+    """
+    Worker function: owns its own SF instance and local counters.
+    seen_fen is shared across all workers for global FEN dedup.
+    """
+    engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
+    engine.configure({"Hash": 64, "Threads": 1})
+
+    node_counts  = collections.Counter()
+    child_counts = collections.Counter()
+    seen         = set()
+    attempts     = 0
+    max_attempts = quota * 80
+    collected    = []
+
+    while len(collected) < quota and attempts < max_attempts:
+        attempts += 1
+        path, final_cp = grow_path(prefix, engine, node_counts, child_counts,
+                                   policy_priors)
+        if path is None:
+            continue
+        seen.add(path)  # block re-traversal regardless of other filters
+        if abs(final_cp) > MAX_ENDING_CP:
+            continue
+        final_epd = board_from_path(path).epd()
+        if final_epd in seen_fen:
+            continue
+        seen_fen.add(final_epd)
+        collected.append(path)
+
+    engine.quit()
+    return prefix, collected, attempts
+
+
+def build_book(total_paths, upto2_paths, policy_priors=None):
     prefixes = get_available_prefixes(upto2_paths)
     prefixes = add_manual_legal_prefixes(prefixes)
-    quotas = make_prefix_quotas(total_paths, prefixes)
+    quotas   = make_prefix_quotas(total_paths, prefixes)
 
     print(f"\nPrefix quotas ({len(quotas)} prefixes):")
     for prefix in sorted(quotas, key=lambda p: -quotas[p]):
         print(f"  {list(prefix)}: {quotas[prefix]}")
 
-    node_counts  = collections.Counter()
-    child_counts = collections.Counter()
+    work = [(prefix, quota) for prefix, quota in quotas.items() if quota > 0]
 
-    all_paths = []
-    shortfalls = {}
+    all_paths       = []
+    shortfalls      = {}
+    seen_fen        = set()
+    n_prefixes_done = 0
+    n_paths_done    = 0
+    n_prefixes_total = len(work)
 
-    for prefix in sorted(quotas):
-        quota = quotas[prefix]
-        if quota == 0:
-            continue
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                generate_prefix_paths, prefix, quota, seen_fen, policy_priors
+            ): prefix
+            for prefix, quota in work
+        }
+        for future in as_completed(futures):
+            prefix, collected, attempts = future.result()
+            quota = quotas[prefix]
+            if len(collected) < quota:
+                shortfalls[prefix] = quota - len(collected)
+            all_paths.extend(collected)
+            n_prefixes_done += 1
+            n_paths_done    += len(collected)
+            pct_pre  = 100 * n_prefixes_done / n_prefixes_total
+            pct_path = 100 * n_paths_done / total_paths
 
-        seen = set()
-        attempts = 0
-        max_attempts = quota * 80
-        collected = []
-
-        while len(collected) < quota and attempts < max_attempts:
-            attempts += 1
-            path = grow_path(prefix, engine, node_counts, child_counts,
-                             policy_priors)
-            if path is None or path in seen:
-                continue
-            seen.add(path)
-            collected.append(path)
-
-        if len(collected) < quota:
-            shortfalls[prefix] = quota - len(collected)
-
-        all_paths.extend(collected)
-        print(f"  {list(prefix)}: {len(collected)}/{quota} "
-              f"({attempts} attempts)")
+            len_counts = collections.Counter(len(p) for p in collected)
+            n_col = max(len(collected), 1)
+            len_str = "  ".join(
+                f"{k} {len_counts[k]/n_col*100:.2f}%"
+                for k in DEPTH_CHOICES
+            )
+            prefix_col   = f"{str(list(prefix)):<22}"
+            result_col   = f"{len(collected):>4}/{quota:<4} ({attempts:>4} att)"
+            progress_col = (f"{n_prefixes_done:>3}/{n_prefixes_total} pre"
+                            f" ({pct_pre:>5.1f}%)"
+                            f"  {n_paths_done:>5}/{total_paths} paths"
+                            f" ({pct_path:>5.1f}%)")
+            print(f"  {prefix_col}  {result_col}  |  {progress_col}"
+                  f"  |  {len_str}")
 
     return all_paths, shortfalls
 
 
-def audit_book(paths, quotas=None):
+def audit_book(paths, shortfalls=None):
     print(f"\n{'='*60}")
     print(f"AUDIT: {len(paths)} total paths")
     print(f"{'='*60}")
@@ -414,9 +420,9 @@ def audit_book(paths, quotas=None):
     for k in sorted(lengths):
         print(f"  {k} plies: {lengths[k]}")
 
+    total = len(paths)
     first_moves = collections.Counter(p[0] for p in paths)
     print("\nFirst move distribution:")
-    total = len(paths)
     for mv, cnt in first_moves.most_common():
         print(f"  {mv}: {cnt}  ({100*cnt/total:.1f}%)")
 
@@ -435,29 +441,19 @@ def audit_book(paths, quotas=None):
     for prefix, cnt in prefixes4.most_common(20):
         print(f"  {list(prefix)}: {cnt}")
 
-    if quotas:
+    if shortfalls:
         print("\nQuota shortfalls:")
-        had_shortfall = False
-        for prefix, deficit in quotas.items():
-            if deficit > 0:
-                print(f"  {list(prefix)}: -{deficit}")
-                had_shortfall = True
-        if not had_shortfall:
-            print("  none")
+        for prefix, deficit in shortfalls.items():
+            print(f"  {list(prefix)}: -{deficit}")
+    else:
+        print("\nNo quota shortfalls.")
 
 
 def main():
     upto2_paths = load_paths(UPTO2_PATH)
     print(f"Loaded {len(upto2_paths)} seed prefixes from {UPTO2_PATH}")
 
-    engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
-    engine.configure({"Hash": 256, "Threads": 1})
-
-    paths, shortfalls = build_book(
-        TOTAL_PATHS, upto2_paths, engine, policy_priors=None
-    )
-
-    engine.quit()
+    paths, shortfalls = build_book(TOTAL_PATHS, upto2_paths)
 
     audit_book(paths, shortfalls)
     save_paths([list(p) for p in paths], OUT_PATH)

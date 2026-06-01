@@ -125,11 +125,11 @@ class MCTSTree(fasttree):
         top_ucis = ucis[:top_k]
         top_visits = visits[:top_k]
 
-        # temperature schedule: linear decay from temp_max (ply 0) to temp_min (ply 30)
+        # temperature schedule: linear decay from temp_max (ply 0) to temp_min (ply 20)
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
 
-        frac = max(0.0, min(1.0, (30.0 - self.n_plies) / 30.0))
+        frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
         temp = temp_min + (temp_max - temp_min) * frac
 
         # build stable logits from visits: log(visits) keeps scale sane

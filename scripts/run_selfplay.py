@@ -539,8 +539,11 @@ def main(run_tag):
                                 working_cfg = create_validation_config(working_cfg, val_yaml_path)
                             rescorer.config = working_cfg
                             for t in sf_rescore_threads:
+                                # preserve throttle state; cap to new base if config lowered depth
+                                current_depth = t.depth
                                 t.update_config(working_cfg)
-                            sf_throttled = False
+                                t.depth = min(current_depth, t.base_depth)
+                            rescorer.current_depth = sf_rescore_threads[0].depth
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
                                 working_cfg.progress_csv_path)

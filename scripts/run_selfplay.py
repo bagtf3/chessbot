@@ -447,7 +447,6 @@ def main(run_tag):
 
             procs = check_and_reap_procs(procs)
             needed_to_retrain = working_cfg.training_queue_buffer
-            sf_throttled = False
             while len(procs) or (recorder.training_queue < needed_to_retrain):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
@@ -498,17 +497,16 @@ def main(run_tag):
                 rescorer.tick()
 
                 sf_backlog = len(rescorer.intake) + len(rescorer.pending)
-                if sf_backlog > 100 and not sf_throttled:
+                is_throttled = sf_rescore_threads[0].depth < sf_rescore_threads[0].base_depth
+                if sf_backlog > 100 and not is_throttled:
                     for t in sf_rescore_threads:
                         t.depth = max(1, t.base_depth - 1)
                     rescorer.current_depth = sf_rescore_threads[0].depth
-                    sf_throttled = True
                     print(f"[rescore] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
-                elif sf_backlog < 10 and sf_throttled:
+                elif sf_backlog < 10 and is_throttled:
                     for t in sf_rescore_threads:
                         t.depth = t.base_depth
                     rescorer.current_depth = sf_rescore_threads[0].depth
-                    sf_throttled = False
                     print(f"[rescore] backlog cleared, depth -> {rescorer.current_depth}")
 
                 recorder.training_queue = rescorer.training_data_size

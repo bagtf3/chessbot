@@ -454,7 +454,7 @@ if val_dfs:
     print("########### Report for SF validation games only ############".center(60))
     report_cpl_and_bmr(df_val, VAL_WINDOW)
 
-from chessbot.utils import plot_training_progress
+from chessbot.plot_utils import plot_training_progress
 from warnings import catch_warnings, simplefilter
 
 if "mass_on_legal" in eval_df.columns:

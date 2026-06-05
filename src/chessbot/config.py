@@ -123,7 +123,7 @@ class Config(object):
     dirichlet_alpha = 0.3
     reuse_tree = True
     sample_moves = True
-    move_sample_temp_range = [0.000001, 1.25]
+    move_sample_temp_range = [0.000001, 2.0]
     
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
     adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000

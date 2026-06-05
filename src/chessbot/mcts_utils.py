@@ -97,7 +97,7 @@ class MCTSTree(fasttree):
             sample = False
 
         # at/after the convergence ply, just use C++/base behavior
-        elif (self.n_plies >= 30) or (self.board.piece_count() <= 20):
+        elif (self.n_plies >= 20) or (self.board.piece_count() <= 20):
             sample = False
 
         else:
@@ -125,11 +125,11 @@ class MCTSTree(fasttree):
         top_ucis = ucis[:top_k]
         top_visits = visits[:top_k]
 
-        # temperature schedule: linear decay from temp_max (ply 0) to temp_min (ply 30)
+        # temperature schedule: linear decay from temp_max (ply 0) to temp_min (ply 20)
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
 
-        frac = max(0.0, min(1.0, (30.0 - self.n_plies) / 30.0))
+        frac = max(0.0, min(1.0, (20.0 - self.n_plies) / 20.0))
         temp = temp_min + (temp_max - temp_min) * frac
 
         # build stable logits from visits: log(visits) keeps scale sane
@@ -455,7 +455,11 @@ class ChessGame(object):
         
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
-        self.tree = MCTSTree(self.board, self.config)
+        tree_cfg = self.config
+        if meta.get('scenario') == 'UHO' and not self.config.is_validation_run:
+            tree_cfg = self.config.copy()
+            tree_cfg.move_sample_temp_range = [0.2, 0.2]
+        self.tree = MCTSTree(self.board, tree_cfg)
         self.tree_data = {}
         self.moves_played = []
         self.recents = []

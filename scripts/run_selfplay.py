@@ -327,10 +327,10 @@ def main(run_tag):
 
 
     # init the async SF worker(s) and rescorer
-    req_q = queue.Queue()
-    res_q = queue.Queue()
+    sf_game_q = queue.Queue()
+    sf_res_q  = queue.Queue()
     sf_rescore_threads = [
-        SFRescoreThread(req_q, res_q, base_cfg)
+        SFRescoreThread(sf_game_q, sf_res_q, base_cfg)
         for _ in range(max(1, base_cfg.rescore_n_sf_threads))
     ]
 
@@ -341,10 +341,13 @@ def main(run_tag):
         eviction_window=base_cfg.rescore_eviction_window,
         max_size=base_cfg.rescore_cache_size,
     )
+    cache_path = os.path.join(base_cfg.run_dir, "sf_cache.pkl.gz")
 
     if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
         cache.load_seed(SF_SEED_CACHE)
-    rescorer = Rescorer(base_cfg, req_q, res_q, cache)
+    if os.path.exists(cache_path):
+        cache.roll_merge(cache_path)
+    rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
@@ -493,6 +496,19 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
+                sf_backlog = len(rescorer.intake) + len(rescorer.pending)
+                is_throttled = sf_rescore_threads[0].depth < sf_rescore_threads[0].base_depth
+                if sf_backlog > 100 and not is_throttled:
+                    for t in sf_rescore_threads:
+                        t.depth = max(1, t.base_depth - 1)
+                    rescorer.current_depth = sf_rescore_threads[0].depth
+                    print(f"[rescore] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
+                elif sf_backlog < 10 and is_throttled:
+                    for t in sf_rescore_threads:
+                        t.depth = t.base_depth
+                    rescorer.current_depth = sf_rescore_threads[0].depth
+                    print(f"[rescore] backlog cleared, depth -> {rescorer.current_depth}")
+
                 recorder.training_queue = rescorer.training_data_size
 
                 # check for a retrain
@@ -520,6 +536,12 @@ def main(run_tag):
                             if is_validation:
                                 working_cfg = create_validation_config(working_cfg, val_yaml_path)
                             rescorer.config = working_cfg
+                            for t in sf_rescore_threads:
+                                # preserve throttle state; cap to new base if config lowered depth
+                                current_depth = t.depth
+                                t.update_config(working_cfg)
+                                t.depth = min(current_depth, t.base_depth)
+                            rescorer.current_depth = sf_rescore_threads[0].depth
                             rescorer.aggregate_metrics(
                                 n_retrains, working_cfg.vscale,
                                 working_cfg.progress_csv_path)
@@ -579,6 +601,7 @@ def main(run_tag):
             # selfplay round report
             recorder.maybe_log_results(force=True)
             total_games += recorder.games_finished
+            cache.save(cache_path)
 
             if is_validation:
                 recorder.config = working_cfg
@@ -638,6 +661,7 @@ def main(run_tag):
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.tick()
         rescorer.push_analyzed(report=True)
+        cache.save(cache_path)
         for t in sf_rescore_threads:
             t.close()
         if rescorer.training_data:

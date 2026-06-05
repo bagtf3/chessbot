@@ -36,6 +36,11 @@ VARIANTS: dict[str, dict] = {
         d_embed=512, transformer_layers=4, num_heads=16,
         ff_dim=1024, dropout=0.05,
     ),
+    "13m-precond-conformer": dict(
+        precond_conformer=True,
+        conv_filters=256, num_heads=8, dropout=0.05,
+        pre_blocks=4, mha_blocks=4,
+    ),
 }
 
 
@@ -64,8 +69,8 @@ def make_ln2d(ch: int):
     return Ln2d()
 
 
-def make_pt_attn_pool_value_head(C: int):
-    """Attention-pool value head. Accepts (B, C, 8, 8) or (B, 64, C)."""
+def make_pt_attn_pool_value_head(C: int, n_heads: int = 4):
+    """Attention-pool value head. Accepts (B, C, 8, 8) or (B, N, C)."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -73,61 +78,131 @@ def make_pt_attn_pool_value_head(C: int):
     class AttnPoolValueHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.ln  = nn.LayerNorm(C)
-            self.ap  = nn.Linear(C, 1)
-            self.fc1 = nn.Linear(C, 256)
-            self.fc2 = nn.Linear(256, 128)
-            self.out = nn.Linear(128, 3)
+            self.ln    = nn.LayerNorm(C)
+            self.proj  = nn.Linear(C, 256)
+            self.mha   = nn.MultiheadAttention(256, n_heads, dropout=0.0, batch_first=True)
+            self.query = nn.Parameter(torch.randn(1, 1, 256))
+            self.out   = nn.Linear(256, 3)
 
         def forward(self, x):
-            if x.dim() == 4:
-                x = x.permute(0, 2, 3, 1).reshape(-1, 64, C)
-            x = self.ln(x)
-            w = torch.softmax(self.ap(x), dim=1)
-            v = (x * w).sum(dim=1)
-            v = F.gelu(self.fc1(v))
-            v = F.gelu(self.fc2(v))
-            return self.out(v)
+            x = F.gelu(self.proj(self.ln(x)))
+            q = self.query.expand(x.shape[0], -1, -1)   # (B, 1, 256)
+            h, _ = self.mha(q, x, x, need_weights=False)
+            return self.out(h.squeeze(1))
 
     return AttnPoolValueHead()
 
 
-def make_pt_relational_policy_head(C: int):
-    """Bilinear from/to policy head. Accepts (B, C, 8, 8).
+def make_pt_mha_policy_head(C: int, n_heads: int = 4):
+    """MHA-refined bilinear policy head. Accepts (B, C, 8, 8).
+    Each from/to branch gets LN -> proj(256) -> GELU -> MHA -> dense(256),
+    then BMM dot product scaled by 1/sqrt(256) for move logits.
     Returns (B, 4288): 4096 normal + 192 underpromotion logits."""
+    import math
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    import pyfastchess
+
+    D = 256
+
+    class MHAPolicyHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln         = nn.LayerNorm(C)
+            self.scale      = 1.0 / math.sqrt(D)
+
+            self.from_proj  = nn.Linear(C, D)
+            self.from_mha   = nn.MultiheadAttention(D, n_heads, dropout=0.0, batch_first=True)
+            self.from_ln    = nn.LayerNorm(D)
+            self.from_out   = nn.Linear(D, D)
+
+            self.to_proj    = nn.Linear(C, D)
+            self.to_mha     = nn.MultiheadAttention(D, n_heads, dropout=0.0, batch_first=True)
+            self.to_ln      = nn.LayerNorm(D)
+            self.to_out     = nn.Linear(D, D)
+
+            self.promo_mix  = nn.Conv2d(C, 64, 1, bias=False)
+            self.promo_mln  = make_ln2d(64)
+            self.promo_c1   = nn.Conv2d(64, 64, 3, padding=1, bias=False)
+            self.promo_ln   = make_ln2d(64)
+            self.promo_out  = nn.Conv2d(64, 3, 1)
+
+            mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("sometimes_legal", mask)
+
+        def forward(self, x):
+            B  = x.shape[0]
+            s  = self.ln(x)                              # (B, 68, C)
+
+            f   = F.gelu(self.from_proj(s))              # (B, 68, 256)
+            fn  = self.from_ln(f)
+            fh, _ = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv  = self.from_out(f[:, :64, :] + fh)      # (B, 64, 256)
+
+            t   = F.gelu(self.to_proj(s))                # (B, 68, 256)
+            tn  = self.to_ln(t)
+            th, _ = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv  = self.to_out(t[:, :64, :] + th)        # (B, 64, 256)
+
+            dots  = torch.bmm(fv.float(), tv.float().transpose(1, 2)).mul(self.scale).reshape(-1, 64 * 64)
+
+            xp    = x[:, :64, :].reshape(B, 8, 8, C).permute(0, 3, 1, 2).contiguous()
+            p     = F.leaky_relu(self.promo_mln(self.promo_mix(xp)), 0.02)
+            sk    = p
+            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3).float()
+
+            logits = torch.cat([dots, promo], dim=1)
+            logits = logits.masked_fill(~self.sometimes_legal, -1e9)
+            return logits.to(x.dtype)
+
+    return MHAPolicyHead()
+
+
+def make_pt_relational_policy_head(C: int):
+    """Bilinear from/to policy head. Accepts (B, C, 8, 8).
+    Returns (B, 4288): 4096 normal + 192 underpromotion logits.
+    Never-legal indices are masked to -1e9 so they carry no gradient."""
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
 
     class RelationalPolicyHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.from_fc   = nn.Linear(C, 256)
-            self.from_ln1  = nn.LayerNorm(256)
-            self.from_fc2  = nn.Linear(256, 256)
-            self.from_ln2  = nn.LayerNorm(256)
+            inner_dim = 512
+            self.ln        = nn.LayerNorm(C)
+            self.from_fc1  = nn.Linear(C, inner_dim)
+            self.from_fc2  = nn.Linear(inner_dim, inner_dim)
 
-            self.to_fc     = nn.Linear(C, 256)
-            self.to_ln1    = nn.LayerNorm(256)
-            self.to_fc2    = nn.Linear(256, 256)
-            self.to_ln2    = nn.LayerNorm(256)
-            
+            self.to_fc1    = nn.Linear(C, inner_dim)
+            self.to_fc2    = nn.Linear(inner_dim, inner_dim)
+            self.scale     = 1.0 / math.sqrt(inner_dim)
+
             self.promo_mix = nn.Conv2d(C, 64, 1, bias=False)
             self.promo_mln = make_ln2d(64)
             self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)
             self.promo_ln  = make_ln2d(64)
             self.promo_out = nn.Conv2d(64, 3, 1)
 
+            mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("sometimes_legal", mask)
+
         def forward(self, x):
-            s    = x.permute(0, 2, 3, 1).reshape(-1, 64, C)
-            fv   = self.from_ln2(F.gelu(self.from_fc2(self.from_ln1(F.gelu(self.from_fc(s))))))
-            tv   = self.to_ln2(self.to_fc2(self.to_ln1(F.gelu(self.to_fc(s)))))
-            norm = torch.bmm(fv, tv.transpose(1, 2)).reshape(-1, 64 * 64)
-            p    = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
-            sk   = p
-            p    = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
-            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3)
-            return torch.cat([norm, promo], dim=1)
+            s     = self.ln(x.permute(0, 2, 3, 1).reshape(-1, 64, C))
+            fv    = self.from_fc2(F.gelu(self.from_fc1(s)))
+            tv    = self.to_fc2(F.gelu(self.to_fc1(s)))
+            dots  = torch.bmm(fv.float(), tv.float().transpose(1, 2)).mul(self.scale).reshape(-1, 64 * 64)
+            p     = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
+            sk    = p
+            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3).float()
+            logits = torch.cat([dots, promo], dim=1)
+            logits = logits.masked_fill(~self.sometimes_legal, -1e9)
+            return logits.to(x.dtype)
 
     return RelationalPolicyHead()
 
@@ -176,6 +251,7 @@ def tf_attn_pool_value_head(x, C, layers, activation="gelu"):
 def tf_relational_policy_head(x, C, layers):
     """Bilinear from/to policy head for TF functional API.
     x: (B, 8, 8, C) or (B, 64, C). Returns policy_logits (B, 4288)."""
+    import math
 
     if len(x.shape) == 3:
         x_seq = x
@@ -184,17 +260,15 @@ def tf_relational_policy_head(x, C, layers):
         x_seq = layers.Reshape((64, C), name="pol_to_seq")(x)
         x_2d  = x
 
+    x_seq    = layers.LayerNormalization(name="pol_prenorm")(x_seq)
     from_h   = layers.Dense(256, activation="gelu", name="pol_from_fc1")(x_seq)
-    from_h   = layers.LayerNormalization(name="pol_from_ln1")(from_h)
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(from_h)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
+    from_vec = layers.Dense(256, name="pol_from_fc2")(from_h)
 
     to_h   = layers.Dense(256, activation="gelu", name="pol_to_fc1")(x_seq)
-    to_h   = layers.LayerNormalization(name="pol_to_ln1")(to_h)
     to_vec = layers.Dense(256, name="pol_to_fc2")(to_h)
-    to_vec = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
 
     norm = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
+    norm = layers.Lambda(lambda t: t * (1.0 / math.sqrt(256)), name="pol_scale")(norm)
     norm = layers.Reshape((64 * 64,), name="pol_normal_flat")(norm)
 
     p    = layers.Conv2D(64, 1, use_bias=False, padding="same", name="pol_promo_mix")(x_2d)
@@ -370,12 +444,16 @@ def build_tf_transformer_branched(cfg: dict):
     v_2d  = layers.Reshape((8, 8, de), name="v_to_2d")(v_seq)
     value = tf_attn_pool_value_head(v_2d, de, layers)
 
-    from_vec = layers.Dense(256, activation="gelu", name="pol_from_fc2")(pf_seq)
-    from_vec = layers.LayerNormalization(name="pol_from_ln2")(from_vec)
-    to_vec   = layers.Dense(256, name="pol_to_fc2")(pt_seq)
-    to_vec   = layers.LayerNormalization(name="pol_to_ln2")(to_vec)
+    import math
+    pf_n     = layers.LayerNormalization(name="pol_from_prenorm")(pf_seq)
+    from_h   = layers.Dense(256, activation="gelu", name="pol_from_fc1")(pf_n)
+    from_vec = layers.Dense(256, name="pol_from_fc2")(from_h)
+    pt_n     = layers.LayerNormalization(name="pol_to_prenorm")(pt_seq)
+    to_h     = layers.Dense(256, activation="gelu", name="pol_to_fc1")(pt_n)
+    to_vec   = layers.Dense(256, name="pol_to_fc2")(to_h)
 
     norm  = layers.Dot(axes=[2, 2], name="pol_qk_dot")([from_vec, to_vec])
+    norm  = layers.Lambda(lambda t: t * (1.0 / math.sqrt(256)), name="pol_scale")(norm)
     norm  = layers.Reshape((64 * 64,), name="pol_normal_flat")(norm)
 
     x_2d  = layers.Reshape((8, 8, de), name="x_to_2d")(x)
@@ -454,7 +532,7 @@ def build_pt_transformer_16m(cfg: dict):
                 x = tx(x)
             x_2d = x.reshape(-1, 8, 8, de).permute(0, 3, 1, 2).contiguous()
             v_2d = F.leaky_relu(self.val_mix_ln(self.val_mix(x_2d)), 0.02)
-            return self.policy_head(x_2d), self.value_head(v_2d)
+            return self.policy_head(x_2d), self.value_head(v_2d.permute(0, 2, 3, 1).reshape(-1, 64, de))
 
     m = M()
     print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
@@ -527,6 +605,92 @@ def build_pt_conformer_interweaved(cfg: dict):
             for block in self.blocks:
                 x = block(x, pos)
             x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
+            return self.policy_head(x), self.value_head(x.permute(0, 2, 3, 1).reshape(-1, 64, cf))
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_precond_conformer(cfg: dict):
+    """
+    4x Conv(256) preconditioner -> concat pos(256) -> 512 ->
+    4x [prenorm-MHA -> FF(512->512->512)] -> heads.
+    """
+    
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    CF = cfg["conv_filters"]   # 256
+    D  = CF * 2                # 512 after concat
+    nh = cfg["num_heads"]
+    dr = cfg["dropout"]
+    pb = cfg["pre_blocks"]
+    mb = cfg["mha_blocks"]
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            r = x
+            h = self.ln(x) if self.ln is not None else x
+            h = F.leaky_relu(self.c1(h), 0.01)
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return r + h
+
+    class TxBlock(nn.Module):
+        def __init__(self, ff_dim=D):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, D)
+
+        def forward(self, x):
+            r = x
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = r + self.drop(h)
+            r = x
+            return r + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb           = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre           = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+            self.pos           = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln       = nn.LayerNorm(CF)
+            self.global_tokens = nn.Parameter(torch.randn(1, 4, D))
+
+            ff_dims = [512, 768, 768, 512]
+            self.blocks        = nn.ModuleList([TxBlock(ff_dim=ffd) for ffd in ff_dims])
+            self.policy_head   = make_pt_mha_policy_head(D, n_heads=8)
+            self.value_head    = make_pt_attn_pool_value_head(D, n_heads=8)
+
+        def forward(self, t):
+            B = t.shape[0]
+            x = self.emb(t).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+
+            conv_seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, 64, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([conv_seq, pos], dim=-1)
+
+            gt = self.global_tokens.expand(B, -1, -1)
+            x = torch.cat([x, gt], dim=1)
+
+            for blk in self.blocks:
+                x = blk(x)
+
             return self.policy_head(x), self.value_head(x)
 
     m = M()
@@ -535,8 +699,9 @@ def build_pt_conformer_interweaved(cfg: dict):
 
 
 PT_BUILDERS: dict[str, object] = {
-    "16m-transformer":           build_pt_transformer_16m,
+    "16m-transformer":          build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
+    "13m-precond-conformer":    build_pt_precond_conformer,
 }
 
 

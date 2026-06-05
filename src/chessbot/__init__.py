@@ -30,6 +30,7 @@ ENDGAME_LOC = os.getenv("ENDGAME_LOC", "")
 SP_DIR = os.getenv("SP_DIR", "")
 MODEL_DIR = os.getenv("MODEL_DIR", "")
 SF_SEED_CACHE = os.getenv("SF_SEED_CACHE", "")
+CUTECHESS_CLI_LOC = os.getenv("CUTECHESS_CLI_LOC", "")
 
 import chess
 WHITE_WINNING_WHITE_MOVE = chess.Board("rn5N/p2p3p/b2k3n/5p2/1p2P3/8/PPPP1PPP/RNBQKB1R w KQ - 1 12")

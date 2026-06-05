@@ -107,3 +107,81 @@ def lc0_analyze(board, nodes=4000, lc0_loc=None, engine_cfg=None):
 
     rows = sorted(last_by_move.values(), key=lambda r: r.get("N", 0), reverse=True)
     return rows
+
+
+class Lc0Session:
+    """Persistent lc0 engine — starts once, reused across analyze() calls."""
+
+    def __init__(self, lc0_loc=None, cfg=None):
+        loc = lc0_loc or LC0_LOC
+        self.eng = chess.engine.SimpleEngine.popen_uci(loc, stderr=subprocess.DEVNULL)
+        base_cfg = {"VerboseMoveStats": True, "MinibatchSize": 64}
+        if cfg:
+            base_cfg.update(cfg)
+        self.eng.configure(base_cfg)
+        self._parser = Lc0Parser()
+        try:
+            self._pid = self.eng._process.pid
+        except Exception:
+            self._pid = None
+
+    @property
+    def pid(self):
+        return self._pid
+
+    def analyze(self, board, nodes):
+        """Analyze board for given node budget.
+
+        Returns (move_rows, wdl, pv):
+          move_rows: list of dicts sorted by N desc — keys: move, N, P_pct, Q, WL, D, M
+          wdl:       (W, D, L) floats 0-1 STM-POV, or None if engine did not report
+          pv:        list of UCI strings
+        """
+        limit = chess.engine.Limit(nodes=nodes)
+        last_by_move = {}
+        last_info = None
+
+        with self.eng.analysis(board, limit, info=chess.engine.INFO_ALL) as an:
+            for info in an:
+                rows = self._parser.parse_info(info)
+                for r in rows:
+                    last_by_move[r["move"]] = r
+                if info.get("pv") or info.get("wdl") or info.get("score"):
+                    last_info = info
+
+        rows = sorted(last_by_move.values(), key=lambda r: r.get("N", 0), reverse=True)
+
+        wdl = None
+        pv = []
+        if last_info is not None:
+            wdl_obj = last_info.get("wdl")
+            if wdl_obj is not None:
+                rel = wdl_obj.relative
+                wdl = (rel.wins / 1000.0, rel.draws / 1000.0, rel.losses / 1000.0)
+            pv_raw = last_info.get("pv") or []
+            pv = [m.uci() for m in pv_raw]
+
+        # fall back to computing WDL from top move's verbose stats
+        if wdl is None and rows:
+            top = rows[0]
+            wl = top.get("WL")
+            d  = top.get("D")
+            if wl is not None and d is not None:
+                w = (1.0 + wl - d) / 2.0
+                l = 1.0 - w - d
+                wdl = (w, d, l)
+
+        return rows, wdl, pv
+
+    def new_game(self):
+        """Send ucinewgame to clear lc0's tree cache."""
+        self.eng.send_line("ucinewgame")
+
+    def close(self):
+        self.eng.quit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()

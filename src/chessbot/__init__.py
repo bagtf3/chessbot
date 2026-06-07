@@ -3,7 +3,23 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-    
+
+# ORT TRT needs CUDA 12 DLLs (cublas64_12, cublasLt64_12, cudart64_12) — lc0 ships them.
+# Torch lib provides cudnn64_9. Both dirs must be on PATH before any ORT session is created.
+lc0_loc = os.getenv("LC0_LOC", "")
+if lc0_loc:
+    lc0_dir = str(Path(lc0_loc).parent)
+    if lc0_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = lc0_dir + os.pathsep + os.environ.get("PATH", "")
+
+try:
+    import torch
+    torch_lib = str(Path(torch.__file__).parent / "lib")
+    if torch_lib not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass
+
 SF_LOC      = os.getenv("SF_LOC", "")
 LC0_LOC     = os.getenv("LC0_LOC", "")
 LC0_WEIGHTS = os.getenv("LC0_WEIGHTS", "")

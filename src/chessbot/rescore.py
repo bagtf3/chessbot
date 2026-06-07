@@ -293,7 +293,7 @@ class SFRescoreThread:
                         info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
                         elapsed += time.time() - t0
                         best_uci = str(info['pv'][0])
-                        pv_ucis  = [str(m) for m in info.get('pv', [])[1:5]]
+                        pv_ucis  = [str(m) for m in info.get('pv', [])[:4]]
                         best_cp  = score_cp_stm_pov(info['score'])
                         best_abs = score_cp_white_pov(info['score'], clipped=False)
                     else:
@@ -415,11 +415,12 @@ class Rescorer(object):
             lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
             sess = make_lc0_trt_session(lc0_onnx, lc0_model, lc0_trt_cache,
                                         opt_batch=batch_size, max_batch=batch_size * 2)
-            if sess.get_providers()[0] == 'TensorrtExecutionProvider':
-                self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
-                print(f"{RS} Lc0Thread: TRT batch_size={batch_size}")
-            else:
-                print(f"{RS} Lc0Thread: no TRT engine found, enrichment disabled")
+            # Hard-fail if TRT didn't load — silent CPU fallback would silently bottleneck training.
+            active = sess.get_providers()[0]
+            if active != 'TensorrtExecutionProvider':
+                raise RuntimeError(f"{RS} Lc0Thread TRT failed, got {active}. Check CUDA/TRT DLLs in PATH.")
+            self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
+            print(f"{RS} Lc0Thread: TRT batch_size={batch_size}")
 
         self.init_analyzer()
 
@@ -1209,7 +1210,9 @@ class Rescorer(object):
                     sc['book'] += 1
                     scw['book'] += 1
 
-        # single forward pass through the game for all LC0 submissions
+        # Single forward pass: replay game from start_fen to collect lc0_features() at each
+        # blunder ply. Must use push_uci replay (not Board(fen)) so lc0_features() has full
+        # move history for all 8 history planes.
         if lc0_waypoints:
             b_lc0 = Board(start_fen)
             for ply_i, mv in enumerate(moves_played):
@@ -1225,7 +1228,10 @@ class Rescorer(object):
                     self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
                     n_pv = 0
                     if aux['pv_ucis']:
-                        b_pv = Board(b_lc0.fen())
+                        # pv_ucis = pv[0:4]: pv[0] is SF's best move from the blunder position,
+                        # subsequent entries are the continuation. Must start from pv[0] — skipping
+                        # it would push a move for the wrong side and corrupt the board.
+                        b_pv = b_lc0.clone()
                         for pv_mv in aux['pv_ucis']:
                             if b_pv.is_terminal():
                                 break

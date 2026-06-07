@@ -1451,23 +1451,22 @@ class Rescorer(object):
         print(row("total", self.sample_counts))
         print()
 
-        # enrichment breakdown: blunder events+pv, book swaps, lc0-total, lc0-%
         ehdr = (f"{RS}  {'enrich':<12} |"
                 f"  {'blunder':>7}  |"
+                f"  {'pv':>7}  |"
                 f"  {'book':>7}  |"
-                f"  {'lc0-total':>9}  |"
                 f"  {'lc0-%':>7}  |")
         print(ehdr)
 
         def enrich_row(label, sc):
-            blur_pv   = sc['lc0_blunder'] + sc['lc0_pv']
-            total_tr  = sc['accepted'] + sc['lc0_pv']
-            enrich_n  = sc['book'] + blur_pv
+            blur_pv    = sc['lc0_blunder'] + sc['lc0_pv']
+            total_tr   = sc['accepted'] + sc['lc0_pv']
+            enrich_n   = sc['book'] + blur_pv
             enrich_pct = f"{enrich_n / total_tr * 100:.1f}%" if total_tr else "--"
             return (f"{RS}  {label:<12} |"
                     f"  {sc['lc0_blunder']:>7}  |"
+                    f"  {sc['lc0_pv']:>7}  |"
                     f"  {sc['book']:>7}  |"
-                    f"  {blur_pv:>9}  |"
                     f"  {enrich_pct:>7}  |")
 
         print(enrich_row("batch", self.sample_counts_window))

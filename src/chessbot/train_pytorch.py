@@ -321,39 +321,28 @@ def make_pt_infer(model, max_bs):
 
 def export_ts_to_onnx(ts_path, onnx_path):
     """
-    Export a TorchScript (.ts/.pt) model to ONNX with dynamic batch axis.
-    Tries dynamo export first; falls back to legacy opset-18 if dynamo
-    produces a fixed batch dimension or fails.
+    Export model to ONNX with dynamic batch axis.
+    Loads from companion .pt as an eager half-precision model — TorchScript export
+    fails because aten::_native_multi_head_attention is not ONNX-exportable.
+    Tries dynamo first; falls back to legacy opset-18.
     """
     import onnx
     from onnx import shape_inference as onnx_si
+    from chessbot.model import PT_BUILDERS, VARIANTS
 
-    model = torch.jit.load(ts_path, map_location='cuda').eval()
+    pt_path = companion_pt(ts_path)
+    ckpt = torch.load(pt_path, map_location='cuda')
+    arch = ckpt.get('arch', FALLBACK_ARCH)
+    model = PT_BUILDERS[arch](VARIANTS[arch]).half().cuda().eval()
+    model.load_state_dict(ckpt['model'])
+
     dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')
+    with torch.no_grad():
+        model(dummy)  # verify forward pass before export
 
-    def has_dynamic_batch(path):
-        m = onnx.load(path)
-        dim0 = m.graph.input[0].type.tensor_type.shape.dim[0]
-        return bool(dim0.dim_param) or dim0.dim_value <= 0
-
-    dynamo_ok = False
-    try:
-        torch.onnx.export(
-            model, dummy, onnx_path,
-            dynamo=True,
-            input_names=['enc_in'],
-            output_names=['policy_logits', 'value_out'],
-            dynamic_shapes=({0: torch.export.Dim('batch', min=1, max=512)},),
-        )
-        if has_dynamic_batch(onnx_path):
-            dynamo_ok = True
-            print(f'[export] dynamo ONNX -> {onnx_path}')
-        else:
-            print('[export] dynamo produced fixed batch, falling back to legacy')
-    except Exception as e:
-        print(f'[export] dynamo failed ({type(e).__name__}: {e}), falling back to legacy')
-
-    if not dynamo_ok:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='Constant folding in symbolic shape inference')
         torch.onnx.export(
             model, dummy, onnx_path,
             opset_version=18,
@@ -366,7 +355,7 @@ def export_ts_to_onnx(ts_path, onnx_path):
             },
             do_constant_folding=False,
         )
-        print(f'[export] legacy opset-18 ONNX -> {onnx_path}')
+    print(f'[export] ONNX -> {onnx_path}')
 
     proto = onnx.load(onnx_path)
     proto = onnx_si.infer_shapes(proto)

@@ -197,6 +197,7 @@ def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
             'trt_profile_opt_shapes':  f'/input/planes:{opt_batch}x112x8x8',
             'trt_profile_max_shapes':  f'/input/planes:{max_batch}x112x8x8',
         }
+        ort.set_default_logger_severity(3)
         providers = [('TensorrtExecutionProvider', trt_opts),
                      'CUDAExecutionProvider', 'CPUExecutionProvider']
         sess   = ort.InferenceSession(src, providers=providers)

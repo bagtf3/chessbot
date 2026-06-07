@@ -300,13 +300,12 @@ def build_validation_summary(looper):
 
 def prepare_val_trt(cfg):
     """
-    Export the current .ts model to ONNX, compile a fresh TRT engine, and
-    patch cfg in-place so workers use ort_trt backend. All paths are derived
-    from cfg.run_dir and cfg.run_tag -- no manual config needed.
+    Export current model to ONNX, compile TRT engine in main process,
+    patch cfg so workers call make_trt_session with identical opts and
+    load the cached engine without recompiling.
     """
-    import tensorrt  # registers TRT DLLs before ort loads its TRT provider
-    import onnxruntime as ort
     from chessbot.train_pytorch import export_ts_to_onnx
+    from chessbot.looper import make_trt_session
 
     val_trt_dir = os.path.join(cfg.run_dir, 'val_trt')
     os.makedirs(val_trt_dir, exist_ok=True)
@@ -317,53 +316,22 @@ def prepare_val_trt(cfg):
     print(f'{V} exporting {cfg.model_path} -> {onnx_path}')
     export_ts_to_onnx(cfg.model_path, onnx_path)
 
-    # remove stale engines so TRT recompiles fresh
+    # clear stale engines so TRT compiles fresh from the new ONNX
     for f in os.listdir(val_trt_dir):
         if f.startswith(model_name) and f.endswith('.engine'):
             os.remove(os.path.join(val_trt_dir, f))
             print(f'{V} removed stale engine: {f}')
 
-    # derive cache prefix (same keying as make_ort_trt_infer)
-    h = hashlib.sha256()
-    with open(onnx_path, 'rb') as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b''):
-            h.update(chunk)
-    cache_prefix = f'{model_name}_{h.hexdigest()[:12]}'
-
-    max_bs = cfg.fwd_batch
-    opt_bs = min(max_bs, 256)
-
-    trt_opts = {
-        'trt_engine_cache_enable':  True,
-        'trt_engine_cache_path':    val_trt_dir,
-        'trt_engine_cache_prefix':  cache_prefix,
-        'trt_fp16_enable':          True,
-        'trt_force_timing_cache':   True,
-        'trt_max_workspace_size':   4 * 1024 * 1024 * 1024,
-        'trt_profile_min_shapes':   'enc_in:1x64',
-        'trt_profile_opt_shapes':   f'enc_in:{opt_bs}x64',
-        'trt_profile_max_shapes':   f'enc_in:{max_bs}x64',
-        'trt_timing_cache_enable':  True,
-        'trt_timing_cache_path':    val_trt_dir,
-    }
-
-    print(f'{V} compiling TRT engine (prefix={cache_prefix})...')
+    print(f'{V} compiling TRT engine...')
     t0 = time.time()
-    providers = [('TensorrtExecutionProvider', trt_opts), 'CUDAExecutionProvider',
-                 'CPUExecutionProvider']
-    sess = ort.InferenceSession(onnx_path, providers=providers)
-    active = sess.get_providers()[0]
-    if active != 'TensorrtExecutionProvider':
-        raise RuntimeError(f'{V} TRT compile failed, got provider: {active}')
-
-    # dummy run at opt_bs to finalize the engine before flush on del
-    dummy = np.zeros((opt_bs, 64), dtype=np.int64)
+    sess = make_trt_session(onnx_path, model_name, val_trt_dir, cfg.fwd_batch)
+    dummy = np.zeros((min(cfg.fwd_batch, 256), 64), dtype=np.int64)
     sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
     del sess
     gc.collect()
     print(f'{V} TRT engine ready  ({time.time() - t0:.0f}s)')
 
-    # patch vcfg -- workers see these via cfg.copy() in spawn_workers
+    # workers call make_trt_session with these same params -> cache hit, no recompile
     cfg.inference_backend = 'ort_trt'
     cfg.model_path   = onnx_path
     cfg.trt_model_name = model_name

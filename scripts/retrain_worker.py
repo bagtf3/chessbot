@@ -17,23 +17,7 @@ import gc
 
 import numpy as np
 
-
-
-import tensorflow as tf
-
 from chessbot.config import Config
-
-
-TFREC_FEATURE_SPEC = {
-    "enc_in":        tf.io.FixedLenFeature([], tf.string),
-    "mask":          tf.io.FixedLenFeature([], tf.string),
-    "policy_logits": tf.io.FixedLenFeature([], tf.string),
-    "value_out":     tf.io.FixedLenFeature([], tf.float32),
-    # old bootstrap files have a single "weight" field; new rescore files split into two
-    "weight":        tf.io.FixedLenFeature([], tf.float32, default_value=1.0),
-    "value_weight":  tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
-    "policy_weight": tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
-}
 
 
 def list_pending_shards(pending_dir):
@@ -78,6 +62,16 @@ def load_shards_pkl(paths):
 
 def load_shards(paths, tries=3, sleep_s=0.25):
     """Load bootstrap tfrecord shards. Returns lists of TF tensors."""
+    import tensorflow as tf
+    tfrec_feature_spec = {
+        "enc_in":        tf.io.FixedLenFeature([], tf.string),
+        "mask":          tf.io.FixedLenFeature([], tf.string),
+        "policy_logits": tf.io.FixedLenFeature([], tf.string),
+        "value_out":     tf.io.FixedLenFeature([], tf.float32),
+        "weight":        tf.io.FixedLenFeature([], tf.float32, default_value=1.0),
+        "value_weight":  tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
+        "policy_weight": tf.io.FixedLenFeature([], tf.float32, default_value=-1.0),
+    }
     X_list, P_list, Y_list, vwht_list, pwht_list = [], [], [], [], []
     loaded = []
 
@@ -88,7 +82,7 @@ def load_shards(paths, tries=3, sleep_s=0.25):
             try:
                 dataset = tf.data.TFRecordDataset(path, compression_type=compression)
                 for raw in dataset:
-                    feat = tf.io.parse_single_example(raw, TFREC_FEATURE_SPEC)
+                    feat = tf.io.parse_single_example(raw, tfrec_feature_spec)
                     X_list.append(
                         tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16)
                         .numpy().astype(np.int32))
@@ -123,6 +117,7 @@ def load_shards(paths, tries=3, sleep_s=0.25):
 
 
 def export_tf_to_onnx(model_path, onnx_path):
+    import tensorflow as tf
     import tf2onnx
     model = tf.keras.models.load_model(model_path, compile=False)
     input_sig = [tf.TensorSpec([None, 64], tf.int32, name="enc_in")]
@@ -185,6 +180,7 @@ def print_fit_history(history, epoch, label=""):
 
 
 def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
+    import tensorflow as tf
     tries = 0
     gpus = []
     while tries < max_tries:
@@ -207,6 +203,7 @@ def enforce_gpu_or_die(max_tries=5, sleep_s=1.0):
 
 def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timings=None):
     """Load, recompile, fit, and save a single model. Cleans up GPU memory after."""
+    import tensorflow as tf
     if timings is None:
         timings = {}
     tag = f"[retrain{(' ' + label) if label else ''}]"
@@ -326,12 +323,11 @@ def main():
 
     t0 = time.time()
     if cfg.retrain_backend == "pt_eager":
-        tf.config.set_visible_devices([], 'GPU')
         from chessbot.train_pytorch import enforce_pytorch_gpu_or_die
         enforce_pytorch_gpu_or_die()
     else:
         enforce_gpu_or_die(max_tries=5, sleep_s=1.0)
-    timings['tf_init'] = time.time() - t0
+    timings['backend_init'] = time.time() - t0
 
     pending_dir = os.path.join(run_dir, "pending_training")
 

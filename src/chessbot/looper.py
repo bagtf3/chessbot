@@ -22,51 +22,60 @@ from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
 
-def make_ort_trt_infer(onnx_path, model_name, trt_cache, max_bs):
+def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
+    """Create an ORT TRT session using identical opts to prepare_val_trt so the
+    pre-compiled engine is reused without recompilation."""
     import hashlib
     import tensorrt  # registers TRT DLLs with Windows before ORT loads its TRT provider
     import onnxruntime as ort
-    prepped = os.path.join(trt_cache, f'{model_name}.onnx')
-    src = prepped if os.path.exists(prepped) else onnx_path
 
     h = hashlib.sha256()
-    with open(src, 'rb') as fh:
+    with open(onnx_path, 'rb') as fh:
         while True:
             chunk = fh.read(1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
-    prefix  = f'{model_name}_{h.hexdigest()[:12]}'
+    prefix = f'{model_name}_{h.hexdigest()[:12]}'
+    opt_bs = min(max_bs, 256)
+
+    ort.set_default_logger_severity(3)
+    sess_opts = ort.SessionOptions()
+    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.log_severity_level = 3
+
+    trt_opts = {
+        'trt_engine_cache_enable':  True,
+        'trt_engine_cache_path':    trt_cache,
+        'trt_engine_cache_prefix':  prefix,
+        'trt_fp16_enable':          True,
+        'trt_force_timing_cache':   True,
+        'trt_max_workspace_size':   4 * 1024 * 1024 * 1024,
+        'trt_profile_min_shapes':   'enc_in:1x64',
+        'trt_profile_opt_shapes':   f'enc_in:{opt_bs}x64',
+        'trt_profile_max_shapes':   f'enc_in:{max_bs}x64',
+        'trt_timing_cache_enable':  True,
+        'trt_timing_cache_path':    trt_cache,
+    }
+
     engines = [f for f in os.listdir(trt_cache)
                if f.startswith(prefix) and f.endswith('.engine')]
-
     if engines:
-        print(f'[ort_trt] engine: {engines[0]}')
-        trt_opts = {
-            'trt_engine_cache_enable': True,
-            'trt_engine_cache_path':   trt_cache,
-            'trt_engine_cache_prefix': prefix,
-            'trt_fp16_enable':         True,
-            'trt_timing_cache_enable': True,
-            'trt_timing_cache_path':   trt_cache,
-            'trt_profile_min_shapes':  'enc_in:1x64',
-            'trt_profile_opt_shapes':  'enc_in:256x64',
-            'trt_profile_max_shapes':  'enc_in:512x64',
-        }
-        providers = [('TensorrtExecutionProvider', trt_opts),
-                     'CUDAExecutionProvider', 'CPUExecutionProvider']
-        sess = ort.InferenceSession(src, providers=providers)
-        active = sess.get_providers()[0]
-        if active != 'TensorrtExecutionProvider':
-            print(f'[ort_trt] WARNING: expected TRT but got {active}')
-        else:
-            print(f'[ort_trt] provider: TensorrtExecutionProvider (cache hit)')
+        print(f'[ort_trt] loading cached engine: {engines[0]}')
     else:
-        print(f'[ort_trt] WARNING: no engine for {prefix!r}, falling back to CUDA EP')
-        sess = ort.InferenceSession(onnx_path,
-                                    providers=['CUDAExecutionProvider',
-                                               'CPUExecutionProvider'])
-        print(f'[ort_trt] provider: {sess.get_providers()[0]}')
+        print(f'[ort_trt] no cached engine for {prefix!r}, TRT will compile')
+
+    providers = [('TensorrtExecutionProvider', trt_opts)]
+    sess = ort.InferenceSession(onnx_path, sess_options=sess_opts, providers=providers)
+    active = sess.get_providers()[0]
+    if active != 'TensorrtExecutionProvider':
+        raise RuntimeError(f'[ort_trt] expected TRT but got {active}')
+    print(f'[ort_trt] provider: TensorrtExecutionProvider')
+    return sess
+
+
+def make_ort_trt_infer(onnx_path, model_name, trt_cache, max_bs):
+    sess = make_trt_session(onnx_path, model_name, trt_cache, max_bs)
 
     def infer(pair):
         enc_np = np.asarray(pair[0], dtype=np.int64)
@@ -783,7 +792,7 @@ class StockfishThread(object):
         return out
 
     def run(self):
-        self.eng = chess.engine.SimpleEngine.popen_uci(self.sf_loc)
+        self.eng = chess.engine.SimpleEngine.popen_uci(self.sf_loc, timeout=60)
         self.eng.configure(self.sf_config)
 
         while not self.stop_ev.is_set():

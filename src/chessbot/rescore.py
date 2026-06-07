@@ -90,9 +90,13 @@ class Lc0Thread:
 
         for i, item in enumerate(batch):
             _, _, x, mask, vwht, pwht = item
+            policy = xc0_policies[i] * mask
+            s = policy.sum()
+            if s > 0:
+                policy /= s
             self.results.append((
                 x, mask,
-                xc0_policies[i],
+                policy,
                 np.array(wdl[i], dtype=np.float32),
                 vwht, pwht,
             ))

@@ -138,6 +138,10 @@ class Config(object):
     retrain_size = 10240
     training_queue_buffer = 30720
 
+    # LC0 distillation enrichment
+    lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
+    lc0_distill_batch_size = 64   # positions per ORT inference call
+
     # inference / retrain backend selection
     inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt"
     retrain_backend          = "pt_eager"  # "pt_eager"

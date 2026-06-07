@@ -319,44 +319,58 @@ def make_pt_infer(model, max_bs):
     return model, fwd
 
 
-def export_pt_to_onnx(model, onnx_path):
+def export_ts_to_onnx(ts_path, onnx_path):
+    """
+    Export a TorchScript (.ts/.pt) model to ONNX with dynamic batch axis.
+    Tries dynamo export first; falls back to legacy opset-18 if dynamo
+    produces a fixed batch dimension or fails.
+    """
     import onnx
-    from onnx import shape_inference
+    from onnx import shape_inference as onnx_si
 
-    device = next(model.parameters()).device
-    model.eval()
+    model = torch.jit.load(ts_path, map_location='cuda').eval()
+    dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')
 
-    class Int32Wrapper(torch.nn.Module):
-        def __init__(self, m):
-            super().__init__()
-            self.m = m
-        def forward(self, t):
-            return self.m(t.long())
+    def has_dynamic_batch(path):
+        m = onnx.load(path)
+        dim0 = m.graph.input[0].type.tensor_type.shape.dim[0]
+        return bool(dim0.dim_param) or dim0.dim_value <= 0
 
-    export_model = Int32Wrapper(model)
-    dummy = torch.zeros(1, 64, dtype=torch.int32, device=device)
+    dynamo_ok = False
+    try:
+        torch.onnx.export(
+            model, dummy, onnx_path,
+            dynamo=True,
+            input_names=['enc_in'],
+            output_names=['policy_logits', 'value_out'],
+            dynamic_shapes=({0: torch.export.Dim('batch', min=1, max=512)},),
+        )
+        if has_dynamic_batch(onnx_path):
+            dynamo_ok = True
+            print(f'[export] dynamo ONNX -> {onnx_path}')
+        else:
+            print('[export] dynamo produced fixed batch, falling back to legacy')
+    except Exception as e:
+        print(f'[export] dynamo failed ({type(e).__name__}: {e}), falling back to legacy')
 
-    for opset in (14, 16):
-        try:
-            torch.onnx.export(
-                export_model,
-                dummy,
-                onnx_path,
-                input_names=["enc_in"],
-                output_names=["policy_logits", "value_out"],
-                dynamic_axes={
-                    "enc_in":        {0: "batch"},
-                    "policy_logits": {0: "batch"},
-                    "value_out":     {0: "batch"},
-                },
-                opset_version=opset,
-            )
-            print(f"[pytorch] ONNX export -> {onnx_path}  (opset {opset})")
-            break
-        except Exception as e:
-            print(f"[pytorch] opset {opset} failed ({type(e).__name__}), retrying...")
+    if not dynamo_ok:
+        torch.onnx.export(
+            model, dummy, onnx_path,
+            opset_version=18,
+            input_names=['enc_in'],
+            output_names=['policy_logits', 'value_out'],
+            dynamic_axes={
+                'enc_in':        {0: 'batch'},
+                'policy_logits': {0: 'batch'},
+                'value_out':     {0: 'batch'},
+            },
+            do_constant_folding=False,
+        )
+        print(f'[export] legacy opset-18 ONNX -> {onnx_path}')
 
     proto = onnx.load(onnx_path)
-    proto = shape_inference.infer_shapes(proto)
+    proto = onnx_si.infer_shapes(proto)
     onnx.save(proto, onnx_path)
-    print(f"[pytorch] ONNX shape inference complete")
+    del model
+    sz_mb = os.path.getsize(onnx_path) / 1024 / 1024
+    print(f'[export] shape inference complete  ({sz_mb:.1f} MB)')

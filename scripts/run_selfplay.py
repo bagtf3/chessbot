@@ -18,7 +18,7 @@ from chessbot.rescore import (
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
-from chessbot.validation import build_validation_summary, create_validation_config
+from chessbot.validation import build_validation_summary, create_validation_config, prepare_val_trt
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 
 import pickle
@@ -404,6 +404,7 @@ def main(run_tag):
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
                 working_cfg = create_validation_config(working_cfg, val_yaml_path)
+                working_cfg = prepare_val_trt(working_cfg)
             
             # update the rescorer config
             rescorer.config = working_cfg

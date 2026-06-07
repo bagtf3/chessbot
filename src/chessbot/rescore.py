@@ -397,7 +397,7 @@ class Rescorer(object):
         self.intake = deque()
         self.pending = {}
 
-        book_path = cfg.enrichment_book_path or os.getenv('ENRICHMENT_BOOK_PATH', '')
+        book_path = os.getenv('ENRICHMENT_BOOK_PATH', '')
         self.enrichment_book = None
         if book_path and os.path.exists(book_path):
             with open(book_path, 'rb') as f:
@@ -406,17 +406,20 @@ class Rescorer(object):
                 (f"{RS} Enrichment book: {len(self.enrichment_book)} "
                 f"positions from {book_path}"))
 
-        lc0_onnx = cfg.lc0_distill_onnx or os.getenv('LC0_DISTILL_ONNX', '')
+        lc0_model     = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
+        lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
         self.lc0_thread = None
-        if lc0_onnx and os.path.exists(lc0_onnx):
-            import onnxruntime as ort
-            sess = ort.InferenceSession(
-                lc0_onnx,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-            )
-            batch_size = getattr(cfg, 'lc0_distill_batch_size', 64)
-            self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
-            print(f"{RS} Lc0Thread: batch_size={batch_size} onnx={lc0_onnx}")
+        if lc0_model and lc0_trt_cache:
+            from chessbot.lc0_utils import make_lc0_trt_session
+            batch_size = cfg.lc0_distill_batch_size
+            lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
+            sess = make_lc0_trt_session(lc0_onnx, lc0_model, lc0_trt_cache,
+                                        opt_batch=batch_size, max_batch=batch_size * 2)
+            if sess.get_providers()[0] == 'TensorrtExecutionProvider':
+                self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
+                print(f"{RS} Lc0Thread: TRT batch_size={batch_size}")
+            else:
+                print(f"{RS} Lc0Thread: no TRT engine found, enrichment disabled")
 
         self.init_analyzer()
 

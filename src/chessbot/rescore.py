@@ -28,7 +28,8 @@ RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 EVICTION_WINDOW = 5000
 EVICTION_MAX_SIZE = 80000
-
+C = 0.9699
+D = d = np.arctanh(0.5)
 
 def lc0_table_index(features_uint8):
     """Derive LC0->XC0 table index (0-3) from suffix planes of lc0_features() output."""
@@ -238,7 +239,9 @@ class SFRescoreThread:
     def __init__(self, sf_game_q, sf_res_q, cfg):
         self.game_q = sf_game_q
         self.res_q  = sf_res_q
-        self.base_depth = cfg.rescore_depth  # config floor; depth may throttle below this
+
+        # config floor; depth may throttle below this
+        self.base_depth = cfg.rescore_depth  
         self.depth = self.base_depth
         self.sf_config = {'Hash': 256}
         self.stop_ev = threading.Event()
@@ -258,7 +261,8 @@ class SFRescoreThread:
         self.t.start()
 
     def close(self):
-        self.stop_ev.set()  # each thread checks its own stop_ev; no shared-queue sentinel needed
+        # each thread checks its own stop_ev; no shared-queue sentinel needed
+        self.stop_ev.set()  
         if self.t is not None:
             self.t.join()
         if self.eng is not None:
@@ -293,7 +297,8 @@ class SFRescoreThread:
                         best_cp  = score_cp_stm_pov(info['score'])
                         best_abs = score_cp_white_pov(info['score'], clipped=False)
                     else:
-                        # partial cache hit: best known, cp filled in by handle_game_results
+                        # partial cache hit: best known
+                        # cp filled in by handle_game_results
                         best_uci = known_best_uci
                         best_cp  = None
                         best_abs = None
@@ -347,7 +352,7 @@ class Rescorer(object):
         self.pending_metrics = []
 
 
-        self.start_time = None  # set on first finalized game to exclude idle startup time
+        self.start_time = None  # set on first game to exclude idle startup time
         self.games_seen = set()
         self.games_processed = 0
         self.written_total = 0
@@ -392,14 +397,16 @@ class Rescorer(object):
         self.intake = deque()
         self.pending = {}
 
-        book_path = getattr(cfg, 'enrichment_book_path', '') or os.getenv('ENRICHMENT_BOOK_PATH', '')
+        book_path = cfg.enrichment_book_path or os.getenv('ENRICHMENT_BOOK_PATH', '')
         self.enrichment_book = None
         if book_path and os.path.exists(book_path):
             with open(book_path, 'rb') as f:
                 self.enrichment_book = pickle.load(f)
-            print(f"{RS} Enrichment book: {len(self.enrichment_book)} positions from {book_path}")
+            print(
+                (f"{RS} Enrichment book: {len(self.enrichment_book)} "
+                f"positions from {book_path}"))
 
-        lc0_onnx = getattr(cfg, 'lc0_distill_onnx', '') or os.getenv('LC0_DISTILL_ONNX', '')
+        lc0_onnx = cfg.lc0_distill_onnx or os.getenv('LC0_DISTILL_ONNX', '')
         self.lc0_thread = None
         if lc0_onnx and os.path.exists(lc0_onnx):
             import onnxruntime as ort
@@ -414,7 +421,7 @@ class Rescorer(object):
         self.init_analyzer()
 
     def maybe_enrich(self, entry, sfen):
-        """50% chance to replace policy+Y with enrichment book data for known opening positions."""
+        """50% chance to replace policy+Y with enrichment book data for book positions"""
         if self.enrichment_book is None:
             return entry
         book_entry = self.enrichment_book.get(sfen)
@@ -446,7 +453,7 @@ class Rescorer(object):
         hmc = b_fast.halfmove_clock()
         halfmoves = 0 if hmc < 45 else hmc
         cache_key = (short_fen, reps, halfmoves)
-        best_cp = int(np.arctanh(np.clip(Q_stm, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5))
+        best_cp = int(np.arctanh(np.clip(Q_stm, -C, C)) * 100.0 / D)
         best_abs = best_cp if turn else -best_cp
         self.cache.set_best(
             cache_key, mv, best_cp, best_abs, self.games_processed, depth=depth
@@ -653,7 +660,8 @@ class Rescorer(object):
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
-        sf_positions = []  # (ply_idx, board_copy, xerces_uci, known_best_uci) for cache misses
+        # (ply_idx, board_copy, xerces_uci, known_best_uci) for cache misses
+        sf_positions = []
         repetitions = defaultdict(int)
         repetitions[b_fast.fen(include_counters=False)] += 1
         # walk each move: route SF moves, build ply state, check cache
@@ -692,9 +700,9 @@ class Rescorer(object):
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q if turn else -this_q
 
-            sf_wdl_tr = tr.get('sf_wdl')
+            sf wdl_tr = tr.get('sf_wdl')
             if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
-                Y_init = (0.5 * z_to_wdl(Z_stm) + 0.5 * np.array(sf_wdl_tr, dtype=np.float32))
+                Y_init = (0.5*z_to_wdl(Z_stm) + 0.5*np.array(sf_wdl_tr, dtype=np.float32))
             else:
                 Y_init = z_to_wdl(Z_stm)
 
@@ -714,11 +722,11 @@ class Rescorer(object):
                     'nn_value': tr.get('nn_value'),
                     'nn_raw_priors': tr.get('nn_raw_priors', []),
                     'mass_on_legal': tr.get('nn_mass_on_legal'),
-                    'sf_cp': int(np.arctanh(np.clip(Q, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5)),
+                    'sf_cp': int(np.arctanh(np.clip(Q, -C, C)) * 100.0 / D),
                     'sf_wdl': None,
                     'candidate_visits': [(c['uci'], c['visits']) for c in cm],
                     'result_z_stm': Z_stm,
-                    'target_y': float(Y_init[0] - Y_init[2]),
+                    'target_y': Y_init[0] - Y_init[2],
                     'policy_eligible': sf_pwht > 0
                 })
 
@@ -812,7 +820,8 @@ class Rescorer(object):
                     ply['played_abs'] = played_abs
                     ply['resolved'] = True
                 else:
-                    # best known but xerces move unscored — pass known_best_uci to skip pass 1
+                    # best known but xerces move unscored
+                    # pass known_best_uci to skip pass 1
                     sf_positions.append((i, board_ch.copy(), xerces_uci, best_uci))
             else:
                 # full cache miss — thread runs both passes
@@ -1127,7 +1136,8 @@ class Rescorer(object):
         scw = self.sample_counts_window
 
         # loop 2: compute WDL targets and CE, classify into hard/soft
-        for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), aux in zip(pending, pending_aux):
+        for tup, aux in zip(pending, pending_aux):
+            x, mask, policy, Q, is_white, ply_i, vwht, pwht = tup
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply_i, result)
             z_eff = eff_z_white if is_white else -eff_z_white
@@ -1169,7 +1179,7 @@ class Rescorer(object):
         start_fen    = game_data['start_fen']
         moves_played = game_data['moves_played']
 
-        # hard-accepted: classify each entry, collect LC0 waypoints for single-pass replay
+        # hard-accepted: classify each entry, collect LC0 waypoints for singlepass replay
         lc0_waypoints = {}
         for entry, (hit_kl, hit_ce, hit_cpl), aux in hard_accepted:
             sc['accepted'] += 1
@@ -1204,7 +1214,10 @@ class Rescorer(object):
                     entry, aux = lc0_waypoints[ply_i]
                     got_fen = b_lc0.fen(include_counters=False)
                     if got_fen != aux['sfen']:
-                        print(f"[rescore] FEN mismatch at ply {ply_i}: {got_fen} != {aux['sfen']}")
+                        msg = f"[rescore] FEN mismatch at ply {ply_i}: {got_fen} "
+                        msg += f"!= {aux['sfen']}"
+                        print(msg)
+
                     x, mask, _, _, vwht, _ = entry
                     self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
                     n_pv = 0
@@ -1662,7 +1675,11 @@ class Rescorer(object):
 
         self.collar_history.append(dict(self.collar_window))
         self.collar_history = self.collar_history[-10:]
-        zero_collar = {'games': 0, 'triggers': 0, 'positions': 0, 'total_pos': 0, 'seen': 0}
+        zero_collar = {
+            'games': 0, 'triggers': 0, 'positions': 0,
+            'total_pos': 0, 'seen': 0
+        }
+        
         self.collar_window = dict(zero_collar)
 
         self.analyzed_results = []

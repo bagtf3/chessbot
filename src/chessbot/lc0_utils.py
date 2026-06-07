@@ -1,0 +1,213 @@
+# Board encoding adapted from lczero-tools (MIT license, abandoned ~2019).
+# Original source: https://github.com/so-much-meta/lczero_tools
+# UCI-to-index tables vendored into xerces_training (same origin).
+# Credit: Leela Chess Zero contributors and the lczero_tools authors.
+
+import collections
+import os
+import struct
+
+import chess
+import numpy as np
+
+from xerces_training.uci_to_idx import IDX_TO_UCI, uci_to_idx as UCI_TO_IDX
+from xerces_training.parse_utils import uci_to_xerces_index
+
+
+HistData = collections.namedtuple(
+    'HistData', 'piece_bytes rep us_oo us_ooo them_oo them_ooo stm rule50')
+PACK_Q = struct.Struct('>Q').pack
+
+
+class Lc0Board:
+    """LC0-compatible board encoder producing (112, 8, 8) float32 feature planes.
+
+    Maintains up to 8 steps of move history for repetition detection and
+    the history planes used by LC0/t1-family models.
+    Always encode from STM perspective (us = side to move).
+    """
+
+    def __init__(self, board: chess.Board = None):
+        self.board = board.copy(stack=False) if board else chess.Board()
+        self.hist  = []
+        self.tctr  = collections.Counter()
+        self.record()
+
+    @classmethod
+    def from_fen(cls, fen: str):
+        return cls(chess.Board(fen))
+
+    def push_uci(self, uci: str):
+        self.board.push(chess.Move.from_uci(uci))
+        self.record()
+
+    def push(self, move: chess.Move):
+        self.board.push(move)
+        self.record()
+
+    def record(self):
+        b   = self.board
+        key = b._transposition_key()
+        self.tctr.update((key,))
+        stm = b.turn
+        pm  = b.pieces_mask
+        raw = (
+            b''.join(PACK_Q(pm(pt, chess.WHITE)) for pt in range(1, 7)) +
+            b''.join(PACK_Q(pm(pt, chess.BLACK)) for pt in range(1, 7))
+        )
+        cr = b.castling_rights
+        if stm:
+            us_ooo, us_oo     = (cr >> chess.A1) & 1, (cr >> chess.H1) & 1
+            them_ooo, them_oo = (cr >> chess.A8) & 1, (cr >> chess.H8) & 1
+        else:
+            us_ooo, us_oo     = (cr >> chess.A8) & 1, (cr >> chess.H8) & 1
+            them_ooo, them_oo = (cr >> chess.A1) & 1, (cr >> chess.H1) & 1
+        self.hist.append(HistData(
+            piece_bytes=raw, rep=int(self.tctr[key] > 1),
+            us_oo=us_oo, us_ooo=us_ooo,
+            them_oo=them_oo, them_ooo=them_ooo,
+            stm=0 if stm else 1,
+            rule50=b.halfmove_clock,
+        ))
+
+    @staticmethod
+    def decode_pieces(raw: bytes, is_black: bool) -> np.ndarray:
+        bits   = np.unpackbits(np.frombuffer(raw, dtype=np.uint8))
+        planes = bits[::-1].reshape(12, 8, 8)[::-1].astype(np.float32)
+        if is_black:
+            planes = planes.reshape(2, 6, 8, 8)[::-1, :, ::-1].reshape(12, 8, 8).copy()
+        return planes
+
+    def features(self) -> np.ndarray:
+        """Return (112, 8, 8) float32 suitable for LC0 model input."""
+        cur      = self.hist[-1]
+        is_black = bool(cur.stm)
+        chunks   = []
+        for h in self.hist[-1:-9:-1]:
+            chunks.append(self.decode_pieces(h.piece_bytes, is_black))
+            chunks.append(np.full((1, 8, 8), float(h.rep), dtype=np.float32))
+        filled = min(len(self.hist), 8)
+        if filled < 8:
+            chunks.append(np.zeros(((8 - filled) * 13, 8, 8), dtype=np.float32))
+        for val in (cur.us_ooo, cur.us_oo, cur.them_ooo, cur.them_oo, cur.stm):
+            chunks.append(np.full((1, 8, 8), float(val), dtype=np.float32))
+        chunks.append(np.full((1, 8, 8), cur.rule50 / 99.0, dtype=np.float32))
+        chunks.append(np.zeros((1, 8, 8), dtype=np.float32))
+        chunks.append(np.ones((1, 8, 8),  dtype=np.float32))
+        return np.concatenate(chunks, axis=0)
+
+    def policy_indices(self, moves=None) -> list:
+        """UCI moves -> LC0 1858-dim policy indices. Defaults to legal moves."""
+        if moves is None:
+            moves = [m.uci() for m in self.board.legal_moves]
+        cur = self.hist[-1]
+        tbl = UCI_TO_IDX[(cur.us_ooo | cur.us_oo) + 2 * cur.stm]
+        return [tbl[m.rstrip('n')] for m in moves]
+
+    def table_index(self) -> int:
+        """Index 0-3 selecting the correct IDX_TO_UCI / UCI_TO_IDX table."""
+        cur = self.hist[-1]
+        return (cur.us_ooo | cur.us_oo) + 2 * cur.stm
+
+
+def short_fen(board: chess.Board) -> str:
+    """4-field FEN (position, turn, castling, ep) — no clocks."""
+    return ' '.join(board.fen().split()[:4])
+
+
+def softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - x.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def build_lc0_to_xc0_maps():
+    """Precompute 4 index arrays mapping LC0 policy index to XC0 flat index.
+
+    Returns list of 4 int32 arrays shape (1858,); -1 where unmapped.
+    Table order: 0=white no-castle, 1=white castle, 2=black no-castle, 3=black castle.
+    """
+    maps = []
+    for ti in range(4):
+        stm_white = ti < 2
+        mapping   = np.full(1858, -1, dtype=np.int32)
+        for lc0_idx, uci in IDX_TO_UCI[ti].items():
+            mapping[lc0_idx] = uci_to_xerces_index(uci, stm_white=stm_white)
+        maps.append(mapping)
+    return maps
+
+
+LC0_TO_XC0 = build_lc0_to_xc0_maps()
+
+
+def lc0_logits_to_xc0_batch(logits: np.ndarray, table_indices: np.ndarray) -> np.ndarray:
+    """Convert a batch of LC0 policy logits to XC0 4288-dim probability arrays.
+
+    logits:        (N, 1858) float32 — raw policy logits from LC0/ORT model
+    table_indices: (N,)      int     — per-position table index 0-3
+
+    Returns (N, 4288) float32 with softmaxed probabilities placed in XC0 slots.
+    Non-moves are zero.
+    """
+    n      = len(logits)
+    result = np.zeros((n, 4288), dtype=np.float32)
+    for ti in range(4):
+        mask = np.where(table_indices == ti)[0]
+        if len(mask) == 0:
+            continue
+        batch   = logits[mask].astype(np.float64)
+        e       = np.exp(batch - batch.max(axis=1, keepdims=True))
+        probs   = (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
+        mapping = LC0_TO_XC0[ti]
+        valid   = mapping >= 0
+        result[np.ix_(mask, mapping[valid])] = probs[:, valid]
+    return result
+
+
+def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
+                          opt_batch: int = 256, max_batch: int = 512):
+    """Create an ORT session for an LC0 model, loading a pre-compiled TRT engine if found.
+
+    Checks trt_cache for a matching .engine file keyed by sha256[:12] of the ONNX source.
+    Falls back to CUDA EP if no engine is present. Prints one-line confirmation.
+    """
+    import hashlib
+    import tensorrt
+    import onnxruntime as ort
+
+    prepped = os.path.join(trt_cache, f'{model_name}.onnx')
+    src     = prepped if os.path.exists(prepped) else onnx_path
+    h = hashlib.sha256()
+    with open(src, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    prefix  = f'{model_name}_{h.hexdigest()[:12]}'
+    engines = [f for f in os.listdir(trt_cache)
+               if f.startswith(prefix) and f.endswith('.engine')]
+
+    if engines:
+        print(f'TRT engine: {engines[0]}')
+        trt_opts = {
+            'trt_engine_cache_enable': True,
+            'trt_engine_cache_path':   trt_cache,
+            'trt_engine_cache_prefix': prefix,
+            'trt_fp16_enable':         True,
+            'trt_timing_cache_enable': True,
+            'trt_timing_cache_path':   trt_cache,
+            'trt_profile_min_shapes':  f'/input/planes:1x112x8x8',
+            'trt_profile_opt_shapes':  f'/input/planes:{opt_batch}x112x8x8',
+            'trt_profile_max_shapes':  f'/input/planes:{max_batch}x112x8x8',
+        }
+        providers = [('TensorrtExecutionProvider', trt_opts),
+                     'CUDAExecutionProvider', 'CPUExecutionProvider']
+        sess   = ort.InferenceSession(src, providers=providers)
+        active = sess.get_providers()[0]
+        if active != 'TensorrtExecutionProvider':
+            print(f'WARNING: expected TRT but got {active}')
+        else:
+            print(f'Provider: TensorrtExecutionProvider (from cache)')
+    else:
+        print(f'No TRT engine for prefix {prefix!r}, using CUDA EP')
+        sess = ort.InferenceSession(onnx_path,
+                                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        print(f'Provider: {sess.get_providers()[0]}')
+    return sess

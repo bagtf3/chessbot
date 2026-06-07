@@ -2,7 +2,7 @@ import re
 import subprocess
 import chess, chess.engine
 
-from chessbot import LC0_LOC
+from chessbot import LC0_LOC, LC0_WEIGHTS
 
 
 def parse_int_safe(s, default=None):
@@ -83,6 +83,11 @@ class Lc0Parser:
         return rows
 
 
+def apply_lc0_weights(cfg):
+    if LC0_WEIGHTS and "WeightsFile" not in cfg:
+        cfg["WeightsFile"] = LC0_WEIGHTS
+
+
 def lc0_analyze(board, nodes=4000, lc0_loc=None, engine_cfg=None):
     """Run lc0 on board for the given node budget. Returns sorted rows.
 
@@ -94,6 +99,7 @@ def lc0_analyze(board, nodes=4000, lc0_loc=None, engine_cfg=None):
     last_by_move = {}
 
     cfg = {"VerboseMoveStats": True, "MinibatchSize": 64}
+    apply_lc0_weights(cfg)
     if engine_cfg:
         cfg.update(engine_cfg)
 
@@ -116,6 +122,7 @@ class Lc0Session:
         loc = lc0_loc or LC0_LOC
         self.eng = chess.engine.SimpleEngine.popen_uci(loc, stderr=subprocess.DEVNULL)
         base_cfg = {"VerboseMoveStats": True, "MinibatchSize": 64}
+        apply_lc0_weights(base_cfg)
         if cfg:
             base_cfg.update(cfg)
         self.eng.configure(base_cfg)
@@ -175,7 +182,8 @@ class Lc0Session:
 
     def new_game(self):
         """Send ucinewgame to clear lc0's tree cache."""
-        self.eng.send_line("ucinewgame")
+        self.eng.protocol.loop.call_soon_threadsafe(
+            self.eng.protocol.send_line, "ucinewgame")
 
     def close(self):
         self.eng.quit()

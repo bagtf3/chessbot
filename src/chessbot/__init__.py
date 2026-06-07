@@ -1,31 +1,12 @@
-# try to get ahead of TF GPU mem management
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
-cuda_dir = os.getenv("CUDA_DIR", "")
-if cuda_dir:
-    os.environ["XLA_FLAGS"] = f'--xla_gpu_cuda_data_dir="{cuda_dir}"'
-
-# global mixed precision policy
-from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy('mixed_float16')
-
-try:
-    import tensorflow as tf
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        for g in gpus:
-            tf.config.experimental.set_memory_growth(g, True)
-except Exception as e:
-    print(f"Error setting TF GPU mem: {e}")
     
-SF_LOC = os.getenv("SF_LOC", "")
-LC0_LOC = os.getenv("LC0_LOC", "")
+SF_LOC      = os.getenv("SF_LOC", "")
+LC0_LOC     = os.getenv("LC0_LOC", "")
+LC0_WEIGHTS = os.getenv("LC0_WEIGHTS", "")
 ENDGAME_LOC = os.getenv("ENDGAME_LOC", "")
 SP_DIR = os.getenv("SP_DIR", "")
 MODEL_DIR = os.getenv("MODEL_DIR", "")

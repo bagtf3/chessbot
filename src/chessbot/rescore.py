@@ -22,11 +22,94 @@ from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
     batch_policy_metrics_from_priors, print_validation,
 )
+from chessbot.lc0_utils import lc0_logits_to_xc0_batch
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 EVICTION_WINDOW = 5000
 EVICTION_MAX_SIZE = 80000
+
+
+def lc0_table_index(features_uint8):
+    """Derive LC0->XC0 table index (0-3) from suffix planes of lc0_features() output."""
+    us_ooo = int(features_uint8[104, 0, 0])
+    us_oo  = int(features_uint8[105, 0, 0])
+    stm    = int(features_uint8[108, 0, 0])  # 0=white, 1=black
+    return (us_ooo | us_oo) + 2 * stm
+
+
+class Lc0Thread:
+    """
+    Synchronous batcher for LC0 distillation inference.
+
+    Accumulates (112,8,8) uint8 feature arrays until batch_size is reached,
+    then runs a single ORT forward pass and converts results to XC0 training
+    samples. No real thread — flushes inline to share the caller's GPU context
+    rather than spawning a competing CUDA stream.
+
+    batch_size is the primary GPU-contention lever: larger = less frequent
+    inference interruptions to the selfplay workers.
+    """
+
+    def __init__(self, ort_session, batch_size=64):
+        self.sess       = ort_session
+        self.batch_size = batch_size
+        self.pending    = []   # (features_uint8, table_index, x, mask, vwht, pwht)
+        self.results    = []   # completed (x, mask, xc0_policy, lc0_wdl, vwht, pwht)
+        self.n_inferences = 0
+        self.n_samples    = 0
+
+        # discover input/output names from session metadata once
+        inputs  = self.sess.get_inputs()
+        outputs = self.sess.get_outputs()
+        self.input_name   = inputs[0].name
+        self.output_names = [o.name for o in outputs]
+
+    def submit(self, features_uint8, x, mask, vwht, pwht):
+        ti = lc0_table_index(features_uint8)
+        self.pending.append((features_uint8, ti, x, mask, vwht, pwht))
+        if len(self.pending) >= self.batch_size:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        batch        = self.pending
+        self.pending = []
+
+        feats = np.stack([item[0] for item in batch]).astype(np.float32)
+        feats[:, 109] /= 99.0  # rule50 plane: raw halfmove clock -> [0,1]
+
+        outs   = self.sess.run(self.output_names, {self.input_name: feats})
+        logits = outs[0]  # (N, 1858) policy logits
+        wdl    = outs[1]  # (N, 3) WDL probs, STM-POV
+
+        tis          = np.array([item[1] for item in batch])
+        xc0_policies = lc0_logits_to_xc0_batch(logits, tis)
+
+        for i, item in enumerate(batch):
+            _, _, x, mask, vwht, pwht = item
+            self.results.append((
+                x, mask,
+                xc0_policies[i],
+                np.array(wdl[i], dtype=np.float32),
+                vwht, pwht,
+            ))
+
+        self.n_inferences += 1
+        self.n_samples    += len(batch)
+
+    def drain(self):
+        out          = self.results
+        self.results = []
+        return out
+
+    def stats(self):
+        return {
+            'inferences': self.n_inferences,
+            'samples':    self.n_samples,
+            'pending':    len(self.pending),
+        }
 
 
 class SFCache:
@@ -51,7 +134,7 @@ class SFCache:
             entry['hits'] += 1
             entry['last_seen'] = game_num
 
-    def set_best(self, key, uci, cp, abs_cp, wdl, game_num, depth=0):
+    def set_best(self, key, uci, cp, abs_cp, game_num, depth=0):
         if key not in self.data:
             self.data[key] = {
                 'best': None, 'others': {}, 'hits': 0, 'last_seen': game_num, 'depth': 0
@@ -59,9 +142,7 @@ class SFCache:
         entry = self.data[key]
         if depth < entry.get('depth', 0):
             return False
-        if wdl is None and entry['best'] is not None:
-            wdl = entry['best'][3]
-        entry['best'] = (uci, cp, abs_cp, wdl)
+        entry['best'] = (uci, cp, abs_cp)
         entry['depth'] = depth
         entry['hits'] += 1
         entry['last_seen'] = game_num
@@ -159,7 +240,7 @@ class SFRescoreThread:
         self.res_q  = sf_res_q
         self.base_depth = cfg.rescore_depth  # config floor; depth may throttle below this
         self.depth = self.base_depth
-        self.sf_config = {'Hash': 256, 'UCI_ShowWDL': True}
+        self.sf_config = {'Hash': 256}
         self.stop_ev = threading.Event()
         self.t = None
         self.eng = None
@@ -208,21 +289,15 @@ class SFRescoreThread:
                         info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
                         elapsed += time.time() - t0
                         best_uci = str(info['pv'][0])
+                        pv_ucis  = [str(m) for m in info.get('pv', [])[1:5]]
                         best_cp  = score_cp_stm_pov(info['score'])
                         best_abs = score_cp_white_pov(info['score'], clipped=False)
-                        wdl = info.get('wdl')
-                        wdl_val = (
-                            (wdl.relative.wins / 1000.0,
-                             wdl.relative.draws / 1000.0,
-                             wdl.relative.losses / 1000.0)
-                            if wdl is not None else None
-                        )
                     else:
-                        # partial cache hit: best known, cp/wdl filled in by handle_game_results
+                        # partial cache hit: best known, cp filled in by handle_game_results
                         best_uci = known_best_uci
                         best_cp  = None
                         best_abs = None
-                        wdl_val  = None
+                        pv_ucis  = []
 
                     # pass 2: score xerces's move only if it differs from best
                     if xerces_uci != best_uci:
@@ -242,9 +317,9 @@ class SFRescoreThread:
                     results.append({
                         'ply_idx':    ply_idx,
                         'best_uci':   best_uci,
+                        'pv_ucis':    pv_ucis,
                         'best_cp':    best_cp,
                         'best_abs':   best_abs,
-                        'wdl':        wdl_val,
                         'played_cp':  played_cp,
                         'played_abs': played_abs,
                         'elapsed':    elapsed,
@@ -316,7 +391,39 @@ class Rescorer(object):
         self.intake = deque()
         self.pending = {}
 
+        book_path = getattr(cfg, 'enrichment_book_path', '') or os.getenv('ENRICHMENT_BOOK_PATH', '')
+        self.enrichment_book = None
+        if book_path and os.path.exists(book_path):
+            with open(book_path, 'rb') as f:
+                self.enrichment_book = pickle.load(f)
+            print(f"{RS} Enrichment book: {len(self.enrichment_book)} positions from {book_path}")
+
+        lc0_onnx = getattr(cfg, 'lc0_distill_onnx', '') or os.getenv('LC0_DISTILL_ONNX', '')
+        self.lc0_thread = None
+        if lc0_onnx and os.path.exists(lc0_onnx):
+            import onnxruntime as ort
+            sess = ort.InferenceSession(
+                lc0_onnx,
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+            )
+            batch_size = getattr(cfg, 'lc0_distill_batch_size', 64)
+            self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
+            print(f"{RS} Lc0Thread: batch_size={batch_size} onnx={lc0_onnx}")
+
         self.init_analyzer()
+
+    def maybe_enrich(self, entry, sfen):
+        """50% chance to replace policy+Y with enrichment book data for known opening positions."""
+        if self.enrichment_book is None:
+            return entry
+        book_entry = self.enrichment_book.get(sfen)
+        if book_entry is None or random.random() >= 0.5:
+            return entry
+        x, mask, policy, Y, vwht, pwht = entry
+        book_xc0, book_wdl = book_entry
+        if not book_xc0.any():
+            return entry
+        return (x, mask, book_xc0, np.array(book_wdl, dtype=np.float32), vwht, pwht)
 
     def close(self):
         pass
@@ -341,13 +448,17 @@ class Rescorer(object):
         best_cp = int(np.arctanh(np.clip(Q_stm, -0.9699, 0.9699)) * 100.0 / np.arctanh(0.5))
         best_abs = best_cp if turn else -best_cp
         self.cache.set_best(
-            cache_key, mv, best_cp, best_abs, None, self.games_processed, depth=depth
+            cache_key, mv, best_cp, best_abs, self.games_processed, depth=depth
         )
 
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
 
     def tick(self):
+        if self.lc0_thread is not None:
+            for sample in self.lc0_thread.drain():
+                self.training_data.append(sample)
+
         # drain completed game batches from SF threads
         while True:
             try:
@@ -519,6 +630,7 @@ class Rescorer(object):
         is_validation_game = 'validation' in game_data.get('scenario', '').lower()
         skip_all_training = is_validation_game
 
+        # snapshot config fields so hot-reloads don't affect an in-flight game
         game_cfg_keys = (
             'train_on_stockfish', 'z_mix',
             'KL_weight_boost', 'KL_boost_threshold',
@@ -668,6 +780,7 @@ class Rescorer(object):
                 'best_cp': None,
                 'best_abs': None,
                 'sf_wdl': None,
+                'pv_ucis': [],
                 'played_cp': None,
                 'played_abs': None,
                 'resolved': False,
@@ -680,12 +793,10 @@ class Rescorer(object):
                 entry = None
 
             if entry and entry['best'] is not None:
-                best_uci, best_cp, best_abs, *_wdl = entry['best']
-                best_wdl = _wdl[0] if _wdl else None
+                best_uci, best_cp, best_abs, *_ = entry['best']
                 ply['best_uci'] = best_uci
                 ply['best_cp'] = best_cp
                 ply['best_abs'] = best_abs
-                ply['sf_wdl'] = best_wdl
                 self.cache.touch(cache_key, self.games_processed)
                 self.n_cache_hits += 1
 
@@ -730,7 +841,6 @@ class Rescorer(object):
             best_uci   = r['best_uci']
             best_cp    = r['best_cp']
             best_abs   = r['best_abs']
-            wdl        = r['wdl']
             played_cp  = r['played_cp']
             played_abs = r['played_abs']
 
@@ -750,26 +860,24 @@ class Rescorer(object):
                 # full analysis result — write best to cache
                 if cache_eligible:
                     self.cache.set_best(
-                        key, best_uci, best_cp, best_abs, wdl,
+                        key, best_uci, best_cp, best_abs,
                         self.games_processed, depth=depth
                     )
                 ply['best_uci'] = best_uci
                 ply['best_cp']  = best_cp
                 ply['best_abs'] = best_abs
-                ply['sf_wdl']   = wdl
             # else: partial hit — best_* already populated from cache in start_game
 
             if xerces_uci != best_uci:
                 # xerces deviated — check if it actually found something better
                 entry = self.cache.get(key) if cache_eligible else None
                 if entry and entry['best'] is not None:
-                    old_best_uci, old_best_cp, old_best_abs, *_wdl = entry['best']
-                    old_best_wdl = _wdl[0] if _wdl else None
+                    old_best_uci, old_best_cp, old_best_abs, *_ = entry['best']
                     if played_cp > old_best_cp:
                         # xerces move is stronger — promote it to best in cache
                         promoted = self.cache.set_best(
                             key, xerces_uci, played_cp, played_abs,
-                            old_best_wdl, self.games_processed, depth=depth
+                            self.games_processed, depth=depth
                         )
                         self.cache.set_move(
                             key, old_best_uci, old_best_cp, old_best_abs,
@@ -792,6 +900,7 @@ class Rescorer(object):
                         self.games_processed
                     )
 
+            ply['pv_ucis']    = r.get('pv_ucis', [])
             ply['played_cp']  = played_cp
             ply['played_abs'] = played_abs
             ply['resolved']   = True
@@ -825,7 +934,7 @@ class Rescorer(object):
         eval_trace = []
         turn_at = {}
         pending = []
-        pending_meta = []
+        pending_aux = []
         kl_map = {}
 
         for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
@@ -916,6 +1025,8 @@ class Rescorer(object):
                 if is_true_blunder:
                     vmap[xc0_uci] = max(1, xc0_n // 4)
 
+            is_blunder = loss_this >= blunder_cp and is_true_blunder
+
             # re-sort after any adjustments
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
             if not visits or sum(v[1] for v in visits) <= 0:
@@ -950,19 +1061,22 @@ class Rescorer(object):
                 policy[idx] += p
 
             pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
-            pending_meta.append({
-                'stm': turn,
-                'nn_value': tr.get('nn_value'),
-                'nn_wdl': tr.get('nn_wdl'),
-                'nn_raw_priors': tr.get('nn_raw_priors', []),
-                'mass_on_legal': tr.get('nn_mass_on_legal'),
-                'best_wdl': tr.get('best_wdl'),
-                'sf_cp': best_cp,
-                'sf_wdl': sf_wdl,
+            pending_aux.append({
+                'sfen':            ply['cache_key'][0],
+                'pv_ucis':         ply.get('pv_ucis', []) if is_blunder else [],
+                'is_blunder':      is_blunder,
+                'ply_i':           i,
+                'stm':             turn,
+                'nn_value':        tr.get('nn_value'),
+                'nn_wdl':          tr.get('nn_wdl'),
+                'nn_raw_priors':   tr.get('nn_raw_priors', []),
+                'mass_on_legal':   tr.get('nn_mass_on_legal'),
+                'best_wdl':        tr.get('best_wdl'),
+                'sf_cp':           best_cp,
                 'candidate_visits': list(zip(mvs, vis)),
-                'result_z_stm': Z_stm,
-                'kl': kl,
-                'cpl': loss_this
+                'result_z_stm':    Z_stm,
+                'kl':              kl,
+                'cpl':             loss_this,
             })
 
         eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
@@ -1007,9 +1121,7 @@ class Rescorer(object):
         sc = self.sample_counts
         scw = self.sample_counts_window
 
-        for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), meta in zip(
-            pending, pending_meta
-        ):
+        for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), aux in zip(pending, pending_aux):
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply_i, result)
             z_eff = eff_z_white if is_white else -eff_z_white
@@ -1017,9 +1129,9 @@ class Rescorer(object):
                 n_diff += 1
 
             z = z_eff if cfg.use_collar_rescoring else z_orig
-            Y = blend_wdl(z, meta.get('best_wdl'), meta.get('sf_wdl'), is_white)
+            Y = blend_wdl(z, aux.get('best_wdl'), is_white)
 
-            nn_wdl = meta['nn_wdl']
+            nn_wdl = aux['nn_wdl']
             if nn_wdl is not None:
                 eps = 1e-7
                 nw = nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0])
@@ -1028,10 +1140,9 @@ class Rescorer(object):
                 ce = -float(np.dot(Y, np.log(p)))
             else:
                 ce = 0.0
-            kl = meta['kl']
-            hit_kl = kl > kl_t
-            hit_ce = ce > ce_t
-            hit_cpl = meta['cpl'] >= cpl_t
+            hit_kl  = aux['kl'] > kl_t
+            hit_ce  = ce > ce_t
+            hit_cpl = aux['cpl'] >= cpl_t
 
             sc['total'] += 1
             scw['total'] += 1
@@ -1039,18 +1150,21 @@ class Rescorer(object):
             entry = (x, mask, policy, Y, vwht, pwht)
             flags = (hit_kl, hit_ce, hit_cpl)
             if hit_kl or hit_ce or hit_cpl:
-                hard_accepted.append((entry, flags))
+                hard_accepted.append((entry, flags, aux))
             else:
-                soft_pool.append(entry)
+                soft_pool.append((entry, aux))
 
             self.pending_metrics.append({
-                **meta,
+                **aux,
                 'target_y': Y[0] - Y[2],
                 'target_wdl': Y,
             })
 
-        for entry, (hit_kl, hit_ce, hit_cpl) in hard_accepted:
-            self.training_data.append(entry)
+        lc0_rate     = getattr(self.config, 'lc0_distill_rate', 0.02)
+        start_fen    = game_data['start_fen']
+        moves_played = game_data['moves_played']
+
+        for entry, (hit_kl, hit_ce, hit_cpl), aux in hard_accepted:
             sc['accepted'] += 1
             scw['accepted'] += 1
             if hit_kl:
@@ -1063,6 +1177,38 @@ class Rescorer(object):
                 sc['cpl'] += 1
                 scw['cpl'] += 1
 
+            if aux['is_blunder'] and self.lc0_thread is not None:
+                # keep original Xerces entry; oversample blunder pos + SF PV via LC0
+                self.training_data.append(entry)
+                x, mask, _, _, vwht, _ = entry
+                b_lc0 = Board(start_fen)
+                for mv in moves_played[:aux['ply_i']]:
+                    b_lc0.push_uci(mv)
+                self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
+                for pv_mv in aux['pv_ucis']:
+                    if b_lc0.is_terminal():
+                        break
+                    b_lc0.push_uci(pv_mv)
+                    if b_lc0.is_terminal():
+                        break
+                    self.lc0_thread.submit(
+                        b_lc0.lc0_features(),
+                        b_lc0.encode_64_tokens(),
+                        b_lc0.legal_move_mask(),
+                        vwht, 1.0,
+                    )
+            elif self.lc0_thread is not None and random.random() < lc0_rate:
+                # random LC0 oversample — no book enrichment
+                self.training_data.append(entry)
+                x, mask, _, _, vwht, pwht = entry
+                b_lc0 = Board(start_fen)
+                for mv in moves_played[:aux['ply_i']]:
+                    b_lc0.push_uci(mv)
+                self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, pwht)
+            else:
+                # book enrichment (50% swap) or plain entry
+                self.training_data.append(self.maybe_enrich(entry, aux['sfen']))
+
         n_hard = len(hard_accepted)
         n_soft = len(soft_pool)
         n_total = n_hard + n_soft
@@ -1072,7 +1218,8 @@ class Rescorer(object):
         if n_sample > 0 and n_soft > 0:
             chosen = np.random.choice(n_soft, size=n_sample, replace=False)
             for i in chosen:
-                self.training_data.append(soft_pool[i])
+                entry, aux = soft_pool[i]
+                self.training_data.append(self.maybe_enrich(entry, aux['sfen']))
                 sc['accepted'] += 1
                 scw['accepted'] += 1
                 sc['rng'] += 1
@@ -1598,11 +1745,8 @@ def z_to_wdl(z_stm):
     return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
-def blend_wdl(z_stm, best_wdl_white_pov, sf_wdl_stm, is_white):
-    """Build 3-component WDL training target.
-    50% game result, 25% search WDL, 25% SF WDL.
-    Falls back to 50/50 z/search when sf_wdl unavailable.
-    """
+def blend_wdl(z_stm, best_wdl_white_pov, is_white):
+    """50% game result (one-hot), 50% Xerces search WDL."""
     z_wdl = z_to_wdl(z_stm)
 
     if best_wdl_white_pov is not None:
@@ -1611,10 +1755,6 @@ def blend_wdl(z_stm, best_wdl_white_pov, sf_wdl_stm, is_white):
             bw = bw[[2, 1, 0]]
     else:
         bw = z_wdl
-
-    if sf_wdl_stm is not None and len(sf_wdl_stm) == 3:
-        sw = np.array(sf_wdl_stm, dtype=np.float32)
-        return (0.5 * z_wdl + 0.25 * bw + 0.25 * sw).astype(np.float32)
 
     return (0.5 * z_wdl + 0.5 * bw).astype(np.float32)
 

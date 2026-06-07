@@ -139,8 +139,11 @@ class Config(object):
     training_queue_buffer = 30720
 
     # inference / retrain backend selection
-    inference_backend = "tf_xla"  # "tf_xla" | "ort_trt" | "pt_eager"
-    retrain_backend = "tf"        # "tf" | "pt_eager"
+    inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt"
+    retrain_backend          = "pt_eager"  # "pt_eager"
+    trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
+    trt_cache                = ""          # ort_trt: path to TRT engine cache dir
+    ort_trt_engine_cache_dir = ""          # legacy alias for trt_cache
 
     def __init__(self):
         self.init_paths()

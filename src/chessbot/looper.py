@@ -15,14 +15,71 @@ _now = time.time
 
 import numpy as np
 import pandas as pd
-import tensorflow as tf
-
 from pyfastchess import (raw_cache_bulk_insert, raw_cache_bulk_insert_np,
                          priors_cache_clear, priors_cache_stats)
 
 from chessbot import SF_LOC
 
 from chessbot.model import load_model, save_model, make_conv_infer
+
+def make_ort_trt_infer(onnx_path, model_name, trt_cache, max_bs):
+    import hashlib
+    import tensorrt  # registers TRT DLLs with Windows before ORT loads its TRT provider
+    import onnxruntime as ort
+    prepped = os.path.join(trt_cache, f'{model_name}.onnx')
+    src = prepped if os.path.exists(prepped) else onnx_path
+
+    h = hashlib.sha256()
+    with open(src, 'rb') as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    prefix  = f'{model_name}_{h.hexdigest()[:12]}'
+    engines = [f for f in os.listdir(trt_cache)
+               if f.startswith(prefix) and f.endswith('.engine')]
+
+    if engines:
+        print(f'[ort_trt] engine: {engines[0]}')
+        trt_opts = {
+            'trt_engine_cache_enable': True,
+            'trt_engine_cache_path':   trt_cache,
+            'trt_engine_cache_prefix': prefix,
+            'trt_fp16_enable':         True,
+            'trt_timing_cache_enable': True,
+            'trt_timing_cache_path':   trt_cache,
+            'trt_profile_min_shapes':  'enc_in:1x64',
+            'trt_profile_opt_shapes':  'enc_in:256x64',
+            'trt_profile_max_shapes':  'enc_in:512x64',
+        }
+        providers = [('TensorrtExecutionProvider', trt_opts),
+                     'CUDAExecutionProvider', 'CPUExecutionProvider']
+        sess = ort.InferenceSession(src, providers=providers)
+        active = sess.get_providers()[0]
+        if active != 'TensorrtExecutionProvider':
+            print(f'[ort_trt] WARNING: expected TRT but got {active}')
+        else:
+            print(f'[ort_trt] provider: TensorrtExecutionProvider (cache hit)')
+    else:
+        print(f'[ort_trt] WARNING: no engine for {prefix!r}, falling back to CUDA EP')
+        sess = ort.InferenceSession(onnx_path,
+                                    providers=['CUDAExecutionProvider',
+                                               'CPUExecutionProvider'])
+        print(f'[ort_trt] provider: {sess.get_providers()[0]}')
+
+    def infer(pair):
+        enc_np = np.asarray(pair[0], dtype=np.int64)
+        pol_fp16, wdl_fp16 = sess.run(
+            ['policy_logits', 'value_out'], {'enc_in': enc_np}
+        )
+        logits = pol_fp16.astype(np.float32)
+        wdl_raw = wdl_fp16.astype(np.float32)
+        e = np.exp(wdl_raw - wdl_raw.max(axis=-1, keepdims=True))
+        wdl = e / e.sum(axis=-1, keepdims=True)
+        return logits, wdl
+
+    return sess, infer
 from chessbot.mcts_utils import ChessGame
 from chessbot.utils import RateMeter, sf_eval
 from chessbot.game_utils import GameSpec
@@ -93,6 +150,13 @@ class GameLooper(object):
             from chessbot.train_pytorch import make_pt_infer
             model = torch.jit.load(cfg.model_path, map_location="cpu")
             self.model, self.infer = make_pt_infer(model, max_bs=cfg.fwd_batch)
+        elif cfg.inference_backend == "ort_trt":
+            self.model, self.infer = make_ort_trt_infer(
+                cfg.model_path,
+                cfg.trt_model_name,
+                cfg.trt_cache,
+                cfg.fwd_batch,
+            )
         else:
             self.model = load_model(cfg.model_path)
             self.infer = make_conv_infer(
@@ -148,10 +212,14 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        if self.config.inference_backend.lower() in ("pytorch", "pt_eager"):
+        backend = self.config.inference_backend.lower()
+        if backend in ("pytorch", "pt_eager"):
             import torch
             torch.cuda.empty_cache()
+        elif backend == "ort_trt":
+            pass
         else:
+            import tensorflow as tf
             tf.keras.backend.clear_session()
         gc.collect()
 
@@ -641,7 +709,7 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
     else:
         model_path = config.model_path
 
-    if config.inference_backend == "pt_eager":
+    if config.inference_backend in ("pt_eager", "ort_trt"):
         model = None  # loaded per-worker in load_reload_model
     elif os.path.exists(model_path):
         print(f"[init] Loading {model_name}")

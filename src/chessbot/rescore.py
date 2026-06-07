@@ -383,7 +383,8 @@ class Rescorer(object):
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0
+            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0,
+            'lc0_blunder': 0, 'lc0_pv': 0, 'book': 0,
         }
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
@@ -655,6 +656,7 @@ class Rescorer(object):
         sf_positions = []  # (ply_idx, board_copy, xerces_uci, known_best_uci) for cache misses
         repetitions = defaultdict(int)
         repetitions[b_fast.fen(include_counters=False)] += 1
+        # walk each move: route SF moves, build ply state, check cache
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
@@ -822,6 +824,7 @@ class Rescorer(object):
             repetitions[b_fast.fen(include_counters=False)] += 1
 
         self.pending[gid] = game_state
+        # submit to SF thread or finalize immediately if cache covered everything
         if sf_positions:
             self.n_sf_submitted += len(sf_positions)
             game_state['waiting'] = True
@@ -923,7 +926,7 @@ class Rescorer(object):
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         EQUIV = cfg.rescore_equiv_range
 
-        # thresholds for retrain acceptance
+        # acceptance thresholds
         kl_t = cfg.rescore_kl_threshold
         ce_t = cfg.rescore_ce_threshold
         cpl_t = cfg.rescore_inaccuracy_cp
@@ -937,6 +940,7 @@ class Rescorer(object):
         pending_aux = []
         kl_map = {}
 
+        # loop 1: per-ply stats, visit redistribution, policy build, accumulate pending
         for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
             i = ply['ply_idx']
             mv = ply['mv']
@@ -1079,6 +1083,7 @@ class Rescorer(object):
                 'cpl':             loss_this,
             })
 
+        # collar-adjusted result targets and blunder replay candidates
         eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
             eval_trace, result, cfg, self.config.blunder_replay_min_ply, gid
         )
@@ -1121,6 +1126,7 @@ class Rescorer(object):
         sc = self.sample_counts
         scw = self.sample_counts_window
 
+        # loop 2: compute WDL targets and CE, classify into hard/soft
         for (x, mask, policy, Q, is_white, ply_i, vwht, pwht), aux in zip(pending, pending_aux):
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply_i, result)
@@ -1160,10 +1166,11 @@ class Rescorer(object):
                 'target_wdl': Y,
             })
 
-        lc0_rate     = getattr(self.config, 'lc0_distill_rate', 0.02)
         start_fen    = game_data['start_fen']
         moves_played = game_data['moves_played']
 
+        # hard-accepted: classify each entry, collect LC0 waypoints for single-pass replay
+        lc0_waypoints = {}
         for entry, (hit_kl, hit_ce, hit_cpl), aux in hard_accepted:
             sc['accepted'] += 1
             scw['accepted'] += 1
@@ -1178,37 +1185,49 @@ class Rescorer(object):
                 scw['cpl'] += 1
 
             if aux['is_blunder'] and self.lc0_thread is not None:
-                # keep original Xerces entry; oversample blunder pos + SF PV via LC0
                 self.training_data.append(entry)
-                x, mask, _, _, vwht, _ = entry
-                b_lc0 = Board(start_fen)
-                for mv in moves_played[:aux['ply_i']]:
-                    b_lc0.push_uci(mv)
-                self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
-                for pv_mv in aux['pv_ucis']:
-                    if b_lc0.is_terminal():
-                        break
-                    b_lc0.push_uci(pv_mv)
-                    if b_lc0.is_terminal():
-                        break
-                    self.lc0_thread.submit(
-                        b_lc0.lc0_features(),
-                        b_lc0.encode_64_tokens(),
-                        b_lc0.legal_move_mask(),
-                        vwht, 1.0,
-                    )
-            elif self.lc0_thread is not None and random.random() < lc0_rate:
-                # random LC0 oversample — no book enrichment
-                self.training_data.append(entry)
-                x, mask, _, _, vwht, pwht = entry
-                b_lc0 = Board(start_fen)
-                for mv in moves_played[:aux['ply_i']]:
-                    b_lc0.push_uci(mv)
-                self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, pwht)
+                lc0_waypoints[aux['ply_i']] = (entry, aux)
+                sc['lc0_blunder'] += 1
+                scw['lc0_blunder'] += 1
             else:
-                # book enrichment (50% swap) or plain entry
-                self.training_data.append(self.maybe_enrich(entry, aux['sfen']))
+                enriched = self.maybe_enrich(entry, aux['sfen'])
+                self.training_data.append(enriched)
+                if enriched is not entry:
+                    sc['book'] += 1
+                    scw['book'] += 1
 
+        # single forward pass through the game for all LC0 submissions
+        if lc0_waypoints:
+            b_lc0 = Board(start_fen)
+            for ply_i, mv in enumerate(moves_played):
+                if ply_i in lc0_waypoints:
+                    entry, aux = lc0_waypoints[ply_i]
+                    got_fen = b_lc0.fen(include_counters=False)
+                    if got_fen != aux['sfen']:
+                        print(f"[rescore] FEN mismatch at ply {ply_i}: {got_fen} != {aux['sfen']}")
+                    x, mask, _, _, vwht, _ = entry
+                    self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
+                    n_pv = 0
+                    if aux['pv_ucis']:
+                        b_pv = Board(b_lc0.fen())
+                        for pv_mv in aux['pv_ucis']:
+                            if b_pv.is_terminal():
+                                break
+                            b_pv.push_uci(pv_mv)
+                            if b_pv.is_terminal():
+                                break
+                            self.lc0_thread.submit(
+                                b_pv.lc0_features(),
+                                b_pv.encode_64_tokens(),
+                                b_pv.legal_move_mask(),
+                                vwht, 1.0,
+                            )
+                            n_pv += 1
+                    sc['lc0_pv'] += n_pv
+                    scw['lc0_pv'] += n_pv
+                b_lc0.push_uci(mv)
+
+        # soft pool: sample up to target acceptance rate
         n_hard = len(hard_accepted)
         n_soft = len(soft_pool)
         n_total = n_hard + n_soft
@@ -1219,7 +1238,11 @@ class Rescorer(object):
             chosen = np.random.choice(n_soft, size=n_sample, replace=False)
             for i in chosen:
                 entry, aux = soft_pool[i]
-                self.training_data.append(self.maybe_enrich(entry, aux['sfen']))
+                enriched = self.maybe_enrich(entry, aux['sfen'])
+                self.training_data.append(enriched)
+                if enriched is not entry:
+                    sc['book'] += 1
+                    scw['book'] += 1
                 sc['accepted'] += 1
                 scw['accepted'] += 1
                 sc['rng'] += 1
@@ -1404,9 +1427,40 @@ class Rescorer(object):
         print(hdr)
         print(row("batch", self.sample_counts_window))
         print(row("total", self.sample_counts))
+        print()
+
+        # enrichment breakdown: blunder events+pv, book swaps, lc0-total, lc0-%
+        ehdr = (f"{RS}  {'enrich':<12} |"
+                f"  {'blunder':>7}  |"
+                f"  {'book':>7}  |"
+                f"  {'lc0-total':>9}  |"
+                f"  {'lc0-%':>7}  |")
+        print(ehdr)
+
+        def enrich_row(label, sc):
+            blur_pv   = sc['lc0_blunder'] + sc['lc0_pv']
+            total_tr  = sc['accepted'] + sc['lc0_pv']
+            enrich_n  = sc['book'] + blur_pv
+            enrich_pct = f"{enrich_n / total_tr * 100:.1f}%" if total_tr else "--"
+            return (f"{RS}  {label:<12} |"
+                    f"  {sc['lc0_blunder']:>7}  |"
+                    f"  {sc['book']:>7}  |"
+                    f"  {blur_pv:>9}  |"
+                    f"  {enrich_pct:>7}  |")
+
+        print(enrich_row("batch", self.sample_counts_window))
+        print(enrich_row("total", self.sample_counts))
+
+        # LC0 output: how many positions have flushed into training_data
+        if self.lc0_thread is not None:
+            lst = self.lc0_thread.stats()
+            print(f"{RS}  lc0 output: {lst['samples']} flushed"
+                  f"  {lst['inferences']} batches"
+                  f"  {lst['pending']} pending")
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0
+            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0,
+            'lc0_blunder': 0, 'lc0_pv': 0, 'book': 0,
         }
         self.sample_counts_window = zero_sc()
 

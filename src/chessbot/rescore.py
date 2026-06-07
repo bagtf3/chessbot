@@ -700,7 +700,7 @@ class Rescorer(object):
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q if turn else -this_q
 
-            sf wdl_tr = tr.get('sf_wdl')
+            sf_wdl_tr = tr.get('sf_wdl')
             if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
                 Y_init = (0.5*z_to_wdl(Z_stm) + 0.5*np.array(sf_wdl_tr, dtype=np.float32))
             else:

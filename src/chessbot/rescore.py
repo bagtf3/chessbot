@@ -1236,9 +1236,10 @@ class Rescorer(object):
                     self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
                     n_pv = 0
                     if aux['pv_ucis']:
-                        # pv_ucis = pv[0:4]: pv[0] is SF's best move from the blunder position,
-                        # subsequent entries are the continuation. Must start from pv[0] — skipping
-                        # it would push a move for the wrong side and corrupt the board.
+                        # pv_ucis = pv[0:4]: pv[0] is SF's best move from
+                        # the blunder position, subsequent entries are the continuation.
+                        # Must start from pv[0] — skipping it would push a move
+                        # for the wrong side and corrupt the board.
                         b_pv = b_lc0.clone()
                         for pv_mv in aux['pv_ucis']:
                             if b_pv.is_terminal():

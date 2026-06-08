@@ -731,7 +731,6 @@ class Rescorer(object):
                     'nn_raw_priors': tr.get('nn_raw_priors', []),
                     'mass_on_legal': tr.get('nn_mass_on_legal'),
                     'sf_cp': int(np.arctanh(np.clip(Q, -C, C)) * 100.0 / D),
-                    'sf_wdl': None,
                     'candidate_visits': [(c['uci'], c['visits']) for c in cm],
                     'result_z_stm': Z_stm,
                     'target_y': Y_init[0] - Y_init[2],
@@ -797,7 +796,6 @@ class Rescorer(object):
                 'best_uci': None,
                 'best_cp': None,
                 'best_abs': None,
-                'sf_wdl': None,
                 'pv_ucis': [],
                 'played_cp': None,
                 'played_abs': None,
@@ -956,6 +954,8 @@ class Rescorer(object):
         pending = []
         pending_aux = []
         kl_map = {}
+        ce_map = {}
+        mse_map = {}
 
         # loop 1: per-ply stats, visit redistribution, policy build, accumulate pending
         for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
@@ -971,7 +971,6 @@ class Rescorer(object):
             best_uci_raw = ply['best_uci']
             best_cp = ply['best_cp']
             best_abs = ply['best_abs']
-            sf_wdl = ply['sf_wdl']
             played_cp = ply['played_cp']
             played_abs = ply.get('played_abs', best_abs)
             visits = list(ply['visits'])
@@ -1002,7 +1001,6 @@ class Rescorer(object):
                 best_abs, played_abs,
                 turn, loss_this,
                 tr.get('stop_reason', ''), tr.get('sims', 0),
-                sf_wdl,
             ])
 
             if ply['skip_training']:
@@ -1156,6 +1154,7 @@ class Rescorer(object):
             Y = blend_wdl(z, aux.get('best_wdl'), is_white)
 
             nn_wdl = aux['nn_wdl']
+            nn_value = aux['nn_value']
             if nn_wdl is not None:
                 eps = 1e-7
                 nw = nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0])
@@ -1164,6 +1163,11 @@ class Rescorer(object):
                 ce = -float(np.dot(Y, np.log(p)))
             else:
                 ce = 0.0
+            if nn_value is not None:
+                sign = 1 if is_white else -1
+                nn_value_stm = np.clip(nn_value * sign, -1.0, 1.0)
+                mse_map[ply_i] = (nn_value_stm - (Y[0] - Y[2])) ** 2
+            ce_map[ply_i] = ce
             hit_kl  = aux['kl'] > kl_t
             hit_ce  = ce > ce_t
             hit_cpl = aux['cpl'] >= cpl_t
@@ -1280,12 +1284,13 @@ class Rescorer(object):
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
-            'sf_wdl',
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
         out_df['played_best_move'] = out_df['delta'] <= 0
-        out_df['rescore_kl'] = out_df['move_num'].map(kl_map)
+        out_df['rescore_kl']  = out_df['move_num'].map(kl_map)
+        out_df['rescore_ce']  = out_df['move_num'].map(ce_map)
+        out_df['rescore_mse'] = out_df['move_num'].map(mse_map)
 
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
 
@@ -1456,10 +1461,7 @@ class Rescorer(object):
         print()
 
         ehdr = (f"{RS}  {'enrich':<12} |"
-                f"  {'blunder':>7}  |"
-                f"  {'pv':>7}  |"
-                f"  {'book':>7}  |"
-                f"  {'lc0-%':>7}  |")
+                + "".join(col(lbl) for lbl in ("blunder", "pv", "book", "lc0-%")))
         print(ehdr)
 
         def enrich_row(label, sc):
@@ -1468,10 +1470,10 @@ class Rescorer(object):
             enrich_n   = sc['book'] + blur_pv
             enrich_pct = f"{enrich_n / total_tr * 100:.1f}%" if total_tr else "--"
             return (f"{RS}  {label:<12} |"
-                    f"  {sc['lc0_blunder']:>7}  |"
-                    f"  {sc['lc0_pv']:>7}  |"
-                    f"  {sc['book']:>7}  |"
-                    f"  {enrich_pct:>7}  |")
+                    + col(sc['lc0_blunder'])
+                    + col(sc['lc0_pv'])
+                    + col(sc['book'])
+                    + col(enrich_pct))
 
         print(enrich_row("batch", self.sample_counts_window))
         print(enrich_row("total", self.sample_counts))

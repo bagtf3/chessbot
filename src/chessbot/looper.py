@@ -749,7 +749,7 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
 class StockfishThread(object):
     def __init__(self, sf_config, depth):
         self.sf_loc = SF_LOC
-        self.sf_config = sf_config
+        self.sf_config = {**sf_config, "UCI_ShowWDL": True}
         self.depth = depth
 
         self.req_q = Queue()

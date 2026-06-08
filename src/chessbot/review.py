@@ -17,7 +17,7 @@ from chessbot.utils import print_recent_summary, format_time
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
     score_to_value_stm_pov_tanh, rnd,
-    calc_entropy, kl_divergence_bits
+    calc_entropy, kl_divergence
 )
 
 
@@ -118,30 +118,87 @@ class GameViewer:
                     cp = score_obj.white().score(mate_score=1500)
                 out.append((move_uci, san, cp, pv))
         return out
+
+    def pv_to_san(self, pv, max_moves=5):
+        """Convert a list of chess.Move to a readable SAN string (up to max_moves plies)."""
+        board = chess.Board(self.board.fen())
+        parts = []
+        for i, move in enumerate(pv[:max_moves]):
+            if board.turn == chess.WHITE:
+                parts.append(f"{board.fullmove_number}.")
+            elif i == 0:
+                parts.append(f"{board.fullmove_number}...")
+            parts.append(board.san(move))
+            board.push(move)
+        return " ".join(parts)
     
     def show_sf_overlay(self, token="sf"):
         """
-        Parse token like 'sf' or 'sf20' to run stockfish.
-          - 'sf' -> depth 16
-          - 'sfNN' -> depth NN (e.g. sf20 -> depth 20)
-        Prints SF top-3 moves (white-pov cp at depth) and if the chosen move
-        isn't in top-3, prints its cp as well
+        Modes:
+          sf / sf<N>          - top-3 at depth N (default 16)
+          sf <move> <depth>   - analyze specific move (UCI or SAN) at given depth
         """
-        # parse token
-        if token == "sf":
-            depth = 16
-        else:
+        parts = token.split()
+        depth = 16
+        move_str = None
+
+        # extract depth from "sfNN" prefix or from a numeric part
+        try:
+            if len(parts[0]) > 2:
+                depth = int(parts[0][2:])
+        except (ValueError, IndexError):
+            pass
+        for part in parts[1:]:
             try:
-                depth = int(token[2:]) if token.startswith("sf") else 16
-            except Exception:
-                depth = 16
-    
+                depth = int(part)
+            except ValueError:
+                move_str = part
+
+        if move_str is not None:
+            # resolve move_str as UCI or SAN against current legal moves
+            sf_board = chess.Board(self.board.fen())
+            root_move = None
+            try:
+                m = chess.Move.from_uci(move_str)
+                if m in sf_board.legal_moves:
+                    root_move = m
+            except ValueError:
+                pass
+            if root_move is None:
+                try:
+                    root_move = sf_board.parse_san(move_str)
+                except ValueError:
+                    pass
+            if root_move is None:
+                print(f"Not a valid move in this position: {move_str}")
+                return
+
+            san = sf_board.san(root_move)
+            sign = 1 if self.turn() else -1
+            print(f"Running Stockfish (depth={depth}, time cap=10s, move={san})...")
+            limit = chess.engine.Limit(depth=depth, time=10.0)
+            with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
+                info = eng.analyse(sf_board, limit=limit,
+                                   root_moves=[root_move],
+                                   info=chess.engine.INFO_ALL)
+            score_obj = info.get("score")
+            cp_stm = None
+            if score_obj is not None:
+                cp_w = score_obj.white().score(mate_score=1500)
+                cp_stm = None if cp_w is None else int(cp_w * sign)
+            cp_str = "mate" if cp_stm is None else str(cp_stm)
+            pv = info.get("pv", [])
+            print(f"  {san:<6}  cp={cp_str}")
+            if pv:
+                print(f"  {self.pv_to_san(pv)}")
+            return
+
         print(f"Running Stockfish (depth={depth}, time cap=10s, multipv=3)...")
         topk = self.run_stockfish_topk(depth=depth, k=3)
         if not topk:
             print("No SF info (maybe engine failed).")
             return
-    
+
         sign = 1 if self.turn() else -1
         print("SF top moves (STM-POV cp):")
         top_ucis = set()
@@ -149,6 +206,8 @@ class GameViewer:
             cp_stm = None if cp is None else int(cp * sign)
             cp_str = "mate" if cp_stm is None else str(cp_stm)
             print(f"  #{i}. {san:<6}  cp={cp_str}")
+            if pv:
+                print(f"      {self.pv_to_san(pv)}")
             if uci:
                 top_ucis.add(uci)
 
@@ -230,9 +289,9 @@ class GameViewer:
         lc0_ent_pri, lc0_ppri = self.compute_norm_entropy(lc0_pri_vec)
         xc0_ent_vis, xc0_pvis = self.compute_norm_entropy(xc0_vis_vec)
         xc0_ent_pri, xc0_ppri = self.compute_norm_entropy(xc0_pri_vec)
-        lc0_kl_vp    = kl_divergence_bits(lc0_pvis, lc0_ppri)
-        kl_xpri_lpri = kl_divergence_bits(xc0_ppri, lc0_ppri)
-        kl_xvis_lvis = kl_divergence_bits(xc0_pvis, lc0_pvis)
+        lc0_kl_vp    = kl_divergence(lc0_vis_vec, lc0_pri_vec)
+        kl_xpri_lpri = kl_divergence(xc0_pri_vec, lc0_pri_vec)
+        kl_xvis_lvis = kl_divergence(xc0_vis_vec, lc0_vis_vec)
 
         hdr = (
             f"  {'SAN':<7}  {'N':>6}  {'P(lc0)':>7}  {'P(xc0)':>7}"
@@ -269,12 +328,12 @@ class GameViewer:
         )
         print(
             f"  {'lc0':<16}  {lc0_ent_vis:>5.3f}  {lc0_ent_pri:>5.3f}"
-            f"  {lc0_kl_vp:.3f} bits"
+            f"  {lc0_kl_vp:.3f}"
         )
         print(
             f"  {'cross KL:':<16}"
             f"  xc0_p||lc0_p={kl_xpri_lpri:.3f}"
-            f"   xc0_v||lc0_v={kl_xvis_lvis:.3f} bits"
+            f"   xc0_v||lc0_v={kl_xvis_lvis:.3f}"
         )
 
         if self.ply < len(self.moves_uci):
@@ -606,31 +665,27 @@ class GameViewer:
 
         norm_vis, p_vis = self.compute_norm_entropy(visits_list)
         norm_pri, p_pri = self.compute_norm_entropy(priors_list)
-        kl = kl_divergence_bits(p_vis, p_pri)
+        kl = kl_divergence(visits_list, priors_list)
 
         r_sf = self.sf_row_for_ply(self.ply)
-        ce_str = "n/a"
-        mse_str = "n/a"
+        nn_wdl    = node.get('nn_wdl')
+        nn_value  = node.get('nn_value')
+        best_wdl  = node.get('best_wdl')
+        sf_wdl_tr = node.get('sf_wdl')
+        is_white  = self.turn()
+        sign      = 1 if is_white else -1
 
-        sf_wdl = None
-        if r_sf is not None:
-            raw = r_sf.get('sf_wdl')
-            if raw is not None:
-                sf_wdl = raw
-
-        nn_wdl = node.get('nn_wdl')
-        nn_value = node.get('nn_value')
-        best_wdl = node.get('best_wdl')
-        is_white = self.turn()
-        sign = 1 if is_white else -1
+        is_sf_turn = ("stockfish" in str(who).lower())
 
         nn_wdl_stm = None
         if nn_wdl is not None:
             nw = np.array(nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0]), dtype=np.float64)
             nn_wdl_stm = nw / nw.sum() if nw.sum() > 0 else nw
 
+        # reconstruct Y matching rescore.py formulas exactly:
+        #   SF move:     0.5*z + 0.5*sf_wdl_tr  (fallback: pure z)
+        #   Xerces move: 0.5*z + 0.5*best_wdl   (fallback: pure z)
         Y = None
-        z_stm = None
         if nn_value is not None:
             z_stm = self.result * sign
             if z_stm > 0:
@@ -639,31 +694,48 @@ class GameViewer:
                 z_wdl = np.array([0.0, 0.0, 1.0])
             else:
                 z_wdl = np.array([0.0, 1.0, 0.0])
-            if best_wdl is not None:
-                bw = np.array(best_wdl, dtype=np.float64)
-                if not is_white:
-                    bw = bw[[2, 1, 0]]
-            else:
-                bw = z_wdl
-            if sf_wdl is not None:
-                Y = 0.5 * z_wdl + 0.25 * bw + 0.25 * np.array(sf_wdl, dtype=np.float64)
-            else:
-                Y = 0.5 * z_wdl + 0.5 * bw
-            target_y = float(Y[0] - Y[2])
-            nn_value_stm = float(np.clip(nn_value * sign, -1.0, 1.0))
-            mse = (nn_value_stm - target_y) ** 2
-            mse_str = f"{mse:.4f}"
-            if nn_wdl_stm is not None:
-                eps = 1e-7
-                p_ce = np.clip(nn_wdl_stm, eps, 1 - eps)
-                p_ce = p_ce / p_ce.sum()
-                ce = -float(np.dot(Y, np.log(p_ce)))
-                ce_str = f"{ce:.3f}"
 
-        kl_nats = kl * 0.693
+            if is_sf_turn:
+                if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
+                    Y = 0.5 * z_wdl + 0.5 * np.array(sf_wdl_tr, dtype=np.float64)
+                else:
+                    Y = z_wdl.copy()
+            else:
+                if best_wdl is not None:
+                    bw = np.array(best_wdl, dtype=np.float64)
+                    if not is_white:
+                        bw = bw[[2, 1, 0]]
+                    Y = 0.5 * z_wdl + 0.5 * bw
+                else:
+                    Y = z_wdl.copy()
+
+        # source KL/CE/MSE from sf_df if available, else compute and mark with *
+        if r_sf is not None and 'rescore_kl' in r_sf and not np.isnan(r_sf['rescore_kl']):
+            kl_str = f"{r_sf['rescore_kl']:.3f} ({kl:.3f}*)"
+        else:
+            kl_str = f"{kl:.3f}*"
+
+        if r_sf is not None and 'rescore_ce' in r_sf and not np.isnan(r_sf['rescore_ce']):
+            ce_str = f"{r_sf['rescore_ce']:.3f}"
+        elif Y is not None and nn_wdl_stm is not None:
+            eps = 1e-7
+            p_ce = np.clip(nn_wdl_stm, eps, 1 - eps)
+            p_ce = p_ce / p_ce.sum()
+            ce_str = f"{-float(np.dot(Y, np.log(p_ce))):.3f}*"
+        else:
+            ce_str = "n/a"
+
+        if r_sf is not None and 'rescore_mse' in r_sf and not np.isnan(r_sf['rescore_mse']):
+            mse_str = f"{r_sf['rescore_mse']:.3f}"
+        elif Y is not None and nn_value is not None:
+            nn_value_stm = np.clip(nn_value * sign, -1.0, 1.0)
+            mse_str = f"{(nn_value_stm - (Y[0] - Y[2])) ** 2:.3f}*"
+        else:
+            mse_str = "n/a"
+
         print(
             f"  entropy (norm'd): visits = {norm_vis:.3f} "
-            f" priors = {norm_pri:.3f}  KL = {kl_nats:.3f}"
+            f" priors = {norm_pri:.3f}  KL = {kl_str}"
             f"  CE = {ce_str}  MSE = {mse_str}"
         )
         if nn_wdl_stm is not None or Y is not None:
@@ -677,9 +749,6 @@ class GameViewer:
             cands, key=lambda x: x.get("visits", 0), reverse=True
         )
 
-        is_sf_turn = ("stockfish" in str(who).lower())
-
-        r_sf = self.sf_row_for_ply(self.ply)
         sf_best_uci = None
         if r_sf is not None:
             sf_best_uci = str(r_sf.get("best_move", "") or "")
@@ -975,10 +1044,10 @@ class GameViewer:
             priors_list = [c.get("P", 0.0) for c in cands]
             _, p_vis = self.compute_norm_entropy(visits_list)
             _, p_pri = self.compute_norm_entropy(priors_list)
-            kl = kl_divergence_bits(p_vis, p_pri)
+            kl = kl_divergence(visits_list, priors_list)
             if kl >= threshold:
                 self.goto(ply)
-                print(f"Found KL={kl:.3f} bits at ply {ply + 1}")
+                print(f"Found KL={kl:.3f} at ply {ply + 1}")
                 return
         print(f"No move with KL >= {threshold} found after ply {self.ply + 1}.")
 
@@ -1038,7 +1107,7 @@ class GameViewer:
                     n = int(s) if s.isdigit() else 1
                 self.show_pv(min_vis=n)
             elif cmd.startswith("sf"):
-                self.show_sf_overlay(cmd)
+                self.show_sf_overlay(cmd_cased)
             elif cmd.startswith("lc0"):
                 self.show_lc0_overlay(cmd)
             elif cmd.startswith("b"):

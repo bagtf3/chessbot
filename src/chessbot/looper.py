@@ -1,7 +1,6 @@
-import os, pickle, gzip, random
-import pathlib, json
+import os, pickle, gzip
+import pathlib
 import time, gc
-import sys, subprocess
 
 import threading
 from queue import Queue, Empty
@@ -15,8 +14,7 @@ _now = time.time
 
 import numpy as np
 import pandas as pd
-from pyfastchess import (raw_cache_bulk_insert, raw_cache_bulk_insert_np,
-                         priors_cache_clear, priors_cache_stats)
+from pyfastchess import raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats
 
 from chessbot import SF_LOC
 

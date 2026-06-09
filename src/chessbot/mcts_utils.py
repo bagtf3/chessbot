@@ -583,7 +583,7 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # fast PV via C++; for sampled moves trace from xc0's choice, not the sampled move
+        # fast PV via C++; for sampled moves trace from xc0 choice, not the sampled move
         pv_start = "" if method == "stockfish" else (xc0_move or mv)
         pv = []
         pv_items = self.tree.principal_variation(24, pv_start)

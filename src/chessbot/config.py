@@ -60,6 +60,11 @@ class Config(object):
     material_diff_cutoff = 9
     material_diff_cutoff_span = 20
 
+    allow_resignation = False
+    resign_threshold = 0.80
+    resign_consecutive = 10
+    resign_min_plies = 20
+
     use_eval_draw = True
     eval_draw_min_plies = 50
     eval_draw_thresh = 0.1

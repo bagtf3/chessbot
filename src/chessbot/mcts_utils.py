@@ -9,7 +9,6 @@ from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
 from chessbot.utils import rnd
-import chessbot.utils as cbu
 from collections import namedtuple
 
 ESCheck = namedtuple('ESCheck', [
@@ -465,6 +464,8 @@ class ChessGame(object):
         self.recents = []
         
         self.mat_adv_counter = 0
+        self.resign_counter_white = 0
+        self.resign_counter_black = 0
         self.outcome = None
         self.plies = 0
         self.mcts_sims_total = 0
@@ -684,6 +685,27 @@ class ChessGame(object):
                 self.outcome = 1.0 if mat_diff > 0 else -1.0
                 return True
         
+        # resignation
+        if cfg.allow_resignation and self.plies >= cfg.resign_min_plies and self.recents:
+            _, q_stm, _, _, turn = self.recents[-1]
+            if turn:
+                if q_stm < -cfg.resign_threshold:
+                    self.resign_counter_white += 1
+                else:
+                    self.resign_counter_white = 0
+            else:
+                if q_stm < -cfg.resign_threshold:
+                    self.resign_counter_black += 1
+                else:
+                    self.resign_counter_black = 0
+
+            if self.resign_counter_white >= cfg.resign_consecutive:
+                self.outcome = -1.0
+                return True
+            if self.resign_counter_black >= cfg.resign_consecutive:
+                self.outcome = 1.0
+                return True
+
         # Syzygy probe if few pieces
         # flip syzygy on if about to end due to length
         if cfg.use_syzygy or (self.plies >= cfg.max_game_length):

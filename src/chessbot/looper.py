@@ -279,7 +279,8 @@ class GameLooper(object):
     def pull_from_queue(self):
         from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
-        # keep draining until full or both queues empty; stop_at_empty means no refill after empty
+        # keep draining until full or both queues empty
+        # stop_at_empty means no refill after empty
         while len(self.active_games) < games_at_once:
             spec = None
             if self.sf_queue is not None:
@@ -560,6 +561,7 @@ class GameLooper(object):
             "scenario": game.meta.get("scenario", ""),
             "plies": game.plies,
             "result": game.outcome or 0.0,
+            "end_reason": game.end_reason,
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
             "duration": _now() - game.started_at,

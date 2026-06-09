@@ -467,6 +467,7 @@ class ChessGame(object):
         self.resign_counter_white = 0
         self.resign_counter_black = 0
         self.outcome = None
+        self.end_reason = ""
         self.plies = 0
         self.mcts_sims_total = 0
         self.mcts_plies = 0
@@ -671,6 +672,7 @@ class ChessGame(object):
         reason, result = self.board.is_game_over()
         if reason != 'none':
             self.outcome = terminal_value_white_pov(self.board)
+            self.end_reason = reason
             return True
 
         # raw material difference
@@ -680,11 +682,12 @@ class ChessGame(object):
                 self.mat_adv_counter += 1
             else:
                 self.mat_adv_counter = 0
-        
+
             if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
                 self.outcome = 1.0 if mat_diff > 0 else -1.0
+                self.end_reason = "material_diff"
                 return True
-        
+
         # resignation
         if cfg.allow_resignation and self.plies >= cfg.resign_min_plies and self.recents:
             _, q_stm, _, _, turn = self.recents[-1]
@@ -701,9 +704,11 @@ class ChessGame(object):
 
             if self.resign_counter_white >= cfg.resign_consecutive:
                 self.outcome = -1.0
+                self.end_reason = "resign"
                 return True
             if self.resign_counter_black >= cfg.resign_consecutive:
                 self.outcome = 1.0
+                self.end_reason = "resign"
                 return True
 
         # Syzygy probe if few pieces
@@ -722,6 +727,7 @@ class ChessGame(object):
                     if table_res in [-2, 0, 2]:
                         table_res = table_res if chess_board.turn else -1*table_res
                         self.outcome = outcomes[table_res]
+                        self.end_reason = "syzygy"
                         return True
                 except:
                     pass
@@ -730,11 +736,13 @@ class ChessGame(object):
         if self.plies >= self.next_eval_draw_check:
             if self.check_for_eval_draw(cfg):
                 self.outcome = 0.0
+                self.end_reason = "eval_draw"
                 return True
 
         # check for overall game_length limit
         if self.plies > cfg.max_game_length:
             self.outcome = 0.0
+            self.end_reason = "max_length"
             return True
         # if we made it here the game is active
         return False

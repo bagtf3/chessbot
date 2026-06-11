@@ -40,9 +40,7 @@ def random_backrow_fen():
     pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
     random.shuffle(pieces)
     white_back = "".join(pieces)
-    random.shuffle(pieces)
-    black_back = "".join(pieces).lower()
-    return f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
+    return f"{white_back.lower()}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
 
 
 def shuffled_backrow_fen(white_pool, black_pool, fix_king=False):
@@ -88,49 +86,58 @@ def make_rook_for_piece_and_pawn_fen():
 
 
 def random_piece_training_fen():
-    piece_vals = {"Q": 9.0, "R": 5.0, "B": 3.5, "N": 3.0, "1": 0.0}
-    pool = ["Q", "R", "B", "N", "1"]
-
-    def sample_side(lo=None, hi=None):
-        for _ in range(500):
-            pieces = [random.choice(pool) for _ in range(7)]
-            total = sum(piece_vals[p] for p in pieces)
-            if total > 21 and total < 35:
-                if lo is None or lo <= total <= hi:
-                    return pieces, total
-        return None, None
-
-    for _ in range(50):
-        wp, wt = sample_side()
-        if wp is None:
-            continue
-        bp, bt = sample_side(lo=wt - 1, hi=wt + 1)
-        if bp is None:
-            continue
-
-        w_pieces = wp + ["K"]
-        random.shuffle(w_pieces)
-        b_pieces = bp + ["K"]
-        random.shuffle(b_pieces)
-
-        w_king_col = w_pieces.index("K")
-        b_king_col = b_pieces.index("K")
-
-        white_pawns = list("PPPPPPPP")
-        black_pawns = list("pppppppp")
-        diff = wt - bt
-        if diff > 0.5:
-            white_pawns[6 if w_king_col <= 3 else 1] = "1"
-        elif diff < -0.5:
-            black_pawns[6 if b_king_col <= 3 else 1] = "1"
-
-        w_rank = to_fen_rank(w_pieces)
-        b_rank = to_fen_rank(b_pieces).lower()
-        return (
-            f"{b_rank}/{''.join(black_pawns)}/8/8/8/8/{''.join(white_pawns)}/{w_rank} w - - 0 1"
-        )
-
-    return random_piece_training_fen()
+    return random.choice([
+        "1bkq1qnb/pppppppp/8/8/8/8/PPPPPPPP/RKRQN1BN w - - 0 1",
+        "1bn1qrbk/pppppppp/8/8/8/8/P1PPPPPP/RRNNQK2 w - - 0 1",
+        "1bnbqkn1/pppppppp/8/8/8/8/PPPPPPPP/KR1QB1R1 w - - 0 1",
+        "1k2qqbb/ppppp1pp/8/8/8/8/PPPPPPPP/R1K1NBQR w - - 0 1",
+        "1knq1rbq/pppppppp/8/8/8/8/PPPPPPPP/1QR1NQKB w - - 0 1",
+        "1nnqrk1r/pppppppp/8/8/8/8/PPPPPPPP/QR1KNN1R w - - 0 1",
+        "1nrkbrqn/pppppppp/8/8/8/8/PPPPPPPP/1KR2RQQ w - - 0 1",
+        "1qk1bbnq/pppppp1p/8/8/8/8/PPPPPPPP/BQNNK1RB w - - 0 1",
+        "1qq1rnkn/pppppppp/8/8/8/8/PPPPPPPP/R1KBRBQB w - - 0 1",
+        "1qqn1brk/p1pppppp/8/8/8/8/PPPPPPPP/2KBQQBB w - - 0 1",
+        "1rk2qqr/pppppppp/8/8/8/8/PPPPPPPP/RRRBNKBN w - - 0 1",
+        "1rqr1nkq/pppppppp/8/8/8/8/PPPPPP1P/NNNNKQRR w - - 0 1",
+        "2qqbqk1/pppppppp/8/8/8/8/PPPPPPPP/RRQ1BBRK w - - 0 1",
+        "3qqbkn/pppppppp/8/8/8/8/P1PPPPPP/BRN1RQK1 w - - 0 1",
+        "b1bqn1kn/ppppp1pp/8/8/8/8/PPPPPPPP/QRB2RK1 w - - 0 1",
+        "b1kr1rnq/pppppppp/8/8/8/8/PPPPPPPP/KB1RQN1R w - - 0 1",
+        "b1qq1nnk/pppppppp/8/8/8/8/PPPPPPPP/QBQNB2K w - - 0 1",
+        "bbk1bbrr/ppp1pp1p/8/8/8/8/PPPPPPPP/NN1RBBKR w - - 0 1",
+        "bbqq1bkb/pppppppp/8/8/8/8/P1PPPPPP/1BNQQBKR w - - 0 1",
+        "bbrkb1rn/pppppp1p/8/8/8/8/PPPPPPPP/RBNKR1NN w - - 0 1",
+        "bk1nqqb1/pppppppp/8/8/8/8/PPPPPPPP/BRRNQNK1 w - - 0 1",
+        "bk1rnrqb/pppppppp/8/8/8/8/PPPPPP1P/RNKRNQ1R w - - 0 1",
+        "bkbbnnq1/pppppppp/8/8/8/8/PPPPPPPP/B1QBBBNK w - - 0 1",
+        "bknrbqnn/pppppppp/8/8/8/8/PPPPPP1P/BNRKBBQB w - - 0 1",
+        "bnbk1bqq/pppppppp/8/8/8/8/PPPPPP1P/KRQQ1NBN w - - 0 1",
+        "bnkq1nnq/pppppp1p/8/8/8/8/PPPPPPPP/1QKBQNR1 w - - 0 1",
+        "bnkqq1rn/pppppppp/8/8/8/8/PPPPPPPP/QBRK1NQN w - - 0 1",
+        "bnrqbkb1/pppppppp/8/8/8/8/P1PPPPPP/BB1QBNKR w - - 0 1",
+        "bq1qbbnk/pppppppp/8/8/8/8/P1PPPPPP/RQBN1NQK w - - 0 1",
+        "bqb1qkb1/pppppppp/8/8/8/8/PPPPPPPP/1QBKQNB1 w - - 0 1",
+        "br1k2rq/pppppppp/8/8/8/8/PPPPPPPP/1RQKR2B w - - 0 1",
+        "kn1qqrb1/pppppppp/8/8/8/8/PPPPPPPP/KQNR1QN1 w - - 0 1",
+        "kqr1b1nr/pppppppp/8/8/8/8/PPPPPPPP/RNRRRNK1 w - - 0 1",
+        "krnbq1rq/pp1ppppp/8/8/8/8/PPPPPPPP/NRRK1QNQ w - - 0 1",
+        "krqb1b1n/pppppppp/8/8/8/8/P1PPPPPP/2BN1QQK w - - 0 1",
+        "n1q1q1bk/pppppppp/8/8/8/8/PPPPPP1P/BRKBBBBN w - - 0 1",
+        "nnqk1bq1/pppppp1p/8/8/8/8/PPPPPPPP/NQRNKB1N w - - 0 1",
+        "nnrbbq1k/pppppppp/8/8/8/8/PPPPPPPP/BNKQQ2N w - - 0 1",
+        "nqb1bqnk/p1pppppp/8/8/8/8/PPPPPPPP/BNKNRNQB w - - 0 1",
+        "nqnbknnr/pppppppp/8/8/8/8/PPPPPPPP/BKR1NQRB w - - 0 1",
+        "nrbbn1kb/pppppppp/8/8/8/8/PPPPPPPP/BN1RBNBK w - - 0 1",
+        "q1bnrqkb/pppppppp/8/8/8/8/P1PPPPPP/QRRNQ1KN w - - 0 1",
+        "q1kqb1r1/pppppppp/8/8/8/8/PPPPPPPP/QK1Q1RB1 w - - 0 1",
+        "qb1bkqbb/pppppppp/8/8/8/8/PPPPPP1P/BQKNB1QR w - - 0 1",
+        "qbbrk1n1/pppppppp/8/8/8/8/PPPPPPPP/QB2RBKN w - - 0 1",
+        "qn1nb1nk/pppppppp/8/8/8/8/PPPPPPPP/1RBBBKNB w - - 0 1",
+        "qr1q1rkn/p1pppppp/8/8/8/8/PPPPPPPP/NRKBNBQN w - - 0 1",
+        "rbknbrr1/pppppppp/8/8/8/8/P1PPPPPP/RR1RKNNR w - - 0 1",
+        "rnkb1rr1/pppppppp/8/8/8/8/PPPPPPPP/R1BNRR1K w - - 0 1",
+        "rnn2rqk/p1ppp1pp/8/8/8/8/PPPPPPPP/1NKRNNRR w - - 0 1",
+    ])
 
 
 def get_pre_opened_game(index=None, mini=False):
@@ -295,21 +302,93 @@ def make_piece_odds_board():
     return b.fen(), meta
 
 
+def remove_pawn(fen, color, file):
+    col = file
+    parts = fen.split()
+    ranks = parts[0].split('/')
+    rank_idx, pawn_char = (1, 'p') if color == 'black' else (6, 'P')
+    expanded = []
+    for c in ranks[rank_idx]:
+        if c.isdigit():
+            expanded.extend([None] * int(c))
+        else:
+            expanded.append(c)
+    if expanded[col] != pawn_char:
+        print(f"warning: no {color} pawn on file {file} in {ranks[rank_idx]!r}")
+        return fen
+    expanded[col] = None
+    new_rank, empty = '', 0
+    for sq in expanded:
+        if sq is None:
+            empty += 1
+        else:
+            if empty:
+                new_rank += str(empty)
+                empty = 0
+            new_rank += sq
+    if empty:
+        new_rank += str(empty)
+    ranks[rank_idx] = new_rank
+    parts[0] = '/'.join(ranks)
+    return ' '.join(parts)
+
+
+def make_b_vs_k_fen():
+    fen = shuffled_backrow_fen(
+        ["K", "Q", "R", "B", "B", "B", "B", "1"],
+        ["K", "Q", "R", "N", "N", "N", "N", "N"],
+        fix_king=True,
+    )
+    back = []
+    for c in fen.split('/')[0]:
+        if c.isdigit():
+            back.extend([None] * int(c))
+        else:
+            back.append(c)
+    eligible = [i for i, p in enumerate(back) if p in ('k', 'n')]
+    return remove_pawn(fen, 'black', random.choice(eligible))
+
+
 def make_piece_training_board():
-    fens = {
-        "rooks_vs_standard": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
-        "b_vs_k": shuffled_backrow_fen(
-            ["K", "Q", "R", "B", "B", "B", "B", "1"],
-            ["K", "Q", "R", "N", "N", "N", "N", "N"],
-            fix_king=True,
-        ),
-        "extra_queen": "qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
-        "random_backrow": random_backrow_fen(),
-        "random_backrow_with_replacement": random_piece_training_fen(),
-        "rook_for_piece_and_pawn": make_rook_for_piece_and_pawn_fen(),
-    }
-    pick = random.choice(list(fens.keys()))
-    board = chess.Board(fens[pick])
+    pick = random.choice([
+        "rooks_vs_standard", "b_vs_k", "extra_queen",
+        "random_backrow", "random_backrow_with_replacement", "rook_for_piece_and_pawn",
+    ])
+    if pick == "rooks_vs_standard":
+        fen = "rnbqkbnr/{}/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1".format(random.choice([
+            "1p1ppppp", "1pp1pppp", "1ppp1ppp", "1pppp1pp", "1ppppp1p", "1pppppp1",
+            "2pppppp",
+            "p1pp1ppp", "p1ppp1pp", "p1pppp1p", "p1ppppp1", "p2ppppp",
+            "pp1p1ppp", "pp1pp1pp", "pp1ppp1p", "pp1pppp1", "pp2pppp",
+            "ppp1p1pp", "ppp1pp1p", "ppp1ppp1", "ppp2ppp",
+            "pppp1p1p", "pppp1pp1", "pppp2pp",
+            "ppppp1p1", "ppppp2p",
+            "pppppp2",
+        ]))
+    elif pick == "b_vs_k":
+        fen = make_b_vs_k_fen()
+    elif pick == "extra_queen":
+        fen = random.choice([
+            "qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
+            "qnbqkbn1/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
+            "1nbqkbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
+        ])
+    elif pick == "random_backrow":
+        fen = random_backrow_fen()
+    elif pick == "random_backrow_with_replacement":
+        fen = random_piece_training_fen()
+    else:
+        fen = random.choice([
+            "rnbqkbnr/pppppppp/8/8/8/8/1PPPPP1P/RNBQKBRR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/P1PPPP1P/RNBQKBRR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/P1PPPPPP/RRBQKBNR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PP1PPP1P/RNBQKBRR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PP1PPPPP/RNRQKBNR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPP1PP1P/RNBQKBRR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPP1PP/RNBQKRNR w - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPP2/RNBQKBRR w - - 0 1",
+        ])
+    board = chess.Board(fen)
     if np.random.uniform() < 0.5:
         board = board.mirror()
     board.turn = chess.WHITE

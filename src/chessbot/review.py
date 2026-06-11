@@ -74,13 +74,16 @@ class GameViewer:
 
     def reset(self):
         self.board = Board(self.start_fen)
+        self.board_ch = chess.Board(self.start_fen)
         self.ply = 0  # 0 = before first move
 
     def goto(self, ply):
         ply = max(0, min(ply, len(self.moves_uci)))
         self.board = Board(self.start_fen)
+        self.board_ch = chess.Board(self.start_fen)
         for u in self.moves_uci[:ply]:
             self.board.push_uci(u)
+            self.board_ch.push(chess.Move.from_uci(u))
         self.ply = ply
         return self
     
@@ -102,7 +105,7 @@ class GameViewer:
         out = []
         limit = chess.engine.Limit(depth=depth, time=10.0)
         with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-            sf_board = chess.Board(self.board.fen())
+            sf_board = self.board_ch.copy()
             infos = eng.analyse(sf_board, limit=limit, multipv=k)
             if not isinstance(infos, list):
                 infos = [infos]
@@ -156,7 +159,7 @@ class GameViewer:
 
         if move_str is not None:
             # resolve move_str as UCI or SAN against current legal moves
-            sf_board = chess.Board(self.board.fen())
+            sf_board = self.board_ch.copy()
             root_move = None
             try:
                 m = chess.Move.from_uci(move_str)
@@ -218,7 +221,7 @@ class GameViewer:
                 print(f"\nPlayed move {upcoming_san} not in SF top-3; computing cp...")
                 limit = chess.engine.Limit(depth=depth, time=10.0)
                 with chess.engine.SimpleEngine.popen_uci(SF_LOC) as eng:
-                    sf_board = chess.Board(self.board.fen())
+                    sf_board = self.board_ch.copy()
                     info = eng.analyse(
                         sf_board, limit=limit,
                         root_moves=[chess.Move.from_uci(upcoming_uci)]
@@ -234,7 +237,7 @@ class GameViewer:
 
     def run_lc0_topk(self, nodes=4000, k=5, engine_cfg=None):
         """Return top-k rows from lc0 (sorted by N) for the current position."""
-        sf_board = chess.Board(self.board.fen())
+        sf_board = self.board_ch.copy()
         rows = lc0_analyze(sf_board, nodes=nodes, engine_cfg=engine_cfg)
         return rows[:k]
 
@@ -249,7 +252,7 @@ class GameViewer:
                 pass
 
         print(f"Running lc0 ({nodes} nodes)...")
-        sf_board = chess.Board(self.board.fen())
+        sf_board = self.board_ch.copy()
         all_rows = lc0_analyze(sf_board, nodes=nodes)
         if not all_rows:
             print("No lc0 data returned.")
@@ -379,13 +382,16 @@ class GameViewer:
         
     def next(self):
         if self.ply < len(self.moves_uci):
-            self.board.push_uci(self.moves_uci[self.ply])
+            mv = self.moves_uci[self.ply]
+            self.board.push_uci(mv)
+            self.board_ch.push(chess.Move.from_uci(mv))
             self.ply += 1
 
     def prev(self):
         if self.ply > 0:
             self.ply -= 1
             self.board.unmake()
+            self.board_ch.pop()
     
     def who_moved(self):
         mover = "White" if self.turn() else "Black"

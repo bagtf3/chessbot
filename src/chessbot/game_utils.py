@@ -45,6 +45,94 @@ def random_backrow_fen():
     return f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
 
 
+def shuffled_backrow_fen(white_pool, black_pool, fix_king=False):
+    w = [p for p in white_pool if p != "K"]
+    b = [p for p in black_pool if p != "K"]
+    random.shuffle(w)
+    random.shuffle(b)
+    if fix_king:
+        w.insert(4, "K")
+        b.insert(4, "K")
+    else:
+        w.append("K"); random.shuffle(w)
+        b.append("K"); random.shuffle(b)
+    return f"{to_fen_rank(b).lower()}/pppppppp/8/8/8/8/PPPPPPPP/{to_fen_rank(w)} w - - 0 1"
+
+
+def to_fen_rank(pieces):
+    result, empty = "", 0
+    for p in pieces:
+        if p == "1":
+            empty += 1
+        else:
+            if empty:
+                result += str(empty)
+                empty = 0
+            result += p
+    if empty:
+        result += str(empty)
+    return result
+
+
+def make_rook_for_piece_and_pawn_fen():
+    # Standard backrow: R N B Q K B N R (indices 0-7)
+    # Pick one minor piece square, replace with extra rook, remove pawn in front
+    sq = random.choice([1, 2, 5, 6])  # b1=N, c1=B, f1=B, g1=N
+    white_back = ["R", "N", "B", "Q", "K", "B", "N", "R"]
+    white_back[sq] = "R"
+    white_pawns = list("PPPPPPPP")
+    white_pawns[sq] = "1"
+    return (
+        f"rnbqkbnr/pppppppp/8/8/8/8/{''.join(white_pawns)}/{''.join(white_back)} w - - 0 1"
+    )
+
+
+def random_piece_training_fen():
+    piece_vals = {"Q": 9.0, "R": 5.0, "B": 3.5, "N": 3.0, "1": 0.0}
+    pool = ["Q", "R", "B", "N", "1"]
+
+    def sample_side(lo=None, hi=None):
+        for _ in range(500):
+            pieces = [random.choice(pool) for _ in range(7)]
+            total = sum(piece_vals[p] for p in pieces)
+            if total > 21 and total < 35:
+                if lo is None or lo <= total <= hi:
+                    return pieces, total
+        return None, None
+
+    for _ in range(50):
+        wp, wt = sample_side()
+        if wp is None:
+            continue
+        bp, bt = sample_side(lo=wt - 1, hi=wt + 1)
+        if bp is None:
+            continue
+
+        w_pieces = wp + ["K"]
+        random.shuffle(w_pieces)
+        b_pieces = bp + ["K"]
+        random.shuffle(b_pieces)
+
+        w_king_col = w_pieces.index("K")
+        b_king_col = b_pieces.index("K")
+
+        white_pawns = list("PPPPPPPP")
+        black_pawns = list("pppppppp")
+        diff = wt - bt
+        if diff > 0.5:
+            white_pawns[6 if w_king_col <= 3 else 1] = "1"
+        elif diff < -0.5:
+            black_pawns[6 if b_king_col <= 3 else 1] = "1"
+
+        w_rank = to_fen_rank(w_pieces)
+        b_rank = to_fen_rank(b_pieces).lower()
+        return (
+            f"{b_rank}/{''.join(black_pawns)}/8/8/8/8/{''.join(white_pawns)}/{w_rank} w - - 0 1"
+        )
+
+    return random_piece_training_fen()
+
+
 def get_pre_opened_game(index=None, mini=False):
     """Returns (start_fen, moves_list)."""
     path_list = MINI_PATHS if mini else PATHS
@@ -209,17 +297,22 @@ def make_piece_odds_board():
 
 def make_piece_training_board():
     fens = {
-        "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
-        "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
-        "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "b_vs_k": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
+        "rooks_vs_standard": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
+        "b_vs_k": shuffled_backrow_fen(
+            ["K", "Q", "R", "B", "B", "B", "B", "1"],
+            ["K", "Q", "R", "N", "N", "N", "N", "N"],
+            fix_king=True,
+        ),
         "extra_queen": "qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1",
-        "random_backrow": random_backrow_fen()
+        "random_backrow": random_backrow_fen(),
+        "random_backrow_with_replacement": random_piece_training_fen(),
+        "rook_for_piece_and_pawn": make_rook_for_piece_and_pawn_fen(),
     }
     pick = random.choice(list(fens.keys()))
     board = chess.Board(fens[pick])
     if np.random.uniform() < 0.5:
         board = board.mirror()
+    board.turn = chess.WHITE
     return board.fen(), {"scenario": f"pt_{pick}"}
 
 
@@ -309,6 +402,7 @@ class GameGenerator:
 
         elif game_type == "piece_training":
             fen, meta = make_piece_training_board()
+            meta["scenario_subtype"] = meta.pop("scenario")
             meta["scenario"] = "piece_training"
             moves = []
         

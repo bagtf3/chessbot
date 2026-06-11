@@ -803,7 +803,7 @@ class StockfishThread(object):
 
             try:
                 res_tup = sf_eval(
-                    board, score_fn=score_to_value_stm_pov_tanh,
+                    board, score_fn=lambda s: score_to_value_stm_pov_tanh(s, mid_cp=150.0),
                     depth=self.depth, engine=self.eng
                 )
 

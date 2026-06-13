@@ -50,8 +50,7 @@ class Config(object):
     n_games = 128
     games_at_once = 128
     micro_batch = 4
-    min_batch = 4
-    fwd_batch = 256
+    macro_batch = 256
 
     max_game_length = 200
     min_game_length = 5

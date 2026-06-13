@@ -10,7 +10,7 @@ import chess.engine
 
 from chessbot.review import score_to_value_stm_pov_tanh
 
-_now = time.time
+now = time.time
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,6 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
                 break
             h.update(chunk)
     prefix = f'{model_name}_{h.hexdigest()[:12]}'
-    opt_bs = min(max_bs, 256)
 
     ort.set_default_logger_severity(3)
     sess_opts = ort.SessionOptions()
@@ -50,7 +49,7 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
         'trt_force_timing_cache':   True,
         'trt_max_workspace_size':   4 * 1024 * 1024 * 1024,
         'trt_profile_min_shapes':   'enc_in:1x64',
-        'trt_profile_opt_shapes':   f'enc_in:{opt_bs}x64',
+        'trt_profile_opt_shapes':   f'enc_in:{max_bs}x64',
         'trt_profile_max_shapes':   f'enc_in:{max_bs}x64',
         'trt_timing_cache_enable':  True,
         'trt_timing_cache_path':    trt_cache,
@@ -119,14 +118,15 @@ class GameLooper(object):
         # pulls in model from config and XLA compilers inferencer
         self.load_reload_model()
         
-        self.batch_candidates = self.create_batch_candidates(self.config)
         self.n_retrains = 0
         
-        self._run_start = _now()
+        self._run_start = now()
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
-        self._last_stats_log = _now()
+        self._last_stats_log = now()
         self.prediction_times = []
+        self.infer_gaps = []
+        self.last_infer_end = None
 
         # self.batcher = Batcher(cfg, self.batch_candidates)
         # self.tf_thread = TensorFlowThread(
@@ -156,19 +156,19 @@ class GameLooper(object):
             import torch
             from chessbot.train_pytorch import make_pt_infer
             model = torch.jit.load(cfg.model_path, map_location="cpu")
-            self.model, self.infer = make_pt_infer(model, max_bs=cfg.fwd_batch)
+            self.model, self.infer = make_pt_infer(model, max_bs=cfg.macro_batch)
         elif cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
                 cfg.trt_model_name,
                 cfg.trt_cache,
-                cfg.fwd_batch,
+                cfg.macro_batch,
             )
         else:
             self.model = load_model(cfg.model_path)
             self.infer = make_conv_infer(
                 self.model,
-                max_bs=cfg.fwd_batch,
+                max_bs=cfg.macro_batch,
                 vscale=cfg.vscale,
             )
     
@@ -256,24 +256,6 @@ class GameLooper(object):
 
         self.n_retrains += 1
 
-    def create_batch_candidates(self, cfg):
-        # create sizes
-        batch_candidates = set([cfg.min_batch, cfg.fwd_batch])
-        bs = cfg.min_batch
-        while bs <= cfg.fwd_batch:
-            batch_candidates.add(bs)
-            bs *= 2
-        
-        # split difference between last 2 if large
-        if len(batch_candidates) >= 2 and cfg.fwd_batch >= 128:
-            sbc = sorted(batch_candidates)
-            lo = sbc[-2]
-            hi = sbc[-1]
-            mid = lo + (hi - lo) // 2
-            sbc.append(mid)
-            return sorted(set(sbc))
-        return sorted(set(batch_candidates))
-
     def pull_from_queue(self):
         from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
@@ -309,10 +291,7 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        #batcher = self.batcher
-        mbs = cfg.micro_batch
-        fwd = cfg.fwd_batch
-        max_fastpath = max(1024, int(2.5 * mbs))
+        max_fastpath = 1024
         mps = self.mps
 
         #(batch size, target), counts returned
@@ -361,20 +340,13 @@ class GameLooper(object):
                         g = self.sf_games[game_id]
                         g.set_stockfish_result(res_tup)
 
-            # usually we will have perfectly filled batches, but some games
-            # may fill less than mbs, leaving room to pick extra leaves from other games
-            likely_fill = min(fwd, mbs * min(len(self.active_games), cfg.games_at_once))
-            batch_target = fwd
-            for candidate in self.batch_candidates:
-                if candidate >= likely_fill:
-                    batch_target = candidate
-                    break
-            
-            bonus = max(0, batch_target - likely_fill)
+            bonus = 0
             finished = []
             preds_batch = []
             # selfplay loop starts here
+            mbs_used = []
             for game in self.active_games[:cfg.games_at_once]:
+                g_mbs = game.config.micro_batch
                 sf_terminal, mcts_terminal = False, False
                 # first resolve any recent preds
                 game.tree.resolve_inflight()
@@ -389,16 +361,16 @@ class GameLooper(object):
                         # stash the game here for easy reference later
                         self.sf_games[game.game_id] = game
                         game.sf_pending = True
-                    
+
                     if game.tree.sims_completed_this_move >= cfg.sf_move_sims:
                         if game.sf_pending and game.sf_ready:
                             # sets pending, ready, res_tup to False, False, None
                             sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
                             mps.tick(1)
                         else:
-                            bonus += mbs
+                            bonus += g_mbs
                             continue
-                
+
                 # if this game has reached its local sim budget, make the move
                 elif game.tree.stop_simulating():
                     # xerces plays from tree
@@ -411,34 +383,39 @@ class GameLooper(object):
                     finished.append(game.game_id)
                     if game.game_id in self.sf_games:
                         del self.sf_games[game.game_id]
-                    bonus += mbs
+                    bonus += g_mbs
                     continue
 
                 # if bonus available we can bump our microbatch up to 2x
-                this_mbs = mbs + min(bonus, mbs) if bonus > 0 else mbs
+                this_mbs = g_mbs + min(bonus, g_mbs) if bonus > 0 else g_mbs
                 res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
                 nn, n_leafs = self.process_results(res, counts, this_mbs)
-                
+                mbs_used.append(this_mbs)
+
                 # update bonus, could go up or down
-                bonus += mbs - nn
+                bonus += g_mbs - nn
                 
                 # update sim count
                 game.tree.sims_completed_this_move += n_leafs
                 if nn:
                     preds_batch += game.tree.pending_encoded_64_tokens()
+                    if len(preds_batch) >= cfg.macro_batch:
+                        pred_fill.append(self.format_and_predict(preds_batch))
+                        preds_batch = []
 
             if preds_batch:
-                batch_target, batch_size = self.format_and_predict(preds_batch)
-                pred_fill.append((batch_size, batch_target))
+                pred_fill.append(self.format_and_predict(preds_batch))
+                preds_batch = []
 
-            if self.maybe_push_telemetry(counts, pred_fill, force=False):
+            if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
+                self.infer_gaps.clear()
                 counts.clear(); pred_fill.clear()
             
             if finished:
                 finished_ids.update(finished)
             
-        self.maybe_push_telemetry(counts, pred_fill, force=True)
+        self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=True)
         return 0
 
     def process_results(self, res, counts, mbs):
@@ -493,43 +470,17 @@ class GameLooper(object):
             keys.append(item[0])
             boards.append(np.asarray(item[1], dtype=np.int32))
 
-        # stack to batch
-        boards_np = np.stack(boards, axis=0)   # (B,64)
-        # pad up to max_batch or a smaller power of 2 if needed
-        # (helps XLA/static-trace shapes)
-
-        target_bs = self.config.fwd_batch
+        boards_np = np.stack(boards, axis=0)   # (B, 64)
         B = boards_np.shape[0]
-        if B < target_bs:
-            # choose padding target safely
-            for new_target in self.batch_candidates:
-                if new_target >= B:
-                    break
-            pad = max(0, int(new_target - B))
-            if pad:
-                pad_boards = np.zeros((pad,)+boards_np.shape[1:], dtype=boards_np.dtype)
-                boards_np_p = np.concatenate([boards_np, pad_boards], axis=0)
-                start = _now()
-                probs_np_p, vals_np_p = self.infer((boards_np_p,))
-                probs_np = probs_np_p[:B]
-                vals_np = vals_np_p[:B]
-
-            else:
-                start = _now()
-                probs_np, vals_np = self.infer((boards_np,))
-        else:
-            new_target = target_bs
-            start = _now()
-            probs_np, vals_np = self.infer((boards_np,))
-        
-        # bulk insert: pass batch arrays directly — zero Python loop
-        # vals_np: (B, 3) float32 WDL softmax probs (STM-POV)
-        # probs_np: (B, 4288) float32 raw policy logits
+        start = now()
+        if self.last_infer_end is not None:
+            self.infer_gaps.append(start - self.last_infer_end)
+        probs_np, vals_np = self.infer((boards_np,))
         keys_np = np.array(keys, dtype=np.uint64)
-        raw_cache_bulk_insert_np(keys_np, vals_np[:B], probs_np[:B])
-        stop = _now()
-        self.prediction_times.append(stop-start)
-        return new_target, B
+        raw_cache_bulk_insert_np(keys_np, vals_np, probs_np)
+        self.last_infer_end = now()
+        self.prediction_times.append(self.last_infer_end - start)
+        return B
 
     def finalize_game_data(self, game):
         """
@@ -554,7 +505,7 @@ class GameLooper(object):
 
         # cast types for JSON 
         mem_summary = {
-            "ts": _now(),
+            "ts": now(),
             "game_id": game.game_id,
             "scenario": game.meta.get("scenario", ""),
             "plies": game.plies,
@@ -562,7 +513,7 @@ class GameLooper(object):
             "end_reason": game.end_reason,
             "vs_stockfish": game.vs_stockfish,
             "stockfish_color": game.stockfish_is_white,
-            "duration": _now() - game.started_at,
+            "duration": now() - game.started_at,
             "sims_done_total": sims_total,
             "mcts_sims_total": game.mcts_sims_total,
             "mcts_plies": game.mcts_plies,
@@ -616,16 +567,16 @@ class GameLooper(object):
         game.recents.clear()
         return
     
-    def maybe_push_telemetry(self, counts, pred_fill, every_sec=45.0, force=False):
-        now = _now()
+    def maybe_push_telemetry(self, counts, pred_fill, mbs_used, every_sec=45.0, force=False):
+        ts_now = now()
         if not force:
-            if now - self._last_stats_log < every_sec:
+            if ts_now - self._last_stats_log < every_sec:
                 return False
 
-        self._last_stats_log = now
+        self._last_stats_log = ts_now
 
-        lpb = [p[0] for p in pred_fill]
-        target = [p[1] for p in pred_fill]
+        lpb = pred_fill
+        target = self.config.macro_batch
 
         s_collected = sum([r[0] for r in counts])
         s_fast = sum([r[1] for r in counts])
@@ -645,14 +596,15 @@ class GameLooper(object):
         s_penalty = sum([r[12] for r in counts])
 
         telemetry = {
-            "ts": now,
+            "ts": ts_now,
             "mps": self.mps.rate(),
             "lps": self.lps.rate(),
-            "mbs": self.config.micro_batch,
+            "mbs": np.mean(mbs_used) if mbs_used else 0.0,
             "apl": np.mean(lpb) if lpb else 0.0,
+            "infer_gap": np.mean(self.infer_gaps) if self.infer_gaps else 0.0,
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
-            "batch_target": np.mean(target) if target else 0.0,
+            "batch_target": target,
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
             "n_groups": len(counts),

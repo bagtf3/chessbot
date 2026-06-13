@@ -324,8 +324,8 @@ def prepare_val_trt(cfg):
 
     print(f'{V} compiling TRT engine...')
     t0 = time.time()
-    sess = make_trt_session(onnx_path, model_name, val_trt_dir, cfg.fwd_batch)
-    dummy = np.zeros((min(cfg.fwd_batch, 256), 64), dtype=np.int64)
+    sess = make_trt_session(onnx_path, model_name, val_trt_dir, cfg.macro_batch)
+    dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
     sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
     del sess
     gc.collect()

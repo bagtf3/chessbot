@@ -1786,7 +1786,7 @@ class RecordKeeper(object):
         summed = defaultdict(float)
         sum_seen = set()
 
-        to_avg = ["mbs", "batch_target", "apl", "pred_wait", "avg_ply"]
+        to_avg = ["mbs", "batch_target", "apl", "infer_gap", "pred_wait", "avg_ply"]
         avged = defaultdict(list)
         avg_seen = set()
 
@@ -1885,13 +1885,12 @@ class RecordKeeper(object):
         right2 = f"collect_stops={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
 
         apl = avged["apl"]
-        batch_target = avged["batch_target"]
-        fill_pct = 100.0 * apl / max(1.0, batch_target)
+        infer_gap = avged.get("infer_gap", 0.0)
 
         pred_wait = avged["pred_wait"]
         preds_per_sec = summed["preds_per_second"]
 
-        left3 = f"[pred stats] fill={apl:.1f}/{batch_target:.1f} ({fill_pct:.1f}%)"
+        left3 = f"[pred stats] batch={apl:.1f}  gap={infer_gap:.3f}s"
         right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
 
         tot = s_priorless + s_with_priors + s_must_visit

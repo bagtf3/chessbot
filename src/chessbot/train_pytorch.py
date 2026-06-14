@@ -18,6 +18,12 @@ def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
 FALLBACK_ARCH = "13m-precond-conformer"
 
 
+def shorten_path(p):
+    parts = p.replace("\\", "/").split("/")
+    idx = next((i for i, x in enumerate(parts) if x == "selfplay_runs"), None)
+    return "/".join(parts[idx:]) if idx is not None else p
+
+
 def log_policy_mask_status(model):
     ph = getattr(model, "policy_head", None)
     buf = getattr(ph, "sometimes_legal", None) if ph is not None else None
@@ -25,9 +31,8 @@ def log_policy_mask_status(model):
         print("[load_pt_model] policy_head.sometimes_legal: NOT FOUND")
         return
     n = int(buf.sum().item())
-    print(f"[load_pt_model] policy_head.sometimes_legal: dtype={buf.dtype} shape={buf.shape} "
-          f"sometimes-legal={n} never-legal={buf.numel()-n}"
-          + ("  OK" if n == 1858 else f"  WARN expected 1858 got {n}"))
+    if n != 1858:
+        print(f"[load_pt_model] policy_head.sometimes_legal: WARN expected 1858 got {n}")
 
 
 def companion_pt(ts_path: str) -> str:
@@ -85,11 +90,11 @@ def save_pt_model(model, path, arch=None, opt=None):
             with torch.no_grad():
                 traced = torch.jit.trace(model, dummy)
             torch.jit.save(traced, path)
-        print(f"[pytorch] TorchScript saved -> {path}")
+        print(f"[pytorch] TorchScript saved -> {shorten_path(path)}")
         pt_path = companion_pt(path)
         payload = {"model": model.state_dict(), "arch": arch}
         torch.save(payload, pt_path)
-        print(f"[pytorch] companion weights saved -> {pt_path}")
+        print(f"[pytorch] companion weights saved -> {shorten_path(pt_path)}")
         return
     payload = {"model": model.state_dict(), "arch": arch}
     if opt is not None:

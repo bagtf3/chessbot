@@ -456,7 +456,7 @@ class ChessGame(object):
         self.sf_search_depth = []
         tree_cfg = self.config
         scenario = meta.get('scenario', '')
-        if scenario in ('UHO', 'piece_training') and not self.config.is_validation_run:
+        if scenario == 'piece_training' and not self.config.is_validation_run:
             tree_cfg = self.config.copy()
             tree_cfg.move_sample_temp_range = [0.2, 0.2]
         self.tree = MCTSTree(self.board, tree_cfg)

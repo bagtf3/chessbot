@@ -515,9 +515,8 @@ def main(run_tag):
                 # check for a retrain
                 if recorder.training_queue >= needed_to_retrain:
                     # drain so write gets accurate data; workers keep playing meanwhile
-                    k = max(1, recorder.training_queue // working_cfg.retrain_size)
                     rescorer.write_training_data_pkl(
-                        size=k * working_cfg.retrain_size, randomize=True)
+                        size=working_cfg.retrain_size, randomize=True)
                     recorder.training_queue = rescorer.training_data_size
 
                     # pause workers before reclaim + launch

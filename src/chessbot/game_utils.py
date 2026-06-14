@@ -606,11 +606,13 @@ class GameGenerator:
                 print(f"[validation_games] warning: could not find unique position for {game_type}, skipping")
                 continue
             fen, moves, _ = result
+            cfg_black = resolve_cfg(cfg)
+            cfg_black.contempt_fight_c = 0.0
             specs.append(GameSpec(
                 fen=fen, moves=moves,
                 meta={"vs_stockfish": True, "stockfish_is_white": True,
                       "scenario": "paired_validation"},
-                cfg=resolve_cfg(cfg),
+                cfg=cfg_black,
             ))
             specs.append(GameSpec(
                 fen=fen, moves=list(moves),

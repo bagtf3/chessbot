@@ -41,6 +41,10 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, dropout=0.05,
         pre_blocks=4, mha_blocks=4,
     ),
+    "hybrid-conv-attn": dict(
+        hybrid_conv_attn=True,
+        n_trunk_blocks=6, trunk_dim=1024, dropout=0.02,
+    ),
 }
 
 
@@ -698,10 +702,162 @@ def build_pt_precond_conformer(cfg: dict):
     return m
 
 
+def build_pt_hybrid_conv_attn(cfg: dict):
+    """Conv frontend + pos-cat -> 256-d -> self-attn(68) -> cross-attn(globals->68).
+
+    Encoder: Embedding(21,128) -> 2xConv2D(128) -> cat([x, pos], dim=-1) -> [B,64,256]
+      -> cat 4 global tokens -> [B,68,256]
+      -> MHABlock self-attn -> CrossAttnBlock(Q=globals[4], KV=68) -> [B,4,256]
+      -> reshape [B,1024]
+    Trunk: n_trunk_blocks x SwiGLU @ trunk_dim
+    Heads: flat policy (masked 4288) + WDL value (3)
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    ENC_DIM     = 128
+    ENC_DIM_MHA = 256
+    N_GLOBAL    = 4
+    ENC_HEADS   = 8
+    ENC_FF      = 1024
+    POLICY_DIM  = 4288
+
+    n_trunk = cfg["n_trunk_blocks"]
+    D       = cfg["trunk_dim"]
+    dr      = cfg["dropout"]
+    assert N_GLOBAL * ENC_DIM_MHA == D
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class ConvBlock2D(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.ln = nn.LayerNorm(d)
+            self.c1 = nn.Conv2d(d, d, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(d, d, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            B, _, d = x.shape
+            h = self.ln(x).reshape(B, 8, 8, d).permute(0, 3, 1, 2)
+            h = F.gelu(self.c1(h))
+            h = self.c2(h)
+            return x + h.permute(0, 2, 3, 1).reshape(B, 64, d)
+
+    class MHABlock(nn.Module):
+        def __init__(self, d, n_heads, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(d)
+            self.attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
+            self.ln2  = nn.LayerNorm(d)
+            self.ff1  = nn.Linear(d, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, d)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + h
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class CrossAttnBlock(nn.Module):
+        def __init__(self, d, n_heads, ff_dim):
+            super().__init__()
+            self.ln_q  = nn.LayerNorm(d)
+            self.ln_kv = nn.LayerNorm(d)
+            self.attn  = nn.MultiheadAttention(d, n_heads, batch_first=True)
+            self.ln2   = nn.LayerNorm(d)
+            self.ff1   = nn.Linear(d, ff_dim)
+            self.ff2   = nn.Linear(ff_dim, d)
+
+        def forward(self, q, kv):
+            kv_n = self.ln_kv(kv)
+            h, _ = self.attn(self.ln_q(q), kv_n, kv_n, need_weights=False)
+            q = q + h
+            return q + self.ff2(F.gelu(self.ff1(self.ln2(q))))
+
+    class SwiGLUBlock(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.norm   = RMSNorm(d)
+            self.w_gate = nn.Linear(d, hidden, bias=False)
+            self.w_up   = nn.Linear(d, hidden, bias=False)
+            self.w_down = nn.Linear(hidden, d, bias=False)
+            self.drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.w_down.weight)
+
+        def forward(self, x):
+            h = self.norm(x)
+            return x + self.drop(self.w_down(F.silu(self.w_gate(h)) * self.w_up(h)))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb           = nn.Embedding(VOCAB_SIZE, ENC_DIM)
+            self.conv          = nn.ModuleList([ConvBlock2D(ENC_DIM), ConvBlock2D(ENC_DIM)])
+            self.pos           = nn.Embedding(SEQ_LEN, ENC_DIM)
+            self.ln_x          = nn.LayerNorm(ENC_DIM)
+            self.ln_pos        = nn.LayerNorm(ENC_DIM)
+            self.global_tokens = nn.Parameter(torch.randn(1, N_GLOBAL, ENC_DIM_MHA) * 0.02)
+            self.self_attn     = MHABlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF)
+            self.cross_attn    = CrossAttnBlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF)
+
+            hidden = D * 3 // 2
+            self.trunk = nn.ModuleList([SwiGLUBlock(D, hidden) for _ in range(n_trunk)])
+
+            self.pol_norm = RMSNorm(D)
+            self.pol_w1   = nn.Linear(D, D, bias=False)
+            self.pol_w2   = nn.Linear(D, POLICY_DIM, bias=False)
+            never_legal = ~torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("never_legal", never_legal)
+
+            self.val_norm = RMSNorm(D)
+            self.val_w1   = nn.Linear(D, D // 2, bias=False)
+            self.val_w2   = nn.Linear(D // 2, 3, bias=False)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x   = self.emb(tokens)                                               # [B, 64, 128]
+            for blk in self.conv:
+                x = blk(x)
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device))         # [64, 128]
+            x   = torch.cat([self.ln_x(x), self.ln_pos(pos).unsqueeze(0).expand(B, -1, -1)], dim=-1)  # [B, 64, 256]
+            gt  = self.global_tokens.expand(B, -1, -1)                          # [B, 4, 256]
+            seq = torch.cat([x, gt], dim=1)                                     # [B, 68, 256]
+            seq = self.self_attn(seq)                                            # [B, 68, 256]
+            g   = self.cross_attn(seq[:, -N_GLOBAL:], seq)                      # [B, 4, 256]
+            x   = g.reshape(B, -1)                                              # [B, 1024]
+            for blk in self.trunk:
+                x = blk(x)
+            pol = self.pol_w2(F.silu(self.pol_w1(self.pol_norm(x))))
+            pol = pol.masked_fill(self.never_legal, -3e4)
+            val = self.val_w2(F.silu(self.val_w1(self.val_norm(x))))
+            return pol, val
+
+    m = M()
+    total = sum(p.numel() for p in m.parameters())
+    print(f"  hybrid-conv-attn architecture:")
+    print(f"    encoder : Embedding({VOCAB_SIZE},{ENC_DIM}) -> 2xConv2D({ENC_DIM}) -> cat(pos) -> [{ENC_DIM_MHA}]")
+    print(f"    attn    : self-attn over [B,68,{ENC_DIM_MHA}] -> cross-attn(Q=globals[{N_GLOBAL}], KV=68)")
+    print(f"    bridge  : [B,{N_GLOBAL},{ENC_DIM_MHA}] -> [B,{D}]")
+    print(f"    trunk   : {n_trunk}x SwiGLUBlock(d={D}, hidden={D * 3 // 2}, dropout={dr})")
+    print(f"    heads   : policy Linear({D}->{D}->4288, masked) | value Linear({D}->{D//2}->3)")
+    print(f"    total params: {total:,}")
+    return m
+
+
 PT_BUILDERS: dict[str, object] = {
     "16m-transformer":          build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
     "13m-precond-conformer":    build_pt_precond_conformer,
+    "hybrid-conv-attn":         build_pt_hybrid_conv_attn,
 }
 
 

@@ -11,6 +11,8 @@ import os
 import queue
 import threading
 
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "upb")
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -97,7 +99,10 @@ def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BA
 
     Imports TF lazily so the supervisor process stays GPU-free.
     """
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
     import tensorflow as tf
+    tf.get_logger().setLevel("ERROR")
 
     feature_spec = {
         "enc_in":        tf.io.FixedLenFeature([], tf.string),
@@ -141,6 +146,156 @@ def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BA
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python TFRecord pipeline (no TensorFlow required)
+# ---------------------------------------------------------------------------
+
+def _varint(data: bytes, pos: int):
+    result = shift = 0
+    while True:
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80): return result, pos
+        shift += 7
+
+
+def _parse_tf_shape(data: bytes) -> list:
+    """Parse TensorShapeProto bytes, return list of dimension sizes."""
+    pos = 0; dims = []
+    while pos < len(data):
+        tag, pos = _varint(data, pos)
+        f, w = tag >> 3, tag & 7
+        if w == 2:
+            ln, pos = _varint(data, pos)
+            sl = data[pos:pos+ln]; pos += ln
+            if f == 2:  # repeated Dim at field 2
+                p2 = 0
+                while p2 < len(sl):
+                    t2, p2 = _varint(sl, p2)
+                    f2, w2 = t2 >> 3, t2 & 7
+                    if w2 == 0:
+                        v, p2 = _varint(sl, p2)
+                        if f2 == 1: dims.append(v)
+                    elif w2 == 2:
+                        ln2, p2 = _varint(sl, p2); p2 += ln2
+        elif w == 0:
+            _, pos = _varint(data, pos)
+        elif w == 1: pos += 8
+        elif w == 5: pos += 4
+    return dims
+
+
+def _decode_tf_tensor(blob: bytes) -> np.ndarray:
+    """Decode a tf.io.serialize_tensor blob into a numpy array without TF."""
+    _DTYPES = {1: np.float32, 3: np.int32, 5: np.int16}
+    pos = 0; dtype_id = None; shape = []; content = None
+    while pos < len(blob):
+        tag, pos = _varint(blob, pos)
+        f, w = tag >> 3, tag & 7
+        if w == 0:
+            v, pos = _varint(blob, pos)
+            if f == 1: dtype_id = v
+        elif w == 2:
+            ln, pos = _varint(blob, pos)
+            sl = blob[pos:pos+ln]; pos += ln
+            if f == 2: shape = _parse_tf_shape(sl)
+            elif f == 4: content = sl
+        elif w == 1: pos += 8
+        elif w == 5: pos += 4
+    arr = np.frombuffer(content, dtype=_DTYPES[dtype_id]).copy()
+    return arr.reshape(shape) if shape else arr
+
+
+_NUMPY_SHUFFLE_CAP = 32_000   # numpy records in RAM (~1GB); TF can handle 256K with C++ internals
+
+def _numpy_record_stream(file_list: list[str], shuffle_buffer: int):
+    """Infinite shuffled stream of parsed single-record tuples (numpy arrays)."""
+    from tfrecord.reader import tfrecord_loader
+    import random
+
+    effective = min(shuffle_buffer, _NUMPY_SHUFFLE_CAP)
+    desc = {
+        "enc_in": "byte", "mask": "byte", "policy_logits": "byte",
+        "value_out": "float", "weight": "float",
+    }
+    files = list(file_list)
+    buf: list = []
+
+    while True:
+        random.shuffle(files)
+        for path in files:
+            try:
+                for raw in tfrecord_loader(path, None, desc, compression_type="gzip"):
+                    enc_in  = _decode_tf_tensor(raw["enc_in"].tobytes()).astype(np.int32)
+                    mask    = _decode_tf_tensor(raw["mask"].tobytes())
+                    policy  = _decode_tf_tensor(raw["policy_logits"].tobytes())
+                    value   = raw["value_out"].astype(np.float32)
+                    weight  = float(raw["weight"][0])
+
+                    mask_f  = mask.astype(np.float32)
+                    n_legal = mask_f.sum()
+                    policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
+                    policy  = np.minimum(policy, POLICY_MAX_CLIP)
+                    policy  = policy / policy.sum()
+
+                    buf.append((enc_in, mask, policy, value, weight))
+                    if len(buf) >= effective:
+                        idx = random.randrange(len(buf))
+                        yield buf[idx]
+                        buf[idx] = buf[-1]; buf.pop()
+            except Exception as exc:
+                print(f"[dataset] error reading {path}: {exc}")
+
+
+def _collate_bundle(records: list, batch_size: int, steps_per_epoch: int) -> dict:
+    """Stack a list of records into a single epoch bundle of numpy arrays."""
+    enc_ins, masks, policies, values, weights = zip(*records)
+    return {
+        "enc_in":        np.stack(enc_ins),
+        "mask":          np.stack(masks),
+        "policy_logits": np.stack(policies),
+        "value_out":     np.stack(values),
+        "weight":        np.array(weights, dtype=np.float32),
+    }
+
+
+class EpochBufferThreadNumpy(threading.Thread):
+    """Prefetches epoch bundles from .tfrecord.gz files without TensorFlow."""
+
+    def __init__(self, file_list: list[str], batch_size: int,
+                 steps_per_epoch: int, shuffle_buffer: int, max_ready: int = 2):
+        super().__init__(daemon=True)
+        self.file_list       = file_list
+        self.batch_size      = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.shuffle_buffer  = shuffle_buffer
+        self.q               = queue.Queue(maxsize=max_ready)
+        self.stop_event      = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def get(self):
+        item = self.q.get()
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def run(self) -> None:
+        try:
+            total  = self.steps_per_epoch * self.batch_size
+            stream = _numpy_record_stream(self.file_list, self.shuffle_buffer)
+            while not self.stop_event.is_set():
+                records = [next(stream) for _ in range(total)]
+                bundle  = _collate_bundle(records, self.batch_size, self.steps_per_epoch)
+                self.q.put(bundle)
+        except Exception as exc:
+            try:
+                self.q.put(exc, timeout=1.0)
+            except queue.Full:
+                pass
 
 
 class EpochBufferThread(threading.Thread):

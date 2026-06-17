@@ -11,7 +11,7 @@ Usage:
     python scripts/bootstrap_model_async_tfrec_pt.py [options]
 
 Options:
-    --model      Model name            (default: 16m-transformer)
+    --model      Model name            (default: hybrid-conv-attn)
     --run-tag    Sub-dir under SP_DIR  (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
@@ -45,10 +45,11 @@ from chessbot.model import VARIANTS, PT_BUILDERS
 PT_BATCH_SIZE      = 512
 PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
 PT_ADAM_BETA2      = 0.995
+PT_SHUFFLE_BUFFER  = 128_000
 
 EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
-DEFAULT_MODEL     = "16m-transformer"
+DEFAULT_MODEL     = "hybrid-conv-attn"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
 
@@ -302,10 +303,6 @@ def worker_main(wargs: dict) -> None:
     from chessbot import MODEL_DIR
     from chessbot.utils import format_time
 
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    import tensorflow as tf
-    tf.config.set_visible_devices([], "GPU")
-
     name        = wargs["name"]
     run_dir     = wargs["run_dir"]
     train_files = wargs["train_files"]
@@ -353,14 +350,10 @@ def worker_main(wargs: dict) -> None:
         f"  batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
     )
 
-    prefetcher = EpochBufferThread(
-        make_dataset(train_files, SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE),
-        PT_STEPS_PER_EPOCH, max_ready=2,
-    )
-    val_prefetcher = EpochBufferThread(
-        make_dataset(val_files, VAL_SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE),
-        PT_STEPS_PER_EPOCH, max_ready=1,
-    )
+    train_ds = make_dataset(train_files, PT_SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE)
+    val_ds   = make_dataset(val_files, VAL_SHUFFLE_BUFFER, batch_size=PT_BATCH_SIZE)
+    prefetcher     = EpochBufferThread(train_ds, PT_STEPS_PER_EPOCH, max_ready=2)
+    val_prefetcher = EpochBufferThread(val_ds,   PT_STEPS_PER_EPOCH, max_ready=1)
     prefetcher.start()
     val_prefetcher.start()
 

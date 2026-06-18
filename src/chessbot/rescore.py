@@ -544,9 +544,6 @@ class Rescorer(object):
         policy = np.zeros(64 * 67, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        eps = self.config.uniform_eps
-        uniform_mass = 1 / len(ucis) if len(ucis) else 0.0
-        pi = eps * uniform_mass + (1.0 - eps) * pi
         pi = np.clip(pi, 0.0, self.config.prior_clip_max)
         pi = pi / pi.sum()
         for idx, p in zip(indices, pi):
@@ -1071,9 +1068,6 @@ class Rescorer(object):
             policy = np.zeros(64 * 67, dtype=np.float32)
             s = sum(vis)
             pi = np.array([v / s for v in vis], dtype=np.float32)
-            eps = cfg.uniform_eps
-            uni = 1.0 / len(mvs) if mvs else 0.0
-            pi = eps * uni + (1.0 - eps) * pi
             pi = np.clip(pi, 0.0, cfg.prior_clip_max)
             pi = pi / pi.sum()
             for idx, p in zip(indices, pi):

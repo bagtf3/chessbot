@@ -404,7 +404,8 @@ def main(run_tag):
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
                 working_cfg = create_validation_config(working_cfg, val_yaml_path)
-                working_cfg = prepare_val_trt(working_cfg)
+                if working_cfg.inference_backend == 'ort_trt':
+                    working_cfg = prepare_val_trt(working_cfg)
             
             # update the rescorer config
             rescorer.config = working_cfg

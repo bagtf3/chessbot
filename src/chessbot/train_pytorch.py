@@ -28,7 +28,20 @@ def log_policy_mask_status(model):
     ph = getattr(model, "policy_head", None)
     buf = getattr(ph, "sometimes_legal", None) if ph is not None else None
     if buf is None:
-        print("[load_pt_model] policy_head.sometimes_legal: NOT FOUND")
+        # newer architectures register never_legal directly on the model
+        never = getattr(model, "never_legal", None)
+        if never is not None:
+            n = int((~never).sum().item())
+            if n != 1858:
+                print(f"[load_pt_model] never_legal: WARN expected 1858 sometimes-legal got {n}")
+            return
+        sl_idx = getattr(model, "sl_idx", None)
+        if sl_idx is not None:
+            n = int(sl_idx.shape[0])
+            if n != 1858:
+                print(f"[load_pt_model] sl_idx: WARN expected 1858 scatter indices got {n}")
+            return
+        print("[load_pt_model] policy mask: NOT FOUND (no policy_head.sometimes_legal, never_legal, or sl_idx)")
         return
     n = int(buf.sum().item())
     if n != 1858:
@@ -82,13 +95,14 @@ def save_pt_model(model, path, arch=None, opt=None):
     """
     if path.endswith(".ts"):
         trace_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(trace_device).eval()
-        if isinstance(model, torch.jit.ScriptModule):
-            torch.jit.save(model, path)
+        use_fp16 = trace_device.type == "cuda"
+        trace_model = model.to(trace_device).half().eval() if use_fp16 else model.to(trace_device).eval()
+        if isinstance(trace_model, torch.jit.ScriptModule):
+            torch.jit.save(trace_model, path)
         else:
             dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
             with torch.no_grad():
-                traced = torch.jit.trace(model, dummy)
+                traced = torch.jit.trace(trace_model, dummy)
             torch.jit.save(traced, path)
         print(f"[pytorch] TorchScript saved -> {shorten_path(path)}")
         pt_path = companion_pt(path)

@@ -49,7 +49,7 @@ PT_SHUFFLE_BUFFER  = 128_000
 
 EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
-DEFAULT_MODEL     = "hybrid-conv-attn"
+DEFAULT_MODEL     = "conv-mha-gemm-smartgate"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
 
@@ -569,8 +569,12 @@ def main() -> None:
         cfg = VARIANTS[arch_name]
         model = PT_BUILDERS[arch_name](cfg)
         model.load_state_dict(raw["model"])
-        ts_path = os.path.join(run_dir, f"{name}.ts")
+        run_tag   = os.path.basename(run_dir)
+        pt_path   = os.path.join(run_dir, f"{run_tag}_model.pt")
+        ts_path   = os.path.join(run_dir, f"{run_tag}_model.ts")
+        torch.save(raw["model"], pt_path)
         export_ts(model, ts_path, arch=arch_name)
+        print(f"[supervisor] export complete -> {pt_path}")
         print(f"[supervisor] export complete -> {ts_path}")
 
 

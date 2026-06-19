@@ -4,20 +4,24 @@
 Conv-backbone speed tests for chess policy+value models.
 
 Models:
-  Conv+MHA   -- channels-first conv encoder -> self-attn over 68 tokens
-                -> cross-attn (globals) -> SwiGLU trunk
-  Conv+GEMM  -- 6x gated conv (128-d, channels-first) -> GatedPoolCompressor
-                -> 1536-d alternating GELU/SwiGLU trunk, WDL branch at 4,
-                   policy head 1858 -> scatter to 4288
+  Conv+MHA+GEMM+SmartGate -- channels-first conv encoder -> pos-cat -> 2x self-attn over 64
+                              -> cross-attn accumulators (main 6x256->1536, gate 3x256->768)
+                              -> 1536-d GEMM trunk (alt GELU/SwiGLU), WDL@4,
+                                 quality policy + smartgate logsigmoid, 1858->scatter 4288
+  Conv+GEMM               -- 4x gated conv (128-d, channels-first) -> GatedPoolCompressor
+                              -> 1536-d alternating GELU/SwiGLU trunk, WDL branch at 4,
+                                 policy head 1858 -> scatter to 4288
+  Conv+GEMM+SmartGate     -- same encoder -> SplitGatedPoolCompressor(18 pools)
+                              -> main[1536] + gate[768]; policy = quality + logsigmoid(gate)
 
 Flags:
-  --dry-run        Build models, print param counts, skip speed test
-  --skip-trt       Skip ORT+TensorRT
-  --skip-hybrid    Skip Conv+MHA model
-  --skip-convgemm  Skip Conv+GEMM model
+  --dry-run              Build models, print param counts, skip speed test
+  --skip-trt             Skip ORT+TensorRT
+  --skip-hybrid          Skip Conv+MHA+GEMM+SmartGate model
+  --skip-convgemm        Skip Conv+GEMM model
+  --skip-convgemm-smartgate  Skip Conv+GEMM+SmartGate model
   --batch-sizes    Space-separated list (default: 1 2 4 8 16 32 64 128 256 512 1024)
-  --trunk-blocks   SwiGLU trunk blocks for Conv+MHA (default: 6)
-  --conv-blocks    Gated conv blocks for Conv+GEMM (default: 6)
+  --trunk-blocks   GEMM trunk blocks for Conv+MHA (default: 6)
   --gemm-blocks    MLP trunk blocks for Conv+GEMM (default: 6)
   --dropout        Dropout (default: 0.02)
 """
@@ -98,12 +102,11 @@ class GELUMlpBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Conv+MHA Hybrid
+# Conv+MHA+GEMM+SmartGate
 # ---------------------------------------------------------------------------
 
 ENC_DIM     = 128
 ENC_DIM_MHA = 256   # after cat([x, pos], dim=-1)
-N_GLOBAL    = 4     # 4 * 256 = 1024 trunk dim
 ENC_HEADS   = 8
 ENC_FF_DIM  = 1024
 
@@ -155,52 +158,82 @@ class CrossAttnBlock(nn.Module):
 
 
 class ConvAttnMlp(nn.Module):
-    """Channels-first conv encoder -> self-attn over 68 -> cross-attn(globals->68) -> SwiGLU trunk."""
-    def __init__(self, n_trunk_blocks=6, trunk_dim=1024, dropout=0.02):
+    """Conv encoder -> pos-cat [B,64,256] -> append 8 accum tokens -> [B,72,256]
+    -> 1x MHABlock over 72 tokens
+    -> 1x CrossAttnBlock(q=accum[8], kv=seq[72]) -> [B,8,256]
+    -> split: first 6 -> [B,1536] GEMM belly, last 2 -> [B,512] smartgate
+    -> 1536-d GEMM trunk (alt GELU/SwiGLU), WDL@4
+    -> quality policy [B,1858] + smartgate logsigmoid(gate) -> scatter [B,4288]
+    Gate is suppress-only; bias init=4.0 -> near no-op at init.
+    """
+    def __init__(self, n_trunk_blocks=6, dropout=0.02):
         super().__init__()
-        assert N_GLOBAL * ENC_DIM_MHA == trunk_dim
+        D      = 1536
+        H      = D * 3 // 2       # 2304
+        D_gate = 512
+        H_gate = D_gate * 3 // 2  # 768
 
-        self.emb           = nn.Embedding(ENC_VOCAB, ENC_DIM)
-        self.conv          = nn.ModuleList([ConvBlock2D(ENC_DIM), ConvBlock2D(ENC_DIM)])
-        self.pos           = nn.Embedding(SEQ_LEN, ENC_DIM)
-        self.ln_x          = nn.LayerNorm(ENC_DIM)
-        self.ln_pos        = nn.LayerNorm(ENC_DIM)
-        self.global_tokens = nn.Parameter(torch.randn(1, N_GLOBAL, ENC_DIM_MHA) * 0.02)
-        self.self_attn     = MHABlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
-        self.cross_attn    = CrossAttnBlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
+        self.emb    = nn.Embedding(ENC_VOCAB, ENC_DIM)
+        self.conv   = nn.ModuleList([ConvBlock2D(ENC_DIM), ConvBlock2D(ENC_DIM)])
+        self.pos    = nn.Embedding(SEQ_LEN, ENC_DIM)
+        self.ln_x   = nn.LayerNorm(ENC_DIM)
+        self.ln_pos = nn.LayerNorm(ENC_DIM)
 
-        hidden = trunk_dim * 3 // 2
-        self.trunk = nn.ModuleList([SwiGLUBlock(trunk_dim, hidden, dropout) for _ in range(n_trunk_blocks)])
+        self.accum_tokens = nn.Parameter(torch.randn(1, 8, ENC_DIM_MHA) * 0.02)
+        self.self_attn    = MHABlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
+        self.cross_attn   = CrossAttnBlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
 
-        self.pol_norm = RMSNorm(trunk_dim)
-        self.pol_w1   = nn.Linear(trunk_dim, trunk_dim, bias=False)
-        self.pol_w2   = nn.Linear(trunk_dim, 1858, bias=False)
+        def make_block(i):
+            return GELUMlpBlock(D, H, dropout) if i % 2 == 0 else SwiGLUBlock(D, H, dropout)
+        self.trunk = nn.ModuleList([make_block(i) for i in range(n_trunk_blocks)])
+
+        self.val_norm = RMSNorm(D)
+        self.val_w1   = nn.Linear(D, D // 2, bias=False)
+        self.val_w2   = nn.Linear(D // 2, 3, bias=False)
+
+        self.pol_norm  = RMSNorm(D)
+        self.pol_out   = nn.Linear(D, 1858, bias=False)
+
+        self.gate_blk  = SwiGLUBlock(D_gate, H_gate, dropout)
+        self.gate_norm = RMSNorm(D_gate)
+        self.gate_out  = nn.Linear(D_gate, 1858, bias=True)
+        nn.init.zeros_(self.gate_out.weight)
+        nn.init.constant_(self.gate_out.bias, 4.0)
+
         self.register_buffer("sl_idx", _load_sometimes_legal_idx())
-
-        self.val_norm = RMSNorm(trunk_dim)
-        self.val_w1   = nn.Linear(trunk_dim, trunk_dim // 2, bias=False)
-        self.val_w2   = nn.Linear(trunk_dim // 2, 3, bias=False)
 
     def forward(self, tokens):
         B = tokens.shape[0]
-        x = self.emb(tokens)                                                           # [B, 64, 128] contiguous
-        x = x.reshape(B, 8, 8, ENC_DIM).permute(0, 3, 1, 2)                         # [B, 128, 8, 8] — 2 free views
+        x = self.emb(tokens)                                                           # [B, 64, 128]
+        x = x.reshape(B, 8, 8, ENC_DIM).permute(0, 3, 1, 2)                         # [B, 128, 8, 8]
         for blk in self.conv:
             x = blk(x)
-        x   = x.reshape(B, ENC_DIM, SEQ_LEN).permute(0, 2, 1)                        # [B, 64, 128] — 2 free views
+        x   = x.reshape(B, ENC_DIM, SEQ_LEN).permute(0, 2, 1)                        # [B, 64, 128]
         pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device))
         x   = torch.cat([self.ln_x(x), self.ln_pos(pos).unsqueeze(0).expand(B, -1, -1)], dim=-1)  # [B, 64, 256]
-        gt  = self.global_tokens.expand(B, -1, -1)
-        seq = torch.cat([x, gt], dim=1)                                                # [B, 68, 256]
-        seq = self.self_attn(seq)
-        g   = self.cross_attn(seq[:, -N_GLOBAL:], seq)                                # [B, 4, 256]
-        x   = g.reshape(B, -1)                                                         # [B, 1024]
-        for blk in self.trunk:
-            x = blk(x)
-        legal_logits = self.pol_w2(F.silu(self.pol_w1(self.pol_norm(x))))
-        pol = torch.full((B, POLICY_DIM), -3e4, device=x.device, dtype=x.dtype)
+
+        seq = torch.cat([x, self.accum_tokens.expand(B, -1, -1)], dim=1)              # [B, 72, 256]
+        seq = self.self_attn(seq)                                                       # [B, 72, 256]
+        g   = self.cross_attn(seq[:, -8:], seq)                                        # [B, 8, 256]
+
+        main_x = g[:, :6, :].reshape(B, -1)                                            # [B, 1536]
+        gate_x = g[:, 6:, :].reshape(B, -1)                                            # [B, 512]
+
+        for blk in self.trunk[:4]:
+            main_x = blk(main_x)
+        val = self.val_w2(F.silu(self.val_w1(self.val_norm(main_x))))
+
+        for blk in self.trunk[4:]:
+            main_x = blk(main_x)
+
+        quality_logits = self.pol_out(self.pol_norm(main_x))                           # [B, 1858]
+
+        gate_x   = self.gate_blk(gate_x)
+        gate_raw = self.gate_out(self.gate_norm(gate_x))                               # [B, 1858]
+
+        legal_logits = quality_logits + F.logsigmoid(gate_raw)
+        pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=legal_logits.dtype)
         pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits)
-        val = self.val_w2(F.silu(self.val_w1(self.val_norm(x))))
         return pol, val
 
 
@@ -310,6 +343,104 @@ def build_conv_gemm_model(n_trunk_blocks=6, dropout=0.02):
 
 
 # ---------------------------------------------------------------------------
+# Conv+GEMM+SmartGate
+# ---------------------------------------------------------------------------
+
+class SplitGatedPoolCompressor(nn.Module):
+    """18-pool gated compressor split into main (12 pools) + gate (6 pools)."""
+    def __init__(self, channels=128, n_main=12, n_gate=6):
+        super().__init__()
+        n_pools          = n_main + n_gate
+        self.channels    = channels
+        self.n_pools     = n_pools
+        self.n_main      = n_main
+        self.n_gate      = n_gate
+        self.norm        = nn.LayerNorm(channels)
+        self.value_proj  = nn.Linear(channels, channels * n_pools, bias=False)
+        self.gate_proj   = nn.Linear(channels, n_pools, bias=False)
+
+    def forward(self, x):                                       # [B, C, 8, 8]
+        B      = x.shape[0]
+        x      = x.reshape(B, self.channels, 64).permute(0, 2, 1)   # [B, 64, C]
+        h      = self.norm(x)
+        values = self.value_proj(h).reshape(B, 64, self.n_pools, self.channels)
+        values = values.permute(0, 2, 1, 3)                          # [B, P, 64, C]
+        gates  = self.gate_proj(h).permute(0, 2, 1).softmax(dim=-1) # [B, P, 64]
+        pooled = (values * gates[:, :, :, None]).sum(dim=2)          # [B, P, C]
+        main_x = pooled[:, :self.n_main, :].reshape(B, self.n_main * self.channels)
+        gate_x = pooled[:, self.n_main:, :].reshape(B, self.n_gate * self.channels)
+        return main_x, gate_x
+
+
+class ConvGEMMSmartGateMlp(nn.Module):
+    """Same conv encoder as Conv+GEMM, but with a split compressor.
+    Main arm (1536-d): identical 6x trunk + WDL + quality policy logits.
+    Gate arm (768-d):  1x SwiGLU -> Linear(768, 1858, bias=True).
+    Combined: legal_logits = quality_logits + F.logsigmoid(gate_raw).
+    logsigmoid is always <= 0, so the gate is suppress-only.
+    Gate bias init=4.0 -> logsigmoid(4.0) ~= -0.018 (near no-op at init).
+    """
+    def __init__(self, n_trunk_blocks=6, dropout=0.02):
+        super().__init__()
+        D      = GEMM_TRUNK_DIM        # 1536
+        H      = D * 3 // 2            # 2304
+        D_gate = 768
+        H_gate = D_gate * 3 // 2       # 1152
+
+        self.emb      = nn.Embedding(ENC_VOCAB, GEMM_ENC_DIM)
+        self.conv     = nn.ModuleList([GatedConvBlock2D(GEMM_ENC_DIM) for _ in range(4)])
+        self.compress = SplitGatedPoolCompressor(GEMM_ENC_DIM, n_main=12, n_gate=6)
+
+        def make_block(i):
+            return GELUMlpBlock(D, H, dropout) if i % 2 == 0 else SwiGLUBlock(D, H, dropout)
+        self.trunk = nn.ModuleList([make_block(i) for i in range(n_trunk_blocks)])
+
+        self.val_norm = RMSNorm(D)
+        self.val_w1   = nn.Linear(D, D // 2, bias=False)
+        self.val_w2   = nn.Linear(D // 2, 3, bias=False)
+
+        self.pol_norm = RMSNorm(D)
+        self.pol_out  = nn.Linear(D, 1858, bias=False)
+
+        self.gate_blk  = SwiGLUBlock(D_gate, H_gate, dropout)
+        self.gate_norm = RMSNorm(D_gate)
+        self.gate_out  = nn.Linear(D_gate, 1858, bias=True)
+        nn.init.constant_(self.gate_out.bias, 4.0)
+
+        self.register_buffer("sl_idx", _load_sometimes_legal_idx())
+
+    def forward(self, tokens):
+        B = tokens.shape[0]
+        x = self.emb(tokens)
+        x = x.reshape(B, 8, 8, GEMM_ENC_DIM).permute(0, 3, 1, 2)   # [B, 128, 8, 8]
+        for blk in self.conv:
+            x = blk(x)
+        main_x, gate_x = self.compress(x)                             # [B,1536], [B,768]
+
+        for blk in self.trunk[:4]:
+            main_x = blk(main_x)
+        val = self.val_w2(F.silu(self.val_w1(self.val_norm(main_x))))
+
+        for blk in self.trunk[4:]:
+            main_x = blk(main_x)
+        quality_logits = self.pol_out(self.pol_norm(main_x))          # [B, 1858]
+
+        gate_x   = self.gate_blk(gate_x)
+        gate_raw = self.gate_out(self.gate_norm(gate_x))              # [B, 1858]
+
+        legal_logits = quality_logits + F.logsigmoid(gate_raw)
+        pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=legal_logits.dtype)
+        pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits)
+        return pol, val
+
+
+def build_conv_gemm_smartgate_model(n_trunk_blocks=6, dropout=0.02):
+    m = ConvGEMMSmartGateMlp(n_trunk_blocks=n_trunk_blocks, dropout=dropout)
+    print(f"  params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -321,9 +452,10 @@ def parse_args():
     p.add_argument("--dry-run",        action="store_true")
     p.add_argument("--skip-trt",       action="store_true")
     p.add_argument("--skip-hybrid",    action="store_true")
-    p.add_argument("--skip-convgemm",  action="store_true")
+    p.add_argument("--skip-convgemm",           action="store_true")
+    p.add_argument("--skip-convgemm-smartgate", action="store_true")
     p.add_argument("--batch-sizes",    nargs="+", type=int, default=DEFAULT_BATCH_SIZES, metavar="B")
-    p.add_argument("--trunk-blocks",   type=int,   default=6,    help="SwiGLU blocks for Conv+MHA trunk")
+    p.add_argument("--trunk-blocks",   type=int,   default=6,    help="GEMM trunk blocks for Conv+MHA")
     p.add_argument("--gemm-blocks",    type=int,   default=6,    help="MLP trunk blocks for Conv+GEMM")
     p.add_argument("--dropout",        type=float, default=0.02)
     return p.parse_args()
@@ -335,7 +467,6 @@ def parse_args():
 
 def random_tokens(batch_size, vocab=ENC_VOCAB):
     return np.random.randint(0, vocab, (batch_size, SEQ_LEN), dtype=np.int32)
-
 
 
 # ---------------------------------------------------------------------------
@@ -466,21 +597,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"PyTorch device: {device}")
 
-    # Conv+MHA
+    # Conv+MHA+GEMM+SmartGate
     if not args.skip_hybrid:
         print(f"\n{'='*60}")
-        print(f"  Conv+MHA  (2xConvBlock2D({ENC_DIM}) channels-first -> pos-cat -> [{ENC_DIM_MHA}]"
-              f" -> self-attn(68) -> cross-attn({N_GLOBAL} globals) -> {args.trunk_blocks}x SwiGLU @ 1024)")
+        print(f"  Conv+MHA+GEMM+SmartGate  (2xConvBlock2D({ENC_DIM}) -> pos-cat -> [{ENC_DIM_MHA}]"
+              f" -> append 8 accum tokens -> 1x self-attn(72)"
+              f" -> 1x cross-attn(q=accum[8], kv=72) -> split first6/last2 -> [1536]/[512]"
+              f" -> {args.trunk_blocks}x alt GELU/SwiGLU, WDL@4,"
+              f" quality+logsigmoid(gate) 1858->4288)")
         build_conv_attn_model(args.trunk_blocks, args.dropout)
 
         if not args.dry_run:
             try:
-                print(f"\n  Building Conv+MHA PT eager ...")
+                print(f"\n  Building Conv+MHA+GEMM+SmartGate PT eager ...")
                 eager_h = make_pt_eager_infer(build_conv_attn_model(args.trunk_blocks, args.dropout), device)
-                res = speed_test("Conv+MHA  PT eager [fp16]", eager_h, bs)
+                res = speed_test("Conv+MHA+GEMM+SmartGate  PT eager [fp16]", eager_h, bs)
                 del eager_h; gc.collect(); torch.cuda.empty_cache()
             except Exception as e:
-                print(f"  [ERROR] Conv+MHA PT eager: {e}")
+                print(f"  [ERROR] Conv+MHA+GEMM+SmartGate PT eager: {e}")
 
         if not args.skip_trt:
             try:
@@ -491,10 +625,10 @@ def main():
                 else:
                     print(f"  [TRT] ONNX cached: {onnx_h}")
                 trt_h, trt_sess_h = make_trt_infer(onnx_h, TRT_CACHE, max_bs=max(bs))
-                res = speed_test("Conv+MHA  ORT TRT [fp16]", trt_h, bs)
+                res = speed_test("Conv+MHA+GEMM+SmartGate  ORT TRT [fp16]", trt_h, bs)
                 del trt_sess_h; gc.collect()
             except Exception as e:
-                print(f"  [ERROR] Conv+MHA TRT: {e}")
+                print(f"  [ERROR] Conv+MHA+GEMM+SmartGate TRT: {e}")
 
     # Conv+GEMM
     if not args.skip_convgemm:
@@ -528,6 +662,40 @@ def main():
                 del trt_sess_g; gc.collect()
             except Exception as e:
                 print(f"  [ERROR] Conv+GEMM TRT: {e}")
+
+    # Conv+GEMM+SmartGate
+    if not args.skip_convgemm_smartgate:
+        print(f"\n{'='*60}")
+        print(f"  Conv+GEMM+SmartGate  (same encoder -> SplitGatedPoolCompressor(18 pools)"
+              f" -> main[1536] + gate[768]"
+              f" -> {args.gemm_blocks}x alt GELU/SwiGLU + gate SwiGLU,"
+              f" policy quality+logsigmoid(gate) 1858->4288)")
+        build_conv_gemm_smartgate_model(args.gemm_blocks, args.dropout)
+
+        if not args.dry_run:
+            try:
+                print(f"\n  Building Conv+GEMM+SmartGate PT eager ...")
+                eager_sg = make_pt_eager_infer(
+                    build_conv_gemm_smartgate_model(args.gemm_blocks, args.dropout), device)
+                res = speed_test("Conv+GEMM+SmartGate  PT eager [fp16]", eager_sg, bs)
+                del eager_sg; gc.collect(); torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"  [ERROR] Conv+GEMM+SmartGate PT eager: {e}")
+
+        if not args.skip_trt:
+            try:
+                os.makedirs(TRT_CACHE, exist_ok=True)
+                onnx_sg = os.path.join(TRT_CACHE, f"conv_gemm_smartgate_t{args.gemm_blocks}.onnx")
+                if not os.path.exists(onnx_sg):
+                    export_to_onnx(
+                        build_conv_gemm_smartgate_model(args.gemm_blocks, args.dropout), device, onnx_sg)
+                else:
+                    print(f"  [TRT] ONNX cached: {onnx_sg}")
+                trt_sg, trt_sess_sg = make_trt_infer(onnx_sg, TRT_CACHE, max_bs=max(bs))
+                res = speed_test("Conv+GEMM+SmartGate  ORT TRT [fp16]", trt_sg, bs)
+                del trt_sess_sg; gc.collect()
+            except Exception as e:
+                print(f"  [ERROR] Conv+GEMM+SmartGate TRT: {e}")
 
     if args.dry_run:
         print("\n  Dry run complete.")

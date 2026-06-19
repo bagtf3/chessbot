@@ -48,6 +48,12 @@ VARIANTS: dict[str, dict] = {
     "conv-gemm": dict(
         n_trunk_blocks=6, dropout=0.02,
     ),
+    "conv-gemm-smartgate": dict(
+        n_trunk_blocks=6, dropout=0.02,
+    ),
+    "conv-mha-gemm-smartgate": dict(
+        n_trunk_blocks=6, dropout=0.02,
+    ),
 }
 
 
@@ -843,8 +849,8 @@ def build_pt_hybrid_conv_attn(cfg: dict):
             for blk in self.trunk:
                 x = blk(x)
             legal_logits = self.pol_w2(F.silu(self.pol_w1(self.pol_norm(x))))
-            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=legal_logits.dtype)
-            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits)
+            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=torch.float32)
+            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits.float())
             val = self.val_w2(F.silu(self.val_w1(self.val_norm(x))))
             return pol, val
 
@@ -974,8 +980,8 @@ def build_pt_conv_gemm(cfg: dict):
             for blk in self.trunk[4:]:
                 x = blk(x)
             legal_logits = self.pol_out(self.pol_norm(x))                   # [B, 1858]
-            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=legal_logits.dtype)
-            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits)
+            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=torch.float32)
+            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits.float())
             return pol, val
 
     m = M()
@@ -989,12 +995,338 @@ def build_pt_conv_gemm(cfg: dict):
     return m
 
 
+def build_pt_conv_gemm_smartgate(cfg: dict):
+    """Same conv encoder as conv-gemm but with a SplitGatedPoolCompressor (18 pools).
+    Main arm (1536-d): identical 6x trunk + WDL + quality policy logits.
+    Gate arm (768-d):  1x SwiGLU -> Linear(768, 1858, bias=True).
+    Combined: legal_logits = quality_logits + F.logsigmoid(gate_raw).
+    logsigmoid is always <= 0, so the gate is suppress-only.
+    Gate bias init=4.0 -> logsigmoid(4.0) ~= -0.018 (near no-op at init).
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    ENC_DIM    = 128
+    N_MAIN     = 12
+    N_GATE     = 6
+    N_POOLS    = N_MAIN + N_GATE
+    TRUNK_DIM  = N_MAIN * ENC_DIM    # 1536
+    D_GATE     = N_GATE * ENC_DIM    # 768
+    HIDDEN     = TRUNK_DIM * 3 // 2  # 2304
+    H_GATE     = D_GATE * 3 // 2     # 1152
+    POLICY_DIM = 4288
+
+    n_trunk = cfg["n_trunk_blocks"]
+    dr      = cfg["dropout"]
+
+    sl_mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+    sl_idx  = sl_mask.nonzero(as_tuple=True)[0]  # [1858]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class GatedConvBlock2D(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.ln     = nn.LayerNorm([d, 8, 8])
+            self.c_gate = nn.Conv2d(d, d, 3, padding=1, bias=False)
+            self.c_up   = nn.Conv2d(d, d, 3, padding=1, bias=False)
+            self.c_out  = nn.Conv2d(d, d, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x)
+            return x + self.c_out(F.silu(self.c_gate(h)) * self.c_up(h))
+
+    class SplitGatedPoolCompressor(nn.Module):
+        def __init__(self, channels, n_main, n_gate):
+            super().__init__()
+            n_pools          = n_main + n_gate
+            self.channels    = channels
+            self.n_pools     = n_pools
+            self.n_main      = n_main
+            self.n_gate      = n_gate
+            self.norm        = nn.LayerNorm(channels)
+            self.value_proj  = nn.Linear(channels, channels * n_pools, bias=False)
+            self.gate_proj   = nn.Linear(channels, n_pools, bias=False)
+        def forward(self, x):          # [B, C, 8, 8]
+            B = x.shape[0]
+            x = x.reshape(B, self.channels, 64).permute(0, 2, 1)  # [B, 64, C]
+            h = self.norm(x)
+            values = self.value_proj(h).reshape(B, 64, self.n_pools, self.channels).permute(0, 2, 1, 3)
+            gates  = self.gate_proj(h).permute(0, 2, 1).softmax(dim=-1)
+            pooled = (values * gates[:, :, :, None]).sum(dim=2)
+            main_x = pooled[:, :self.n_main, :].reshape(B, self.n_main * self.channels)
+            gate_x = pooled[:, self.n_main:, :].reshape(B, self.n_gate * self.channels)
+            return main_x, gate_x
+
+    class SwiGLUBlock(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.norm   = RMSNorm(d)
+            self.w_gate = nn.Linear(d, hidden, bias=False)
+            self.w_up   = nn.Linear(d, hidden, bias=False)
+            self.w_down = nn.Linear(hidden, d, bias=False)
+            self.drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.w_down.weight)
+        def forward(self, x):
+            h = self.norm(x)
+            return x + self.drop(self.w_down(F.silu(self.w_gate(h)) * self.w_up(h)))
+
+    class GELUMlpBlock(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.norm = RMSNorm(d)
+            self.w1   = nn.Linear(d, hidden, bias=False)
+            self.w2   = nn.Linear(hidden, d, bias=False)
+            self.drop = nn.Dropout(dr)
+            nn.init.zeros_(self.w2.weight)
+        def forward(self, x):
+            return x + self.drop(self.w2(F.gelu(self.w1(self.norm(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb      = nn.Embedding(VOCAB_SIZE, ENC_DIM)
+            self.conv     = nn.ModuleList([GatedConvBlock2D(ENC_DIM) for _ in range(4)])
+            self.compress = SplitGatedPoolCompressor(ENC_DIM, N_MAIN, N_GATE)
+
+            def make_block(i):
+                return GELUMlpBlock(TRUNK_DIM, HIDDEN) if i % 2 == 0 else SwiGLUBlock(TRUNK_DIM, HIDDEN)
+            self.trunk = nn.ModuleList([make_block(i) for i in range(n_trunk)])
+
+            self.val_norm = RMSNorm(TRUNK_DIM)
+            self.val_w1   = nn.Linear(TRUNK_DIM, TRUNK_DIM // 2, bias=False)
+            self.val_w2   = nn.Linear(TRUNK_DIM // 2, 3, bias=False)
+
+            self.pol_norm  = RMSNorm(TRUNK_DIM)
+            self.pol_out   = nn.Linear(TRUNK_DIM, 1858, bias=False)
+
+            self.gate_blk  = SwiGLUBlock(D_GATE, H_GATE)
+            self.gate_norm = RMSNorm(D_GATE)
+            self.gate_out  = nn.Linear(D_GATE, 1858, bias=True)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens)
+            x = x.reshape(B, 8, 8, ENC_DIM).permute(0, 3, 1, 2)           # [B, 128, 8, 8]
+            for blk in self.conv:
+                x = blk(x)
+            main_x, gate_x = self.compress(x)                               # [B,1536], [B,768]
+            for blk in self.trunk[:4]:
+                main_x = blk(main_x)
+            val = self.val_w2(F.silu(self.val_w1(self.val_norm(main_x))))
+            for blk in self.trunk[4:]:
+                main_x = blk(main_x)
+            quality_logits = self.pol_out(self.pol_norm(main_x))            # [B, 1858]
+            gate_x   = self.gate_blk(gate_x)
+            gate_raw = self.gate_out(self.gate_norm(gate_x))               # [B, 1858]
+            legal_logits = quality_logits + F.logsigmoid(gate_raw)
+            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=torch.float32)
+            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits.float())
+            return pol, val
+
+    m = M()
+    total = sum(p.numel() for p in m.parameters())
+    print(f"  conv-gemm-smartgate architecture:")
+    print(f"    encoder : Embedding({VOCAB_SIZE},{ENC_DIM}) -> 4x GatedConvBlock2D({ENC_DIM}) channels-first")
+    print(f"    compress: SplitGatedPoolCompressor({N_POOLS} pools: {N_MAIN} main + {N_GATE} gate)")
+    print(f"    trunk   : {n_trunk}x alt GELU/SwiGLU(d={TRUNK_DIM}, hidden={HIDDEN}), WDL branch @4")
+    print(f"    gate    : SwiGLUBlock({D_GATE},{H_GATE}) -> Linear({D_GATE}->1858, bias=4.0)")
+    print(f"    heads   : policy quality+logsigmoid(gate) -> scatter 4288 | value -> 3")
+    print(f"    total params: {total:,}")
+    return m
+
+
+def build_pt_conv_mha_gemm_smartgate(cfg: dict):
+    """Conv encoder -> pos-cat [B,64,256] -> append 8 accum tokens -> [B,72,256]
+    -> 1x MHABlock self-attn over 72 tokens
+    -> 1x CrossAttnBlock(q=accum[8], kv=72) -> [B,8,256]
+    -> split: first 6 -> [B,1536] GEMM belly, last 2 -> [B,512] smartgate
+    -> 1536-d GEMM trunk (alt GELU/SwiGLU), WDL@4
+    -> quality policy Linear(1536->1858) + logsigmoid(gate Linear(512->1858)) -> scatter 4288
+    Gate is suppress-only; bias init=4.0 -> near no-op at init.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    ENC_DIM     = 128
+    ENC_DIM_MHA = 256
+    ENC_HEADS   = 8
+    ENC_FF      = 1024
+    TRUNK_DIM   = 1536
+    HIDDEN      = TRUNK_DIM * 3 // 2   # 2304
+    D_GATE      = 512
+    H_GATE      = D_GATE * 3 // 2      # 768
+    POLICY_DIM  = 4288
+
+    n_trunk = cfg["n_trunk_blocks"]
+    dr      = cfg["dropout"]
+
+    sl_mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+    sl_idx  = sl_mask.nonzero(as_tuple=True)[0]  # [1858]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class ConvBlock2D(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.ln = nn.LayerNorm([d, 8, 8])
+            self.c1 = nn.Conv2d(d, d, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(d, d, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = F.gelu(self.c1(self.ln(x)))
+            return x + self.c2(h)
+
+    class MHABlock(nn.Module):
+        def __init__(self, d, n_heads, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(d)
+            self.attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
+            self.ln2  = nn.LayerNorm(d)
+            self.ff1  = nn.Linear(d, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, d)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + h
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class CrossAttnBlock(nn.Module):
+        def __init__(self, d, n_heads, ff_dim):
+            super().__init__()
+            self.ln_q  = nn.LayerNorm(d)
+            self.ln_kv = nn.LayerNorm(d)
+            self.attn  = nn.MultiheadAttention(d, n_heads, batch_first=True)
+            self.ln2   = nn.LayerNorm(d)
+            self.ff1   = nn.Linear(d, ff_dim)
+            self.ff2   = nn.Linear(ff_dim, d)
+        def forward(self, q, kv):
+            kv_n = self.ln_kv(kv)
+            h, _ = self.attn(self.ln_q(q), kv_n, kv_n, need_weights=False)
+            q = q + h
+            return q + self.ff2(F.gelu(self.ff1(self.ln2(q))))
+
+    class SwiGLUBlock(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.norm   = RMSNorm(d)
+            self.w_gate = nn.Linear(d, hidden, bias=False)
+            self.w_up   = nn.Linear(d, hidden, bias=False)
+            self.w_down = nn.Linear(hidden, d, bias=False)
+            self.drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.w_down.weight)
+        def forward(self, x):
+            h = self.norm(x)
+            return x + self.drop(self.w_down(F.silu(self.w_gate(h)) * self.w_up(h)))
+
+    class GELUMlpBlock(nn.Module):
+        def __init__(self, d, hidden):
+            super().__init__()
+            self.norm = RMSNorm(d)
+            self.w1   = nn.Linear(d, hidden, bias=False)
+            self.w2   = nn.Linear(hidden, d, bias=False)
+            self.drop = nn.Dropout(dr)
+            nn.init.zeros_(self.w2.weight)
+        def forward(self, x):
+            return x + self.drop(self.w2(F.gelu(self.w1(self.norm(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb    = nn.Embedding(VOCAB_SIZE, ENC_DIM)
+            self.conv   = nn.ModuleList([ConvBlock2D(ENC_DIM), ConvBlock2D(ENC_DIM)])
+            self.pos    = nn.Embedding(SEQ_LEN, ENC_DIM)
+            self.ln_x   = nn.LayerNorm(ENC_DIM)
+            self.ln_pos = nn.LayerNorm(ENC_DIM)
+
+            self.accum_tokens = nn.Parameter(torch.randn(1, 8, ENC_DIM_MHA) * 0.02)
+            self.self_attn    = MHABlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF)
+            self.cross_attn   = CrossAttnBlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF)
+
+            def make_block(i):
+                return GELUMlpBlock(TRUNK_DIM, HIDDEN) if i % 2 == 0 else SwiGLUBlock(TRUNK_DIM, HIDDEN)
+            self.trunk = nn.ModuleList([make_block(i) for i in range(n_trunk)])
+
+            self.val_norm = RMSNorm(TRUNK_DIM)
+            self.val_w1   = nn.Linear(TRUNK_DIM, TRUNK_DIM // 2, bias=False)
+            self.val_w2   = nn.Linear(TRUNK_DIM // 2, 3, bias=False)
+
+            self.pol_norm  = RMSNorm(TRUNK_DIM)
+            self.pol_out   = nn.Linear(TRUNK_DIM, 1858, bias=False)
+
+            self.gate_blk  = SwiGLUBlock(D_GATE, H_GATE)
+            self.gate_norm = RMSNorm(D_GATE)
+            self.gate_out  = nn.Linear(D_GATE, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens)                                                       # [B, 64, 128]
+            x = x.reshape(B, 8, 8, ENC_DIM).permute(0, 3, 1, 2)                     # [B, 128, 8, 8]
+            for blk in self.conv:
+                x = blk(x)
+            x   = x.reshape(B, ENC_DIM, SEQ_LEN).permute(0, 2, 1)                    # [B, 64, 128]
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device))
+            x   = torch.cat([self.ln_x(x), self.ln_pos(pos).unsqueeze(0).expand(B, -1, -1)], dim=-1)  # [B, 64, 256]
+            seq = torch.cat([x, self.accum_tokens.expand(B, -1, -1)], dim=1)          # [B, 72, 256]
+            seq = self.self_attn(seq)                                                   # [B, 72, 256]
+            g   = self.cross_attn(seq[:, -8:], seq)                                    # [B, 8, 256]
+            main_x = g[:, :6, :].reshape(B, -1)                                        # [B, 1536]
+            gate_x = g[:, 6:, :].reshape(B, -1)                                        # [B, 512]
+            for blk in self.trunk[:4]:
+                main_x = blk(main_x)
+            val = self.val_w2(F.silu(self.val_w1(self.val_norm(main_x))))
+            for blk in self.trunk[4:]:
+                main_x = blk(main_x)
+            quality_logits = self.pol_out(self.pol_norm(main_x))                       # [B, 1858]
+            gate_x   = self.gate_blk(gate_x)
+            gate_raw = self.gate_out(self.gate_norm(gate_x))                           # [B, 1858]
+            legal_logits = quality_logits + F.logsigmoid(gate_raw)
+            pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=torch.float32)
+            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits.float())
+            return pol, val
+
+    m = M()
+    total = sum(p.numel() for p in m.parameters())
+    print(f"  conv-mha-gemm-smartgate architecture:")
+    print(f"    encoder : Embedding({VOCAB_SIZE},{ENC_DIM}) -> 2xConvBlock2D({ENC_DIM}) channels-first -> cat(pos) -> [{ENC_DIM_MHA}]")
+    print(f"    attn    : append 8 accum tokens -> MHABlock(72) -> CrossAttnBlock(q=8, kv=72)")
+    print(f"    split   : first 6x256 -> [{TRUNK_DIM}] | last 2x256 -> [{D_GATE}]")
+    print(f"    trunk   : {n_trunk}x alt GELU/SwiGLU(d={TRUNK_DIM}, hidden={HIDDEN}), WDL branch @4")
+    print(f"    gate    : SwiGLUBlock({D_GATE},{H_GATE}) -> Linear({D_GATE}->1858, bias=4.0)")
+    print(f"    heads   : policy quality+logsigmoid(gate) -> scatter 4288 | value -> 3")
+    print(f"    total params: {total:,}")
+    return m
+
+
 PT_BUILDERS: dict[str, object] = {
     "16m-transformer":          build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
     "13m-precond-conformer":    build_pt_precond_conformer,
     "hybrid-conv-attn":         build_pt_hybrid_conv_attn,
     "conv-gemm":                build_pt_conv_gemm,
+    "conv-gemm-smartgate":      build_pt_conv_gemm_smartgate,
+    "conv-mha-gemm-smartgate":  build_pt_conv_mha_gemm_smartgate,
 }
 
 

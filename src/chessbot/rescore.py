@@ -1487,7 +1487,7 @@ class Rescorer(object):
         self.sample_counts_window = zero_sc()
 
     def aggregate_metrics(self, epoch, vscale, progress_csv_path, size=None):
-        if len(self.pending_metrics) < self.config.retrain_size // 2:
+        if len(self.pending_metrics) < self.config.retrain_size:
             return
 
         chunk_size = size if size is not None else len(self.pending_metrics)

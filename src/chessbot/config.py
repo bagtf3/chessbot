@@ -10,7 +10,7 @@ class Config(object):
     # files
     selfplay_dir = SP_DIR
     run_tag = "dummy"
-    init_model = MODEL_DIR + 'dummy.h5'
+    init_model = MODEL_DIR + 'dummy.ts'
     previous_run_tag = None
 
     # highest level params

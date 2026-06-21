@@ -19,7 +19,6 @@ from IPython.display import SVG, display, clear_output
 from pyfastchess import Board as fastboard
 
 from chessbot import SF_LOC
-from chessbot import features as ft
 
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -172,15 +171,6 @@ def make_random_move(board):
         board.push_uci(random.choice(moves))
         return board    
 
-
-def get_all_board_features(board):
-    all_feats = ft.all_king_exposure_features(board)
-    all_feats.update(ft.all_piece_features(board))
-    
-    wt, blk = ft.get_piece_value_sum(board)
-    all_feats['material'] = [wt, blk]
-    
-    return all_feats
 
 
 def softmax(x):

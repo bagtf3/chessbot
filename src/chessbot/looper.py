@@ -18,13 +18,11 @@ from pyfastchess import raw_cache_bulk_insert_np, priors_cache_clear, priors_cac
 
 from chessbot import SF_LOC
 
-from chessbot.model import load_model, save_model, make_conv_infer
 from chessbot.infer_ort_trt import make_ort_trt_infer
 
 from chessbot.mcts_utils import ChessGame
 from chessbot.utils import RateMeter, sf_eval
 from chessbot.game_utils import GameSpec
-#from chessbot.tf_thread import Batcher, TensorFlowThread
 
 
 class GameLooper(object):
@@ -63,20 +61,12 @@ class GameLooper(object):
         self.infer_gaps = []
         self.last_infer_end = None
 
-        # self.batcher = Batcher(cfg, self.batch_candidates)
-        # self.tf_thread = TensorFlowThread(
-        #     cfg, self.infer, max_inflight=cfg.max_tf_inflight)
-        
-        # self.tf_thread.start()
-    
+
     def close(self):
         if self.sf_thread is not None:
             self.sf_thread.close()
             self.sf_thread = None
         
-        # if self.tf_thread is not None:
-        #     self.tf_thread.close()
-        #     self.tf_thread = None
 
     def __enter__(self):
         return self
@@ -98,13 +88,6 @@ class GameLooper(object):
                 cfg.trt_model_name,
                 cfg.trt_cache,
                 cfg.macro_batch,
-            )
-        else:
-            self.model = load_model(cfg.model_path)
-            self.infer = make_conv_infer(
-                self.model,
-                max_bs=cfg.macro_batch,
-                vscale=cfg.vscale,
             )
     
     def check_for_pause(self):
@@ -143,11 +126,6 @@ class GameLooper(object):
 
         If "unpause" arrived early and was buffered, do not block.
         """
-        # if self.tf_thread is not None:
-        #     self.tf_thread.pause(blocking=True)
-        #     with self.tf_thread.infer_lock:
-        #         self.tf_thread.infer = None
-        
         del self.infer
         self.infer = None
 
@@ -160,9 +138,6 @@ class GameLooper(object):
             torch.cuda.empty_cache()
         elif backend == "ort_trt":
             pass
-        else:
-            import tensorflow as tf
-            tf.keras.backend.clear_session()
         gc.collect()
 
         priors_cache_clear()
@@ -183,11 +158,6 @@ class GameLooper(object):
                 continue
 
         self.load_reload_model()
-
-        # if self.tf_thread is not None:
-        #     with self.tf_thread.infer_lock:
-        #         self.tf_thread.infer = self.infer
-        #     self.tf_thread.unpause()
 
         self.n_retrains += 1
 
@@ -565,10 +535,6 @@ class GameLooper(object):
         if self.active_games:
             telemetry["avg_ply"] = np.mean([g.plies for g in self.active_games])
 
-        # if self.tf_thread:
-        #     tf_stats = self.tf_thread.stats()
-        #     telemetry["pred_wait"] = tf_stats["mean_pred_s"]
-        #     telemetry["preds_per_second"] = telemetry["apl"] / telemetry["pred_wait"]
         telemetry["pred_wait"] = np.mean(self.prediction_times) if self.prediction_times else 0.0
         telemetry["preds_per_second"] = (telemetry["apl"] / telemetry["pred_wait"]
                                          if telemetry["pred_wait"] else 0.0)
@@ -596,27 +562,7 @@ class GameLooper(object):
 
 
 def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, sf_queue=None):
-    # pre-built config (from yaml)
-    model_name = config.run_tag + "_model.h5"
-
-    if not getattr(config, "model_path", False):
-        model_path = os.path.join(config.run_dir, model_name)
-        config.model_path = model_path
-    else:
-        model_path = config.model_path
-
-    if config.inference_backend in ("pt_eager", "ort_trt"):
-        model = None  # loaded per-worker in load_reload_model
-    elif os.path.exists(model_path):
-        print(f"[init] Loading {model_name}")
-        model = load_model(model_path)
-    else:
-        print(f"[init] Loading {config.init_model}")
-        model = load_model(config.init_model)
-        try:
-            save_model(model, model_path)
-        except OSError:
-            pass  # another worker won the race; model_path will exist on next run
+    model = None  # loaded per-worker in load_reload_model
 
     looper = GameLooper(
         model=model, cfg=config.copy(),

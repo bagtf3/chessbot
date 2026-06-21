@@ -13,7 +13,7 @@ from chessbot import SP_DIR, SF_SEED_CACHE
 from chessbot.looper import init_selfplay
 from chessbot.rescore import (
     Rescorer, SFRescoreThread, SFCache,
-    launch_retrain_async, poll_retrain, reclaim_vram,
+    launch_retrain_async, poll_retrain,
 )
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
@@ -302,9 +302,6 @@ def parse_paths(run_tag):
     val_yaml_path = os.path.join(base_cfg.run_dir, "validation_config.yaml")
     return base_cfg, yaml_path, val_yaml_path
 
-
-def reclaim_vram_worker(mb):
-    reclaim_vram(mb)
 
 
 def launch_retrain(run_tag, working_cfg, epoch=0):

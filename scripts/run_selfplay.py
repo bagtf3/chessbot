@@ -19,6 +19,7 @@ from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
+from chessbot.infer_ort_trt import prepare_trt
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 
 import pickle
@@ -27,44 +28,6 @@ import threading
 import queue
 
 STOP_REQUESTED = threading.Event()
-
-
-def prepare_trt(cfg, trt_dir, model_name):
-    """
-    Export current model to ONNX and compile a TRT engine in the calling process.
-    Deletes stale .engine files but preserves .profile and .timing for fast recompile.
-    Patches cfg so workers call make_trt_session and get a cache hit, not a recompile.
-    """
-    import gc
-    import numpy as np
-    from chessbot.train_pytorch import export_ts_to_onnx
-    from chessbot.looper import make_trt_session
-
-    os.makedirs(trt_dir, exist_ok=True)
-    onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
-
-    print(f'[trt] exporting {cfg.model_path} -> {onnx_path}')
-    export_ts_to_onnx(cfg.model_path, onnx_path)
-
-    for f in os.listdir(trt_dir):
-        if f.startswith(model_name) and f.endswith('.engine'):
-            os.remove(os.path.join(trt_dir, f))
-            print(f'[trt] removed stale engine: {f}')
-
-    print('[trt] compiling TRT engine...')
-    t0 = time.time()
-    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch)
-    dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
-    sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
-    del sess
-    gc.collect()
-    print(f'[trt] TRT engine ready ({time.time() - t0:.0f}s)')
-
-    cfg.inference_backend = 'ort_trt'
-    cfg.model_path = onnx_path
-    cfg.trt_model_name = model_name
-    cfg.trt_cache = trt_dir
-    return cfg
 
 MAX_BACKLOG = 250
 GAME_QUEUE_MIN = 36  # top up when central queue drops below this

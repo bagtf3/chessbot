@@ -26,6 +26,11 @@ import os
 import re
 import time
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "3"
+
 import numpy as np
 import pandas as pd
 import scipy.special
@@ -49,7 +54,7 @@ PT_SHUFFLE_BUFFER  = 128_000
 
 EPOCHS_PER_WORKER = 1000
 CHECKPOINT_EVERY  = 20
-DEFAULT_MODEL     = "conv-mha-gemm-smartgate"
+DEFAULT_MODEL     = "16m-precond-smartgate"
 DEFAULT_RUN_TAG   = "val_test_multi"
 
 

@@ -1174,14 +1174,12 @@ class GameViewer:
         ent, norm = calc_entropy(p)
         return norm, p
 
-    def generate_training_data(self, min_visits=200, sf_accept_rate=0.5, cpl_threshold=60, **kwargs):
+    def generate_training_data(self, min_visits=200, cpl_threshold=60, skip_sf_moves=False, min_ply=0, **kwargs):
         """
         Walk the game and produce Xerces training examples.
+        - Plies below min_ply are skipped.
+        - If skip_sf_moves, all plies where stockfish moved are skipped.
         - Plies with fewer than min_visits total MCTS visits are skipped.
-        - SF plies are accepted with probability sf_accept_rate.
-        - For startpos/pre_opened/pre_opened_mini, plies 0-9 are accepted with
-          probability ramping from 0.5 (ply 0) to 0.95 (ply 9) to diversify
-          opening coverage.
         - If sf_df was passed to __init__ and cpl_threshold is set, plies where
           the played move's CPL (loss column) exceeds cpl_threshold are skipped.
           Plies with no matching SF row are also skipped when SF data is present.
@@ -1190,8 +1188,6 @@ class GameViewer:
         result = self.result
         self.reset()
 
-        opening_scenarios = {'startpos', 'pre_opened', 'pre_opened_mini'}
-        is_opening_scenario = self.log.get('scenario', '') in opening_scenarios
         use_cpl_filter = (self.sf_rows is not None) and (cpl_threshold is not None)
 
         total_plies = len(self.moves_uci)
@@ -1201,15 +1197,17 @@ class GameViewer:
             is_white_move = "white" in mover
             is_sf_move = "stockfish" in mover
 
+            if self.ply < min_ply:
+                self.next()
+                continue
+
+            if skip_sf_moves and is_sf_move:
+                self.next()
+                continue
+
             if use_cpl_filter:
                 sf_row = self.sf_row_for_ply(self.ply)
                 if sf_row is None or sf_row['loss'] > cpl_threshold:
-                    self.next()
-                    continue
-
-            if is_opening_scenario and self.ply < 10:
-                accept_prob = 0.5 + 0.45 * (self.ply / 9)
-                if random.random() > accept_prob:
                     self.next()
                     continue
 
@@ -1239,30 +1237,18 @@ class GameViewer:
 
             visits = sorted(visits, key=lambda x: x[1], reverse=True)
 
-            if is_sf_move and visits[0][0] != move_played:
-                # SF disagrees with Xerces's top move — apply accept rate gate
-                if random.random() > sf_accept_rate:
-                    self.next()
-                    continue
-                # accepted: swap SF move into top slot
-                most_visited = visits[0][0]
-                for v in visits:
-                    if v[0] == move_played:
-                        v[0] = most_visited
-                        break
-                visits[0][0] = move_played
-
             counts = np.array([x[1] for x in visits], dtype=np.float32)
             s = counts.sum()
             if s > 0.0:
                 pi = counts / s
             else:
-                # uniform fallback over legal moves
                 n_l = len(lms)
                 if n_l == 0:
                     self.next()
                     continue
                 pi = np.ones(n_l, dtype=np.float32) / float(n_l)
+            pi = np.minimum(pi, 0.6)
+            pi /= pi.sum()
             
             # map legal moves -> flat xerces indices and build policy
             

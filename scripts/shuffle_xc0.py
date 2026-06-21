@@ -23,11 +23,16 @@ import threading
 import time
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "3"
 import tensorflow as tf
+tf.get_logger().setLevel("ERROR")
 
 
 BUFFER_SIZE      = 256_000
-RECORDS_PER_FILE = 10_240
+RECORDS_PER_FILE = 20_480
 DEFAULT_OUT_DIR  = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0"
 DEFAULT_IN_DIR   = os.getenv("BOOTSTRAP_TFREC_DIR", "")
 
@@ -68,7 +73,7 @@ def writer_thread(write_q, out_dir, begin):
             f"[shard {shard_id:05d}]  "
             f"total_in={total_in:,}  total_out={total_out:,}  "
             f"elapsed={elapsed:.0f}s  "
-            f"rate={total_in / max(elapsed, 1e-9):,.0f} rec/s"
+            f"rate={total_out / max(elapsed, 1e-9):,.0f} rec/s"
         )
         write_q.task_done()
 
@@ -93,10 +98,27 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     random.shuffle(in_files)
 
+    existing = [
+        f for f in os.listdir(args.out_dir)
+        if f.endswith(".tfrecord.gz")
+    ]
+    shard_start = 0
+    if existing:
+        nums = []
+        for name in existing:
+            stem = name.replace(".tfrecord.gz", "")
+            try:
+                nums.append(int(stem.split("_")[-1]))
+            except ValueError:
+                pass
+        if nums:
+            shard_start = max(nums) + 1
+
     print(f"[shuffle] input files  : {len(in_files):,}")
     print(f"[shuffle] buffer_size  : {BUFFER_SIZE:,}")
     print(f"[shuffle] records/file : {RECORDS_PER_FILE:,}")
     print(f"[shuffle] output dir   : {args.out_dir}")
+    print(f"[shuffle] shard_start  : {shard_start:,}")
 
     begin     = time.time()
     write_q   = queue.Queue(maxsize=3)  # cap in-flight shards to ~3
@@ -107,7 +129,7 @@ def main():
 
     buffer       = []
     output_batch = []
-    shard_id     = 0
+    shard_id     = shard_start
     total_in     = 0
 
     def flush():
@@ -139,12 +161,15 @@ def main():
         f" draining buffer ({len(buffer):,})..."
     )
     random.shuffle(buffer)
-    output_batch.extend(buffer)
-    buffer = []
-    flush()
-
-    if output_batch:
-        write_q.put((shard_id, output_batch, total_in))
+    write_q.maxsize = 0  # unbounded for drain — let writer run uncontested
+    i = 0
+    while i + RECORDS_PER_FILE <= len(buffer):
+        write_q.put((shard_id, buffer[i:i + RECORDS_PER_FILE], total_in))
+        shard_id += 1
+        i += RECORDS_PER_FILE
+    remainder = output_batch + buffer[i:]
+    if remainder:
+        write_q.put((shard_id, remainder, total_in))
         shard_id += 1
 
     write_q.put(None)

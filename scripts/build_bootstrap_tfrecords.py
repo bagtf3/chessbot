@@ -1,4 +1,8 @@
 import os, time
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+os.environ["GLOG_minloglevel"] = "3"
 import pickle
 import random
 import multiprocessing as mp
@@ -14,19 +18,22 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 
 TARGET_WRITTEN_POSITIONS = 5_000_000
-OUT_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "")
+OUT_DIR = os.getenv("BOOTSTRAP_TFREC_DIR", "C:/Users/Bryan/Data/chessbot_data/training_data/wdl_062126")
 
 RUN_TAGS = [
-    "cfiw_pretrained_run4", "cfiw_pretrained_run5",
-    "cfiw_pretrained_run6", "cfiw_pretrained_run7"
+    "precond_run3", "precond_run2",
     ]
 
-DRAW_RATE = 0.75
-MAX_CPL = 60       # game-level CPL filter (mean clipped loss across game)
+MAX_CPL = 30       # game-level CPL filter (mean clipped loss across game)
 CPL_THRESHOLD = 20 # per-ply CPL filter passed to generate_training_data
-SHARD_GAMES = 50
+SHARD_GAMES = 100
 N_WORKERS = max([1, os.cpu_count() - 2])
-Z_BLEND = 0.8      # weight on game result (Z); remainder goes to search WDL
+Z_BLEND = 0.5      # weight on game result (Z); remainder goes to search WDL
+
+SKIP_OPENING_PLIES = {
+    "startpos": 12,
+    "pre_opened_mini": 8,
+}
 
 
 def to_wdl(x):
@@ -135,44 +142,54 @@ def make_example(enc_in, mask, policy, value: np.ndarray, weight):
 
 
 def load_sf_df_for_games(run_tag, game_ids):
-    pkl = os.path.join(SP_DIR, run_tag, ANALYZE_PKL)
-    with open(pkl, "rb") as f:
-        prev_run = pickle.load(f)
-
-    df_all = prev_run["df_all"]
+    df_all = SF_CACHE[run_tag]
     return df_all[df_all["game_id"].isin(game_ids)].copy()
 
 
 def iter_game_records(game, sf_df):
-    # Pre-filter to this game's rows so GameViewer.init works on a tiny frame
     game_id = game["game_id"]
     game_sf = sf_df.loc[sf_df["game_id"] == game_id] if sf_df is not None else None
 
     gv = GameViewer(game["pkl_file"], sf_df=game_sf)
 
-    if gv.result == 0 and random.random() > DRAW_RATE:
-        return
-
     if len(gv.moves_uci) < 10:
         return
 
+    scenario = game.get("scenario", "")
+    min_ply = SKIP_OPENING_PLIES.get(scenario, 0)
+
     x_list, m_list, p_list, z_list, v_list, wdl_list, r_list = gv.generate_training_data(
-        cpl_threshold=CPL_THRESHOLD
+        cpl_threshold=CPL_THRESHOLD,
+        skip_sf_moves=True,
+        min_ply=min_ply,
     )
     if not x_list:
         return
-
-    weight = 1.0
 
     for enc_in, mask, policy, z, v, wdl in zip(
         x_list, m_list, p_list, z_list, v_list, wdl_list
     ):
         search_wdl = np.array(wdl, dtype=np.float32) if wdl is not None else to_wdl(v)
         wdl_target = Z_BLEND * to_wdl(z) + (1 - Z_BLEND) * search_wdl
-        yield make_example(enc_in, mask, policy, wdl_target, weight)
+        yield make_example(enc_in, mask, policy, wdl_target, 1.0)
 
 
-def make_jobs(games_by_run):
+def get_shard_start(out_dir):
+    if not os.path.isdir(out_dir):
+        return 0
+    nums = []
+    for name in os.listdir(out_dir):
+        if not name.endswith(".tfrecord.gz"):
+            continue
+        stem = name.replace(".tfrecord.gz", "")
+        try:
+            nums.append(int(stem.split("_")[-1]))
+        except ValueError:
+            pass
+    return max(nums) + 1 if nums else 0
+
+
+def make_jobs(games_by_run, shard_start=0):
     all_games = []
     for run_tag, games in games_by_run.items():
         for game in games:
@@ -180,14 +197,21 @@ def make_jobs(games_by_run):
     random.shuffle(all_games)
     jobs = []
     for i in range(0, len(all_games), SHARD_GAMES):
-        jobs.append((i // SHARD_GAMES, all_games[i:i + SHARD_GAMES]))
+        jobs.append((shard_start + i // SHARD_GAMES, all_games[i:i + SHARD_GAMES]))
     return jobs
 
+
+SF_CACHE = {}
 
 def worker_init(seed_base):
     seed = seed_base + os.getpid()
     random.seed(seed)
     np.random.seed(seed % (2 ** 32 - 1))
+    for rt in RUN_TAGS:
+        pkl = os.path.join(SP_DIR, rt, ANALYZE_PKL)
+        with open(pkl, "rb") as f:
+            prev = pickle.load(f)
+        SF_CACHE[rt] = prev["df_all"]
 
 
 def process_shard(job):
@@ -234,14 +258,17 @@ def main():
     games_by_run = load_training_games()
     total_input_games = sum([len(v) for v in games_by_run.values()])
 
+    shard_start = get_shard_start(OUT_DIR)
+
     print(f"workers={N_WORKERS}")
     print(f"max_cpl={MAX_CPL}")
     print(f"max_positions={TARGET_WRITTEN_POSITIONS:,}")
     print(f"training_games={total_input_games}")
+    print(f"shard_start={shard_start}")
     for rt in RUN_TAGS:
         print(f"  {rt}: {len(games_by_run.get(rt, []))}")
 
-    jobs = make_jobs(games_by_run)
+    jobs = make_jobs(games_by_run, shard_start)
 
     total_games = 0
     total_pos = 0

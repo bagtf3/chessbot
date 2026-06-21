@@ -300,7 +300,7 @@ def retrain_one_model(model_path, X, Y, s_wts, cfg, epoch, args, label="", timin
 
 def print_timings(timings):
     parts = []
-    for key, label in [('load_shards', 'shards'), ('fit', 'fit'), ('total', 'total')]:
+    for key, label in [('load_shards', 'shards'), ('fit', 'fit'), ('trt_compile', 'trt'), ('total', 'total')]:
         if key in timings:
             parts.append(f"{label}={timings[key]:.1f}s")
     print(f"[retrain] {' '.join(parts)}")
@@ -405,6 +405,29 @@ def main():
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")
+
+    if cfg.inference_backend == 'ort_trt' and cfg.retrain_backend == 'pt_eager':
+        from chessbot.looper import make_trt_session
+        from chessbot.train_pytorch import export_ts_to_onnx
+        trt_dir = cfg.trt_cache or os.path.join(run_dir, 'trt_cache')
+        model_name = cfg.trt_model_name or f'{cfg.run_tag}_selfplay'
+        onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
+        os.makedirs(trt_dir, exist_ok=True)
+        t0 = time.time()
+        print('[retrain] exporting ONNX for TRT recompile...')
+        export_ts_to_onnx(cfg.model_path, onnx_path)
+        for f in os.listdir(trt_dir):
+            if f.startswith(model_name) and f.endswith('.engine'):
+                os.remove(os.path.join(trt_dir, f))
+                print(f'[retrain] removed stale engine: {f}')
+        print('[retrain] compiling TRT engine...')
+        sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch)
+        dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
+        sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
+        del sess
+        gc.collect()
+        timings['trt_compile'] = time.time() - t0
+        print(f'[retrain] TRT engine ready ({timings["trt_compile"]:.0f}s)')
 
     timings['total'] = time.time() - t_total
     print_timings(timings)

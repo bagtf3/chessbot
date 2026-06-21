@@ -298,46 +298,6 @@ def build_validation_summary(looper):
     return summary
 
 
-def prepare_val_trt(cfg):
-    """
-    Export current model to ONNX, compile TRT engine in main process,
-    patch cfg so workers call make_trt_session with identical opts and
-    load the cached engine without recompiling.
-    """
-    from chessbot.train_pytorch import export_ts_to_onnx
-    from chessbot.looper import make_trt_session
-
-    val_trt_dir = os.path.join(cfg.run_dir, 'val_trt')
-    os.makedirs(val_trt_dir, exist_ok=True)
-
-    model_name = f'{cfg.run_tag}_val'
-    onnx_path  = os.path.join(val_trt_dir, f'{model_name}.onnx')
-
-    print(f'{V} exporting {cfg.model_path} -> {onnx_path}')
-    export_ts_to_onnx(cfg.model_path, onnx_path)
-
-    # clear stale engines so TRT compiles fresh from the new ONNX
-    for f in os.listdir(val_trt_dir):
-        if f.startswith(model_name) and f.endswith('.engine'):
-            os.remove(os.path.join(val_trt_dir, f))
-            print(f'{V} removed stale engine: {f}')
-
-    print(f'{V} compiling TRT engine...')
-    t0 = time.time()
-    sess = make_trt_session(onnx_path, model_name, val_trt_dir, cfg.macro_batch)
-    dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
-    sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
-    del sess
-    gc.collect()
-    print(f'{V} TRT engine ready  ({time.time() - t0:.0f}s)')
-
-    # workers call make_trt_session with these same params -> cache hit, no recompile
-    cfg.inference_backend = 'ort_trt'
-    cfg.model_path   = onnx_path
-    cfg.trt_model_name = model_name
-    cfg.trt_cache    = val_trt_dir
-    return cfg
-
 
 def append_validation_summary(run_dir, summary):
     """

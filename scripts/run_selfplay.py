@@ -19,7 +19,7 @@ from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, find_script
 from chessbot.validation import build_validation_summary, create_validation_config
-from chessbot.infer_ort_trt import prepare_trt
+from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 
 import pickle
@@ -411,8 +411,7 @@ def main(run_tag):
                     trt_dir = os.path.join(working_cfg.run_dir, 'val_trt')
                     model_name = f'{working_cfg.run_tag}_val'
                 else:
-                    trt_dir = working_cfg.trt_cache or os.path.join(working_cfg.run_dir, 'trt_cache')
-                    model_name = working_cfg.trt_model_name or f'{working_cfg.run_tag}_selfplay'
+                    trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
                 working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
             
             # update the rescorer config
@@ -568,6 +567,10 @@ def main(run_tag):
                         rescorer.tick()
 
                         time.sleep(0.05)
+
+                    if working_cfg.inference_backend == 'ort_trt' and not is_validation:
+                        trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
+                        working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
 
                     # unpause workers
                     for p in procs:

@@ -394,21 +394,12 @@ def main():
           f"policy={cfg.policy_loss_weight:.4f}  "
           f"ratio={cfg.value_loss_weight / cfg.policy_loss_weight:.4f}:1")
 
-    if cfg.retrain_backend == "pt_eager":
-        from chessbot.train_pytorch import retrain_pt
-        retrain_pt(cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
-                   label="", timings=timings)
-    else:
-        retrain_one_model(
-            cfg.model_path, X, Y, s_wts, cfg, epoch, args,
-            label="", timings=timings)
+    from chessbot.train_pytorch import retrain_pt
+    retrain_pt(cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
+               label="", timings=timings)
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")
-
-    if cfg.inference_backend == 'ort_trt' and cfg.retrain_backend == 'pt_eager':
-        from chessbot.infer_ort_trt import recompile_selfplay_trt
-        timings['trt_compile'] = recompile_selfplay_trt(cfg)
 
     timings['total'] = time.time() - t_total
     print_timings(timings)

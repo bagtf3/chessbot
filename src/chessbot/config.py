@@ -175,8 +175,7 @@ class Config(object):
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
 
-        ext = ".ts" if self.inference_backend == "pt_eager" else ".h5"
-        model_name = f"{self.run_tag}_model{ext}"
+        model_name = f"{self.run_tag}_model.ts"
         self.model_path = os.path.join(self.run_dir, model_name)
 
         if 'dummy' not in self.run_dir:

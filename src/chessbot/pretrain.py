@@ -27,11 +27,11 @@ import pandas as pd
 BATCH_SIZE         = 256
 EPOCH_SIZE         = 10_240
 SHUFFLE_BUFFER     = 256_000
-VAL_SHUFFLE_BUFFER = 16_000
+VAL_SHUFFLE_BUFFER = 40_960
 STEPS_PER_EPOCH    = EPOCH_SIZE // BATCH_SIZE
 VAL_FRACTION       = 0.05
-VAL_SPLIT_SEED     = 69
-UNIFORM_BLEND      = 0.05
+VAL_SPLIT_SEED     = 42
+UNIFORM_BLEND      = 0.001
 POLICY_MAX_CLIP    = 0.6
 PLOT_EVERY         = 10
 DEFAULT_MAX_EPOCH  = 2000
@@ -121,7 +121,7 @@ def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BA
         policy  = tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
         mask_f  = tf.cast(mask, tf.float32)
         n_legal = tf.reduce_sum(mask_f)
-        policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
+        #policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
         policy  = tf.minimum(policy, POLICY_MAX_CLIP)
         policy  = policy / tf.reduce_sum(policy)
         value   = feat["value_out"]
@@ -236,7 +236,7 @@ def _numpy_record_stream(file_list: list[str], shuffle_buffer: int):
 
                     mask_f  = mask.astype(np.float32)
                     n_legal = mask_f.sum()
-                    policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
+                    #policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
                     policy  = np.minimum(policy, POLICY_MAX_CLIP)
                     policy  = policy / policy.sum()
 

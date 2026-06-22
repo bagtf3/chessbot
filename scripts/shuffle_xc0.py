@@ -31,9 +31,9 @@ import tensorflow as tf
 tf.get_logger().setLevel("ERROR")
 
 
-BUFFER_SIZE      = 256_000
-RECORDS_PER_FILE = 20_480
-DEFAULT_OUT_DIR  = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0"
+BUFFER_SIZE      = 384_000
+RECORDS_PER_FILE = 10_240
+DEFAULT_OUT_DIR  = r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl_30m_records_062126"
 DEFAULT_IN_DIR   = os.getenv("BOOTSTRAP_TFREC_DIR", "")
 
 OPTIONS = tf.io.TFRecordOptions(compression_type="GZIP")

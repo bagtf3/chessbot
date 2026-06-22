@@ -36,7 +36,7 @@ import pandas as pd
 import scipy.special
 
 from chessbot.pretrain import (
-    EPOCH_SIZE, SHUFFLE_BUFFER, VAL_SHUFFLE_BUFFER,
+    EPOCH_SIZE, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY, DEFAULT_MAX_EPOCH,
     POLICY_LW, VALUE_LW,
     lr_for_epoch,
@@ -49,10 +49,10 @@ from chessbot.model import VARIANTS, PT_BUILDERS
 
 PT_BATCH_SIZE      = 512
 PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
-PT_ADAM_BETA2      = 0.995
+PT_ADAM_BETA2      = 0.999
 PT_SHUFFLE_BUFFER  = 128_000
 
-EPOCHS_PER_WORKER = 1000
+EPOCHS_PER_WORKER = 5000
 CHECKPOINT_EVERY  = 20
 DEFAULT_MODEL     = "16m-precond-smartgate"
 DEFAULT_RUN_TAG   = "val_test_multi"

@@ -247,6 +247,146 @@ def build_conv_attn_model(n_trunk_blocks=6, dropout=0.02):
     return m
 
 
+def build_precond_mha_value(cfg):
+    """Same as ablated but value head: Linear(D->128) on all 65 tokens (squares + WDL acc),
+    then xattn (q=WDL acc, kv=all 65) -> LN -> Linear(128->64) -> GELU -> Linear(64->3)."""
+    import math
+    import pyfastchess
+
+    CF  = cfg["conv_filters"]
+    D   = CF * 2
+    nh  = cfg["num_heads"]
+    dr  = cfg["dropout"]
+    pb  = cfg["pre_blocks"]
+    PDH = 256
+
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class TxBlock(nn.Module):
+        def __init__(self, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, D)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb     = nn.Embedding(21, CF)
+            self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+            self.pos     = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln = nn.LayerNorm(CF)
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+
+            ff_dims = [768, 1024, 1024, 768]
+            self.blocks   = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
+            self.trunk_ln = nn.LayerNorm(D)
+
+            # value head: project to 128, xattn (q=WDL acc, kv=64 squares + WDL acc)
+            self.val_proj  = nn.Linear(D, 128, bias=False)
+            self.val_xattn = nn.MultiheadAttention(128, 4, batch_first=True)
+            self.val_out   = nn.Linear(128, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, D * 3 // 2, bias=False)
+            self.gate_w_up   = nn.Linear(D, D * 3 // 2, bias=False)
+            self.gate_w_down = nn.Linear(D * 3 // 2, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+            seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([seq, pos], dim=-1)
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)
+
+            # value: project 64 squares + WDL acc (token 64) to 128, xattn q=WDL acc
+            v_ctx  = F.gelu(self.val_proj(x[:, :65, :]))      # (B, 65, 128)
+            q      = v_ctx[:, 64:65, :]                        # (B, 1,  128)
+            h, _   = self.val_xattn(q, v_ctx, v_ctx, need_weights=False)  # (B, 1, 128)
+            wdl    = self.val_out(h.squeeze(1))                # (B, 3)
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)
+            dots      = dots_full.reshape(B, 64 * 64)
+            dots_sub  = dots_full[:, 48:56, 56:64]
+            pf        = self.promo_from(fv[:, 48:56, :])
+            pt        = self.promo_to(tv[:, 56:64, :])
+            promo     = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192)
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            pol = torch.full((B, 4288), -3e4, device=tokens.device, dtype=combined.dtype)
+            pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), combined)
+            return pol.to(x.dtype), wdl
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -486,36 +626,36 @@ def main():
         except Exception as e:
             print(f"  [ERROR] 13m-precond-conformer TRT: {e}")
 
-    # 16m-precond-smartgate
+    # 16m-precond-smartgate (bilinear subblock underpromo)
     print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate  (4xConv(256) precond -> 512-d -> 8 global accumulators"
-          f" -> 4x transformer -> trunk_ln -> WDL + SmartGate + from/to MHA policy)")
+    print(f"  16m-precond-smartgate  (bilinear subblock underpromo: dots_sub + 2x Linear(PDH,3))")
     build_pt_precond_smartgate(PRECOND_CFG)
 
     if not args.dry_run:
         try:
             print(f"\n  Building 16m-precond-smartgate PT eager ...")
-            eager_sg = make_pt_eager_infer(build_pt_precond_smartgate(PRECOND_CFG), device)
+            eager_abl = make_pt_eager_infer(build_pt_precond_smartgate(PRECOND_CFG), device)
             lbl = "16m-precond-smartgate  PT eager"
-            all_results[lbl] = speed_test(lbl + " [fp16]", eager_sg, bs)
-            del eager_sg; gc.collect(); torch.cuda.empty_cache()
+            all_results[lbl] = speed_test(lbl + " [fp16]", eager_abl, bs)
+            del eager_abl; gc.collect(); torch.cuda.empty_cache()
         except Exception as e:
             print(f"  [ERROR] 16m-precond-smartgate PT eager: {e}")
 
-    if not args.skip_trt:
+    # 16m-precond-mha-value
+    print(f"\n{'='*60}")
+    print(f"  16m-precond-mha-value  (ablated promo head + xattn value: Linear(D->128) on 65 tokens,"
+          f" q=WDL acc, kv=squares+acc -> LN -> 64 -> 3)")
+    build_precond_mha_value(PRECOND_CFG)
+
+    if not args.dry_run:
         try:
-            os.makedirs(TRT_CACHE, exist_ok=True)
-            onnx_sg = os.path.join(TRT_CACHE, "precond_smartgate_pb4.onnx")
-            if not os.path.exists(onnx_sg):
-                export_to_onnx(build_pt_precond_smartgate(PRECOND_CFG), device, onnx_sg)
-            else:
-                print(f"  [TRT] ONNX cached: {onnx_sg}")
-            trt_sg, trt_sess_sg = make_trt_infer(onnx_sg, TRT_CACHE, max_bs=max(bs))
-            lbl = "16m-precond-smartgate  ORT TRT"
-            all_results[lbl] = speed_test(lbl + " [fp16]", trt_sg, bs)
-            del trt_sess_sg; gc.collect()
+            print(f"\n  Building 16m-precond-mha-value PT eager ...")
+            eager_mv = make_pt_eager_infer(build_precond_mha_value(PRECOND_CFG), device)
+            lbl = "16m-precond-mha-value  PT eager"
+            all_results[lbl] = speed_test(lbl + " [fp16]", eager_mv, bs)
+            del eager_mv; gc.collect(); torch.cuda.empty_cache()
         except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate TRT: {e}")
+            print(f"  [ERROR] 16m-precond-mha-value PT eager: {e}")
 
     if args.dry_run:
         print("\n  Dry run complete.")

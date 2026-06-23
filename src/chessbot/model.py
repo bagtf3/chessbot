@@ -1134,13 +1134,9 @@ def build_pt_precond_smartgate(cfg: dict):
             self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
             self.to_out    = nn.Linear(PDH, PDH)
 
-            self.scale = 1.0 / math.sqrt(PDH)
-
-            self.promo_mix = nn.Conv2d(D, 64, 1, bias=False)
-            self.promo_mln = make_ln2d(64)
-            self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)
-            self.promo_ln  = make_ln2d(64)
-            self.promo_out = nn.Conv2d(64, 3, 1)
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
 
             self.register_buffer("sl_idx", sl_idx)
 
@@ -1177,13 +1173,13 @@ def build_pt_precond_smartgate(cfg: dict):
             th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
             tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, PDH]
 
-            dots  = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale).reshape(B, 64 * 64)
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)          # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
 
-            xb    = x[:, :64, :].reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
-            p     = F.leaky_relu(self.promo_mln(self.promo_mix(xb)), 0.02)
-            sk    = p
-            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
-            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(B, 8 * 8 * 3).float()
+            dots_sub = dots_full[:, 48:56, 56:64]                                   # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                             # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                               # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
 
             raw_4288 = torch.cat([dots, promo], dim=1)
             q_sl     = raw_4288[:, self.sl_idx]

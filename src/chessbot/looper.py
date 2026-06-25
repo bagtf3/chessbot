@@ -14,7 +14,7 @@ now = time.time
 
 import numpy as np
 import pandas as pd
-from pyfastchess import raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats
+from pyfastchess import raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats, MCTSForest
 
 from chessbot import SF_LOC
 
@@ -43,6 +43,7 @@ class GameLooper(object):
         self.active_games = []
         self.sf_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
+        self.forest = MCTSForest()
 
         self.pull_from_queue()
 
@@ -188,6 +189,7 @@ class GameLooper(object):
                 board.push_uci(mv)
             cg = ChessGame(board=board, meta=spec.meta, cfg=spec.cfg)
             self.active_games.append(cg)
+            self.forest.add_tree(cg.tree)
 
     def run(self, stop_event=None):
         """
@@ -247,14 +249,11 @@ class GameLooper(object):
 
             bonus = 0
             finished = []
-            preds_batch = []
-            # selfplay loop starts here
             mbs_used = []
+            self.forest.resolve_all_inflight()
             for game in self.active_games[:cfg.games_at_once]:
                 g_mbs = game.config.micro_batch
                 sf_terminal, mcts_terminal = False, False
-                # first resolve any recent preds
-                game.tree.resolve_inflight()
 
                 # if its stockfish turn, check if the move is ready
                 # otherwise do not block and move on
@@ -284,6 +283,7 @@ class GameLooper(object):
 
                 # terminal check. do not sim on a finished game
                 if sf_terminal or mcts_terminal:
+                    self.forest.pop_tree(game.tree)
                     self.finalize_game_data(game)
                     finished.append(game.game_id)
                     if game.game_id in self.sf_games:
@@ -299,18 +299,18 @@ class GameLooper(object):
 
                 # update bonus, could go up or down
                 bonus += g_mbs - nn
-                
+
                 # update sim count
                 game.tree.sims_completed_this_move += n_leafs
-                if nn:
-                    preds_batch += game.tree.pending_encoded_64_tokens()
-                    if len(preds_batch) >= cfg.macro_batch:
-                        pred_fill.append(self.format_and_predict(preds_batch))
-                        preds_batch = []
 
-            if preds_batch:
-                pred_fill.append(self.format_and_predict(preds_batch))
-                preds_batch = []
+            keys_np, boards_np = self.forest.get_all_encoded()
+            if len(keys_np):
+                boards_i32 = boards_np.astype(np.int32)
+                macro = cfg.macro_batch
+                for i in range(0, len(keys_np), macro):
+                    pred_fill.append(
+                        self.format_and_predict(keys_np[i:i + macro], boards_i32[i:i + macro])
+                    )
 
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
@@ -354,34 +354,21 @@ class GameLooper(object):
         ])
         return nn, n_leafs
 
-    def format_and_predict(self, preds_batch):
+    def format_and_predict(self, keys_np, boards_np):
         """
-        preds_batch: list of items produced by tree.pending_encoded_64_tokens(...)
-        expected shape:
-            - (zobrist, board_np)
+        keys_np: uint64[B] zobrist keys
+        boards_np: int32[B, 64] board tokens (STM-as-white)
 
         Runs inference and writes into the raw policy cache as (zobrist, value, probs).
         Masking/softmax is applied in C++ build_priors.
         """
-
-        if not preds_batch:
+        B = len(keys_np)
+        if B == 0:
             return
-
-        # collect arrays + keys
-        boards = []
-        keys = []
-
-        for item in preds_batch:
-            keys.append(item[0])
-            boards.append(np.asarray(item[1], dtype=np.int32))
-
-        boards_np = np.stack(boards, axis=0)   # (B, 64)
-        B = boards_np.shape[0]
         start = now()
         if self.last_infer_end is not None:
             self.infer_gaps.append(start - self.last_infer_end)
         probs_np, vals_np = self.infer((boards_np,))
-        keys_np = np.array(keys, dtype=np.uint64)
         raw_cache_bulk_insert_np(keys_np, vals_np, probs_np)
         self.last_infer_end = now()
         self.prediction_times.append(self.last_infer_end - start)

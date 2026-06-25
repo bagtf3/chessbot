@@ -15,25 +15,27 @@ HISTORY_FILENAME = "validation_history.jsonl"
 V = "[validation]"
 
 SF_TABLE_DEFAULT = [
-  {"depth": 5,  "elo": 2172, "name": "SF17d5"},
-  {"depth": 6,  "elo": 2252, "name": "SF17d6"},
-  {"depth": 7,  "elo": 2357, "name": "SF17d7"},
-  {"depth": 8,  "elo": 2472, "name": "SF17d8"},
-  {"depth": 9,  "elo": 2586, "name": "SF17d9"},
-  {"depth": 10, "elo": 2689, "name": "SF17d10"},
-  {"depth": 11, "elo": 2791, "name": "SF17d11"},
-  {"depth": 12, "elo": 2894, "name": "SF17d12"},
-  {"depth": 13, "elo": 2936, "name": "SF17d13"},
-  {"depth": 14, "elo": 2977, "name": "SF17d14"},
-  {"depth": 15, "elo": 3019, "name": "SF17d15"},
-  {"depth": 16, "elo": 3060, "name": "SF17d16"},
-  {"depth": 18, "elo": 3097, "name": "SF17d18"},
-  {"depth": 20, "elo": 3134, "name": "SF17d20"},
-  {"depth": 22, "elo": 3169, "name": "SF17d22"},
-  {"depth": 24, "elo": 3200, "name": "SF17d24"},
-  {"depth": 26, "elo": 3231, "name": "SF17d26"},
-  {"depth": 28, "elo": 3262, "name": "SF17d28"},
-  {"depth": 30, "elo": 3293, "name": "SF17d30"},
+  {"depth": 1,  "elo": 1575, "name": "SF17d1"},
+  {"depth": 2,  "elo": 1745, "name": "SF17d2"},
+  {"depth": 3,  "elo": 1837, "name": "SF17d3"},
+  {"depth": 4,  "elo": 1984, "name": "SF17d4"},
+  {"depth": 5,  "elo": 2092, "name": "SF17d5"},
+  {"depth": 6,  "elo": 2245, "name": "SF17d6"},
+  {"depth": 7,  "elo": 2376, "name": "SF17d7"},
+  {"depth": 8,  "elo": 2567, "name": "SF17d8"},
+  {"depth": 9,  "elo": 2759, "name": "SF17d9"},
+  {"depth": 10, "elo": 2912, "name": "SF17d10"},
+  {"depth": 11, "elo": 3035, "name": "SF17d11"},
+  {"depth": 12, "elo": 3137, "name": "SF17d12"},
+  {"depth": 13, "elo": 3223, "name": "SF17d13"},
+  {"depth": 14, "elo": 3297, "name": "SF17d14"},
+  {"depth": 15, "elo": 3363, "name": "SF17d15"},
+  {"depth": 16, "elo": 3422, "name": "SF17d16"},
+  {"depth": 17, "elo": 3477, "name": "SF17d17"},
+  {"depth": 18, "elo": 3529, "name": "SF17d18"},
+  {"depth": 20, "elo": 3625, "name": "SF17d20"},
+  {"depth": 22, "elo": 3716, "name": "SF17d22"},
+  {"depth": 23, "elo": 3761, "name": "SF17d23"},
 ]
 
 def create_validation_config(cfg, yaml_file=None):
@@ -116,16 +118,17 @@ def continue_depth_from_previous_cfg(cfg, last_entry):
     the closest matching index in cfg.sf_table. Leaves cfg unchanged if
     nothing usable found.
     """
-
-    prev_index = last_entry.get("depth_index", 0)
+    prev_depth = last_entry.get("depth", 0)
     prev_bumped = last_entry["bumped"]
+    target_depth = prev_depth + (1 if prev_bumped else 0)
 
     n_rows = len(cfg.sf_table)
-    if prev_bumped:
-        new_index = min(n_rows-1, prev_index + 1)
-    else:
-        new_index = prev_index
-    
+    new_index = n_rows - 1
+    for i, row in enumerate(cfg.sf_table):
+        if row["depth"] >= target_depth:
+            new_index = i
+            break
+
     cfg.sf_index = new_index
     cfg.sf_depth = cfg.sf_table[cfg.sf_index]['depth']
     cfg.sf_elo = cfg.sf_table[cfg.sf_index]['elo']

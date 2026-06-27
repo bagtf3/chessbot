@@ -1043,7 +1043,7 @@ def build_pt_conv_mha_gemm_smartgate(cfg: dict):
     return m
 
 
-def build_pt_precond_smartgate(cfg: dict):
+def build_pt_precond_smartgate(cfg: dict, policy_1858: bool = False):
     """4x Conv(256) preconditioner -> concat pos(256) -> 512-d
     -> append 8 specialized global accumulators -> 4x transformer blocks
     -> shared trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
@@ -1184,6 +1184,8 @@ def build_pt_precond_smartgate(cfg: dict):
             raw_4288 = torch.cat([dots, promo], dim=1)
             q_sl     = raw_4288[:, self.sl_idx]
             combined = q_sl + F.logsigmoid(gate_raw.float())
+            if policy_1858:
+                return combined.to(x.dtype), wdl
             pol = torch.full((B, 4288), -3e4, device=tokens.device, dtype=combined.dtype)
             pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), combined)
             return pol.to(x.dtype), wdl

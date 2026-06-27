@@ -1,0 +1,138 @@
+HANDOFF: 1858 POLICY DOMAIN MIGRATION
+======================================
+
+## THE GOAL
+Migrate the entire stack from 4288-slot policy to 1858-slot policy (sometimes-legal only).
+No retraining needed -- it is a surgical change that removes the scatter-back step in the model.
+
+## WHAT IS DONE
+
+### 1. model.py -- policy_1858 flag (DONE, WORKING)
+File: src/chessbot/model.py
+Added `policy_1858: bool = False` parameter to `build_pt_precond_smartgate`.
+If True, forward() returns (B, 1858) instead of scattering back to (B, 4288).
+Default is False so all existing callers are unchanged.
+
+The key change in forward():
+    combined = q_sl + F.logsigmoid(gate_raw.float())  # already (B, 1858)
+    if policy_1858:
+        return combined.to(x.dtype), wdl
+    # ... scatter to 4288 as before
+
+Verified working via scripts/poc_1858_policy.py (zero diff between the two paths).
+
+### 2. Python kRemap validation (DONE, ALL PASS)
+File: scripts/test_kremap.py
+Tests 1, 5, 6, bonus EP -- all pass.
+Validates the Python-side kRemap logic and that build_sometimes_legal_mask() is correct.
+
+### 3. C++ pfc1858 build (DONE, ALL PASS)
+Worktree: C:\Users\Bryan\repos\pyfastchess_1858\  (branch: convert1858)
+Installed to: C:\Users\Bryan\repos\pyfastchess_1858\dist_1858\  (package name: pfc1858)
+
+Changes made:
+  - backend.cpp: added kRemap static array; moves_to_indices() and legal_move_mask()
+    now return 1858-domain indices instead of 4288-domain
+  - binding.cpp: raw_cache_bulk_insert_np validates size == 1858 instead of 4288
+  - cache.hpp, mcts.hpp, singleton_registry.hpp: comments updated
+  - pyproject.toml + CMakeLists.txt: package renamed pyfastchess -> pfc1858
+  - src/pfc1858/__init__.py: import_module("pfc1858._core")
+
+File: scripts/test_kremap_cpp.py
+Tests 2, 3, 5 against pfc1858 -- all 10 positions PASS.
+Spot check: a7a8n->1792, a7a8q->1401, a7a8b->1814, a7a8r->1836.
+
+NOTE: pyfastchess and pfc1858 CANNOT be imported in the same process.
+pybind11 type registry is global; both register "Board" and it conflicts.
+They must run in separate subprocesses if you need both.
+
+## WHAT STILL NEEDS TESTING
+
+### Test 4: model output equivalence (NOT YET DONE)
+Prove that pol_1858 from the new model == pol_4288[:, sl_idx] from the old model.
+
+The correct script is SIMPLE -- previous session wasted time on subprocess complexity
+and accidentally ran CPU inference (slow). The right approach:
+
+```python
+import sys, pickle, gc
+import numpy as np
+import torch
+
+sys.path.insert(0, r"C:\Users\Bryan\repos\chessbot\src")
+import pyfastchess
+from chessbot.model import PT_BUILDERS, VARIANTS
+
+SNAPSHOT = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs\precond_run2\grad_analysis_snapshot.pkl"
+PT_PATH  = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs\16m_precond_run0\16m_precond_run0_model.pt"
+DEVICE   = torch.device("cuda")
+
+sl_idx = np.where(pyfastchess.build_sometimes_legal_mask())[0]  # (1858,)
+
+with open(SNAPSHOT, "rb") as f:
+    data = pickle.load(f)
+tokens_np = np.stack([data[i][0] for i in range(1024)]).astype(np.int32)
+tokens_t  = torch.from_numpy(tokens_np).long().to(DEVICE)
+
+# model A: 4288
+obj = torch.load(PT_PATH, map_location=DEVICE)
+arch = obj.get("arch", "16m-precond-smartgate")
+modelA = PT_BUILDERS[arch](VARIANTS[arch], policy_1858=False).to(DEVICE).eval()
+modelA.load_state_dict(obj["model"], strict=False)
+with torch.no_grad():
+    polA, _ = modelA(tokens_t)
+pol4288 = polA.float().cpu().numpy()
+del modelA, obj; gc.collect(); torch.cuda.empty_cache()
+
+# model B: 1858
+obj = torch.load(PT_PATH, map_location=DEVICE)
+modelB = PT_BUILDERS[arch](VARIANTS[arch], policy_1858=True).to(DEVICE).eval()
+modelB.load_state_dict(obj["model"], strict=False)
+with torch.no_grad():
+    polB, _ = modelB(tokens_t)
+pol1858 = polB.float().cpu().numpy()
+del modelB, obj; gc.collect(); torch.cuda.empty_cache()
+
+diff = np.abs(pol1858 - pol4288[:, sl_idx])
+print(f"max diff: {diff.max():.2e}, mean diff: {diff.mean():.2e}")
+assert diff.max() < 1e-4, "FAIL"
+print("PASS")
+```
+
+Notes on the snapshot data structure:
+    data = list of tuples: (tokens, pol_target, pol_4288, wdl, outcome, weight)
+    tokens: int32 (64,) -- board encoding, direct model input
+    pol_4288: float32 (4288,) -- stored NN output logits (nonzero at ~4 positions)
+
+sl_idx comes from pyfastchess.build_sometimes_legal_mask() -- returns bool array (4288,),
+np.where gives the (1858,) indices of the sometimes-legal slots.
+
+## AFTER TEST 4 PASSES
+Remaining work:
+  1. Update looper.py to use policy_1858=True when creating the model
+  2. Update infer_ort_trt.py (ORT/TRT export path) for 1858 output shape
+  3. Update rescore.py -- policy targets are currently 4288-dim, need kRemap applied
+  4. Update train_pytorch.py -- policy loss expects 4288, needs to expect 1858
+  5. Retrain / fine-tune from current checkpoint (minimal, weights are already good)
+  6. Flip pyfastchess production build to pfc1858 (merge convert1858 -> dev, rebuild)
+
+## KEY PATHS
+  chessbot src:          C:\Users\Bryan\repos\chessbot\src\chessbot\
+  model.py:              src\chessbot\model.py
+  pyfastchess worktree:  C:\Users\Bryan\repos\pyfastchess_1858\
+  pfc1858 install:       C:\Users\Bryan\repos\pyfastchess_1858\dist_1858\
+  active model .pt:      C:\Users\Bryan\Data\chessbot_data\selfplay_runs\16m_precond_run0\16m_precond_run0_model.pt
+  grad snapshot:         C:\Users\Bryan\Data\chessbot_data\selfplay_runs\precond_run2\grad_analysis_snapshot.pkl
+  test scripts:          C:\Users\Bryan\repos\chessbot\scripts\
+    poc_1858_policy.py   -- POC (done)
+    test_kremap.py       -- Python kRemap (done)
+    test_kremap_cpp.py   -- C++ kRemap via pfc1858 (done)
+    test_build_priors_1858.py -- Test 4 (write fresh, see above)
+
+## WHAT WENT WRONG THIS SESSION
+  1. Forgot build_sometimes_legal_mask is in pyfastchess not chessbot.model
+  2. Tried to import pyfastchess + pfc1858 in same process -> type conflict
+  3. Overcomplicated Test 4 with subprocess orchestration, MCTSTree, board generation
+  4. Ran inference on CPU (15.8M param transformer = very slow on CPU)
+  5. Test 4 does NOT need boards, legal moves, MCTSTree, or subprocesses.
+     It is purely a model output comparison. pyfastchess is only needed for sl_idx.

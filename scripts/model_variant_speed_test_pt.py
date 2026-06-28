@@ -641,6 +641,21 @@ def main():
         except Exception as e:
             print(f"  [ERROR] 16m-precond-smartgate PT eager: {e}")
 
+    # 16m-precond-smartgate-1858 (same weights, no scatter back to 4288)
+    print(f"\n{'='*60}")
+    print(f"  16m-precond-smartgate-1858  (same as above, policy_1858=True: returns (B,1858) directly)")
+    build_pt_precond_smartgate(PRECOND_CFG, policy_1858=True)
+
+    if not args.dry_run:
+        try:
+            print(f"\n  Building 16m-precond-smartgate-1858 PT eager ...")
+            eager_1858 = make_pt_eager_infer(build_pt_precond_smartgate(PRECOND_CFG, policy_1858=True), device)
+            lbl = "16m-precond-SG-1858  PT eager"
+            all_results[lbl] = speed_test(lbl + " [fp16]", eager_1858, bs)
+            del eager_1858; gc.collect(); torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  [ERROR] 16m-precond-smartgate-1858 PT eager: {e}")
+
     # 16m-precond-mha-value
     print(f"\n{'='*60}")
     print(f"  16m-precond-mha-value  (ablated promo head + xattn value: Linear(D->128) on 65 tokens,"

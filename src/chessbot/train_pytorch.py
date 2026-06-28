@@ -66,7 +66,7 @@ def load_pt_model(path):
             if isinstance(meta, dict) and "model" in meta:
                 from chessbot.model import PT_BUILDERS, VARIANTS
                 arch = meta.get("arch", FALLBACK_ARCH)
-                model = PT_BUILDERS[arch](VARIANTS[arch])
+                model = PT_BUILDERS[arch](VARIANTS[arch], policy_1858=True)
                 model.load_state_dict(meta["model"], strict=False)
                 log_policy_mask_status(model)
                 return model, arch
@@ -79,7 +79,7 @@ def load_pt_model(path):
         if isinstance(state_dict, torch.nn.Module):
             return state_dict, FALLBACK_ARCH
         arch = obj.get("arch", FALLBACK_ARCH)
-        model = PT_BUILDERS[arch](VARIANTS[arch])
+        model = PT_BUILDERS[arch](VARIANTS[arch], policy_1858=True)
         model.load_state_dict(state_dict, strict=False)
         log_policy_mask_status(model)
         return model, arch
@@ -302,7 +302,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 def make_pt_infer(model, max_bs):
     """
     Returns (model, fwd) where fwd(enc_np) -> (logits_np, wdl_np).
-    logits_np: (B, 4288) raw policy logits
+    logits_np: (B, 1858) raw policy logits
     wdl_np:    (B, 3) softmax WDL probabilities
     Softmax on policy, uniform_eps, prior_clip_max applied in C++ build_priors.
     """
@@ -352,7 +352,7 @@ def export_ts_to_onnx(ts_path, onnx_path):
     pt_path = companion_pt(ts_path)
     ckpt = torch.load(pt_path, map_location='cuda')
     arch = ckpt.get('arch', FALLBACK_ARCH)
-    model = PT_BUILDERS[arch](VARIANTS[arch]).half().cuda().eval()
+    model = PT_BUILDERS[arch](VARIANTS[arch], policy_1858=True).half().cuda().eval()
     model.load_state_dict(ckpt['model'])
 
     dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')

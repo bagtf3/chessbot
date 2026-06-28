@@ -23,6 +23,7 @@ from chessbot.utils import (
     batch_policy_metrics_from_priors, print_validation,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch
+from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
@@ -66,9 +67,12 @@ class Lc0Thread:
         self.input_name   = inputs[0].name
         self.output_names = [o.name for o in outputs]
 
-    def submit(self, features_uint8, x, mask, vwht, pwht):
-        ti = lc0_table_index(features_uint8)
-        self.pending.append((features_uint8, ti, x, mask, vwht, pwht))
+    def submit(self, features_uint8, board, x, mask, vwht, pwht):
+        ti   = lc0_table_index(features_uint8)
+        ucis = board.legal_moves()
+        lc0_idx = np.array([UCI_TO_IDX[ti][u.rstrip('n')] for u in ucis], dtype=np.int32)
+        xc0_idx = np.array(board.moves_to_indices(ucis), dtype=np.int32)
+        self.pending.append((features_uint8, lc0_idx, xc0_idx, x, mask, vwht, pwht))
         if len(self.pending) >= self.batch_size:
             self.flush()
 
@@ -85,11 +89,12 @@ class Lc0Thread:
         logits = outs[0]  # (N, 1858) policy logits
         wdl    = outs[1]  # (N, 3) WDL probs, STM-POV
 
-        tis          = np.array([item[1] for item in batch])
-        xc0_policies = lc0_logits_to_xc0_batch(logits, tis)
+        lc0_idx_list = [item[1] for item in batch]
+        xc0_idx_list = [item[2] for item in batch]
+        xc0_policies = lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list)
 
         for i, item in enumerate(batch):
-            _, _, x, mask, vwht, pwht = item
+            _, _, _, x, mask, vwht, pwht = item
             policy = xc0_policies[i] * mask
             s = policy.sum()
             if s > 0:
@@ -541,7 +546,7 @@ class Rescorer(object):
     
     def make_policy_example(self, board, ucis, visits):
         indices = board.moves_to_indices(ucis)
-        policy = np.zeros(64 * 67, dtype=np.float32)
+        policy = np.zeros(1858, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
         pi = np.clip(pi, 0.0, self.config.prior_clip_max)
@@ -1065,7 +1070,7 @@ class Rescorer(object):
             # build policy from precomputed board state
             idx_map = ply['idx_map']
             indices = [idx_map[u] for u in mvs]
-            policy = np.zeros(64 * 67, dtype=np.float32)
+            policy = np.zeros(1858, dtype=np.float32)
             s = sum(vis)
             pi = np.array([v / s for v in vis], dtype=np.float32)
             pi = np.clip(pi, 0.0, cfg.prior_clip_max)
@@ -1227,7 +1232,7 @@ class Rescorer(object):
                         print(msg)
 
                     x, mask, _, _, vwht, _ = entry
-                    self.lc0_thread.submit(b_lc0.lc0_features(), x, mask, vwht, 1.0)
+                    self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, mask, vwht, 1.0)
                     n_pv = 0
                     if aux['pv_ucis']:
                         # pv_ucis = pv[0:4]: pv[0] is SF's best move from
@@ -1243,6 +1248,7 @@ class Rescorer(object):
                                 break
                             self.lc0_thread.submit(
                                 b_pv.lc0_features(),
+                                b_pv,
                                 b_pv.encode_64_tokens(),
                                 b_pv.legal_move_mask(),
                                 vwht, 1.0,

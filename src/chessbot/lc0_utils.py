@@ -120,46 +120,26 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum(axis=-1, keepdims=True)
 
 
-def build_lc0_to_xc0_maps():
-    """Precompute 4 index arrays mapping LC0 policy index to XC0 flat index.
+def lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list):
+    """Convert LC0 policy logits to XC0 1858-domain probability arrays.
 
-    Returns list of 4 int32 arrays shape (1858,); -1 where unmapped.
-    Table order: 0=white no-castle, 1=white castle, 2=black no-castle, 3=black castle.
-    """
-    maps = []
-    for ti in range(4):
-        stm_white = ti < 2
-        mapping   = np.full(1858, -1, dtype=np.int32)
-        for lc0_idx, uci in IDX_TO_UCI[ti].items():
-            mapping[lc0_idx] = uci_to_xerces_index(uci, stm_white=stm_white)
-        maps.append(mapping)
-    return maps
+    logits:       (N, 1858) float32 — raw policy logits from LC0/ORT model
+    lc0_idx_list: list of N int arrays — LC0 indices for each position's legal moves
+    xc0_idx_list: list of N int arrays — corresponding XC0 1858-domain indices
 
-
-LC0_TO_XC0 = build_lc0_to_xc0_maps()
-
-
-def lc0_logits_to_xc0_batch(logits: np.ndarray, table_indices: np.ndarray) -> np.ndarray:
-    """Convert a batch of LC0 policy logits to XC0 4288-dim probability arrays.
-
-    logits:        (N, 1858) float32 — raw policy logits from LC0/ORT model
-    table_indices: (N,)      int     — per-position table index 0-3
-
-    Returns (N, 4288) float32 with softmaxed probabilities placed in XC0 slots.
-    Non-moves are zero.
+    Returns (N, 1858) float32 with softmaxed probabilities in XC0 slots.
     """
     n      = len(logits)
-    result = np.zeros((n, 4288), dtype=np.float32)
-    for ti in range(4):
-        mask = np.where(table_indices == ti)[0]
-        if len(mask) == 0:
+    result = np.zeros((n, 1858), dtype=np.float32)
+    for i in range(n):
+        lc0_idx = lc0_idx_list[i]
+        xc0_idx = xc0_idx_list[i]
+        if len(lc0_idx) == 0:
             continue
-        batch   = logits[mask].astype(np.float64)
-        e       = np.exp(batch - batch.max(axis=1, keepdims=True))
-        probs   = (e / e.sum(axis=1, keepdims=True)).astype(np.float32)
-        mapping = LC0_TO_XC0[ti]
-        valid   = mapping >= 0
-        result[np.ix_(mask, mapping[valid])] = probs[:, valid]
+        raw   = logits[i, lc0_idx].astype(np.float64)
+        e     = np.exp(raw - raw.max())
+        probs = (e / e.sum()).astype(np.float32)
+        result[i, xc0_idx] = probs
     return result
 
 

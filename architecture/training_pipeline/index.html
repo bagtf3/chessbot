@@ -868,6 +868,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../experimental_features/smartgate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmartGate
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../experimental_features/matelock/" class="md-nav__link">
         
   
@@ -1315,23 +1343,23 @@
 <p><img alt="Selfplay telemetry" src="../../images/selfplay_telemetry.JPG" /></p>
 <p>The live telemetry view aggregates across all workers and updates each reporting interval. Key metrics: moves/sec (MPS) and leaf evaluations/sec (LPS) reflect game and NN throughput respectively; games/hour gives the effective data generation rate; cache hit rate shows what fraction of leaf collections were resolved by the C++ priors cache without NN inference; PUCT stats and per-scenario W/D/L breakdowns make it easy to spot if one game type is producing systematically lopsided results.</p>
 <h2 id="gamelooper">GameLooper</h2>
-<p><code>GameLooper</code> manages a pool of <code>active_games</code> (up to <code>games_at_once</code> concurrent <code>ChessGame</code> instances) and drives the inference loop.</p>
+<p><code>GameLooper</code> manages a pool of <code>active_games</code> (up to <code>games_at_once</code> concurrent <code>ChessGame</code> instances) and drives the inference loop. Every tree is registered with a single C++ <code>MCTSForest</code>, which owns leaf collection and board encoding across all games at once — the Python loop never touches individual leaf boards.</p>
 <p>Each iteration:</p>
 <ol>
-<li><code>collect_many_leaves(this_mbs, max_fastpath)</code> — called across all active games simultaneously, gathering new leaf nodes that need NN evaluation. Cache hits and terminals are resolved in C++ and don't surface here.</li>
-<li>Leaf boards are stacked into a batch. The batch is padded to the next valid size for XLA trace reuse.</li>
-<li><code>fwd((boards_np,))</code> — NN inference. Returns <code>(policy_logits [B, 4288], value [B, 1])</code>.</li>
-<li><code>raw_cache_bulk_insert_np(zobrists, values, logits)</code> — inserts results into the C++ raw cache.</li>
-<li>Per-leaf: <code>tree.apply_result(node, priors, wdl)</code> — expands the node and triggers backprop.</li>
-<li>Games that have reached a terminal state are finalized, serialized to pickle, and replaced with fresh games.</li>
+<li><code>forest.resolve_all_inflight()</code> — settle any leaves whose NN results arrived last iteration.</li>
+<li>For each active game, <code>game.tree.collect_many_leaves(this_mbs, max_fastpath)</code> gathers new leaf nodes that need NN evaluation. Cache hits and terminals are resolved in C++ and don't surface here. A per-game <code>micro_batch</code> sets the target leaf count; unused budget rolls into a <code>bonus</code> that lets the next game temporarily double its microbatch, keeping the aggregate batch full.</li>
+<li><code>batch_encoder()</code> — one C++ call (<code>forest.get_all_encoded</code>, or <code>get_all_lc0_features</code> for the <code>lc0_trt</code> backend) returns <code>(keys_np, enc_np)</code>: the zobrist keys and encoded boards for every pending leaf in the forest.</li>
+<li><code>format_and_predict(keys, enc)</code> — the encoded batch is sliced into <code>macro_batch</code> chunks and run through <code>infer(...)</code>, returning <code>(policy_logits [B, 1858], wdl [B, 3])</code>. <code>raw_cache_bulk_insert_np(keys, wdl, logits)</code> writes results into the C++ raw cache, where masking/softmax happen in <code>build_priors</code>.</li>
+<li>On the next iteration <code>resolve_all_inflight()</code> expands the waiting nodes and backpropagates.</li>
+<li>Games that reach a terminal state are popped from the forest, finalized (serialized to pickle and enqueued for rescoring), and removed from <code>active_games</code>; <code>pull_from_queue()</code> refills the pool.</li>
 </ol>
-<p>The inference step is intentionally kept as the sole GPU operation. There is no per-game GPU work; everything else is CPU-side C++ or Python orchestration.</p>
-<p><strong>Pause and reload.</strong> When the main process sends a pause signal, <code>GameLooper</code> drains any in-flight leaves, calls <code>tf.keras.backend.clear_session()</code> (or <code>torch.cuda.empty_cache()</code> for the PyTorch backend) to release VRAM, and blocks on the unpause queue. On resume it reloads the model from the path provided in the unpause message and recompiles the inference function. VRAM is released before the retrain subprocess starts so both fit on the same GPU.</p>
+<p>The inference step is intentionally kept as the sole GPU operation. There is no per-game GPU work; encoding, cache lookups, and tree updates are all CPU-side C++, with Python only orchestrating.</p>
+<p><strong>Pause and reload.</strong> When the main process sends a pause signal, <code>GameLooper</code> tears down the inference session (<code>del self.infer</code>/<code>del self.model</code>), calls <code>torch.cuda.empty_cache()</code> for the PyTorch backends (the TRT backends need no explicit free), clears the priors cache, and blocks on the message queue until an unpause arrives. An unpause that arrives early is buffered so the wait can't deadlock. On resume it reloads the model from the path in the unpause message and rebuilds the inference function. VRAM is released before the retrain subprocess starts so both fit on the same GPU.</p>
 <h2 id="stockfishthread">StockfishThread</h2>
 <p><code>StockfishThread</code> runs a Stockfish engine on a background daemon thread, handling positions that need engine evaluation during selfplay — primarily for games played against Stockfish and for the vs-SF validation rounds.</p>
 <p>Games submit a (game_id, board_fen) pair via <code>submit()</code>. The thread drains its input queue, runs Stockfish to the configured depth, and pushes (game_id, result_tuple) to a response queue. The result tuple contains <code>(eval_cp_stm_pov, best_move_uci, wdl_tuple)</code>. Games poll the response queue at the start of each move.</p>
 <h2 id="game-curriculum">Game Curriculum</h2>
-<p><code>GameGenerator</code> selects starting positions according to a weighted scenario mix configured per run. The active <code>val_test</code> curriculum is:</p>
+<p><code>GameGenerator</code> selects starting positions according to a weighted scenario mix configured per run. The active <code>16m_precond</code> curriculum is:</p>
 <table>
 <thead>
 <tr>
@@ -1391,7 +1419,7 @@
 <li><strong>Eval draw</strong> — if all evaluations within a rolling window stay near zero, the game is adjudicated as a draw.</li>
 <li><strong>Max game length</strong> — hard cap to prevent runaway games.</li>
 </ul>
-<p>Syzygy tablebase adjudication and material-diff cutoffs are configurable but disabled in the current <code>val_test</code> run.</p>
+<p>Syzygy tablebase adjudication (&lt;= 5 pieces) and material-diff cutoffs are also configurable per run. The adjudicator flags in effect for a game are recorded with its training data so rescoring knows how each outcome was reached.</p>
 
 
 

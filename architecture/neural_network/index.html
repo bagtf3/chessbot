@@ -643,10 +643,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#conformer-architecture" class="md-nav__link">
+  <a href="#preconditioner-smartgate-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Conformer Architecture
+        Preconditioner-SmartGate Architecture
       
     </span>
   </a>
@@ -654,21 +654,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#tensorflow-xla-inference" class="md-nav__link">
+  <a href="#onnx-runtime-tensorrt-inference" class="md-nav__link">
     <span class="md-ellipsis">
       
-        TensorFlow + XLA Inference
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#onnx-tensorrt" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        ONNX / TensorRT
+        ONNX Runtime + TensorRT Inference
       
     </span>
   </a>
@@ -837,6 +826,34 @@
     
   
     Experimental Features
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../experimental_features/smartgate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmartGate
   
 
     
@@ -1228,10 +1245,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#conformer-architecture" class="md-nav__link">
+  <a href="#preconditioner-smartgate-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Conformer Architecture
+        Preconditioner-SmartGate Architecture
       
     </span>
   </a>
@@ -1239,21 +1256,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#tensorflow-xla-inference" class="md-nav__link">
+  <a href="#onnx-runtime-tensorrt-inference" class="md-nav__link">
     <span class="md-ellipsis">
       
-        TensorFlow + XLA Inference
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#onnx-tensorrt" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        ONNX / TensorRT
+        ONNX Runtime + TensorRT Inference
       
     </span>
   </a>
@@ -1315,38 +1321,26 @@
 </tbody>
 </table>
 <p>Castling rights are folded into the king token — no separate planes are needed. The en passant square gets its own token on the target square, giving the model direct spatial context about which file is eligible. There are no stacked history planes; the model sees only the current position.</p>
-<p>Vocabulary size is 21. This encoding is defined in C++ (<code>backend.hpp</code>) and is fixed across the entire stack.</p>
-<h2 id="conformer-architecture">Conformer Architecture</h2>
-<p>The active model is <code>16m-conformer-interweaved</code>, defined in <code>scripts/model_variant_speed_test.py</code>. It is a hybrid architecture where each of the 10 blocks interweaves a transformer attention step with a convolutional residual step, rather than stacking all conv blocks followed by all transformer layers.</p>
-<p><strong>Input and embedding.</strong> The 64-token sequence is passed through a token embedding (<code>vocab_size=21 → d_embed=256</code>) and immediately reshaped to an 8×8 spatial grid.</p>
-<p><strong>Positional embedding — graduated drip.</strong> A positional embedding (<code>64 → cf=256</code>) is injected at block entry, in sequence form, with decreasing strength at fixed intervals: full strength at block 0, then ×0.1 at block 2, ×0.05 at block 4, and ×0.025 at block 6. This graduated drip lets the model absorb positional structure early and gradually de-emphasizes it as the representation matures.</p>
-<p><strong>10 interweaved blocks.</strong> Each block processes the representation in two stages:</p>
-<ol>
-<li><em>Attention stage</em> — reshape to sequence (64, cf), prenorm MHA: <code>LayerNorm → MHA(num_heads=8, key_dim=32) → Dropout → residual</code>.</li>
-<li><em>Conv stage</em> — reshape back to (8, 8, cf), conv residual: <code>Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LayerNorm → residual + LeakyReLU</code>.</li>
-</ol>
-<p>No BatchNorm anywhere — small and variable batch sizes during selfplay make it unstable.</p>
-<p><strong>Policy head — relational bilinear.</strong> The spatial output is flattened to a (64, cf) sequence. Two independent projection towers compute a 128-dim vector per square:</p>
+<p>Vocabulary size is 21. This encoding is defined in C++ (pyfastchess) and is fixed across the entire stack.</p>
+<h2 id="preconditioner-smartgate-architecture">Preconditioner-SmartGate Architecture</h2>
+<p>The active model is <code>16m-precond-smartgate</code>, built by <code>build_pt_precond_smartgate</code> in <code>src/chessbot/model.py</code>. It is a PyTorch model (~15.8M parameters) trained in float16. The design pairs a convolutional preconditioner with a transformer trunk, and attaches every output head to a dedicated global accumulator token rather than pooling over the board.</p>
+<p><strong>Input and embedding.</strong> The 64-token sequence goes through a token embedding (<code>vocab_size=21 → conv_filters=256</code>) and is reshaped to an 8×8 spatial grid.</p>
+<p><strong>Convolutional preconditioner.</strong> 4 residual conv blocks (<code>pre_blocks=4</code>) run over the 8×8 grid. Each block is <code>LayerNorm → Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LeakyReLU</code>, added back as a residual (the first block skips the prenorm). This lets local spatial structure resolve before any attention runs.</p>
+<p><strong>Positional concat.</strong> The preconditioned grid is flattened to a (64, 256) sequence and LayerNorm'd, then a learned positional embedding (<code>64 → 256</code>) is <strong>concatenated</strong> (not added), producing a 512-d (<code>D = conv_filters * 2</code>) representation per square. Positional information rides in its own channels instead of being summed into the content.</p>
+<p><strong>Global accumulator tokens.</strong> 8 learned global tokens are appended to the sequence, giving <code>[B, 72, D]</code>. These are the model's read-out registers: after the trunk, each output head reads from its own token instead of pooling the 64 board squares.</p>
+<p><strong>Transformer trunk.</strong> 4 prenorm transformer blocks (<code>num_heads=8</code>) with GELU feed-forwards of width <code>[768, 1024, 1024, 768]</code>. Each block is <code>LayerNorm → MHA → residual</code>, then <code>LayerNorm → Linear → GELU → Linear → residual</code>. A shared <code>trunk_ln</code> LayerNorm closes the trunk. No BatchNorm anywhere — small, variable selfplay batches make it unstable.</p>
+<p><strong>Value head (accumulator 0).</strong> <code>Linear(D → D/2) → GELU → Linear(D/2 → 3)</code> reads token 64, producing raw WDL logits. Trained as a 3-class [win, draw, loss] softmax, STM-POV.</p>
+<p><strong>Policy head — from/to attention (accumulators 2–7).</strong> Two projection towers (<code>Linear(D → 256)</code>) build a 256-d vector per square, each refined by its own 4-head self-attention (<code>from_mha</code>, <code>to_mha</code>) that also attends over policy-specific accumulator tokens. Normal-move logits are the scaled dot products <code>(from · to^T) / sqrt(256)</code> → a (64, 64) matrix flattened to 4096. Underpromotion logits (192, from-file × to-file × piece) come from small <code>promo_from</code>/<code>promo_to</code> projections added to the relevant dot-product sub-block. Concatenated, these give the 4288-slot dense move space.</p>
+<p><strong>SmartGate (accumulator 1) and the 1858 domain.</strong> In parallel, a gated FFN (<code>SiLU</code> gate × up-projection → down-projection residual → RMSNorm → <code>Linear(D → 1858)</code>) reads token 65 and produces one gate logit per <strong>legal-in-some-position</strong> move. The raw 4288 logits are indexed down to the 1858 "sometimes-legal" move slots (<code>build_sometimes_legal_mask</code>), and the gate is applied as <code>logits + logsigmoid(gate)</code>. Because <code>logsigmoid ≤ 0</code>, the gate is <strong>suppress-only</strong> — it can dampen a move but never invent one. Its output bias initializes to 4.0 (<code>logsigmoid(4) ≈ 0</code>), so at init the gate is a near no-op and only learns to veto moves the from/to head over-weights. The model's policy output is these 1858 legal logits; C++ scatters them back into the 4288 flat space.</p>
+<p>The value used elsewhere (<code>nn_value</code>) is derived in C++ as <code>win - loss</code>. Policy post-processing — softmax over legal moves, <code>uniform_eps</code> blending, <code>prior_clip_max</code> clamping — is handled in C++ (<code>build_priors</code>) after raw logits are inserted into the raw cache.</p>
+<h2 id="onnx-runtime-tensorrt-inference">ONNX Runtime + TensorRT Inference</h2>
+<p>Inference runs through ONNX Runtime with the TensorRT execution provider (<code>src/chessbot/infer_ort_trt.py</code>), the <code>ort_trt</code> backend. TensorFlow has been removed from the active path (old Keras/TF architectures are quarantined in <code>legacy_models.py</code>).</p>
+<p>After each retrain, <code>prepare_trt()</code> exports the current TorchScript model to ONNX (<code>export_ts_to_onnx</code>, input <code>enc_in: [B, 64]</code> int64) and stages it in the run's TRT cache. Workers then call <code>make_ort_trt_infer()</code>, which builds an ORT <code>InferenceSession</code> with:</p>
 <ul>
-<li><em>From-tower</em>: <code>Dense(384, gelu) → Dense(256, gelu) → Dense(128)</code> — one vector per source square.</li>
-<li><em>To-tower</em>: <code>Dense(384, gelu) → Dense(256, gelu) → Dense(128)</code> — one vector per destination square.</li>
+<li><code>TensorrtExecutionProvider</code> — fp16 enabled, 4 GB workspace, fixed shape profile (<code>enc_in:1x64</code> min, <code>{max_bs}x64</code> opt/max). Compiled engines are cached to disk keyed by the sha256[:12] of the ONNX bytes, so subsequent sessions load the engine instead of paying the multi-minute compile. TRT is required, not a fallback — the session raises if it doesn't come up on TRT.</li>
 </ul>
-<p>Normal move logits are computed as scaled dot products between from- and to-vectors: <code>(from · to^T) / sqrt(128)</code>, producing a (64, 64) logit matrix flattened to 4096 values. Underpromotion logits (192 values, encoding from-file × to-file × piece type) are produced by a separate small conv head and concatenated, giving 4288 total policy logits.</p>
-<p><strong>Value head.</strong> A 1×1 conv mix + LayerNorm + LeakyReLU branch feeds into attention pooling (learned per-square weights), then <code>Dense(256) → Dense(128) → Dense(3, float32)</code> producing raw WDL logits. The model is trained with <code>CategoricalCrossentropy(from_logits=True)</code> against a 3-component [win, draw, loss] target.</p>
-<p>The model is trained with mixed float16 precision (<code>mixed_float16</code> global policy set at import time).</p>
-<h2 id="tensorflow-xla-inference">TensorFlow + XLA Inference</h2>
-<p>The primary inference path uses TensorFlow with XLA compilation. <code>make_conv_infer()</code> in <code>looper.py</code> wraps the loaded Keras model in a <code>@tf.function(experimental_compile=True)</code> callable and returns a <code>fwd((boards_np,))</code> function that accepts a batch of 64-token board arrays and returns <code>(policy_logits [B, 4288], value [B, 1])</code>.</p>
-<p>XLA traces the function at the first call for each batch size. To avoid repeated retracing, the selfplay loop pads batches to the next power of two or to a fixed set of candidate sizes. Throughput on an RTX 2080 is roughly 12k board evaluations per second at typical selfplay batch sizes.</p>
-<p><code>make_conv_infer</code> applies softmax to the value logits inside the XLA graph, returning <code>(policy_logits [B, 4288], wdl [B, 3])</code> where <code>wdl</code> is <code>[win, draw, loss]</code> probabilities, STM-POV. The scalar value used elsewhere (<code>nn_value</code>) is derived in C++ as <code>win - loss</code>. Policy post-processing — softmax over legal moves, <code>uniform_eps</code> blending, <code>prior_clip_max</code> clamping — is handled in C++ (<code>build_priors</code>) after raw logits are inserted into the raw cache.</p>
-<h2 id="onnx-tensorrt">ONNX / TensorRT</h2>
-<p>An alternative inference backend is available via <code>infer_ort.py</code>, using ONNX Runtime with the TensorRT execution provider.</p>
-<p>After retraining, <code>retrain_worker.py</code> can optionally export the Keras model to ONNX using <code>tf2onnx</code> (<code>export_tf_to_onnx()</code>), targeting opset 17. The exported model takes <code>enc_in: [B, 64]</code> int32 and produces policy logits and value.</p>
-<p><code>make_ort_infer()</code> creates an ORT <code>InferenceSession</code> with:</p>
-<ul>
-<li><code>TensorrtExecutionProvider</code> — fp16 enabled, dynamic shape profiles from batch 1 to <code>max_bs</code>, engine file cached to disk so subsequent sessions skip the ~10-15 minute TRT compile step.</li>
-<li><code>CUDAExecutionProvider</code> as fallback.</li>
-</ul>
-<p>The session returns the same <code>(logits, value)</code> interface as <code>make_conv_infer</code>, so the selfplay loop is inference-backend-agnostic. ONNX/TRT is primarily used for benchmarking and when TRT's kernel fusion provides a throughput advantage over TF+XLA for a given batch size profile.</p>
+<p><code>infer(pair)</code> casts the board batch to int64, runs the session for <code>policy_logits</code> and <code>value_out</code>, and softmaxes the WDL logits on the CPU, returning <code>(logits [B, 1858], wdl [B, 3])</code>. <code>pt_eager</code> (raw PyTorch) remains available for debugging and as the retrain backend; both expose the same <code>(logits, wdl)</code> interface, so the selfplay loop is inference-backend-agnostic.</p>
+<p>A third backend, <code>lc0_trt</code>, swaps in a distilled Leela network over the same TRT machinery — see the <a href="../evaluation_pipeline/">rescoring pipeline</a> for how LC0 is used as a distillation teacher.</p>
 
 
 

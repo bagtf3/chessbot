@@ -754,6 +754,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lc0-distillation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LC0 Distillation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#retraining" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -870,6 +881,34 @@
     
   
     Experimental Features
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../experimental_features/smartgate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmartGate
   
 
     
@@ -1316,6 +1355,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lc0-distillation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LC0 Distillation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#retraining" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1354,9 +1404,9 @@
 <p>Stockfish results are cached in <code>SFCache</code> — an LRU cache keyed on a short FEN (position + repetition count + halfmove clock). The cache is seeded from pre-computed depth-20 analysis at run start, so common positions in the opening and early middlegame are already resolved without queuing live SF queries. Entries are evicted when the cache exceeds <code>rescore_cache_size</code>.</p>
 <h2 id="training-targets">Training Targets</h2>
 <p>The value target for each ply is a blended 3-component WDL:</p>
-<pre><code>Y = 0.5 * z_wdl + 0.25 * search_wdl + 0.25 * sf_wdl
+<pre><code>Y = 0.5 * z_wdl + 0.5 * sf_wdl
 </code></pre>
-<p>where <code>z_wdl</code> is the game result converted to WDL, <code>search_wdl</code> is the MCTS tree's WDL at that ply, and <code>sf_wdl</code> is Stockfish's WDL. When SF analysis is unavailable for a ply, the SF component falls back to the search WDL. This blending keeps the targets grounded in the actual game outcome while pulling them toward a stronger signal.</p>
+<p>where <code>z_wdl</code> is the game result converted to WDL and <code>sf_wdl</code> is Stockfish's WDL at that ply. When SF analysis is unavailable, the target falls back to <code>z_wdl</code> alone. Blending the outcome with Stockfish's read keeps the target grounded in what actually happened while pulling it toward a stronger positional signal — an earlier variant also mixed in the MCTS search WDL, but that component was dropped.</p>
 <h2 id="blunder-detection-and-visit-redistribution">Blunder Detection and Visit Redistribution</h2>
 <p>After SF analysis is complete, <code>finalize_game()</code> scans each ply for blunders — positions where Stockfish rates the played move significantly worse than its best move. When a blunder is detected, the visit distribution used as the policy target is redistributed: visits are shifted toward the moves SF considers good, reducing the weight on the blundered line. This prevents the model from learning to confidently play moves that Stockfish rates as mistakes.</p>
 <p>Positions containing blunders are also candidates for replay games — new selfplay games starting from the blundered position — which puts more data on the positions the model is currently weakest on.</p>
@@ -1370,6 +1420,9 @@
 <li><strong>CPL</strong> — centipawn loss of the played move vs Stockfish best. High CPL flags positions where a suboptimal move was played, worth learning from.</li>
 </ul>
 <p>Positions that exceed any threshold are accepted unconditionally. Those that fall below all thresholds are soft-sampled with probability proportional to <code>max(kl/kl_t, ce/ce_t)</code>, with a floor of <code>rescore_sample_floor</code>. This concentrates training data on informative positions while keeping a baseline of easy positions to maintain calibration.</p>
+<h2 id="lc0-distillation">LC0 Distillation</h2>
+<p>When an LC0 distillation model is configured (<code>lc0_distill_model_name</code> plus the <code>LC0_DISTILL_*</code> environment paths), the rescorer runs a distilled Leela network as a policy teacher alongside Stockfish. An <code>Lc0Thread</code> batches positions through the same ORT+TensorRT machinery the selfplay backend uses, evaluates them in LC0's native feature/policy layout, and maps the resulting logits back into the 1858 move domain with <code>lc0_logits_to_xc0_batch</code>. The LC0 policy becomes an additional soft target for those positions, transferring Leela's opening and positional knowledge without paying its full search cost during selfplay.</p>
+<p>Distillation is targeted rather than blanket. A pre-built <strong>enrichment book</strong> covers common book positions: for a position in the book, <code>maybe_enrich()</code> has a 50% chance of replacing the ply's policy and value targets with the book's stronger data. Blunder positions are enriched with Leela's principal variation, so the corrected policy target reflects a strong engine's continuation rather than only Stockfish's single best move. LC0 evaluation is entirely optional — with no distill model configured, the <code>Lc0Thread</code> is never created and rescoring proceeds on Stockfish alone.</p>
 <h2 id="retraining">Retraining</h2>
 <p><img alt="Retrain loop" src="../../images/retrain_loop.JPG" /></p>
 <p>Retraining runs as a subprocess (<code>retrain_worker.py</code>) rather than inline. The reason is straightforward: on an 8GB GPU, selfplay inference and model training can't share VRAM comfortably. Running training in a subprocess means its GPU memory is fully released when the process exits, and the workers can resume with a clean VRAM state.</p>

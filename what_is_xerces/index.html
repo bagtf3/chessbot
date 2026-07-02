@@ -824,6 +824,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../experimental_features/smartgate/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmartGate
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../experimental_features/matelock/" class="md-nav__link">
         
   
@@ -1218,11 +1246,11 @@
 <p>Xerces is an open-source, neural-network powered chess engine, trained on multiple data sources: published Lc0 game data, curated Xerces self-play data, and ongoing self-play with Stockfish rescoring.</p>
 <ul>
 <li>Monte Carlo Tree Search with PUCT selection</li>
-<li>Neural network evaluation (multiple architectures — currently a <a href="https://arxiv.org/abs/2005.08100">conformer</a> ~16M params)</li>
+<li>Neural network evaluation (a preconditioner + transformer "precond-smartgate" model, ~15.8M params)</li>
 <li>Stockfish post-hoc rescoring for blunder detection and visit redistribution</li>
 <li>Async retrain loop running between self-play rounds</li>
 </ul>
-<p>The <a href="https://github.com/bagtf3/chessbot">Python package</a> handles training, search orchestration, and inference using TensorFlow and ONNX Runtime. It sits on top of a high-performance <a href="https://github.com/bagtf3/pyfastchess">C++ backend</a> built on <a href="https://github.com/Disservin/chess-library">Disservin's chess-library</a>, which provides the core board representation, move generation, and MCTS tree.</p>
+<p>The <a href="https://github.com/bagtf3/chessbot">Python package</a> handles training, search orchestration, and inference in PyTorch, served through ONNX Runtime with TensorRT. It sits on top of a high-performance <a href="https://github.com/bagtf3/pyfastchess">C++ backend</a> built on <a href="https://github.com/Disservin/chess-library">Disservin's chess-library</a>, which provides the core board representation, move generation, and MCTS tree.</p>
 <h2 id="design-philosophy">Design Philosophy</h2>
 <p>Xerces is built around the idea that chess strength emerges from the interaction between search and learning, not from neural scale alone.</p>
 <p>Rather than pursuing the largest possible networks, Xerces explores whether moderately-sized, information-dense models paired with aggressive, adaptive search can produce strong and interesting play under real compute constraints.</p>

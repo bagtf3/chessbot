@@ -15,10 +15,10 @@ Stockfish results are cached in `SFCache` — an LRU cache keyed on a short FEN 
 The value target for each ply is a blended 3-component WDL:
 
 ```
-Y = 0.5 * z_wdl + 0.25 * search_wdl + 0.25 * sf_wdl
+Y = 0.5 * z_wdl + 0.5 * sf_wdl
 ```
 
-where `z_wdl` is the game result converted to WDL, `search_wdl` is the MCTS tree's WDL at that ply, and `sf_wdl` is Stockfish's WDL. When SF analysis is unavailable for a ply, the SF component falls back to the search WDL. This blending keeps the targets grounded in the actual game outcome while pulling them toward a stronger signal.
+where `z_wdl` is the game result converted to WDL and `sf_wdl` is Stockfish's WDL at that ply. When SF analysis is unavailable, the target falls back to `z_wdl` alone. Blending the outcome with Stockfish's read keeps the target grounded in what actually happened while pulling it toward a stronger positional signal — an earlier variant also mixed in the MCTS search WDL, but that component was dropped.
 
 ## Blunder Detection and Visit Redistribution
 
@@ -39,6 +39,12 @@ Not all positions from a game are included in training. Each ply is evaluated ag
 - **CPL** — centipawn loss of the played move vs Stockfish best. High CPL flags positions where a suboptimal move was played, worth learning from.
 
 Positions that exceed any threshold are accepted unconditionally. Those that fall below all thresholds are soft-sampled with probability proportional to `max(kl/kl_t, ce/ce_t)`, with a floor of `rescore_sample_floor`. This concentrates training data on informative positions while keeping a baseline of easy positions to maintain calibration.
+
+## LC0 Distillation
+
+When an LC0 distillation model is configured (`lc0_distill_model_name` plus the `LC0_DISTILL_*` environment paths), the rescorer runs a distilled Leela network as a policy teacher alongside Stockfish. An `Lc0Thread` batches positions through the same ORT+TensorRT machinery the selfplay backend uses, evaluates them in LC0's native feature/policy layout, and maps the resulting logits back into the 1858 move domain with `lc0_logits_to_xc0_batch`. The LC0 policy becomes an additional soft target for those positions, transferring Leela's opening and positional knowledge without paying its full search cost during selfplay.
+
+Distillation is targeted rather than blanket. A pre-built **enrichment book** covers common book positions: for a position in the book, `maybe_enrich()` has a 50% chance of replacing the ply's policy and value targets with the book's stronger data. Blunder positions are enriched with Leela's principal variation, so the corrected policy target reflects a strong engine's continuation rather than only Stockfish's single best move. LC0 evaluation is entirely optional — with no distill model configured, the `Lc0Thread` is never created and rescoring proceeds on Stockfish alone.
 
 ## Retraining
 

@@ -16,51 +16,38 @@ Token values:
 
 Castling rights are folded into the king token — no separate planes are needed. The en passant square gets its own token on the target square, giving the model direct spatial context about which file is eligible. There are no stacked history planes; the model sees only the current position.
 
-Vocabulary size is 21. This encoding is defined in C++ (`backend.hpp`) and is fixed across the entire stack.
+Vocabulary size is 21. This encoding is defined in C++ (pyfastchess) and is fixed across the entire stack.
 
-## Conformer Architecture
+## Preconditioner-SmartGate Architecture
 
-The active model is `16m-conformer-interweaved`, defined in `scripts/model_variant_speed_test.py`. It is a hybrid architecture where each of the 10 blocks interweaves a transformer attention step with a convolutional residual step, rather than stacking all conv blocks followed by all transformer layers.
+The active model is `16m-precond-smartgate`, built by `build_pt_precond_smartgate` in `src/chessbot/model.py`. It is a PyTorch model (~15.8M parameters) trained in float16. The design pairs a convolutional preconditioner with a transformer trunk, and attaches every output head to a dedicated global accumulator token rather than pooling over the board.
 
-**Input and embedding.** The 64-token sequence is passed through a token embedding (`vocab_size=21 → d_embed=256`) and immediately reshaped to an 8×8 spatial grid.
+**Input and embedding.** The 64-token sequence goes through a token embedding (`vocab_size=21 → conv_filters=256`) and is reshaped to an 8×8 spatial grid.
 
-**Positional embedding — graduated drip.** A positional embedding (`64 → cf=256`) is injected at block entry, in sequence form, with decreasing strength at fixed intervals: full strength at block 0, then ×0.1 at block 2, ×0.05 at block 4, and ×0.025 at block 6. This graduated drip lets the model absorb positional structure early and gradually de-emphasizes it as the representation matures.
+**Convolutional preconditioner.** 4 residual conv blocks (`pre_blocks=4`) run over the 8×8 grid. Each block is `LayerNorm → Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LeakyReLU`, added back as a residual (the first block skips the prenorm). This lets local spatial structure resolve before any attention runs.
 
-**10 interweaved blocks.** Each block processes the representation in two stages:
+**Positional concat.** The preconditioned grid is flattened to a (64, 256) sequence and LayerNorm'd, then a learned positional embedding (`64 → 256`) is **concatenated** (not added), producing a 512-d (`D = conv_filters * 2`) representation per square. Positional information rides in its own channels instead of being summed into the content.
 
-1. *Attention stage* — reshape to sequence (64, cf), prenorm MHA: `LayerNorm → MHA(num_heads=8, key_dim=32) → Dropout → residual`.
-2. *Conv stage* — reshape back to (8, 8, cf), conv residual: `Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LayerNorm → residual + LeakyReLU`.
+**Global accumulator tokens.** 8 learned global tokens are appended to the sequence, giving `[B, 72, D]`. These are the model's read-out registers: after the trunk, each output head reads from its own token instead of pooling the 64 board squares.
 
-No BatchNorm anywhere — small and variable batch sizes during selfplay make it unstable.
+**Transformer trunk.** 4 prenorm transformer blocks (`num_heads=8`) with GELU feed-forwards of width `[768, 1024, 1024, 768]`. Each block is `LayerNorm → MHA → residual`, then `LayerNorm → Linear → GELU → Linear → residual`. A shared `trunk_ln` LayerNorm closes the trunk. No BatchNorm anywhere — small, variable selfplay batches make it unstable.
 
-**Policy head — relational bilinear.** The spatial output is flattened to a (64, cf) sequence. Two independent projection towers compute a 128-dim vector per square:
+**Value head (accumulator 0).** `Linear(D → D/2) → GELU → Linear(D/2 → 3)` reads token 64, producing raw WDL logits. Trained as a 3-class [win, draw, loss] softmax, STM-POV.
 
-- *From-tower*: `Dense(384, gelu) → Dense(256, gelu) → Dense(128)` — one vector per source square.
-- *To-tower*: `Dense(384, gelu) → Dense(256, gelu) → Dense(128)` — one vector per destination square.
+**Policy head — from/to attention (accumulators 2–7).** Two projection towers (`Linear(D → 256)`) build a 256-d vector per square, each refined by its own 4-head self-attention (`from_mha`, `to_mha`) that also attends over policy-specific accumulator tokens. Normal-move logits are the scaled dot products `(from · to^T) / sqrt(256)` → a (64, 64) matrix flattened to 4096. Underpromotion logits (192, from-file × to-file × piece) come from small `promo_from`/`promo_to` projections added to the relevant dot-product sub-block. Concatenated, these give the 4288-slot dense move space.
 
-Normal move logits are computed as scaled dot products between from- and to-vectors: `(from · to^T) / sqrt(128)`, producing a (64, 64) logit matrix flattened to 4096 values. Underpromotion logits (192 values, encoding from-file × to-file × piece type) are produced by a separate small conv head and concatenated, giving 4288 total policy logits.
+**SmartGate (accumulator 1) and the 1858 domain.** In parallel, a gated FFN (`SiLU` gate × up-projection → down-projection residual → RMSNorm → `Linear(D → 1858)`) reads token 65 and produces one gate logit per **legal-in-some-position** move. The raw 4288 logits are indexed down to the 1858 "sometimes-legal" move slots (`build_sometimes_legal_mask`), and the gate is applied as `logits + logsigmoid(gate)`. Because `logsigmoid ≤ 0`, the gate is **suppress-only** — it can dampen a move but never invent one. Its output bias initializes to 4.0 (`logsigmoid(4) ≈ 0`), so at init the gate is a near no-op and only learns to veto moves the from/to head over-weights. The model's policy output is these 1858 legal logits; C++ scatters them back into the 4288 flat space.
 
-**Value head.** A 1×1 conv mix + LayerNorm + LeakyReLU branch feeds into attention pooling (learned per-square weights), then `Dense(256) → Dense(128) → Dense(3, float32)` producing raw WDL logits. The model is trained with `CategoricalCrossentropy(from_logits=True)` against a 3-component [win, draw, loss] target.
+The value used elsewhere (`nn_value`) is derived in C++ as `win - loss`. Policy post-processing — softmax over legal moves, `uniform_eps` blending, `prior_clip_max` clamping — is handled in C++ (`build_priors`) after raw logits are inserted into the raw cache.
 
-The model is trained with mixed float16 precision (`mixed_float16` global policy set at import time).
+## ONNX Runtime + TensorRT Inference
 
-## TensorFlow + XLA Inference
+Inference runs through ONNX Runtime with the TensorRT execution provider (`src/chessbot/infer_ort_trt.py`), the `ort_trt` backend. TensorFlow has been removed from the active path (old Keras/TF architectures are quarantined in `legacy_models.py`).
 
-The primary inference path uses TensorFlow with XLA compilation. `make_conv_infer()` in `looper.py` wraps the loaded Keras model in a `@tf.function(experimental_compile=True)` callable and returns a `fwd((boards_np,))` function that accepts a batch of 64-token board arrays and returns `(policy_logits [B, 4288], value [B, 1])`.
+After each retrain, `prepare_trt()` exports the current TorchScript model to ONNX (`export_ts_to_onnx`, input `enc_in: [B, 64]` int64) and stages it in the run's TRT cache. Workers then call `make_ort_trt_infer()`, which builds an ORT `InferenceSession` with:
 
-XLA traces the function at the first call for each batch size. To avoid repeated retracing, the selfplay loop pads batches to the next power of two or to a fixed set of candidate sizes. Throughput on an RTX 2080 is roughly 12k board evaluations per second at typical selfplay batch sizes.
+- `TensorrtExecutionProvider` — fp16 enabled, 4 GB workspace, fixed shape profile (`enc_in:1x64` min, `{max_bs}x64` opt/max). Compiled engines are cached to disk keyed by the sha256[:12] of the ONNX bytes, so subsequent sessions load the engine instead of paying the multi-minute compile. TRT is required, not a fallback — the session raises if it doesn't come up on TRT.
 
-`make_conv_infer` applies softmax to the value logits inside the XLA graph, returning `(policy_logits [B, 4288], wdl [B, 3])` where `wdl` is `[win, draw, loss]` probabilities, STM-POV. The scalar value used elsewhere (`nn_value`) is derived in C++ as `win - loss`. Policy post-processing — softmax over legal moves, `uniform_eps` blending, `prior_clip_max` clamping — is handled in C++ (`build_priors`) after raw logits are inserted into the raw cache.
+`infer(pair)` casts the board batch to int64, runs the session for `policy_logits` and `value_out`, and softmaxes the WDL logits on the CPU, returning `(logits [B, 1858], wdl [B, 3])`. `pt_eager` (raw PyTorch) remains available for debugging and as the retrain backend; both expose the same `(logits, wdl)` interface, so the selfplay loop is inference-backend-agnostic.
 
-## ONNX / TensorRT
-
-An alternative inference backend is available via `infer_ort.py`, using ONNX Runtime with the TensorRT execution provider.
-
-After retraining, `retrain_worker.py` can optionally export the Keras model to ONNX using `tf2onnx` (`export_tf_to_onnx()`), targeting opset 17. The exported model takes `enc_in: [B, 64]` int32 and produces policy logits and value.
-
-`make_ort_infer()` creates an ORT `InferenceSession` with:
-
-- `TensorrtExecutionProvider` — fp16 enabled, dynamic shape profiles from batch 1 to `max_bs`, engine file cached to disk so subsequent sessions skip the ~10-15 minute TRT compile step.
-- `CUDAExecutionProvider` as fallback.
-
-The session returns the same `(logits, value)` interface as `make_conv_infer`, so the selfplay loop is inference-backend-agnostic. ONNX/TRT is primarily used for benchmarking and when TRT's kernel fusion provides a throughput advantage over TF+XLA for a given batch size profile.
+A third backend, `lc0_trt`, swaps in a distilled Leela network over the same TRT machinery — see the [rescoring pipeline](evaluation_pipeline.md) for how LC0 is used as a distillation teacher.

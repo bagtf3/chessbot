@@ -61,8 +61,7 @@ Rather than binary piece-plane stacks, Xerces encodes the board as 64 integer to
 
 ## How fast does it run?
 
-On the RTX 2080, inference runs at roughly 12,000 board evaluations per second with the 16M parameter conformer. With the C++ priors cache absorbing repeated positions, effective node throughput during selfplay reaches around 40,000 nodes per second peak, 25,000 sustained.
-Selfplay training is about 500 games per hour and validation vs Stockfish is about 100 games per hour.
+On the RTX 2080, the ~15.8M parameter precond-smartgate network is served in fp16 through ONNX Runtime + TensorRT. With the `MCTSForest` batching leaf encoding across all active games, selfplay sustains around 40,000 leaves per second, of which roughly 21,000 per second actually reach the network. The gap is absorbed before inference: the C++ priors cache resolves repeated positions, terminal nodes need no evaluation, and matelock's must-visit leaves are forced without a fresh prediction. That works out to roughly 750 games per hour of training; validation vs Stockfish is about 100 games per hour.
 
 ---
 

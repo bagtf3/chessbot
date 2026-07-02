@@ -27,6 +27,7 @@ nav:
     - Review Tools: architecture/runtime_and_inference.md
   - Experimental Features:
     - experimental_features/index.md
+    - SmartGate: experimental_features/smartgate.md
     - MateLock: experimental_features/matelock.md
     - VScale: experimental_features/vscale.md
     - Robust Selection Criteria: experimental_features/rsc.md

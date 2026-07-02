@@ -41,6 +41,9 @@ class MCTSTree(fasttree):
         super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor,
                          cfg.uniform_eps, cfg.prior_clip_max)
 
+        if getattr(cfg, 'inference_backend', '') == 'lc0_trt':
+            self.set_lc0_policy(True)
+
         # bookkeeping
         self.board = board
         self.root_board_fen = board.fen()

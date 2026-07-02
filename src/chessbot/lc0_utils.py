@@ -143,12 +143,36 @@ def lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list):
     return result
 
 
+def make_lc0_infer(sess):
+    """Wrap an LC0 ORT session into an infer(pair) callable.
+
+    pair[0]: (B, 112, 8, 8) uint8 features from get_all_lc0_features().
+    Returns (policy_logits[B,1858], wdl_probs[B,3]).
+    Policy indices are already in LC0 order — the C++ tree uses set_lc0_policy(True)
+    so build_priors reads the correct LC0 slots directly.
+    """
+    input_name   = sess.get_inputs()[0].name
+    output_names = [o.name for o in sess.get_outputs()]
+
+    def infer(pair):
+        feat_u8  = pair[0]                            # (B, 112, 8, 8) uint8
+        feat_f32 = feat_u8.astype(np.float32)
+        feat_f32[:, 109] /= 99.0                      # normalise rule50
+        outs   = sess.run(output_names, {input_name: feat_f32})
+        logits = outs[0].astype(np.float32)           # (B, 1858)
+        wdl    = outs[1].astype(np.float32)           # (B, 3) already softmaxed
+        return logits, wdl
+
+    return infer
+
+
 def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
                           opt_batch: int = 256, max_batch: int = 512):
-    """Create an ORT session for an LC0 model, loading a pre-compiled TRT engine if found.
+    """Create an ORT session for an LC0 model with TRT EP.
 
-    Checks trt_cache for a matching .engine file keyed by sha256[:12] of the ONNX source.
-    Falls back to CUDA EP if no engine is present. Prints one-line confirmation.
+    Always attempts TRT — compiles and caches a new engine if none exists for
+    the sha256[:12] prefix of the ONNX source. First run for a new model will
+    be slow while the engine compiles.
     """
     import hashlib
     import tensorrt
@@ -166,29 +190,27 @@ def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
 
     if engines:
         print(f'TRT engine: {engines[0]}')
-        trt_opts = {
-            'trt_engine_cache_enable': True,
-            'trt_engine_cache_path':   trt_cache,
-            'trt_engine_cache_prefix': prefix,
-            'trt_fp16_enable':         True,
-            'trt_timing_cache_enable': True,
-            'trt_timing_cache_path':   trt_cache,
-            'trt_profile_min_shapes':  f'/input/planes:1x112x8x8',
-            'trt_profile_opt_shapes':  f'/input/planes:{opt_batch}x112x8x8',
-            'trt_profile_max_shapes':  f'/input/planes:{max_batch}x112x8x8',
-        }
-        ort.set_default_logger_severity(3)
-        providers = [('TensorrtExecutionProvider', trt_opts),
-                     'CUDAExecutionProvider', 'CPUExecutionProvider']
-        sess   = ort.InferenceSession(src, providers=providers)
-        active = sess.get_providers()[0]
-        if active != 'TensorrtExecutionProvider':
-            print(f'WARNING: expected TRT but got {active}')
-        else:
-            print(f'Provider: TensorrtExecutionProvider (from cache)')
     else:
-        print(f'No TRT engine for prefix {prefix!r}, using CUDA EP')
-        sess = ort.InferenceSession(onnx_path,
-                                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        print(f'Provider: {sess.get_providers()[0]}')
+        print(f'No TRT engine for prefix {prefix!r}, will compile now (this may take a few minutes)...')
+
+    trt_opts = {
+        'trt_engine_cache_enable': True,
+        'trt_engine_cache_path':   trt_cache,
+        'trt_engine_cache_prefix': prefix,
+        'trt_fp16_enable':         True,
+        'trt_timing_cache_enable': True,
+        'trt_timing_cache_path':   trt_cache,
+        'trt_profile_min_shapes':  f'/input/planes:1x112x8x8',
+        'trt_profile_opt_shapes':  f'/input/planes:{opt_batch}x112x8x8',
+        'trt_profile_max_shapes':  f'/input/planes:{max_batch}x112x8x8',
+    }
+    ort.set_default_logger_severity(3)
+    providers = [('TensorrtExecutionProvider', trt_opts),
+                 'CUDAExecutionProvider', 'CPUExecutionProvider']
+    sess   = ort.InferenceSession(src, providers=providers)
+    active = sess.get_providers()[0]
+    if active != 'TensorrtExecutionProvider':
+        print(f'WARNING: expected TRT but got {active}')
+    else:
+        print(f'Provider: TensorrtExecutionProvider')
     return sess

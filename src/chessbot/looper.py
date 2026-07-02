@@ -83,6 +83,7 @@ class GameLooper(object):
             from chessbot.train_pytorch import make_pt_infer
             model = torch.jit.load(cfg.model_path, map_location="cpu")
             self.model, self.infer = make_pt_infer(model, max_bs=cfg.macro_batch)
+            self.batch_encoder = self.forest.get_all_encoded
         elif cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
@@ -90,6 +91,22 @@ class GameLooper(object):
                 cfg.trt_cache,
                 cfg.macro_batch,
             )
+            self.batch_encoder = self.forest.get_all_encoded
+        elif cfg.inference_backend == "lc0_trt":
+            from chessbot.lc0_utils import make_lc0_trt_session, make_lc0_infer
+            lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
+            lc0_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
+            if not lc0_model or not lc0_cache:
+                raise RuntimeError(
+                    "lc0_trt requires lc0_distill_model_name and LC0_DISTILL_TRT_CACHE"
+                )
+            lc0_onnx = os.path.join(lc0_cache, f'{lc0_model}.onnx')
+            sess = make_lc0_trt_session(
+                lc0_onnx, lc0_model, lc0_cache, cfg.macro_batch,
+            )
+            self.model = sess
+            self.infer = make_lc0_infer(sess)
+            self.batch_encoder = self.forest.get_all_lc0_features
     
     def check_for_pause(self):
         """
@@ -137,7 +154,7 @@ class GameLooper(object):
         if backend in ("pytorch", "pt_eager"):
             import torch
             torch.cuda.empty_cache()
-        elif backend == "ort_trt":
+        elif backend in ("ort_trt", "lc0_trt"):
             pass
         gc.collect()
 
@@ -303,13 +320,12 @@ class GameLooper(object):
                 # update sim count
                 game.tree.sims_completed_this_move += n_leafs
 
-            keys_np, boards_np = self.forest.get_all_encoded()
+            keys_np, enc_np = self.batch_encoder()
             if len(keys_np):
-                boards_i32 = boards_np.astype(np.int32)
                 macro = cfg.macro_batch
                 for i in range(0, len(keys_np), macro):
                     pred_fill.append(
-                        self.format_and_predict(keys_np[i:i + macro], boards_i32[i:i + macro])
+                        self.format_and_predict(keys_np[i:i + macro], enc_np[i:i + macro])
                     )
 
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):

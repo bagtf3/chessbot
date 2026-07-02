@@ -1191,11 +1191,420 @@ def build_pt_precond_smartgate(cfg: dict):
     return m
 
 
+def build_pt_conv_shallow_mha(cfg: dict):
+    """2x Conv(128) -> LN(x) -> concat(x, x, pos(128)) -> 384-d
+    -> append 8 global accumulators -> 8x TxBlock(d=384, ff_dim=1024)
+    -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7) at 384-d.
+    SmartGate intermediate dim stays at 768 (same as 16m-precond-smartgate).
+    """
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    CF     = cfg["conv_filters"]   # 128
+    D      = CF * 3                # 384  (LN(x) + LN(x) + pos(128))
+    nh     = cfg["num_heads"]      # 8
+    dr     = cfg["dropout"]
+    mb     = cfg["mha_blocks"]     # 8
+    PDH    = D                     # 384, no downstep in policy heads
+    GATE_H = 768
+
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class TxBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, 1024)
+            self.ff2  = nn.Linear(1024, D)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb     = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(2)])
+            self.pos     = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln = nn.LayerNorm(CF)
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+
+            self.blocks   = nn.ModuleList([TxBlock() for _ in range(mb)])
+            self.trunk_ln = nn.LayerNorm(D)
+
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=False)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, GATE_H, bias=False)
+            self.gate_w_up   = nn.Linear(D, GATE_H, bias=False)
+            self.gate_w_down = nn.Linear(GATE_H, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+            seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([seq, seq, pos], dim=-1)                             # [B, 64, 384]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)   # [B, 72, 384]
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)                                               # [B, 72, 384]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))               # [B, 3]
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)  # [B, 68, 384]
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)  # [B, 68, 384]
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)                     # [B, 64, 256]
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, 256]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                              # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                        # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                          # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_conv_pure(cfg: dict):
+    """12x ConvBlock(256) channels-first (NCHW) backbone -> trunk_ln.
+    WDL:       Conv(256,8) -> leaky_relu -> reshape [B,512] -> GELU -> Linear(512,3).
+    SmartGate: avg_pool -> Linear(256,16) -> SwiGLU(16,768,16) -> RMSNorm -> Linear(16,1858).
+    Policy:    board tokens [B,64,256] -> from/to MHA at PDH=256 -> bilinear -> smartgate -> 1858.
+    """
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    D      = cfg["conv_filters"]   # 128
+    nb     = cfg["num_blocks"]     # 12
+    dr     = cfg["dropout"]
+    PDH    = D                     # 128
+    GATE_H = 768
+
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(D) if prenorm else None
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb      = nn.Embedding(VOCAB_SIZE, D)
+            self.blocks   = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(nb)])
+            self.trunk_ln = make_ln2d(D)
+
+            self.wdl_conv = nn.Conv2d(D, 8, 1, bias=False)
+            self.wdl_out  = nn.Linear(512, 3, bias=False)
+
+            self.gate_pool   = nn.AdaptiveAvgPool2d(1)
+            self.gate_down   = nn.Linear(D, 16, bias=False)
+            self.gate_w_gate = nn.Linear(16, GATE_H, bias=False)
+            self.gate_w_up   = nn.Linear(16, GATE_H, bias=False)
+            self.gate_w_down = nn.Linear(GATE_H, 16, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(16)
+            self.gate_out  = nn.Linear(16, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens).reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
+            for blk in self.blocks:
+                x = blk(x)
+            trunk = self.trunk_ln(x)                                            # [B, D, 8, 8]
+
+            wdl_h = F.leaky_relu(self.wdl_conv(trunk), 0.01).reshape(B, 512)
+            wdl   = self.wdl_out(F.gelu(wdl_h))                                # [B, 3]
+
+            gi       = self.gate_down(self.gate_pool(trunk).reshape(B, D))     # [B, 16]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
+
+            board  = trunk.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)         # [B, 64, 256]
+
+            f_proj = F.gelu(self.from_proj(board))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn, fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj + fh)                                # [B, 64, 128]
+
+            t_proj = F.gelu(self.to_proj(board))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn, tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj + th)                                  # [B, 64, 128]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]
+            pf       = self.promo_from(fv[:, 48:56, :])
+            pt       = self.promo_to(tv[:, 56:64, :])
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots.float(), promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(trunk.dtype), wdl
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_full_mha_smartgate(cfg: dict):
+    """No conv. Embedding(256) + pos(128) -> cat -> 384-d [B,64,384]
+    -> append 8 global accum tokens -> 7x TxBlock(d=384) -> Linear(384->512) expander
+    -> 1x TxBlock(d=512) -> trunk_ln(512)
+    -> same WDL/SmartGate/from-to-policy heads as 16m-precond-smartgate at 512-d.
+    """
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    D_SMALL = 384   # 256 tok + 128 pos
+    D_LARGE = 512   # after expander, used by last block and all heads
+    nh  = cfg["num_heads"]   # 8
+    dr  = cfg["dropout"]
+    PDH = 256
+
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+
+    class TxBlock(nn.Module):
+        def __init__(self, d, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(d)
+            self.attn = nn.MultiheadAttention(d, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(d)
+            self.ff1  = nn.Linear(d, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, d)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tok_emb = nn.Embedding(VOCAB_SIZE, 256)
+            self.pos     = nn.Embedding(SEQ_LEN, 128)
+            self.tok_ln  = nn.LayerNorm(256)
+            self.pos_ln  = nn.LayerNorm(128)
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D_SMALL) * 0.02)
+
+            small_ff_dims = [512, 768, 768, 768, 768, 768, 768]
+            self.small_blocks = nn.ModuleList([TxBlock(D_SMALL, ffd) for ffd in small_ff_dims])
+            self.expander     = nn.Linear(D_SMALL, D_LARGE, bias=False)
+            self.expand_ln    = nn.LayerNorm(D_LARGE)
+            self.large_block  = TxBlock(D_LARGE, 512)
+            self.trunk_ln     = nn.LayerNorm(D_LARGE)
+
+            self.wdl_w1 = nn.Linear(D_LARGE, D_LARGE // 2, bias=False)
+            self.wdl_w2 = nn.Linear(D_LARGE // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D_LARGE, D_LARGE * 3 // 2, bias=False)
+            self.gate_w_up   = nn.Linear(D_LARGE, D_LARGE * 3 // 2, bias=False)
+            self.gate_w_down = nn.Linear(D_LARGE * 3 // 2, D_LARGE, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D_LARGE)
+            self.gate_out  = nn.Linear(D_LARGE, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D_LARGE, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D_LARGE, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([self.tok_ln(self.tok_emb(tokens)), self.pos_ln(pos)], dim=-1)  # [B, 64, 384]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)               # [B, 72, 384]
+            for blk in self.small_blocks:
+                x = blk(x)
+            x = self.expand_ln(self.expander(x))                                           # [B, 72, 512]
+            x = self.large_block(x)
+            x = self.trunk_ln(x)
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)  # [B, 68, 512]
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)  # [B, 68, 512]
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]
+            pf       = self.promo_from(fv[:, 48:56, :])
+            pt       = self.promo_to(tv[:, 56:64, :])
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
 PT_BUILDERS: dict[str, object] = {
     "16m-transformer":           build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
     "13m-precond-conformer":     build_pt_precond_conformer,
-    "16m-precond-smartgate":     build_pt_precond_smartgate,
+    "16m-precond-smartgate":                build_pt_precond_smartgate,
+    "conv-shallow-mha":                      build_pt_conv_shallow_mha,
+    "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "hybrid-conv-attn":          build_pt_hybrid_conv_attn,
     "conv-gemm":                 build_pt_conv_gemm,
     "conv-gemm-smartgate":       build_pt_conv_gemm_smartgate,

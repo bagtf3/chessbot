@@ -46,24 +46,25 @@ VALUE_LW  = 4.0
 #   decay_end..end:      flat at LR_MIN
 # ---------------------------------------------------------------------------
 
-LR_MIN           = 2e-5
+LR_MIN           = 5e-5
 LR_MAX           = 3e-4
 LR_WARMUP_EPOCHS = 30
 LR_DECAY_EPOCHS  = 300
 LR_STEP_SIZE     = 50
 
 
-def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH, scale: float = 1.0) -> float:
+def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH, scale: float = 1.0,
+                 lr_min: float = LR_MIN, lr_max: float = LR_MAX) -> float:
     decay_end   = max_epoch - LR_DECAY_EPOCHS
     total_steps = decay_end // LR_STEP_SIZE
     if ep >= decay_end:
-        lr = LR_MIN
+        lr = lr_min
     else:
         step = ep // LR_STEP_SIZE
         t    = (step + 1) / total_steps
-        lr   = LR_MIN + 0.5 * (LR_MAX - LR_MIN) * (1.0 + math.cos(math.pi * t))
+        lr   = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
     if ep < LR_WARMUP_EPOCHS:
-        lr = min(lr, LR_MIN + (LR_MAX - LR_MIN) * (ep / LR_WARMUP_EPOCHS))
+        lr = min(lr, lr_min + (lr_max - lr_min) * (ep / LR_WARMUP_EPOCHS))
     return lr * scale
 
 

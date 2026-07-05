@@ -618,23 +618,29 @@ def main(run_tag):
                 # we do not train after validation currently
                 continue
 
-        # drain any remaining games before exit
-        remaining = len(finished_games) + len(rescorer.intake) + len(rescorer.pending)
-        if remaining and not STOP_REQUESTED.is_set():
-            print(f"[main] {remaining} games remaining after all rounds — continuing post-process")
-            while (finished_games or rescorer.intake or rescorer.pending) and not STOP_REQUESTED.is_set():
-                while finished_games:
-                    to_process = finished_games.popleft()
-                    rescorer.submit(pull_pkl(to_process))
-                rescorer.tick()
+            # end of round: drain the largest multiple of retrain_size sitting
+            # in the buffer (randomized), rather than carrying it all forward
+            # into the next round's normal single-batch retrains. On the last
+            # round there's no next round to carry stragglers into, so keep
+            # looping until the SF-rescore pipeline (intake/pending) is fully
+            # drained instead of returning after a single pass.
+            is_last_round = run_num >= base_cfg.n_rounds
+            while True:
                 recorder.training_queue = rescorer.training_data_size
-                if recorder.training_queue >= needed_to_retrain:
-                    k = max(1, recorder.training_queue // working_cfg.retrain_size)
-                    rescorer.write_training_data_pkl(size=k * working_cfg.retrain_size, randomize=True)
+                k = recorder.training_queue // working_cfg.retrain_size
+                if k > 0:
+                    drain_size = k * working_cfg.retrain_size
+                    print(
+                        f"[main] end of round: draining {drain_size} of "
+                        f"{recorder.training_queue} queued samples"
+                    )
+                    rescorer.write_training_data_pkl(size=drain_size, randomize=True)
                     recorder.training_queue = rescorer.training_data_size
+
                     if retrain is None:
                         retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
                         rescorer.reset_writer()
+
                     while retrain is not None:
                         done, rc = poll_retrain(retrain, print_output=True)
                         if done:
@@ -642,16 +648,41 @@ def main(run_tag):
                             recorder.n_retrains += 1
                             working_cfg = Config.from_yaml(yaml_path, init=True)
                             rescorer.config = working_cfg
+                            for t in sf_rescore_threads:
+                                # preserve throttle state; cap to new base if config lowered depth
+                                current_depth = t.depth
+                                t.update_config(working_cfg)
+                                t.depth = min(current_depth, t.base_depth)
+                            rescorer.current_depth = sf_rescore_threads[0].depth
                             rescorer.aggregate_metrics(
-                                n_retrains, working_cfg.vscale, working_cfg.progress_csv_path)
+                                n_retrains, working_cfg.vscale,
+                                working_cfg.progress_csv_path)
                             n_retrains += 1
+
+                        # workers for this round are already stopped; just keep
+                        # ticking the rescorer so SF-pending games can finish
                         while finished_games:
                             to_process = finished_games.popleft()
                             rescorer.submit(pull_pkl(to_process))
                         rescorer.tick()
+
                         time.sleep(0.05)
-                else:
-                    time.sleep(0.1)
+
+                if not is_last_round:
+                    break
+
+                # last round: wait for any still-in-flight SF rescoring to
+                # land, then loop back and check for another full multiple.
+                while finished_games:
+                    to_process = finished_games.popleft()
+                    rescorer.submit(pull_pkl(to_process))
+                rescorer.tick()
+
+                pending_left = finished_games or rescorer.intake or rescorer.pending
+                if not pending_left or STOP_REQUESTED.is_set():
+                    break
+
+                time.sleep(0.1)
 
         # capture the return situation
         rescorer.tick()

@@ -100,7 +100,12 @@ def save_pt_model(model, path, arch=None, opt=None):
         if isinstance(trace_model, torch.jit.ScriptModule):
             torch.jit.save(trace_model, path)
         else:
-            dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
+            from chessbot.model import VARIANTS
+            if VARIANTS.get(arch, {}).get("lc0_input", False):
+                dtype = torch.float16 if use_fp16 else torch.float32
+                dummy = torch.zeros(1, 112, 8, 8, dtype=dtype, device=trace_device)
+            else:
+                dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
             with torch.no_grad():
                 traced = torch.jit.trace(trace_model, dummy)
             torch.jit.save(traced, path)
@@ -188,7 +193,12 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
     n      = len(X)
-    X_t    = torch.from_numpy(X).long().to(device)
+    if cfg.encoding_type == "lc0":
+        # raw uint8 lc0 planes -> float, rule50 /99 at the model-input boundary
+        X_t = torch.from_numpy(X).float().to(device)
+        X_t[:, 109] /= 99.0
+    else:
+        X_t = torch.from_numpy(X).long().to(device)
     P_t    = torch.from_numpy(P).float().to(device)
     Y_t    = torch.from_numpy(Y_wdl).float().to(device)
     vwht_t = torch.from_numpy(vwht).float().to(device)
@@ -299,7 +309,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)
 
 
-def make_pt_infer(model, max_bs):
+def make_pt_infer(model, max_bs, encoding_type="xc0"):
     """
     Returns (model, fwd) where fwd(enc_np) -> (logits_np, wdl_np).
     logits_np: (B, 1858) raw policy logits
@@ -309,11 +319,18 @@ def make_pt_infer(model, max_bs):
     device = torch.device("cuda")
     model = model.to(device).half().eval()
     model = torch.jit.optimize_for_inference(model)
+    is_lc0 = encoding_type == "lc0"
 
     def base_fwd(pair):
         enc_np = pair[0]
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            enc_t = torch.from_numpy(enc_np).long().to(device)
+            if is_lc0:
+                # drained lc0 planes are raw uint8 (rule50 unscaled)
+                enc_t = torch.from_numpy(enc_np).float().to(device)
+                enc_t[:, 109] /= 99.0
+                enc_t = enc_t.half()
+            else:
+                enc_t = torch.from_numpy(enc_np).long().to(device)
             logits, value = model(enc_t)
         logits = logits.float()
         wdl = F.softmax(value.float(), dim=-1)
@@ -338,7 +355,7 @@ def make_pt_infer(model, max_bs):
     return model, fwd
 
 
-def export_ts_to_onnx(ts_path, onnx_path):
+def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
     """
     Export model to ONNX with dynamic batch axis.
     Loads from companion .pt as an eager half-precision model — TorchScript export
@@ -355,7 +372,10 @@ def export_ts_to_onnx(ts_path, onnx_path):
     model = PT_BUILDERS[arch](VARIANTS[arch]).half().cuda().eval()
     model.load_state_dict(ckpt['model'])
 
-    dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')
+    if encoding_type == "lc0":
+        dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float16, device='cuda')
+    else:
+        dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')
     with torch.no_grad():
         model(dummy)  # verify forward pass before export
 

@@ -178,6 +178,13 @@ def main():
     elapsed = time.time() - begin
     print(f"\n[done] shards={shard_id:,}  total_in={total_in:,}  elapsed={elapsed:.0f}s")
 
+    # TF (imported for TFRecordWriter) leaves background threads that stall
+    # interpreter shutdown on Windows. All shards are written and the writer
+    # thread has joined, so hard-exit instead of waiting on TF's teardown.
+    import sys
+    sys.stdout.flush(); sys.stderr.flush()
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()

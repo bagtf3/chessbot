@@ -108,8 +108,16 @@ def main():
         if src_model and os.path.exists(src_model):
             src_ext = Path(src_model).suffix
             if src_ext in (".pt", ".ts"):
-                # copy all .pt and .ts files; init_model points to .pt
-                pt_files = list(Path(src_dir).glob("*.pt")) + list(Path(src_dir).glob("*.ts"))
+                # copy only the canonical {clone_tag}_model.* files;
+                # ignore *_backup.* stale copies (would otherwise collide
+                # on the single destination filename and silently win)
+                pt_files = [
+                    f for f in (
+                        list(Path(src_dir).glob("*.pt")) +
+                        list(Path(src_dir).glob("*.ts"))
+                    )
+                    if f.stem == f"{clone_tag}_model"
+                ]
                 cfg.init_model = None
                 for f in pt_files:
                     dst = os.path.join(dest_dir, f"{run_tag}_model{f.suffix}")
@@ -127,6 +135,27 @@ def main():
         else:
             # no source model found; leave cfg.init_model as default (may be configured)
             print("[clone] no model found in source; using default init_model in config")
+
+        # copy train_ckpts (retrain optimizer state) if present, renaming the
+        # file(s) so the stem matches the new run's model name
+        src_ckpts_dir = os.path.join(src_dir, "train_ckpts")
+        if os.path.isdir(src_ckpts_dir):
+            dst_ckpts_dir = os.path.join(dest_dir, "train_ckpts")
+            os.makedirs(dst_ckpts_dir, exist_ok=True)
+            old_stem = f"{clone_tag}_model"
+            new_stem = f"{run_tag}_model"
+            copied_any = False
+            for f in Path(src_ckpts_dir).iterdir():
+                if not f.is_file():
+                    continue
+                name = f.name
+                if name.startswith(old_stem):
+                    name = new_stem + name[len(old_stem):]
+                dst = os.path.join(dst_ckpts_dir, name)
+                shutil.copy2(f, dst)
+                copied_any = True
+            if copied_any:
+                print(f"[clone] copied train_ckpts from {clone_tag}, renamed to match {new_stem}")
 
         # copy config.yaml if present; update run_tag and init_model in the copy
         src_cfg = os.path.join(src_dir, "config.yaml")
@@ -162,6 +191,13 @@ def main():
             dst_remaining = os.path.join(dest_dir, "remaining_untrained.pkl")
             shutil.move(src_remaining, dst_remaining)
             print(f"[clone] moved remaining_untrained.pkl from {clone_tag}")
+
+        # move sf_cache.pkl.gz if present
+        src_sf_cache = os.path.join(src_dir, "sf_cache.pkl.gz")
+        if os.path.exists(src_sf_cache):
+            dst_sf_cache = os.path.join(dest_dir, "sf_cache.pkl.gz")
+            shutil.move(src_sf_cache, dst_sf_cache)
+            print(f"[clone] moved sf_cache.pkl.gz from {clone_tag}")
 
         # copy eval_progress.csv unless suppressed
         if not args.ignore_eval_progress:

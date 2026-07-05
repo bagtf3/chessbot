@@ -78,21 +78,35 @@ class GameLooper(object):
 
     def load_reload_model(self):
         cfg = self.config
+        encoding = cfg.encoding_type
+        if encoding not in ("xc0", "lc0"):
+            raise RuntimeError(f"unknown encoding_type {encoding!r}")
+
+        # the encoder is chosen SOLELY by encoding_type -- never by the backend.
+        if encoding == "lc0":
+            self.batch_encoder = self.forest.get_all_lc0_features
+        else:
+            self.batch_encoder = self.forest.get_all_encoded
+
         if cfg.inference_backend == "pt_eager":
             import torch
             from chessbot.train_pytorch import make_pt_infer
             model = torch.jit.load(cfg.model_path, map_location="cpu")
-            self.model, self.infer = make_pt_infer(model, max_bs=cfg.macro_batch)
-            self.batch_encoder = self.forest.get_all_encoded
+            self.model, self.infer = make_pt_infer(
+                model, max_bs=cfg.macro_batch, encoding_type=encoding)
         elif cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
                 cfg.trt_model_name,
                 cfg.trt_cache,
                 cfg.macro_batch,
+                encoding_type=encoding,
             )
-            self.batch_encoder = self.forest.get_all_encoded
         elif cfg.inference_backend == "lc0_trt":
+            if encoding != "lc0":
+                raise RuntimeError(
+                    "lc0_trt inference requires encoding_type='lc0' (real Leela "
+                    "reads 112x8x8 planes); got encoding_type=%r" % encoding)
             from chessbot.lc0_utils import make_lc0_trt_session, make_lc0_infer
             lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
             lc0_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
@@ -106,7 +120,6 @@ class GameLooper(object):
             )
             self.model = sess
             self.infer = make_lc0_infer(sess)
-            self.batch_encoder = self.forest.get_all_lc0_features
     
     def check_for_pause(self):
         """
@@ -373,7 +386,9 @@ class GameLooper(object):
     def format_and_predict(self, keys_np, boards_np):
         """
         keys_np: uint64[B] zobrist keys
-        boards_np: int32[B, 64] board tokens (STM-as-white)
+        boards_np: encoded boards from batch_encoder -- xc0 tokens (B, 64) int16
+        or lc0 planes (B, 112, 8, 8) uint8, per cfg.encoding_type. self.infer owns
+        the dtype/rule50 conversion for the active encoding.
 
         Runs inference and writes into the raw policy cache as (zobrist, value, probs).
         Masking/softmax is applied in C++ build_priors.
@@ -534,19 +549,22 @@ class GameLooper(object):
             "s_pruned": s_pruned,
             "s_penalty": s_penalty,
         }
+        tm = telemetry
 
         if self.active_games:
-            telemetry["avg_ply"] = np.mean([g.plies for g in self.active_games])
+            tm["avg_ply"] = np.mean([g.plies for g in self.active_games])
 
-        telemetry["pred_wait"] = np.mean(self.prediction_times) if self.prediction_times else 0.0
-        telemetry["preds_per_second"] = (telemetry["apl"] / telemetry["pred_wait"]
-                                         if telemetry["pred_wait"] else 0.0)
+        tm["pred_wait"] = np.mean(self.prediction_times) if self.prediction_times else 0.0
+
+        tm["preds_per_second"] = 0.0
+        if tm["pred_wait"]:
+            tm["preds_per_second"] = tm["apl"] / tm["pred_wait"]
 
         pcs = priors_cache_stats()
         for k, v in pcs.items():
-            telemetry[f"cache_{k}"] = v
+            tm[f"cache_{k}"] = v
 
-        self.telemetry_q.put({"looper_id": self.id, "telemetry": telemetry})
+        self.telemetry_q.put({"looper_id": self.id, "telemetry": tm})
 
         return True
     

@@ -36,6 +36,10 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, dropout=0.03,
         pre_blocks=4,
     ),
+    "16m-precond-smartgate-lc0": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=4, lc0_input=True,
+    ),
     "hybrid-conv-attn": dict(
         hybrid_conv_attn=True,
         n_trunk_blocks=6, trunk_dim=1024, dropout=0.02,
@@ -1048,6 +1052,10 @@ def build_pt_precond_smartgate(cfg: dict):
     -> append 8 specialized global accumulators -> 4x transformer blocks
     -> shared trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
     Gate is suppress-only (logsigmoid <= 0); bias init=4.0 -> near no-op at init.
+
+    If cfg["lc0_input"] is set, the token embedding stem is replaced by a 1x1
+    conv over (B, 112, 8, 8) lc0 planes; everything downstream is identical.
+    Used for the lc0-vs-xc0 encoding bake-off.
     """
     import math
     import torch
@@ -1061,6 +1069,7 @@ def build_pt_precond_smartgate(cfg: dict):
     dr  = cfg["dropout"]
     pb  = cfg["pre_blocks"]     # 4
     PDH = 256
+    lc0_input = bool(cfg.get("lc0_input", False))
 
     sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
@@ -1100,7 +1109,11 @@ def build_pt_precond_smartgate(cfg: dict):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            self.emb     = nn.Embedding(VOCAB_SIZE, CF)
+            if lc0_input:
+                self.stem    = nn.Conv2d(112, CF, 1)
+                self.stem_ln = make_ln2d(CF)
+            else:
+                self.emb     = nn.Embedding(VOCAB_SIZE, CF)
             self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
             self.pos     = nn.Embedding(SEQ_LEN, CF)
             self.conv_ln = nn.LayerNorm(CF)
@@ -1140,13 +1153,16 @@ def build_pt_precond_smartgate(cfg: dict):
 
             self.register_buffer("sl_idx", sl_idx)
 
-        def forward(self, tokens):
-            B = tokens.shape[0]
-            x = self.emb(tokens).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            if lc0_input:
+                x = self.stem_ln(self.stem(x_in))                             # [B, CF, 8, 8]
+            else:
+                x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
             for blk in self.pre:
                 x = blk(x)
             seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
-            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            pos = self.pos(torch.arange(SEQ_LEN, device=x_in.device)).unsqueeze(0).expand(B, -1, -1)
             x = torch.cat([seq, pos], dim=-1)                                   # [B, 64, D]
             x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)    # [B, 72, D]
             for blk in self.blocks:
@@ -1603,6 +1619,7 @@ PT_BUILDERS: dict[str, object] = {
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
     "13m-precond-conformer":     build_pt_precond_conformer,
     "16m-precond-smartgate":                build_pt_precond_smartgate,
+    "16m-precond-smartgate-lc0":            build_pt_precond_smartgate,
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "hybrid-conv-attn":          build_pt_hybrid_conv_attn,

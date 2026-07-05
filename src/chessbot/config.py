@@ -146,8 +146,14 @@ class Config(object):
     lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
     lc0_distill_batch_size = 64   # positions per ORT inference call
 
+    # board encoding fed to the model. Sole driver of the encoder on every path
+    # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16
+    # tokens; "lc0" = 112x8x8 lc0 planes. Selfplay and retrain MUST agree or the
+    # model is fed garbage. Orthogonal to inference_backend (lc0_trt requires lc0).
+    encoding_type            = "xc0"        # "xc0" | "lc0"
+
     # inference / retrain backend selection
-    inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt"
+    inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt" | "lc0_trt"
     retrain_backend          = "pt_eager"  # "pt_eager"
     trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
     trt_cache                = ""          # ort_trt: path to TRT engine cache dir

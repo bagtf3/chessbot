@@ -353,7 +353,12 @@ def main():
         print("[retrain] no training samples after loading shards")
         return 0
 
-    X       = np.stack(X_list).astype(np.int32)
+    # lc0 planes stay raw uint8 here (rule50 /99 + float happens in retrain_pt at
+    # the model-input boundary); xc0 tokens are int32.
+    if cfg.encoding_type == "lc0":
+        X   = np.stack(X_list)
+    else:
+        X   = np.stack(X_list).astype(np.int32)
     P       = np.stack(P_list).astype(np.float32)
     Y_value = np.array(Y_list,    dtype=np.float32)
     vwht    = np.array(vwht_list, dtype=np.float32)

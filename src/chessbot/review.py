@@ -1174,7 +1174,8 @@ class GameViewer:
         ent, norm = calc_entropy(p)
         return norm, p
 
-    def generate_training_data(self, min_visits=200, cpl_threshold=60, skip_sf_moves=False, min_ply=0, **kwargs):
+    def generate_training_data(self, min_visits=200, cpl_threshold=60, skip_sf_moves=False, min_ply=0,
+                               emit_lc0=False, policy_clip=0.6, **kwargs):
         """
         Walk the game and produce Xerces training examples.
         - Plies below min_ply are skipped.
@@ -1183,8 +1184,11 @@ class GameViewer:
         - If sf_df was passed to __init__ and cpl_threshold is set, plies where
           the played move's CPL (loss column) exceeds cpl_threshold are skipped.
           Plies with no matching SF row are also skipped when SF data is present.
+        - policy_clip caps per-move visit prob (renormalized); None disables it.
+        - emit_lc0 also returns per-ply lc0 (112,8,8) features and the ply index,
+          appended as two extra lists (X, M, P, Z, V, WDL, R, L, PLY).
         """
-        X, M, P, Z, V, WDL, R = [], [], [], [], [], [], []
+        X, M, P, Z, V, WDL, R, L, PLY = [], [], [], [], [], [], [], [], []
         result = self.result
         self.reset()
 
@@ -1247,9 +1251,10 @@ class GameViewer:
                     self.next()
                     continue
                 pi = np.ones(n_l, dtype=np.float32) / float(n_l)
-            pi = np.minimum(pi, 0.6)
-            pi /= pi.sum()
-            
+            if policy_clip is not None:
+                pi = np.minimum(pi, policy_clip)
+                pi /= pi.sum()
+
             # map legal moves -> flat xerces indices and build policy
             
             visited = [x[0] for x in visits]
@@ -1281,10 +1286,15 @@ class GameViewer:
             V.append(this_q_stm)
             WDL.append(this_wdl)
             R.append(len(self.moves_uci) - int(self.ply))
+            if emit_lc0:
+                L.append(rb.lc0_features())
+                PLY.append(int(self.ply))
 
             # advance to next ply using existing helper
             self.next()
 
+        if emit_lc0:
+            return X, M, P, Z, V, WDL, R, L, PLY
         return X, M, P, Z, V, WDL, R
 
 
@@ -1876,8 +1886,17 @@ class RecordKeeper(object):
         pred_wait = avged["pred_wait"]
         preds_per_sec = summed["preds_per_second"]
 
-        left3 = f"[pred stats] batch={apl:.1f}  gap={infer_gap:.3f}s"
-        right3 = f"wait={pred_wait:.03f}s preds/s={preds_per_sec:.1f}"
+        duty_cycle = 0.0
+        cycle_time = pred_wait + infer_gap
+        if cycle_time:
+            duty_cycle = pred_wait / cycle_time
+        realized_preds_per_sec = duty_cycle * preds_per_sec
+
+        left3 = f"[pred stats] batch={apl:.1f}  duty={duty_cycle * 100:.1f}%"
+        right3 = f"gap={infer_gap:.3f}s wait={pred_wait:.3f}s"
+
+        left3b = f"[pred stats] actual preds/s={realized_preds_per_sec:.1f}"
+        right3b = f"ideal preds/s={preds_per_sec:.1f}"
 
         tot = s_priorless + s_with_priors + s_must_visit
         wo_priors = 100.0 * s_priorless / tot if tot > 0.0 else 0.0
@@ -1907,6 +1926,7 @@ class RecordKeeper(object):
         print(f"{left1:<{col_width}} | {right1}")
         print(f"{left2:<{col_width}} | {right2}")
         print(f"{left3:<{col_width}} | {right3}")
+        print(f"{left3b:<{col_width}} | {right3b}")
         print(f"{left4:<{col_width}} | {right4}")
         print(f"{left5:<{col_width}} | {right5}")
         print(f"{left6:<{col_width}} | {right6}")

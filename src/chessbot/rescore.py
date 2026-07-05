@@ -214,7 +214,7 @@ class SFCache:
                         others_added += 1
         print(
             f"[SFCache] roll_merge: {added:,} added, {updated:,} best upgraded,"
-            f" {others_added:,} other moves merged from {path}"
+            f" {others_added:,} other moves merged from {os.path.basename(path)}"
         )
         return added, updated
 
@@ -544,6 +544,14 @@ class Rescorer(object):
     def reset_writer(self):
         self.written_this_round = 0
     
+    def encode_board(self, board):
+        """Board -> model input, per cfg.encoding_type. lc0 planes are raw uint8
+        (rule50 unscaled); the /99 + float conversion happens at the model-input
+        boundary (retrain / infer). board must carry full move history for lc0."""
+        if self.config.encoding_type == "lc0":
+            return board.lc0_features()
+        return board.encode_64_tokens()
+
     def make_policy_example(self, board, ucis, visits):
         indices = board.moves_to_indices(ucis)
         policy = np.zeros(1858, dtype=np.float32)
@@ -553,7 +561,7 @@ class Rescorer(object):
         pi = pi / pi.sum()
         for idx, p in zip(indices, pi):
             policy[idx] += p
-        x = board.encode_64_tokens()
+        x = self.encode_board(board)
         mask = board.legal_move_mask()
         return x, mask, policy
 
@@ -771,7 +779,7 @@ class Rescorer(object):
 
             lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
-            x = b_fast.encode_64_tokens()
+            x = self.encode_board(b_fast)
             mask = b_fast.legal_move_mask()
             short_fen = b_fast.fen(include_counters=False)
             reps = 3 if repetitions[short_fen] >= 3 else 0
@@ -1249,7 +1257,7 @@ class Rescorer(object):
                             self.lc0_thread.submit(
                                 b_pv.lc0_features(),
                                 b_pv,
-                                b_pv.encode_64_tokens(),
+                                self.encode_board(b_pv),
                                 b_pv.legal_move_mask(),
                                 vwht, 1.0,
                             )

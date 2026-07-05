@@ -5,7 +5,18 @@ import time
 import numpy as np
 
 
-def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
+ENC_SHAPE = {"xc0": "64", "lc0": "112x8x8"}
+
+
+def enc_dummy(max_bs, encoding_type):
+    """Dummy enc_in batch for TRT warmup/compile, matching the ONNX input dtype."""
+    bs = min(max_bs, 256)
+    if encoding_type == "lc0":
+        return np.zeros((bs, 112, 8, 8), dtype=np.float16)
+    return np.zeros((bs, 64), dtype=np.int64)
+
+
+def make_trt_session(onnx_path, model_name, trt_cache, max_bs, encoding_type="xc0"):
     """Create an ORT TRT session. Pre-compiled engines are reused via content-hash prefix."""
     import hashlib
     import tensorrt  # registers TRT DLLs with Windows before ORT loads its TRT provider
@@ -32,9 +43,9 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
         'trt_fp16_enable':          True,
         'trt_force_timing_cache':   True,
         'trt_max_workspace_size':   4 * 1024 * 1024 * 1024,
-        'trt_profile_min_shapes':   'enc_in:1x64',
-        'trt_profile_opt_shapes':   f'enc_in:{max_bs}x64',
-        'trt_profile_max_shapes':   f'enc_in:{max_bs}x64',
+        'trt_profile_min_shapes':   f'enc_in:1x{ENC_SHAPE[encoding_type]}',
+        'trt_profile_opt_shapes':   f'enc_in:{max_bs}x{ENC_SHAPE[encoding_type]}',
+        'trt_profile_max_shapes':   f'enc_in:{max_bs}x{ENC_SHAPE[encoding_type]}',
         'trt_timing_cache_enable':  True,
         'trt_timing_cache_path':    trt_cache,
     }
@@ -55,11 +66,18 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs):
     return sess
 
 
-def make_ort_trt_infer(onnx_path, model_name, trt_cache, max_bs):
-    sess = make_trt_session(onnx_path, model_name, trt_cache, max_bs)
+def make_ort_trt_infer(onnx_path, model_name, trt_cache, max_bs, encoding_type="xc0"):
+    sess = make_trt_session(onnx_path, model_name, trt_cache, max_bs, encoding_type)
+    is_lc0 = encoding_type == "lc0"
 
     def infer(pair):
-        enc_np = np.asarray(pair[0], dtype=np.int64)
+        if is_lc0:
+            # drained lc0 planes are raw uint8 (rule50 unscaled); convert at boundary
+            enc_np = np.asarray(pair[0], dtype=np.float32)
+            enc_np[:, 109] /= 99.0
+            enc_np = enc_np.astype(np.float16)
+        else:
+            enc_np = np.asarray(pair[0], dtype=np.int64)
         pol_fp16, wdl_fp16 = sess.run(
             ['policy_logits', 'value_out'], {'enc_in': enc_np}
         )
@@ -91,8 +109,9 @@ def prepare_trt(cfg, trt_dir, model_name):
     os.makedirs(trt_dir, exist_ok=True)
     onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
 
-    print(f'[trt] exporting {cfg.model_path} -> {onnx_path}')
-    export_ts_to_onnx(cfg.model_path, onnx_path)
+    print(f'[trt] exporting {os.path.basename(cfg.model_path)} -> '
+          f'{os.path.basename(onnx_path)}')
+    export_ts_to_onnx(cfg.model_path, onnx_path, encoding_type=cfg.encoding_type)
 
     for f in os.listdir(trt_dir):
         if f.startswith(model_name) and f.endswith('.engine'):
@@ -101,8 +120,9 @@ def prepare_trt(cfg, trt_dir, model_name):
 
     print('[trt] compiling TRT engine...')
     t0 = time.time()
-    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch)
-    dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
+    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch,
+                            cfg.encoding_type)
+    dummy = enc_dummy(cfg.macro_batch, cfg.encoding_type)
     sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
     del sess
     gc.collect()
@@ -129,7 +149,7 @@ def recompile_selfplay_trt(cfg):
 
     t0 = time.time()
     print('[retrain] exporting ONNX for TRT recompile...')
-    export_ts_to_onnx(cfg.model_path, onnx_path)
+    export_ts_to_onnx(cfg.model_path, onnx_path, encoding_type=cfg.encoding_type)
 
     for f in os.listdir(trt_dir):
         if f.startswith(model_name) and f.endswith('.engine'):
@@ -137,8 +157,9 @@ def recompile_selfplay_trt(cfg):
             print(f'[retrain] removed stale engine: {f}')
 
     print('[retrain] compiling TRT engine...')
-    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch)
-    dummy = np.zeros((min(cfg.macro_batch, 256), 64), dtype=np.int64)
+    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch,
+                            cfg.encoding_type)
+    dummy = enc_dummy(cfg.macro_batch, cfg.encoding_type)
     sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
     del sess
     gc.collect()

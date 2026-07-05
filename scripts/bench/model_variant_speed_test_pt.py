@@ -38,8 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
-from chessbot.model import (build_pt_precond_smartgate, build_pt_conv_shallow_mha,
-                            build_pt_conv_pure)
+from chessbot.model import build_pt_precond_smartgate, build_pt_conv_pure
 
 SEQ_LEN    = 64
 ENC_VOCAB  = 21
@@ -59,9 +58,16 @@ PRECOND_CFG = dict(
     pre_blocks=4, mha_blocks=4,
 )
 
-CONV_SHALLOW_CFG = dict(
-    conv_filters=128, num_heads=8, dropout=0.03, mha_blocks=8,
+LC0_CFG = dict(
+    conv_filters=256, num_heads=8, dropout=0.05,
+    pre_blocks=4, lc0_input=True,
 )
+
+XC0H_K_LIST = [1, 2, 6, 8]
+XC0H_CFGS = {
+    K: dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=K)
+    for K in XC0H_K_LIST
+}
 
 CONV_PURE_CFG = dict(
     conv_filters=256, num_blocks=12, dropout=0.03,
@@ -282,6 +288,36 @@ def random_tokens(batch_size, vocab=ENC_VOCAB):
     return np.random.randint(0, vocab, (batch_size, SEQ_LEN), dtype=np.int32)
 
 
+def random_lc0_features(batch_size):
+    """(B, 112, 8, 8) uint8, matching board_to_lc0_features's raw output (rule50
+    unscaled). Preprocessing (float cast + rule50/99) happens at the model boundary,
+    same as production (see make_pt_infer's is_lc0 branch)."""
+    return np.random.randint(0, 2, (batch_size, 112, 8, 8), dtype=np.uint8)
+
+
+def lc0_trt_preprocess(enc_np):
+    """Raw uint8 lc0 planes -> float32, rule50 (plane 109) /99, cast to float16 --
+    the ONNX graph's input is already-preprocessed float16, matching
+    train_pytorch.export_ts_to_onnx's lc0 dummy convention."""
+    x = enc_np.astype(np.float32)
+    x[:, 109] /= 99.0
+    return x.astype(np.float16)
+
+
+def random_xc0h_tokens(batch_size, K):
+    """(B, K*64+K+3) int32, matching board.history_tokens(K)'s flat layout:
+    K frames of 64 slim tokens (vocab 0..14) + K repetition flags (0/1)
+    + castling (0..15) + stm (0/1) + hmc (0..99ish)."""
+    n = K * 64 + K + 3
+    out = np.zeros((batch_size, n), dtype=np.int32)
+    out[:, :K * 64]          = np.random.randint(0, 15, (batch_size, K * 64))
+    out[:, K * 64:K * 64 + K] = np.random.randint(0, 2, (batch_size, K))
+    out[:, K * 64 + K]        = np.random.randint(0, 16, batch_size)
+    out[:, K * 64 + K + 1]    = np.random.randint(0, 2, batch_size)
+    out[:, K * 64 + K + 2]    = np.random.randint(0, 100, batch_size)
+    return out
+
+
 def load_results_csv():
     """Returns {(label, params): {batch_size: {latency_ms, throughput}}}"""
     import csv
@@ -331,25 +367,35 @@ def display_cached_result(label, cached, batch_sizes):
 # Inference wrappers
 # ---------------------------------------------------------------------------
 
-def make_pt_eager_infer(model, device):
+def make_pt_eager_infer(model, device, is_lc0=False):
     model = model.half().to(device).eval()
 
-    def infer(tokens_np):
+    def infer(enc_np):
         with torch.no_grad():
-            x = torch.from_numpy(tokens_np).long().to(device)
+            if is_lc0:
+                # raw uint8 lc0 planes -> float, rule50 (plane 109) /99 at the
+                # model-input boundary, matching train_pytorch.make_pt_infer
+                x = torch.from_numpy(enc_np).float().to(device)
+                x[:, 109] /= 99.0
+                x = x.half()
+            else:
+                x = torch.from_numpy(enc_np).long().to(device)
             p, v = model(x)
             return p.float().cpu().numpy(), v.float().cpu().numpy()
 
     return infer
 
 
-def export_to_onnx(model, device, onnx_path):
+def export_to_onnx(model, device, onnx_path, dummy=None):
     import warnings
     import onnx
     from onnx import shape_inference as onnx_si
     print(f"  Exporting to ONNX (opset 18) ...")
     model = model.half().to(device).eval()
-    dummy = torch.zeros(1, SEQ_LEN, dtype=torch.long, device=device)
+    if dummy is None:
+        dummy = torch.zeros(1, SEQ_LEN, dtype=torch.long, device=device)
+    else:
+        dummy = dummy.to(device)
     with torch.no_grad():
         model(dummy)
     with warnings.catch_warnings():
@@ -369,10 +415,17 @@ def export_to_onnx(model, device, onnx_path):
     print(f"  ONNX export done ({sz_mb:.1f} MB)")
 
 
-def make_trt_infer(onnx_path, cache_dir, max_bs=512):
+def make_trt_infer(onnx_path, cache_dir, max_bs=512, input_shape="64", preprocess_fn=None):
+    """input_shape: profile shape suffix after the batch dim, e.g. "64",
+    "112x8x8", or "391" (xc0h-K6's flat width). preprocess_fn(enc_np) -> np.ndarray
+    ready for session.run; defaults to a plain int64 cast (xc0/xc0h token inputs).
+    lc0 needs float32->rule50/99->float16, matching train_pytorch.make_pt_infer."""
     import hashlib
     import tensorrt
     import onnxruntime as ort
+
+    if preprocess_fn is None:
+        preprocess_fn = lambda x: x.astype(np.int64)
 
     h = hashlib.sha256()
     with open(onnx_path, "rb") as fh:
@@ -395,9 +448,9 @@ def make_trt_infer(onnx_path, cache_dir, max_bs=512):
         "trt_fp16_enable":          True,
         "trt_force_timing_cache":   True,
         "trt_max_workspace_size":   4 * 1024 * 1024 * 1024,
-        "trt_profile_min_shapes":   "enc_in:1x64",
-        "trt_profile_opt_shapes":   f"enc_in:{max_bs}x64",
-        "trt_profile_max_shapes":   f"enc_in:{max_bs}x64",
+        "trt_profile_min_shapes":   f"enc_in:1x{input_shape}",
+        "trt_profile_opt_shapes":   f"enc_in:{max_bs}x{input_shape}",
+        "trt_profile_max_shapes":   f"enc_in:{max_bs}x{input_shape}",
         "trt_timing_cache_enable":  True,
         "trt_timing_cache_path":    cache_dir,
     }
@@ -415,8 +468,8 @@ def make_trt_infer(onnx_path, cache_dir, max_bs=512):
         raise RuntimeError(f"[trt] expected TensorrtExecutionProvider but got {active}")
     print(f"  [trt] ready in {elapsed:.1f}s")
 
-    def infer(tokens_np):
-        return session.run(None, {"enc_in": tokens_np.astype(np.int64)})
+    def infer(enc_np):
+        return session.run(None, {"enc_in": preprocess_fn(enc_np)})
 
     return infer, session
 
@@ -425,7 +478,7 @@ def make_trt_infer(onnx_path, cache_dir, max_bs=512):
 # Speed test
 # ---------------------------------------------------------------------------
 
-def speed_test(label, infer_fn, batch_sizes):
+def speed_test(label, infer_fn, batch_sizes, input_fn=random_tokens):
     print(f"\n  {'-'*56}")
     print(f"  {label}")
     print(f"  warmup={N_WARMUP}  iters={N_ITERS}")
@@ -433,7 +486,7 @@ def speed_test(label, infer_fn, batch_sizes):
     print(f"  {'-'*7} {'-'*12} {'-'*13}")
     results = {}
     for b in batch_sizes:
-        inp = random_tokens(b)
+        inp = input_fn(b)
         for _ in range(N_WARMUP):
             infer_fn(inp)
         t0 = time.perf_counter()
@@ -497,11 +550,11 @@ def main():
     csv_data    = load_results_csv()
     all_results = {}
 
-    def run_or_cached(lbl, infer_fn, params):
+    def run_or_cached(lbl, infer_fn, params, input_fn=random_tokens):
         hit = csv_data.get((lbl, params))
         if hit and all(b in hit for b in bs):
             return display_cached_result(lbl + " [fp16]", hit, bs)
-        result = speed_test(lbl + " [fp16]", infer_fn, bs)
+        result = speed_test(lbl + " [fp16]", infer_fn, bs, input_fn=input_fn)
         save_results_csv(lbl, params, result)
         return result
 
@@ -556,37 +609,92 @@ def main():
         except Exception as e:
             print(f"  [ERROR] 16m-precond-smartgate PT eager: {e}")
 
-    # conv-shallow-mha
+        if not args.skip_trt:
+            try:
+                lbl     = "16m-precond-smartgate  ORT TRT"
+                onnx_sg = os.path.join(TRT_CACHE, f"precond_sg_{params_sg}.onnx")
+                if not os.path.exists(onnx_sg):
+                    export_to_onnx(build_pt_precond_smartgate(PRECOND_CFG), device, onnx_sg)
+                else:
+                    print(f"  [TRT] ONNX cached: {onnx_sg}")
+                trt_sg, trt_sess_sg = make_trt_infer(onnx_sg, TRT_CACHE, max_bs=max(bs))
+                all_results[lbl] = run_or_cached(lbl, trt_sg, params_sg)
+                del trt_sess_sg; gc.collect()
+            except Exception as e:
+                print(f"  [ERROR] 16m-precond-smartgate TRT: {e}")
+
+    # 16m-precond-smartgate-lc0
     print(f"\n{'='*60}")
-    print(f"  conv-shallow-mha  (2xConv(128) -> cat LN(conv)+pos(128) -> 256-d"
-          f" -> 8 global accum tokens -> {CONV_SHALLOW_CFG['mha_blocks']}x MHA(ff=1024)"
-          f" -> trunk_ln -> WDL/SmartGate/from-to-policy heads)")
-    model_cs  = build_pt_conv_shallow_mha(CONV_SHALLOW_CFG)
-    params_cs = sum(p.numel() for p in model_cs.parameters())
+    print(f"  16m-precond-smartgate-lc0  (1x1 conv stem over (112,8,8) lc0 planes;"
+          f" everything downstream identical to 16m-precond-smartgate)")
+    model_lc0  = build_pt_precond_smartgate(LC0_CFG)
+    params_lc0 = sum(p.numel() for p in model_lc0.parameters())
 
     if not args.dry_run:
         try:
-            print(f"\n  Building conv-shallow-mha PT eager ...")
-            eager_cs = make_pt_eager_infer(model_cs, device)
-            lbl = "conv-shallow-mha  PT eager"
-            all_results[lbl] = run_or_cached(lbl, eager_cs, params_cs)
-            del eager_cs; gc.collect(); torch.cuda.empty_cache()
+            print(f"\n  Building 16m-precond-smartgate-lc0 PT eager ...")
+            eager_lc0 = make_pt_eager_infer(model_lc0, device, is_lc0=True)
+            lbl = "16m-precond-smartgate-lc0  PT eager"
+            all_results[lbl] = run_or_cached(lbl, eager_lc0, params_lc0, input_fn=random_lc0_features)
+            del eager_lc0; gc.collect(); torch.cuda.empty_cache()
         except Exception as e:
-            print(f"  [ERROR] conv-shallow-mha PT eager: {e}")
+            print(f"  [ERROR] 16m-precond-smartgate-lc0 PT eager: {e}")
 
         if not args.skip_trt:
             try:
-                lbl     = "conv-shallow-mha  ORT TRT"
-                onnx_cs = os.path.join(TRT_CACHE, f"conv_shallow_mha_{params_cs}.onnx")
-                if not os.path.exists(onnx_cs):
-                    export_to_onnx(build_pt_conv_shallow_mha(CONV_SHALLOW_CFG), device, onnx_cs)
+                lbl      = "16m-precond-smartgate-lc0  ORT TRT"
+                onnx_lc0 = os.path.join(TRT_CACHE, f"precond_lc0_{params_lc0}.onnx")
+                if not os.path.exists(onnx_lc0):
+                    dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float16, device=device)
+                    export_to_onnx(build_pt_precond_smartgate(LC0_CFG), device, onnx_lc0, dummy=dummy)
                 else:
-                    print(f"  [TRT] ONNX cached: {onnx_cs}")
-                trt_cs, trt_sess_cs = make_trt_infer(onnx_cs, TRT_CACHE, max_bs=max(bs))
-                all_results[lbl] = run_or_cached(lbl, trt_cs, params_cs)
-                del trt_sess_cs; gc.collect()
+                    print(f"  [TRT] ONNX cached: {onnx_lc0}")
+                trt_lc0, trt_sess_lc0 = make_trt_infer(
+                    onnx_lc0, TRT_CACHE, max_bs=max(bs),
+                    input_shape="112x8x8", preprocess_fn=lc0_trt_preprocess)
+                all_results[lbl] = run_or_cached(lbl, trt_lc0, params_lc0, input_fn=random_lc0_features)
+                del trt_sess_lc0; gc.collect()
             except Exception as e:
-                print(f"  [ERROR] conv-shallow-mha TRT: {e}")
+                print(f"  [ERROR] 16m-precond-smartgate-lc0 TRT: {e}")
+
+    # 16m-precond-smartgate-xc0h (K = 1, 2, 6, 8)
+    for K in XC0H_K_LIST:
+        print(f"\n{'='*60}")
+        print(f"  16m-precond-smartgate-xc0h-K{K}  (compact history-token stem, K={K};"
+              f" everything downstream identical to 16m-precond-smartgate)")
+        model_xh  = build_pt_precond_smartgate(XC0H_CFGS[K])
+        params_xh = sum(p.numel() for p in model_xh.parameters())
+        in_len_xh = K * 64 + K + 3
+
+        if not args.dry_run:
+            try:
+                print(f"\n  Building 16m-precond-smartgate-xc0h-K{K} PT eager ...")
+                eager_xh = make_pt_eager_infer(model_xh, device)
+                lbl = f"16m-precond-smartgate-xc0h-K{K}  PT eager"
+                all_results[lbl] = run_or_cached(
+                    lbl, eager_xh, params_xh,
+                    input_fn=lambda b, K=K: random_xc0h_tokens(b, K))
+                del eager_xh; gc.collect(); torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K{K} PT eager: {e}")
+
+            if not args.skip_trt:
+                try:
+                    lbl     = f"16m-precond-smartgate-xc0h-K{K}  ORT TRT"
+                    onnx_xh = os.path.join(TRT_CACHE, f"precond_xc0h_k{K}_{params_xh}.onnx")
+                    if not os.path.exists(onnx_xh):
+                        dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                        export_to_onnx(build_pt_precond_smartgate(XC0H_CFGS[K]), device, onnx_xh, dummy=dummy)
+                    else:
+                        print(f"  [TRT] ONNX cached: {onnx_xh}")
+                    trt_xh, trt_sess_xh = make_trt_infer(
+                        onnx_xh, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
+                    all_results[lbl] = run_or_cached(
+                        lbl, trt_xh, params_xh,
+                        input_fn=lambda b, K=K: random_xc0h_tokens(b, K))
+                    del trt_sess_xh; gc.collect()
+                except Exception as e:
+                    print(f"  [ERROR] 16m-precond-smartgate-xc0h-K{K} TRT: {e}")
 
     # conv-pure
     print(f"\n{'='*60}")

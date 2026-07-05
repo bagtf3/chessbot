@@ -40,6 +40,10 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, dropout=0.03,
         pre_blocks=4, lc0_input=True,
     ),
+    "16m-precond-smartgate-xc0h": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=4, xc0h_K=6,
+    ),
     "hybrid-conv-attn": dict(
         hybrid_conv_attn=True,
         n_trunk_blocks=6, trunk_dim=1024, dropout=0.02,
@@ -1056,6 +1060,15 @@ def build_pt_precond_smartgate(cfg: dict):
     If cfg["lc0_input"] is set, the token embedding stem is replaced by a 1x1
     conv over (B, 112, 8, 8) lc0 planes; everything downstream is identical.
     Used for the lc0-vs-xc0 encoding bake-off.
+
+    If cfg["xc0h_K"] is set (xc0h = xc0 with history), the stem instead consumes
+    the flat compact history-token encoding from pyfastchess's
+    board.history_tokens(K) / MCTSForest.get_all_history_tokens(K), K = cfg["xc0h_K"]:
+    K frames of 64 slim tokens + K repetition flags + castling/stm/hmc, flattened
+    to (B, K*64+K+3). A shared per-square token embedding (+ learned per-frame-age
+    bias) plus a learned castling plane and scaled stm/hmc/rep channels are
+    concatenated per square and projected to CF; everything downstream is
+    identical to the xc0/lc0 stems. See PLANS.md section 4.
     """
     import math
     import torch
@@ -1070,6 +1083,10 @@ def build_pt_precond_smartgate(cfg: dict):
     pb  = cfg["pre_blocks"]     # 4
     PDH = 256
     lc0_input = bool(cfg.get("lc0_input", False))
+    XC0H_K    = cfg.get("xc0h_K")      # None -> not xc0h; presence of K IS the flag
+    xc0h_input = XC0H_K is not None
+    XC0H_VOCAB = 15   # 0=empty, 1-6 us P/N/B/R/Q/K, 7-12 them P/N/B/R/Q/K, 13=EP, 14=PAD
+    XC0H_DEMB  = 18
 
     sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
@@ -1112,6 +1129,24 @@ def build_pt_precond_smartgate(cfg: dict):
             if lc0_input:
                 self.stem    = nn.Conv2d(112, CF, 1)
                 self.stem_ln = make_ln2d(CF)
+            elif xc0h_input:
+                xc0h_in_ch = XC0H_K * XC0H_DEMB + XC0H_K + 3   # frames + rep + castle + stm + hmc
+                self.xc0h_tok_emb  = nn.Embedding(XC0H_VOCAB, XC0H_DEMB)
+                self.xc0h_cast_emb = nn.Embedding(16, 64)
+                # project to CF-1; the CF-th channel is a constant ones-plane appended
+                # after the norm (post-projection, post-LN) so the first ConvBlock's
+                # zero-padded 3x3 conv can find the board edge, same purpose as lc0's
+                # all-ones plane. Must be added AFTER LayerNorm, not before -- LN would
+                # subtract the constant into each square's own per-channel mean and
+                # destroy its constancy.
+                self.xc0h_proj    = nn.Linear(xc0h_in_ch, CF - 1)
+                self.xc0h_proj_ln = nn.LayerNorm(CF - 1)
+
+                # free learnable scales (init 1.0) for rep/stm/hmc/ones-pad
+                self.xc0h_rep_scale  = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_stm_scale  = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_hmc_scale  = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_ones_scale = nn.Parameter(torch.tensor(1.0))
             else:
                 self.emb     = nn.Embedding(VOCAB_SIZE, CF)
             self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
@@ -1157,6 +1192,36 @@ def build_pt_precond_smartgate(cfg: dict):
             B = x_in.shape[0]
             if lc0_input:
                 x = self.stem_ln(self.stem(x_in))                             # [B, CF, 8, 8]
+            elif xc0h_input:
+                K = XC0H_K
+                # model's running dtype (fp16 under half() inference, fp32 in training) --
+                # rep/stm/hmc are cast here and run natively in that dtype throughout,
+                # same as everywhere else in this model past the embed.
+                dtype = self.xc0h_tok_emb.weight.dtype
+                tok  = x_in[:, :K * 64].reshape(B, K, 64).long()
+                rep  = x_in[:, K * 64:K * 64 + K].to(dtype)
+                cast = x_in[:, K * 64 + K].long()
+                stm  = x_in[:, K * 64 + K + 1].to(dtype)
+                hmc  = x_in[:, K * 64 + K + 2].to(dtype)
+
+                tok_emb = self.xc0h_tok_emb(tok)                                    # [B,K,64,d]
+                tok_emb = tok_emb.permute(0, 2, 1, 3).reshape(B, 64, K * XC0H_DEMB)  # [B,64,K*d]
+
+                # rep/stm/hmc are raw 0/1 (or unbounded for hmc) -- rescale to roughly
+                # the same [-1,1] order of magnitude as the (~unit-variance) embeddings
+                # so none of them get washed out or dominate at the projection below.
+                # Each also gets its own free learnable scale (init 1.0).
+                rep_planes = (rep * 2.0 - 1.0).unsqueeze(1).expand(B, 64, K) * self.xc0h_rep_scale
+                cast_plane = self.xc0h_cast_emb(cast).unsqueeze(-1)                 # [B,64,1]
+                stm_plane  = (stm * 2.0 - 1.0).view(B, 1, 1).expand(B, 64, 1) * self.xc0h_stm_scale
+                hmc_plane  = (hmc / 99.0 * 2.0 - 1.0).view(B, 1, 1).expand(B, 64, 1) * self.xc0h_hmc_scale
+
+                fused = torch.cat(
+                    [tok_emb, rep_planes, cast_plane, stm_plane, hmc_plane], dim=-1)  # [B,64,in_ch]
+                projected = self.xc0h_proj_ln(self.xc0h_proj(fused))                # [B, 64, CF-1]
+                ones = projected.new_ones(B, 64, 1) * self.xc0h_ones_scale          # constant edge-mask channel
+                x = torch.cat([projected, ones], dim=-1)                           # [B, 64, CF]
+                x = x.reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()         # [B, CF, 8, 8]
             else:
                 x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
             for blk in self.pre:

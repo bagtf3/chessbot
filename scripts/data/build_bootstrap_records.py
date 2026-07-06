@@ -271,9 +271,13 @@ def iter_xc0_game(game, sf_df):
         for ci, prob in zip(indices, pi):
             policy[ci] += prob
 
-        wdl_node   = node.get("best_wdl")
-        search_wdl = (np.array(wdl_node, dtype=np.float32)
-                      if wdl_node is not None else to_wdl(0.0))
+        wdl_node = node.get("best_wdl")
+        if wdl_node is not None:
+            search_wdl = np.array(wdl_node, dtype=np.float32)
+            if not is_white:
+                search_wdl = search_wdl[[2, 1, 0]]
+        else:
+            search_wdl = to_wdl(0.0)
         z = (1 if is_white else -1) if result > 0 else (
             (-1 if is_white else 1) if result < 0 else 0)
         wdl = (Z_BLEND * to_wdl(z) + (1.0 - Z_BLEND) * search_wdl).astype(np.float32)

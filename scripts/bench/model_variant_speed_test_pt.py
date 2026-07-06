@@ -63,11 +63,7 @@ LC0_CFG = dict(
     pre_blocks=4, lc0_input=True,
 )
 
-XC0H_K_LIST = [1, 2, 6, 8]
-XC0H_CFGS = {
-    K: dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=K)
-    for K in XC0H_K_LIST
-}
+XC0H_CFG = dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=6)
 
 CONV_PURE_CFG = dict(
     conv_filters=256, num_blocks=12, dropout=0.03,
@@ -623,78 +619,43 @@ def main():
             except Exception as e:
                 print(f"  [ERROR] 16m-precond-smartgate TRT: {e}")
 
-    # 16m-precond-smartgate-lc0
+    # 16m-precond-smartgate-xc0h-K6
     print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate-lc0  (1x1 conv stem over (112,8,8) lc0 planes;"
+    print(f"  16m-precond-smartgate-xc0h-K6  (compact history-token stem, K=6;"
           f" everything downstream identical to 16m-precond-smartgate)")
-    model_lc0  = build_pt_precond_smartgate(LC0_CFG)
-    params_lc0 = sum(p.numel() for p in model_lc0.parameters())
+    model_xh  = build_pt_precond_smartgate(XC0H_CFG)
+    params_xh = sum(p.numel() for p in model_xh.parameters())
+    in_len_xh = 6 * 64 + 6 + 3
 
     if not args.dry_run:
         try:
-            print(f"\n  Building 16m-precond-smartgate-lc0 PT eager ...")
-            eager_lc0 = make_pt_eager_infer(model_lc0, device, is_lc0=True)
-            lbl = "16m-precond-smartgate-lc0  PT eager"
-            all_results[lbl] = run_or_cached(lbl, eager_lc0, params_lc0, input_fn=random_lc0_features)
-            del eager_lc0; gc.collect(); torch.cuda.empty_cache()
+            print(f"\n  Building 16m-precond-smartgate-xc0h-K6 PT eager ...")
+            eager_xh = make_pt_eager_infer(model_xh, device)
+            lbl = "16m-precond-smartgate-xc0h-K6  PT eager"
+            all_results[lbl] = run_or_cached(
+                lbl, eager_xh, params_xh,
+                input_fn=lambda b: random_xc0h_tokens(b, 6))
+            del eager_xh; gc.collect(); torch.cuda.empty_cache()
         except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate-lc0 PT eager: {e}")
+            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 PT eager: {e}")
 
         if not args.skip_trt:
             try:
-                lbl      = "16m-precond-smartgate-lc0  ORT TRT"
-                onnx_lc0 = os.path.join(TRT_CACHE, f"precond_lc0_{params_lc0}.onnx")
-                if not os.path.exists(onnx_lc0):
-                    dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float16, device=device)
-                    export_to_onnx(build_pt_precond_smartgate(LC0_CFG), device, onnx_lc0, dummy=dummy)
+                lbl     = "16m-precond-smartgate-xc0h-K6  ORT TRT"
+                onnx_xh = os.path.join(TRT_CACHE, f"precond_xc0h_k6_{params_xh}.onnx")
+                if not os.path.exists(onnx_xh):
+                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                    export_to_onnx(build_pt_precond_smartgate(XC0H_CFG), device, onnx_xh, dummy=dummy)
                 else:
-                    print(f"  [TRT] ONNX cached: {onnx_lc0}")
-                trt_lc0, trt_sess_lc0 = make_trt_infer(
-                    onnx_lc0, TRT_CACHE, max_bs=max(bs),
-                    input_shape="112x8x8", preprocess_fn=lc0_trt_preprocess)
-                all_results[lbl] = run_or_cached(lbl, trt_lc0, params_lc0, input_fn=random_lc0_features)
-                del trt_sess_lc0; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate-lc0 TRT: {e}")
-
-    # 16m-precond-smartgate-xc0h (K = 1, 2, 6, 8)
-    for K in XC0H_K_LIST:
-        print(f"\n{'='*60}")
-        print(f"  16m-precond-smartgate-xc0h-K{K}  (compact history-token stem, K={K};"
-              f" everything downstream identical to 16m-precond-smartgate)")
-        model_xh  = build_pt_precond_smartgate(XC0H_CFGS[K])
-        params_xh = sum(p.numel() for p in model_xh.parameters())
-        in_len_xh = K * 64 + K + 3
-
-        if not args.dry_run:
-            try:
-                print(f"\n  Building 16m-precond-smartgate-xc0h-K{K} PT eager ...")
-                eager_xh = make_pt_eager_infer(model_xh, device)
-                lbl = f"16m-precond-smartgate-xc0h-K{K}  PT eager"
+                    print(f"  [TRT] ONNX cached: {onnx_xh}")
+                trt_xh, trt_sess_xh = make_trt_infer(
+                    onnx_xh, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
                 all_results[lbl] = run_or_cached(
-                    lbl, eager_xh, params_xh,
-                    input_fn=lambda b, K=K: random_xc0h_tokens(b, K))
-                del eager_xh; gc.collect(); torch.cuda.empty_cache()
+                    lbl, trt_xh, params_xh,
+                    input_fn=lambda b: random_xc0h_tokens(b, 6))
+                del trt_sess_xh; gc.collect()
             except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K{K} PT eager: {e}")
-
-            if not args.skip_trt:
-                try:
-                    lbl     = f"16m-precond-smartgate-xc0h-K{K}  ORT TRT"
-                    onnx_xh = os.path.join(TRT_CACHE, f"precond_xc0h_k{K}_{params_xh}.onnx")
-                    if not os.path.exists(onnx_xh):
-                        dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
-                        export_to_onnx(build_pt_precond_smartgate(XC0H_CFGS[K]), device, onnx_xh, dummy=dummy)
-                    else:
-                        print(f"  [TRT] ONNX cached: {onnx_xh}")
-                    trt_xh, trt_sess_xh = make_trt_infer(
-                        onnx_xh, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
-                    all_results[lbl] = run_or_cached(
-                        lbl, trt_xh, params_xh,
-                        input_fn=lambda b, K=K: random_xc0h_tokens(b, K))
-                    del trt_sess_xh; gc.collect()
-                except Exception as e:
-                    print(f"  [ERROR] 16m-precond-smartgate-xc0h-K{K} TRT: {e}")
+                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 TRT: {e}")
 
     # conv-pure
     print(f"\n{'='*60}")

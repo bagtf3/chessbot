@@ -1161,20 +1161,31 @@ def build_pt_precond_smartgate(cfg: dict):
                     E = E + torch.randn_like(E) * 0.02
                     self.xc0h_tok_emb.weight.copy_(E)
                 self.xc0h_cast_emb = nn.Embedding(16, 64)
-                # project to CF-1; the CF-th channel is a constant ones-plane appended
-                # after the norm (post-projection, post-LN) so the first ConvBlock's
-                # zero-padded 3x3 conv can find the board edge, same purpose as lc0's
-                # all-ones plane. Must be added AFTER LayerNorm, not before -- LN would
-                # subtract the constant into each square's own per-channel mean and
-                # destroy its constancy.
-                self.xc0h_proj    = nn.Linear(xc0h_in_ch, CF - 1)
-                self.xc0h_proj_ln = nn.LayerNorm(CF - 1)
+                # project to CF-4; 4 spatial planes (ones, checkerboard, rank, file)
+                # appended after the norm so LN can't destroy their constant/gradient
+                # values. Each gets its own learnable scale so convs can attenuate any
+                # plane toward zero if the geometry isn't useful.
+                self.xc0h_proj    = nn.Linear(xc0h_in_ch, CF - 4)
+                self.xc0h_proj_ln = nn.LayerNorm(CF - 4)
 
-                # free learnable scales (init 1.0) for rep/stm/hmc/ones-pad
-                self.xc0h_rep_scale  = nn.Parameter(torch.tensor(1.0))
-                self.xc0h_stm_scale  = nn.Parameter(torch.tensor(1.0))
-                self.xc0h_hmc_scale  = nn.Parameter(torch.tensor(1.0))
-                self.xc0h_ones_scale = nn.Parameter(torch.tensor(1.0))
+                # free learnable scales (init 1.0): 3 for rep/stm/hmc, 4 for spatial planes
+                self.xc0h_rep_scale     = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_stm_scale     = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_hmc_scale     = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_ones_scale    = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_checker_scale = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_rank_scale    = nn.Parameter(torch.tensor(1.0))
+                self.xc0h_file_scale    = nn.Parameter(torch.tensor(1.0))
+
+                sqs = torch.arange(64).float()
+                ranks_sq = sqs // 8
+                files_sq = sqs % 8
+                self.register_buffer("xc0h_spatial", torch.stack([
+                    torch.ones(64),
+                    ((ranks_sq + files_sq) % 2) * 2 - 1,
+                    ranks_sq / 7.0 * 2 - 1,
+                    files_sq / 7.0 * 2 - 1,
+                ], dim=-1).unsqueeze(0))                                        # [1, 64, 4]
             else:
                 self.emb     = nn.Embedding(VOCAB_SIZE, CF)
             self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
@@ -1246,9 +1257,11 @@ def build_pt_precond_smartgate(cfg: dict):
 
                 fused = torch.cat(
                     [tok_emb, rep_planes, cast_plane, stm_plane, hmc_plane], dim=-1)  # [B,64,in_ch]
-                projected = self.xc0h_proj_ln(self.xc0h_proj(fused))                # [B, 64, CF-1]
-                ones = projected.new_ones(B, 64, 1) * self.xc0h_ones_scale          # constant edge-mask channel
-                x = torch.cat([projected, ones], dim=-1)                           # [B, 64, CF]
+                projected = self.xc0h_proj_ln(self.xc0h_proj(fused))                # [B, 64, CF-4]
+                scales  = torch.stack([self.xc0h_ones_scale, self.xc0h_checker_scale,
+                                       self.xc0h_rank_scale, self.xc0h_file_scale])
+                spatial = self.xc0h_spatial.to(projected.dtype).expand(B, -1, -1) * scales  # [B, 64, 4]
+                x = torch.cat([projected, spatial], dim=-1)                          # [B, 64, CF]
                 x = x.reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()         # [B, CF, 8, 8]
             else:
                 x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()

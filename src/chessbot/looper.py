@@ -79,12 +79,15 @@ class GameLooper(object):
     def load_reload_model(self):
         cfg = self.config
         encoding = cfg.encoding_type
-        if encoding not in ("xc0", "lc0"):
+        if encoding not in ("xc0", "lc0", "xc0h"):
             raise RuntimeError(f"unknown encoding_type {encoding!r}")
 
         # the encoder is chosen SOLELY by encoding_type -- never by the backend.
         if encoding == "lc0":
             self.batch_encoder = self.forest.get_all_lc0_features
+        elif encoding == "xc0h":
+            K = cfg.history_K
+            self.batch_encoder = lambda: self.forest.get_all_history_tokens(K)
         else:
             self.batch_encoder = self.forest.get_all_encoded
 

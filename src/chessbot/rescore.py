@@ -550,6 +550,8 @@ class Rescorer(object):
         boundary (retrain / infer). board must carry full move history for lc0."""
         if self.config.encoding_type == "lc0":
             return board.lc0_features()
+        if self.config.encoding_type == "xc0h":
+            return board.history_tokens(self.config.history_K)
         return board.encode_64_tokens()
 
     def make_policy_example(self, board, ucis, visits):

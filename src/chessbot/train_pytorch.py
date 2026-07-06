@@ -101,9 +101,13 @@ def save_pt_model(model, path, arch=None, opt=None):
             torch.jit.save(trace_model, path)
         else:
             from chessbot.model import VARIANTS
-            if VARIANTS.get(arch, {}).get("lc0_input", False):
+            cfg = VARIANTS.get(arch, {})
+            if cfg.get("lc0_input", False):
                 dtype = torch.float16 if use_fp16 else torch.float32
                 dummy = torch.zeros(1, 112, 8, 8, dtype=dtype, device=trace_device)
+            elif cfg.get("xc0h_K") is not None:
+                K = cfg["xc0h_K"]
+                dummy = torch.zeros(1, K * 64 + K + 3, dtype=torch.long, device=trace_device)
             else:
                 dummy = torch.zeros(1, 64, dtype=torch.long, device=trace_device)
             with torch.no_grad():
@@ -374,6 +378,8 @@ def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
 
     if encoding_type == "lc0":
         dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float16, device='cuda')
+    elif encoding_type == "xc0h":
+        dummy = torch.zeros(1, 393, dtype=torch.long, device='cuda')
     else:
         dummy = torch.zeros(1, 64, dtype=torch.long, device='cuda')
     with torch.no_grad():

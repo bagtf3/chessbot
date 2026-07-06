@@ -37,7 +37,7 @@ import scipy.special
 
 from chessbot.pretrain import (
     EPOCH_SIZE, VAL_SHUFFLE_BUFFER,
-    PLOT_EVERY, DEFAULT_MAX_EPOCH,
+    PLOT_EVERY,
     POLICY_LW, VALUE_LW,
     lr_for_epoch,
     list_tfrecord_files, split_train_val,
@@ -52,10 +52,11 @@ PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
 PT_ADAM_BETA2      = 0.999
 PT_SHUFFLE_BUFFER  = 128_000
 
-EPOCHS_PER_WORKER = 5000
 CHECKPOINT_EVERY  = 20
-DEFAULT_MODEL     = "16m-precond-smartgate"
+DEFAULT_MODEL     = "16m-precond-smartgate-xc0h"
 DEFAULT_RUN_TAG   = "val_test_multi"
+DEFAULT_MAX_EPOCH = 3501
+DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_070526\shuffled"
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +265,7 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
     val_logits = np.concatenate(all_val, axis=0)
     target_wdl = bundle["value_out"].numpy()
     pstack     = bundle["policy_logits"].numpy()
-    mstack     = bundle["mask"].numpy()
+    mstack     = (pstack > 0).astype(np.int32)
 
     val_wdl    = scipy.special.softmax(val_logits, axis=1)
     val_q      = val_wdl[:, 0] - val_wdl[:, 2]
@@ -497,13 +498,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--tfrec-dir",
-        default=os.getenv(
-            "BOOTSTRAP_TFREC_DIR",
-            r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl",
-        ),
-        help="path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)",
+        default=DEFAULT_TFREC_DIR,
+        help="path to .tfrecord.gz files",
     )
-    parser.add_argument("--max-epoch", type=int,   default=DEFAULT_MAX_EPOCH)
+    parser.add_argument("--max-epoch", type=int, default=DEFAULT_MAX_EPOCH)
     args = parser.parse_args()
 
     if not args.tfrec_dir:
@@ -513,12 +511,12 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
 
     name = args.model
-    print(f"[supervisor] model={name}")
-    print(f"[supervisor] run_dir={run_dir}")
-    print(f"[supervisor] tfrec_dir={args.tfrec_dir}")
     from chessbot.pretrain import LR_MIN, LR_MAX
-    print(f"[supervisor] max_epoch={args.max_epoch}")
-    print(f"[supervisor] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
+    print(f"[train] model={name}")
+    print(f"[train] run_dir={run_dir}")
+    print(f"[train] tfrec_dir={args.tfrec_dir}")
+    print(f"[train] max_epoch={args.max_epoch}")
+    print(f"[train] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
           f"  lr_range=[{LR_MIN:.1e}, {LR_MAX:.1e}]")
 
     all_files = list_tfrecord_files(args.tfrec_dir)
@@ -526,49 +524,30 @@ def main() -> None:
         parser.error(f"no .tfrecord.gz files found in {args.tfrec_dir}")
 
     train_files, val_files = split_train_val(all_files)
-    print(f"[supervisor] train_files={len(train_files)}  val_files={len(val_files)}")
+    print(f"[train] train_files={len(train_files)}  val_files={len(val_files)}")
 
     resume = get_resume_epoch(run_dir, name)
 
-    while resume < args.max_epoch:
-        block_start = (resume // EPOCHS_PER_WORKER) * EPOCHS_PER_WORKER
-        end_epoch   = min(block_start + EPOCHS_PER_WORKER, args.max_epoch)
+    wargs = {
+        "name":        name,
+        "run_dir":     run_dir,
+        "train_files": train_files,
+        "val_files":   val_files,
+        "model_dir":   MODEL_DIR,
+        "start_epoch": resume,
+        "end_epoch":   args.max_epoch,
+        "max_epoch":   args.max_epoch,
+    }
+    worker_main(wargs)
 
-        print(
-            f"\n[supervisor] block {block_start // EPOCHS_PER_WORKER}"
-            f"  epochs {resume}..{end_epoch - 1}"
-        )
-
-        wargs = {
-            "name":        name,
-            "run_dir":     run_dir,
-            "train_files": train_files,
-            "val_files":   val_files,
-            "model_dir":   MODEL_DIR,
-            "start_epoch": resume,
-            "end_epoch":   end_epoch,
-            "max_epoch":   args.max_epoch,
-        }
-
-        exit_code = spawn_block(wargs)
-
-        if exit_code == 0:
-            resume = end_epoch
-            print(f"[supervisor] block complete  ->  resume={resume}")
-        else:
-            print(f"[supervisor] worker crashed (exit={exit_code}), recovering ...")
-            time.sleep(5)
-            resume = get_resume_epoch(run_dir, name)
-            print(f"[supervisor] will retry from epoch {resume}")
-
-    print(f"\n[supervisor] training complete ({args.max_epoch} epochs)")
+    print(f"\n[train] training complete ({args.max_epoch} epochs)")
 
     last_ckpt = find_last_checkpoint(run_dir, name)
     if last_ckpt >= 0:
         import torch
         from chessbot.train_pytorch import save_pt_model as export_ts
         src = ckpt_path(run_dir, name, last_ckpt)
-        print(f"[supervisor] exporting final model from {os.path.basename(src)}")
+        print(f"[train] exporting final model from {os.path.basename(src)}")
         raw = torch.load(src, map_location="cpu")
         arch_name = raw.get("arch", name) if isinstance(raw, dict) else name
         cfg = VARIANTS[arch_name]
@@ -579,8 +558,8 @@ def main() -> None:
         ts_path   = os.path.join(run_dir, f"{run_tag}_model.ts")
         torch.save(raw["model"], pt_path)
         export_ts(model, ts_path, arch=arch_name)
-        print(f"[supervisor] export complete -> {pt_path}")
-        print(f"[supervisor] export complete -> {ts_path}")
+        print(f"[train] export complete -> {pt_path}")
+        print(f"[train] export complete -> {ts_path}")
 
 
 if __name__ == "__main__":

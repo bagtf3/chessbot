@@ -13,27 +13,27 @@ uses `floor(77000 / 10240) * 10240 = 71680` games, chosen randomly from the
 
 All other (non-end-of-round) retrains keep the current approach unchanged.
 
-## 2. Update bootstrap data pipeline for 1858 policy output
+## 2. Update bootstrap data pipeline for 1858 policy output [PRODUCER DONE]
 
-Update the `build_bootstrap_data` suite of scripts, `shuffle_xco`,
-`lco_to_xco`, and the other tools inside `/repos/xerces_training`, along with
-`bootstrap_model_async_tfrec_pt` in chessbot, so the whole bootstrap data
-pipeline works with the new 1858-slot policy output instead of the old
-4288-flat/legacy target shape.
+Producer side complete. `scripts/data/build_bootstrap_records.py` is the new
+canonical bootstrap builder. It combines two sources into xc0h-K6 tfrecords
+with 1858 policy targets:
 
-This spans two repos:
-- `chessbot/scripts/train/bootstrap_model_async_tfrec_pt.py` (and its sibling
-  `bootstrap_model_async_tfrec.py`) — consumer side, needs to read/feed
-  1858-dim policy targets into the PT model instead of whatever shape it
-  currently expects.
-- `xerces_training` (`chunkparser.py`, `parse_utils.py`, `uci_to_idx.py`,
-  `shufflebuffer.py`, and the `shuffle_xco` / `lco_to_xco` conversion tools) —
-  producer side, needs the LC0 chunk -> Xerces record conversion and shuffle
-  pipeline to emit/consume 1858-dim policy consistently end to end.
+- **lc0 source** — V6 binary chunks → `v6_planes_to_xc0h` (direct from bits),
+  3 workers, each draining a disjoint chunk subset
+- **xc0 source** — selfplay game logs → `board.history_tokens(K=6)` via
+  pyfastchess, 4 workers, each handling a disjoint subset of run tags
 
-Audit each script for hardcoded policy dims (4288, legacy flat indices, etc.)
-and reconcile them against the 1858 legal-move domain used by
-`build_pt_precond_smartgate`.
+Run tags (xc0 source): `16m_precond_run2`, `16m_precond_run1`,
+`16m_precond_run0`, `precond_run5..1`, `cfiw_wdl_run2`, `cfiw_wdl_run1`.
+
+Filters: `GAME_CPL_MAX=20`, `MOVE_CPL_MAX=15`, skip SF moves, skip plies with
+no tree search data. Policy is raw-normalized visit counts (no clipping). No
+legal mask stored. Target: 20M records per source (40M combined). Shuffle pass
+via `shuffle_xco.py` into `xc0hK6_070526/shuffled`. Running at ~14k rec/sec.
+
+Consumer side (`bootstrap_model_async_tfrec_pt.py`) still needs to be updated
+to read 1858-dim policy targets from the new record schema.
 
 ## 3. Compositional (move-geometry) embedding init -- init only, learnable
 
@@ -174,3 +174,19 @@ ablation arm.
 Let the existing bake-off arms (curr-only vs 4hist vs lc0; nohmc / norep / nostm)
 define the minimal sufficient token budget (K, which meta channels) before
 committing.
+
+## 5. Byte-encode xc0 records for faster parsing
+
+xc0 tfrecords currently store `xc0h_board` as a raw bytes blob and `policy` as
+float32 bytes, parsed by TF's proto machinery at training time. lc0's V6 binary
+format parses much faster because the struct layout is fixed and tight — no
+proto overhead, direct struct.unpack.
+
+Goal: define a fixed binary layout for xc0h-K6 records analogous to lc0's V6
+struct, write a matching parser in `xerces_training/chunkparser.py` or a new
+`xc0_chunkparser.py`, and update `build_bootstrap_records.py` and the training
+loader to use it. Expected benefit: meaningfully faster data throughput at
+training time, especially with many workers. Design the struct so K is fixed at
+build time (e.g. K=6 → `int16[393] + float32[1858] + float32[3]` = tight pack)
+and the file format uses simple gzip-compressed binary chunks with a small
+fixed-size header, mirroring lc0's approach.

@@ -148,8 +148,7 @@ def make_lc0_infer(sess):
 
     pair[0]: (B, 112, 8, 8) uint8 features from get_all_lc0_features().
     Returns (policy_logits[B,1858], wdl_probs[B,3]).
-    Policy indices are already in LC0 order — the C++ tree uses set_lc0_policy(True)
-    so build_priors reads the correct LC0 slots directly.
+    Policy indices are in LC0 order (castling at rook slots, promos at lc0 promo tail).
     """
     input_name   = sess.get_inputs()[0].name
     output_names = [o.name for o in sess.get_outputs()]

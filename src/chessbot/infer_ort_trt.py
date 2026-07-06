@@ -5,7 +5,7 @@ import time
 import numpy as np
 
 
-ENC_SHAPE = {"xc0": "64", "lc0": "112x8x8"}
+ENC_SHAPE = {"xc0": "64", "lc0": "112x8x8", "xc0h": "393"}
 
 
 def enc_dummy(max_bs, encoding_type):
@@ -13,6 +13,8 @@ def enc_dummy(max_bs, encoding_type):
     bs = min(max_bs, 256)
     if encoding_type == "lc0":
         return np.zeros((bs, 112, 8, 8), dtype=np.float16)
+    if encoding_type == "xc0h":
+        return np.zeros((bs, 393), dtype=np.int64)
     return np.zeros((bs, 64), dtype=np.int64)
 
 

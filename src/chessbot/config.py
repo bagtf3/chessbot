@@ -150,7 +150,8 @@ class Config(object):
     # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16
     # tokens; "lc0" = 112x8x8 lc0 planes. Selfplay and retrain MUST agree or the
     # model is fed garbage. Orthogonal to inference_backend (lc0_trt requires lc0).
-    encoding_type            = "xc0"        # "xc0" | "lc0"
+    encoding_type            = "xc0"        # "xc0" | "xc0h" | "lc0"
+    history_K                = 6            # xc0h only: history frame count
 
     # inference / retrain backend selection
     inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt" | "lc0_trt"

@@ -107,6 +107,22 @@ Notes on the snapshot data structure:
 sl_idx comes from pyfastchess.build_sometimes_legal_mask() -- returns bool array (4288,),
 np.where gives the (1858,) indices of the sometimes-legal slots.
 
+## BOOTSTRAP DATA [PRODUCER + CONSUMER DONE - 2025-07-05]
+`scripts/data/build_bootstrap_records.py` generates xc0h-K6 tfrecords with
+1858 policy targets from both lc0 chunks and xc0 selfplay game logs (3 lc0
+workers + 4 xc0 workers, 40M total target). Output goes to
+`xc0hK6_070526/staging` then `shuffle_xco.py` → `\shuffled`.
+
+`scripts/train/bootstrap_model_async_tfrec_pt.py` updated to:
+- Read new schema (xc0h_board/policy/wdl) via updated make_dataset in pretrain.py
+- Use model `16m-precond-smartgate-xc0h` (xc0h_K=6 stem, 393-token input)
+- Default tfrec-dir = xc0hK6_070526/shuffled, max_epoch=3501
+- Run single in-process job (no subprocess spawning)
+- Export pt+ts to val_test_multi at completion
+
+Run command:
+    python scripts/train/bootstrap_model_async_tfrec_pt.py
+
 ## AFTER TEST 4 PASSES
 Remaining work:
   1. Update looper.py to use policy_1858=True when creating the model

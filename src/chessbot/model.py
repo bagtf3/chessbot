@@ -1132,6 +1132,34 @@ def build_pt_precond_smartgate(cfg: dict):
             elif xc0h_input:
                 xc0h_in_ch = XC0H_K * XC0H_DEMB + XC0H_K + 3   # frames + rep + castle + stm + hmc
                 self.xc0h_tok_emb  = nn.Embedding(XC0H_VOCAB, XC0H_DEMB)
+                with torch.no_grad():
+                    d = XC0H_DEMB
+                    empty    = torch.randn(d); knight   = torch.randn(d)
+                    pawn     = torch.randn(d); diagonal = torch.randn(d)
+                    us       = torch.randn(d); orthogon = torch.randn(d)
+                    them     = torch.randn(d); king_prim= torch.randn(d)
+                    pad      = torch.randn(d)
+                    rows = [
+                        empty,                          # 0  empty
+                        us + pawn,                      # 1  us_P
+                        us + knight,                    # 2  us_N
+                        us + diagonal,                  # 3  us_B
+                        us + orthogon,                  # 4  us_R
+                        us + diagonal + orthogon,       # 5  us_Q
+                        us + king_prim,                 # 6  us_K
+                        them + pawn,                    # 7  them_P
+                        them + knight,                  # 8  them_N
+                        them + diagonal,                # 9  them_B
+                        them + orthogon,                # 10 them_R
+                        them + diagonal + orthogon,     # 11 them_Q
+                        them + king_prim,               # 12 them_K
+                        empty + them,                   # 13 EP
+                        pad,                            # 14 PAD
+                    ]
+                    E = torch.stack(rows)
+                    E = E / (E.norm(dim=1, keepdim=True) + 1e-6)
+                    E = E + torch.randn_like(E) * 0.02
+                    self.xc0h_tok_emb.weight.copy_(E)
                 self.xc0h_cast_emb = nn.Embedding(16, 64)
                 # project to CF-1; the CF-th channel is a constant ones-plane appended
                 # after the norm (post-projection, post-LN) so the first ConvBlock's
@@ -1685,6 +1713,7 @@ PT_BUILDERS: dict[str, object] = {
     "13m-precond-conformer":     build_pt_precond_conformer,
     "16m-precond-smartgate":                build_pt_precond_smartgate,
     "16m-precond-smartgate-lc0":            build_pt_precond_smartgate,
+    "16m-precond-smartgate-xc0h":           build_pt_precond_smartgate,
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "hybrid-conv-attn":          build_pt_hybrid_conv_attn,

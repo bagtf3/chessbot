@@ -65,3 +65,32 @@ Games terminate on checkmate or draw by the rules, but several early-exit condit
 - **Max game length** — hard cap to prevent runaway games.
 
 Syzygy tablebase adjudication (<= 5 pieces) and material-diff cutoffs are also configurable per run. The adjudicator flags in effect for a game are recorded with its training data so rescoring knows how each outcome was reached.
+
+## Bootstrap Data Pipeline
+
+Before self-play begins, the model is pretrained on a large static dataset built
+from two sources. `scripts/data/build_bootstrap_records.py` is the canonical
+tool for this.
+
+**lc0 source** — lc0 V6 binary training chunks decoded directly to xc0h tokens
+via `v6_planes_to_xc0h` (no float32 intermediate). Draws are dropped at 50%.
+3 workers each drain a disjoint chunk subset.
+
+**xc0 source** — Xerces selfplay game logs from historical run tags. For each
+game that passes a `GAME_CPL_MAX=20` filter, plies with SF analysis loss
+<= `MOVE_CPL_MAX=15` and tree search data are extracted. The board is replayed
+through `board.history_tokens(K=6)` via pyfastchess to produce the xc0h
+encoding, preserving full opening history via warm replay of the prefix. SF
+moves are skipped. 4 workers each handle a disjoint subset of run tags.
+
+Both sources produce records with schema:
+
+```
+xc0h_board  int16[393]    K=6 history frames + meta tokens
+policy      float32[1858] normalized visit distribution (no clipping)
+wdl         float32[3]    Z_BLEND * result_wdl + (1-Z_BLEND) * search_wdl
+```
+
+Target is 20M records per source (40M total). Output goes to a staging
+directory, then a single shuffle pass via `scripts/data/shuffle_xco.py`
+produces the final training-ready shards.

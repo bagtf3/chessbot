@@ -106,30 +106,20 @@ def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BA
     tf.get_logger().setLevel("ERROR")
 
     feature_spec = {
-        "enc_in":        tf.io.FixedLenFeature([], tf.string),
-        "mask":          tf.io.FixedLenFeature([], tf.string),
-        "policy_logits": tf.io.FixedLenFeature([], tf.string),
-        "value_out":     tf.io.FixedLenFeature([3], tf.float32),
-        "weight":        tf.io.FixedLenFeature([], tf.float32),
+        "xc0h_board": tf.io.FixedLenFeature([], tf.string),
+        "policy":     tf.io.FixedLenFeature([], tf.string),
+        "wdl":        tf.io.FixedLenFeature([3], tf.float32),
     }
 
     def parse_record(raw):
         feat   = tf.io.parse_single_example(raw, feature_spec)
-        enc_in = tf.cast(
-            tf.io.parse_tensor(feat["enc_in"], out_type=tf.int16), tf.int32
-        )
-        mask    = tf.io.parse_tensor(feat["mask"], out_type=tf.int32)
-        policy  = tf.io.parse_tensor(feat["policy_logits"], out_type=tf.float32)
-        mask_f  = tf.cast(mask, tf.float32)
-        n_legal = tf.reduce_sum(mask_f)
-        #policy  = (1.0 - UNIFORM_BLEND) * policy + UNIFORM_BLEND * (mask_f / n_legal)
-        policy  = tf.minimum(policy, POLICY_MAX_CLIP)
-        policy  = policy / tf.reduce_sum(policy)
-        value   = feat["value_out"]
-        weight  = feat["weight"]
+        enc_in = tf.cast(tf.io.decode_raw(feat["xc0h_board"], tf.int16), tf.int32)
+        policy = tf.io.decode_raw(feat["policy"], tf.float32)
+        policy = policy / tf.reduce_sum(policy)
+        weight = tf.constant(1.0, dtype=tf.float32)
         return (
-            {"enc_in": enc_in, "mask": mask},
-            {"policy_logits": policy, "value_out": value},
+            {"enc_in": enc_in, "mask": tf.zeros([1858], dtype=tf.int32)},
+            {"policy_logits": policy, "value_out": feat["wdl"]},
             {"policy_logits": weight, "value_out": weight},
         )
 

@@ -76,3 +76,31 @@ training time, especially with many workers. Design the struct so K is fixed at
 build time (e.g. K=6 → `int16[393] + float32[1858] + float32[3]` = tight pack)
 and the file format uses simple gzip-compressed binary chunks with a small
 fixed-size header, mirroring lc0's approach.
+
+## 3. Flat visit distribution sharpening in rescore
+
+When the MCTS visit distribution is very flat (low conviction, all moves near-equal
+visits) the model picked no clear winner and the training target is noisy. But if
+CPL=0 (the model's top move matches SF), the model was actually right — it just
+wasn't confident. In that case we can safely sharpen the visit distribution before
+using it as a policy target.
+
+Proposed: in `rescore.py`, after computing the visit-based policy target, check if
+the distribution entropy is above some threshold (or equivalently if the top-move
+visit fraction is below some floor). If CPL=0 and the distribution is flat, apply a
+sharpening temperature to the raw visit counts before renormalizing:
+
+```python
+pi_sharp = pi ** 1.2   # or similar exponent > 1.0
+pi_sharp /= pi_sharp.sum()
+```
+
+This increases conviction on the correct move without fabricating signal the search
+didn't produce. The failure mode this targets: late endgames where priors are weak,
+Q differences between moves are small, and every move looks equally good to both the
+model and the search — resulting in a flat pi that teaches nothing. If the model was
+right, reward that with a sharper target. If CPL != 0, leave the target as-is (don't
+sharpen a wrong distribution).
+
+Tunable: the exponent (1.2 is a starting point), the entropy/flatness threshold that
+triggers sharpening, and whether to gate on CPL=0 strictly or allow CPL <= N centipawns.

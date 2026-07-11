@@ -459,6 +459,7 @@ class ChessGame(object):
         if scenario == 'piece_training' and not self.config.is_validation_run:
             tree_cfg = self.config.copy()
             tree_cfg.move_sample_temp_range = [0.2, 0.2]
+        
         self.tree = MCTSTree(self.board, tree_cfg)
         self.tree_data = {}
         self.moves_played = []
@@ -548,7 +549,7 @@ class ChessGame(object):
             "stop_reason": self.tree.sim_stop_reason, "stm": turn
         }
         
-        # IMPORTANT, this MUST happen before the move is pushed, otherwise the values change
+        # IMPORTANT, this MUST happen before the move is pushed otherwise the vals change
         best_d = details[0]
         best_wdl = (rnd(best_d.win, 4), rnd(best_d.draw, 4), rnd(best_d.loss, 4))
         best_q = rnd(best_d.Q, 4)
@@ -561,8 +562,10 @@ class ChessGame(object):
         data['best_wdl'] = best_wdl
         data['Q_stm'] = Q_stm
         data['Q_white'] = Q_white
+
         if self.is_stockfish_turn() and self.sf_wdl is not None:
             data['sf_wdl'] = self.sf_wdl
+        
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 

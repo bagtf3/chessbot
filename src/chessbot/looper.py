@@ -14,7 +14,9 @@ now = time.time
 
 import numpy as np
 import pandas as pd
-from pyfastchess import raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats, MCTSForest
+from pyfastchess import (
+    raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats, MCTSForest
+)
 
 from chessbot import SF_LOC
 
@@ -97,6 +99,7 @@ class GameLooper(object):
             model = torch.jit.load(cfg.model_path, map_location="cpu")
             self.model, self.infer = make_pt_infer(
                 model, max_bs=cfg.macro_batch, encoding_type=encoding)
+            
         elif cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
@@ -105,11 +108,13 @@ class GameLooper(object):
                 cfg.macro_batch,
                 encoding_type=encoding,
             )
+
         elif cfg.inference_backend == "lc0_trt":
             if encoding != "lc0":
                 raise RuntimeError(
                     "lc0_trt inference requires encoding_type='lc0' (real Leela "
                     "reads 112x8x8 planes); got encoding_type=%r" % encoding)
+            
             from chessbot.lc0_utils import make_lc0_trt_session, make_lc0_infer
             lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
             lc0_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
@@ -117,6 +122,7 @@ class GameLooper(object):
                 raise RuntimeError(
                     "lc0_trt requires lc0_distill_model_name and LC0_DISTILL_TRT_CACHE"
                 )
+
             lc0_onnx = os.path.join(lc0_cache, f'{lc0_model}.onnx')
             sess = make_lc0_trt_session(
                 lc0_onnx, lc0_model, lc0_cache, cfg.macro_batch,
@@ -234,6 +240,9 @@ class GameLooper(object):
         max_fastpath = 1024
         mps = self.mps
 
+        # nn macro batch
+        macro = cfg.macro_batch
+        
         #(batch size, target), counts returned
         pred_fill, counts = [], []
         finished_ids = set()
@@ -256,8 +265,8 @@ class GameLooper(object):
             if not self.active_games:
                 if self.stop_at_empty:
                     break
-                # queue transiently empty — wait up to 2min for parent to refill
-                for _ in range(240):
+                # queue transiently empty — wait up to 3min for parent to refill
+                for _ in range(360):
                     time.sleep(0.5)
                     self.pull_from_queue()
                     if self.active_games:
@@ -324,8 +333,8 @@ class GameLooper(object):
                     bonus += g_mbs
                     continue
 
-                # if bonus available we can bump our microbatch up to 2x
-                this_mbs = g_mbs + min(bonus, g_mbs) if bonus > 0 else g_mbs
+                # if bonus available we can bump our microbatch up by at most 2
+                this_mbs = g_mbs + max(0, min(bonus, 2))
                 res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
                 nn, n_leafs = self.process_results(res, counts, this_mbs)
                 mbs_used.append(this_mbs)
@@ -338,10 +347,9 @@ class GameLooper(object):
 
             keys_np, enc_np = self.batch_encoder()
             if len(keys_np):
-                macro = cfg.macro_batch
                 for i in range(0, len(keys_np), macro):
                     pred_fill.append(
-                        self.format_and_predict(keys_np[i:i + macro], enc_np[i:i + macro])
+                        self.format_and_predict(keys_np[i:i+macro], enc_np[i:i+macro])
                     )
 
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
@@ -360,11 +368,10 @@ class GameLooper(object):
         nt = res.count_terminal
         nc = res.count_cached
 
-        pl = res.total_priorless
+        bl = res.total_blocked
         pu = res.total_puct
 
         mv = res.total_must_visit
-        wp = res.total_with_priors
 
         sk = res.total_skipped
         pr = res.total_pruned
@@ -380,10 +387,9 @@ class GameLooper(object):
 
         counts.append([
             nn, fastpaths, nt, nc, f_stop, c_stop,
-            pl, pu,
-            mv, wp,
-            sk, pr, pen
+            bl, pu, mv, sk, pr, pen
         ])
+
         return nn, n_leafs
 
     def format_and_predict(self, keys_np, boards_np):
@@ -402,10 +408,12 @@ class GameLooper(object):
         start = now()
         if self.last_infer_end is not None:
             self.infer_gaps.append(start - self.last_infer_end)
+
         probs_np, vals_np = self.infer((boards_np,))
         raw_cache_bulk_insert_np(keys_np, vals_np, probs_np)
         self.last_infer_end = now()
         self.prediction_times.append(self.last_infer_end - start)
+        
         return B
 
     def finalize_game_data(self, game):
@@ -511,15 +519,14 @@ class GameLooper(object):
         s_fast_stops = sum([r[4] for r in counts])
         s_collect_stops = sum([r[5] for r in counts])
 
-        s_priorless = sum([r[6] for r in counts])
+        s_blocked = sum([r[6] for r in counts])
         s_puct = sum([r[7] for r in counts])
 
         s_must_visit = sum([r[8] for r in counts])
-        s_with_priors = sum([r[9] for r in counts])
 
-        s_skipped = sum([r[10] for r in counts])
-        s_pruned = sum([r[11] for r in counts])
-        s_penalty = sum([r[12] for r in counts])
+        s_skipped = sum([r[9] for r in counts])
+        s_pruned = sum([r[10] for r in counts])
+        s_penalty = sum([r[11] for r in counts])
 
         telemetry = {
             "ts": ts_now,
@@ -542,11 +549,10 @@ class GameLooper(object):
             "s_fast_stops": s_fast_stops,
             "s_collect_stops": s_collect_stops,
 
-            "s_priorless": s_priorless,
+            "s_blocked": s_blocked,
             "s_puct": s_puct,
 
             "s_must_visit": s_must_visit,
-            "s_with_priors": s_with_priors,
 
             "s_skipped": s_skipped,
             "s_pruned": s_pruned,

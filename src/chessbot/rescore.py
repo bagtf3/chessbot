@@ -771,13 +771,14 @@ class Rescorer(object):
                 xerces_uci = visits[0][0]
 
             top_uci = visits[0][0]
-            if xerces_uci != top_uci:
-                vmap = {u: n for u, n in visits}
-                top_n = vmap.get(top_uci, 1)
-                xc0_n = vmap.get(xerces_uci, 1)
-                vmap[top_uci] = max(1, xc0_n)
-                vmap[xerces_uci] = max(1, top_n)
-                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            # NOTE: visit swap disabled for raw_visits experiment
+            # if xerces_uci != top_uci:
+            #     vmap = {u: n for u, n in visits}
+            #     top_n = vmap.get(top_uci, 1)
+            #     xc0_n = vmap.get(xerces_uci, 1)
+            #     vmap[top_uci] = max(1, xc0_n)
+            #     vmap[xerces_uci] = max(1, top_n)
+            #     visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
@@ -1036,25 +1037,9 @@ class Rescorer(object):
 
             is_true_blunder = not (played_cp > 350 and Z_stm > 0)
 
-            # visit correction based on move quality
+            # NOTE: visit correction disabled for raw_visits experiment
             if loss_this <= EQUIV:
                 kl_eligible = True
-
-                # respect SF best move, set a modest floor
-                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 4))
-            
-            elif loss_this <= cfg.rescore_inaccuracy_cp or missed_mate:
-                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
-
-            elif loss_this < blunder_cp:
-                vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
-                if is_true_blunder:
-                    vmap[xc0_uci] = max(1, xc0_n // 2)
-
-            else:
-                vmap[best_uci] = xc0_n
-                if is_true_blunder:
-                    vmap[xc0_uci] = max(1, xc0_n // 4)
 
             is_blunder = loss_this >= blunder_cp and is_true_blunder
 

@@ -1770,9 +1770,9 @@ class RecordKeeper(object):
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
             "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
-            "s_priorless", "s_puct", "preds_per_second",
+            "s_blocked", "s_puct", "preds_per_second",
 
-            "s_must_visit", "s_with_priors",
+            "s_must_visit",
             "s_skipped", "s_pruned", "s_penalty",
 
             # priors cache (per-worker) telemetry, aggregate across workers
@@ -1854,11 +1854,10 @@ class RecordKeeper(object):
         s_cached = summed.get("s_cached", 0)
         s_fast_stops = summed.get("s_fast_stops", 0)
         s_collect_stops = summed.get("s_collect_stops", 0)
-        s_priorless = summed.get("s_priorless", 0)
+        s_blocked = summed.get("s_blocked", 0)
         s_puct = summed.get("s_puct", 0)
 
         s_must_visit = summed.get("s_must_visit", 0)
-        s_with_priors = summed.get("s_with_priors", 0)
 
         s_skipped = summed.get("s_skipped", 0)
         s_pruned = summed.get("s_pruned", 0)
@@ -1898,10 +1897,9 @@ class RecordKeeper(object):
         left3b = f"[pred stats] actual preds/s={realized_preds_per_sec:.1f}"
         right3b = f"ideal preds/s={preds_per_sec:.1f}"
 
-        tot = s_priorless + s_with_priors + s_must_visit
-        wo_priors = 100.0 * s_priorless / tot if tot > 0.0 else 0.0
         puct_per_leaf = s_puct / total_overall if total_overall else 0.0
-        left4 = f"[puct stats] priorless={s_priorless:.0f} ({wo_priors:.3f}%)"
+        blocked_pct = 100.0 * s_blocked / (s_blocked + s_collected) if (s_blocked + s_collected) > 0 else 0.0
+        left4 = f"[puct stats] blocked={s_blocked:.0f} ({blocked_pct:.3f}%)"
         right4 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
 
         tot_skip = s_skipped + s_pruned

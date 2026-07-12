@@ -120,6 +120,9 @@ class Config(object):
     fpu_reduction = 0.1
     qema_span = 40
     qdelta_span = 100
+    allow_sharpening = False
+    sharpening_factor = 0.1
+    sharpening_step = 200
 
     # randomness
     add_root_noise = True

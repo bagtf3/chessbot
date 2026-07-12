@@ -72,6 +72,10 @@ class MCTSTree(fasttree):
             float(cfg.contempt_fight_c),
             float(cfg.contempt_save_c),
         )
+        if cfg.allow_sharpening:
+            self.set_allow_sharpening(True)
+            self.set_sharpening_factor(float(cfg.sharpening_factor))
+            self.set_sharpening_step(int(cfg.sharpening_step))
 
         # early-stop rolling state
         self._es_last_checked_at = 0

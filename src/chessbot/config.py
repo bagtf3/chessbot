@@ -85,9 +85,6 @@ class Config(object):
     rescore_cache_size = 50000
     rescore_n_sf_threads = 1
 
-    # blunder replay
-    blunder_replay_min_ply = 20
-
     use_collar_rescoring = False
     collar_threshold_cp = 300
     collar_n_consec = 5

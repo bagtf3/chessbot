@@ -381,9 +381,6 @@ class Rescorer(object):
         self.last_10_bmrs = []
         self.last_10_plies = []
 
-        self.blunder_replay_specs = []
-        self.blunder_replay_counts = {'winning': 0, 'neutral': 0, 'mismatch': 0}
-
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
             'total_pos': 0, 'seen': 0,
@@ -1092,43 +1089,9 @@ class Rescorer(object):
                 'cpl':             loss_this,
             })
 
-        # collar-adjusted result targets and blunder replay candidates
-        eff_z_by_ply, n_triggers, replayable_blunders = collar_z_map(
-            eval_trace, result, cfg, self.config.blunder_replay_min_ply, gid
-        )
+        # collar-adjusted result targets
+        eff_z_by_ply, n_triggers = collar_z_map(eval_trace, result, cfg, gid)
 
-        # look for and handle blunder replays
-        for blunder_ply, blunder_type, blunderer_is_white in replayable_blunders:
-            if vs_stockfish and blunderer_is_white == sf_color:
-                # SF blundered, skip
-                self.blunder_replay_counts['mismatch'] += 1
-                continue  
-
-            if blunder_type == 'neutral' and random.random() > 0.25:
-                continue
-
-            actual_stm_is_white = turn_at.get(blunder_ply)
-            if actual_stm_is_white is None:
-                self.blunder_replay_counts['mismatch'] += 1
-                continue
-
-            self.blunder_replay_specs.append({
-                'fen': game_data['start_fen'],
-                'moves': game_data['moves_played'][:blunder_ply],
-                'stockfish_is_white': actual_stm_is_white,
-                'source_game_id': gid
-            })
-
-            self.blunder_replay_counts[blunder_type] += 1
-            total = sum(self.blunder_replay_counts.values())
-            if total % 50 == 0:
-                c = self.blunder_replay_counts
-                print(
-                    f"[blunder replay] tally at {total}:"
-                    f" winning={c['winning']} neutral={c['neutral']}"
-                    f" mismatch={c['mismatch']}"
-                )
-        
         n_diff = 0
         hard_accepted = []
         soft_pool = []
@@ -1695,7 +1658,7 @@ class Rescorer(object):
         self.analyzed_results = []
 
 # helpers
-def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
+def collar_z_map(eval_trace, game_result, cfg, game_id=None):
     """
     Walk eval_trace (list of (ply, white_pov_cp)) and return
     (eff_z_by_ply, n_triggers).
@@ -1716,7 +1679,7 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
     reset_cp = cfg.collar_reset_cp
 
     if not eval_trace:
-        return {}, 0, []
+        return {}, 0
 
     plies = [p for p, _ in eval_trace]
     evals = [e for _, e in eval_trace]
@@ -1727,25 +1690,9 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
     count = 0
     segment_start = 0
     n_triggers = 0
-    replayable_blunders = []
-    neutral_blunders = []
     collar_set_by_non_winner = False
-    neutral_position = False
-    neutral_count = 0
 
     for i, ev in enumerate(evals):
-        # detect a neutral -> losing deviation
-        if neutral_position and abs(ev) >= reset_cp:
-            if plies[i] >= replay_min_ply:
-                # if the delta is large, assume blunder
-                if abs(ev - evals[i-1]) > abs(reset_cp - threshold):
-                    # and the current STM loses the game
-                    if game_result > 0 if ev > 0 else game_result < 0:
-                        neutral_blunders.append((plies[i-1], 'neutral', ev < 0))
-
-        neutral_count = neutral_count + 1 if abs(ev) < reset_cp else 0
-        neutral_position = neutral_count >= n_consec
-
         if collar is None:
             if ev > threshold:
                 if count <= 0:
@@ -1777,27 +1724,17 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
             )
 
             if broken:
-                # first, check if replayable based on collar holder and prev eval
-                if plies[i] >= replay_min_ply:
-                    if collar_set_by_non_winner and abs(evals[i-1]) > threshold:
-                        replayable_blunders.append(
-                            (plies[i-1], 'winning', collar == 'white')
-                        )
-
-                # then continue collar logic
                 segment_start = i
                 collar = None
                 count = 0
                 n_triggers += 1
-
             else:
                 collar_state[i] = collar
 
     eff_z = {}
 
-    # if we detected 0 flips, no updates.
     if not n_triggers:
-        return eff_z, n_triggers, neutral_blunders
+        return eff_z, n_triggers
 
     for i, ply in enumerate(plies):
         if collar_state[i] == 'white':
@@ -1807,11 +1744,10 @@ def collar_z_map(eval_trace, game_result, cfg, replay_min_ply, game_id=None):
         else:
             eff_z[ply] = float(game_result)
 
-    # sanity check: if all eff_z values collapsed back to game_result, no real flips
     if all(v == float(game_result) for v in eff_z.values()):
-        return {}, 0, neutral_blunders
+        return {}, 0
 
-    return eff_z, n_triggers, replayable_blunders + neutral_blunders
+    return eff_z, n_triggers
 
 
 def value_weight_for_game(cfg, is_draw):

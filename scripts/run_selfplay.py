@@ -122,38 +122,12 @@ def child_looper(
         looper.run(stop_ev)
 
 
-def top_up_queues(game_queue, sf_queue, game_gen, rscr=None, budget=None, target=None):
+def top_up_queues(game_queue, sf_queue, game_gen, budget=None, target=None):
     added = 0
     if target is None:
         target = GAME_QUEUE_MIN * 2
 
     sf_target = target // 2
-
-    # drain pending blunder replays onto sf_queue before filling with regular games
-    if rscr is not None and sf_queue is not None:
-        while rscr.blunder_replay_specs:
-            if budget is not None and added >= budget:
-                break
-
-            spec_data = rscr.blunder_replay_specs.pop(0)
-            meta = {
-                'scenario': 'blunder_replay',
-                'vs_stockfish': True,
-                'stockfish_is_white': spec_data['stockfish_is_white'],
-            }
-
-            game_spec_cfg = resolve_cfg(game_gen.config)
-
-            # update config on blunder replay for deeper search
-            game_spec_cfg.sample_moves = False
-            game_spec_cfg.sf_move_sims = max(300, game_spec_cfg.sf_move_sims)
-            
-            sf_queue.put(GameSpec(
-                fen=spec_data['fen'], moves=spec_data['moves'],
-                meta=meta, cfg=game_spec_cfg,
-            ))
-            
-            added += 1
 
     while budget is None or added < budget:
         game_ok = game_queue.qsize() >= target
@@ -433,7 +407,7 @@ def main(run_tag):
                 n_games = working_cfg.n_games
                 initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
                 total_queued = top_up_queues(
-                    game_queue, sf_queue, game_gen, rescorer,
+                    game_queue, sf_queue, game_gen,
                     budget=n_games, target=initial_target,
                 )
 
@@ -467,12 +441,11 @@ def main(run_tag):
 
                 # refill queues; blunder replays trigger a top-up even if queues aren't low
                 if not stop_signal_sent:
-                    has_blunders = bool(rescorer.blunder_replay_specs)
                     sf_low = sf_queue is not None and sf_queue.qsize() < GAME_QUEUE_MIN // 2
                     game_low = game_queue.qsize() < GAME_QUEUE_MIN
-                    if has_blunders or sf_low or game_low:
+                    if sf_low or game_low:
                         added = top_up_queues(
-                            game_queue, sf_queue, game_gen, rescorer,
+                            game_queue, sf_queue, game_gen,
                             budget=n_games - total_queued,
                         )
                         total_queued += added
@@ -580,20 +553,6 @@ def main(run_tag):
             procs = shutdown_round(procs, recent_q, telemetry_q)
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
-
-            if sf_queue is not None:
-                while True:
-                    try:
-                        spec = sf_queue.get_nowait()
-                        if spec.meta.get('scenario') == 'blunder_replay':
-                            rescorer.blunder_replay_specs.append({
-                                'fen': spec.fen,
-                                'moves': spec.moves,
-                                'stockfish_is_white': spec.meta['stockfish_is_white']
-                            })
-                    
-                    except Exception:
-                        break
 
             for q in (game_queue, sf_queue):
                 if q is not None:

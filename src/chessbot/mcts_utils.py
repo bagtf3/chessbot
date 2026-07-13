@@ -68,9 +68,9 @@ class MCTSTree(fasttree):
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
         self.set_contempt(
-            float(cfg.contempt_flip_q),
+            float(cfg.contempt_zero_q),
+            float(cfg.contempt_full_q),
             float(cfg.contempt_fight_c),
-            float(cfg.contempt_save_c),
         )
         if cfg.allow_sharpening:
             self.set_allow_sharpening(True)

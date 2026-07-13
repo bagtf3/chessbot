@@ -1034,9 +1034,25 @@ class Rescorer(object):
 
             is_true_blunder = not (played_cp > 350 and Z_stm > 0)
 
-            # NOTE: visit correction disabled for raw_visits experiment
-            if loss_this <= EQUIV:
-                kl_eligible = True
+            # strong move, do nothing
+            if loss_this <= cfg.rescore_inaccuracy_cp:
+                # very strong
+                if loss_this <= EQUIV:
+                    kl_eligible = True
+
+            elif missed_mate:
+                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
+
+            elif loss_this < blunder_cp:
+                vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, xc0_n // 2)
+            
+            # true blunder, harsh penalty
+            else:
+                vmap[best_uci] = xc0_n
+                if is_true_blunder:
+                    vmap[xc0_uci] = max(1, xc0_n // 4)
 
             is_blunder = loss_this >= blunder_cp and is_true_blunder
 

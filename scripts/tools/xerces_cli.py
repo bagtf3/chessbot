@@ -63,9 +63,9 @@ class Cfg:
     prior_clip_max   = 0.65
     vscale           = 0.9
     fpu_reduction    = 0.1
-    contempt_flip_q  = 0.0
+    contempt_zero_q  = 0.0
+    contempt_full_q  = 0.5
     contempt_fight_c = 0.0
-    contempt_save_c  = 0.0
     qema_span        = 40
     qdelta_span      = 100
     add_root_noise   = False
@@ -916,7 +916,7 @@ def main():
                else Config.from_json(config_path))
         for attr in ("c_puct", "uniform_eps", "prior_clip_max", "vscale",
                      "fpu_reduction", "pruning_factor",
-                     "contempt_flip_q", "contempt_fight_c", "contempt_save_c"):
+                     "contempt_zero_q", "contempt_full_q", "contempt_fight_c"):
             if hasattr(cfg, attr):
                 cfg_overrides[attr] = getattr(cfg, attr)
         if args.sims is None and hasattr(cfg, "sims_ceiling"):

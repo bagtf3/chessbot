@@ -288,22 +288,18 @@ def iter_xc0_game(game, sf_df):
         board.push_uci(move_played)
 
 
-def xc0_stream(run_tags, stop_evt):
-    for rt in run_tags:
+def xc0_stream(run_tag, stop_evt):
+    games, sf_by_gid = load_xc0_games(run_tag)
+    for game in games:
         if stop_evt.is_set():
             return
-        games, sf_by_gid = load_xc0_games(rt)
-        for game in games:
-            if stop_evt.is_set():
-                return
-            sf_df = sf_by_gid.get(game["game_id"])
-            yield from iter_xc0_game(game, sf_df)
-        games = sf_by_gid = None
+        sf_df = sf_by_gid.get(game["game_id"])
+        yield from iter_xc0_game(game, sf_df)
 
 
-def xc0_worker(name, run_tags, out_dir, target, shared_total, stop_evt, log_q, prefix):
+def xc0_worker(name, run_tag, out_dir, target, shared_total, stop_evt, log_q, prefix):
     os.makedirs(out_dir, exist_ok=True)
-    run_source(name, xc0_stream(run_tags, stop_evt),
+    run_source(name, xc0_stream(run_tag, stop_evt),
                out_dir, target, shared_total, stop_evt, log_q, prefix)
     os._exit(0)
 
@@ -374,11 +370,13 @@ def run_source(name, record_gen, out_dir, target, shared_total, stop_evt, log_q,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lc0-dir",  default=DEFAULT_LC0_DIR)
-    ap.add_argument("--out-dir",  default=DEFAULT_OUT_DIR)
-    ap.add_argument("--run-tags", nargs="+", default=RUN_TAGS)
-    ap.add_argument("--target",   type=int, default=TARGET_PER_SOURCE,
-                    help="records per source (lc0 and xc0 each run to this)")
+    ap.add_argument("--lc0-dir",    default=DEFAULT_LC0_DIR)
+    ap.add_argument("--out-dir",    default=DEFAULT_OUT_DIR)
+    ap.add_argument("--run-tags",   nargs="+", default=RUN_TAGS)
+    ap.add_argument("--lc0-target", type=int, default=TARGET_PER_SOURCE)
+    ap.add_argument("--xc0-target", type=int, default=TARGET_PER_SOURCE)
+    ap.add_argument("--workers",    type=int, default=LC0_WORKERS + XC0_WORKERS,
+                    help="total concurrent workers of any type")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -402,46 +400,65 @@ def main():
     xc0_ctr  = ctx.Value("q", 0)
     log_q    = ctx.Queue()
 
-    procs = {}
+    # pending job list: supervisor pops one at a time and spawns a worker
+    pending = (
+        [("lc0", s) for s in partition(lc0_chunks, LC0_WORKERS)] +
+        [("xc0", rt) for rt in args.run_tags]
+    )
 
-    for i, subset in enumerate(partition(lc0_chunks, LC0_WORKERS)):
-        name = f"lc0-{i}"
-        procs[name] = ctx.Process(
-            target=lc0_worker,
-            args=(name, subset, args.out_dir, args.target,
-                  lc0_ctr, lc0_stop, log_q, f"lc0_{i}"))
+    active = {}   # name -> Process
+    seq    = [0]  # monotonic worker id
 
-    for i, tags in enumerate(partition(list(args.run_tags), XC0_WORKERS)):
-        name = f"xc0-{i}"
-        procs[name] = ctx.Process(
-            target=xc0_worker,
-            args=(name, tags, args.out_dir, args.target,
-                  xc0_ctr, xc0_stop, log_q, f"xc0_{i}"))
+    def spawn_next():
+        while pending:
+            kind, item = pending[0]
+            stop = lc0_stop if kind == "lc0" else xc0_stop
+            if stop.is_set():
+                pending.pop(0)
+                continue
+            pending.pop(0)
+            i      = seq[0]; seq[0] += 1
+            name   = f"{kind}-{i}"
+            ctr    = lc0_ctr if kind == "lc0" else xc0_ctr
+            tgt    = args.lc0_target if kind == "lc0" else args.xc0_target
+            fn     = lc0_worker if kind == "lc0" else xc0_worker
+            p = ctx.Process(target=fn,
+                            args=(name, item, args.out_dir, tgt,
+                                  ctr, stop, log_q, f"{kind}_{i}"))
+            p.start()
+            active[name] = p
+            print(f"[supervisor] spawned {name}  "
+                  f"active={len(active)}  pending={len(pending)}", flush=True)
+            return True
+        return False
 
     begin = time.time()
-    for p in procs.values():
-        p.start()
-    print(f"[main] {len(procs)} workers started  target={args.target:,} per source", flush=True)
+    for _ in range(args.workers):
+        if not spawn_next():
+            break
+    print(f"[main] {len(active)} workers running  "
+          f"lc0_target={args.lc0_target:,}  xc0_target={args.xc0_target:,}", flush=True)
 
-    done           = {name: False for name in procs}
-    last_combined  = 0
-    REPORT_EVERY   = 50_000
+    last_combined = 0
+    REPORT_EVERY  = 50_000
 
-    while not all(done.values()):
+    while active:
         try:
             msg = log_q.get(timeout=2.0)
         except queue.Empty:
-            for name, p in procs.items():
-                if not done[name] and not p.is_alive():
+            for name, p in list(active.items()):
+                if not p.is_alive():
                     print(f"[{name}] exited without done msg", flush=True)
-                    done[name] = True
+                    del active[name]
+                    spawn_next()
             continue
 
         if msg["kind"] == "done":
-            done[msg["name"]] = True
+            active.pop(msg["name"], None)
             print(f"[{msg['name']}] done  total={msg['total']:,}  "
                   f"shards={msg['shards']}  elapsed={msg['elapsed']:.0f}s  "
                   f"reason={msg['reason']}", flush=True)
+            spawn_next()
         elif msg["kind"] == "progress":
             with lc0_ctr.get_lock():
                 lc0_n = lc0_ctr.value
@@ -451,16 +468,17 @@ def main():
             if combined - last_combined >= REPORT_EVERY:
                 last_combined = combined
                 elapsed = time.time() - begin
-                lc0_rate  = lc0_n / max(elapsed, 1e-9)
-                xc0_rate  = xc0_n / max(elapsed, 1e-9)
+                lc0_rate   = lc0_n / max(elapsed, 1e-9)
+                xc0_rate   = xc0_n / max(elapsed, 1e-9)
                 total_rate = combined / max(elapsed, 1e-9)
-                pct = combined / (2 * args.target) * 100
+                pct = combined / (args.lc0_target + args.xc0_target) * 100
                 print(f"[{combined:,}]  "
                       f"lc0={lc0_n:,} ({lc0_rate:,.0f}/s)  "
                       f"xc0={xc0_n:,} ({xc0_rate:,.0f}/s)  "
-                      f"total={total_rate:,.0f}/s  {pct:.1f}%", flush=True)
+                      f"total={total_rate:,.0f}/s  {pct:.1f}%  "
+                      f"active={len(active)}  pending={len(pending)}", flush=True)
 
-    for p in procs.values():
+    for p in active.values():
         p.join(timeout=30)
         if p.is_alive():
             p.terminate()

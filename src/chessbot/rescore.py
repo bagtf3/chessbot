@@ -405,7 +405,7 @@ class Rescorer(object):
 
         book_path = os.getenv('ENRICHMENT_BOOK_PATH', '')
         self.enrichment_book = None
-        if book_path and os.path.exists(book_path):
+        if cfg.lc0_distill_book and book_path and os.path.exists(book_path):
             with open(book_path, 'rb') as f:
                 self.enrichment_book = pickle.load(f)
             print(

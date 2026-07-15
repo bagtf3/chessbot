@@ -117,10 +117,6 @@ class Config(object):
     fpu_reduction = 0.1
     qema_span = 40
     qdelta_span = 100
-    allow_sharpening = False
-    sharpening_factor = 0.1
-    sharpening_step = 200
-
     # randomness
     add_root_noise = True
     dirichlet_eps = 0.3
@@ -145,6 +141,7 @@ class Config(object):
     # LC0 distillation enrichment
     lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
     lc0_distill_batch_size = 64   # positions per ORT inference call
+    lc0_distill_book = True       # whether to load and apply the enrichment book
 
     # board encoding fed to the model. Sole driver of the encoder on every path
     # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16

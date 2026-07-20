@@ -37,30 +37,38 @@ import pyfastchess as pf
 from xerces_training.chunkparser import ChunkParser, V6_STRUCT_STRING
 from xerces_training.parse_utils import v6_planes_to_xc0h, get_policy_vector
 
+from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
+
 from chessbot import SP_DIR
 from chessbot.review import load_game_index, ANALYZE_PKL
+from chessbot.lc0_utils import lc0_logits_to_xc0_batch
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
-DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_070526\staging"
+DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_071826\staging"
 
 RUN_TAGS = [
     "16m_precond_run2", "16m_precond_run1", "16m_precond_run0",
+    "16m_xc0hK6_run4", "16m_xc0hK6_run3", "16m_xc0hK6_run2", "16m_xc0hK6_run1",
     "precond_run5", "precond_run4", "precond_run3", "precond_run2", "precond_run1",
     "cfiw_wdl_run2", "cfiw_wdl_run1",
+    "val_test",
 ]
 
 TARGET_PER_SOURCE = 20_000_000
-LC0_WORKERS      = 3
-XC0_WORKERS      = 4
+LC0_JOBS         = 6
+MAX_CONCURRENT_XC0 = 4
 RECORDS_PER_FILE = 10_240
 Z_BLEND          = 0.5
-LC0_DRAW_DROP    = 0.5
+LC0_DRAW_DROP    = 0.4
+DEDUPE_FLOOR     = 0.05
 GAME_CPL_MAX     = 20
-MOVE_CPL_MAX     = 15
+MOVE_CPL_MAX     = 10
 K                = 6
 
-SKIP_SCENARIOS    = {"blunder_replay"}
-NO_WARM_SCENARIOS = {"startpos", "piece_odds", "piece_training"}
+SKIP_SCENARIOS     = {"blunder_replay"}
+NO_WARM_SCENARIOS  = {"startpos", "piece_odds", "piece_training"}
+LC0_FULL_SCENARIOS = {"paired_validation", "UHO"}
+LC0_DISTILL_BATCH  = 128
 
 SL_IDX   = np.nonzero(pf.build_sometimes_legal_mask().astype(bool))[0]
 N_1858   = len(SL_IDX)
@@ -91,6 +99,49 @@ def partition(items, n):
 
 
 # ---------------------------------------------------------------------------
+# lc0 distillation batcher
+# ---------------------------------------------------------------------------
+
+def lc0_table_index(feat):
+    return (int(feat[104, 0, 0]) | int(feat[105, 0, 0])) + 2 * int(feat[108, 0, 0])
+
+
+class Lc0Batcher:
+    def __init__(self, sess, batch_size=256):
+        self.sess         = sess
+        self.batch_size   = batch_size
+        self.pending      = []   # (features_uint8, lc0_idx, xc0_idx)
+        self.results      = []   # (lc0_wdl, xc0_policy_1858)
+        self.input_name   = sess.get_inputs()[0].name
+        self.output_names = [o.name for o in sess.get_outputs()]
+
+    def submit(self, features_uint8, board):
+        ti      = lc0_table_index(features_uint8)
+        ucis    = board.legal_moves()
+        lc0_idx = np.array([UCI_TO_IDX[ti][u.rstrip('n')] for u in ucis], dtype=np.int32)
+        xc0_idx = np.array(board.moves_to_indices(ucis), dtype=np.int32)
+        self.pending.append((features_uint8, lc0_idx, xc0_idx))
+        if len(self.pending) >= self.batch_size:
+            self._run_batch()
+
+    def _run_batch(self):
+        batch, self.pending = self.pending, []
+        feats = np.stack([p[0] for p in batch]).astype(np.float32)
+        feats[:, 109] /= 99.0
+        outs   = self.sess.run(self.output_names, {self.input_name: feats})
+        logits, wdl_batch = outs[0], outs[1]
+        policies = lc0_logits_to_xc0_batch(logits, [p[1] for p in batch], [p[2] for p in batch])
+        for i, pol in enumerate(policies):
+            self.results.append((np.array(wdl_batch[i], dtype=np.float32), pol))
+
+    def flush_and_drain(self):
+        if self.pending:
+            self._run_batch()
+        out, self.results = self.results, []
+        return out
+
+
+# ---------------------------------------------------------------------------
 # lc0 source
 # ---------------------------------------------------------------------------
 
@@ -99,6 +150,8 @@ def lc0_stream(chunks, stop_evt):
                          draw_drop_rate=LC0_DRAW_DROP,
                          diff_focus_min=1.0, diff_focus_slope=0.0)
     dummy = np.zeros(64, dtype=np.int64)
+    prev_pl  = -1
+    game_ply = 0
     for rec in parser.inner.sequential_gen():
         if stop_evt.is_set():
             return
@@ -108,6 +161,15 @@ def lc0_stream(chunks, stop_evt):
          root_q, best_q, root_d, best_d, root_m, best_m, pl,
          result_q, result_d, pq, pd, pm, oq, od, om,
          visits, pidx, bidx, r1, r2, r3, r4) = V6_STRUC.unpack(rec)
+
+        if pl > prev_pl:
+            game_ply = 0
+        else:
+            game_ply += 1
+        prev_pl = pl
+
+        if game_ply < 15 and random.random() >= min(1.0, (game_ply + 1) * 0.05):
+            continue
 
         probs = np.frombuffer(probs_bytes, dtype=np.float32)
         pol4288, _ = get_policy_vector(probs, stm, us_ooo, us_oo, dummy)
@@ -150,26 +212,24 @@ def load_xc0_games(rt):
     analyze_path = os.path.join(rd, ANALYZE_PKL)
     if not os.path.exists(analyze_path):
         print(f"[xc0] {rt}: no analyze pkl, skipping", flush=True)
-        return [], {}
+        return [], {}, set()
 
-    games = load_game_index(rd)
-    games = [g for g in games if isinstance(g.get("pkl_file"), str)
-             and os.path.exists(g["pkl_file"])]
+    games = [g for g in load_game_index(rd) if isinstance(g.get("pkl_file"), str)]
 
     with open(analyze_path, "rb") as fh:
         prev = pickle.load(fh)
     df_all = prev["df_all"]
     df_all = df_all.copy()
     df_all["clipped_loss"] = np.clip(df_all["loss"], -1000, 1000)
-    game_cpl = df_all.groupby("game_id")["clipped_loss"].mean()
+    grouped = df_all.groupby("game_id", sort=False)
+    game_cpl = grouped["clipped_loss"].mean()
     good_gids = set(game_cpl[game_cpl <= GAME_CPL_MAX].index)
 
-    games = [g for g in games if g["game_id"] in good_gids]
-    sf_by_gid = {gid: sub for gid, sub in df_all.groupby("game_id", sort=False)}
+    sf_by_gid = {gid: sub for gid, sub in grouped}
 
     random.shuffle(games)
-    print(f"[xc0] {rt}: {len(games):,} games after CPL<={GAME_CPL_MAX} filter", flush=True)
-    return games, sf_by_gid
+    print(f"[xc0] {rt}: {len(games):,} games  ({len(good_gids):,} xc0-eligible)", flush=True)
+    return games, sf_by_gid, good_gids
 
 
 def align_sf(moves, sf_rows):
@@ -190,7 +250,9 @@ def align_sf(moves, sf_rows):
     return sf_rows, by_ply
 
 
-def iter_xc0_game(game, sf_df):
+def iter_xc0_game(game, sf_df, seen=None, lc0_batcher=None, xc0_eligible=True):
+    if not os.path.exists(game["pkl_file"]):
+        return
     log = load_log(game["pkl_file"])
     scenario = log.get("scenario") or game.get("scenario", "")
     if scenario in SKIP_SCENARIOS:
@@ -210,7 +272,6 @@ def iter_xc0_game(game, sf_df):
     if sf_df is not None and len(sf_df):
         sf_rows, sf_by_ply = align_sf(moves, sf_df)
 
-    # warm history for opening scenarios; startpos/piece_odds/piece_training start fresh
     if scenario in NO_WARM_SCENARIOS:
         board = pf.Board(start_fen)
     else:
@@ -230,83 +291,190 @@ def iter_xc0_game(game, sf_df):
         if not warmed:
             board = pf.Board(start_fen)
 
+    lc0_pending  = []   # xc0h boards queued for lc0 inference this game
+
     for ply, move_played in enumerate(moves):
-        is_white = board.side_to_move() == "w"
+        is_white   = board.side_to_move() == "w"
         is_sf_move = vs_sf and sf_color is not None and (
             (is_white and sf_color) or (not is_white and not sf_color))
-        if is_sf_move:
-            board.push_uci(move_played)
-            continue
 
-        idx = sf_by_ply.get(ply)
-        if idx is None:
-            board.push_uci(move_played)
-            continue
-        loss = sf_rows.iloc[idx]["loss"]
-        if loss is None or loss > MOVE_CPL_MAX:
-            board.push_uci(move_played)
-            continue
+        made_xc0      = False
+        dedup_skipped = False
 
-        node = tree_data.get(ply)
-        cms  = node.get("candidate_moves") if node else None
-        if not cms:
-            board.push_uci(move_played)
-            continue
+        if not is_sf_move and xc0_eligible:
+            idx  = sf_by_ply.get(ply)
+            loss = sf_rows.iloc[idx]["loss"] if idx is not None else None
+            if loss is not None and loss <= MOVE_CPL_MAX:
+                node = tree_data.get(ply)
+                cms  = node.get("candidate_moves") if node else None
+                if cms:
+                    take = True
+                    if ply < 20 and seen is not None:
+                        key  = board.hash()
+                        n    = seen.get(key, 0)
+                        take = random.random() < max(1.0 - n / 20.0, DEDUPE_FLOOR)
+                        if take:
+                            seen[key] = n + 1
+                        else:
+                            dedup_skipped = True
+                    if take:
+                        visits_map = {c["uci"]: c["visits"] for c in cms}
+                        for u in board.legal_moves():
+                            if u not in visits_map:
+                                visits_map[u] = 1
+                        ucis   = list(visits_map.keys())
+                        counts = np.array([visits_map[u] for u in ucis], dtype=np.float32)
+                        s      = counts.sum()
+                        if s > 0:
+                            pi      = counts / s
+                            indices = board.moves_to_indices(ucis)
+                            policy  = np.zeros(N_1858, dtype=np.float32)
+                            for ci, prob in zip(indices, pi):
+                                policy[ci] += prob
+                            wdl_node   = node.get("best_wdl")
+                            search_wdl = (np.array(wdl_node, dtype=np.float32)[[2, 1, 0] if not is_white else [0, 1, 2]]
+                                          if wdl_node is not None else to_wdl(0.0))
+                            z   = (1 if is_white else -1) if result > 0 else (
+                                  (-1 if is_white else 1) if result < 0 else 0)
+                            wdl = (Z_BLEND * to_wdl(z) + (1.0 - Z_BLEND) * search_wdl).astype(np.float32)
+                            xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
+                            yield ('xc0', xc0h, policy, wdl)
+                            made_xc0 = True
 
-        visits_map = {c["uci"]: c["visits"] for c in cms}
-        for u in board.legal_moves():
-            if u not in visits_map:
-                visits_map[u] = 1
-
-        ucis   = list(visits_map.keys())
-        counts = np.array([visits_map[u] for u in ucis], dtype=np.float32)
-        s = counts.sum()
-        if s <= 0:
-            board.push_uci(move_played)
-            continue
-        pi = counts / s
-
-        indices = board.moves_to_indices(ucis)
-        policy  = np.zeros(N_1858, dtype=np.float32)
-        for ci, prob in zip(indices, pi):
-            policy[ci] += prob
-
-        wdl_node = node.get("best_wdl")
-        if wdl_node is not None:
-            search_wdl = np.array(wdl_node, dtype=np.float32)
-            if not is_white:
-                search_wdl = search_wdl[[2, 1, 0]]
-        else:
-            search_wdl = to_wdl(0.0)
-        z = (1 if is_white else -1) if result > 0 else (
-            (-1 if is_white else 1) if result < 0 else 0)
-        wdl = (Z_BLEND * to_wdl(z) + (1.0 - Z_BLEND) * search_wdl).astype(np.float32)
-
-        xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
-        yield xc0h, policy, wdl
+        lc0d_accept = 1.0 if scenario in LC0_FULL_SCENARIOS else min(1.0, 0.05 + ply * 0.95 / 16)
+        if not made_xc0 and not dedup_skipped and lc0_batcher is not None and random.random() < lc0d_accept:
+            xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
+            lc0_batcher.submit(board.lc0_features(), board)
+            lc0_pending.append(xc0h)
 
         board.push_uci(move_played)
 
+    if lc0_pending:
+        for xc0h, (lc0_wdl, lc0_pol) in zip(lc0_pending, lc0_batcher.flush_and_drain()):
+            yield ('lc0d', xc0h, lc0_pol, lc0_wdl)
 
-def xc0_stream(run_tag, stop_evt):
-    games, sf_by_gid = load_xc0_games(run_tag)
+
+def xc0_stream(run_tag, stop_evt, lc0_batcher=None):
+    seen = {}
+    games, sf_by_gid, good_gids = load_xc0_games(run_tag)
     for game in games:
         if stop_evt.is_set():
             return
+        xc0_eligible = game["game_id"] in good_gids
+        if not xc0_eligible and lc0_batcher is None:
+            continue
         sf_df = sf_by_gid.get(game["game_id"])
-        yield from iter_xc0_game(game, sf_df)
+        yield from iter_xc0_game(game, sf_df, seen, lc0_batcher, xc0_eligible)
 
 
-def xc0_worker(name, run_tag, out_dir, target, shared_total, stop_evt, log_q, prefix):
+def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q, prefix):
     os.makedirs(out_dir, exist_ok=True)
-    run_source(name, xc0_stream(run_tag, stop_evt),
-               out_dir, target, shared_total, stop_evt, log_q, prefix)
+    lc0_batcher   = None
+    lc0_model     = os.getenv('LC0_DISTILL_MODEL', '')
+    lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
+    if lc0_model and lc0_trt_cache:
+        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+        from chessbot.lc0_utils import make_lc0_trt_session
+        lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
+        sess = make_lc0_trt_session(lc0_onnx, lc0_model, lc0_trt_cache,
+                                    opt_batch=LC0_DISTILL_BATCH, max_batch=LC0_DISTILL_BATCH * 2)
+        active = sess.get_providers()[0]
+        if active != 'TensorrtExecutionProvider':
+            raise RuntimeError(f"Lc0Batcher TRT failed, got {active}. Check CUDA/TRT DLLs in PATH.")
+        lc0_batcher = Lc0Batcher(sess, batch_size=LC0_DISTILL_BATCH)
+        print(f"[{name}] Lc0Batcher: TRT batch_size={LC0_DISTILL_BATCH}", flush=True)
+
+    run_source_dual(name, xc0_stream(run_tag, stop_evt, lc0_batcher),
+                    out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q,
+                    xc0_prefix=prefix, lc0d_prefix=f"lc0d_{name}")
     os._exit(0)
 
 
 # ---------------------------------------------------------------------------
 # shared runner: async shard writer + progress reporting
 # ---------------------------------------------------------------------------
+
+def run_source_dual(name, record_gen, out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q,
+                    xc0_prefix, lc0d_prefix):
+    """Like run_source but routes tagged ('xc0'|'lc0d', xc0h, pol, wdl) records to separate shards.
+    Only xc0 records count toward the shared target."""
+    xc0_wq  = queue.Queue(6)
+    lc0d_wq = queue.Queue(6)
+    stats   = {"xc0_shards": 0, "lc0d_shards": 0}
+
+    def writer_fn(wq, prefix, shard_key):
+        shard_id = 0
+        while True:
+            records = wq.get()
+            if records is None:
+                break
+            path = os.path.join(out_dir, f"{prefix}_{shard_id:05d}.tfrecord.gz")
+            with tf.io.TFRecordWriter(path, OPTIONS) as w:
+                for xc0h, pol, wdl in records:
+                    w.write(make_example(xc0h, pol, wdl))
+            shard_id += 1
+            stats[shard_key] = shard_id
+
+    xc0_wt  = threading.Thread(target=writer_fn, args=(xc0_wq,  xc0_prefix,  "xc0_shards"))
+    lc0d_wt = threading.Thread(target=writer_fn, args=(lc0d_wq, lc0d_prefix, "lc0d_shards"))
+    xc0_wt.start()
+    lc0d_wt.start()
+
+    begin       = time.time()
+    xc0_buf     = []
+    lc0d_buf    = []
+    total       = 0
+    last_report = 0
+    reason      = "source_exhausted"
+
+    for kind, xc0h, pol, wdl in record_gen:
+        if stop_evt.is_set():
+            reason = "stopped_by_peer"
+            break
+        if kind == 'xc0':
+            xc0_buf.append((xc0h, pol, wdl))
+            total += 1
+            if len(xc0_buf) >= RECORDS_PER_FILE:
+                xc0_wq.put(xc0_buf)
+                xc0_buf = []
+            with shared_total.get_lock():
+                shared_total.value += 1
+                combined = shared_total.value
+            if combined >= target:
+                reason = "target_reached"
+                stop_evt.set()
+                break
+        else:
+            lc0d_buf.append((xc0h, pol, wdl))
+            if len(lc0d_buf) >= RECORDS_PER_FILE:
+                lc0d_wq.put(lc0d_buf)
+                lc0d_buf = []
+            with lc0d_ctr.get_lock():
+                lc0d_ctr.value += 1
+            with shared_total.get_lock():
+                shared_total.value += 1
+                combined = shared_total.value
+            if combined >= target:
+                reason = "target_reached"
+                stop_evt.set()
+                break
+        if total - last_report >= 100_000:
+            last_report = total
+            log_q.put({"name": name, "kind": "progress"})
+
+    for buf, wq in [(xc0_buf, xc0_wq), (lc0d_buf, lc0d_wq)]:
+        if buf:
+            wq.put(buf)
+    xc0_wq.put(None)
+    lc0d_wq.put(None)
+    xc0_wt.join()
+    lc0d_wt.join()
+
+    elapsed = time.time() - begin
+    log_q.put({"name": name, "kind": "done", "total": total,
+               "shards": stats["xc0_shards"] + stats["lc0d_shards"],
+               "elapsed": elapsed, "reason": reason})
+
 
 def run_source(name, record_gen, out_dir, target, shared_total, stop_evt, log_q, prefix):
     write_q = queue.Queue(6)
@@ -375,11 +543,24 @@ def main():
     ap.add_argument("--run-tags",   nargs="+", default=RUN_TAGS)
     ap.add_argument("--lc0-target", type=int, default=TARGET_PER_SOURCE)
     ap.add_argument("--xc0-target", type=int, default=TARGET_PER_SOURCE)
-    ap.add_argument("--workers",    type=int, default=LC0_WORKERS + XC0_WORKERS,
+    ap.add_argument("--workers",    type=int, default=6,
                     help="total concurrent workers of any type")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # pre-compile lc0d TRT engine in the supervisor so workers never race to build it
+    lc0_model     = os.getenv('LC0_DISTILL_MODEL', '')
+    lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
+    if lc0_model and lc0_trt_cache:
+        from chessbot.lc0_utils import make_lc0_trt_session
+        lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
+        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+        print(f"[main] pre-compiling lc0d TRT engine ({lc0_model})...", flush=True)
+        _sess = make_lc0_trt_session(lc0_onnx, lc0_model, lc0_trt_cache,
+                                     opt_batch=LC0_DISTILL_BATCH, max_batch=LC0_DISTILL_BATCH * 2)
+        del _sess
+        print(f"[main] lc0d TRT engine ready", flush=True)
 
     # gather lc0 chunks
     lc0_chunks = []
@@ -398,37 +579,46 @@ def main():
     xc0_stop = ctx.Event()
     lc0_ctr  = ctx.Value("q", 0)
     xc0_ctr  = ctx.Value("q", 0)
+    lc0d_ctr = ctx.Value("q", 0)
     log_q    = ctx.Queue()
 
     # pending job list: supervisor pops one at a time and spawns a worker
     pending = (
-        [("lc0", s) for s in partition(lc0_chunks, LC0_WORKERS)] +
-        [("xc0", rt) for rt in args.run_tags]
+        [("xc0", rt) for rt in args.run_tags] +
+        [("lc0", s) for s in partition(lc0_chunks, LC0_JOBS)]
     )
 
     active = {}   # name -> Process
     seq    = [0]  # monotonic worker id
 
     def spawn_next():
-        while pending:
-            kind, item = pending[0]
+        active_lc0 = sum(1 for n in active if n.startswith("lc0-"))
+        active_xc0 = sum(1 for n in active if n.startswith("xc0-"))
+        for idx in range(len(pending)):
+            kind, item = pending[idx]
             stop = lc0_stop if kind == "lc0" else xc0_stop
             if stop.is_set():
-                pending.pop(0)
+                pending.pop(idx)
+                return spawn_next()
+            if kind == "lc0" and active_lc0 >= args.workers - active_xc0:
                 continue
-            pending.pop(0)
+            if kind == "xc0" and active_xc0 >= MAX_CONCURRENT_XC0:
+                continue
+            pending.pop(idx)
             i      = seq[0]; seq[0] += 1
             name   = f"{kind}-{i}"
             ctr    = lc0_ctr if kind == "lc0" else xc0_ctr
             tgt    = args.lc0_target if kind == "lc0" else args.xc0_target
             fn     = lc0_worker if kind == "lc0" else xc0_worker
+            extra  = () if kind == "lc0" else (lc0d_ctr,)
             p = ctx.Process(target=fn,
                             args=(name, item, args.out_dir, tgt,
-                                  ctr, stop, log_q, f"{kind}_{i}"))
+                                  ctr, *extra, stop, log_q, f"{kind}_{i}"))
             p.start()
             active[name] = p
             print(f"[supervisor] spawned {name}  "
-                  f"active={len(active)}  pending={len(pending)}", flush=True)
+                  f"active={len(active)}  lc0={active_lc0+int(kind=='lc0')}  "
+                  f"xc0={active_xc0+int(kind=='xc0')}  pending={len(pending)}", flush=True)
             return True
         return False
 
@@ -440,7 +630,7 @@ def main():
           f"lc0_target={args.lc0_target:,}  xc0_target={args.xc0_target:,}", flush=True)
 
     last_combined = 0
-    REPORT_EVERY  = 50_000
+    REPORT_EVERY  = 100_000
 
     while active:
         try:
@@ -461,20 +651,25 @@ def main():
             spawn_next()
         elif msg["kind"] == "progress":
             with lc0_ctr.get_lock():
-                lc0_n = lc0_ctr.value
+                lc0_n     = lc0_ctr.value
             with xc0_ctr.get_lock():
-                xc0_n = xc0_ctr.value
-            combined = lc0_n + xc0_n
+                xc0_combo = xc0_ctr.value   # xc0_pure + lc0d combined
+            with lc0d_ctr.get_lock():
+                lc0d_n    = lc0d_ctr.value
+            xc0_n    = xc0_combo - lc0d_n
+            combined = lc0_n + xc0_combo    # no double-count
             if combined - last_combined >= REPORT_EVERY:
                 last_combined = combined
                 elapsed = time.time() - begin
-                lc0_rate   = lc0_n / max(elapsed, 1e-9)
-                xc0_rate   = xc0_n / max(elapsed, 1e-9)
+                lc0_rate   = lc0_n   / max(elapsed, 1e-9)
+                xc0_rate   = xc0_n   / max(elapsed, 1e-9)
+                lc0d_rate  = lc0d_n  / max(elapsed, 1e-9)
                 total_rate = combined / max(elapsed, 1e-9)
                 pct = combined / (args.lc0_target + args.xc0_target) * 100
                 print(f"[{combined:,}]  "
                       f"lc0={lc0_n:,} ({lc0_rate:,.0f}/s)  "
                       f"xc0={xc0_n:,} ({xc0_rate:,.0f}/s)  "
+                      f"lc0d={lc0d_n:,} ({lc0d_rate:,.0f}/s)  "
                       f"total={total_rate:,.0f}/s  {pct:.1f}%  "
                       f"active={len(active)}  pending={len(pending)}", flush=True)
 
@@ -484,11 +679,15 @@ def main():
             p.terminate()
 
     with lc0_ctr.get_lock():
-        lc0_final = lc0_ctr.value
+        lc0_final   = lc0_ctr.value
     with xc0_ctr.get_lock():
-        xc0_final = xc0_ctr.value
+        xc0_combo   = xc0_ctr.value
+    with lc0d_ctr.get_lock():
+        lc0d_final  = lc0d_ctr.value
+    xc0_final = xc0_combo - lc0d_final
     elapsed = time.time() - begin
-    print(f"\n[done] elapsed={elapsed:.0f}s  lc0={lc0_final:,}  xc0={xc0_final:,}  "
+    print(f"\n[done] elapsed={elapsed:.0f}s  "
+          f"lc0={lc0_final:,}  xc0={xc0_final:,}  lc0d={lc0d_final:,}  "
           f"out={args.out_dir}")
     os._exit(0)
 

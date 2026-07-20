@@ -27,7 +27,7 @@ import pandas as pd
 BATCH_SIZE         = 256
 EPOCH_SIZE         = 10_240
 SHUFFLE_BUFFER     = 256_000
-VAL_SHUFFLE_BUFFER = 40_960
+VAL_SHUFFLE_BUFFER = 96_000
 STEPS_PER_EPOCH    = EPOCH_SIZE // BATCH_SIZE
 VAL_FRACTION       = 0.05
 VAL_SPLIT_SEED     = 42
@@ -93,10 +93,12 @@ def split_train_val(
 # TFRecord data pipeline
 # ---------------------------------------------------------------------------
 
-def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BATCH_SIZE):
-    """Build a repeating, shuffled TF dataset from .tfrecord.gz files.
+def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BATCH_SIZE,
+                 repeat: bool = True):
+    """Build a shuffled TF dataset from .tfrecord.gz files.
 
     Imports TF lazily so the supervisor process stays GPU-free.
+    repeat=False gives a single-pass iterator (raises StopIteration when exhausted).
     """
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
@@ -123,7 +125,8 @@ def make_dataset(file_list: list[str], shuffle_buffer: int, batch_size: int = BA
 
     ds = tf.data.Dataset.from_tensor_slices(file_list)
     ds = ds.shuffle(len(file_list), reshuffle_each_iteration=True)
-    ds = ds.repeat()
+    if repeat:
+        ds = ds.repeat()
     ds = ds.interleave(
         lambda p: tf.data.TFRecordDataset(p, compression_type="GZIP"),
         cycle_length=tf.data.AUTOTUNE,

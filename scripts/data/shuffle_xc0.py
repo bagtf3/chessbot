@@ -31,8 +31,6 @@ tf.get_logger().setLevel("ERROR")
 
 BUFFER_SIZE      = 384_000
 RECORDS_PER_FILE = 10_240
-DEFAULT_OUT_DIR  = r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl_30m_records_062126"
-DEFAULT_IN_DIR   = os.getenv("BOOTSTRAP_TFREC_DIR", "")
 
 OPTIONS = tf.io.TFRecordOptions(compression_type="GZIP")
 
@@ -153,13 +151,10 @@ def partition(items, n):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--in-dir",  default=DEFAULT_IN_DIR)
-    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    parser.add_argument("--in-dir",  required=True)
+    parser.add_argument("--out-dir", required=True)
     parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
-
-    if not args.in_dir:
-        parser.error("--in-dir is required (or set $BOOTSTRAP_TFREC_DIR)")
 
     in_files = sorted(
         os.path.join(args.in_dir, f)

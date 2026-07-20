@@ -291,3 +291,132 @@ def plot_validation(
     fig.tight_layout()
     fig.savefig(plot_path, dpi=120)
     plt.close(fig)
+
+
+def plot_lc0_validation(
+    epoch,
+    plot_path,
+    lc0_arr,
+    nn_arr,
+    tgt_arr,
+    lc0_vals_stm,
+    nn_vals_stm,
+    tgt_ys,
+    sf_cps,
+    result_zs,
+    ce_lc0_true,
+    ce_xc0_lc0,
+    bias_lc0_true,
+    bias_xc0_lc0,
+    ce_comp_lc0_true,
+    ce_comp_xc0_lc0,
+    lc0_value_mse,
+    lc0_value_corr,
+    max_scatter=5000,
+):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    labels = ['W', 'D', 'L']
+    colors = ['#3cb371', '#ffd700', '#ff8c00']
+    z_palette = {1.0: '#3cb371', 0.0: '#ffd700', -1.0: '#ff8c00'}
+    legend_patches = [
+        mpatches.Patch(color='#3cb371', label='win'),
+        mpatches.Patch(color='#ffd700', label='draw'),
+        mpatches.Patch(color='#ff8c00', label='loss'),
+    ]
+
+    n_pts = len(lc0_arr)
+    idx = np.random.choice(n_pts, min(n_pts, max_scatter), replace=False)
+
+    def scatter_val_vs_target(ax, pred_v, tgt_y, pred_label, tgt_label, mse, corr):
+        pv = pred_v[idx]; ty = tgt_y[idx]
+        valid = ~np.isnan(pv) & ~np.isnan(ty)
+        ax.scatter(ty[valid], pv[valid], s=4, alpha=0.3, c='steelblue')
+        ax.set_xlabel(tgt_label)
+        ax.set_ylabel(f'{pred_label} value (STM-POV)')
+        ax.set_title(f'Epoch {epoch}: {pred_label} vs {tgt_label}  MSE={mse:.3f} r={corr:.3f}')
+
+    def scatter_val_vs_sfcp(ax, pred_v, sfcp, rz, pred_label):
+        pv = pred_v[idx]; sfcp2 = sfcp[idx]; rz2 = rz[idx]
+        valid = ~np.isnan(sfcp2)
+        pv2, sfcp2v, rz2v = pv[valid], sfcp2[valid], rz2[valid]
+        sfcp_tanh = np.tanh(sfcp2v * (np.arctanh(0.8) / 500.0))
+        mse2  = np.mean((pv2 - sfcp_tanh) ** 2) if len(pv2) > 1 else float('nan')
+        corr2 = np.corrcoef(pv2, sfcp2v)[0, 1]   if len(pv2) > 1 else float('nan')
+        c2 = [z_palette.get(round(float(z)), '#999999') for z in rz2v]
+        ax.scatter(sfcp2v, pv2, s=4, alpha=0.3, c=c2)
+        ax.set_xlabel('SF CP (STM-POV)')
+        ax.set_ylabel(f'{pred_label} value (STM-POV)')
+        ax.set_title(f'{pred_label} value vs SF CP  MSE={mse2:.3f} r={corr2:.3f}')
+        ax.legend(handles=legend_patches, fontsize=8)
+
+    def hist_per_ce(ax, pred_arr, tgt_wdl, val_ce, pred_label, tgt_label):
+        per_ce = -np.sum(tgt_wdl * np.log(np.clip(pred_arr, 1e-7, 1.0)), axis=1)
+        ax.hist(per_ce, bins=60, range=(0, 3), color='steelblue', alpha=0.7, edgecolor='none')
+        ax.axvline(val_ce, color='red', lw=1.5, label=f'mean={val_ce:.3f}')
+        p50 = float(np.percentile(per_ce, 50))
+        p90 = float(np.percentile(per_ce, 90))
+        ax.axvline(p50, color='orange', lw=1, linestyle='--', label=f'p50={p50:.3f}')
+        ax.axvline(p90, color='darkred', lw=1, linestyle=':', label=f'p90={p90:.3f}')
+        ax.set_xlabel('per-position CE (nats)')
+        ax.set_ylabel('count')
+        ax.set_title(f'{pred_label} vs {tgt_label}: CE distribution')
+        ax.legend(fontsize=8)
+
+    def bias_bars(ax, bias, pred_label, tgt_label):
+        bvals = [float(bias[i]) for i in range(3)]
+        bar_colors = ['#d73027' if v > 0 else '#4575b4' for v in bvals]
+        bars = ax.bar(labels, bvals, color=bar_colors, width=0.5)
+        ax.axhline(0, color='black', lw=0.8)
+        ax.set_ylabel('mean(pred - target)')
+        ax.set_title(f'WDL bias: {pred_label} vs {tgt_label}  (red=over, blue=under)')
+        for bar, v in zip(bars, bvals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    v + (0.001 if v >= 0 else -0.003),
+                    f'{v:+.4f}', ha='center',
+                    va='bottom' if v >= 0 else 'top', fontsize=9)
+
+    def ce_components(ax, ce_comp, val_ce, pred_label, tgt_label):
+        cvals = [float(ce_comp[i]) for i in range(3)]
+        ax.bar(labels, cvals, color=colors, width=0.5)
+        ax.set_ylabel('mean CE contribution (nats)')
+        ax.set_title(f'CE by component: {pred_label} vs {tgt_label}  total={val_ce:.3f}')
+        for i, v in enumerate(cvals):
+            ax.text(i, v + 0.002, f'{v:.4f}', ha='center', va='bottom', fontsize=9)
+
+    # Figure 1: lc0 vs true
+    fig1, ax1 = plt.subplots(2, 3, figsize=(18, 10))
+    fig1.suptitle(f'Epoch {epoch} — lc0 vs true  (n={n_pts:,})', fontsize=13)
+    scatter_val_vs_target(ax1[0, 0], lc0_vals_stm, tgt_ys, 'lc0', 'target Y',
+                          lc0_value_mse, lc0_value_corr)
+    scatter_val_vs_sfcp(ax1[0, 1], lc0_vals_stm, sf_cps, result_zs, 'lc0')
+    hist_per_ce(ax1[0, 2], lc0_arr, tgt_arr, ce_lc0_true, 'lc0', 'true')
+    bias_bars(ax1[1, 0], bias_lc0_true, 'lc0', 'true')
+    ce_components(ax1[1, 1], ce_comp_lc0_true, ce_lc0_true, 'lc0', 'true')
+    ax1[1, 2].set_visible(False)
+    fig1.tight_layout()
+    fig1.savefig(plot_path.replace('lc0_validation_latest', 'lc0_vs_true_latest'), dpi=120)
+    plt.close(fig1)
+
+    # Figure 2: xc0 vs lc0 (lc0 as ground truth)
+    xc0_vals = nn_vals_stm.astype(np.float32)
+    lc0_as_tgt = lc0_vals_stm.astype(np.float32)
+    valid_x = ~np.isnan(xc0_vals) & ~np.isnan(lc0_as_tgt)
+    xc0_mse  = float(np.mean((xc0_vals[valid_x] - lc0_as_tgt[valid_x]) ** 2)) if valid_x.any() else float('nan')
+    xc0_corr = float(np.corrcoef(xc0_vals[valid_x], lc0_as_tgt[valid_x])[0, 1]) if valid_x.sum() > 1 else float('nan')
+
+    fig2, ax2 = plt.subplots(2, 3, figsize=(18, 10))
+    fig2.suptitle(f'Epoch {epoch} — xc0 vs lc0  (n={n_pts:,})', fontsize=13)
+    scatter_val_vs_target(ax2[0, 0], xc0_vals, lc0_as_tgt, 'xc0', 'lc0 value',
+                          xc0_mse, xc0_corr)
+    scatter_val_vs_sfcp(ax2[0, 1], xc0_vals, sf_cps, result_zs, 'xc0')
+    hist_per_ce(ax2[0, 2], nn_arr, lc0_arr, ce_xc0_lc0, 'xc0', 'lc0')
+    bias_bars(ax2[1, 0], bias_xc0_lc0, 'xc0', 'lc0')
+    ce_components(ax2[1, 1], ce_comp_xc0_lc0, ce_xc0_lc0, 'xc0', 'lc0')
+    ax2[1, 2].set_visible(False)
+    fig2.tight_layout()
+    fig2.savefig(plot_path.replace('lc0_validation_latest', 'xc0_vs_lc0_latest'), dpi=120)
+    plt.close(fig2)

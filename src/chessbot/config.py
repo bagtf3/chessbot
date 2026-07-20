@@ -141,7 +141,8 @@ class Config(object):
     # LC0 distillation enrichment
     lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
     lc0_distill_batch_size = 64   # positions per ORT inference call
-    lc0_distill_book = True       # whether to load and apply the enrichment book
+    lc0_enrich_frac   = 0.0   # fraction of non-blunder accepted positions to enrich with lc0 (0=off, 1=all)
+    lc0_enrich_weight = 0.75  # vwht/pwht multiplier applied to lc0-generated training samples
 
     # board encoding fed to the model. Sole driver of the encoder on every path
     # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16

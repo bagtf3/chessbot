@@ -7,7 +7,7 @@ import random
 import subprocess
 import threading
 from collections import deque, defaultdict
-from queue import Queue, Empty
+from queue import Empty
 
 import pickle
 import chess, chess.engine
@@ -22,22 +22,15 @@ from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
     batch_policy_metrics_from_priors, print_validation,
 )
-from chessbot.lc0_utils import lc0_logits_to_xc0_batch
+from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-EVICTION_WINDOW = 5000
-EVICTION_MAX_SIZE = 80000
+EVICTION_WINDOW = 10000
+EVICTION_MAX_SIZE = 250000
 C = 0.9699
 D = d = np.arctanh(0.5)
-
-def lc0_table_index(features_uint8):
-    """Derive LC0->XC0 table index (0-3) from suffix planes of lc0_features() output."""
-    us_ooo = int(features_uint8[104, 0, 0])
-    us_oo  = int(features_uint8[105, 0, 0])
-    stm    = int(features_uint8[108, 0, 0])  # 0=white, 1=black
-    return (us_ooo | us_oo) + 2 * stm
 
 
 class Lc0Thread:
@@ -339,6 +332,7 @@ class SFRescoreThread:
                         'elapsed':    elapsed,
                         'depth':      self.depth,
                     })
+            
             except Exception as e:
                 self.res_q.put(('__error__', e))
                 self.stop_ev.set()
@@ -383,8 +377,8 @@ class Rescorer(object):
 
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
-            'total_pos': 0, 'seen': 0,
-        }
+            'total_pos': 0, 'seen': 0}
+
         self.collar_total = zero_collar()
         self.collar_window = zero_collar()
         self.collar_history = []
@@ -395,8 +389,8 @@ class Rescorer(object):
 
         zero_sc = lambda: {
             'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0,
-            'lc0_blunder': 0, 'lc0_pv': 0, 'lc0_enrich': 0,
-        }
+            'lc0_blunder': 0, 'lc0_pv': 0, 'lc0_enrich': 0}
+
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
 
@@ -411,12 +405,18 @@ class Rescorer(object):
             from chessbot.lc0_utils import make_lc0_trt_session
             batch_size = cfg.lc0_distill_batch_size
             lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
-            sess = make_lc0_trt_session(lc0_onnx, lc0_model, lc0_trt_cache,
-                                        opt_batch=batch_size, max_batch=batch_size * 2)
-            # Hard-fail if TRT didn't load — silent CPU fallback would silently bottleneck training.
+            sess = make_lc0_trt_session(
+                lc0_onnx, lc0_model, lc0_trt_cache,
+                opt_batch=batch_size, max_batch=batch_size * 2)
+            
+            # Hard-fail if TRT didn't load
+            # silent CPU fallback would silently bottleneck training.
             active = sess.get_providers()[0]
             if active != 'TensorrtExecutionProvider':
-                raise RuntimeError(f"{RS} Lc0Thread TRT failed, got {active}. Check CUDA/TRT DLLs in PATH.")
+                msg = f"{RS} Lc0Thread TRT failed, got {active}."
+                msg += " Check CUDA/TRT DLLs in PATH."
+                raise RuntimeError(msg)
+            
             self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
             print(f"{RS} Lc0Thread: TRT batch_size={batch_size}")
 
@@ -438,7 +438,7 @@ class Rescorer(object):
 
     def maybe_seed_cache(self, b_fast, mv, Q_stm, turn, repetitions, depth=0):
         short_fen = b_fast.fen(include_counters=False)
-        reps = 3 if repetitions[short_fen] >= 3 else 0
+        reps = 2 if repetitions[short_fen] >= 2 else 0
         hmc = b_fast.halfmove_clock()
         halfmoves = 0 if hmc < 45 else hmc
         cache_key = (short_fen, reps, halfmoves)
@@ -470,6 +470,7 @@ class Rescorer(object):
             intake_list = list(self.intake)
             random.shuffle(intake_list)
             self.intake = deque(intake_list)
+        
         while self.intake and len(self.pending) < 20:
             self.start_game(self.intake.popleft())
 
@@ -747,21 +748,20 @@ class Rescorer(object):
                 xerces_uci = visits[0][0]
 
             top_uci = visits[0][0]
-            # NOTE: visit swap disabled for raw_visits experiment
-            # if xerces_uci != top_uci:
-            #     vmap = {u: n for u, n in visits}
-            #     top_n = vmap.get(top_uci, 1)
-            #     xc0_n = vmap.get(xerces_uci, 1)
-            #     vmap[top_uci] = max(1, xc0_n)
-            #     vmap[xerces_uci] = max(1, top_n)
-            #     visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            if xerces_uci != top_uci:
+                vmap = {u: n for u, n in visits}
+                top_n = vmap.get(top_uci, 1)
+                xc0_n = vmap.get(xerces_uci, 1)
+                vmap[top_uci] = max(1, xc0_n)
+                vmap[xerces_uci] = max(1, top_n)
+                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
             x = self.encode_board(b_fast)
             mask = b_fast.legal_move_mask()
             short_fen = b_fast.fen(include_counters=False)
-            reps = 3 if repetitions[short_fen] >= 3 else 0
+            reps = 2 if repetitions[short_fen] >= 2 else 0
             hmc = b_fast.halfmove_clock()
             halfmoves = 0 if hmc < 45 else hmc
             cache_key = (short_fen, reps, halfmoves)
@@ -979,10 +979,6 @@ class Rescorer(object):
             cpl_s += loss_this
             n_plies += 1
 
-            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
-            if missed_mate:
-                loss_this = min(200, loss_this)
-
             eval_trace.append((i, best_abs))
             rows.append([
                 i, mv, xerces_uci, best_uci,
@@ -996,50 +992,43 @@ class Rescorer(object):
                 continue
 
             lms = ply['lms']
-            blunder_cp = cfg.rescore_blunder_cp_loser
-            if Z_stm > 0.0:
-                blunder_cp = cfg.rescore_blunder_cp_winner
-
-            kl_eligible = False
-
             # ensure all legal moves have at least 1 visit
             vmap = {u: max(1, int(v)) for u, v in visits}
             for m in lms:
                 if m not in vmap:
                     vmap[m] = 1
+            
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
-            is_true_blunder = not (played_cp > 350 and Z_stm > 0)
+            kl_eligible = loss_this <= EQUIV
 
-            # strong move, do nothing
-            if loss_this <= cfg.rescore_inaccuracy_cp:
-                # very strong
-                if loss_this <= EQUIV:
-                    kl_eligible = True
+            # variable blunder thresholds based on outcome
+            blunder_cp = cfg.rescore_blunder_cp_winner
+            if Z_stm <= 0.0:
+                blunder_cp = cfg.rescore_blunder_cp_loser
 
-            elif missed_mate:
-                xc0_n = visits[0][1]
-                vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
+            # define missed mate as missed a mating line but still winning. punish less
+            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
+            missed_mate_still_won = missed_mate and Z_stm > 0
+            loss_this = min(200, loss_this) if missed_mate_still_won else loss_this
+
+            is_blunder = loss_this >= blunder_cp
+            true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
 
             # mild and big blunders: drop xc0 record, queue lc0 instead
-
-            is_blunder = loss_this >= blunder_cp and is_true_blunder
-            is_mild_blunder = (not missed_mate
-                               and loss_this > cfg.rescore_inaccuracy_cp
-                               and loss_this < blunder_cp)
-            skip_xc0 = is_blunder or is_mild_blunder
-            if is_mild_blunder:
-                lc0_mode = 'mild_true' if is_true_blunder else 'mild'
+            skip_xc0 = not missed_mate_still_won and (loss_this >= blunder_cp)
+            if missed_mate_still_won:
+                lc0_mode = None
+            elif true_blunder:
+                lc0_mode = 'pos_sf_xc0_pov'
             elif is_blunder:
-                lc0_mode = 'full'
+                lc0_mode = 'pos_sf_pov'
+            elif loss_this >= cfg.rescore_inaccuracy_cp:
+                lc0_mode = 'pos_only'
             else:
                 lc0_mode = None
 
-            # re-sort after any adjustments
-            visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
-            if not visits or sum(v[1] for v in visits) <= 0:
-                print(f"[rescore] visits invalid; skipping move_idx={i} played={mv}")
-                continue
+            # just FYI if we do any adjustments we need to re-sort.
 
             mvs = [v[0] for v in visits]
             vis = [v[1] for v in visits]
@@ -1067,11 +1056,11 @@ class Rescorer(object):
 
             pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
             sf_pv = ply.get('pv_ucis', [])
-            if lc0_mode == 'mild_true':
-                pv_seqs = [sf_pv[:1]]
-            elif lc0_mode == 'full':
-                xc0_pv = [s['uci'] for s in ply['tr'].get('pv', [])[:4]]
+            if lc0_mode == 'pos_sf_xc0_pov':
+                xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:4]]
                 pv_seqs = [sf_pv, xc0_pv]
+            elif lc0_mode == 'pos_sf_pov':
+                pv_seqs = [sf_pv[:1]]
             else:
                 pv_seqs = []
 

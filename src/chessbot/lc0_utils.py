@@ -14,6 +14,14 @@ from xerces_training.uci_to_idx import IDX_TO_UCI, uci_to_idx as UCI_TO_IDX
 from xerces_training.parse_utils import uci_to_xerces_index
 
 
+def lc0_table_index(features_uint8):
+    """Derive LC0->XC0 table index (0-3) from suffix planes of lc0_features() output."""
+    us_ooo = int(features_uint8[104, 0, 0])
+    us_oo  = int(features_uint8[105, 0, 0])
+    stm    = int(features_uint8[108, 0, 0])  # 0=white, 1=black
+    return (us_ooo | us_oo) + 2 * stm
+
+
 HistData = collections.namedtuple(
     'HistData', 'piece_bytes rep us_oo us_ooo them_oo them_ooo stm rule50')
 PACK_Q = struct.Struct('>Q').pack

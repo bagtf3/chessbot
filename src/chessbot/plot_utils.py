@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 
@@ -289,8 +290,10 @@ def plot_validation(
     axes[1, 2].set_visible(False)
 
     fig.tight_layout()
-    fig.savefig(plot_path, dpi=120)
+    tmp_path = plot_path + '.tmp'
+    fig.savefig(tmp_path, dpi=120, format='png')
     plt.close(fig)
+    os.replace(tmp_path, plot_path)
 
 
 def plot_lc0_validation(
@@ -398,8 +401,10 @@ def plot_lc0_validation(
     ce_components(ax1[1, 1], ce_comp_lc0_true, ce_lc0_true, 'lc0', 'true')
     ax1[1, 2].set_visible(False)
     fig1.tight_layout()
-    fig1.savefig(plot_path.replace('lc0_validation_latest', 'lc0_vs_true_latest'), dpi=120)
+    p1 = plot_path.replace('lc0_validation_latest', 'lc0_vs_true_latest')
+    fig1.savefig(p1 + '.tmp', dpi=120, format='png')
     plt.close(fig1)
+    os.replace(p1 + '.tmp', p1)
 
     # Figure 2: xc0 vs lc0 (lc0 as ground truth)
     xc0_vals = nn_vals_stm.astype(np.float32)
@@ -418,5 +423,7 @@ def plot_lc0_validation(
     ce_components(ax2[1, 1], ce_comp_xc0_lc0, ce_xc0_lc0, 'xc0', 'lc0')
     ax2[1, 2].set_visible(False)
     fig2.tight_layout()
-    fig2.savefig(plot_path.replace('lc0_validation_latest', 'xc0_vs_lc0_latest'), dpi=120)
+    p2 = plot_path.replace('lc0_validation_latest', 'xc0_vs_lc0_latest')
+    fig2.savefig(p2 + '.tmp', dpi=120, format='png')
     plt.close(fig2)
+    os.replace(p2 + '.tmp', p2)

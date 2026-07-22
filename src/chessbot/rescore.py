@@ -1001,9 +1001,7 @@ class Rescorer(object):
                 blunder_cp = cfg.rescore_blunder_cp_winner
 
             kl_eligible = False
-            xc0_uci = visits[0][0]
-            xc0_n = visits[0][1]
-            
+
             # ensure all legal moves have at least 1 visit
             vmap = {u: max(1, int(v)) for u, v in visits}
             for m in lms:
@@ -1020,20 +1018,22 @@ class Rescorer(object):
                     kl_eligible = True
 
             elif missed_mate:
+                xc0_n = visits[0][1]
                 vmap[best_uci] = max(vmap.get(best_uci, 1), max(1, xc0_n // 2))
 
-            elif loss_this < blunder_cp:
-                vmap[best_uci] = max(vmap.get(best_uci, 1), xc0_n)
-                if is_true_blunder:
-                    vmap[xc0_uci] = max(1, xc0_n // 2)
-            
-            # true blunder, harsh penalty
-            else:
-                vmap[best_uci] = xc0_n
-                if is_true_blunder:
-                    vmap[xc0_uci] = max(1, xc0_n // 4)
+            # mild and big blunders: drop xc0 record, queue lc0 instead
 
             is_blunder = loss_this >= blunder_cp and is_true_blunder
+            is_mild_blunder = (not missed_mate
+                               and loss_this > cfg.rescore_inaccuracy_cp
+                               and loss_this < blunder_cp)
+            skip_xc0 = is_blunder or is_mild_blunder
+            if is_mild_blunder:
+                lc0_mode = 'mild_true' if is_true_blunder else 'mild'
+            elif is_blunder:
+                lc0_mode = 'full'
+            else:
+                lc0_mode = None
 
             # re-sort after any adjustments
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
@@ -1066,9 +1066,20 @@ class Rescorer(object):
                 policy[idx] += p
 
             pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
+            sf_pv = ply.get('pv_ucis', [])
+            if lc0_mode == 'mild_true':
+                pv_seqs = [sf_pv[:1]]
+            elif lc0_mode == 'full':
+                xc0_pv = [s['uci'] for s in ply['tr'].get('pv', [])[:4]]
+                pv_seqs = [sf_pv, xc0_pv]
+            else:
+                pv_seqs = []
+
             pending_aux.append({
                 'sfen':            ply['cache_key'][0],
-                'pv_ucis':         ply.get('pv_ucis', []) if is_blunder else [],
+                'pv_seqs':         pv_seqs,
+                'skip_xc0':        skip_xc0,
+                'lc0_mode':        lc0_mode,
                 'is_blunder':      is_blunder,
                 'ply_i':           i,
                 'stm':             turn,
@@ -1088,12 +1099,14 @@ class Rescorer(object):
         eff_z_by_ply, n_triggers = collar_z_map(eval_trace, result, cfg, gid)
 
         n_diff = 0
-        hard_accepted = []
-        soft_pool = []
         sc = self.sample_counts
         scw = self.sample_counts_window
 
-        # loop 2: compute WDL targets and CE, classify into hard/soft
+        start_fen    = game_data['start_fen']
+        moves_played = game_data['moves_played']
+
+        # loop 2: compute WDL targets, add to training, build lc0 waypoints
+        lc0_waypoints = {}
         for tup, aux in zip(pending, pending_aux):
             x, mask, policy, Q, is_white, ply_i, vwht, pwht = tup
             z_orig = result if is_white else -result
@@ -1128,11 +1141,30 @@ class Rescorer(object):
             scw['total'] += 1
 
             entry = (x, mask, policy, Y, vwht, pwht)
-            flags = (hit_kl, hit_ce, hit_cpl)
-            if hit_kl or hit_ce or hit_cpl:
-                hard_accepted.append((entry, flags, aux, Y, is_white))
-            else:
-                soft_pool.append((entry, aux, Y, is_white))
+
+            if not aux.get('skip_xc0'):
+                self.training_data.append(entry)
+                sc['accepted'] += 1
+                scw['accepted'] += 1
+                if hit_kl:
+                    sc['kl'] += 1
+                    scw['kl'] += 1
+                if hit_ce:
+                    sc['ce'] += 1
+                    scw['ce'] += 1
+                if hit_cpl:
+                    sc['cpl'] += 1
+                    scw['cpl'] += 1
+
+            if self.lc0_thread is not None:
+                if aux.get('lc0_mode'):
+                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
+                    sc['lc0_blunder'] += 1
+                    scw['lc0_blunder'] += 1
+                elif random.random() < cfg.lc0_enrich_frac:
+                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
+                    sc['lc0_enrich'] += 1
+                    scw['lc0_enrich'] += 1
 
             self.pending_metrics.append({
                 **aux,
@@ -1140,56 +1172,26 @@ class Rescorer(object):
                 'target_wdl': Y,
             })
 
-        start_fen    = game_data['start_fen']
-        moves_played = game_data['moves_played']
-
-        # hard-accepted: classify each entry, add xc0 to training, build lc0 waypoints
-        lc0_waypoints = {}
-        for entry, (hit_kl, hit_ce, hit_cpl), aux, Y, is_white in hard_accepted:
-            sc['accepted'] += 1
-            scw['accepted'] += 1
-            if hit_kl:
-                sc['kl'] += 1
-                scw['kl'] += 1
-            if hit_ce:
-                sc['ce'] += 1
-                scw['ce'] += 1
-            if hit_cpl:
-                sc['cpl'] += 1
-                scw['cpl'] += 1
-
-            self.training_data.append(entry)
-            if aux['is_blunder'] and self.lc0_thread is not None:
-                sc['lc0_blunder'] += 1
-                scw['lc0_blunder'] += 1
-
-            if self.lc0_thread is not None:
-                if aux['is_blunder'] or random.random() < cfg.lc0_enrich_frac:
-                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-                    if not aux['is_blunder']:
-                        sc['lc0_enrich'] += 1
-                        scw['lc0_enrich'] += 1
-
         # soft pool: sample up to target acceptance rate
-        n_hard = len(hard_accepted)
-        n_soft = len(soft_pool)
-        n_total = n_hard + n_soft
-        target_n = int(cfg.rescore_target_acceptance * n_total)
-        n_need = max(0, target_n - n_hard)
-        n_sample = min(n_soft, max(int(cfg.rescore_sample_floor * n_soft), n_need))
-        if n_sample > 0 and n_soft > 0:
-            chosen = np.random.choice(n_soft, size=n_sample, replace=False)
-            for i in chosen:
-                entry, aux, Y, is_white = soft_pool[i]
-                self.training_data.append(entry)
-                sc['accepted'] += 1
-                scw['accepted'] += 1
-                sc['rng'] += 1
-                scw['rng'] += 1
-                if self.lc0_thread is not None and random.random() < cfg.lc0_enrich_frac:
-                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-                    sc['lc0_enrich'] += 1
-                    scw['lc0_enrich'] += 1
+        # n_hard = ...
+        # n_soft = len(soft_pool)
+        # n_total = n_hard + n_soft
+        # target_n = int(cfg.rescore_target_acceptance * n_total)
+        # n_need = max(0, target_n - n_hard)
+        # n_sample = min(n_soft, max(int(cfg.rescore_sample_floor * n_soft), n_need))
+        # if n_sample > 0 and n_soft > 0:
+        #     chosen = np.random.choice(n_soft, size=n_sample, replace=False)
+        #     for i in chosen:
+        #         entry, aux, Y, is_white = soft_pool[i]
+        #         self.training_data.append(entry)
+        #         sc['accepted'] += 1
+        #         scw['accepted'] += 1
+        #         sc['rng'] += 1
+        #         scw['rng'] += 1
+        #         if self.lc0_thread is not None and random.random() < cfg.lc0_enrich_frac:
+        #             lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
+        #             sc['lc0_enrich'] += 1
+        #             scw['lc0_enrich'] += 1
 
         if lc0_waypoints and self.lc0_thread is not None:
             lc0_meta = []
@@ -1209,19 +1211,20 @@ class Rescorer(object):
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
                     lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs))))
 
-                    if aux['is_blunder'] and aux['pv_ucis']:
-                        # pv_ucis = pv[0:4]: pv[0] is SF's best move from
-                        # the blunder position, subsequent entries are the continuation.
-                        # Must start from pv[0] — skipping it would push a move
-                        # for the wrong side and corrupt the board.
+                    n_pv = 0
+                    seen_fens = set()
+                    for pv_seq in aux.get('pv_seqs', []):
                         b_pv = b_lc0.clone()
-                        n_pv = 0
-                        for pv_mv in aux['pv_ucis']:
+                        for pv_mv in pv_seq:
                             if b_pv.is_terminal():
                                 break
                             b_pv.push_uci(pv_mv)
                             if b_pv.is_terminal():
                                 break
+                            fen = b_pv.fen(include_counters=False)
+                            if fen in seen_fens:
+                                continue
+                            seen_fens.add(fen)
                             self.lc0_thread.submit(
                                 b_pv.lc0_features(),
                                 b_pv,
@@ -1231,8 +1234,8 @@ class Rescorer(object):
                             )
                             lc0_meta.append(('pv', None, None, None, []))
                             n_pv += 1
-                        sc['lc0_pv'] += n_pv
-                        scw['lc0_pv'] += n_pv
+                    sc['lc0_pv'] += n_pv
+                    scw['lc0_pv'] += n_pv
                 b_lc0.push_uci(mv)
 
             self.lc0_thread.flush()
@@ -1896,9 +1899,7 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
     collar_state = [None] * n
     collar = None
     count = 0
-    segment_start = 0
     n_triggers = 0
-    collar_set_by_non_winner = False
 
     for i, ev in enumerate(evals):
         if collar is None:
@@ -1914,16 +1915,14 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
                 count = 0
 
             if count >= n_consec:
-                for j in range(segment_start, i + 1):
+                for j in range(i - count + 1, i + 1):
                     collar_state[j] = 'white'
                 collar = 'white'
-                collar_set_by_non_winner = game_result < 1.0
                 count = 0
             elif count <= -n_consec:
-                for j in range(segment_start, i + 1):
+                for j in range(i + count + 1, i + 1):
                     collar_state[j] = 'black'
                 collar = 'black'
-                collar_set_by_non_winner = game_result > -1.0
                 count = 0
         else:
             broken = (
@@ -1932,7 +1931,6 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
             )
 
             if broken:
-                segment_start = i
                 collar = None
                 count = 0
                 n_triggers += 1
@@ -1940,9 +1938,6 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
                 collar_state[i] = collar
 
     eff_z = {}
-
-    if not n_triggers:
-        return eff_z, n_triggers
 
     for i, ply in enumerate(plies):
         if collar_state[i] == 'white':
@@ -1952,7 +1947,7 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
         else:
             eff_z[ply] = float(game_result)
 
-    if all(v == float(game_result) for v in eff_z.values()):
+    if n_triggers == 0 or all(v == float(game_result) for v in eff_z.values()):
         return {}, 0
 
     return eff_z, n_triggers

@@ -1077,6 +1077,7 @@ class GameViewer:
         print("                       minimum visits, e.g. pv8")
         print("  cpl > <N>            seek next move with CPL >= N, e.g. cpl > 50")
         print("  kl > <N>             seek next move with KL >= N, e.g. kl > 1.5")
+        print("  temp <T>             show priors temperature-scaled by T (read-only)")
 
     def replay(self):
         print(f"Replaying {self.log['scenario']}. Result {self.log['result']}")
@@ -1146,6 +1147,16 @@ class GameViewer:
                     self.seek_kl(threshold)
                 except (ValueError, IndexError):
                     print("Usage: kl > <number>")
+            elif cmd.startswith("temp"):
+                parts = cmd.split()
+                try:
+                    arg = parts[1]
+                    if arg.startswith("e="):
+                        self.show_temp(None, target_entropy=float(arg[2:]))
+                    else:
+                        self.show_temp(float(arg))
+                except (IndexError, ValueError):
+                    print("Usage: temp <T>  or  temp e=<0-1>")
             elif cmd.startswith("visits"):
                 split = [c.strip() for c in cmd.split(" ") if c.strip()]
                 # check to see if a int was given to show deeper visit info
@@ -1159,6 +1170,67 @@ class GameViewer:
                 # default: forward one move
                 shown = False
                 self.next()
+
+    def temp_for_entropy(self, priors, target_norm_entropy, tol=1e-4):
+        p = np.array(priors, dtype=np.float64)
+        p = p / p.sum()
+
+        def norm_entropy_at(t):
+            scaled = p ** (1.0 / t)
+            scaled /= scaled.sum()
+            _, norm = calc_entropy(scaled)
+            return norm
+
+        lo, hi = 1e-6, 10.0
+        steps = 0
+        best = (lo + hi) / 2
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            steps += 1
+            val = norm_entropy_at(mid)
+            best = mid
+            if val < target_norm_entropy:
+                lo = mid
+            else:
+                hi = mid
+            if abs(val - target_norm_entropy) < 0.05:
+                break
+        self._last_temp_steps = steps
+        return best
+
+    def show_temp(self, temp, target_entropy=None):
+        node, who, chosen = self.node_who_chosen()
+        if node is None:
+            print("  (no candidate_moves in log)")
+            return
+        cands = node.get("candidate_moves") or []
+        if not cands:
+            print("  (no candidates)")
+            return
+
+        priors = np.array([c.get("P", 0.0) for c in cands], dtype=np.float64)
+        ucis   = [c.get("uci", "?") for c in cands]
+
+        if target_entropy is not None:
+            temp = self.temp_for_entropy(priors, target_entropy)
+
+        p_new = priors ** (1.0 / temp)
+        s = p_new.sum()
+        if s <= 0:
+            print("  (priors are zero)")
+            return
+        p_new = p_new / s
+
+        norm_orig, _ = self.compute_norm_entropy(priors)
+        norm_temp, _ = self.compute_norm_entropy(p_new)
+
+        steps_str = f"  ({self._last_temp_steps} steps)" if target_entropy is not None else ""
+        print(f"\n  T={temp:.4f}  entropy (norm'd): original = {norm_orig:.3f}  temp-scaled = {norm_temp:.3f}{steps_str}")
+        print(f"  {'move':<8}  {'prior':>8}  {'temp':>8}  {'delta':>8}")
+        order = np.argsort(p_new)[::-1]
+        for i in order:
+            delta = p_new[i] - priors[i]
+            print(f"  {ucis[i]:<8}  {priors[i]:>8.4f}  {p_new[i]:>8.4f}  {delta:>+8.4f}")
 
     def compute_norm_entropy(self, arr):
         """Return (normalized_entropy_bits, prob_vector)."""

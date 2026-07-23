@@ -20,7 +20,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
-    batch_policy_metrics_from_priors, print_validation,
+    batch_policy_metrics_from_priors, print_validation, calc_entropy,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
@@ -393,6 +393,14 @@ class Rescorer(object):
 
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
+
+        self.tscale_n = 0
+        self.tscale_eligible = 0
+        self.tscale_iters = 0
+        self.tscale_ne_before = 0.0
+        self.tscale_ne_after = 0.0
+        self.tscale_best_T = 0.0
+        self.tscale_time = 0.0
 
         self.intake = deque()
         self.pending = {}
@@ -976,6 +984,9 @@ class Rescorer(object):
                 best_abs = played_abs
 
             loss_this = delta
+            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
+            if missed_mate:
+                loss_this = min(200, loss_this)
             cpl_s += loss_this
             n_plies += 1
 
@@ -1007,10 +1018,7 @@ class Rescorer(object):
             if Z_stm <= 0.0:
                 blunder_cp = cfg.rescore_blunder_cp_loser
 
-            # define missed mate as missed a mating line but still winning. punish less
-            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
             missed_mate_still_won = missed_mate and Z_stm > 0
-            loss_this = min(200, loss_this) if missed_mate_still_won else loss_this
 
             is_blunder = loss_this >= blunder_cp
             true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
@@ -1032,6 +1040,43 @@ class Rescorer(object):
 
             mvs = [v[0] for v in visits]
             vis = [v[1] for v in visits]
+
+            if Z_stm >= 0 and loss_this <= EQUIV and len(mvs) >= 5:
+                self.tscale_eligible += 1
+                vis_arr = np.array(vis, dtype=np.float64)
+                vis_arr /= vis_arr.sum()
+                _, ne = calc_entropy(vis_arr)
+                target_e = 0.65
+                if ne > target_e:
+                    t0 = time.perf_counter()
+                    lo, hi, best, best_dist = 0.3, 1.0, 0.75, float('inf')
+                    iters = 0
+                    for _ in range(5):
+                        mid = (lo + hi) / 2
+                        scaled = vis_arr ** (1.0 / mid)
+                        scaled /= scaled.sum()
+                        _, ne_mid = calc_entropy(scaled)
+                        iters += 1
+                        if ne_mid < ne:
+                            dist = abs(ne_mid - target_e)
+                            if dist < best_dist:
+                                best, best_dist = mid, dist
+                            if dist < 0.05:
+                                break
+                        if ne_mid < target_e:
+                            lo = mid
+                        else:
+                            hi = mid
+                    vis_arr = vis_arr ** (1.0 / best)
+                    vis = list(vis_arr / vis_arr.sum())
+                    _, ne_after = calc_entropy(np.array(vis, dtype=np.float64))
+                    self.tscale_n += 1
+                    self.tscale_iters += iters
+                    self.tscale_ne_before += ne
+                    self.tscale_ne_after += ne_after
+                    self.tscale_best_T += best
+                    self.tscale_time += time.perf_counter() - t0
+
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
@@ -1704,13 +1749,6 @@ class Rescorer(object):
             lc0_value_mse=lc0_value_mse,
             lc0_value_corr=lc0_value_corr,
         )
-        print(f"[lc0 metrics] epoch={epoch}  n={len(lc0_wdls)}"
-              f"  val_mse={lc0_value_mse:.4f}  val_ce={ce_lc0_true:.4f}"
-              f"  kl_lc0_xc0={align_stats['kl_lc0_xc0_priors']:.4f}"
-              f"  ce_lc0gt_visits={align_stats['ce_lc0gt_xc0_visits']:.4f}"
-              f"  prior_top1={align_stats['prior_top1_agree']:.3f}"
-              f"  prior_top3={align_stats['prior_top3_agree']:.3f}"
-              f"  prior_top5={align_stats['prior_top5_agree']:.3f}")
 
     @staticmethod
     def compute_policy_align_metrics(samples):
@@ -1840,6 +1878,19 @@ class Rescorer(object):
             self.print_collar_stats()
             print()
             self.print_sample_stats()
+
+            n, el = self.tscale_n, self.tscale_eligible
+            if el > 0:
+                frac = n / el
+                avg_iters = self.tscale_iters / n if n else 0
+                avg_ne_b  = self.tscale_ne_before / n if n else 0
+                avg_ne_a  = self.tscale_ne_after / n if n else 0
+                avg_T     = self.tscale_best_T / n if n else 0
+                avg_us    = self.tscale_time / n * 1e6 if n else 0
+                print(f"{RS}  tscale: {n}/{el} ({frac:.1%})  ne {avg_ne_b:.3f}->{avg_ne_a:.3f}  delta={avg_ne_a-avg_ne_b:+.3f}  avg_T={avg_T:.3f}")
+                print(f"{RS}  tscale: avg_iters={avg_iters:.1f}  avg={avg_us:.1f}us  total={self.tscale_time*1000:.1f}ms")
+            self.tscale_n = self.tscale_eligible = self.tscale_iters = 0
+            self.tscale_ne_before = self.tscale_ne_after = self.tscale_best_T = self.tscale_time = 0.0
 
             w_this = self.written_this_round
             wtot = self.written_total

@@ -72,6 +72,8 @@ class MCTSTree(fasttree):
             float(cfg.contempt_full_q),
             float(cfg.contempt_fight_c),
         )
+        self.set_tempscale_entropy_target(float(cfg.tempscale_entropy_target))
+        self.set_tempscale_trigger_q(float(cfg.tempscale_trigger_q))
         # early-stop rolling state
         self._es_last_checked_at = 0
         self._es_tripped = False

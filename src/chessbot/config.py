@@ -145,6 +145,10 @@ class Config(object):
     lc0_enrich_frac   = 0.0   # fraction of non-blunder accepted positions to enrich with lc0 (0=off, 1=all)
     lc0_enrich_weight = 0.75  # vwht/pwht multiplier applied to lc0-generated training samples
 
+    # Prior temperature scaling in C++ tree (0 = disabled)
+    tempscale_entropy_target = 0.0   # normed entropy target; 0 = disabled
+    tempscale_trigger_q      = -2.0  # STM-POV Q floor; -2 = always; 0.5 = winning only
+
     # board encoding fed to the model. Sole driver of the encoder on every path
     # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16
     # tokens; "lc0" = 112x8x8 lc0 planes. Selfplay and retrain MUST agree or the

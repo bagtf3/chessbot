@@ -223,10 +223,11 @@ class GameLooper(object):
                     self.config.sf_config, self.config.sf_depth
                 )
                 self.sf_thread.start()
+            game_cfg = spec.cfg
             board = fastboard(spec.fen)
             for mv in spec.moves:
                 board.push_uci(mv)
-            cg = ChessGame(board=board, meta=spec.meta, cfg=spec.cfg)
+            cg = ChessGame(board=board, meta=spec.meta, cfg=game_cfg)
             self.active_games.append(cg)
             self.forest.add_tree(cg.tree)
 

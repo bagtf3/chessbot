@@ -601,12 +601,6 @@ class ChessGame(object):
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv
 
-        nn = self.tree.emulate_nn_result()
-        data["nn_value"] = nn["value"]
-        data["nn_wdl"] = nn["wdl"]
-        data["nn_raw_priors"] = nn["raw_priors"]
-        data["nn_mass_on_legal"] = nn["mass_on_legal"]
-
         self.tree_data[self.plies] = data
     
     def set_stockfish_result(self, res_tup):

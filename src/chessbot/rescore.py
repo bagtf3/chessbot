@@ -20,7 +20,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
-    batch_policy_metrics_from_priors, print_validation, calc_entropy,
+    calc_entropy,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
@@ -388,7 +388,7 @@ class Rescorer(object):
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0,
+            'total': 0, 'accepted': 0,
             'lc0_blunder': 0, 'lc0_pv': 0, 'lc0_enrich': 0}
 
         self.sample_counts = zero_sc()
@@ -404,7 +404,6 @@ class Rescorer(object):
 
         self.intake = deque()
         self.pending = {}
-        self.pending_lc0_metrics = []
 
         lc0_model     = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
         lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
@@ -432,6 +431,50 @@ class Rescorer(object):
 
     def close(self):
         pass
+
+    def export_state(self):
+        return {
+            'training_data': self.training_data,
+            'analyzed_results': self.analyzed_results,
+            'pending_metrics': self.pending_metrics,
+            'games_seen': self.games_seen,
+            'games_processed': self.games_processed,
+            'written_total': self.written_total,
+            'written_this_round': self.written_this_round,
+            'n_saved': self.n_saved,
+            'total_cpl_plies': self.total_cpl_plies,
+            'total_bmr_plies': self.total_bmr_plies,
+            'total_plies': self.total_plies,
+            'n_sf_submitted': self.n_sf_submitted,
+            'n_cache_hits': self.n_cache_hits,
+            'sf_compute_time': self.sf_compute_time,
+            'sf_compute_count': self.sf_compute_count,
+            'last_10_cpls': self.last_10_cpls,
+            'last_10_bmrs': self.last_10_bmrs,
+            'last_10_plies': self.last_10_plies,
+            'collar_total': self.collar_total,
+            'collar_window': self.collar_window,
+            'collar_history': self.collar_history,
+            'total_stop': self.total_stop,
+            'window_stop': self.window_stop,
+            'sample_counts': self.sample_counts,
+            'sample_counts_window': self.sample_counts_window,
+            'tscale_n': self.tscale_n,
+            'tscale_eligible': self.tscale_eligible,
+            'tscale_iters': self.tscale_iters,
+            'tscale_ne_before': self.tscale_ne_before,
+            'tscale_ne_after': self.tscale_ne_after,
+            'tscale_best_T': self.tscale_best_T,
+            'tscale_time': self.tscale_time,
+            'start_time': self.start_time,
+            'current_depth': self.current_depth,
+            'intake': self.intake,
+            'pending': self.pending,
+        }
+
+    def import_state(self, state):
+        for k, v in state.items():
+            setattr(self, k, v)
 
     def __enter__(self):
         return self
@@ -554,7 +597,7 @@ class Rescorer(object):
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         x, mask, policy = self.make_policy_example(board, ucis, visits)
-        self.training_data.append((x, mask, policy, Y, vwht, pwht))
+        self.training_data.append((x, mask, policy, Y, vwht, pwht, 'xc0'))
     
     def write_training_data_pkl(self, size=None, randomize=True):
         cfg = self.config
@@ -938,11 +981,6 @@ class Rescorer(object):
         do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         EQUIV = cfg.rescore_equiv_range
 
-        # acceptance thresholds
-        kl_t = cfg.rescore_kl_threshold
-        ce_t = cfg.rescore_ce_threshold
-        cpl_t = cfg.rescore_inaccuracy_cp
-
         cpl_s = 0.0
         n_plies = 0
         rows = []
@@ -950,9 +988,6 @@ class Rescorer(object):
         turn_at = {}
         pending = []
         pending_aux = []
-        kl_map = {}
-        ce_map = {}
-        mse_map = {}
 
         # loop 1: per-ply stats, visit redistribution, policy build, accumulate pending
         for ply in sorted(game_state['ply_states'], key=lambda p: p['ply_idx']):
@@ -1083,7 +1118,6 @@ class Rescorer(object):
             vwht = value_weight_for_game(cfg, is_draw)
             pwht = 1.0
             kl = kl_divergence(priors, vis)
-            kl_map[i] = kl
             if kl_eligible and do_KL_boost:
                 if kl >= cfg.KL_boost_threshold:
                     pwht *= KL_coef
@@ -1117,16 +1151,9 @@ class Rescorer(object):
                 'is_blunder':      is_blunder,
                 'ply_i':           i,
                 'stm':             turn,
-                'nn_value':        tr.get('nn_value'),
-                'nn_wdl':          tr.get('nn_wdl'),
-                'nn_raw_priors':   tr.get('nn_raw_priors', []),
-                'mass_on_legal':   tr.get('nn_mass_on_legal'),
                 'best_wdl':        tr.get('best_wdl'),
                 'sf_cp':           best_cp,
-                'candidate_visits': list(zip(mvs, vis)),
                 'result_z_stm':    Z_stm,
-                'kl':              kl,
-                'cpl':             loss_this,
             })
 
         # collar-adjusted result targets
@@ -1152,43 +1179,15 @@ class Rescorer(object):
             z = z_eff if cfg.use_collar_rescoring else z_orig
             Y = blend_wdl(z, aux.get('best_wdl'), is_white)
 
-            nn_wdl = aux['nn_wdl']
-            nn_value = aux['nn_value']
-            if nn_wdl is not None:
-                eps = 1e-7
-                nw = nn_wdl if is_white else (nn_wdl[2], nn_wdl[1], nn_wdl[0])
-                p = np.clip(nw, eps, 1 - eps)
-                p = p / p.sum()
-                ce = -float(np.dot(Y, np.log(p)))
-            else:
-                ce = 0.0
-            if nn_value is not None:
-                sign = 1 if is_white else -1
-                nn_value_stm = np.clip(nn_value * sign, -1.0, 1.0)
-                mse_map[ply_i] = (nn_value_stm - (Y[0] - Y[2])) ** 2
-            ce_map[ply_i] = ce
-            hit_kl  = aux['kl'] > kl_t
-            hit_ce  = ce > ce_t
-            hit_cpl = aux['cpl'] >= cpl_t
-
             sc['total'] += 1
             scw['total'] += 1
 
-            entry = (x, mask, policy, Y, vwht, pwht)
+            entry = (x, mask, policy, Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
                 self.training_data.append(entry)
                 sc['accepted'] += 1
                 scw['accepted'] += 1
-                if hit_kl:
-                    sc['kl'] += 1
-                    scw['kl'] += 1
-                if hit_ce:
-                    sc['ce'] += 1
-                    scw['ce'] += 1
-                if hit_cpl:
-                    sc['cpl'] += 1
-                    scw['cpl'] += 1
 
             if self.lc0_thread is not None:
                 if aux.get('lc0_mode'):
@@ -1201,31 +1200,11 @@ class Rescorer(object):
                     scw['lc0_enrich'] += 1
 
             self.pending_metrics.append({
-                **aux,
-                'target_y': Y[0] - Y[2],
-                'target_wdl': Y,
+                'stm':          aux['stm'],
+                'sf_cp':        aux['sf_cp'],
+                'result_z_stm': aux['result_z_stm'],
+                'target_wdl':   Y,
             })
-
-        # soft pool: sample up to target acceptance rate
-        # n_hard = ...
-        # n_soft = len(soft_pool)
-        # n_total = n_hard + n_soft
-        # target_n = int(cfg.rescore_target_acceptance * n_total)
-        # n_need = max(0, target_n - n_hard)
-        # n_sample = min(n_soft, max(int(cfg.rescore_sample_floor * n_soft), n_need))
-        # if n_sample > 0 and n_soft > 0:
-        #     chosen = np.random.choice(n_soft, size=n_sample, replace=False)
-        #     for i in chosen:
-        #         entry, aux, Y, is_white = soft_pool[i]
-        #         self.training_data.append(entry)
-        #         sc['accepted'] += 1
-        #         scw['accepted'] += 1
-        #         sc['rng'] += 1
-        #         scw['rng'] += 1
-        #         if self.lc0_thread is not None and random.random() < cfg.lc0_enrich_frac:
-        #             lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-        #             sc['lc0_enrich'] += 1
-        #             scw['lc0_enrich'] += 1
 
         if lc0_waypoints and self.lc0_thread is not None:
             lc0_meta = []
@@ -1239,7 +1218,7 @@ class Rescorer(object):
                         msg += f"!= {aux['sfen']}"
                         print(msg)
 
-                    x, mask, _, _, vwht, _ = entry
+                    x, mask, _, _, vwht, _, _ = entry
                     ucis_now = b_lc0.legal_moves()
                     self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, mask, vwht, 1.0)
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
@@ -1276,30 +1255,8 @@ class Rescorer(object):
             w = cfg.lc0_enrich_weight
             for (kind, aux, Y, is_white, uci_flat), result in zip(lc0_meta, self.lc0_thread.drain()):
                 x, mask, policy, lc0_wdl, vwht, pwht = result
-                self.training_data.append((x, mask, policy, lc0_wdl, vwht * w, pwht * w))
-                if kind == 'main' and aux is not None:
-                    lc0_pol = policy
-                    lc0_policy_dict = {u: float(lc0_pol[i]) for u, i in uci_flat}
-                    lc0_wdl_stm = lc0_wdl
-                    nn_wdl = aux.get('nn_wdl')
-                    if nn_wdl is not None:
-                        nn_wdl_stm = np.array(nn_wdl if is_white else
-                            [nn_wdl[2], nn_wdl[1], nn_wdl[0]], dtype=np.float32)
-                    else:
-                        nn_wdl_stm = None
-                    stm_sign = 1.0 if is_white else -1.0
-                    nn_v = aux.get('nn_value')
-                    self.pending_lc0_metrics.append({
-                        'lc0_wdl': lc0_wdl_stm,
-                        'lc0_policy_dict': lc0_policy_dict,
-                        'target_wdl': Y,
-                        'nn_wdl': nn_wdl_stm,
-                        'nn_raw_priors': aux.get('nn_raw_priors', []),
-                        'candidate_visits': aux.get('candidate_visits', []),
-                        'nn_value_stm': float(np.clip(nn_v * stm_sign, -1.0, 1.0)) if nn_v is not None else None,
-                        'sf_cp': aux.get('sf_cp'),
-                        'result_z_stm': aux.get('result_z_stm'),
-                    })
+                source = 'lc0' if kind == 'main' else 'lc0_pv'
+                self.training_data.append((x, mask, policy, lc0_wdl, vwht * w, pwht * w, source))
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
@@ -1311,9 +1268,6 @@ class Rescorer(object):
 
         out_df = pd.DataFrame(rows, columns=cols)
         out_df['played_best_move'] = out_df['delta'] <= 0
-        out_df['rescore_kl']  = out_df['move_num'].map(kl_map)
-        out_df['rescore_ce']  = out_df['move_num'].map(ce_map)
-        out_df['rescore_mse'] = out_df['move_num'].map(mse_map)
 
         overall_bmr = out_df['played_best_move'].mean() if len(out_df) else np.nan
 
@@ -1460,344 +1414,102 @@ class Rescorer(object):
             print(row("last 300", combined))
 
     def print_sample_stats(self):
-        cats = ("cpl", "kl", "ce", "rng")
-        labels = ("CPL", " KL", " CE", "rng")
         W = 10
 
         def col(val):
             return f"  {val:>{W}}  |"
 
-        def row(label, sc):
+        def sample_row(label, sc):
             acc = sc['accepted']
-            ratio = acc / sc['total'] if sc['total'] else 0.0
-            lbl = f"{label} {ratio:.0%}"
-            out = f"{RS}  {lbl:<12} |"
-            for c in cats:
-                val = f"{sc[c] / acc:.1%}" if acc else "--"
-                out += col(val)
-            return out
-
-        hdr = f"{RS}  {'':<12} |" + "".join(col(lbl) for lbl in labels)
-        print(hdr)
-        print(row("batch", self.sample_counts_window))
-        print(row("total", self.sample_counts))
-        print()
-
-        ehdr = (f"{RS}  {'enrich':<12} |"
-                + "".join(col(lbl) for lbl in ("blunder", "pv", "enrich", "lc0-%")))
-        print(ehdr)
-
-        def enrich_row(label, sc):
-            lc0_total  = sc['lc0_blunder'] + sc['lc0_pv'] + sc['lc0_enrich']
-            total_tr   = sc['accepted'] + sc['lc0_pv'] + sc['lc0_enrich']
-            enrich_pct = f"{lc0_total / total_tr * 100:.1f}%" if total_tr else "--"
+            total = sc['total']
+            ratio = acc / total if total else 0.0
+            lc0_total = sc['lc0_blunder'] + sc['lc0_pv'] + sc['lc0_enrich']
+            all_tr = acc + sc['lc0_pv'] + sc['lc0_enrich']
+            enrich_pct = f"{lc0_total / all_tr * 100:.1f}%" if all_tr else "--"
             return (f"{RS}  {label:<12} |"
-                    + col(sc['lc0_blunder'])
-                    + col(sc['lc0_pv'])
-                    + col(sc['lc0_enrich'])
-                    + col(enrich_pct))
+                    + col(f"{acc}/{total} ({ratio:.0%})")
+                    + col(f"lc0 {enrich_pct}"))
 
-        print(enrich_row("batch", self.sample_counts_window))
-        print(enrich_row("total", self.sample_counts))
+        hdr = f"{RS}  {'':<12} |" + col("accepted") + col("lc0 enrich")
+        print(hdr)
+        print(sample_row("batch", self.sample_counts_window))
+        print(sample_row("total", self.sample_counts))
 
-        # LC0 output: how many positions have flushed into training_data
         if self.lc0_thread is not None:
             lst = self.lc0_thread.stats()
-            print(f"{RS}  lc0 output: {lst['samples']} flushed"
+            print(f"{RS}  lc0: {lst['samples']} flushed"
                   f"  {lst['inferences']} batches"
                   f"  {lst['pending']} pending")
 
-        zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'kl': 0, 'ce': 0, 'cpl': 0, 'rng': 0,
+        self.sample_counts_window = {
+            'total': 0, 'accepted': 0,
             'lc0_blunder': 0, 'lc0_pv': 0, 'lc0_enrich': 0,
         }
-        self.sample_counts_window = zero_sc()
 
-    def aggregate_metrics(self, epoch, vscale, progress_csv_path, size=None):
-        if len(self.pending_metrics) < 0.8 * self.config.retrain_size:
+    def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path):
+        import pickle
+        self.pending_metrics = []
+
+        if not os.path.exists(pred_pkl_path):
+            print(f"[metrics] pred pkl not found, skipping: {pred_pkl_path}")
             return
 
-        chunk_size = size if size is not None else len(self.pending_metrics)
-        chunk = self.pending_metrics[:chunk_size]
-        self.pending_metrics = self.pending_metrics[chunk_size:]
+        with open(pred_pkl_path, 'rb') as f:
+            preds = pickle.load(f)  # list of (pred_wdl, true_wdl, source)
 
-        nn_vals_stm, target_ys, sf_cps, result_zs = [], [], [], []
-        mol_vals, policy_samples = [], []
-        nn_wdls, target_wdls = [], []
+        eps = 1e-7
+        xc0_pred, xc0_true = [], []
+        lc0_pred, lc0_true = [], []
 
-        for m in chunk:
-            nn_v = m.get('nn_value')
-            if nn_v is None:
-                continue
-            stm_sign = 1.0 if m['stm'] else -1.0
-            nn_stm = np.clip(nn_v * stm_sign, -1.0, 1.0)
-            nn_vals_stm.append(nn_stm)
-            target_ys.append(m['target_y'])
-            sf_cps.append(m['sf_cp'])
-            result_zs.append(m['result_z_stm'])
-            mol = m.get('mass_on_legal')
-            mol_vals.append(mol if mol is not None else float('nan'))
-            priors_map = {u: p for u, p in m.get('nn_raw_priors', [])}
-            if m.get('policy_eligible', True):
-                policy_samples.append((priors_map, m.get('candidate_visits', [])))
-            nn_wdl = m.get('nn_wdl')
-            tgt_wdl = m.get('target_wdl')
-            if nn_wdl is not None and tgt_wdl is not None:
-                if not m['stm']:  # white-POV -> STM-POV for black: swap win/loss
-                    nn_wdl = (nn_wdl[2], nn_wdl[1], nn_wdl[0])
-                nn_wdls.append(nn_wdl)
-                target_wdls.append(tgt_wdl)
+        for pred_wdl, true_wdl, source in preds:
+            p = np.clip(np.array(pred_wdl, dtype=np.float64), eps, 1 - eps)
+            p /= p.sum()
+            t = np.array(true_wdl, dtype=np.float64)
+            if source == 'xc0':
+                xc0_pred.append(p)
+                xc0_true.append(t)
+            else:
+                lc0_pred.append(p)
+                lc0_true.append(t)
 
-        nn_vals_stm = np.array(nn_vals_stm, dtype=np.float32)
-        target_ys   = np.array(target_ys,   dtype=np.float32)
-        sf_cps      = np.array(sf_cps,      dtype=np.float32)
-        result_zs   = np.array(result_zs,   dtype=np.float32)
-        mol_vals    = np.array(mol_vals,     dtype=np.float32)
+        def wdl_block(pred_list, true_list):
+            if not pred_list:
+                return {}
+            p = np.array(pred_list, dtype=np.float64)
+            t = np.array(true_list, dtype=np.float64)
+            p = np.clip(p, eps, 1 - eps)
+            p /= p.sum(axis=1, keepdims=True)
+            ce = float(-np.mean(np.sum(t * np.log(p), axis=1)))
+            bias = np.mean(p - t, axis=0)
+            return {'ce': round(ce, 5), 'bias_w': round(float(bias[0]), 5),
+                    'bias_d': round(float(bias[1]), 5), 'bias_l': round(float(bias[2]), 5),
+                    'n': len(pred_list)}
 
-        valid_v = ~np.isnan(nn_vals_stm) & ~np.isnan(target_ys)
-        n = int(valid_v.sum())
-        val_mse = np.mean(
-            (nn_vals_stm[valid_v] - target_ys[valid_v]) ** 2
-        ) if n else float('nan')
-        val_corr = (
-            np.corrcoef(nn_vals_stm[valid_v], target_ys[valid_v])[0, 1]
-        ) if n > 1 else float('nan')
+        xb = wdl_block(xc0_pred, xc0_true)
+        lb = wdl_block(lc0_pred, lc0_true)
 
-        pol_stats = batch_policy_metrics_from_priors(
-            policy_samples, self.config.uniform_eps, self.config.prior_clip_max)
+        pfx = f"[epoch {epoch:4d}] [metrics]"
+        if xb:
+            print(f"{pfx} xc0_vs_true  CE={xb['ce']:.4f}  "
+                  f"bias W={xb['bias_w']:+.4f} D={xb['bias_d']:+.4f} L={xb['bias_l']:+.4f}"
+                  f"  n={xb['n']}")
+        if lb:
+            print(f"{pfx} xc0_vs_lc0   CE={lb['ce']:.4f}  "
+                  f"bias W={lb['bias_w']:+.4f} D={lb['bias_d']:+.4f} L={lb['bias_l']:+.4f}"
+                  f"  n={lb['n']}")
 
-        valid_m = ~np.isnan(mol_vals)
-        mol_est = float(np.mean(mol_vals[valid_m])) if valid_m.any() else float('nan')
-        mol_cov = float(valid_m.mean()) if len(valid_m) else 0.0
-
-        if nn_wdls:
-            nn_wdl_arr  = np.array(nn_wdls,     dtype=np.float64)
-            tgt_wdl_arr = np.array(target_wdls, dtype=np.float64)
-            eps = 1e-7
-            nn_wdl_arr = np.clip(nn_wdl_arr, eps, 1.0 - eps)
-            nn_wdl_arr /= nn_wdl_arr.sum(axis=1, keepdims=True)
-            val_ce = -np.mean(np.sum(tgt_wdl_arr * np.log(nn_wdl_arr), axis=1))
-            wdl_bias = np.mean(nn_wdl_arr - tgt_wdl_arr, axis=0)
-            ce_components = -np.mean(tgt_wdl_arr * np.log(nn_wdl_arr), axis=0)
-        else:
-            val_ce = float('nan')
-            wdl_bias = np.array([float('nan')] * 3)
-            ce_components = np.array([float('nan')] * 3)
-
-        stats = {'value_mse': val_mse, 'value_corr': val_corr, 'value_ce': val_ce}
-        stats.update(pol_stats)
-        stats['mass_on_legal'] = mol_est
-        stats['wdl_bias_w'] = float(wdl_bias[0])
-        stats['wdl_bias_d'] = float(wdl_bias[1])
-        stats['wdl_bias_l'] = float(wdl_bias[2])
-        stats['ce_w'] = float(ce_components[0])
-        stats['ce_d'] = float(ce_components[1])
-        stats['ce_l'] = float(ce_components[2])
-        print_validation(epoch, stats, mass_on_legal=mol_est, mol_coverage=mol_cov)
-
-        row = {**stats, 'model_epoch': epoch, 'n_samples': n,
-               'mol_coverage_pct': round(mol_cov * 100, 1)}
+        row = {'model_epoch': epoch}
+        for k, v in xb.items():
+            row[f'xc0_vs_true_{k}'] = v
+        for k, v in lb.items():
+            row[f'xc0_vs_lc0_{k}'] = v
         row_df = pd.DataFrame([row])
         if os.path.exists(progress_csv_path):
-            all_df = pd.concat(
-                [pd.read_csv(progress_csv_path), row_df], ignore_index=True)
+            all_df = pd.concat([pd.read_csv(progress_csv_path), row_df], ignore_index=True)
         else:
             all_df = row_df
         all_df.round(5).to_csv(progress_csv_path, index=False)
-
-        from chessbot.plot_utils import plot_validation
-        plot_path = os.path.join(os.path.dirname(progress_csv_path), "validation_latest.png")
-        plot_validation(
-            epoch=epoch,
-            plot_path=plot_path,
-            nn_vals_stm=nn_vals_stm,
-            target_ys=target_ys,
-            sf_cps=sf_cps,
-            result_zs=result_zs,
-            val_mse=val_mse,
-            val_corr=val_corr,
-            val_ce=val_ce,
-            nn_wdl_arr=nn_wdl_arr if nn_wdls else None,
-            tgt_wdl_arr=tgt_wdl_arr if nn_wdls else None,
-            wdl_bias=wdl_bias,
-            ce_components=ce_components,
-        )
-        print(f"[metrics] plot saved")
-
-        if self.pending_lc0_metrics and self.config.lc0_enrich_frac > 0:
-            lc0_csv  = progress_csv_path.replace('eval_progress.csv', 'lc0_metrics.csv')
-            lc0_plot = os.path.join(os.path.dirname(progress_csv_path), 'lc0_validation_latest.png')
-            self.aggregate_lc0_metrics(epoch, lc0_csv, lc0_plot)
-
-    def aggregate_lc0_metrics(self, epoch, lc0_csv_path, lc0_plot_path):
-        chunk = self.pending_lc0_metrics
-        self.pending_lc0_metrics = []
-
-        lc0_wdls, nn_wdls, tgt_wdls = [], [], []
-        lc0_val_stms, nn_vals_stm, tgt_ys_scalar = [], [], []
-        sf_cps, result_zs = [], []
-        policy_samples_lc0 = []
-        policy_align_samples = []   # (lc0_pol_dict, xc0_priors_dict, xc0_visits_dict)
-
-        for m in chunk:
-            if m['nn_wdl'] is None:
-                continue
-            lc0_wdl = m['lc0_wdl']
-            tgt_wdl = m['target_wdl']
-            lc0_wdls.append(lc0_wdl)
-            nn_wdls.append(m['nn_wdl'])
-            tgt_wdls.append(tgt_wdl)
-            lc0_val_stms.append(float(lc0_wdl[0] - lc0_wdl[2]))
-            tgt_ys_scalar.append(float(tgt_wdl[0] - tgt_wdl[2]))
-            nn_vals_stm.append(m['nn_value_stm'])
-            sf_cps.append(m['sf_cp'])
-            result_zs.append(m['result_z_stm'])
-            pol_d = m.get('lc0_policy_dict')
-            cv    = m.get('candidate_visits')
-            nr    = m.get('nn_raw_priors', [])
-            if pol_d and cv:
-                policy_samples_lc0.append((pol_d, cv))
-            if pol_d and nr:
-                xc0_priors = {u: p for u, p in nr}
-                xc0_visits = {u: float(c) for u, c in cv} if cv else {}
-                policy_align_samples.append((pol_d, xc0_priors, xc0_visits))
-
-        if not lc0_wdls:
-            return
-
-        eps = 1e-7
-        lc0_arr = np.clip(np.array(lc0_wdls, dtype=np.float64), eps, 1 - eps)
-        lc0_arr /= lc0_arr.sum(axis=1, keepdims=True)
-        nn_arr  = np.clip(np.array(nn_wdls,  dtype=np.float64), eps, 1 - eps)
-        nn_arr  /= nn_arr.sum(axis=1, keepdims=True)
-        tgt_arr = np.array(tgt_wdls, dtype=np.float64)
-
-        ce_lc0_true = float(-np.mean(np.sum(tgt_arr * np.log(lc0_arr), axis=1)))
-        ce_xc0_lc0  = float(-np.mean(np.sum(lc0_arr * np.log(nn_arr),  axis=1)))
-        bias_lc0_true = np.mean(lc0_arr - tgt_arr, axis=0)
-        bias_xc0_lc0  = np.mean(nn_arr  - lc0_arr, axis=0)
-        ce_comp_lc0_true = -np.mean(tgt_arr * np.log(lc0_arr), axis=0)
-        ce_comp_xc0_lc0  = -np.mean(lc0_arr * np.log(nn_arr),  axis=0)
-
-        lc0_val_stms  = np.array(lc0_val_stms,  dtype=np.float32)
-        tgt_ys_scalar = np.array(tgt_ys_scalar, dtype=np.float32)
-        nn_vals_stm   = np.array([v if v is not None else float('nan') for v in nn_vals_stm], dtype=np.float32)
-        sf_cps        = np.array([v if v is not None else float('nan') for v in sf_cps],      dtype=np.float32)
-        result_zs     = np.array([v if v is not None else float('nan') for v in result_zs],   dtype=np.float32)
-
-        valid_v = ~np.isnan(lc0_val_stms) & ~np.isnan(tgt_ys_scalar)
-        lc0_value_mse  = float(np.mean((lc0_val_stms[valid_v] - tgt_ys_scalar[valid_v]) ** 2)) if valid_v.any() else float('nan')
-        lc0_value_corr = float(np.corrcoef(lc0_val_stms[valid_v], tgt_ys_scalar[valid_v])[0, 1]) if valid_v.sum() > 1 else float('nan')
-
-        lc0_pol_stats = batch_policy_metrics_from_priors(
-            policy_samples_lc0, self.config.uniform_eps, self.config.prior_clip_max)
-
-        align_stats = self.compute_policy_align_metrics(policy_align_samples)
-
-        row = {
-            'model_epoch': epoch, 'n_samples': len(lc0_wdls),
-            'lc0_value_mse':      round(lc0_value_mse,  5),
-            'lc0_value_corr':     round(lc0_value_corr, 5),
-            'lc0_value_ce':       round(ce_lc0_true,    5),
-            'lc0_vs_true_bias_w': round(float(bias_lc0_true[0]), 5),
-            'lc0_vs_true_bias_d': round(float(bias_lc0_true[1]), 5),
-            'lc0_vs_true_bias_l': round(float(bias_lc0_true[2]), 5),
-            'lc0_policy_ce':      round(lc0_pol_stats.get('policy_ce',   float('nan')), 5),
-            'lc0_uniform_ce':     round(lc0_pol_stats.get('uniform_ce',  float('nan')), 5),
-            'lc0_ce_gain':        round(lc0_pol_stats.get('ce_gain',     float('nan')), 5),
-            'lc0_top1_exact':     round(lc0_pol_stats.get('top1_exact',  float('nan')), 5),
-            'lc0_avg_top_prob':   round(lc0_pol_stats.get('avg_top_prob',float('nan')), 5),
-            'lc0_top1_mass':      round(lc0_pol_stats.get('top1_mass',   float('nan')), 5),
-            'lc0_top3_mass':      round(lc0_pol_stats.get('top3_mass',   float('nan')), 5),
-            'lc0_top5_mass':      round(lc0_pol_stats.get('top5_mass',   float('nan')), 5),
-            'xc0_vs_lc0_ce':     round(ce_xc0_lc0, 5),
-            'xc0_vs_lc0_bias_w': round(float(bias_xc0_lc0[0]), 5),
-            'xc0_vs_lc0_bias_d': round(float(bias_xc0_lc0[1]), 5),
-            'xc0_vs_lc0_bias_l': round(float(bias_xc0_lc0[2]), 5),
-            # policy alignment: lc0 priors vs xc0 priors/visits
-            'kl_lc0_xc0_priors':      round(align_stats['kl_lc0_xc0_priors'],      5),
-            'ce_lc0gt_xc0_visits':    round(align_stats['ce_lc0gt_xc0_visits'],    5),
-            'prior_top1_agree':       round(align_stats['prior_top1_agree'],        5),
-            'prior_top3_agree':       round(align_stats['prior_top3_agree'],        5),
-            'prior_top5_agree':       round(align_stats['prior_top5_agree'],        5),
-        }
-        row_df = pd.DataFrame([row])
-        if os.path.exists(lc0_csv_path):
-            all_df = pd.concat([pd.read_csv(lc0_csv_path), row_df], ignore_index=True)
-        else:
-            all_df = row_df
-        all_df.round(5).to_csv(lc0_csv_path, index=False)
-
-        from chessbot.plot_utils import plot_lc0_validation
-        plot_lc0_validation(
-            epoch=epoch,
-            plot_path=lc0_plot_path,
-            lc0_arr=lc0_arr,
-            nn_arr=nn_arr,
-            tgt_arr=tgt_arr,
-            lc0_vals_stm=lc0_val_stms,
-            nn_vals_stm=nn_vals_stm,
-            tgt_ys=tgt_ys_scalar,
-            sf_cps=sf_cps,
-            result_zs=result_zs,
-            ce_lc0_true=ce_lc0_true,
-            ce_xc0_lc0=ce_xc0_lc0,
-            bias_lc0_true=bias_lc0_true,
-            bias_xc0_lc0=bias_xc0_lc0,
-            ce_comp_lc0_true=ce_comp_lc0_true,
-            ce_comp_xc0_lc0=ce_comp_xc0_lc0,
-            lc0_value_mse=lc0_value_mse,
-            lc0_value_corr=lc0_value_corr,
-        )
-
-    @staticmethod
-    def compute_policy_align_metrics(samples):
-        eps = 1e-12
-        nan = float('nan')
-        kl_vals, ce_vis_vals = [], []
-        top1, top3, top5 = [], [], []
-
-        for lc0_pol, xc0_priors, xc0_visits in samples:
-            ucis = list(lc0_pol.keys())
-            if not ucis:
-                continue
-
-            lc0_p = np.array([lc0_pol.get(u, 0.0) for u in ucis], dtype=np.float64)
-            lc0_s = lc0_p.sum()
-            if lc0_s <= 0:
-                continue
-            lc0_p /= lc0_s
-
-            xc0_p = np.array([xc0_priors.get(u, 0.0) for u in ucis], dtype=np.float64)
-            xc0_s = xc0_p.sum()
-            if xc0_s > 0:
-                xc0_p /= xc0_s
-                # KL(lc0 || xc0_priors)
-                kl_vals.append(float(np.sum(lc0_p * np.log((lc0_p + eps) / (xc0_p + eps)))))
-                # top-k agreement: lc0 top-1 in xc0 top-k
-                lc0_top1_idx = int(np.argmax(lc0_p))
-                xc0_sorted   = np.argsort(-xc0_p)
-                top1.append(float(xc0_sorted[0] == lc0_top1_idx))
-                top3.append(float(lc0_top1_idx in xc0_sorted[:min(3, len(xc0_sorted))]))
-                top5.append(float(lc0_top1_idx in xc0_sorted[:min(5, len(xc0_sorted))]))
-
-            # CE(lc0 as GT vs xc0 visits)
-            xc0_v = np.array([xc0_visits.get(u, 0.0) for u in ucis], dtype=np.float64)
-            xc0_vs = xc0_v.sum()
-            if xc0_vs > 0:
-                xc0_v /= xc0_vs
-                ce_vis_vals.append(float(-np.sum(lc0_p * np.log(xc0_v + eps))))
-
-        def mean_or_nan(lst):
-            return float(np.mean(lst)) if lst else nan
-
-        return {
-            'kl_lc0_xc0_priors':   mean_or_nan(kl_vals),
-            'ce_lc0gt_xc0_visits': mean_or_nan(ce_vis_vals),
-            'prior_top1_agree':    mean_or_nan(top1),
-            'prior_top3_agree':    mean_or_nan(top3),
-            'prior_top5_agree':    mean_or_nan(top5),
-        }
+        print(f"{pfx} saved to {os.path.basename(progress_csv_path)}")
 
     def push_analyzed(self, report=True):
         # safeguard here

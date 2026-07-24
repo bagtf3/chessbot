@@ -28,6 +28,13 @@ import threading
 import queue
 
 STOP_REQUESTED = threading.Event()
+STOP_AFTER_ROUND_REQUESTED = threading.Event()
+NEXT_ROUND_REQUESTED = threading.Event()
+RELOAD_REQUESTED = threading.Event()
+PAUSE_REQUESTED = threading.Event()
+UNPAUSE_REQUESTED = threading.Event()
+SAVE_TRAINING_DATA_REQUESTED = threading.Event()
+SAVE_TRAINING_DATA_N = None
 
 MAX_BACKLOG = 250
 GAME_QUEUE_MIN = 36  # top up when central queue drops below this
@@ -35,6 +42,49 @@ GAME_QUEUE_MIN = 36  # top up when central queue drops below this
 
 def request_stop(signum=None, frame=None):
     STOP_REQUESTED.set()
+
+
+def stdin_listener():
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        if not cmd:
+            continue
+        parts = cmd.split()
+        if cmd == 'stop':
+            print("[cmd] stopping -- saving data and exiting")
+            request_stop()
+        elif cmd == 'stop now':
+            print("[cmd] hard stop")
+            os._exit(1)
+        elif cmd == 'stop after this round':
+            print("[cmd] will stop after this round completes")
+            STOP_AFTER_ROUND_REQUESTED.set()
+        elif cmd == 'next round':
+            print("[cmd] next round requested")
+            NEXT_ROUND_REQUESTED.set()
+        elif cmd == 'reload':
+            print("[cmd] reload queued -- applies at next round start")
+            RELOAD_REQUESTED.set()
+        elif parts[0] == 'pause':
+            dur = int(parts[1]) if len(parts) > 1 else None
+            print(f"[cmd] pausing workers{f' for {dur}s' if dur else ''}")
+            PAUSE_REQUESTED.set()
+            if dur:
+                def auto_unpause(d=dur):
+                    time.sleep(d)
+                    print("[cmd] auto-unpause")
+                    UNPAUSE_REQUESTED.set()
+                threading.Thread(target=auto_unpause, daemon=True).start()
+        elif cmd == 'unpause':
+            print("[cmd] unpausing workers")
+            UNPAUSE_REQUESTED.set()
+        elif parts[0] == 'save' and ' '.join(parts[1:3]) == 'training data':
+            global SAVE_TRAINING_DATA_N
+            SAVE_TRAINING_DATA_N = int(parts[3]) if len(parts) > 3 else None
+            SAVE_TRAINING_DATA_REQUESTED.set()
+            print(f"[cmd] save training data requested{f' (n={SAVE_TRAINING_DATA_N})' if SAVE_TRAINING_DATA_N else ''}")
+        else:
+            print(f"[cmd] unknown command: {cmd!r}")
 
 
 def update_game_index(game, base_cfg):
@@ -340,6 +390,8 @@ def main(run_tag):
     
     recorder = RecordKeeper(n_retrains, run_num=0, every_sec=45.0)
 
+    threading.Thread(target=stdin_listener, daemon=True).start()
+
     start = time.time()
     procs = []
     recent_q = None
@@ -352,10 +404,11 @@ def main(run_tag):
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
+            cmd_paused = False
             recorder = RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
             recorder.training_queue = len(rescorer.training_data)
 
-            if STOP_REQUESTED.is_set():
+            if STOP_REQUESTED.is_set() or STOP_AFTER_ROUND_REQUESTED.is_set():
                 break
 
             print("#"*72)
@@ -372,6 +425,20 @@ def main(run_tag):
             # fresh reload each pass
             working_cfg = Config.from_yaml(yaml_path, init=True)
             is_validation = False
+
+            if RELOAD_REQUESTED.is_set():
+                RELOAD_REQUESTED.clear()
+                import importlib
+                import chessbot.rescore
+                import chessbot.review
+                importlib.reload(chessbot.rescore)
+                importlib.reload(chessbot.review)
+                state = rescorer.export_state()
+                rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
+                rescorer.import_state(state)
+                recorder = chessbot.review.RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
+                recorder.training_queue = len(rescorer.training_data)
+                print("[cmd] reloaded rescore/review, rescorer state migrated")
 
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
@@ -431,7 +498,44 @@ def main(run_tag):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
-                
+
+                if NEXT_ROUND_REQUESTED.is_set():
+                    NEXT_ROUND_REQUESTED.clear()
+                    if not stop_signal_sent:
+                        for w in procs:
+                            w["msg_q"].put("drain_and_stop")
+                        stop_signal_sent = True
+                    print("[cmd] draining workers for next round")
+                    break
+
+                if PAUSE_REQUESTED.is_set():
+                    PAUSE_REQUESTED.clear()
+                    if not cmd_paused:
+                        for p in procs:
+                            p["msg_q"].put("pause")
+                        cmd_paused = True
+                        print("[cmd] workers paused")
+
+                if cmd_paused and UNPAUSE_REQUESTED.is_set():
+                    UNPAUSE_REQUESTED.clear()
+                    for p in procs:
+                        p["msg_q"].put("unpause")
+                    cmd_paused = False
+                    print("[cmd] workers unpaused")
+
+                if SAVE_TRAINING_DATA_REQUESTED.is_set():
+                    SAVE_TRAINING_DATA_REQUESTED.clear()
+                    data = rescorer.training_data
+                    n = SAVE_TRAINING_DATA_N
+                    if n and n < len(data):
+                        import random as _random
+                        data = _random.sample(data, n)
+                    ts = int(time.time())
+                    snap_path = os.path.join(base_cfg.run_dir, f"training_snapshot_{ts}.pkl")
+                    with open(snap_path, "wb") as f:
+                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print(f"[cmd] saved {len(data)} samples to training_snapshot_{ts}.pkl")
+
                 # check for finished procs
                 procs = check_and_reap_procs(procs)
 
@@ -497,8 +601,18 @@ def main(run_tag):
                         size=working_cfg.retrain_size, randomize=True)
                     recorder.training_queue = rescorer.training_data_size
 
-                    # pause workers before reclaim + launch
-                    for p in procs:
+                    # worker 0 predicts training batch then pauses; rest just pause
+                    pred_pkl_path = os.path.join(
+                        working_cfg.pending_training_dir, "predictions_latest.pkl")
+                    if os.path.exists(pred_pkl_path):
+                        os.remove(pred_pkl_path)
+                    if procs:
+                        procs[0]["msg_q"].put({
+                            "cmd": "predict_then_pause",
+                            "training_dir": working_cfg.pending_training_dir,
+                            "pred_pkl_path": pred_pkl_path,
+                        })
+                    for p in procs[1:]:
                         p["msg_q"].put("pause")
 
                     if retrain is None:
@@ -521,8 +635,9 @@ def main(run_tag):
                                 t.depth = min(current_depth, t.base_depth)
                             rescorer.current_depth = sf_rescore_threads[0].depth
                             rescorer.aggregate_metrics(
-                                n_retrains, working_cfg.vscale,
-                                working_cfg.progress_csv_path)
+                                n_retrains,
+                                working_cfg.progress_csv_path,
+                                pred_pkl_path)
                             n_retrains += 1
 
                         # keep submitting games while waiting on retrain
@@ -613,9 +728,12 @@ def main(run_tag):
                                 t.update_config(working_cfg)
                                 t.depth = min(current_depth, t.base_depth)
                             rescorer.current_depth = sf_rescore_threads[0].depth
+                            eor_pred_pkl = os.path.join(
+                                working_cfg.pending_training_dir, "predictions_latest.pkl")
                             rescorer.aggregate_metrics(
-                                n_retrains, working_cfg.vscale,
-                                working_cfg.progress_csv_path)
+                                n_retrains,
+                                working_cfg.progress_csv_path,
+                                eor_pred_pkl)
                             n_retrains += 1
 
                         # workers for this round are already stopped; just keep

@@ -1041,14 +1041,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../experimental_features/blunder_replay.md" class="md-nav__link">
+      <a href="../../experimental_features/tempscale/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Blunder Replay
+    Prior Temperature Scaling
   
 
     
@@ -1495,7 +1495,7 @@ score = Q_eff + U
 </ul>
 <p>On a cache hit during descent, the tree expands the node using the stored priors and WDL immediately, then backprops — no NN call needed. The hit rate is tracked and surfaced in telemetry.</p>
 <h3 id="raw-policy-cache">Raw Policy Cache</h3>
-<p>A secondary cache stores raw (Zobrist, value, policy_logits) tuples, inserted in bulk by Python after each NN inference batch via <code>raw_cache_bulk_insert_np()</code>. This feeds the priors cache on the C++ side: when the tree needs priors for a node, it checks the raw cache first, applies softmax, <code>uniform_eps</code>, and <code>prior_clip_max</code> in C++ (<code>build_priors</code>), and stores the result in the priors cache.</p>
+<p>A secondary cache stores raw (Zobrist, value, policy_logits) tuples, inserted in bulk by Python after each NN inference batch via <code>raw_cache_bulk_insert_np()</code>. This feeds the priors cache on the C++ side: when the tree needs priors for a node, it checks the raw cache first, applies softmax, <code>uniform_eps</code>, and <code>prior_clip_max</code> in C++ (<code>build_priors</code>), and stores the result in the priors cache. Optionally, priors that are still too spread out after that are sharpened further — see <a href="../../experimental_features/tempscale/">Prior Temperature Scaling</a>.</p>
 <p>The separation allows Python to insert raw logits once per batch and let C++ handle post-processing, keeping the interface thin.</p>
 <h2 id="tree-reuse">Tree Reuse</h2>
 <p>When a move is played, <code>advance_root(move_uci)</code> promotes the chosen child to be the new root. The subtree rooted at that child is preserved — all its accumulated visits, WDL, and cached priors carry over into the next search. Subtrees for other moves are discarded. Tree reuse is configurable and is on by default.</p>

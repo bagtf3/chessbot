@@ -1013,14 +1013,14 @@
   
   
     <li class="md-nav__item">
-      <a href="../../experimental_features/blunder_replay.md" class="md-nav__link">
+      <a href="../../experimental_features/tempscale/" class="md-nav__link">
         
   
   
   <span class="md-ellipsis">
     
   
-    Blunder Replay
+    Prior Temperature Scaling
   
 
     
@@ -1400,8 +1400,7 @@
 <h2 id="rescoring-overview">Rescoring Overview</h2>
 <p>After a game finishes, it isn't used for training directly. The raw selfplay data contains noisy outcome labels and visit distributions that reflect the current (imperfect) model. The <code>Rescorer</code> processes each finished game asynchronously, runs Stockfish analysis on every position, and builds cleaner training targets before anything reaches the training queue.</p>
 <h2 id="sf-analysis-pipeline">SF Analysis Pipeline</h2>
-<p>Each game pickle contains the full move history and per-ply NN outputs. <code>Rescorer.start_game()</code> iterates through the plies and submits positions to the Stockfish queue for analysis. Results come back asynchronously via <code>handle_sf_result()</code>, which stores the best move, centipawn evaluation, and WDL triple for each ply.</p>
-<p>Stockfish results are cached in <code>SFCache</code> — an LRU cache keyed on a short FEN (position + repetition count + halfmove clock). The cache is seeded from pre-computed depth-20 analysis at run start, so common positions in the opening and early middlegame are already resolved without queuing live SF queries. Entries are evicted when the cache exceeds <code>rescore_cache_size</code>.</p>
+<p>Each game pickle contains the full move history and per-ply NN outputs. <code>Rescorer.start_game()</code> iterates through the plies and submits positions to the Stockfish queue for analysis. Results come back asynchronously via <code>handle_sf_result()</code>, which stores the best move, centipawn evaluation, and WDL triple for each ply. Every position gets full analysis — an earlier position-keyed cache (<code>SFCache</code>) that skipped re-analysis of repeated positions was tried and removed; it wasn't paying off.</p>
 <h2 id="training-targets">Training Targets</h2>
 <p>The value target for each ply is a blended 3-component WDL:</p>
 <pre><code>Y = 0.5 * z_wdl + 0.5 * sf_wdl
@@ -1409,11 +1408,11 @@
 <p>where <code>z_wdl</code> is the game result converted to WDL and <code>sf_wdl</code> is Stockfish's WDL at that ply. When SF analysis is unavailable, the target falls back to <code>z_wdl</code> alone. Blending the outcome with Stockfish's read keeps the target grounded in what actually happened while pulling it toward a stronger positional signal — an earlier variant also mixed in the MCTS search WDL, but that component was dropped.</p>
 <h2 id="blunder-detection-and-visit-redistribution">Blunder Detection and Visit Redistribution</h2>
 <p>After SF analysis is complete, <code>finalize_game()</code> scans each ply for blunders — positions where Stockfish rates the played move significantly worse than its best move. When a blunder is detected, the visit distribution used as the policy target is redistributed: visits are shifted toward the moves SF considers good, reducing the weight on the blundered line. This prevents the model from learning to confidently play moves that Stockfish rates as mistakes.</p>
-<p>Positions containing blunders are also candidates for replay games — new selfplay games starting from the blundered position — which puts more data on the positions the model is currently weakest on.</p>
+<p>An earlier version of this pipeline handled blunders by spawning dedicated replay games starting from the blundered position, to put more data on the positions the model was currently weakest on. That mechanism has been replaced: blunder positions are now routed to LC0 distillation instead (see LC0 Distillation below), so the corrected signal for a blundered position comes from a strong engine's continuation rather than a fresh selfplay game. <code>blunder_replay</code> only survives as a scenario tag some data-loading scripts still know to skip in older game logs.</p>
 <h2 id="collar-rescoring">Collar Rescoring</h2>
 <p>The eval collar tracks consecutive plies where one side's evaluation stays above a threshold. When the collar fires, it retroactively adjusts the game result label for the affected stretch of plies, overriding the final game outcome with the collar evaluation. This corrects for cases where a clearly winning position was eventually drawn or lost due to adjudication noise or model error, keeping the value targets honest about who was winning at each point in the game.</p>
 <h2 id="sample-acceptance">Sample Acceptance</h2>
-<p>Not all positions from a game are included in training. A ply is dropped (<code>skip_xc0</code>) when it's a true blunder (CPL above <code>rescore_blunder_cp_loser</code>/<code>rescore_blunder_cp_winner</code>) that didn't still end in a won position for the mover — those go to the LC0 waypoint/replay path instead of the xc0 policy target. Everything else is accepted.</p>
+<p>Not all positions from a game are included in training. A ply is dropped (<code>skip_xc0</code>) when it's a true blunder (CPL above <code>rescore_blunder_cp_loser</code>/<code>rescore_blunder_cp_winner</code>) that didn't still end in a won position for the mover — those go to the LC0 waypoint path instead of the xc0 policy target. Everything else is accepted.</p>
 <p>Separately, KL divergence between the NN's prior and the final visit distribution is used to boost the policy loss weight (<code>pwht</code>) on positions where the search significantly disagreed with the network's first guess, via <code>KL_boost_threshold</code>/<code>KL_weight_boost</code> — this reweights informative positions rather than filtering them. An earlier design also had a value-CE-based soft-sampling scheme (<code>rescore_kl_threshold</code>/<code>rescore_ce_threshold</code>/<code>rescore_sample_floor</code>/<code>rescore_target_acceptance</code>); it was tried, found not to help, and removed.</p>
 <h2 id="lc0-distillation">LC0 Distillation</h2>
 <p>When an LC0 distillation model is configured (<code>lc0_distill_model_name</code> plus the <code>LC0_DISTILL_*</code> environment paths), the rescorer runs a distilled Leela network as a policy teacher alongside Stockfish. An <code>Lc0Thread</code> batches positions through the same ORT+TensorRT machinery the selfplay backend uses, evaluates them in LC0's native feature/policy layout, and maps the resulting logits back into the 1858 move domain with <code>lc0_logits_to_xc0_batch</code>. The LC0 policy becomes an additional soft target for those positions, transferring Leela's opening and positional knowledge without paying its full search cost during selfplay.</p>

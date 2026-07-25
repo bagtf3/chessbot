@@ -714,6 +714,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#bootstrap-data-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bootstrap Data Pipeline
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -980,7 +991,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../experimental_features/blunder_replay/" class="md-nav__link">
+      <a href="../../experimental_features/blunder_replay.md" class="md-nav__link">
         
   
   
@@ -1310,6 +1321,17 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#bootstrap-data-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bootstrap Data Pipeline
+      
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1420,6 +1442,27 @@
 <li><strong>Max game length</strong> — hard cap to prevent runaway games.</li>
 </ul>
 <p>Syzygy tablebase adjudication (&lt;= 5 pieces) and material-diff cutoffs are also configurable per run. The adjudicator flags in effect for a game are recorded with its training data so rescoring knows how each outcome was reached.</p>
+<h2 id="bootstrap-data-pipeline">Bootstrap Data Pipeline</h2>
+<p>Before self-play begins, the model is pretrained on a large static dataset built
+from two sources. <code>scripts/data/build_bootstrap_records.py</code> is the canonical
+tool for this.</p>
+<p><strong>lc0 source</strong> — lc0 V6 binary training chunks decoded directly to xc0h tokens
+via <code>v6_planes_to_xc0h</code> (no float32 intermediate). Draws are dropped at 50%.
+3 workers each drain a disjoint chunk subset.</p>
+<p><strong>xc0 source</strong> — Xerces selfplay game logs from historical run tags. For each
+game that passes a <code>GAME_CPL_MAX=20</code> filter, plies with SF analysis loss
+&lt;= <code>MOVE_CPL_MAX=15</code> and tree search data are extracted. The board is replayed
+through <code>board.history_tokens(K=6)</code> via pyfastchess to produce the xc0h
+encoding, preserving full opening history via warm replay of the prefix. SF
+moves are skipped. 4 workers each handle a disjoint subset of run tags.</p>
+<p>Both sources produce records with schema:</p>
+<pre><code>xc0h_board  int16[393]    K=6 history frames + meta tokens
+policy      float32[1858] normalized visit distribution (no clipping)
+wdl         float32[3]    Z_BLEND * result_wdl + (1-Z_BLEND) * search_wdl
+</code></pre>
+<p>Target is 20M records per source (40M total). Output goes to a staging
+directory, then a single shuffle pass via <code>scripts/data/shuffle_xco.py</code>
+produces the final training-ready shards.</p>
 
 
 

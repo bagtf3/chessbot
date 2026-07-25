@@ -1013,7 +1013,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../experimental_features/blunder_replay/" class="md-nav__link">
+      <a href="../../experimental_features/blunder_replay.md" class="md-nav__link">
         
   
   
@@ -1413,13 +1413,8 @@
 <h2 id="collar-rescoring">Collar Rescoring</h2>
 <p>The eval collar tracks consecutive plies where one side's evaluation stays above a threshold. When the collar fires, it retroactively adjusts the game result label for the affected stretch of plies, overriding the final game outcome with the collar evaluation. This corrects for cases where a clearly winning position was eventually drawn or lost due to adjudication noise or model error, keeping the value targets honest about who was winning at each point in the game.</p>
 <h2 id="sample-acceptance">Sample Acceptance</h2>
-<p>Not all positions from a game are included in training. Each ply is evaluated against three acceptance criteria:</p>
-<ul>
-<li><strong>KL divergence</strong> — KL between the NN's prior and the final visit distribution. High KL means the search significantly disagreed with the network's first guess, making the position informative.</li>
-<li><strong>Value CE</strong> — cross-entropy between the NN's WDL output and Stockfish's WDL. High CE means the model's value estimate was wrong on this position.</li>
-<li><strong>CPL</strong> — centipawn loss of the played move vs Stockfish best. High CPL flags positions where a suboptimal move was played, worth learning from.</li>
-</ul>
-<p>Positions that exceed any threshold are accepted unconditionally. Those that fall below all thresholds are soft-sampled with probability proportional to <code>max(kl/kl_t, ce/ce_t)</code>, with a floor of <code>rescore_sample_floor</code>. This concentrates training data on informative positions while keeping a baseline of easy positions to maintain calibration.</p>
+<p>Not all positions from a game are included in training. A ply is dropped (<code>skip_xc0</code>) when it's a true blunder (CPL above <code>rescore_blunder_cp_loser</code>/<code>rescore_blunder_cp_winner</code>) that didn't still end in a won position for the mover — those go to the LC0 waypoint/replay path instead of the xc0 policy target. Everything else is accepted.</p>
+<p>Separately, KL divergence between the NN's prior and the final visit distribution is used to boost the policy loss weight (<code>pwht</code>) on positions where the search significantly disagreed with the network's first guess, via <code>KL_boost_threshold</code>/<code>KL_weight_boost</code> — this reweights informative positions rather than filtering them. An earlier design also had a value-CE-based soft-sampling scheme (<code>rescore_kl_threshold</code>/<code>rescore_ce_threshold</code>/<code>rescore_sample_floor</code>/<code>rescore_target_acceptance</code>); it was tried, found not to help, and removed.</p>
 <h2 id="lc0-distillation">LC0 Distillation</h2>
 <p>When an LC0 distillation model is configured (<code>lc0_distill_model_name</code> plus the <code>LC0_DISTILL_*</code> environment paths), the rescorer runs a distilled Leela network as a policy teacher alongside Stockfish. An <code>Lc0Thread</code> batches positions through the same ORT+TensorRT machinery the selfplay backend uses, evaluates them in LC0's native feature/policy layout, and maps the resulting logits back into the 1858 move domain with <code>lc0_logits_to_xc0_batch</code>. The LC0 policy becomes an additional soft target for those positions, transferring Leela's opening and positional knowledge without paying its full search cost during selfplay.</p>
 <p>Distillation is targeted rather than blanket. A pre-built <strong>enrichment book</strong> covers common book positions: for a position in the book, <code>maybe_enrich()</code> has a 50% chance of replacing the ply's policy and value targets with the book's stronger data. Blunder positions are enriched with Leela's principal variation, so the corrected policy target reflects a strong engine's continuation rather than only Stockfish's single best move. LC0 evaluation is entirely optional — with no distill model configured, the <code>Lc0Thread</code> is never created and rescoring proceeds on Stockfish alone.</p>

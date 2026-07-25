@@ -22,7 +22,7 @@ where `z_wdl` is the game result converted to WDL and `sf_wdl` is Stockfish's WD
 
 After SF analysis is complete, `finalize_game()` scans each ply for blunders — positions where Stockfish rates the played move significantly worse than its best move. When a blunder is detected, the visit distribution used as the policy target is redistributed: visits are shifted toward the moves SF considers good, reducing the weight on the blundered line. This prevents the model from learning to confidently play moves that Stockfish rates as mistakes.
 
-Positions containing blunders are also candidates for replay games — new selfplay games starting from the blundered position — which puts more data on the positions the model is currently weakest on.
+An earlier version of this pipeline handled blunders by spawning dedicated replay games starting from the blundered position, to put more data on the positions the model was currently weakest on. That mechanism has been replaced: blunder positions are now routed to LC0 distillation instead (see LC0 Distillation below), so the corrected signal for a blundered position comes from a strong engine's continuation rather than a fresh selfplay game. `blunder_replay` only survives as a scenario tag some data-loading scripts still know to skip in older game logs.
 
 ## Collar Rescoring
 
@@ -30,7 +30,7 @@ The eval collar tracks consecutive plies where one side's evaluation stays above
 
 ## Sample Acceptance
 
-Not all positions from a game are included in training. A ply is dropped (`skip_xc0`) when it's a true blunder (CPL above `rescore_blunder_cp_loser`/`rescore_blunder_cp_winner`) that didn't still end in a won position for the mover — those go to the LC0 waypoint/replay path instead of the xc0 policy target. Everything else is accepted.
+Not all positions from a game are included in training. A ply is dropped (`skip_xc0`) when it's a true blunder (CPL above `rescore_blunder_cp_loser`/`rescore_blunder_cp_winner`) that didn't still end in a won position for the mover — those go to the LC0 waypoint path instead of the xc0 policy target. Everything else is accepted.
 
 Separately, KL divergence between the NN's prior and the final visit distribution is used to boost the policy loss weight (`pwht`) on positions where the search significantly disagreed with the network's first guess, via `KL_boost_threshold`/`KL_weight_boost` — this reweights informative positions rather than filtering them. An earlier design also had a value-CE-based soft-sampling scheme (`rescore_kl_threshold`/`rescore_ce_threshold`/`rescore_sample_floor`/`rescore_target_acceptance`); it was tried, found not to help, and removed.
 

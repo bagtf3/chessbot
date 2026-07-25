@@ -60,7 +60,7 @@ On a cache hit during descent, the tree expands the node using the stored priors
 
 ### Raw Policy Cache
 
-A secondary cache stores raw (Zobrist, value, policy_logits) tuples, inserted in bulk by Python after each NN inference batch via `raw_cache_bulk_insert_np()`. This feeds the priors cache on the C++ side: when the tree needs priors for a node, it checks the raw cache first, applies softmax, `uniform_eps`, and `prior_clip_max` in C++ (`build_priors`), and stores the result in the priors cache.
+A secondary cache stores raw (Zobrist, value, policy_logits) tuples, inserted in bulk by Python after each NN inference batch via `raw_cache_bulk_insert_np()`. This feeds the priors cache on the C++ side: when the tree needs priors for a node, it checks the raw cache first, applies softmax, `uniform_eps`, and `prior_clip_max` in C++ (`build_priors`), and stores the result in the priors cache. Optionally, priors that are still too spread out after that are sharpened further — see [Prior Temperature Scaling](../experimental_features/tempscale.md).
 
 The separation allows Python to insert raw logits once per batch and let C++ handle post-processing, keeping the interface thin.
 

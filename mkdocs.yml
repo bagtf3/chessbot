@@ -31,7 +31,7 @@ nav:
     - MateLock: experimental_features/matelock.md
     - VScale: experimental_features/vscale.md
     - Robust Selection Criteria: experimental_features/rsc.md
-    - Blunder Replay: experimental_features/blunder_replay.md
+    - Prior Temperature Scaling: experimental_features/tempscale.md
     - Iterative Deepening MCTS: experimental_features/iterative_deepening_mcts.md
   - FAQ: faq.md
   - Setup:

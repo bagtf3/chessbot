@@ -1178,8 +1178,7 @@ class GameViewer:
         def norm_entropy_at(t):
             scaled = p ** (1.0 / t)
             scaled /= scaled.sum()
-            _, norm = calc_entropy(scaled)
-            return norm
+            return calc_entropy(scaled, normed_only=True)
 
         lo, hi = 1e-6, 10.0
         steps = 0

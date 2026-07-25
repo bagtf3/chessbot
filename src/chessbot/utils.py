@@ -181,7 +181,7 @@ def softmax(x):
     return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
 
 
-def calc_entropy(visits):
+def calc_entropy(visits, normed_only=False):
     # visits: sequence or ndarray of nonneg weights/probs
     if isinstance(visits, list):
         a = np.array(visits, dtype=float, copy=False)
@@ -189,14 +189,14 @@ def calc_entropy(visits):
         a = visits
 
     if a.size == 0:
-        return 0.0, 0.0
+        return 0.0 if normed_only else (0.0, 0.0)
 
     # force negatives to zero (defensive)
     a = np.where(a > 0.0, a, 0.0)
 
     total = a.sum()
     if total <= 0.0:
-        return 0.0, 0.0
+        return 0.0 if normed_only else (0.0, 0.0)
 
     p = a / total
     mask = p > 0.0
@@ -208,7 +208,7 @@ def calc_entropy(visits):
     n = p.size
     norm = ent / np.log2(n) if n > 1 else 0.0
 
-    return ent, norm
+    return norm if normed_only else (ent, norm)
 
 
 def kl_divergence(p_list, q_list):

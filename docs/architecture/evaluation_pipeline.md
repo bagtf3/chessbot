@@ -32,13 +32,9 @@ The eval collar tracks consecutive plies where one side's evaluation stays above
 
 ## Sample Acceptance
 
-Not all positions from a game are included in training. Each ply is evaluated against three acceptance criteria:
+Not all positions from a game are included in training. A ply is dropped (`skip_xc0`) when it's a true blunder (CPL above `rescore_blunder_cp_loser`/`rescore_blunder_cp_winner`) that didn't still end in a won position for the mover — those go to the LC0 waypoint/replay path instead of the xc0 policy target. Everything else is accepted.
 
-- **KL divergence** — KL between the NN's prior and the final visit distribution. High KL means the search significantly disagreed with the network's first guess, making the position informative.
-- **Value CE** — cross-entropy between the NN's WDL output and Stockfish's WDL. High CE means the model's value estimate was wrong on this position.
-- **CPL** — centipawn loss of the played move vs Stockfish best. High CPL flags positions where a suboptimal move was played, worth learning from.
-
-Positions that exceed any threshold are accepted unconditionally. Those that fall below all thresholds are soft-sampled with probability proportional to `max(kl/kl_t, ce/ce_t)`, with a floor of `rescore_sample_floor`. This concentrates training data on informative positions while keeping a baseline of easy positions to maintain calibration.
+Separately, KL divergence between the NN's prior and the final visit distribution is used to boost the policy loss weight (`pwht`) on positions where the search significantly disagreed with the network's first guess, via `KL_boost_threshold`/`KL_weight_boost` — this reweights informative positions rather than filtering them. An earlier design also had a value-CE-based soft-sampling scheme (`rescore_kl_threshold`/`rescore_ce_threshold`/`rescore_sample_floor`/`rescore_target_acceptance`); it was tried, found not to help, and removed.
 
 ## LC0 Distillation
 

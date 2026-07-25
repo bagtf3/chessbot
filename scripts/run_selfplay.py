@@ -388,10 +388,12 @@ def main(run_tag):
     )
     cache_path = os.path.join(base_cfg.run_dir, "sf_cache.pkl.gz")
 
-    if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
-        cache.load_seed(SF_SEED_CACHE)
-    if os.path.exists(cache_path):
-        cache.roll_merge(cache_path)
+    # [nocache] kept constructed but never populated; its stats() feed the
+    # [nocache] telemetry row, where size must stay 0 to prove it is off
+    # [nocache] if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
+    # [nocache]     cache.load_seed(SF_SEED_CACHE)
+    # [nocache] if os.path.exists(cache_path):
+    # [nocache]     cache.roll_merge(cache_path)
     rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
     finished_games = rescorer.get_unprocessed()
 
@@ -696,7 +698,7 @@ def main(run_tag):
             # selfplay round report
             recorder.maybe_log_results(force=True)
             total_games += recorder.games_finished
-            cache.save(cache_path)
+            # [nocache] cache.save(cache_path)
 
             if is_validation:
                 recorder.config = working_cfg
@@ -795,7 +797,7 @@ def main(run_tag):
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.tick()
         rescorer.push_analyzed(report=True)
-        cache.save(cache_path)
+        # [nocache] cache.save(cache_path)
         for t in sf_rescore_threads:
             t.close()
         if rescorer.training_data:

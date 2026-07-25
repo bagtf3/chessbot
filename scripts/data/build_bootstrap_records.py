@@ -42,6 +42,7 @@ from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 from chessbot import SP_DIR
 from chessbot.review import load_game_index, ANALYZE_PKL
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch
+from chessbot.utils import calc_entropy
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
 DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_071826\staging"
@@ -64,6 +65,12 @@ DEDUPE_FLOOR     = 0.05
 GAME_CPL_MAX     = 20
 MOVE_CPL_MAX     = 10
 K                = 6
+
+TSCALE_TARGET    = 0.7
+TSCALE_MARGIN    = 0.05
+TSCALE_MAX_ITERS = 5
+TSCALE_LO        = 0.2
+TSCALE_HI        = 1.0
 
 SKIP_SCENARIOS     = {"blunder_replay"}
 NO_WARM_SCENARIOS  = {"startpos", "piece_odds", "piece_training"}
@@ -96,6 +103,44 @@ def to_wdl(z):
 
 def partition(items, n):
     return [items[i::n] for i in range(n)]
+
+
+MISSING_WDL_WARN_EVERY = 1_000
+missing_wdl_ctr = [0]
+
+
+def warn_missing_wdl(run_tag):
+    missing_wdl_ctr[0] += 1
+    n = missing_wdl_ctr[0]
+    if n == 1 or n % MISSING_WDL_WARN_EVERY == 0:
+        print(f"[xc0] WARNING: {run_tag} node missing best_wdl (scalar value head?), "
+              f"skipping xc0 record (count={n:,})", flush=True)
+
+
+def maybe_temp_scale(pi):
+    pi = pi.astype(np.float64)
+    ne = calc_entropy(pi, normed_only=True)
+    if ne <= TSCALE_TARGET:
+        return pi.astype(np.float32)
+    lo, hi = TSCALE_LO, TSCALE_HI
+    best, best_dist = (lo + hi) / 2, float('inf')
+    for _ in range(TSCALE_MAX_ITERS):
+        mid    = (lo + hi) / 2
+        scaled = pi ** (1.0 / mid)
+        scaled /= scaled.sum()
+        ne_mid = calc_entropy(scaled, normed_only=True)
+        if ne_mid < ne:
+            dist = abs(ne_mid - TSCALE_TARGET)
+            if dist < best_dist:
+                best, best_dist = mid, dist
+            if dist < TSCALE_MARGIN:
+                break
+        if ne_mid < TSCALE_TARGET:
+            lo = mid
+        else:
+            hi = mid
+    scaled = pi ** (1.0 / best)
+    return (scaled / scaled.sum()).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +371,9 @@ def iter_xc0_game(game, sf_df, seen=None, lc0_batcher=None, xc0_eligible=True):
                         counts = np.array([visits_map[u] for u in ucis], dtype=np.float32)
                         s      = counts.sum()
                         if s > 0:
-                            pi      = counts / s
+                            pi = counts / s
+                            if loss == 0 and len(ucis) > 5:
+                                pi = maybe_temp_scale(pi)
                             indices = board.moves_to_indices(ucis)
                             policy  = np.zeros(N_1858, dtype=np.float32)
                             for ci, prob in zip(indices, pi):

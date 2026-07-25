@@ -92,6 +92,10 @@ class Config(object):
     KL_boost_threshold = 1.75
     KL_weight_boost = 1.0
 
+    kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median
+    kl_boost_p80_mult    = 3.0   # pwht multiplier when KL > running EMA 80th pctile
+    kl_quantile_lr       = 0.002 # step size for the online trackers (~1/lr sample window, ~500)
+
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
         "random_init": 0.08, "piece_odds": 0.02, "piece_training": 0.01

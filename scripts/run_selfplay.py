@@ -436,17 +436,21 @@ def main(run_tag):
 
             if RELOAD_REQUESTED.is_set():
                 RELOAD_REQUESTED.clear()
+                global Config
                 import importlib
+                import chessbot.config
                 import chessbot.rescore
                 import chessbot.review
+                importlib.reload(chessbot.config)
                 importlib.reload(chessbot.rescore)
                 importlib.reload(chessbot.review)
+                Config = chessbot.config.Config
                 state = rescorer.export_state()
-                rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
+                rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q)
                 rescorer.import_state(state)
                 recorder = chessbot.review.RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
                 recorder.training_queue = len(rescorer.training_data)
-                print("[cmd] reloaded rescore/review, rescorer state migrated")
+                print("[cmd] reloaded config/rescore/review, rescorer state migrated")
 
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True
@@ -618,6 +622,8 @@ def main(run_tag):
                         p["msg_q"].put("pause")
 
                     if retrain is None:
+                        print(f"[rescore] KL running medians: "
+                              f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
                         retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
                         rescorer.reset_writer()
 
@@ -715,6 +721,8 @@ def main(run_tag):
                     recorder.training_queue = rescorer.training_data_size
 
                     if retrain is None:
+                        print(f"[rescore] KL running medians: "
+                              f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
                         eor_pred_pkl = os.path.join(
                             working_cfg.run_dir, "predictions_latest.pkl")
                         if os.path.exists(eor_pred_pkl):

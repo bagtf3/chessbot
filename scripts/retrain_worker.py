@@ -311,6 +311,8 @@ def save_predictions_pkl(model, X_raw, pred_pkl_path, batch_size=256):
     import torch
     import torch.nn.functional as F
     device = torch.device("cuda")
+    # NOTE: Module.to()/.half() mutate in place -- this permanently flips the
+    # caller's model to fp16/eval. Caller must reload fresh before training.
     model = model.to(device).half().eval()
     results = []
     with torch.no_grad():
@@ -387,10 +389,15 @@ def main():
     timings['load_shards'] = time.time() - t0
 
     from chessbot.train_pytorch import load_pt_model, retrain_pt
-    model, arch = load_pt_model(cfg.model_path)
 
     if args.pred_pkl_path:
+        model, arch = load_pt_model(cfg.model_path)
         save_predictions_pkl(model, X, args.pred_pkl_path, batch_size=args.batch_size)
+        # save_predictions_pkl mutates model to fp16/eval in place -- reload a
+        # clean fp32 copy for training rather than reuse the now-tainted object.
+        model, arch = load_pt_model(cfg.model_path)
+    else:
+        model, arch = load_pt_model(cfg.model_path)
 
     valid = ~np.isnan(Y_value).any(axis=1) if Y_value.ndim == 2 else ~np.isnan(Y_value)
     n_invalid = int((~valid).sum())

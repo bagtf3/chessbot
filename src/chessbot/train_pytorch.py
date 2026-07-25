@@ -234,6 +234,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     epoch_losses     = []
     epoch_grad_stats = []
+    nan_skips        = 0
     t0 = time.time()
     for ep_idx in range(1):
         idx          = torch.randperm(n, device=device)
@@ -262,6 +263,34 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             opt.zero_grad()
             loss.backward()
             raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
+
+            if not np.isfinite(raw_norm):
+                nan_skips += 1
+                dump_path = os.path.join(
+                    os.path.dirname(model_path),
+                    f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
+                try:
+                    import pickle
+                    with open(dump_path, "wb") as f:
+                        pickle.dump({
+                            'batch_idx': batch_idx.detach().cpu().numpy(),
+                            'X':    xb.detach().cpu().numpy(),
+                            'P':    pb.detach().cpu().numpy(),
+                            'Y':    yb.detach().cpu().numpy(),
+                            'vwht': vwb.detach().cpu().numpy(),
+                            'pwht': pwb.detach().cpu().numpy(),
+                            'loss': loss.item() if torch.isfinite(loss) else float('nan'),
+                            'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
+                            'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
+                        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
+                          f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
+                except Exception as e:
+                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
+                          f"failed to dump offending batch: {e}")
+                opt.zero_grad()
+                continue
+
             grad_norms.append(raw_norm)
             if raw_norm > clip_norm:
                 clip_count += 1
@@ -272,6 +301,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             value_total  += value_loss.item()
             steps        += 1
 
+        if nan_skips:
+            print(f"{tag} {nan_skips} batch(es) skipped this epoch due to non-finite grad norm")
+
         gn = np.array(grad_norms)
         epoch_losses.append({
             'loss':   total        / max(1, steps),
@@ -279,10 +311,10 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             'value':  value_total  / max(1, steps),
         })
         epoch_grad_stats.append({
-            'gn_mean':   float(gn.mean()),
-            'gn_median': float(np.median(gn)),
-            'gn_min':    float(gn.min()),
-            'gn_max':    float(gn.max()),
+            'gn_mean':   float(gn.mean())   if gn.size else float('nan'),
+            'gn_median': float(np.median(gn)) if gn.size else float('nan'),
+            'gn_min':    float(gn.min())    if gn.size else float('nan'),
+            'gn_max':    float(gn.max())    if gn.size else float('nan'),
             'gn_clips':  clip_count,
             'gn_steps':  steps,
         })

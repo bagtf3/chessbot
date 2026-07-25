@@ -221,6 +221,16 @@ def kl_divergence(p_list, q_list):
     return np.sum(p * np.log(p / q))
 
 
+def cross_entropy(p_list, q_list):
+    # same p/q convention as kl_divergence: CE(p, q) = -sum(p * log(q))
+    eps = 1e-12
+    p = np.asarray(p_list, dtype=float) + eps
+    q = np.asarray(q_list, dtype=float) + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    return -np.sum(p * np.log(q))
+
+
 def kl_divergence_bits(p, q, eps=1e-12):
     """KL(p || q) in bits."""
     p = np.asarray(p, dtype=np.float64)

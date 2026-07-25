@@ -47,12 +47,18 @@ from chessbot.utils import calc_entropy
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
 DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_071826\staging"
 
+# RUN_TAGS = [
+#     "16m_precond_run2", "16m_precond_run1", "16m_precond_run0",
+#     "16m_xc0hK6_run4", "16m_xc0hK6_run3", "16m_xc0hK6_run2", "16m_xc0hK6_run1",
+#     "precond_run5", "precond_run4", "precond_run3", "precond_run2", "precond_run1",
+#     "cfiw_wdl_run2", "cfiw_wdl_run1",
+#     "val_test",
+# ]
+
 RUN_TAGS = [
-    "16m_precond_run2", "16m_precond_run1", "16m_precond_run0",
-    "16m_xc0hK6_run4", "16m_xc0hK6_run3", "16m_xc0hK6_run2", "16m_xc0hK6_run1",
-    "precond_run5", "precond_run4", "precond_run3", "precond_run2", "precond_run1",
-    "cfiw_wdl_run2", "cfiw_wdl_run1",
-    "val_test",
+    "cfiw_pretrained_run5",
+    "16m_deep_pretrain_run3", "16m_deep_pretrain_run2", "16m_deep_pretrain_run1",
+    "cfiw_pretrained_run7", "cfiw_pretrained_run6",
 ]
 
 TARGET_PER_SOURCE = 20_000_000
@@ -109,12 +115,27 @@ MISSING_WDL_WARN_EVERY = 1_000
 missing_wdl_ctr = [0]
 
 
+def detect_has_wdl(games):
+    """Called once at worker startup: loads games in order until it finds one
+    with tree_search_data, checks for best_wdl on any node, and returns that
+    as a fixed answer for the whole run. No re-checking once the worker is
+    into its per-position loop."""
+    for g in games:
+        if not os.path.exists(g["pkl_file"]):
+            continue
+        log = load_log(g["pkl_file"])
+        tree_data = log.get("tree_search_data", {})
+        if tree_data:
+            return any(n.get("best_wdl") is not None for n in tree_data.values())
+    return False
+
+
 def warn_missing_wdl(run_tag):
     missing_wdl_ctr[0] += 1
     n = missing_wdl_ctr[0]
     if n == 1 or n % MISSING_WDL_WARN_EVERY == 0:
-        print(f"[xc0] WARNING: {run_tag} node missing best_wdl (scalar value head?), "
-              f"skipping xc0 record (count={n:,})", flush=True)
+        print(f"[xc0] WARNING: {run_tag} node missing best_wdl on a run detected as "
+              f"WDL-head -- skipping xc0 record (count={n:,})", flush=True)
 
 
 def maybe_temp_scale(pi):
@@ -295,7 +316,7 @@ def align_sf(moves, sf_rows):
     return sf_rows, by_ply
 
 
-def iter_xc0_game(game, sf_df, seen=None, lc0_batcher=None, xc0_eligible=True):
+def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc0_eligible=True):
     if not os.path.exists(game["pkl_file"]):
         return
     log = load_log(game["pkl_file"])
@@ -378,15 +399,23 @@ def iter_xc0_game(game, sf_df, seen=None, lc0_batcher=None, xc0_eligible=True):
                             policy  = np.zeros(N_1858, dtype=np.float32)
                             for ci, prob in zip(indices, pi):
                                 policy[ci] += prob
-                            wdl_node   = node.get("best_wdl")
-                            search_wdl = (np.array(wdl_node, dtype=np.float32)[[2, 1, 0] if not is_white else [0, 1, 2]]
-                                          if wdl_node is not None else to_wdl(0.0))
-                            z   = (1 if is_white else -1) if result > 0 else (
-                                  (-1 if is_white else 1) if result < 0 else 0)
-                            wdl = (Z_BLEND * to_wdl(z) + (1.0 - Z_BLEND) * search_wdl).astype(np.float32)
-                            xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
-                            yield ('xc0', xc0h, policy, wdl)
-                            made_xc0 = True
+                            wdl_node = node.get("best_wdl")
+                            if wdl_node is not None:
+                                search_wdl = np.array(wdl_node, dtype=np.float32)[
+                                    [2, 1, 0] if not is_white else [0, 1, 2]]
+                            elif has_wdl:
+                                warn_missing_wdl(run_tag)
+                                search_wdl = None
+                            else:
+                                search_wdl = to_wdl(node.get("Q_stm", 0.0))
+
+                            if search_wdl is not None:
+                                z   = (1 if is_white else -1) if result > 0 else (
+                                      (-1 if is_white else 1) if result < 0 else 0)
+                                wdl = (Z_BLEND * to_wdl(z) + (1.0 - Z_BLEND) * search_wdl).astype(np.float32)
+                                xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
+                                yield ('xc0', xc0h, policy, wdl)
+                                made_xc0 = True
 
         lc0d_accept = 1.0 if scenario in LC0_FULL_SCENARIOS else min(1.0, 0.05 + ply * 0.95 / 16)
         if not made_xc0 and not dedup_skipped and lc0_batcher is not None and random.random() < lc0d_accept:
@@ -401,9 +430,8 @@ def iter_xc0_game(game, sf_df, seen=None, lc0_batcher=None, xc0_eligible=True):
             yield ('lc0d', xc0h, lc0_pol, lc0_wdl)
 
 
-def xc0_stream(run_tag, stop_evt, lc0_batcher=None):
+def xc0_stream(run_tag, stop_evt, games, sf_by_gid, good_gids, has_wdl, lc0_batcher=None):
     seen = {}
-    games, sf_by_gid, good_gids = load_xc0_games(run_tag)
     for game in games:
         if stop_evt.is_set():
             return
@@ -411,11 +439,18 @@ def xc0_stream(run_tag, stop_evt, lc0_batcher=None):
         if not xc0_eligible and lc0_batcher is None:
             continue
         sf_df = sf_by_gid.get(game["game_id"])
-        yield from iter_xc0_game(game, sf_df, seen, lc0_batcher, xc0_eligible)
+        yield from iter_xc0_game(game, sf_df, run_tag, has_wdl, seen, lc0_batcher, xc0_eligible)
 
 
 def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q, prefix):
     os.makedirs(out_dir, exist_ok=True)
+
+    # resolved once at worker startup, never re-checked in the per-position loop
+    games, sf_by_gid, good_gids = load_xc0_games(run_tag)
+    has_wdl = detect_has_wdl(games)
+    print(f"[{name}] {run_tag}: detected {'WDL' if has_wdl else 'scalar-Q'} value head "
+          f"-- {'native best_wdl' if has_wdl else 'naive Q_stm mapping'} will be used", flush=True)
+
     lc0_batcher   = None
     lc0_model     = os.getenv('LC0_DISTILL_MODEL', '')
     lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
@@ -431,7 +466,7 @@ def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr, stop_evt,
         lc0_batcher = Lc0Batcher(sess, batch_size=LC0_DISTILL_BATCH)
         print(f"[{name}] Lc0Batcher: TRT batch_size={LC0_DISTILL_BATCH}", flush=True)
 
-    run_source_dual(name, xc0_stream(run_tag, stop_evt, lc0_batcher),
+    run_source_dual(name, xc0_stream(run_tag, stop_evt, games, sf_by_gid, good_gids, has_wdl, lc0_batcher),
                     out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q,
                     xc0_prefix=prefix, lc0d_prefix=f"lc0d_{name}")
     os._exit(0)
@@ -592,6 +627,8 @@ def main():
     ap.add_argument("--xc0-target", type=int, default=TARGET_PER_SOURCE)
     ap.add_argument("--workers",    type=int, default=6,
                     help="total concurrent workers of any type")
+    ap.add_argument("--xc0-only",  action="store_true",
+                    help="skip the raw lc0 V6-chunk source entirely; only process xc0 selfplay runs")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -611,14 +648,17 @@ def main():
 
     # gather lc0 chunks
     lc0_chunks = []
-    for d in sorted(os.listdir(args.lc0_dir)):
-        full = os.path.join(args.lc0_dir, d)
-        if not os.path.isdir(full):
-            continue
-        lc0_chunks.extend(
-            os.path.join(full, f) for f in os.listdir(full)
-            if f.endswith(".gz") and not f.endswith(".tfrecord.gz"))
-    print(f"[scan] {len(lc0_chunks):,} lc0 chunk files")
+    if not args.xc0_only:
+        for d in sorted(os.listdir(args.lc0_dir)):
+            full = os.path.join(args.lc0_dir, d)
+            if not os.path.isdir(full):
+                continue
+            lc0_chunks.extend(
+                os.path.join(full, f) for f in os.listdir(full)
+                if f.endswith(".gz") and not f.endswith(".tfrecord.gz"))
+        print(f"[scan] {len(lc0_chunks):,} lc0 chunk files")
+    else:
+        print(f"[scan] --xc0-only: skipping raw lc0 source")
     print(f"[scan] {len(args.run_tags)} xc0 run tags: {args.run_tags}")
 
     ctx = mp.get_context("spawn")
@@ -632,7 +672,7 @@ def main():
     # pending job list: supervisor pops one at a time and spawns a worker
     pending = (
         [("xc0", rt) for rt in args.run_tags] +
-        [("lc0", s) for s in partition(lc0_chunks, LC0_JOBS)]
+        ([] if args.xc0_only else [("lc0", s) for s in partition(lc0_chunks, LC0_JOBS)])
     )
 
     active = {}   # name -> Process
@@ -712,7 +752,8 @@ def main():
                 xc0_rate   = xc0_n   / max(elapsed, 1e-9)
                 lc0d_rate  = lc0d_n  / max(elapsed, 1e-9)
                 total_rate = combined / max(elapsed, 1e-9)
-                pct = combined / (args.lc0_target + args.xc0_target) * 100
+                total_target = args.xc0_target if args.xc0_only else args.lc0_target + args.xc0_target
+                pct = combined / total_target * 100
                 print(f"[{combined:,}]  "
                       f"lc0={lc0_n:,} ({lc0_rate:,.0f}/s)  "
                       f"xc0={xc0_n:,} ({xc0_rate:,.0f}/s)  "

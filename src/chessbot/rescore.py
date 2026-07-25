@@ -19,7 +19,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence,
+    score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
     calc_entropy,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
@@ -240,6 +240,8 @@ class Rescorer(object):
         self.n_saved = 0
         self.total_cpl_plies = 0.0
         self.total_bmr_plies = 0.0
+        self.total_kl_plies = 0.0
+        self.total_ce_plies = 0.0
         self.total_plies = 0
 
         self.n_sf_submitted = 0
@@ -251,6 +253,8 @@ class Rescorer(object):
         self.current_depth = cfg.rescore_depth
         self.last_10_cpls = []
         self.last_10_bmrs = []
+        self.last_10_kls = []
+        self.last_10_ces = []
         self.last_10_plies = []
 
         zero_collar = lambda: {
@@ -279,6 +283,9 @@ class Rescorer(object):
         self.tscale_ne_after = 0.0
         self.tscale_best_T = 0.0
         self.tscale_time = 0.0
+
+        self.kl_q50 = 0.3  # online-tracked EMA median of eligible-ply KL; hardcoded seed
+        self.kl_q80 = 1.0  # online-tracked EMA 80th percentile of eligible-ply KL; hardcoded seed
 
         self.intake = deque()
         self.pending = {}
@@ -321,6 +328,8 @@ class Rescorer(object):
             'n_saved': self.n_saved,
             'total_cpl_plies': self.total_cpl_plies,
             'total_bmr_plies': self.total_bmr_plies,
+            'total_kl_plies': self.total_kl_plies,
+            'total_ce_plies': self.total_ce_plies,
             'total_plies': self.total_plies,
             'n_sf_submitted': self.n_sf_submitted,
             'sf_compute_time': self.sf_compute_time,
@@ -329,6 +338,8 @@ class Rescorer(object):
             'sf_rerun_count': self.sf_rerun_count,
             'last_10_cpls': self.last_10_cpls,
             'last_10_bmrs': self.last_10_bmrs,
+            'last_10_kls': self.last_10_kls,
+            'last_10_ces': self.last_10_ces,
             'last_10_plies': self.last_10_plies,
             'collar_total': self.collar_total,
             'collar_window': self.collar_window,
@@ -344,6 +355,8 @@ class Rescorer(object):
             'tscale_ne_after': self.tscale_ne_after,
             'tscale_best_T': self.tscale_best_T,
             'tscale_time': self.tscale_time,
+            'kl_q50': self.kl_q50,
+            'kl_q80': self.kl_q80,
             'start_time': self.start_time,
             'current_depth': self.current_depth,
             'intake': self.intake,
@@ -554,6 +567,7 @@ class Rescorer(object):
         game_cfg_keys = (
             'train_on_stockfish',
             'KL_weight_boost', 'KL_boost_threshold',
+            'kl_boost_median_mult', 'kl_boost_p80_mult', 'kl_quantile_lr',
             'rescore_equiv_range', 'rescore_blunder_cp_loser',
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
             'uniform_eps', 'prior_clip_max',
@@ -734,8 +748,6 @@ class Rescorer(object):
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
 
-        KL_coef = cfg.KL_weight_boost
-        do_KL_boost = (KL_coef > 0) and (KL_coef != 1.0)
         EQUIV = cfg.rescore_equiv_range
 
         cpl_s = 0.0
@@ -789,6 +801,7 @@ class Rescorer(object):
                 best_abs, played_abs,
                 turn, loss_this,
                 tr.get('stop_reason', ''), tr.get('sims', 0),
+                np.nan, np.nan,  # kl, ce -- filled in below if this ply trains
             ])
 
             if ply['skip_training']:
@@ -875,9 +888,14 @@ class Rescorer(object):
             vwht = value_weight_for_game(cfg, is_draw)
             pwht = 1.0
             kl = kl_divergence(priors, vis)
-            if kl_eligible and do_KL_boost:
-                if kl >= cfg.KL_boost_threshold:
-                    pwht *= KL_coef
+            rows[-1][-2] = kl
+            self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
+            self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
+            if kl_eligible:
+                if kl >= self.kl_q80:
+                    pwht *= cfg.kl_boost_p80_mult
+                elif kl >= self.kl_q50:
+                    pwht *= cfg.kl_boost_median_mult
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']
@@ -919,6 +937,7 @@ class Rescorer(object):
 
         start_fen    = game_data['start_fen']
         moves_played = game_data['moves_played']
+        row_by_ply   = {r[0]: r for r in rows}
 
         # loop 2: compute WDL targets, add to training, build lc0 waypoints
         lc0_waypoints = {}
@@ -932,6 +951,15 @@ class Rescorer(object):
 
             z = z_eff if cfg.use_collar_rescoring else z_orig
             Y = blend_wdl(z, aux.get('best_wdl'), is_white)
+
+            wdl_node = aux.get('best_wdl')
+            if wdl_node is not None:
+                model_wdl = np.array(wdl_node, dtype=np.float32)
+                if not is_white:
+                    model_wdl = model_wdl[[2, 1, 0]]
+                row = row_by_ply.get(ply_i)
+                if row is not None:
+                    row[-1] = cross_entropy(Y, model_wdl)
 
             sc['total'] += 1
             scw['total'] += 1
@@ -1021,6 +1049,7 @@ class Rescorer(object):
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
+            'kl', 'ce',
         ]
 
         out_df = pd.DataFrame(rows, columns=cols)
@@ -1497,16 +1526,22 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b, plies = save_analysis_chunk_simple(run_dir, self.analyzed_results)
+        outp, c, b, kl, ce, plies = save_analysis_chunk_simple(run_dir, self.analyzed_results)
         self.n_saved += 1
         self.total_cpl_plies += c * plies
         self.total_bmr_plies += b * plies
+        self.total_kl_plies  += kl * plies
+        self.total_ce_plies  += ce * plies
         self.total_plies += plies
 
         self.last_10_cpls.append(c)
         self.last_10_cpls = self.last_10_cpls[-10:]
         self.last_10_bmrs.append(b)
         self.last_10_bmrs = self.last_10_bmrs[-10:]
+        self.last_10_kls.append(kl)
+        self.last_10_kls = self.last_10_kls[-10:]
+        self.last_10_ces.append(ce)
+        self.last_10_ces = self.last_10_ces[-10:]
         self.last_10_plies.append(plies)
         self.last_10_plies = self.last_10_plies[-10:]
 
@@ -1515,18 +1550,18 @@ class Rescorer(object):
                 w = np.array(self.last_10_plies, dtype=np.float64)
                 last_10_avg_c = np.dot(self.last_10_cpls, w) / w.sum()
                 last_10_avg_b = np.dot(self.last_10_bmrs, w) / w.sum()
-                print(
-                    f"{RS} {'Last 10 avg:':<16} CPL {last_10_avg_c:.3f}",
-                    f"BMR {last_10_avg_b:.3f}"
-                )
+                last_10_avg_kl = np.dot(self.last_10_kls, w) / w.sum()
+                last_10_avg_ce = np.dot(self.last_10_ces, w) / w.sum()
+                print(fmt_rescore_stats(
+                    "Last 10 avg:", last_10_avg_c, last_10_avg_b,
+                    last_10_avg_ce, last_10_avg_kl))
 
             if self.n_saved >= 2:
                 cpl_mean = self.total_cpl_plies / self.total_plies
                 bmr_mean = self.total_bmr_plies / self.total_plies
-                print(
-                    f"{RS} {'Overall stats:':<16} CPL {cpl_mean:.3f}",
-                    f"BMR {bmr_mean:.3f}"
-                )
+                kl_mean  = self.total_kl_plies  / self.total_plies
+                ce_mean  = self.total_ce_plies  / self.total_plies
+                print(fmt_rescore_stats("Overall stats:", cpl_mean, bmr_mean, ce_mean, kl_mean))
 
             W = 10
 
@@ -1705,6 +1740,14 @@ def collar_z_map(eval_trace, game_result, cfg, game_id=None):
 
 def value_weight_for_game(cfg, is_draw):
     return cfg.draw_value_scale if is_draw else 1.0
+
+
+def update_ema_quantile(estimate, x, target_q, lr):
+    """Online stochastic-approximation quantile tracker (Robbins-Monro).
+    Self-corrects toward the point where P(X < estimate) == target_q."""
+    if x < estimate:
+        return estimate + lr * (target_q - 1.0)
+    return estimate + lr * target_q
 
 
 def z_to_wdl(z_stm):
@@ -1915,6 +1958,12 @@ def combine_analysis_staging(run_dir):
     return combined_new
 
 
+def fmt_rescore_stats(label, cpl, bmr, ce, kl):
+    # CPL swings between 1 and 2+ digits -- fixed width keeps columns aligned
+    return (f"{RS} {label:<16}CPL {cpl:>5.2f}  BMR {bmr:>4.2f}  "
+            f"CE {ce:>4.2f}  KL {kl:>4.2f}")
+
+
 def save_analysis_chunk_simple(run_dir, batch):
     """
     Build a combined-style object for `batch` (list of analysis_out dicts)
@@ -1953,10 +2002,12 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
+    kl  = df_all.kl.mean()
+    ce  = df_all.ce.mean()
     plies = len(df_all)
 
     print(f"{RS} Saving {len(batch)} analyzed games")
-    print(f"{RS} {'Batch stats:':<16} CPL {cpl:.3f} BMR {bmr:.3f}")
+    print(fmt_rescore_stats("Batch stats:", cpl, bmr, ce, kl))
 
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)
@@ -1964,7 +2015,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr, plies
+    return outp, cpl, bmr, kl, ce, plies
 
 
 def make_fake_visits(mv, lms, ratio_best=60):

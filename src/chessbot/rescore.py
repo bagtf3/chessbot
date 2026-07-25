@@ -27,8 +27,6 @@ from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
-EVICTION_WINDOW = 10000
-EVICTION_MAX_SIZE = 250000
 C = 0.9699
 D = d = np.arctanh(0.5)
 
@@ -115,127 +113,13 @@ class Lc0Thread:
         }
 
 
-class SFCache:
-    """
-    Position-keyed cache for Stockfish analysis results.
-    Key: short FEN (position + turn + castling + ep, no move clocks).
-    Each entry stores the best move found and any other moves analyzed
-    at that position, so repeated positions skip SF calls entirely.
-    """
-
-    def __init__(self, eviction_window=EVICTION_WINDOW, max_size=EVICTION_MAX_SIZE):
-        self.data = {}
-        self.eviction_window = eviction_window
-        self.max_size = max_size
-
-    def get(self, key):
-        return self.data.get(key)
-
-    def touch(self, key, game_num):
-        entry = self.data.get(key)
-        if entry is not None:
-            entry['hits'] += 1
-            entry['last_seen'] = game_num
-
-    def set_best(self, key, uci, cp, abs_cp, game_num, depth=0):
-        if key not in self.data:
-            self.data[key] = {
-                'best': None, 'others': {}, 'hits': 0, 'last_seen': game_num, 'depth': 0
-            }
-        entry = self.data[key]
-        if depth < entry.get('depth', 0):
-            return False
-        entry['best'] = (uci, cp, abs_cp)
-        entry['depth'] = depth
-        entry['hits'] += 1
-        entry['last_seen'] = game_num
-        return True
-
-    def set_move(self, key, uci, cp, abs_cp, game_num):
-        entry = self.data.get(key)
-        if entry is not None:
-            entry['others'][uci] = (cp, abs_cp)
-            entry['last_seen'] = game_num
-
-    def load_seed(self, path):
-        """Merge a pre-computed SFCache pickle (gzipped) into this cache.
-        Existing entries are not overwritten — the seeded depth-20 values win
-        only for positions not yet seen in the live run."""
-        import gzip as gz
-        with gz.open(path, "rb") as f:
-            saved = pickle.load(f)
-        seeded = saved.get("data", {})
-        depth = saved.get("depth", "?")
-        added = 0
-        for key, entry in seeded.items():
-            if key not in self.data:
-                entry["last_seen"] = 10 ** 9  # pin: never evict
-                self.data[key] = entry
-                added += 1
-        print(f"[SFCache] loaded seed: {added:,} entries (depth={depth}) from {path}")
-        return added
-
-    def save(self, path):
-        """Save cache to disk as gzipped pickle, atomically."""
-        tmp = str(path) + ".tmp"
-        with gzip.open(tmp, "wb") as f:
-            pickle.dump({"data": self.data}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, str(path))
-
-    def roll_merge(self, path):
-        """Load a previously saved cache and merge into current.
-        For each key: higher-depth best wins; others dicts are unioned."""
-        with gzip.open(path, "rb") as f:
-            saved = pickle.load(f)
-        saved_data = saved.get("data", {})
-        added = updated = others_added = 0
-        for key, se in saved_data.items():
-            if key not in self.data:
-                se["last_seen"] = 0
-                self.data[key] = se
-                added += 1
-            else:
-                cur = self.data[key]
-                if (se.get("depth", 0) > cur.get("depth", 0)
-                        and se.get("best") is not None):
-                    cur["best"] = se["best"]
-                    cur["depth"] = se["depth"]
-                    updated += 1
-                for uci, val in se.get("others", {}).items():
-                    if uci not in cur["others"]:
-                        cur["others"][uci] = val
-                        others_added += 1
-        print(
-            f"[SFCache] roll_merge: {added:,} added, {updated:,} best upgraded,"
-            f" {others_added:,} other moves merged from {os.path.basename(path)}"
-        )
-        return added, updated
-
-    def maybe_evict(self, game_num):
-        if len(self.data) < self.max_size:
-            return 0
-        threshold = game_num - self.eviction_window
-        stale = [k for k, v in self.data.items() if v['last_seen'] < threshold]
-        for k in stale:
-            del self.data[k]
-        return len(stale)
-
-    def stats(self):
-        return {
-            'size': len(self.data),
-            'total_hits': sum(v['hits'] for v in self.data.values()),
-        }
-
-
 class SFRescoreThread:
     """
     SF worker that processes one game at a time for TT locality.
     submit_game() enqueues a whole game; the thread processes positions
     sequentially in ply order and returns a batch result.
 
-    positions: [(ply_idx, board_copy, xerces_uci, known_best_uci), ...]
-      known_best_uci=None  -> full analysis needed (cache miss)
-      known_best_uci=<uci> -> best already known, only analyse xerces move
+    positions: [(ply_idx, board_copy, xerces_uci), ...]
     """
 
     def __init__(self, sf_game_q, sf_res_q, cfg):
@@ -285,26 +169,18 @@ class SFRescoreThread:
             gid, positions = item
             results = []
             try:
-                for ply_idx, board, xerces_uci, known_best_uci in positions:
+                for ply_idx, board, xerces_uci in positions:
                     limit = chess.engine.Limit(depth=self.depth)
                     elapsed = 0.0
 
-                    # pass 1: full best-move analysis (skipped if caller already has best)
-                    if known_best_uci is None:
-                        t0 = time.time()
-                        info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
-                        elapsed += time.time() - t0
-                        best_uci = str(info['pv'][0])
-                        pv_ucis  = [str(m) for m in info.get('pv', [])[:4]]
-                        best_cp  = score_cp_stm_pov(info['score'])
-                        best_abs = score_cp_white_pov(info['score'], clipped=False)
-                    else:
-                        # partial cache hit: best known
-                        # cp filled in by handle_game_results
-                        best_uci = known_best_uci
-                        best_cp  = None
-                        best_abs = None
-                        pv_ucis  = []
+                    # pass 1: full best-move analysis
+                    t0 = time.time()
+                    info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
+                    elapsed += time.time() - t0
+                    best_uci = str(info['pv'][0])
+                    pv_ucis  = [str(m) for m in info.get('pv', [])[:4]]
+                    best_cp  = score_cp_stm_pov(info['score'])
+                    best_abs = score_cp_white_pov(info['score'], clipped=False)
 
                     # pass 2: score xerces's move only if it differs from best
                     rerun = xerces_uci != best_uci
@@ -346,11 +222,10 @@ class SFRescoreThread:
 
 class Rescorer(object):
 
-    def __init__(self, cfg, sf_game_q, sf_res_q, cache):
+    def __init__(self, cfg, sf_game_q, sf_res_q):
         self.config   = cfg
         self.game_q   = sf_game_q
         self.res_q    = sf_res_q
-        self.cache    = cache
 
         self.training_data = []
         self.analyzed_results = []
@@ -368,7 +243,6 @@ class Rescorer(object):
         self.total_plies = 0
 
         self.n_sf_submitted = 0
-        self.n_cache_hits = 0
         self.sf_compute_time = 0.0
         self.sf_compute_count = 0
         self.sf_call_count = 0
@@ -449,7 +323,6 @@ class Rescorer(object):
             'total_bmr_plies': self.total_bmr_plies,
             'total_plies': self.total_plies,
             'n_sf_submitted': self.n_sf_submitted,
-            'n_cache_hits': self.n_cache_hits,
             'sf_compute_time': self.sf_compute_time,
             'sf_compute_count': self.sf_compute_count,
             'sf_call_count': self.sf_call_count,
@@ -697,7 +570,7 @@ class Rescorer(object):
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
-        # (ply_idx, board_copy, xerces_uci, known_best_uci) queued for SF analysis
+        # (ply_idx, board_copy, xerces_uci) queued for SF analysis
         sf_positions = []
         # walk each move: route SF moves, build ply state
         for i, mv in enumerate(game_data.get('moves_played', [])):
@@ -797,7 +670,7 @@ class Rescorer(object):
                 'resolved': False,
             }
 
-            sf_positions.append((i, board_ch.copy(), xerces_uci, None))
+            sf_positions.append((i, board_ch.copy(), xerces_uci))
 
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
@@ -839,11 +712,9 @@ class Rescorer(object):
             if ply is None:
                 continue
 
-            if best_cp is not None:
-                ply['best_uci'] = best_uci
-                ply['best_cp']  = best_cp
-                ply['best_abs'] = best_abs
-
+            ply['best_uci']   = best_uci
+            ply['best_cp']    = best_cp
+            ply['best_abs']   = best_abs
             ply['pv_ucis']    = r.get('pv_ucis', [])
             ply['played_cp']  = played_cp
             ply['played_abs'] = played_abs

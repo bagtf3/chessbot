@@ -6,9 +6,7 @@ After a game finishes, it isn't used for training directly. The raw selfplay dat
 
 ## SF Analysis Pipeline
 
-Each game pickle contains the full move history and per-ply NN outputs. `Rescorer.start_game()` iterates through the plies and submits positions to the Stockfish queue for analysis. Results come back asynchronously via `handle_sf_result()`, which stores the best move, centipawn evaluation, and WDL triple for each ply.
-
-Stockfish results are cached in `SFCache` — an LRU cache keyed on a short FEN (position + repetition count + halfmove clock). The cache is seeded from pre-computed depth-20 analysis at run start, so common positions in the opening and early middlegame are already resolved without queuing live SF queries. Entries are evicted when the cache exceeds `rescore_cache_size`.
+Each game pickle contains the full move history and per-ply NN outputs. `Rescorer.start_game()` iterates through the plies and submits positions to the Stockfish queue for analysis. Results come back asynchronously via `handle_sf_result()`, which stores the best move, centipawn evaluation, and WDL triple for each ply. Every position gets full analysis — an earlier position-keyed cache (`SFCache`) that skipped re-analysis of repeated positions was tried and removed; it wasn't paying off.
 
 ## Training Targets
 

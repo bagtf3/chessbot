@@ -9,10 +9,10 @@ import json
 import numpy as np
 import pandas as pd
 
-from chessbot import SP_DIR, SF_SEED_CACHE
+from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
 from chessbot.rescore import (
-    Rescorer, SFRescoreThread, SFCache,
+    Rescorer, SFRescoreThread,
     launch_retrain_async, poll_retrain,
 )
 from chessbot.review import RecordKeeper
@@ -382,19 +382,7 @@ def main(run_tag):
     for t in sf_rescore_threads:
         t.start()
 
-    cache = SFCache(
-        eviction_window=base_cfg.rescore_eviction_window,
-        max_size=base_cfg.rescore_cache_size,
-    )
-    cache_path = os.path.join(base_cfg.run_dir, "sf_cache.pkl.gz")
-
-    # [nocache] kept constructed but never populated; its stats() feed the
-    # [nocache] telemetry row, where size must stay 0 to prove it is off
-    # [nocache] if SF_SEED_CACHE and os.path.exists(SF_SEED_CACHE):
-    # [nocache]     cache.load_seed(SF_SEED_CACHE)
-    # [nocache] if os.path.exists(cache_path):
-    # [nocache]     cache.roll_merge(cache_path)
-    rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q, cache)
+    rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q)
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
@@ -698,7 +686,6 @@ def main(run_tag):
             # selfplay round report
             recorder.maybe_log_results(force=True)
             total_games += recorder.games_finished
-            # [nocache] cache.save(cache_path)
 
             if is_validation:
                 recorder.config = working_cfg
@@ -797,7 +784,6 @@ def main(run_tag):
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
         rescorer.tick()
         rescorer.push_analyzed(report=True)
-        # [nocache] cache.save(cache_path)
         for t in sf_rescore_threads:
             t.close()
         if rescorer.training_data:

@@ -81,8 +81,6 @@ class Config(object):
     rescore_inaccuracy_cp = 75
     rescore_blunder_cp_loser = 90
     rescore_blunder_cp_winner = 200
-    rescore_eviction_window = 500
-    rescore_cache_size = 50000
     rescore_n_sf_threads = 1
 
     use_collar_rescoring = False

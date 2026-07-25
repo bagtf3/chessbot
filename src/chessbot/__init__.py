@@ -26,7 +26,6 @@ LC0_WEIGHTS = os.getenv("LC0_WEIGHTS", "")
 ENDGAME_LOC = os.getenv("ENDGAME_LOC", "")
 SP_DIR = os.getenv("SP_DIR", "")
 MODEL_DIR = os.getenv("MODEL_DIR", "")
-SF_SEED_CACHE = os.getenv("SF_SEED_CACHE", "")
 CUTECHESS_CLI_LOC = os.getenv("CUTECHESS_CLI_LOC", "")
 
 import chess

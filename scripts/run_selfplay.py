@@ -334,6 +334,19 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
+def next_model_epoch(progress_csv_path):
+    """Next model_epoch to write. Row count is wrong when the csv has gaps or
+    duplicate epochs (cloned runs, partial rows), so continue past the max."""
+    if not os.path.exists(progress_csv_path):
+        return 0
+
+    df = pd.read_csv(progress_csv_path)
+    if not len(df) or 'model_epoch' not in df.columns:
+        return 0
+
+    return int(df['model_epoch'].max()) + 1
+
+
 
 def launch_retrain(run_tag, working_cfg, epoch=0, pred_pkl_path=None):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
@@ -391,13 +404,8 @@ def main(run_tag):
         n_loaded = len(rescorer.training_data)
         print(f"[main] loaded {n_loaded} samples from remaining_untrained.pkl")
 
-    # infer n_retrains
-    if os.path.exists(base_cfg.progress_csv_path):
-        progress_df = pd.read_csv(base_cfg.progress_csv_path)
-        n_retrains = len(progress_df)
-    else:
-        n_retrains = 0
-    
+    n_retrains = next_model_epoch(base_cfg.progress_csv_path)
+
     recorder = RecordKeeper(n_retrains, run_num=0, every_sec=45.0)
 
     threading.Thread(target=stdin_listener, daemon=True).start()
@@ -495,12 +503,7 @@ def main(run_tag):
             # validation is pre-filled and already signaled; training tracks budget below
             stop_signal_sent = is_validation
 
-            # infer n_retrains
-            if os.path.exists(working_cfg.progress_csv_path):
-                progress_df = pd.read_csv(working_cfg.progress_csv_path)
-                n_retrains = len(progress_df)
-            else:
-                n_retrains = 0
+            n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
             procs = check_and_reap_procs(procs)
             needed_to_retrain = working_cfg.training_queue_buffer

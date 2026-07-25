@@ -6,7 +6,7 @@ import sys
 import random
 import subprocess
 import threading
-from collections import deque, defaultdict
+from collections import deque
 from queue import Empty
 
 import pickle
@@ -492,19 +492,6 @@ class Rescorer(object):
     def training_data_size(self):
         return len(self.training_data)
 
-    def maybe_seed_cache(self, b_fast, mv, Q_stm, turn, repetitions, depth=0):
-        # [nocache] unreachable: both call sites in start_game are commented out
-        short_fen = b_fast.fen(include_counters=False)
-        reps = 2 if repetitions[short_fen] >= 2 else 0
-        hmc = b_fast.halfmove_clock()
-        halfmoves = 0 if hmc < 45 else hmc
-        cache_key = (short_fen, reps, halfmoves)
-        best_cp = int(np.arctanh(np.clip(Q_stm, -C, C)) * 100.0 / D)
-        best_abs = best_cp if turn else -best_cp
-        self.cache.set_best(
-            cache_key, mv, best_cp, best_abs, self.games_processed, depth=depth
-        )
-
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
 
@@ -530,9 +517,6 @@ class Rescorer(object):
         
         while self.intake and len(self.pending) < 20:
             self.start_game(self.intake.popleft())
-
-        # [nocache] if self.games_processed > 0 and self.games_processed % 100 == 0:
-        # [nocache]     self.cache.maybe_evict(self.games_processed)
 
     def init_analyzer(self):
         run_dir = self.config.run_dir
@@ -713,29 +697,17 @@ class Rescorer(object):
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
-        # (ply_idx, board_copy, xerces_uci, known_best_uci) for cache misses
+        # (ply_idx, board_copy, xerces_uci, known_best_uci) queued for SF analysis
         sf_positions = []
-        repetitions = defaultdict(int)  # [nocache] no longer read by anything live
-        # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
-        # walk each move: route SF moves, build ply state, check cache
+        # walk each move: route SF moves, build ply state
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
 
             if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
-                deep_enough = game_sf_depth and game_sf_depth >= cfg.rescore_depth
-                if not skip_all_training and deep_enough:
-                    tr_sf = tree_data.get(i, tree_data.get(str(i), {}))
-                    Q_stm = tr_sf.get('Q_stm')
-                    if Q_stm is not None:
-                        # [nocache] self.maybe_seed_cache(
-                        # [nocache]     b_fast, mv, Q_stm, turn, repetitions, depth=game_sf_depth
-                        # [nocache] )
-                        pass
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
-                # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             tr = tree_data.get(i, tree_data.get(str(i), {}))
@@ -743,7 +715,6 @@ class Rescorer(object):
             if not cm:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
-                # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             Z_stm = result if turn else -result
@@ -761,11 +732,6 @@ class Rescorer(object):
                 Y_init = z_to_wdl(Z_stm)
 
             if is_sf_move:
-                # [nocache] if game_sf_depth and game_sf_depth >= cfg.rescore_depth:
-                # [nocache]     self.maybe_seed_cache(
-                # [nocache]         b_fast, mv, Q, turn, repetitions, depth=game_sf_depth
-                # [nocache]     )
-
                 sf_pwht = 0.0 if is_validation_game else 1.0
                 self.training_data_from_sf(
                     b_fast, mv, cm, Y_init, is_draw, policy_weight=sf_pwht
@@ -773,7 +739,6 @@ class Rescorer(object):
 
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
-                # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             visits = [(c['uci'], max(1, c['visits'])) for c in cm]
@@ -781,7 +746,6 @@ class Rescorer(object):
             if not visits:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
-                # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
                 continue
 
             sel_method = tr.get('selection_method')
@@ -807,10 +771,6 @@ class Rescorer(object):
             mask = b_fast.legal_move_mask()
             # short_fen still needed for the lc0 waypoint FEN check
             short_fen = b_fast.fen(include_counters=False)
-            # [nocache] reps = 2 if repetitions[short_fen] >= 2 else 0
-            # [nocache] hmc = b_fast.halfmove_clock()
-            # [nocache] halfmoves = 0 if hmc < 45 else hmc
-            # [nocache] cache_key = (short_fen, reps, halfmoves)
 
             ply = {
                 'ply_idx': i,
@@ -827,7 +787,7 @@ class Rescorer(object):
                 'idx_map': idx_map,
                 'skip_training': skip_all_training,
                 'xerces_uci': xerces_uci,
-                'sfen': short_fen,  # [nocache] was 'cache_key': cache_key
+                'sfen': short_fen,
                 'best_uci': None,
                 'best_cp': None,
                 'best_abs': None,
@@ -837,44 +797,14 @@ class Rescorer(object):
                 'resolved': False,
             }
 
-            # cache only checked for opening positions -- mid/late game rarely repeats
-            # [nocache] if i < 30:
-            # [nocache]     entry = self.cache.get(cache_key)
-            # [nocache] else:
-            # [nocache]     entry = None
-            # [nocache]
-            # [nocache] if entry and entry['best'] is not None:
-            # [nocache]     best_uci, best_cp, best_abs, *_ = entry['best']
-            # [nocache]     ply['best_uci'] = best_uci
-            # [nocache]     ply['best_cp'] = best_cp
-            # [nocache]     ply['best_abs'] = best_abs
-            # [nocache]     self.cache.touch(cache_key, self.games_processed)
-            # [nocache]     self.n_cache_hits += 1
-            # [nocache]
-            # [nocache]     if xerces_uci == best_uci:
-            # [nocache]         ply['played_cp'] = best_cp
-            # [nocache]         ply['played_abs'] = best_abs
-            # [nocache]         ply['resolved'] = True
-            # [nocache]     elif xerces_uci in entry['others']:
-            # [nocache]         played_cp, played_abs = entry['others'][xerces_uci]
-            # [nocache]         ply['played_cp'] = played_cp
-            # [nocache]         ply['played_abs'] = played_abs
-            # [nocache]         ply['resolved'] = True
-            # [nocache]     else:
-            # [nocache]         # best known but xerces move unscored
-            # [nocache]         # pass known_best_uci to skip pass 1
-            # [nocache]         sf_positions.append((i, board_ch.copy(), xerces_uci, best_uci))
-            # [nocache] else:
-            # full cache miss -- thread runs both passes. [nocache] now the only path
             sf_positions.append((i, board_ch.copy(), xerces_uci, None))
 
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
-            # [nocache] repetitions[b_fast.fen(include_counters=False)] += 1
 
         self.pending[gid] = game_state
-        # submit to SF thread or finalize immediately if cache covered everything
+        # submit to SF thread, or finalize immediately if every move was SF's own
         if sf_positions:
             self.n_sf_submitted += len(sf_positions)
             game_state['waiting'] = True
@@ -909,56 +839,10 @@ class Rescorer(object):
             if ply is None:
                 continue
 
-            # [nocache] key        = ply['cache_key']
-            xerces_uci = ply['xerces_uci']
-            depth      = r['depth']
-            # [nocache] cache_eligible = ply_idx < 30  # mirror the GET gate in start_game
-
             if best_cp is not None:
-                # full analysis result -- write best to cache
-                # [nocache] if cache_eligible:
-                # [nocache]     self.cache.set_best(
-                # [nocache]         key, best_uci, best_cp, best_abs,
-                # [nocache]         self.games_processed, depth=depth
-                # [nocache]     )
                 ply['best_uci'] = best_uci
                 ply['best_cp']  = best_cp
                 ply['best_abs'] = best_abs
-            # else: partial hit -- best_* already populated from cache in start_game
-            # [nocache] no partial hits now: pass 1 always runs, best_cp always set
-
-            # [nocache] whole block below is cache write-back only
-            # [nocache] if xerces_uci != best_uci:
-            # [nocache]     # xerces deviated -- check if it actually found something better
-            # [nocache]     entry = self.cache.get(key) if cache_eligible else None
-            # [nocache]     if entry and entry['best'] is not None:
-            # [nocache]         old_best_uci, old_best_cp, old_best_abs, *_ = entry['best']
-            # [nocache]         if played_cp > old_best_cp:
-            # [nocache]             # xerces move is stronger -- promote it to best in cache
-            # [nocache]             promoted = self.cache.set_best(
-            # [nocache]                 key, xerces_uci, played_cp, played_abs,
-            # [nocache]                 self.games_processed, depth=depth
-            # [nocache]             )
-            # [nocache]             self.cache.set_move(
-            # [nocache]                 key, old_best_uci, old_best_cp, old_best_abs,
-            # [nocache]                 self.games_processed
-            # [nocache]             )
-            # [nocache]             if promoted:
-            # [nocache]                 ply['best_uci'] = xerces_uci
-            # [nocache]                 ply['best_cp']  = played_cp
-            # [nocache]                 ply['best_abs'] = played_abs
-            # [nocache]         else:
-            # [nocache]             self.cache.set_move(
-            # [nocache]                 key, xerces_uci, played_cp, played_abs,
-            # [nocache]                 self.games_processed
-            # [nocache]             )
-            # [nocache]     elif not cache_eligible:
-            # [nocache]         pass  # ply >= 30: skip cache writes entirely
-            # [nocache]     else:
-            # [nocache]         self.cache.set_move(
-            # [nocache]             key, xerces_uci, played_cp, played_abs,
-            # [nocache]             self.games_processed
-            # [nocache]         )
 
             ply['pv_ucis']    = r.get('pv_ucis', [])
             ply['played_cp']  = played_cp
@@ -1146,7 +1030,7 @@ class Rescorer(object):
                 pv_seqs = []
 
             pending_aux.append({
-                'sfen':            ply['sfen'],  # [nocache] was ply['cache_key'][0]
+                'sfen':            ply['sfen'],
                 'pv_seqs':         pv_seqs,
                 'skip_xc0':        skip_xc0,
                 'lc0_mode':        lc0_mode,

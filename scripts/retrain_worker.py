@@ -306,12 +306,33 @@ def print_timings(timings):
     print(f"[retrain] {' '.join(parts)}")
 
 
+def save_predictions_pkl(model, X_raw, pred_pkl_path, batch_size=256):
+    import pickle
+    import torch
+    import torch.nn.functional as F
+    device = torch.device("cuda")
+    model = model.to(device).half().eval()
+    results = []
+    with torch.no_grad():
+        for i in range(0, len(X_raw), batch_size):
+            xb = torch.from_numpy(X_raw[i:i + batch_size]).long().to(device)
+            pol_logits, val_out = model(xb)
+            pol_np = pol_logits.float().cpu().numpy()
+            wdl_np = F.softmax(val_out.float(), dim=-1).cpu().numpy()
+            for j in range(len(pol_np)):
+                results.append((wdl_np[j].tolist(), pol_np[j].tolist()))
+    with open(pred_pkl_path, "wb") as f:
+        pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[retrain] saved {len(results)} predictions -> {os.path.basename(pred_pkl_path)}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run-dir", required=True, help="run directory")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--epoch", type=int, default=0, help="retrain epoch number for logging")
+    p.add_argument("--pred-pkl-path", default=None, help="path to save pre-retrain predictions")
     args = p.parse_args()
 
     t_total = time.time()
@@ -365,6 +386,12 @@ def main():
     pwht    = np.array(pwht_list, dtype=np.float32)
     timings['load_shards'] = time.time() - t0
 
+    from chessbot.train_pytorch import load_pt_model, retrain_pt
+    model, arch = load_pt_model(cfg.model_path)
+
+    if args.pred_pkl_path:
+        save_predictions_pkl(model, X, args.pred_pkl_path, batch_size=args.batch_size)
+
     valid = ~np.isnan(Y_value).any(axis=1) if Y_value.ndim == 2 else ~np.isnan(Y_value)
     n_invalid = int((~valid).sum())
     if n_invalid > 0:
@@ -399,9 +426,10 @@ def main():
           f"policy={cfg.policy_loss_weight:.4f}  "
           f"ratio={cfg.value_loss_weight / cfg.policy_loss_weight:.4f}:1")
 
-    from chessbot.train_pytorch import retrain_pt
-    retrain_pt(cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
-               label="", timings=timings)
+    retrain_pt(
+        cfg.model_path, X, P, Y_value, vwht, pwht, cfg, epoch, args,
+        label="", timings=timings, model=model, arch=arch,
+    )
 
     removed = delete_files(loaded_shards)
     print(f"[retrain] deleted {removed} shard files")

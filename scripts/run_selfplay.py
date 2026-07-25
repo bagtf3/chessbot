@@ -35,6 +35,7 @@ PAUSE_REQUESTED = threading.Event()
 UNPAUSE_REQUESTED = threading.Event()
 SAVE_TRAINING_DATA_REQUESTED = threading.Event()
 SAVE_TRAINING_DATA_N = None
+WORKER_PROCS = []
 
 MAX_BACKLOG = 250
 GAME_QUEUE_MIN = 36  # top up when central queue drops below this
@@ -55,6 +56,11 @@ def stdin_listener():
             request_stop()
         elif cmd == 'stop now':
             print("[cmd] hard stop")
+            for w in WORKER_PROCS:
+                try:
+                    w.kill()
+                except Exception:
+                    pass
             os._exit(1)
         elif cmd == 'stop after this round':
             print("[cmd] will stop after this round completes")
@@ -139,6 +145,7 @@ def spawn_workers(cfg, recent_q, telemetry_q, game_queue, sf_queue=None):
             daemon=True,
         )
         p.start()
+        WORKER_PROCS.append(p)
 
         procs.append({
             "id": c.id,
@@ -328,11 +335,14 @@ def parse_paths(run_tag):
 
 
 
-def launch_retrain(run_tag, working_cfg, epoch=0):
+def launch_retrain(run_tag, working_cfg, epoch=0, pred_pkl_path=None):
     rt_script = find_script("retrain_worker.py", start_file=__file__)
     if not rt_script:
         raise RuntimeError("retrain_worker.py not found")
-    return launch_retrain_async(run_tag, rt_script, working_cfg, epoch=epoch)
+    return launch_retrain_async(
+        run_tag, rt_script, working_cfg,
+        epoch=epoch, pred_pkl_path=pred_pkl_path,
+    )
 
 
 def pull_pkl(to_process):
@@ -602,8 +612,7 @@ def main(run_tag):
                     recorder.training_queue = rescorer.training_data_size
 
                     # worker 0 predicts training batch then pauses; rest just pause
-                    pred_pkl_path = os.path.join(
-                        working_cfg.pending_training_dir, "predictions_latest.pkl")
+                    pred_pkl_path = os.path.join(working_cfg.run_dir, "predictions_latest.pkl")
                     if os.path.exists(pred_pkl_path):
                         os.remove(pred_pkl_path)
                     if procs:
@@ -700,6 +709,8 @@ def main(run_tag):
             # drained instead of returning after a single pass.
             is_last_round = run_num >= base_cfg.n_rounds
             while True:
+                if STOP_REQUESTED.is_set():
+                    break
                 recorder.training_queue = rescorer.training_data_size
                 k = recorder.training_queue // working_cfg.retrain_size
                 if k > 0:
@@ -712,7 +723,12 @@ def main(run_tag):
                     recorder.training_queue = rescorer.training_data_size
 
                     if retrain is None:
-                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
+                        eor_pred_pkl = os.path.join(
+                            working_cfg.run_dir, "predictions_latest.pkl")
+                        if os.path.exists(eor_pred_pkl):
+                            os.remove(eor_pred_pkl)
+                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains,
+                                                 pred_pkl_path=eor_pred_pkl)
                         rescorer.reset_writer()
 
                     while retrain is not None:
@@ -728,8 +744,6 @@ def main(run_tag):
                                 t.update_config(working_cfg)
                                 t.depth = min(current_depth, t.base_depth)
                             rescorer.current_depth = sf_rescore_threads[0].depth
-                            eor_pred_pkl = os.path.join(
-                                working_cfg.pending_training_dir, "predictions_latest.pkl")
                             rescorer.aggregate_metrics(
                                 n_retrains,
                                 working_cfg.progress_csv_path,

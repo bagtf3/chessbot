@@ -127,9 +127,6 @@ def save_pt_model(model, path, arch=None, opt=None):
 
 
 
-RETRAIN_CLIP_NORM = 20.0
-
-
 def pt_opt_state_path(model_path: str, run_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(model_path))[0]
     return os.path.join(run_dir, "train_ckpts", stem + "_opt_state.pt")
@@ -180,18 +177,19 @@ def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
 
 
 def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
-               label="", timings=None):
-    """Load, train 2 epochs at LR/1.5, save. Mirrors retrain_one_model."""
+               label="", timings=None, model=None, arch=None):
+    """Load, train one epoch, save."""
     if timings is None:
         timings = {}
     tag = f"[retrain{(' ' + label) if label else ''}]"
     short_model = os.path.join(
         os.path.basename(os.path.dirname(model_path)),
         os.path.basename(model_path))
-    print(f"{tag} loading {short_model}")
 
     t0 = time.time()
-    model, arch = load_pt_model(model_path)
+    if model is None:
+        print(f"{tag} loading {short_model}")
+        model, arch = load_pt_model(model_path)
     device = torch.device("cuda")
     model  = model.to(device).train()
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
@@ -209,6 +207,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     pwht_t = torch.from_numpy(pwht).float().to(device)
 
     lr = cfg.learning_rate
+    clip_norm = cfg.retrain_clip_norm
     opt = torch.optim.Adam(
         model.parameters(), lr=lr,
         betas=(0.9, cfg.adam_beta2),
@@ -262,9 +261,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
             opt.zero_grad()
             loss.backward()
-            raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), RETRAIN_CLIP_NORM).item()
+            raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
             grad_norms.append(raw_norm)
-            if raw_norm > RETRAIN_CLIP_NORM:
+            if raw_norm > clip_norm:
                 clip_count += 1
             opt.step()
 

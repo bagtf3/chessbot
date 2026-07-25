@@ -353,6 +353,7 @@ class Rescorer(object):
         self.training_data = []
         self.analyzed_results = []
         self.pending_metrics = []
+        self.pending_pred_samples = None
 
 
         self.start_time = None  # set on first game to exclude idle startup time
@@ -629,6 +630,7 @@ class Rescorer(object):
         with open(out_path, "wb") as f:
             pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+        self.pending_pred_samples = chunk
         self.training_data = remainder
         self.written_this_round += len(chunk)
         self.written_total += len(chunk)
@@ -1419,25 +1421,25 @@ class Rescorer(object):
         def col(val):
             return f"  {val:>{W}}  |"
 
-        def sample_row(label, sc):
-            acc = sc['accepted']
-            total = sc['total']
-            ratio = acc / total if total else 0.0
+        def enrich_row(label, sc):
             lc0_total = sc['lc0_blunder'] + sc['lc0_pv'] + sc['lc0_enrich']
-            all_tr = acc + sc['lc0_pv'] + sc['lc0_enrich']
-            enrich_pct = f"{lc0_total / all_tr * 100:.1f}%" if all_tr else "--"
+            total_tr  = sc['accepted'] + sc['lc0_pv'] + sc['lc0_enrich']
+            enrich_pct = f"{lc0_total / total_tr * 100:.1f}%" if total_tr else "--"
             return (f"{RS}  {label:<12} |"
-                    + col(f"{acc}/{total} ({ratio:.0%})")
-                    + col(f"lc0 {enrich_pct}"))
+                    + col(sc['lc0_blunder'])
+                    + col(sc['lc0_pv'])
+                    + col(sc['lc0_enrich'])
+                    + col(enrich_pct))
 
-        hdr = f"{RS}  {'':<12} |" + col("accepted") + col("lc0 enrich")
-        print(hdr)
-        print(sample_row("batch", self.sample_counts_window))
-        print(sample_row("total", self.sample_counts))
+        ehdr = (f"{RS}  {'enrich':<12} |"
+                + "".join(col(lbl) for lbl in ("blunder", "pv", "enrich", "lc0-%")))
+        print(ehdr)
+        print(enrich_row("batch", self.sample_counts_window))
+        print(enrich_row("total", self.sample_counts))
 
         if self.lc0_thread is not None:
             lst = self.lc0_thread.stats()
-            print(f"{RS}  lc0: {lst['samples']} flushed"
+            print(f"{RS}  lc0 output: {lst['samples']} flushed"
                   f"  {lst['inferences']} batches"
                   f"  {lst['pending']} pending")
 
@@ -1455,61 +1457,248 @@ class Rescorer(object):
             return
 
         with open(pred_pkl_path, 'rb') as f:
-            preds = pickle.load(f)  # list of (pred_wdl, true_wdl, source)
+            preds = pickle.load(f)  # list of (pred_wdl, pred_pol_logits)
+
+        samples = self.pending_pred_samples
+        self.pending_pred_samples = None
+
+        if not samples:
+            print("[metrics] no pending_pred_samples, skipping")
+            return
+
+        if len(samples) != len(preds):
+            print(f"[metrics] sample/pred count mismatch: {len(samples)} vs {len(preds)}, skipping")
+            return
 
         eps = 1e-7
-        xc0_pred, xc0_true = [], []
-        lc0_pred, lc0_true = [], []
+        groups = {'xc0_vs_true': {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': []},
+                  'xc0_vs_lc0':  {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': []}}
 
-        for pred_wdl, true_wdl, source in preds:
-            p = np.clip(np.array(pred_wdl, dtype=np.float64), eps, 1 - eps)
-            p /= p.sum()
-            t = np.array(true_wdl, dtype=np.float64)
-            if source == 'xc0':
-                xc0_pred.append(p)
-                xc0_true.append(t)
-            else:
-                lc0_pred.append(p)
-                lc0_true.append(t)
+        for (pred_wdl, pred_pol), sample in zip(preds, samples):
+            true_wdl = np.array(sample[3], dtype=np.float64)
+            true_pol = np.array(sample[2], dtype=np.float64)
+            source = sample[6] if len(sample) > 6 else 'xc0'
+            grp = 'xc0_vs_lc0' if source in ('lc0', 'lc0_pv') else 'xc0_vs_true'
+            g = groups[grp]
+            g['wdl_pred'].append(pred_wdl)
+            g['wdl_true'].append(true_wdl)
+            g['pol_pred'].append(pred_pol)
+            g['pol_true'].append(true_pol)
 
-        def wdl_block(pred_list, true_list):
-            if not pred_list:
-                return {}
-            p = np.array(pred_list, dtype=np.float64)
-            t = np.array(true_list, dtype=np.float64)
-            p = np.clip(p, eps, 1 - eps)
-            p /= p.sum(axis=1, keepdims=True)
-            ce = float(-np.mean(np.sum(t * np.log(p), axis=1)))
-            bias = np.mean(p - t, axis=0)
-            return {'ce': round(ce, 5), 'bias_w': round(float(bias[0]), 5),
-                    'bias_d': round(float(bias[1]), 5), 'bias_l': round(float(bias[2]), 5),
-                    'n': len(pred_list)}
+        def metrics_block(g):
+            if not g['wdl_pred']:
+                return None
+            pp = np.array(g['wdl_pred'], dtype=np.float64)
+            pt = np.array(g['wdl_true'], dtype=np.float64)
+            pp = np.clip(pp, eps, 1 - eps)
+            pp /= pp.sum(axis=1, keepdims=True)
 
-        xb = wdl_block(xc0_pred, xc0_true)
-        lb = wdl_block(lc0_pred, lc0_true)
+            # scalar value for correlation: expected score from WDL
+            pred_v = pp[:, 0] - pp[:, 2]
+            true_v = pt[:, 0] - pt[:, 2]
+            ce = float(-np.mean(np.sum(pt * np.log(pp), axis=1)))
+            mse = float(np.mean((pred_v - true_v) ** 2))
+            corr = float(np.corrcoef(pred_v, true_v)[0, 1]) if len(pred_v) > 1 else 0.0
+
+            logits = np.array(g['pol_pred'], dtype=np.float32)
+            true_p = np.array(g['pol_true'], dtype=np.float32)
+            logits_max = logits.max(axis=1, keepdims=True)
+            exp_l = np.exp(logits - logits_max)
+            pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
+
+            safe_t = np.clip(true_p, 1e-9, None)
+            n_moves = (true_p > 0).sum(axis=1, keepdims=True).clip(1)
+            uniform_ce = float(np.mean(np.log(n_moves.squeeze())))
+            pol_ce = float(-np.mean(np.sum(safe_t * np.log(np.clip(pred_probs, 1e-9, None)), axis=1)))
+            pol_ce_gain = uniform_ce - pol_ce
+
+            top1_true = np.argmax(true_p, axis=1)
+            top1_pred = np.argmax(pred_probs, axis=1)
+            top1_exact = float(np.mean(top1_true == top1_pred))
+
+            def topk_mass(k):
+                idx = np.argsort(true_p, axis=1)[:, -k:]
+                return float(np.mean(pred_probs[np.arange(len(pred_probs))[:, None], idx].sum(axis=1)))
+
+            return {
+                'ce': ce, 'mse': mse, 'corr': corr,
+                'pol_ce': pol_ce, 'uniform_ce': uniform_ce, 'pol_ce_gain': pol_ce_gain,
+                'top1_exact': top1_exact,
+                'top1_mass': topk_mass(1), 'top3_mass': topk_mass(3), 'top5_mass': topk_mass(5),
+                'n': len(g['wdl_pred']),
+            }
+
+        xb = metrics_block(groups['xc0_vs_true'])
+        lb = metrics_block(groups['xc0_vs_lc0'])
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
-        if xb:
-            print(f"{pfx} xc0_vs_true  CE={xb['ce']:.4f}  "
-                  f"bias W={xb['bias_w']:+.4f} D={xb['bias_d']:+.4f} L={xb['bias_l']:+.4f}"
-                  f"  n={xb['n']}")
-        if lb:
-            print(f"{pfx} xc0_vs_lc0   CE={lb['ce']:.4f}  "
-                  f"bias W={lb['bias_w']:+.4f} D={lb['bias_d']:+.4f} L={lb['bias_l']:+.4f}"
-                  f"  n={lb['n']}")
 
-        row = {'model_epoch': epoch}
-        for k, v in xb.items():
-            row[f'xc0_vs_true_{k}'] = v
-        for k, v in lb.items():
-            row[f'xc0_vs_lc0_{k}'] = v
-        row_df = pd.DataFrame([row])
-        if os.path.exists(progress_csv_path):
-            all_df = pd.concat([pd.read_csv(progress_csv_path), row_df], ignore_index=True)
-        else:
-            all_df = row_df
-        all_df.round(5).to_csv(progress_csv_path, index=False)
+        def print_wdl(label, b):
+            if not b:
+                return
+            print(f"{pfx} {label}  CE={b['ce']:.3f}  MSE={b['mse']:.3f}  "
+                  f"corr={b['corr']:.2f}  pol_CE_gain={b['pol_ce_gain']:.2f}  n={b['n']}")
+
+        def print_pol(label, b):
+            if not b:
+                return
+            print(f"{pfx} {label}  top1_exact={b['top1_exact']:.2f}  "
+                  f"mass: top1={b['top1_mass']:.2f}  top3={b['top3_mass']:.2f}  top5={b['top5_mass']:.2f}")
+
+        print_wdl('xc0_vs_true', xb)
+        print_wdl('xc0_vs_lc0 ', lb)
+        print_pol('xc0_vs_true', xb)
+        print_pol('xc0_vs_lc0 ', lb)
+
+        def save_csv(path, label, b):
+            if not b:
+                return
+            row = {'model_epoch': epoch}
+            for k, v in b.items():
+                row[f'{label}_{k}'] = round(v, 5)
+            row_df = pd.DataFrame([row])
+            if os.path.exists(path):
+                all_df = pd.concat([pd.read_csv(path), row_df], ignore_index=True)
+            else:
+                all_df = row_df
+            all_df.round(5).to_csv(path, index=False)
+
+        vs_true_col_map = {
+            'mse': 'value_mse', 'corr': 'value_corr', 'ce': 'value_ce',
+            'pol_ce': 'policy_ce', 'uniform_ce': 'uniform_ce', 'pol_ce_gain': 'ce_gain',
+            'top1_exact': 'top1_exact',
+            'top1_mass': 'top1_mass', 'top3_mass': 'top3_mass', 'top5_mass': 'top5_mass',
+            'n': 'n_samples',
+        }
+        if xb:
+            row = {'model_epoch': epoch}
+            for k, col in vs_true_col_map.items():
+                if k in xb:
+                    row[col] = round(xb[k], 5)
+            row_df = pd.DataFrame([row])
+            if os.path.exists(progress_csv_path):
+                all_df = pd.concat([pd.read_csv(progress_csv_path), row_df], ignore_index=True)
+            else:
+                all_df = row_df
+            all_df.round(5).to_csv(progress_csv_path, index=False)
+        lc0_csv = os.path.join(os.path.dirname(progress_csv_path), 'eval_progress_vs_lc0.csv')
+        save_csv(lc0_csv, 'xc0_vs_lc0', lb)
         print(f"{pfx} saved to {os.path.basename(progress_csv_path)}")
+
+        self.save_validation_plots(epoch, os.path.dirname(progress_csv_path), groups)
+
+    def save_validation_plots(self, epoch, run_dir, groups):
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        sqrt3_2 = np.sqrt(3) / 2
+        max_scatter = 5000
+        eps = 1e-9
+
+        def plot_group(g, label, out_path):
+            if not g['wdl_pred']:
+                return
+            pp = np.array(g['wdl_pred'], dtype=np.float64)
+            pt = np.array(g['wdl_true'], dtype=np.float64)
+            pp = np.clip(pp, eps, 1.0)
+            pp /= pp.sum(axis=1, keepdims=True)
+
+            pred_v = pp[:, 0] - pp[:, 2]
+            true_v = pt[:, 0] - pt[:, 2]
+            per_ce = -np.sum(pt * np.log(np.clip(pp, eps, 1.0)), axis=1)
+            mean_ce = float(np.mean(per_ce))
+            mse = float(np.mean((pred_v - true_v) ** 2))
+            corr = float(np.corrcoef(pred_v, true_v)[0, 1]) if len(pred_v) > 1 else 0.0
+            wdl_bias = np.mean(pp - pt, axis=0)
+            ce_comp = -np.mean(pt * np.log(np.clip(pp, eps, 1.0)), axis=0)
+
+            logits = np.array(g['pol_pred'], dtype=np.float32)
+            true_p = np.array(g['pol_true'], dtype=np.float32)
+            exp_l = np.exp(logits - logits.max(axis=1, keepdims=True))
+            pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
+
+            def topk_mass(k):
+                ki = np.argsort(true_p, axis=1)[:, -k:]
+                return float(np.mean(pred_probs[np.arange(len(pred_probs))[:, None], ki].sum(axis=1)))
+
+            n = len(pred_v)
+            idx = np.random.choice(n, min(max_scatter, n), replace=False)
+
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            fig.suptitle(f"Epoch {epoch}: {label}  n={n}", fontsize=12)
+
+            axes[0, 0].scatter(true_v[idx], pred_v[idx], s=4, alpha=0.3, c='steelblue')
+            axes[0, 0].set_xlabel("target value (W-L)")
+            axes[0, 0].set_ylabel("pred value (W-L)")
+            axes[0, 0].set_title(f"value scatter  MSE={mse:.3f}  r={corr:.3f}")
+
+            masses = [topk_mass(1), topk_mass(3), topk_mass(5)]
+            axes[0, 1].bar(['top1', 'top3', 'top5'], masses,
+                           color=['#4575b4', '#74add1', '#abd9e9'], width=0.5)
+            for i, v in enumerate(masses):
+                axes[0, 1].text(i, v + 0.005, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
+            axes[0, 1].set_ylim(0, 1.0)
+            axes[0, 1].set_title("policy top-k mass")
+
+            tx = 0.5 * pp[idx, 0] + pp[idx, 1]
+            ty = sqrt3_2 * pp[idx, 0]
+            axes[0, 2].plot([0.5, 1.0, 0.0, 0.5], [sqrt3_2, 0.0, 0.0, sqrt3_2], 'k-', lw=0.8)
+            sc = axes[0, 2].scatter(
+                tx, ty, s=4, alpha=0.4,
+                c=per_ce[idx], cmap='RdYlGn_r', vmin=0, vmax=2.0,
+            )
+            cbar = fig.colorbar(sc, ax=axes[0, 2], shrink=0.8)
+            thresholds = np.arange(0, 2.01, 0.25)
+            cdf_vals = [np.mean(per_ce <= t) for t in thresholds]
+            cbar.set_ticks(thresholds)
+            cbar.set_ticklabels([f'{t:.2f}  ({v:.2f})' for t, v in zip(thresholds, cdf_vals)])
+            axes[0, 2].text(0.5, sqrt3_2 + 0.03, 'W', ha='center', va='bottom', fontsize=9)
+            axes[0, 2].text(1.03, -0.03, 'D', ha='left', va='top', fontsize=9)
+            axes[0, 2].text(-0.03, -0.03, 'L', ha='right', va='top', fontsize=9)
+            axes[0, 2].set_aspect('equal')
+            axes[0, 2].axis('off')
+            axes[0, 2].set_title(f'WDL ternary  mean CE={mean_ce:.3f}')
+
+            wdl_labels = ['W', 'D', 'L']
+            wdl_colors = ['#3cb371', '#ffd700', '#ff8c00']
+            bias_vals = wdl_bias.tolist()
+            bias_colors = ['#d73027' if v > 0 else '#4575b4' for v in bias_vals]
+            bars = axes[1, 0].bar(wdl_labels, bias_vals, color=bias_colors, width=0.5)
+            axes[1, 0].axhline(0, color='black', lw=0.8)
+            axes[1, 0].set_ylabel('mean(pred - target)')
+            axes[1, 0].set_title('WDL bias (red=over, blue=under)')
+            for bar, v in zip(bars, bias_vals):
+                axes[1, 0].text(
+                    bar.get_x() + bar.get_width() / 2,
+                    v + (0.001 if v >= 0 else -0.003),
+                    f'{v:+.4f}', ha='center',
+                    va='bottom' if v >= 0 else 'top', fontsize=9,
+                )
+
+            ce_vals = ce_comp.tolist()
+            axes[1, 1].bar(wdl_labels, ce_vals, color=wdl_colors, width=0.5)
+            axes[1, 1].set_ylabel('mean CE contribution (nats)')
+            axes[1, 1].set_title(f'CE by component  total={mean_ce:.3f}')
+            for i, v in enumerate(ce_vals):
+                axes[1, 1].text(i, v + 0.002, f'{v:.4f}', ha='center', va='bottom', fontsize=9)
+
+            axes[1, 2].set_visible(False)
+
+            fig.tight_layout()
+            fig.savefig(out_path, dpi=120)
+            plt.close(fig)
+
+        plot_group(
+            groups['xc0_vs_true'],
+            'xc0_vs_true',
+            os.path.join(run_dir, 'validation_latest.png'),
+        )
+        plot_group(
+            groups['xc0_vs_lc0'],
+            'xc0_vs_lc0',
+            os.path.join(run_dir, 'validation_vs_lc0_latest.png'),
+        )
 
     def push_analyzed(self, report=True):
         # safeguard here
@@ -1998,11 +2187,13 @@ def encourage_best_move(visits, played_mv, best_mv, lms):
     return [[u, int(v)] for u, v in items]
 
 
-def launch_retrain_async(run_tag, rt_script, working_cfg, epoch=None):
+def launch_retrain_async(run_tag, rt_script, working_cfg, epoch=None, pred_pkl_path=None):
     cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
     cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
     if epoch is not None:
         cmd += ["--epoch", str(epoch)]
+    if pred_pkl_path is not None:
+        cmd += ["--pred-pkl-path", pred_pkl_path]
 
     print(f"[retrain] launching worker")
 

@@ -130,7 +130,7 @@ class GameLooper(object):
             self.model = sess
             self.infer = make_lc0_infer(sess)
     
-    def _run_training_predictions(self, msg):
+    def run_training_predictions(self, msg):
         import pickle, pathlib
         training_dir = msg.get("training_dir", "")
         pred_pkl_path = msg.get("pred_pkl_path", "")
@@ -156,10 +156,9 @@ class GameLooper(object):
             batch = np.stack(xs[i:i + batch_size], axis=0)
             probs_np, vals_np = self.infer((batch,))
             for j in range(len(probs_np)):
-                source = samples[i + j][6] if len(samples[i + j]) > 6 else 'xc0'
-                true_wdl = samples[i + j][3]
                 pred_wdl = tuple(float(v) for v in vals_np[j])
-                results.append((pred_wdl, true_wdl, source))
+                pred_pol = probs_np[j].tolist()
+                results.append((pred_wdl, pred_pol))
 
         try:
             with open(pred_pkl_path, "wb") as f:
@@ -189,7 +188,7 @@ class GameLooper(object):
                 return True
 
             if cmd == "predict_then_pause":
-                self._run_training_predictions(msg)
+                self.run_training_predictions(msg)
                 return True
 
             if cmd == "unpause":

@@ -13,6 +13,7 @@ import chessbot.utils as cbu
 VALIDATION_CONFIG_FILENAME = "validation_config.yaml"
 HISTORY_FILENAME = "validation_history.jsonl"
 V = "[validation]"
+DEFAULT_START_DEPTH = 10
 
 SF_TABLE_DEFAULT = [
   {"depth": 1,  "elo": 1575, "name": "SF17d1"},
@@ -41,7 +42,10 @@ SF_TABLE_DEFAULT = [
 def create_validation_config(cfg, yaml_file=None):
     vcfg = cfg.copy()
     vcfg.sf_table = SF_TABLE_DEFAULT
-    vcfg.sf_index = 0
+    vcfg.sf_index = next(
+        (i for i, row in enumerate(vcfg.sf_table) if row["depth"] >= DEFAULT_START_DEPTH),
+        len(vcfg.sf_table) - 1,
+    )
     vcfg.sf_depth = vcfg.sf_table[vcfg.sf_index]['depth']
     vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
     vcfg.consec_over_50 = 0

@@ -53,10 +53,10 @@ PT_ADAM_BETA2      = 0.999
 PT_SHUFFLE_BUFFER  = 384_000
 
 CHECKPOINT_EVERY  = 20
-DEFAULT_MODEL     = "16m-precond-smartgate-xc0h"
+DEFAULT_MODEL     = "18m-precond-smartgate-xc0h-6c4t"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
-DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_070526\shuffled"
+DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
 
 
 def find_last_checkpoint(run_dir: str, name: str) -> int:
-    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d{{4}})\.pt$")
+    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d+)\.pt$")
     best = -1
     try:
         for fname in os.listdir(run_dir):
@@ -81,7 +81,7 @@ def find_last_checkpoint(run_dir: str, name: str) -> int:
 
 
 def delete_old_checkpoints(run_dir: str, name: str, keep_epoch: int) -> None:
-    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d{{4}})\.pt$")
+    pat = re.compile(rf"^{re.escape(name)}_pt_ckpt(\d+)\.pt$")
     try:
         for fname in os.listdir(run_dir):
             m = pat.match(fname)

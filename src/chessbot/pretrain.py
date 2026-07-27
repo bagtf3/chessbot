@@ -211,7 +211,7 @@ def save_plot(
         return
     n    = len(eval_df)
     hide = max(int(0.1 * n), 5)
-    win  = min(max(3, int(n * 0.2)), 15)
+    win  = min(max(3, int(n * 0.2)), 50)
     if win % 2 == 0:
         win += 1
     xs_show = np.arange(n)[hide:]

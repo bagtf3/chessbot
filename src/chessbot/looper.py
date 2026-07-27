@@ -197,6 +197,7 @@ class GameLooper(object):
 
             if cmd == "drain_and_stop":
                 self.stop_at_empty = True
+                self.active_games = self.active_games[:self.config.games_at_once]
                 continue
 
             continue
@@ -244,10 +245,11 @@ class GameLooper(object):
         self.n_retrains += 1
 
     def pull_from_queue(self):
+        if self.stop_at_empty:
+            return
         from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
         # keep draining until full or both queues empty
-        # stop_at_empty means no refill after empty
         while len(self.active_games) < games_at_once:
             spec = None
             if self.sf_queue is not None:

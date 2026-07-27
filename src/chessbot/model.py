@@ -44,6 +44,10 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, dropout=0.03,
         pre_blocks=4, xc0h_K=6,
     ),
+    "18m-precond-smartgate-xc0h-6c4t": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=6, tx_blocks=4, xc0h_K=6,
+    ),
     "hybrid-conv-attn": dict(
         hybrid_conv_attn=True,
         n_trunk_blocks=6, trunk_dim=1024, dropout=0.02,
@@ -1076,11 +1080,13 @@ def build_pt_precond_smartgate(cfg: dict):
     import torch.nn.functional as F
     import pyfastchess
 
-    CF  = cfg["conv_filters"]   # 256
-    D   = CF * 2                # 512
+    CF      = cfg["conv_filters"]   # 256
+    add_pos = bool(cfg.get("add_pos", False))
+    D       = CF if add_pos else CF * 2   # 256 if pos is added, else 512 (pos concatenated)
     nh  = cfg["num_heads"]      # 8
     dr  = cfg["dropout"]
-    pb  = cfg["pre_blocks"]     # 4
+    interleave_n = cfg.get("interleave_n")   # if set: N x (1 MHA block, 2 conv blocks)
+    pb  = 0 if interleave_n else cfg["pre_blocks"]     # 4
     PDH = 256
     lc0_input = bool(cfg.get("lc0_input", False))
     XC0H_K    = cfg.get("xc0h_K")      # None -> not xc0h; presence of K IS the flag
@@ -1194,8 +1200,16 @@ def build_pt_precond_smartgate(cfg: dict):
 
             self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
 
-            ff_dims = [768, 1024, 1024, 768]
-            self.blocks   = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
+            if interleave_n:
+                ff_dims = [768] + [1024] * (interleave_n - 2) + [768] \
+                    if interleave_n >= 2 else [768] * interleave_n
+                self.interleave_tx   = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
+                self.interleave_conv = nn.ModuleList(
+                    [ConvBlock(prenorm=True) for _ in range(2 * interleave_n)])
+            else:
+                tx_blocks = cfg.get("tx_blocks", 4)
+                ff_dims   = [768] + [1024] * (tx_blocks - 2) + [768]
+                self.blocks = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
             self.trunk_ln = nn.LayerNorm(D)
 
             self.wdl_w1 = nn.Linear(D, D // 2, bias=False)
@@ -1269,10 +1283,20 @@ def build_pt_precond_smartgate(cfg: dict):
                 x = blk(x)
             seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
             pos = self.pos(torch.arange(SEQ_LEN, device=x_in.device)).unsqueeze(0).expand(B, -1, -1)
-            x = torch.cat([seq, pos], dim=-1)                                   # [B, 64, D]
+            x = (seq + pos) if add_pos else torch.cat([seq, pos], dim=-1)          # [B, 64, D]
             x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)    # [B, 72, D]
-            for blk in self.blocks:
-                x = blk(x)
+            if interleave_n:
+                for i, tx in enumerate(self.interleave_tx):
+                    x = tx(x)
+                    board, glob = x[:, :SEQ_LEN], x[:, SEQ_LEN:]
+                    board = board.reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+                    board = self.interleave_conv[2 * i](board)
+                    board = self.interleave_conv[2 * i + 1](board)
+                    board = board.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF)
+                    x = torch.cat([board, glob], dim=1)
+            else:
+                for blk in self.blocks:
+                    x = blk(x)
             x = self.trunk_ln(x)                                                # [B, 72, D]
 
             wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))               # [B, 3]
@@ -1462,9 +1486,13 @@ def build_pt_conv_shallow_mha(cfg: dict):
 
 
 def build_pt_conv_pure(cfg: dict):
-    """12x ConvBlock(256) channels-first (NCHW) backbone -> trunk_ln.
+    """N x ConvBlock(conv_filters) channels-first (NCHW) backbone -> trunk_ln,
+    N = cfg["num_blocks"] (currently 16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
     WDL:       Conv(256,8) -> leaky_relu -> reshape [B,512] -> GELU -> Linear(512,3).
-    SmartGate: avg_pool -> Linear(256,16) -> SwiGLU(16,768,16) -> RMSNorm -> Linear(16,1858).
+    SmartGate: Conv(256,16,3x3) -> leaky_relu -> reshape [B,1024] -> Linear(1024,512)
+               -> GELU -> LayerNorm(512) -> SwiGLU(512,768,512) -> RMSNorm -> Linear(512,1858),
+               same D=512 SwiGLU/RMSNorm/gate_out shape and zero-init/bias=4.0 convention
+               as the precond-smartgate family's gate.
     Policy:    board tokens [B,64,256] -> from/to MHA at PDH=256 -> bilinear -> smartgate -> 1858.
     """
     import math
@@ -1473,11 +1501,12 @@ def build_pt_conv_pure(cfg: dict):
     import torch.nn.functional as F
     import pyfastchess
 
-    D      = cfg["conv_filters"]   # 128
-    nb     = cfg["num_blocks"]     # 12
-    dr     = cfg["dropout"]
-    PDH    = D                     # 128
-    GATE_H = 768
+    D       = cfg["conv_filters"]   # 128
+    nb      = cfg["num_blocks"]
+    dr      = cfg["dropout"]
+    PDH     = D                     # 128
+    GATE_D  = 512
+    GATE_H  = GATE_D * 3 // 2
 
     sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
@@ -1509,15 +1538,17 @@ def build_pt_conv_pure(cfg: dict):
             self.wdl_conv = nn.Conv2d(D, 8, 1, bias=False)
             self.wdl_out  = nn.Linear(512, 3, bias=False)
 
-            self.gate_pool   = nn.AdaptiveAvgPool2d(1)
-            self.gate_down   = nn.Linear(D, 16, bias=False)
-            self.gate_w_gate = nn.Linear(16, GATE_H, bias=False)
-            self.gate_w_up   = nn.Linear(16, GATE_H, bias=False)
-            self.gate_w_down = nn.Linear(GATE_H, 16, bias=False)
+            self.gate_conv    = nn.Conv2d(D, 16, 3, padding=1, bias=False)   # [B,16,8,8]
+            self.gate_proj    = nn.Linear(16 * 64, GATE_D)                    # 1024 -> 512
+            self.gate_proj_ln = nn.LayerNorm(GATE_D)
+
+            self.gate_w_gate = nn.Linear(GATE_D, GATE_H, bias=False)
+            self.gate_w_up   = nn.Linear(GATE_D, GATE_H, bias=False)
+            self.gate_w_down = nn.Linear(GATE_H, GATE_D, bias=False)
             self.gate_drop   = nn.Dropout(dr)
             nn.init.zeros_(self.gate_w_down.weight)
-            self.gate_norm = RMSNorm(16)
-            self.gate_out  = nn.Linear(16, 1858, bias=True)
+            self.gate_norm = RMSNorm(GATE_D)
+            self.gate_out  = nn.Linear(GATE_D, 1858, bias=True)
             nn.init.zeros_(self.gate_out.weight)
             nn.init.constant_(self.gate_out.bias, 4.0)
 
@@ -1547,8 +1578,9 @@ def build_pt_conv_pure(cfg: dict):
             wdl_h = F.leaky_relu(self.wdl_conv(trunk), 0.01).reshape(B, 512)
             wdl   = self.wdl_out(F.gelu(wdl_h))                                # [B, 3]
 
-            gi       = self.gate_down(self.gate_pool(trunk).reshape(B, D))     # [B, 16]
-            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            gc = F.leaky_relu(self.gate_conv(trunk), 0.01).reshape(B, 16 * 64)  # [B, 1024]
+            gi = self.gate_proj_ln(F.gelu(self.gate_proj(gc)))                  # [B, 512]
+            h  = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
             g        = gi + self.gate_drop(self.gate_w_down(h))
             gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
 
@@ -1727,6 +1759,7 @@ PT_BUILDERS: dict[str, object] = {
     "16m-precond-smartgate":                build_pt_precond_smartgate,
     "16m-precond-smartgate-lc0":            build_pt_precond_smartgate,
     "16m-precond-smartgate-xc0h":           build_pt_precond_smartgate,
+    "18m-precond-smartgate-xc0h-6c4t":      build_pt_precond_smartgate,
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "hybrid-conv-attn":          build_pt_hybrid_conv_attn,

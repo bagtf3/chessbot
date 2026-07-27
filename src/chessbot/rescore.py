@@ -243,6 +243,8 @@ class Rescorer(object):
         self.total_kl_plies = 0.0
         self.total_ce_plies = 0.0
         self.total_plies = 0
+        self.total_kl_valid_plies = 0.0
+        self.total_ce_valid_plies = 0.0
 
         self.n_sf_submitted = 0
         self.sf_compute_time = 0.0
@@ -256,6 +258,8 @@ class Rescorer(object):
         self.last_10_kls = []
         self.last_10_ces = []
         self.last_10_plies = []
+        self.last_10_kl_plies = []
+        self.last_10_ce_plies = []
 
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
@@ -284,8 +288,8 @@ class Rescorer(object):
         self.tscale_best_T = 0.0
         self.tscale_time = 0.0
 
-        self.kl_q50 = 0.3  # online-tracked EMA median of eligible-ply KL; hardcoded seed
-        self.kl_q80 = 1.0  # online-tracked EMA 80th percentile of eligible-ply KL; hardcoded seed
+        self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL; hardcoded seed
+        self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL; hardcoded seed
 
         self.intake = deque()
         self.pending = {}
@@ -331,6 +335,8 @@ class Rescorer(object):
             'total_kl_plies': self.total_kl_plies,
             'total_ce_plies': self.total_ce_plies,
             'total_plies': self.total_plies,
+            'total_kl_valid_plies': self.total_kl_valid_plies,
+            'total_ce_valid_plies': self.total_ce_valid_plies,
             'n_sf_submitted': self.n_sf_submitted,
             'sf_compute_time': self.sf_compute_time,
             'sf_compute_count': self.sf_compute_count,
@@ -341,6 +347,8 @@ class Rescorer(object):
             'last_10_kls': self.last_10_kls,
             'last_10_ces': self.last_10_ces,
             'last_10_plies': self.last_10_plies,
+            'last_10_kl_plies': self.last_10_kl_plies,
+            'last_10_ce_plies': self.last_10_ce_plies,
             'collar_total': self.collar_total,
             'collar_window': self.collar_window,
             'collar_history': self.collar_history,
@@ -1526,32 +1534,54 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b, kl, ce, plies = save_analysis_chunk_simple(run_dir, self.analyzed_results)
+        outp, c, b, kl, ce, plies, kl_n, ce_n = save_analysis_chunk_simple(
+            run_dir, self.analyzed_results)
         self.n_saved += 1
         self.total_cpl_plies += c * plies
         self.total_bmr_plies += b * plies
-        self.total_kl_plies  += kl * plies
-        self.total_ce_plies  += ce * plies
         self.total_plies += plies
+        # kl/ce are undefined (NaN) for batches with no trainable plies
+        # (e.g. all-validation rounds) -- weight/accumulate by valid plies
+        # only, so they don't poison the running totals with NaN.
+        if kl_n:
+            self.total_kl_plies += kl * kl_n
+            self.total_kl_valid_plies += kl_n
+        if ce_n:
+            self.total_ce_plies += ce * ce_n
+            self.total_ce_valid_plies += ce_n
 
         self.last_10_cpls.append(c)
         self.last_10_cpls = self.last_10_cpls[-10:]
         self.last_10_bmrs.append(b)
         self.last_10_bmrs = self.last_10_bmrs[-10:]
-        self.last_10_kls.append(kl)
-        self.last_10_kls = self.last_10_kls[-10:]
-        self.last_10_ces.append(ce)
-        self.last_10_ces = self.last_10_ces[-10:]
         self.last_10_plies.append(plies)
         self.last_10_plies = self.last_10_plies[-10:]
+        if kl_n:
+            self.last_10_kls.append(kl)
+            self.last_10_kls = self.last_10_kls[-10:]
+            self.last_10_kl_plies.append(kl_n)
+            self.last_10_kl_plies = self.last_10_kl_plies[-10:]
+        if ce_n:
+            self.last_10_ces.append(ce)
+            self.last_10_ces = self.last_10_ces[-10:]
+            self.last_10_ce_plies.append(ce_n)
+            self.last_10_ce_plies = self.last_10_ce_plies[-10:]
 
         if report:
             if len(self.last_10_cpls) >= 10:
                 w = np.array(self.last_10_plies, dtype=np.float64)
                 last_10_avg_c = np.dot(self.last_10_cpls, w) / w.sum()
                 last_10_avg_b = np.dot(self.last_10_bmrs, w) / w.sum()
-                last_10_avg_kl = np.dot(self.last_10_kls, w) / w.sum()
-                last_10_avg_ce = np.dot(self.last_10_ces, w) / w.sum()
+                if self.last_10_kls:
+                    wk = np.array(self.last_10_kl_plies, dtype=np.float64)
+                    last_10_avg_kl = np.dot(self.last_10_kls, wk) / wk.sum()
+                else:
+                    last_10_avg_kl = float('nan')
+                if self.last_10_ces:
+                    wc = np.array(self.last_10_ce_plies, dtype=np.float64)
+                    last_10_avg_ce = np.dot(self.last_10_ces, wc) / wc.sum()
+                else:
+                    last_10_avg_ce = float('nan')
                 print(fmt_rescore_stats(
                     "Last 10 avg:", last_10_avg_c, last_10_avg_b,
                     last_10_avg_ce, last_10_avg_kl))
@@ -1559,8 +1589,10 @@ class Rescorer(object):
             if self.n_saved >= 2:
                 cpl_mean = self.total_cpl_plies / self.total_plies
                 bmr_mean = self.total_bmr_plies / self.total_plies
-                kl_mean  = self.total_kl_plies  / self.total_plies
-                ce_mean  = self.total_ce_plies  / self.total_plies
+                kl_mean = (self.total_kl_plies / self.total_kl_valid_plies
+                           if self.total_kl_valid_plies else float('nan'))
+                ce_mean = (self.total_ce_plies / self.total_ce_valid_plies
+                           if self.total_ce_valid_plies else float('nan'))
                 print(fmt_rescore_stats("Overall stats:", cpl_mean, bmr_mean, ce_mean, kl_mean))
 
             W = 10
@@ -2002,6 +2034,8 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
+    kl_n = int(df_all.kl.notna().sum())
+    ce_n = int(df_all.ce.notna().sum())
     kl  = df_all.kl.mean()
     ce  = df_all.ce.mean()
     plies = len(df_all)
@@ -2015,7 +2049,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr, kl, ce, plies
+    return outp, cpl, bmr, kl, ce, plies, kl_n, ce_n
 
 
 def make_fake_visits(mv, lms, ratio_best=60):

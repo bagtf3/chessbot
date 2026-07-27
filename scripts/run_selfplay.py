@@ -30,6 +30,7 @@ import queue
 STOP_REQUESTED = threading.Event()
 STOP_AFTER_ROUND_REQUESTED = threading.Event()
 NEXT_ROUND_REQUESTED = threading.Event()
+NO_NEW_GAMES_REQUESTED = threading.Event()
 RELOAD_REQUESTED = threading.Event()
 PAUSE_REQUESTED = threading.Event()
 UNPAUSE_REQUESTED = threading.Event()
@@ -68,6 +69,9 @@ def stdin_listener():
         elif cmd == 'next round':
             print("[cmd] next round requested")
             NEXT_ROUND_REQUESTED.set()
+        elif cmd == 'no new games':
+            print("[cmd] no new games -- draining current games, round ends normally")
+            NO_NEW_GAMES_REQUESTED.set()
         elif cmd == 'reload':
             print("[cmd] reload queued -- applies at next round start")
             RELOAD_REQUESTED.set()
@@ -367,6 +371,7 @@ def pull_pkl(to_process):
 
 
 def main(run_tag):
+    global Config
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 
@@ -436,7 +441,6 @@ def main(run_tag):
 
             if RELOAD_REQUESTED.is_set():
                 RELOAD_REQUESTED.clear()
-                global Config
                 import importlib
                 import chessbot.config
                 import chessbot.rescore
@@ -514,6 +518,19 @@ def main(run_tag):
                         stop_signal_sent = True
                     print("[cmd] draining workers for next round")
                     break
+
+                if NO_NEW_GAMES_REQUESTED.is_set():
+                    NO_NEW_GAMES_REQUESTED.clear()
+                    if not stop_signal_sent:
+                        for w in procs:
+                            w["msg_q"].put("drain_and_stop")
+                        stop_signal_sent = True
+                        dropped = len(drain_queue(game_queue))
+                        if sf_queue is not None:
+                            dropped += len(drain_queue(sf_queue))
+                        print(f"[cmd] no new games -- workers draining, "
+                              f"dropped {dropped} queued-but-unplayed games, "
+                              f"queues frozen for rest of round")
 
                 if PAUSE_REQUESTED.is_set():
                     PAUSE_REQUESTED.clear()

@@ -56,9 +56,8 @@ DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_07182
 # ]
 
 RUN_TAGS = [
-    "cfiw_pretrained_run5",
     "16m_deep_pretrain_run3", "16m_deep_pretrain_run2", "16m_deep_pretrain_run1",
-    "cfiw_pretrained_run7", "cfiw_pretrained_run6",
+    "cfiw_pretrained_run5", "cfiw_pretrained_run6", "cfiw_pretrained_run7",
 ]
 
 TARGET_PER_SOURCE = 20_000_000
@@ -72,6 +71,10 @@ GAME_CPL_MAX     = 20
 MOVE_CPL_MAX     = 10
 K                = 6
 
+COLLAR_THRESHOLD_CP     = 350
+COLLAR_N_CONSEC         = 7
+COLLAR_REVERSAL_N_CONSEC = 3
+
 TSCALE_TARGET    = 0.7
 TSCALE_MARGIN    = 0.05
 TSCALE_MAX_ITERS = 5
@@ -81,12 +84,33 @@ TSCALE_HI        = 1.0
 SKIP_SCENARIOS     = {"blunder_replay"}
 NO_WARM_SCENARIOS  = {"startpos", "piece_odds", "piece_training"}
 LC0_FULL_SCENARIOS = {"paired_validation", "UHO"}
-LC0_DISTILL_BATCH  = 128
+LC0_DISTILL_BATCH  = 64  # must match cfg.lc0_distill_batch_size used at selfplay time --
+                         # TRT's cache key bakes in opt/max profile shapes, so a mismatched
+                         # batch size here silently forces a full recompile every run
 
 SL_IDX   = np.nonzero(pf.build_sometimes_legal_mask().astype(bool))[0]
 N_1858   = len(SL_IDX)
 OPTIONS  = tf.io.TFRecordOptions(compression_type="GZIP")
 V6_STRUC = struct.Struct(V6_STRUCT_STRING)
+
+
+def resume_shard_id(out_dir, prefix):
+    """Next shard_id to write for this prefix, so reruns append instead of
+    overwriting whatever's already in out_dir (same approach shuffle_xc0.py
+    uses for its own shard files)."""
+    marker = prefix + "_"
+    existing = [f for f in os.listdir(out_dir)
+                if f.startswith(marker) and f.endswith(".tfrecord.gz")]
+    if not existing:
+        return 0
+    nums = []
+    for name in existing:
+        stem = name[:-len(".tfrecord.gz")]
+        try:
+            nums.append(int(stem.rsplit("_", 1)[-1]))
+        except ValueError:
+            pass
+    return max(nums) + 1 if nums else 0
 
 
 def bytes_feature(b):
@@ -267,7 +291,13 @@ def lc0_worker(name, chunks, out_dir, target, shared_total, stop_evt, log_q, pre
 # xc0 source
 # ---------------------------------------------------------------------------
 
+_first_disk_read = [True]
+
+
 def load_log(path):
+    if _first_disk_read[0]:
+        _first_disk_read[0] = False
+        print(f"[disk] first game read from disk at {time.strftime('%H:%M:%S')}", flush=True)
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rb") as f:
         return pickle.load(f)
@@ -278,24 +308,77 @@ def load_xc0_games(rt):
     analyze_path = os.path.join(rd, ANALYZE_PKL)
     if not os.path.exists(analyze_path):
         print(f"[xc0] {rt}: no analyze pkl, skipping", flush=True)
-        return [], {}, set()
+        return [], {}
 
     games = [g for g in load_game_index(rd) if isinstance(g.get("pkl_file"), str)]
 
     with open(analyze_path, "rb") as fh:
         prev = pickle.load(fh)
     df_all = prev["df_all"]
-    df_all = df_all.copy()
-    df_all["clipped_loss"] = np.clip(df_all["loss"], -1000, 1000)
-    grouped = df_all.groupby("game_id", sort=False)
-    game_cpl = grouped["clipped_loss"].mean()
-    good_gids = set(game_cpl[game_cpl <= GAME_CPL_MAX].index)
-
-    sf_by_gid = {gid: sub for gid, sub in grouped}
+    sf_by_gid = {gid: sub for gid, sub in df_all.groupby("game_id", sort=False)}
 
     random.shuffle(games)
-    print(f"[xc0] {rt}: {len(games):,} games  ({len(good_gids):,} xc0-eligible)", flush=True)
-    return games, sf_by_gid, good_gids
+    print(f"[xc0] {rt}: {len(games):,} games", flush=True)
+    return games, sf_by_gid
+
+
+def game_cpl_mean(sf_df):
+    if sf_df is None or not len(sf_df):
+        return None
+    return float(np.clip(sf_df["loss"], -1000, 1000).mean())
+
+
+def collar_is_noisy(sf_df, result):
+    """Detect a decisive-then-reversed swing: one side sustains a >350cp edge
+    for 7+ consecutive plies, then either doesn't win the game or gives the
+    edge back (crosses to a losing eval for that side) for 3+ straight plies."""
+    if sf_df is None or not len(sf_df) or "best_absolute" not in sf_df.columns:
+        return False
+
+    evals = sf_df.sort_values("move_num")["best_absolute"].to_numpy()
+
+    holder      = None
+    holder_start = None
+    run_sign    = 0
+    run_count   = 0
+
+    for i, ev in enumerate(evals):
+        if ev > COLLAR_THRESHOLD_CP:
+            sign = 1
+        elif ev < -COLLAR_THRESHOLD_CP:
+            sign = -1
+        else:
+            sign = 0
+
+        if sign != 0 and sign == run_sign:
+            run_count += 1
+        elif sign != 0:
+            run_sign, run_count = sign, 1
+        else:
+            run_sign, run_count = 0, 0
+
+        if run_count >= COLLAR_N_CONSEC:
+            holder, holder_start = ('white' if run_sign == 1 else 'black'), i
+            break
+
+    if holder is None:
+        return False
+
+    holder_result = 1.0 if holder == 'white' else -1.0
+    if float(result) != holder_result:
+        return True
+
+    below_count = 0
+    for ev in evals[holder_start:]:
+        holder_pov = ev if holder == 'white' else -ev
+        if holder_pov < 0:
+            below_count += 1
+            if below_count >= COLLAR_REVERSAL_N_CONSEC:
+                return True
+        else:
+            below_count = 0
+
+    return False
 
 
 def align_sf(moves, sf_rows):
@@ -430,23 +513,46 @@ def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc
             yield ('lc0d', xc0h, lc0_pol, lc0_wdl)
 
 
-def xc0_stream(run_tag, stop_evt, games, sf_by_gid, good_gids, has_wdl, lc0_batcher=None):
+def xc0_stream(run_tag, stop_evt, games, sf_by_gid, has_wdl,
+              cpl_hard_skip=None, use_collar_gate=False, lc0_batcher=None, stats=None):
+    if stats is None:
+        stats = {}
+    stats.update(games_hard_skipped=0, games_collar_skipped=0, games_accepted=0,
+                xc0_pos=0, lc0d_pos=0)
+
     seen = {}
     for game in games:
         if stop_evt.is_set():
             return
-        xc0_eligible = game["game_id"] in good_gids
+        if game.get("scenario") in SKIP_SCENARIOS:
+            continue
+        sf_df    = sf_by_gid.get(game["game_id"])
+        game_cpl = game_cpl_mean(sf_df)
+
+        if cpl_hard_skip is not None and game_cpl is not None and game_cpl > cpl_hard_skip:
+            stats['games_hard_skipped'] += 1
+            continue
+
+        if use_collar_gate and collar_is_noisy(sf_df, game.get("result", 0)):
+            stats['games_collar_skipped'] += 1
+            continue
+
+        xc0_eligible = game_cpl is not None and game_cpl <= GAME_CPL_MAX
         if not xc0_eligible and lc0_batcher is None:
             continue
-        sf_df = sf_by_gid.get(game["game_id"])
-        yield from iter_xc0_game(game, sf_df, run_tag, has_wdl, seen, lc0_batcher, xc0_eligible)
+
+        stats['games_accepted'] += 1
+        for item in iter_xc0_game(game, sf_df, run_tag, has_wdl, seen, lc0_batcher, xc0_eligible):
+            stats['xc0_pos' if item[0] == 'xc0' else 'lc0d_pos'] += 1
+            yield item
 
 
-def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q, prefix):
+def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr,
+              cpl_hard_skip, use_collar_gate, stop_evt, log_q, prefix):
     os.makedirs(out_dir, exist_ok=True)
 
     # resolved once at worker startup, never re-checked in the per-position loop
-    games, sf_by_gid, good_gids = load_xc0_games(run_tag)
+    games, sf_by_gid = load_xc0_games(run_tag)
     has_wdl = detect_has_wdl(games)
     print(f"[{name}] {run_tag}: detected {'WDL' if has_wdl else 'scalar-Q'} value head "
           f"-- {'native best_wdl' if has_wdl else 'naive Q_stm mapping'} will be used", flush=True)
@@ -466,9 +572,18 @@ def xc0_worker(name, run_tag, out_dir, target, shared_total, lc0d_ctr, stop_evt,
         lc0_batcher = Lc0Batcher(sess, batch_size=LC0_DISTILL_BATCH)
         print(f"[{name}] Lc0Batcher: TRT batch_size={LC0_DISTILL_BATCH}", flush=True)
 
-    run_source_dual(name, xc0_stream(run_tag, stop_evt, games, sf_by_gid, good_gids, has_wdl, lc0_batcher),
+    stats   = {}
+    xc0_gen = xc0_stream(run_tag, stop_evt, games, sf_by_gid, has_wdl,
+                        cpl_hard_skip, use_collar_gate, lc0_batcher, stats)
+    run_source_dual(name, xc0_gen,
                     out_dir, target, shared_total, lc0d_ctr, stop_evt, log_q,
                     xc0_prefix=prefix, lc0d_prefix=f"lc0d_{name}")
+
+    print(f"[{name}] {run_tag} summary  "
+          f"xc0_pos={stats.get('xc0_pos', 0):,}  lc0d_pos={stats.get('lc0d_pos', 0):,}  "
+          f"games_accepted={stats.get('games_accepted', 0):,}  "
+          f"hard_skipped={stats.get('games_hard_skipped', 0):,}  "
+          f"collar_skipped={stats.get('games_collar_skipped', 0):,}", flush=True)
     os._exit(0)
 
 
@@ -485,7 +600,7 @@ def run_source_dual(name, record_gen, out_dir, target, shared_total, lc0d_ctr, s
     stats   = {"xc0_shards": 0, "lc0d_shards": 0}
 
     def writer_fn(wq, prefix, shard_key):
-        shard_id = 0
+        shard_id = resume_shard_id(out_dir, prefix)
         while True:
             records = wq.get()
             if records is None:
@@ -506,6 +621,7 @@ def run_source_dual(name, record_gen, out_dir, target, shared_total, lc0d_ctr, s
     xc0_buf     = []
     lc0d_buf    = []
     total       = 0
+    total_all   = 0
     last_report = 0
     reason      = "source_exhausted"
 
@@ -513,6 +629,7 @@ def run_source_dual(name, record_gen, out_dir, target, shared_total, lc0d_ctr, s
         if stop_evt.is_set():
             reason = "stopped_by_peer"
             break
+        total_all += 1
         if kind == 'xc0':
             xc0_buf.append((xc0h, pol, wdl))
             total += 1
@@ -540,8 +657,8 @@ def run_source_dual(name, record_gen, out_dir, target, shared_total, lc0d_ctr, s
                 reason = "target_reached"
                 stop_evt.set()
                 break
-        if total - last_report >= 100_000:
-            last_report = total
+        if total_all - last_report >= 100_000:
+            last_report = total_all
             log_q.put({"name": name, "kind": "progress"})
 
     for buf, wq in [(xc0_buf, xc0_wq), (lc0d_buf, lc0d_wq)]:
@@ -563,7 +680,7 @@ def run_source(name, record_gen, out_dir, target, shared_total, stop_evt, log_q,
     stats   = {"shards": 0}
 
     def writer_fn():
-        shard_id = 0
+        shard_id = resume_shard_id(out_dir, prefix)
         while True:
             records = write_q.get()
             if records is None:
@@ -629,6 +746,13 @@ def main():
                     help="total concurrent workers of any type")
     ap.add_argument("--xc0-only",  action="store_true",
                     help="skip the raw lc0 V6-chunk source entirely; only process xc0 selfplay runs")
+    ap.add_argument("--cpl-hard-skip", type=float, default=None,
+                    help="hard-skip a game entirely (xc0 and lc0d both) if its mean clipped "
+                         "CPL exceeds this value")
+    ap.add_argument("--use-collar-gate", action="store_true",
+                    help="hard-skip a game entirely if a >350cp edge held for 7+ plies is "
+                         "either not converted into a win or gives back to a losing eval "
+                         "for 3+ consecutive plies")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -697,7 +821,7 @@ def main():
             ctr    = lc0_ctr if kind == "lc0" else xc0_ctr
             tgt    = args.lc0_target if kind == "lc0" else args.xc0_target
             fn     = lc0_worker if kind == "lc0" else xc0_worker
-            extra  = () if kind == "lc0" else (lc0d_ctr,)
+            extra  = () if kind == "lc0" else (lc0d_ctr, args.cpl_hard_skip, args.use_collar_gate)
             p = ctx.Process(target=fn,
                             args=(name, item, args.out_dir, tgt,
                                   ctr, *extra, stop, log_q, f"{kind}_{i}"))

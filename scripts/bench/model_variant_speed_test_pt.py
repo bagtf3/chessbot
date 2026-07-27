@@ -4,27 +4,29 @@
 Conv-backbone speed tests for chess policy+value models.
 
 Models:
-  Conv+MHA+GEMM+SmartGate -- channels-first conv encoder -> pos-cat -> 2x self-attn over 64
-                              -> cross-attn accumulators (main 6x256->1536, gate 2x256->512)
-                              -> 1536-d GEMM trunk (alt GELU/SwiGLU), WDL@4,
-                                 quality policy + smartgate logsigmoid, 1858->scatter 4288
-  13m-precond-conformer    -- 4x Conv(256) preconditioner -> concat pos(256) -> 512-d
-                              -> 4x [prenorm-MHA(heads=8) -> FF(512)] with varying ff_dims
-                              -> MHA policy + attn-pool value heads
-  13m-precond-conformer-v2 -- same preconditioner; 8 specialized global accumulators
-                              (WDL/gate/from-spec/to-spec/shared) -> 4x transformer blocks
-                              -> shared trunk_ln -> WDL(0) + SmartGate(1) + from/to policy(2-7)
-  full-mha-smartgate        -- no conv; emb(256)+pos(256)->512 -> append 8 accum tokens
-                              -> 8x full MHA transformer blocks -> same WDL/SmartGate/
-                                 from-to-policy heads as 16m-precond-smartgate
+  16m-precond-smartgate-xc0h-K6      -- prod: 4x Conv(256) preconditioner -> concat pos(256)
+                                         -> 512-d -> 8 global accumulators -> 4x transformer
+                                         blocks -> shared trunk_ln -> WDL(0) + SmartGate(1)
+                                         + from/to policy(2-7)
+  16m-precond-smartgate-xc0h-K6-5c5t -- same, with 5 conv preconditioner blocks and
+                                         5 transformer blocks instead of 4+4
+  18m-precond-smartgate-xc0h-K6-6c4t -- same stem; 6 conv preconditioner blocks, 4
+                                        transformer blocks (unchanged), pos concatenated
+                                        (CF=256 -> D=512, same as prod)
+  16m-precond-smartgate-xc0h-K6-cfiw -- same stem; pos added once up front (CF=256,
+                                        d_model stays 256); 5x interleaved blocks, each
+                                        1 MHA block (over board+global, 72 tokens) then
+                                        2 conv blocks (over the 64 board tokens reshaped
+                                        to 8x8, global tokens excluded from conv)
+  conv-pure                          -- 16x ConvBlock(256) NCHW -> trunk_ln -> WDL conv(8)
+                                         -> SmartGate conv(16,3x3)->1024->512 SwiGLU/RMSNorm
+                                         -> policy 2xLinear->256->MHA(256)
 
 Flags:
   --dry-run              Build models, print param counts, skip speed test
   --skip-trt             Skip ORT+TensorRT
-  --skip-hybrid          Skip Conv+MHA+GEMM+SmartGate model
+  --skip-convpure        Skip conv-pure model
   --batch-sizes    Space-separated list (default: 1 2 4 8 16 32 64 128 256 512)
-  --trunk-blocks   GEMM trunk blocks for Conv+MHA (default: 6)
-  --dropout        Dropout (default: 0.02)
 """
 
 import os
@@ -52,212 +54,26 @@ CSV_RESULTS  = os.path.join(TRT_CACHE, "speed_results.csv")
 
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
-PRECOND_CFG = dict(
-    precond_conformer=True,
-    conv_filters=256, num_heads=8, dropout=0.05,
-    pre_blocks=4, mha_blocks=4,
-)
-
-LC0_CFG = dict(
-    conv_filters=256, num_heads=8, dropout=0.05,
-    pre_blocks=4, lc0_input=True,
-)
-
 XC0H_CFG = dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=6)
 
-CONV_PURE_CFG = dict(
-    conv_filters=256, num_blocks=12, dropout=0.03,
+XC0H_5C5T_CFG = dict(
+    conv_filters=256, num_heads=8, dropout=0.05,
+    pre_blocks=5, tx_blocks=5, xc0h_K=6,
 )
 
+XC0H_CFIW_CFG = dict(
+    conv_filters=256, num_heads=8, dropout=0.05,
+    xc0h_K=6, add_pos=True, interleave_n=5,
+)
 
-def _load_sometimes_legal_idx():
-    import pyfastchess
-    mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
-    return mask.nonzero(as_tuple=True)[0]  # [1858]
+XC0H_6C4T_CFG = dict(
+    conv_filters=256, num_heads=8, dropout=0.05,
+    pre_blocks=6, tx_blocks=4, xc0h_K=6,
+)
 
-
-# ---------------------------------------------------------------------------
-# Shared blocks
-# ---------------------------------------------------------------------------
-
-class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-6):
-        super().__init__()
-        self.scale = nn.Parameter(torch.ones(d))
-        self.eps   = eps
-
-    def forward(self, x):
-        return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
-
-
-class SwiGLUBlock(nn.Module):
-    def __init__(self, d, hidden, dropout=0.0):
-        super().__init__()
-        self.norm   = RMSNorm(d)
-        self.w_gate = nn.Linear(d, hidden, bias=False)
-        self.w_up   = nn.Linear(d, hidden, bias=False)
-        self.w_down = nn.Linear(hidden, d, bias=False)
-        self.drop   = nn.Dropout(dropout)
-        nn.init.zeros_(self.w_down.weight)
-
-    def forward(self, x):
-        h = self.norm(x)
-        return x + self.drop(self.w_down(F.silu(self.w_gate(h)) * self.w_up(h)))
-
-
-class GELUMlpBlock(nn.Module):
-    def __init__(self, d, hidden, dropout=0.0):
-        super().__init__()
-        self.norm = RMSNorm(d)
-        self.w1   = nn.Linear(d, hidden, bias=False)
-        self.w2   = nn.Linear(hidden, d, bias=False)
-        self.drop = nn.Dropout(dropout)
-        nn.init.zeros_(self.w2.weight)
-
-    def forward(self, x):
-        return x + self.drop(self.w2(F.gelu(self.w1(self.norm(x)))))
-
-
-# ---------------------------------------------------------------------------
-# Conv+MHA+GEMM+SmartGate
-# ---------------------------------------------------------------------------
-
-ENC_DIM     = 128
-ENC_DIM_MHA = 256   # after cat([x, pos], dim=-1)
-ENC_HEADS   = 8
-ENC_FF_DIM  = 1024
-
-
-class ConvBlock2D(nn.Module):
-    """Channels-first prenorm conv block. x: [B, d, 8, 8]"""
-    def __init__(self, d):
-        super().__init__()
-        self.ln = nn.LayerNorm([d, 8, 8])
-        self.c1 = nn.Conv2d(d, d, 3, padding=1, bias=False)
-        self.c2 = nn.Conv2d(d, d, 3, padding=1, bias=False)
-
-    def forward(self, x):
-        h = F.gelu(self.c1(self.ln(x)))
-        return x + self.c2(h)
-
-
-class MHABlock(nn.Module):
-    def __init__(self, d, n_heads, ff_dim):
-        super().__init__()
-        self.ln1  = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(d, n_heads, batch_first=True)
-        self.ln2  = nn.LayerNorm(d)
-        self.ff1  = nn.Linear(d, ff_dim)
-        self.ff2  = nn.Linear(ff_dim, d)
-
-    def forward(self, x):
-        n = self.ln1(x)
-        h, _ = self.attn(n, n, n, need_weights=False)
-        x = x + h
-        return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
-
-
-class CrossAttnBlock(nn.Module):
-    def __init__(self, d, n_heads, ff_dim):
-        super().__init__()
-        self.ln_q  = nn.LayerNorm(d)
-        self.ln_kv = nn.LayerNorm(d)
-        self.attn  = nn.MultiheadAttention(d, n_heads, batch_first=True)
-        self.ln2   = nn.LayerNorm(d)
-        self.ff1   = nn.Linear(d, ff_dim)
-        self.ff2   = nn.Linear(ff_dim, d)
-
-    def forward(self, q, kv):
-        kv_n = self.ln_kv(kv)
-        h, _ = self.attn(self.ln_q(q), kv_n, kv_n, need_weights=False)
-        q = q + h
-        return q + self.ff2(F.gelu(self.ff1(self.ln2(q))))
-
-
-class ConvAttnMlp(nn.Module):
-    """Conv encoder -> pos-cat [B,64,256] -> append 8 accum tokens -> [B,72,256]
-    -> 1x MHABlock over 72 tokens
-    -> 1x CrossAttnBlock(q=accum[8], kv=seq[72]) -> [B,8,256]
-    -> split: first 6 -> [B,1536] GEMM belly, last 2 -> [B,512] smartgate
-    -> 1536-d GEMM trunk (alt GELU/SwiGLU), WDL@4
-    -> quality policy [B,1858] + smartgate logsigmoid(gate) -> scatter [B,4288]
-    Gate is suppress-only; bias init=4.0 -> near no-op at init.
-    """
-    def __init__(self, n_trunk_blocks=6, dropout=0.02):
-        super().__init__()
-        D      = 1536
-        H      = D * 3 // 2       # 2304
-        D_gate = 512
-        H_gate = D_gate * 3 // 2  # 768
-
-        self.emb    = nn.Embedding(ENC_VOCAB, ENC_DIM)
-        self.conv   = nn.ModuleList([ConvBlock2D(ENC_DIM), ConvBlock2D(ENC_DIM)])
-        self.pos    = nn.Embedding(SEQ_LEN, ENC_DIM)
-        self.ln_x   = nn.LayerNorm(ENC_DIM)
-        self.ln_pos = nn.LayerNorm(ENC_DIM)
-
-        self.accum_tokens = nn.Parameter(torch.randn(1, 8, ENC_DIM_MHA) * 0.02)
-        self.self_attn    = MHABlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
-        self.cross_attn   = CrossAttnBlock(ENC_DIM_MHA, ENC_HEADS, ENC_FF_DIM)
-
-        def make_block(i):
-            return GELUMlpBlock(D, H, dropout) if i % 2 == 0 else SwiGLUBlock(D, H, dropout)
-        self.trunk = nn.ModuleList([make_block(i) for i in range(n_trunk_blocks)])
-
-        self.val_norm = RMSNorm(D)
-        self.val_w1   = nn.Linear(D, D // 2, bias=False)
-        self.val_w2   = nn.Linear(D // 2, 3, bias=False)
-
-        self.pol_norm  = RMSNorm(D)
-        self.pol_out   = nn.Linear(D, 1858, bias=False)
-
-        self.gate_blk  = SwiGLUBlock(D_gate, H_gate, dropout)
-        self.gate_norm = RMSNorm(D_gate)
-        self.gate_out  = nn.Linear(D_gate, 1858, bias=True)
-        nn.init.zeros_(self.gate_out.weight)
-        nn.init.constant_(self.gate_out.bias, 4.0)
-
-        self.register_buffer("sl_idx", _load_sometimes_legal_idx())
-
-    def forward(self, tokens):
-        B = tokens.shape[0]
-        x = self.emb(tokens)                                                           # [B, 64, 128]
-        x = x.reshape(B, 8, 8, ENC_DIM).permute(0, 3, 1, 2)                         # [B, 128, 8, 8]
-        for blk in self.conv:
-            x = blk(x)
-        x   = x.reshape(B, ENC_DIM, SEQ_LEN).permute(0, 2, 1)                        # [B, 64, 128]
-        pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device))
-        x   = torch.cat([self.ln_x(x), self.ln_pos(pos).unsqueeze(0).expand(B, -1, -1)], dim=-1)  # [B, 64, 256]
-
-        seq = torch.cat([x, self.accum_tokens.expand(B, -1, -1)], dim=1)              # [B, 72, 256]
-        seq = self.self_attn(seq)                                                       # [B, 72, 256]
-        g   = self.cross_attn(seq[:, -8:], seq)                                        # [B, 8, 256]
-
-        main_x = g[:, :6, :].reshape(B, -1)                                            # [B, 1536]
-        gate_x = g[:, 6:, :].reshape(B, -1)                                            # [B, 512]
-
-        for blk in self.trunk[:4]:
-            main_x = blk(main_x)
-        val = self.val_w2(F.silu(self.val_w1(self.val_norm(main_x))))
-
-        for blk in self.trunk[4:]:
-            main_x = blk(main_x)
-
-        quality_logits = self.pol_out(self.pol_norm(main_x))                           # [B, 1858]
-
-        gate_x   = self.gate_blk(gate_x)
-        gate_raw = self.gate_out(self.gate_norm(gate_x))                               # [B, 1858]
-
-        legal_logits = quality_logits + F.logsigmoid(gate_raw)
-        pol = torch.full((B, POLICY_DIM), -3e4, device=legal_logits.device, dtype=legal_logits.dtype)
-        pol.scatter_(1, self.sl_idx.unsqueeze(0).expand(B, -1), legal_logits)
-        return pol, val
-
-
-def build_conv_attn_model(n_trunk_blocks=6, dropout=0.02):
-    m = ConvAttnMlp(n_trunk_blocks=n_trunk_blocks, dropout=dropout)
-    print(f"  params: {sum(p.numel() for p in m.parameters()):,}")
-    return m
+CONV_PURE_CFG = dict(
+    conv_filters=256, num_blocks=16, dropout=0.03,
+)
 
 
 def parse_args():
@@ -269,10 +85,8 @@ def parse_args():
     p.add_argument("--clear-cache",   nargs="?", const="soft", default=None,
                    metavar="hard", help="Clear engine/ONNX cache (bare) or everything incl. CSV (hard)")
     p.add_argument("--skip-trt",      action="store_true")
-    p.add_argument("--skip-hybrid",   action="store_true")
+    p.add_argument("--skip-convpure", action="store_true", default=False)
     p.add_argument("--batch-sizes",   nargs="+", type=int, default=DEFAULT_BATCH_SIZES, metavar="B")
-    p.add_argument("--trunk-blocks",      type=int,   default=6,    help="GEMM trunk blocks for Conv+MHA")
-    p.add_argument("--dropout",           type=float, default=0.02)
     return p.parse_args()
 
 
@@ -554,71 +368,6 @@ def main():
         save_results_csv(lbl, params, result)
         return result
 
-    # Conv+MHA+GEMM+SmartGate
-    if not args.skip_hybrid:
-        print(f"\n{'='*60}")
-        print(f"  Conv+MHA+GEMM+SmartGate  (2xConvBlock2D({ENC_DIM}) -> pos-cat -> [{ENC_DIM_MHA}]"
-              f" -> append 8 accum tokens -> 1x self-attn(72)"
-              f" -> 1x cross-attn(q=accum[8], kv=72) -> split first6/last2 -> [1536]/[512]"
-              f" -> {args.trunk_blocks}x alt GELU/SwiGLU, WDL@4,"
-              f" quality+logsigmoid(gate) 1858->4288)")
-        model_h  = build_conv_attn_model(args.trunk_blocks, args.dropout)
-        params_h = sum(p.numel() for p in model_h.parameters())
-
-        if not args.dry_run:
-            try:
-                print(f"\n  Building Conv+MHA+GEMM+SmartGate PT eager ...")
-                eager_h = make_pt_eager_infer(model_h, device)
-                lbl = "Conv+MHA+GEMM+SG  PT eager"
-                all_results[lbl] = run_or_cached(lbl, eager_h, params_h)
-                del eager_h; gc.collect(); torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"  [ERROR] Conv+MHA+GEMM+SmartGate PT eager: {e}")
-
-            if not args.skip_trt:
-                try:
-                    lbl    = "Conv+MHA+GEMM+SG  ORT TRT"
-                    onnx_h = os.path.join(TRT_CACHE, f"conv_mha_t{args.trunk_blocks}_{params_h}.onnx")
-                    if not os.path.exists(onnx_h):
-                        export_to_onnx(build_conv_attn_model(args.trunk_blocks, args.dropout), device, onnx_h)
-                    else:
-                        print(f"  [TRT] ONNX cached: {onnx_h}")
-                    trt_h, trt_sess_h = make_trt_infer(onnx_h, TRT_CACHE, max_bs=max(bs))
-                    all_results[lbl] = run_or_cached(lbl, trt_h, params_h)
-                    del trt_sess_h; gc.collect()
-                except Exception as e:
-                    print(f"  [ERROR] Conv+MHA+GEMM+SmartGate TRT: {e}")
-
-    # 16m-precond-smartgate
-    print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate  (bilinear subblock underpromo: dots_sub + 2x Linear(PDH,3))")
-    model_sg  = build_pt_precond_smartgate(PRECOND_CFG)
-    params_sg = sum(p.numel() for p in model_sg.parameters())
-
-    if not args.dry_run:
-        try:
-            print(f"\n  Building 16m-precond-smartgate PT eager ...")
-            eager_sg = make_pt_eager_infer(model_sg, device)
-            lbl = "16m-precond-smartgate  PT eager"
-            all_results[lbl] = run_or_cached(lbl, eager_sg, params_sg)
-            del eager_sg; gc.collect(); torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate PT eager: {e}")
-
-        if not args.skip_trt:
-            try:
-                lbl     = "16m-precond-smartgate  ORT TRT"
-                onnx_sg = os.path.join(TRT_CACHE, f"precond_sg_{params_sg}.onnx")
-                if not os.path.exists(onnx_sg):
-                    export_to_onnx(build_pt_precond_smartgate(PRECOND_CFG), device, onnx_sg)
-                else:
-                    print(f"  [TRT] ONNX cached: {onnx_sg}")
-                trt_sg, trt_sess_sg = make_trt_infer(onnx_sg, TRT_CACHE, max_bs=max(bs))
-                all_results[lbl] = run_or_cached(lbl, trt_sg, params_sg)
-                del trt_sess_sg; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate TRT: {e}")
-
     # 16m-precond-smartgate-xc0h-K6
     print(f"\n{'='*60}")
     print(f"  16m-precond-smartgate-xc0h-K6  (compact history-token stem, K=6;"
@@ -657,36 +406,152 @@ def main():
             except Exception as e:
                 print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 TRT: {e}")
 
-    # conv-pure
+    # 16m-precond-smartgate-xc0h-K6-5c5t
     print(f"\n{'='*60}")
-    print(f"  conv-pure  (12x ConvBlock(128) NCHW -> trunk_ln"
-          f" -> WDL conv(8)/reshape/GELU, SmartGate pool/16-d, policy 2xLinear->256->MHA(128))")
-    model_cp  = build_pt_conv_pure(CONV_PURE_CFG)
-    params_cp = sum(p.numel() for p in model_cp.parameters())
+    print(f"  16m-precond-smartgate-xc0h-K6-5c5t  (same stem as xc0h-K6;"
+          f" 5 conv preconditioner blocks + 5 transformer blocks instead of 4+4)")
+    model_5c5t  = build_pt_precond_smartgate(XC0H_5C5T_CFG)
+    params_5c5t = sum(p.numel() for p in model_5c5t.parameters())
 
     if not args.dry_run:
         try:
-            print(f"\n  Building conv-pure PT eager ...")
-            eager_cp = make_pt_eager_infer(model_cp, device)
-            lbl = "conv-pure  PT eager"
-            all_results[lbl] = run_or_cached(lbl, eager_cp, params_cp)
-            del eager_cp; gc.collect(); torch.cuda.empty_cache()
+            print(f"\n  Building 16m-precond-smartgate-xc0h-K6-5c5t PT eager ...")
+            eager_5c5t = make_pt_eager_infer(model_5c5t, device)
+            lbl = "16m-precond-smartgate-xc0h-K6-5c5t  PT eager"
+            all_results[lbl] = run_or_cached(
+                lbl, eager_5c5t, params_5c5t,
+                input_fn=lambda b: random_xc0h_tokens(b, 6))
+            del eager_5c5t; gc.collect(); torch.cuda.empty_cache()
         except Exception as e:
-            print(f"  [ERROR] conv-pure PT eager: {e}")
+            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-5c5t PT eager: {e}")
 
         if not args.skip_trt:
             try:
-                lbl     = "conv-pure  ORT TRT"
-                onnx_cp = os.path.join(TRT_CACHE, f"conv_pure_{params_cp}.onnx")
-                if not os.path.exists(onnx_cp):
-                    export_to_onnx(build_pt_conv_pure(CONV_PURE_CFG), device, onnx_cp)
+                lbl        = "16m-precond-smartgate-xc0h-K6-5c5t  ORT TRT"
+                onnx_5c5t  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_5c5t_{params_5c5t}.onnx")
+                if not os.path.exists(onnx_5c5t):
+                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                    export_to_onnx(build_pt_precond_smartgate(XC0H_5C5T_CFG), device, onnx_5c5t, dummy=dummy)
                 else:
-                    print(f"  [TRT] ONNX cached: {onnx_cp}")
-                trt_cp, trt_sess_cp = make_trt_infer(onnx_cp, TRT_CACHE, max_bs=max(bs))
-                all_results[lbl] = run_or_cached(lbl, trt_cp, params_cp)
-                del trt_sess_cp; gc.collect()
+                    print(f"  [TRT] ONNX cached: {onnx_5c5t}")
+                trt_5c5t, trt_sess_5c5t = make_trt_infer(
+                    onnx_5c5t, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
+                all_results[lbl] = run_or_cached(
+                    lbl, trt_5c5t, params_5c5t,
+                    input_fn=lambda b: random_xc0h_tokens(b, 6))
+                del trt_sess_5c5t; gc.collect()
             except Exception as e:
-                print(f"  [ERROR] conv-pure TRT: {e}")
+                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-5c5t TRT: {e}")
+
+    # 16m-precond-smartgate-xc0h-K6-cfiw
+    print(f"\n{'='*60}")
+    print(f"  16m-precond-smartgate-xc0h-K6-cfiw  (same stem as xc0h-K6; pos added once"
+          f" up front, d_model stays CF=256; 5x [1 MHA block over 72 tokens ->"
+          f" 2 conv blocks over the 64 board tokens reshaped to 8x8, global tokens"
+          f" excluded from conv])")
+    model_cfiw  = build_pt_precond_smartgate(XC0H_CFIW_CFG)
+    params_cfiw = sum(p.numel() for p in model_cfiw.parameters())
+
+    if not args.dry_run:
+        try:
+            print(f"\n  Building 16m-precond-smartgate-xc0h-K6-cfiw PT eager ...")
+            eager_cfiw = make_pt_eager_infer(model_cfiw, device)
+            lbl = "16m-precond-smartgate-xc0h-K6-cfiw  PT eager"
+            all_results[lbl] = run_or_cached(
+                lbl, eager_cfiw, params_cfiw,
+                input_fn=lambda b: random_xc0h_tokens(b, 6))
+            del eager_cfiw; gc.collect(); torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-cfiw PT eager: {e}")
+
+        if not args.skip_trt:
+            try:
+                lbl        = "16m-precond-smartgate-xc0h-K6-cfiw  ORT TRT"
+                onnx_cfiw  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_cfiw_{params_cfiw}.onnx")
+                if not os.path.exists(onnx_cfiw):
+                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                    export_to_onnx(build_pt_precond_smartgate(XC0H_CFIW_CFG), device, onnx_cfiw, dummy=dummy)
+                else:
+                    print(f"  [TRT] ONNX cached: {onnx_cfiw}")
+                trt_cfiw, trt_sess_cfiw = make_trt_infer(
+                    onnx_cfiw, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
+                all_results[lbl] = run_or_cached(
+                    lbl, trt_cfiw, params_cfiw,
+                    input_fn=lambda b: random_xc0h_tokens(b, 6))
+                del trt_sess_cfiw; gc.collect()
+            except Exception as e:
+                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-cfiw TRT: {e}")
+
+    # 18m-precond-smartgate-xc0h-K6-6c4t
+    print(f"\n{'='*60}")
+    print(f"  18m-precond-smartgate-xc0h-K6-6c4t  (same stem as xc0h-K6;"
+          f" 6 conv preconditioner blocks, 4 transformer blocks (unchanged),"
+          f" pos concatenated so CF=256 -> D=512, same as prod)")
+    model_6c4t  = build_pt_precond_smartgate(XC0H_6C4T_CFG)
+    params_6c4t = sum(p.numel() for p in model_6c4t.parameters())
+
+    if not args.dry_run:
+        try:
+            print(f"\n  Building 18m-precond-smartgate-xc0h-K6-6c4t PT eager ...")
+            eager_6c4t = make_pt_eager_infer(model_6c4t, device)
+            lbl = "18m-precond-smartgate-xc0h-K6-6c4t  PT eager"
+            all_results[lbl] = run_or_cached(
+                lbl, eager_6c4t, params_6c4t,
+                input_fn=lambda b: random_xc0h_tokens(b, 6))
+            del eager_6c4t; gc.collect(); torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t PT eager: {e}")
+
+        if not args.skip_trt:
+            try:
+                lbl        = "18m-precond-smartgate-xc0h-K6-6c4t  ORT TRT"
+                onnx_6c4t  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_6c4t_{params_6c4t}.onnx")
+                if not os.path.exists(onnx_6c4t):
+                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                    export_to_onnx(build_pt_precond_smartgate(XC0H_6C4T_CFG), device, onnx_6c4t, dummy=dummy)
+                else:
+                    print(f"  [TRT] ONNX cached: {onnx_6c4t}")
+                trt_6c4t, trt_sess_6c4t = make_trt_infer(
+                    onnx_6c4t, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
+                all_results[lbl] = run_or_cached(
+                    lbl, trt_6c4t, params_6c4t,
+                    input_fn=lambda b: random_xc0h_tokens(b, 6))
+                del trt_sess_6c4t; gc.collect()
+            except Exception as e:
+                print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t TRT: {e}")
+
+    # conv-pure
+    if not args.skip_convpure:
+        print(f"\n{'='*60}")
+        print(f"  conv-pure  (16x ConvBlock(256) NCHW -> trunk_ln"
+              f" -> WDL conv(8)/reshape/GELU, SmartGate conv(16)->1024->512 SwiGLU,"
+              f" policy 2xLinear->256->MHA(256))")
+        model_cp  = build_pt_conv_pure(CONV_PURE_CFG)
+        params_cp = sum(p.numel() for p in model_cp.parameters())
+
+        if not args.dry_run:
+            try:
+                print(f"\n  Building conv-pure PT eager ...")
+                eager_cp = make_pt_eager_infer(model_cp, device)
+                lbl = "conv-pure  PT eager"
+                all_results[lbl] = run_or_cached(lbl, eager_cp, params_cp)
+                del eager_cp; gc.collect(); torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"  [ERROR] conv-pure PT eager: {e}")
+
+            if not args.skip_trt:
+                try:
+                    lbl     = "conv-pure  ORT TRT"
+                    onnx_cp = os.path.join(TRT_CACHE, f"conv_pure_{params_cp}.onnx")
+                    if not os.path.exists(onnx_cp):
+                        export_to_onnx(build_pt_conv_pure(CONV_PURE_CFG), device, onnx_cp)
+                    else:
+                        print(f"  [TRT] ONNX cached: {onnx_cp}")
+                    trt_cp, trt_sess_cp = make_trt_infer(onnx_cp, TRT_CACHE, max_bs=max(bs))
+                    all_results[lbl] = run_or_cached(lbl, trt_cp, params_cp)
+                    del trt_sess_cp; gc.collect()
+                except Exception as e:
+                    print(f"  [ERROR] conv-pure TRT: {e}")
 
     if args.dry_run:
         print("\n  Dry run complete.")

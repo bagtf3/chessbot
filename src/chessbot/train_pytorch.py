@@ -17,6 +17,10 @@ def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
 
 FALLBACK_ARCH = "13m-precond-conformer"
 
+# TEMPORARY cap on how many records retrain_pt puts on the GPU at once.
+# Remove once retrain moves to the tfrec + async EpochBuffer streamer.
+VRAM_CHUNK = 40960
+
 
 def shorten_path(p):
     parts = p.replace("\\", "/").split("/")
@@ -194,17 +198,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     model  = model.to(device).train()
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
-    n      = len(X)
-    if cfg.encoding_type == "lc0":
-        # raw uint8 lc0 planes -> float, rule50 /99 at the model-input boundary
-        X_t = torch.from_numpy(X).float().to(device)
-        X_t[:, 109] /= 99.0
-    else:
-        X_t = torch.from_numpy(X).long().to(device)
-    P_t    = torch.from_numpy(P).float().to(device)
-    Y_t    = torch.from_numpy(Y_wdl).float().to(device)
-    vwht_t = torch.from_numpy(vwht).float().to(device)
-    pwht_t = torch.from_numpy(pwht).float().to(device)
+    n = len(X)
 
     lr = cfg.learning_rate
     clip_norm = cfg.retrain_clip_norm
@@ -237,69 +231,87 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     nan_skips        = 0
     t0 = time.time()
     for ep_idx in range(1):
-        idx          = torch.randperm(n, device=device)
+        # TEMPORARY: chunk the dataset into <=VRAM_CHUNK-record groups so a
+        # single retrain never pushes more than that onto the GPU at once --
+        # loading the whole array upfront was blowing past VRAM on large
+        # retrains and falling back to slow system-RAM spillover. Remove
+        # once retrain moves to the tfrec + async EpochBuffer streamer.
+        perm         = np.random.permutation(n)
         total        = value_total = policy_total = 0.0
         steps        = 0
         grad_norms   = []
         clip_count   = 0
 
-        for start in range(0, n, args.batch_size):
-            batch_idx = idx[start:start + args.batch_size]
-            xb  = X_t[batch_idx]
-            pb  = P_t[batch_idx]
-            yb  = Y_t[batch_idx]
-            vwb = vwht_t[batch_idx]
-            pwb = pwht_t[batch_idx]
+        for chunk_start in range(0, n, VRAM_CHUNK):
+            chunk_idx = perm[chunk_start:chunk_start + VRAM_CHUNK]
 
-            policy_logits, value_out = model(xb)
+            if cfg.encoding_type == "lc0":
+                X_t = torch.from_numpy(X[chunk_idx]).float().to(device)
+                X_t[:, 109] /= 99.0
+            else:
+                X_t = torch.from_numpy(X[chunk_idx]).long().to(device)
+            P_t    = torch.from_numpy(P[chunk_idx]).float().to(device)
+            Y_t    = torch.from_numpy(Y_wdl[chunk_idx]).float().to(device)
+            vwht_t = torch.from_numpy(vwht[chunk_idx]).float().to(device)
+            pwht_t = torch.from_numpy(pwht[chunk_idx]).float().to(device)
 
-            log_probs   = F.log_softmax(policy_logits, dim=-1)
-            policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
+            for start in range(0, len(chunk_idx), args.batch_size):
+                end = start + args.batch_size
+                xb  = X_t[start:end]
+                pb  = P_t[start:end]
+                yb  = Y_t[start:end]
+                vwb = vwht_t[start:end]
+                pwb = pwht_t[start:end]
 
-            log_wdl    = F.log_softmax(value_out, dim=-1)
-            value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
+                policy_logits, value_out = model(xb)
 
-            loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
-            opt.zero_grad()
-            loss.backward()
-            raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
+                log_probs   = F.log_softmax(policy_logits, dim=-1)
+                policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
 
-            if not np.isfinite(raw_norm):
-                nan_skips += 1
-                dump_path = os.path.join(
-                    os.path.dirname(model_path),
-                    f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
-                try:
-                    import pickle
-                    with open(dump_path, "wb") as f:
-                        pickle.dump({
-                            'batch_idx': batch_idx.detach().cpu().numpy(),
-                            'X':    xb.detach().cpu().numpy(),
-                            'P':    pb.detach().cpu().numpy(),
-                            'Y':    yb.detach().cpu().numpy(),
-                            'vwht': vwb.detach().cpu().numpy(),
-                            'pwht': pwb.detach().cpu().numpy(),
-                            'loss': loss.item() if torch.isfinite(loss) else float('nan'),
-                            'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
-                            'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
-                        }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
-                          f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
-                except Exception as e:
-                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
-                          f"failed to dump offending batch: {e}")
+                log_wdl    = F.log_softmax(value_out, dim=-1)
+                value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
+
+                loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
                 opt.zero_grad()
-                continue
+                loss.backward()
+                raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
 
-            grad_norms.append(raw_norm)
-            if raw_norm > clip_norm:
-                clip_count += 1
-            opt.step()
+                if not np.isfinite(raw_norm):
+                    nan_skips += 1
+                    dump_path = os.path.join(
+                        os.path.dirname(model_path),
+                        f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
+                    try:
+                        import pickle
+                        with open(dump_path, "wb") as f:
+                            pickle.dump({
+                                'batch_idx': chunk_idx[start:end],
+                                'X':    xb.detach().cpu().numpy(),
+                                'P':    pb.detach().cpu().numpy(),
+                                'Y':    yb.detach().cpu().numpy(),
+                                'vwht': vwb.detach().cpu().numpy(),
+                                'pwht': pwb.detach().cpu().numpy(),
+                                'loss': loss.item() if torch.isfinite(loss) else float('nan'),
+                                'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
+                                'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
+                            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
+                              f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
+                    except Exception as e:
+                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
+                              f"failed to dump offending batch: {e}")
+                    opt.zero_grad()
+                    continue
 
-            total        += loss.item()
-            policy_total += policy_loss.item()
-            value_total  += value_loss.item()
-            steps        += 1
+                grad_norms.append(raw_norm)
+                if raw_norm > clip_norm:
+                    clip_count += 1
+                opt.step()
+
+                total        += loss.item()
+                policy_total += policy_loss.item()
+                value_total  += value_loss.item()
+                steps        += 1
 
         if nan_skips:
             print(f"{tag} {nan_skips} batch(es) skipped this epoch due to non-finite grad norm")

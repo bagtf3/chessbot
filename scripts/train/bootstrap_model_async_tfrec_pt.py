@@ -52,7 +52,7 @@ PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
 PT_ADAM_BETA2      = 0.999
 PT_SHUFFLE_BUFFER  = 384_000
 
-CHECKPOINT_EVERY  = 20
+CHECKPOINT_EVERY  = 100
 DEFAULT_MODEL     = "18m-precond-smartgate-xc0h-6c4t"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
@@ -560,6 +560,20 @@ def main() -> None:
         export_ts(model, ts_path, arch=arch_name)
         print(f"[train] export complete -> {pt_path}")
         print(f"[train] export complete -> {ts_path}")
+
+        # Lift-and-shift the pretraining optimizer state into selfplay's
+        # retrain opt-state slot, so the first selfplay retrain warm-starts
+        # from the same Adam moments the model actually converged under
+        # instead of starting cold against an already-converged model.
+        if "optimizer" in raw:
+            from chessbot.train_pytorch import pt_opt_state_path
+            opt_state_path = pt_opt_state_path(pt_path, run_dir)
+            os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
+            torch.save(raw["optimizer"], opt_state_path)
+            print(f"[train] exported optimizer state -> {opt_state_path}")
+        else:
+            print("[train] no optimizer state in checkpoint -- "
+                  "selfplay retrain will start fresh")
 
 
 if __name__ == "__main__":

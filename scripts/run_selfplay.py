@@ -1,10 +1,10 @@
 # run_selfplay.py
 import os
 import time
-import queue as py_queue
 import multiprocessing as mp
 import sys
 import json
+import queue
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,6 @@ from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 import pickle
 import signal
 import threading
-import queue
 
 STOP_REQUESTED = threading.Event()
 STOP_AFTER_ROUND_REQUESTED = threading.Event()
@@ -205,6 +204,14 @@ def top_up_queues(game_queue, sf_queue, game_gen, budget=None, target=None):
     return added
 
 
+def close_proc(p):
+    p.close()
+    try:
+        WORKER_PROCS.remove(p)
+    except ValueError:
+        pass
+
+
 def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
     """
     - If a proc exited: join + close + remove from list.
@@ -220,7 +227,7 @@ def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
 
         if not p.is_alive():
             p.join(timeout=0)
-            p.close()
+            close_proc(p)
             continue
 
         if request_stop and w["stop_sent_at"] is None:
@@ -254,18 +261,20 @@ def drain_queue(q):
     while True:
         try:
             out.append(q.get_nowait())
-        except py_queue.Empty:
+        except queue.Empty:
             break
     return out
 
 
 def shutdown_round(procs, recent_q, telemetry_q, max_wait_s=15.0):
-    deadline = time.monotonic() + max_wait_s
+    # max_wait_s=None waits indefinitely for workers to finish their
+    # in-flight games naturally, with no forced kill.
+    deadline = None if max_wait_s is None else time.monotonic() + max_wait_s
 
     # Ask nicely first and start escalation timers
     procs = check_and_reap_procs(procs, request_stop=True)
 
-    while procs and time.monotonic() < deadline:
+    while procs and (deadline is None or time.monotonic() < deadline):
         procs = check_and_reap_procs(procs, request_stop=True)
         time.sleep(0.05)
 
@@ -297,7 +306,7 @@ def shutdown_round(procs, recent_q, telemetry_q, max_wait_s=15.0):
             p = w["p"]
             p.join(timeout=2.0)
             if not p.is_alive():
-                p.close()
+                close_proc(p)
 
         procs = [w for w in procs if w["p"].is_alive()]
 
@@ -360,6 +369,14 @@ def launch_retrain(run_tag, working_cfg, epoch=0, pred_pkl_path=None):
         run_tag, rt_script, working_cfg,
         epoch=epoch, pred_pkl_path=pred_pkl_path,
     )
+
+
+def start_retrain(run_tag, working_cfg, rescorer, epoch, pred_pkl_path):
+    print(f"[rescore] KL running medians: "
+          f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
+    retrain = launch_retrain(run_tag, working_cfg, epoch=epoch, pred_pkl_path=pred_pkl_path)
+    rescorer.reset_writer()
+    return retrain
 
 
 def pull_pkl(to_process):
@@ -475,20 +492,26 @@ def main(run_tag):
             ctx = mp.get_context()
             game_gen = GameGenerator(working_cfg)
 
+            n_workers = max(1, working_cfg.n_workers)
+            initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
+
             if is_validation:
                 game_queue = ctx.Queue()
                 sf_queue = None
-                for spec in game_gen.validation_games():
-                    game_queue.put(spec)
+                validation_specs = game_gen.validation_games()
+                n_games = len(validation_specs)
+                val_spec_idx = 0
+                total_queued = 0
+                while val_spec_idx < n_games and total_queued < initial_target:
+                    game_queue.put(validation_specs[val_spec_idx])
+                    val_spec_idx += 1
+                    total_queued += 1
+
                 procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
-                for w in procs:
-                    w["msg_q"].put("drain_and_stop")
             else:
                 game_queue = ctx.Queue()
                 sf_queue = ctx.Queue()
-                n_workers = max(1, working_cfg.n_workers)
                 n_games = working_cfg.n_games
-                initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
                 total_queued = top_up_queues(
                     game_queue, sf_queue, game_gen,
                     budget=n_games, target=initial_target,
@@ -498,14 +521,17 @@ def main(run_tag):
                     working_cfg, recent_q, telemetry_q, game_queue, sf_queue
                 )
 
-            # validation is pre-filled and already signaled; training tracks budget below
-            stop_signal_sent = is_validation
+            # Both branches now ramp workers up before any stop signal is
+            # sent. Validation used to pre-fill the entire n_games budget and
+            # signal drain_and_stop immediately after spawn, which raced with
+            # pull_from_queue's ramp-up (stop_at_empty short-circuits it) and
+            # capped concurrency well below games_at_once * n_workers.
+            stop_signal_sent = False
 
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
             procs = check_and_reap_procs(procs)
-            needed_to_retrain = working_cfg.training_queue_buffer
-            while len(procs) or (recorder.training_queue < needed_to_retrain):
+            while len(procs) or (recorder.training_queue < working_cfg.training_queue_buffer):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
@@ -531,6 +557,8 @@ def main(run_tag):
                         print(f"[cmd] no new games -- workers draining, "
                               f"dropped {dropped} queued-but-unplayed games, "
                               f"queues frozen for rest of round")
+                    else:
+                        print("[cmd] no new games -- queues already frozen this round, no-op")
 
                 if PAUSE_REQUESTED.is_set():
                     PAUSE_REQUESTED.clear()
@@ -572,10 +600,18 @@ def main(run_tag):
                     sf_low = sf_queue is not None and sf_queue.qsize() < GAME_QUEUE_MIN // 2
                     game_low = game_queue.qsize() < GAME_QUEUE_MIN
                     if sf_low or game_low:
-                        added = top_up_queues(
-                            game_queue, sf_queue, game_gen,
-                            budget=n_games - total_queued,
-                        )
+                        if is_validation:
+                            added = 0
+                            while (val_spec_idx < len(validation_specs)
+                                   and game_queue.qsize() < GAME_QUEUE_MIN * 2):
+                                game_queue.put(validation_specs[val_spec_idx])
+                                val_spec_idx += 1
+                                added += 1
+                        else:
+                            added = top_up_queues(
+                                game_queue, sf_queue, game_gen,
+                                budget=n_games - total_queued,
+                            )
                         total_queued += added
                         # n_games reached — tell all workers to drain and exit
                         if total_queued >= n_games:
@@ -619,7 +655,7 @@ def main(run_tag):
                 recorder.training_queue = rescorer.training_data_size
 
                 # check for a retrain
-                if recorder.training_queue >= needed_to_retrain:
+                if recorder.training_queue >= working_cfg.training_queue_buffer:
                     # drain so write gets accurate data; workers keep playing meanwhile
                     rescorer.write_training_data_pkl(
                         size=working_cfg.retrain_size, randomize=True)
@@ -639,10 +675,8 @@ def main(run_tag):
                         p["msg_q"].put("pause")
 
                     if retrain is None:
-                        print(f"[rescore] KL running medians: "
-                              f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
-                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains)
-                        rescorer.reset_writer()
+                        retrain = start_retrain(
+                            run_tag, working_cfg, rescorer, n_retrains, pred_pkl_path)
 
                     while retrain is not None:
                         done, rc = poll_retrain(retrain, print_output=True)
@@ -689,8 +723,13 @@ def main(run_tag):
                 else:
                     time.sleep(0.5)
             
-            # when done, close the queues
-            procs = shutdown_round(procs, recent_q, telemetry_q)
+            # when done, close the queues. Workers already got drain_and_stop,
+            # so they'll exit on their own once in-flight games finish; only
+            # force a hard kill deadline on the truly last round, so the
+            # process is guaranteed to terminate.
+            is_final_round = run_num >= base_cfg.n_rounds
+            shutdown_wait_s = 15.0 if is_final_round else None
+            procs = shutdown_round(procs, recent_q, telemetry_q, max_wait_s=shutdown_wait_s)
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
 
@@ -716,37 +755,41 @@ def main(run_tag):
                 # we do not train after validation currently
                 continue
 
-            # end of round: drain the largest multiple of retrain_size sitting
-            # in the buffer (randomized), rather than carrying it all forward
-            # into the next round's normal single-batch retrains. On the last
-            # round there's no next round to carry stragglers into, so keep
-            # looping until the SF-rescore pipeline (intake/pending) is fully
-            # drained instead of returning after a single pass.
-            is_last_round = run_num >= base_cfg.n_rounds
-            while True:
+            # Only drain/retrain at round-end on the truly last round of the
+            # whole run. Every other round-end just moves on to the next
+            # round with no retrain here -- retraining otherwise only
+            # happens via the mid-round training_queue_buffer trigger, so a
+            # single low bar (retrain_size) at every round boundary can't
+            # slip in a small, poorly-mixed retrain behind that trigger's
+            # back.
+            is_last_round = is_final_round
+            while is_last_round:
                 if STOP_REQUESTED.is_set():
                     break
                 recorder.training_queue = rescorer.training_data_size
                 k = recorder.training_queue // working_cfg.retrain_size
                 if k > 0:
-                    drain_size = k * working_cfg.retrain_size
+                    # one retrain_size batch per pass -- retrain_pt loads the
+                    # whole batch onto the GPU at once, so draining multiple
+                    # multiples into a single call can blow past VRAM and
+                    # fall back to slow system-RAM spillover. Loop back below
+                    # for any remaining multiples instead.
+                    drain_size = working_cfg.retrain_size
                     print(
-                        f"[main] end of round: draining {drain_size} of "
-                        f"{recorder.training_queue} queued samples"
+                        f"[main] end of run: draining {drain_size} of "
+                        f"{recorder.training_queue} queued samples "
+                        f"({k} full batches remaining)"
                     )
                     rescorer.write_training_data_pkl(size=drain_size, randomize=True)
                     recorder.training_queue = rescorer.training_data_size
 
                     if retrain is None:
-                        print(f"[rescore] KL running medians: "
-                              f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
                         eor_pred_pkl = os.path.join(
                             working_cfg.run_dir, "predictions_latest.pkl")
                         if os.path.exists(eor_pred_pkl):
                             os.remove(eor_pred_pkl)
-                        retrain = launch_retrain(run_tag, working_cfg, epoch=n_retrains,
-                                                 pred_pkl_path=eor_pred_pkl)
-                        rescorer.reset_writer()
+                        retrain = start_retrain(
+                            run_tag, working_cfg, rescorer, n_retrains, eor_pred_pkl)
 
                     while retrain is not None:
                         done, rc = poll_retrain(retrain, print_output=True)
@@ -776,9 +819,6 @@ def main(run_tag):
 
                         time.sleep(0.05)
 
-                if not is_last_round:
-                    break
-
                 # last round: wait for any still-in-flight SF rescoring to
                 # land, then loop back and check for another full multiple.
                 while finished_games:
@@ -786,8 +826,10 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
+                recorder.training_queue = rescorer.training_data_size
+                more_full_batches = recorder.training_queue >= working_cfg.retrain_size
                 pending_left = finished_games or rescorer.intake or rescorer.pending
-                if not pending_left or STOP_REQUESTED.is_set():
+                if (not pending_left and not more_full_batches) or STOP_REQUESTED.is_set():
                     break
 
                 time.sleep(0.1)

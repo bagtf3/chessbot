@@ -1264,7 +1264,7 @@ class Rescorer(object):
 
         eps = 1e-7
         group_names = (
-            'xc0_vs_true', 'xc0_vs_lc0', 'xc0_vs_lc0_blunder', 'xc0_vs_lc0_enrich',
+            'xc0_vs_true', 'xc0_vs_lc0', 'xc0_vs_lc0_blunder',
         )
         groups = {k: {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [], 'pol_mask': []}
                   for k in group_names}
@@ -1280,10 +1280,8 @@ class Rescorer(object):
                 grp_keys = ['xc0_vs_lc0']
                 if source in ('lc0_blunder', 'lc0_pv'):
                     grp_keys.append('xc0_vs_lc0_blunder')
-                elif source == 'lc0_enrich':
-                    grp_keys.append('xc0_vs_lc0_enrich')
-                # legacy tag 'lc0' predates the blunder/enrich split and can't
-                # be attributed to either sub-slice -- counted in the "all" bucket only
+                # legacy tag 'lc0' and 'lc0_enrich' aren't split out further --
+                # counted in the "all" bucket only
 
             for grp in grp_keys:
                 g = groups[grp]
@@ -1351,7 +1349,6 @@ class Rescorer(object):
         xb  = metrics_block(groups['xc0_vs_true'], want_legal_stats=True)
         lb  = metrics_block(groups['xc0_vs_lc0'], want_legal_stats=True)
         lbb = metrics_block(groups['xc0_vs_lc0_blunder'])
-        lbe = metrics_block(groups['xc0_vs_lc0_enrich'])
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
@@ -1369,7 +1366,7 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(xb, 'true'), (lb, 'lc0 all'), (lbb, 'lc0 blunder'), (lbe, 'lc0 enrich')]
+        slices = [(xb, 'true'), (lb, 'lc0 all'), (lbb, 'lc0 blunder')]
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:

@@ -57,7 +57,7 @@ def companion_pt(ts_path: str) -> str:
     return ts_path[:-3] + ".pt"
 
 
-def load_pt_model(path):
+def load_pt_model(path, log_params=False):
     """Returns (model, arch_or_None).
     .ts path: loads ScriptModule directly (no architecture dependency).
               arch read from companion .pt metadata if present.
@@ -70,7 +70,7 @@ def load_pt_model(path):
             if isinstance(meta, dict) and "model" in meta:
                 from chessbot.model import PT_BUILDERS, VARIANTS
                 arch = meta.get("arch", FALLBACK_ARCH)
-                model = PT_BUILDERS[arch](VARIANTS[arch])
+                model = PT_BUILDERS[arch](VARIANTS[arch], log_params=log_params)
                 model.load_state_dict(meta["model"], strict=False)
                 log_policy_mask_status(model)
                 return model, arch
@@ -83,7 +83,7 @@ def load_pt_model(path):
         if isinstance(state_dict, torch.nn.Module):
             return state_dict, FALLBACK_ARCH
         arch = obj.get("arch", FALLBACK_ARCH)
-        model = PT_BUILDERS[arch](VARIANTS[arch])
+        model = PT_BUILDERS[arch](VARIANTS[arch], log_params=log_params)
         model.load_state_dict(state_dict, strict=False)
         log_policy_mask_status(model)
         return model, arch

@@ -235,7 +235,7 @@ def make_pt_relational_policy_head(C: int):
 # PyTorch builders
 # ---------------------------------------------------------------------------
 
-def build_pt_transformer_16m(cfg: dict):
+def build_pt_transformer_16m(cfg: dict, log_params: bool = False):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -284,11 +284,12 @@ def build_pt_transformer_16m(cfg: dict):
             return self.policy_head(x_2d), self.value_head(v_2d.permute(0, 2, 3, 1).reshape(-1, 64, de))
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_conformer_interweaved(cfg: dict):
+def build_pt_conformer_interweaved(cfg: dict, log_params: bool = False):
     """Interweaved conformer: cb x [prenorm-MHA -> ConvRes].
     Graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none."""
     import torch
@@ -357,11 +358,12 @@ def build_pt_conformer_interweaved(cfg: dict):
             return self.policy_head(x), self.value_head(x.permute(0, 2, 3, 1).reshape(-1, 64, cf))
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_precond_conformer(cfg: dict):
+def build_pt_precond_conformer(cfg: dict, log_params: bool = False):
     """
     4x Conv(256) preconditioner -> concat pos(256) -> 512 ->
     4x [prenorm-MHA -> FF(512->512->512)] -> heads.
@@ -443,11 +445,12 @@ def build_pt_precond_conformer(cfg: dict):
             return self.policy_head(x), self.value_head(x)
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_hybrid_conv_attn(cfg: dict):
+def build_pt_hybrid_conv_attn(cfg: dict, log_params: bool = False):
     """Conv frontend + pos-cat -> 256-d -> self-attn(68) -> cross-attn(globals->68).
 
     Encoder: Embedding(21,128) -> 2xConv2D(128) -> cat([x, pos], dim=-1) -> [B,64,256]
@@ -602,7 +605,7 @@ def build_pt_hybrid_conv_attn(cfg: dict):
     return m
 
 
-def build_pt_conv_gemm(cfg: dict):
+def build_pt_conv_gemm(cfg: dict, log_params: bool = False):
     """4x GatedConvBlock2D(128, channels-first) -> GatedPoolCompressor(12 pools)
     -> [B, 1536] -> 6x alternating GELU/SwiGLU trunk
     -> WDL head after block 4, policy Linear(1536->1858) scatter to 4288 after block 6.
@@ -731,7 +734,7 @@ def build_pt_conv_gemm(cfg: dict):
     return m
 
 
-def build_pt_conv_gemm_smartgate(cfg: dict):
+def build_pt_conv_gemm_smartgate(cfg: dict, log_params: bool = False):
     """Same conv encoder as conv-gemm but with a SplitGatedPoolCompressor (18 pools).
     Main arm (1536-d): identical 6x trunk + WDL + quality policy logits.
     Gate arm (768-d):  1x SwiGLU -> Linear(768, 1858, bias=True).
@@ -882,7 +885,7 @@ def build_pt_conv_gemm_smartgate(cfg: dict):
     return m
 
 
-def build_pt_conv_mha_gemm_smartgate(cfg: dict):
+def build_pt_conv_mha_gemm_smartgate(cfg: dict, log_params: bool = False):
     """Conv encoder -> pos-cat [B,64,256] -> append 8 accum tokens -> [B,72,256]
     -> 1x MHABlock self-attn over 72 tokens
     -> 1x CrossAttnBlock(q=accum[8], kv=72) -> [B,8,256]
@@ -1055,7 +1058,7 @@ def build_pt_conv_mha_gemm_smartgate(cfg: dict):
     return m
 
 
-def build_pt_precond_smartgate(cfg: dict):
+def build_pt_precond_smartgate(cfg: dict, log_params: bool = False):
     """4x Conv(256) preconditioner -> concat pos(256) -> 512-d
     -> append 8 specialized global accumulators -> 4x transformer blocks
     -> shared trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
@@ -1335,11 +1338,12 @@ def build_pt_precond_smartgate(cfg: dict):
             return combined.to(x.dtype), wdl
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_conv_shallow_mha(cfg: dict):
+def build_pt_conv_shallow_mha(cfg: dict, log_params: bool = False):
     """2x Conv(128) -> LN(x) -> concat(x, x, pos(128)) -> 384-d
     -> append 8 global accumulators -> 8x TxBlock(d=384, ff_dim=1024)
     -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7) at 384-d.
@@ -1483,11 +1487,12 @@ def build_pt_conv_shallow_mha(cfg: dict):
             return combined.to(x.dtype), wdl
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_conv_pure(cfg: dict):
+def build_pt_conv_pure(cfg: dict, log_params: bool = False):
     """N x ConvBlock(conv_filters) channels-first (NCHW) backbone -> trunk_ln,
     N = cfg["num_blocks"] (currently 16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
     WDL:       Conv(256,8) -> leaky_relu -> reshape [B,512] -> GELU -> Linear(512,3).
@@ -1612,11 +1617,12 @@ def build_pt_conv_pure(cfg: dict):
             return combined.to(trunk.dtype), wdl
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 
-def build_pt_full_mha_smartgate(cfg: dict):
+def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
     """No conv. Embedding(256) + pos(128) -> cat -> 384-d [B,64,384]
     -> append 8 global accum tokens -> 7x TxBlock(d=384) -> Linear(384->512) expander
     -> 1x TxBlock(d=512) -> trunk_ln(512)
@@ -1750,7 +1756,8 @@ def build_pt_full_mha_smartgate(cfg: dict):
             return combined.to(x.dtype), wdl
 
     m = M()
-    print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
     return m
 
 

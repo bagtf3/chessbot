@@ -761,6 +761,7 @@ def main(run_tag):
                         to_process = finished_games.popleft()
                         rescorer.submit(pull_pkl(to_process))
                     rescorer.tick()
+                    recorder.maybe_log_results()
 
                     time.sleep(0.05)
 

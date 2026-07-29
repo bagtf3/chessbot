@@ -2,9 +2,9 @@
 
 ## Board Encoding
 
-The neural network receives a board as 64 integer tokens, one per square, always from the perspective of the side to move (STM-as-white). Black positions are flipped via `sq ^ 56` before encoding so the model always sees its own pieces as the "white" side.
+The base building block is a single position encoded as 64 integer tokens, one per square, always from the perspective of the side to move (STM-as-white). Black positions are flipped via `sq ^ 56` before encoding so the model always sees its own pieces as the "white" side.
 
-Token values:
+Single-frame token values:
 
 | Range | Meaning |
 |---|---|
@@ -14,15 +14,15 @@ Token values:
 | 10–18 | Opponent pieces (same structure, +9 offset) |
 | 19 | En passant target square |
 
-Castling rights are folded into the king token — no separate planes are needed. The en passant square gets its own token on the target square, giving the model direct spatial context about which file is eligible. There are no stacked history planes; the model sees only the current position.
+Castling rights are folded into the king token in this single-frame encoding — no separate planes are needed. The en passant square gets its own token on the target square, giving the model direct spatial context about which file is eligible. Vocabulary size is 21. This encoding is defined in C++ (pyfastchess) and is fixed across the entire stack.
 
-Vocabulary size is 21. This encoding is defined in C++ (pyfastchess) and is fixed across the entire stack.
+The **primary model encoding** (`xc0h`) stacks 6 of these frames — the current position plus 5 prior positions, oldest padded if the game is younger than that — instead of just the current one. Each frame uses a simplified per-square token (pieces 1-6/7-12 by ownership, no castling folded in, EP token, pad token for missing history), all frozen to the same STM-relative orientation so frames stay spatially aligned across time. The stack is followed by a per-frame repetition flag and 3 metadata scalars (combined castling rights, side to move, halfmove clock), for a flat length of `K*64 + K + 3` — 393 tokens at `history_K=6`. This was adopted as the primary architecture after testing showed it outperforming the single-frame, no-history version (see the FAQ: "Do you use history planes?").
 
 ## Preconditioner-SmartGate Architecture
 
-The active model is `16m-precond-smartgate`, built by `build_pt_precond_smartgate` in `src/chessbot/model.py`. It is a PyTorch model (~15.8M parameters) trained in float16. The design pairs a convolutional preconditioner with a transformer trunk, and attaches every output head to a dedicated global accumulator token rather than pooling over the board.
+The active model family is `precond-smartgate` (`build_pt_precond_smartgate` in `src/chessbot/model.py`), currently run against the `xc0h` history encoding above. It is a PyTorch model trained in float16. The design pairs a convolutional preconditioner with a transformer trunk, and attaches every output head to a dedicated global accumulator token rather than pooling over the board.
 
-**Input and embedding.** The 64-token sequence goes through a token embedding (`vocab_size=21 → conv_filters=256`) and is reshaped to an 8×8 spatial grid.
+**Input and embedding.** The token sequence goes through a token embedding (`vocab_size=21 → conv_filters=256`) and is reshaped to an 8×8 spatial grid (the history/metadata tail is handled separately from the per-square grid).
 
 **Convolutional preconditioner.** 4 residual conv blocks (`pre_blocks=4`) run over the 8×8 grid. Each block is `LayerNorm → Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LeakyReLU`, added back as a residual (the first block skips the prenorm). This lets local spatial structure resolve before any attention runs.
 

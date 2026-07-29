@@ -21,7 +21,7 @@ things work is to build it myself. It's also fun to be able to experiment with n
 
 ## How strong is it?
 
-I estimate between 2600-2700 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs under 20 centipawn loss on average.
+I estimate around 3050 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs 8-10 centipawn loss on average.
 
 ---
 
@@ -43,19 +43,19 @@ That's intentional. Part of the appeal of the project is the constraint — figu
 
 ---
 
-## Why no history planes?
+## Do you use history planes?
 
-Most AlphaZero-style engines stack 8 ply of board history as input features. Xerces uses only the current position. The hypothesis is that history planes in AZ-style engines are largely cargo cult — the model learns to ignore most of them, and the useful signal (repetitions, piece trajectories) is either available from the search tree itself or can be captured with a better encoding. This remains an open question but the engine trains and plays well without them.
+Yes, as of the current primary architecture. Xerces started from the opposite hypothesis — that AlphaZero-style history planes are largely cargo cult, with the model learning to ignore most of them. That was tested head-to-head against a history-aware encoding, and stacking a short window of prior positions turned out to earn its keep, so it's now the primary encoding rather than a side experiment. The current scheme stacks the current position plus 5 prior frames (6 total), each in the same token-per-square style as the base encoding, alongside a per-frame repetition flag and a few metadata scalars (castling rights, side to move, halfmove clock). It's a lighter touch than the classic 8-ply AZ history stack — full board planes per frame — while still giving the model direct access to recent piece trajectories and repetitions instead of relying solely on the search tree for that signal.
 
 ---
 
 ## What's different about the board encoding?
 
-Rather than binary piece-plane stacks, Xerces encodes the board as 64 integer tokens — one per square — always from the side-to-move's perspective. A few design choices worth noting:
+Rather than binary piece-plane stacks, Xerces's base encoding represents a position as 64 integer tokens — one per square — always from the side-to-move's perspective. The primary model stacks 6 of these frames (current position + 5 prior) rather than just one — see "Do you use history planes?" above. A few design choices worth noting:
 
-- Castling rights are folded into the king token (9 possible values) rather than using separate planes.
+- Castling rights are folded into the king token (9 possible values) in the single-frame encoding, rather than using separate planes.
 - The en passant target square receives a dedicated token directly on that square, giving the model spatial context about which file is eligible.
-- The board is always flipped so the side to move appears as "white," so the model never has to learn two perspectives of the same position.
+- The board is always flipped so the side to move appears as "white," so the model never has to learn two perspectives of the same position — history frames stay frozen to that same orientation too, so they remain spatially aligned with the current frame.
 
 ---
 

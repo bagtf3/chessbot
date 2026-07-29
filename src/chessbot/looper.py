@@ -130,44 +130,6 @@ class GameLooper(object):
             self.model = sess
             self.infer = make_lc0_infer(sess)
     
-    def run_training_predictions(self, msg):
-        import pickle, pathlib
-        training_dir = msg.get("training_dir", "")
-        pred_pkl_path = msg.get("pred_pkl_path", "")
-
-        pkls = sorted(pathlib.Path(training_dir).glob("*.pkl"))
-        samples = []
-        for p in pkls:
-            try:
-                with open(p, "rb") as f:
-                    chunk = pickle.load(f)
-                samples.extend(chunk)
-            except Exception as e:
-                print(f"[worker] predict_then_pause: failed reading {p}: {e}")
-
-        if not samples:
-            print("[worker] predict_then_pause: no training samples found")
-            return
-
-        batch_size = 256
-        results = []
-        xs = [s[0] for s in samples]
-        for i in range(0, len(xs), batch_size):
-            batch = np.stack(xs[i:i + batch_size], axis=0)
-            probs_np, vals_np = self.infer((batch,))
-            for j in range(len(probs_np)):
-                pred_wdl = tuple(float(v) for v in vals_np[j])
-                pred_pol = probs_np[j].tolist()
-                results.append((pred_wdl, pred_pol))
-
-        try:
-            with open(pred_pkl_path, "wb") as f:
-                pickle.dump(results, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[worker] predict_then_pause: saved {len(results)} preds to "
-                  f"{pathlib.Path(pred_pkl_path).name}")
-        except Exception as e:
-            print(f"[worker] predict_then_pause: failed saving preds: {e}")
-
     def check_for_pause(self):
         """
         Drain msg_q (non-blocking). Return True if a pause was requested.
@@ -185,10 +147,6 @@ class GameLooper(object):
             cmd = msg.get("cmd") if isinstance(msg, dict) else msg
 
             if cmd == "pause":
-                return True
-
-            if cmd == "predict_then_pause":
-                self.run_training_predictions(msg)
                 return True
 
             if cmd == "unpause":

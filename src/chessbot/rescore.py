@@ -1,10 +1,8 @@
-import os, json, gzip, pathlib, time
+import os, json, gzip, time
 from types import SimpleNamespace
 from pathlib import Path
 import uuid
-import sys
 import random
-import subprocess
 import threading
 from collections import deque
 from queue import Empty
@@ -23,6 +21,7 @@ from chessbot.utils import (
     calc_entropy,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
+from chessbot.replay_buffer import LiveBuffer
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -227,9 +226,8 @@ class Rescorer(object):
         self.game_q   = sf_game_q
         self.res_q    = sf_res_q
 
-        self.training_data = []
+        self.live_buffer = LiveBuffer(cfg.primary_buffer_dir)
         self.analyzed_results = []
-        self.pending_pred_samples = None
 
 
         self.start_time = None  # set on first game to exclude idle startup time
@@ -323,7 +321,7 @@ class Rescorer(object):
 
     def export_state(self):
         return {
-            'training_data': self.training_data,
+            'live_buffer_records': self.live_buffer.records,
             'analyzed_results': self.analyzed_results,
             'games_seen': self.games_seen,
             'games_processed': self.games_processed,
@@ -373,6 +371,9 @@ class Rescorer(object):
 
     def import_state(self, state):
         for k, v in state.items():
+            if k == 'live_buffer_records':
+                self.live_buffer.records = v
+                continue
             setattr(self, k, v)
 
     def __enter__(self):
@@ -384,7 +385,7 @@ class Rescorer(object):
 
     @property
     def training_data_size(self):
-        return len(self.training_data)
+        return len(self.live_buffer)
 
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
@@ -392,7 +393,7 @@ class Rescorer(object):
     def tick(self):
         if self.lc0_thread is not None:
             for sample in self.lc0_thread.drain():
-                self.training_data.append(sample)
+                self.live_buffer.append(sample)
 
         # drain completed game batches from SF threads
         while True:
@@ -403,6 +404,12 @@ class Rescorer(object):
             if gid == '__error__':
                 raise results
             self.handle_game_results(gid, results)
+
+        flushed = self.live_buffer.flush_all_ready()
+        if flushed:
+            n = len(flushed) * self.live_buffer.shard_size
+            self.written_this_round += n
+            self.written_total += n
 
         if len(self.intake) > len(self.pending):
             intake_list = list(self.intake)
@@ -481,42 +488,7 @@ class Rescorer(object):
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         x, mask, policy = self.make_policy_example(board, ucis, visits)
-        self.training_data.append((x, mask, policy, Y, vwht, pwht, 'xc0'))
-    
-    def write_training_data_pkl(self, size=None, randomize=True):
-        cfg = self.config
-        out_dir = pathlib.Path(cfg.pending_training_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # clear stale pkl shards from any previous failed retrain
-        deleted = []
-        for p in out_dir.iterdir():
-            if p.is_file() and p.suffix == ".pkl":
-                p.unlink()
-                deleted.append(p.name)
-
-        if deleted:
-            print(f"{RS} deleted {len(deleted)} stale pkl files in {out_dir}")
-
-        if randomize:
-            random.shuffle(self.training_data)
-
-        if size is None:
-            size = cfg.retrain_size
-
-        chunk = self.training_data[:size]
-        remainder = self.training_data[size:]
-
-        filename = f"{int(time.time())}-{uuid.uuid4().hex}.pkl"
-        out_path = out_dir / filename
-
-        with open(out_path, "wb") as f:
-            pickle.dump(chunk, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        self.pending_pred_samples = chunk
-        self.training_data = remainder
-        self.written_this_round += len(chunk)
-        self.written_total += len(chunk)
+        self.live_buffer.append((x, mask, policy, Y, vwht, pwht, 'xc0'))
 
     def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
         cfg = self.config
@@ -975,7 +947,7 @@ class Rescorer(object):
             entry = (x, mask, policy, Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
-                self.training_data.append(entry)
+                self.live_buffer.append(entry)
                 sc['accepted'] += 1
                 scw['accepted'] += 1
 
@@ -1049,7 +1021,7 @@ class Rescorer(object):
                     source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
                 else:
                     source = 'lc0_enrich'  # main position from random enrich sampling
-                self.training_data.append((x, mask, policy, lc0_wdl, vwht * w, pwht * w, source))
+                self.live_buffer.append((x, mask, policy, lc0_wdl, vwht * w, pwht * w, source))
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
@@ -1249,13 +1221,13 @@ class Rescorer(object):
             return
 
         with open(pred_pkl_path, 'rb') as f:
-            preds = pickle.load(f)  # list of (pred_wdl, pred_pol_logits)
+            payload = pickle.load(f)  # {"samples": [...], "preds": [(pred_wdl, pred_pol_logits)]}
 
-        samples = self.pending_pred_samples
-        self.pending_pred_samples = None
+        samples = payload["samples"]
+        preds = payload["preds"]
 
         if not samples:
-            print("[metrics] no pending_pred_samples, skipping")
+            print("[metrics] no samples in pred pkl, skipping")
             return
 
         if len(samples) != len(preds):
@@ -1264,7 +1236,7 @@ class Rescorer(object):
 
         eps = 1e-7
         group_names = (
-            'xc0_vs_true', 'xc0_vs_lc0', 'xc0_vs_lc0_blunder', 'xc0_vs_lc0_enrich',
+            'xc0_vs_true', 'xc0_vs_lc0', 'xc0_vs_lc0_blunder',
         )
         groups = {k: {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [], 'pol_mask': []}
                   for k in group_names}
@@ -1280,10 +1252,8 @@ class Rescorer(object):
                 grp_keys = ['xc0_vs_lc0']
                 if source in ('lc0_blunder', 'lc0_pv'):
                     grp_keys.append('xc0_vs_lc0_blunder')
-                elif source == 'lc0_enrich':
-                    grp_keys.append('xc0_vs_lc0_enrich')
-                # legacy tag 'lc0' predates the blunder/enrich split and can't
-                # be attributed to either sub-slice -- counted in the "all" bucket only
+                # legacy tag 'lc0' and 'lc0_enrich' aren't split out further --
+                # counted in the "all" bucket only
 
             for grp in grp_keys:
                 g = groups[grp]
@@ -1351,7 +1321,6 @@ class Rescorer(object):
         xb  = metrics_block(groups['xc0_vs_true'], want_legal_stats=True)
         lb  = metrics_block(groups['xc0_vs_lc0'], want_legal_stats=True)
         lbb = metrics_block(groups['xc0_vs_lc0_blunder'])
-        lbe = metrics_block(groups['xc0_vs_lc0_enrich'])
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
@@ -1369,7 +1338,7 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(xb, 'true'), (lb, 'lc0 all'), (lbb, 'lc0 blunder'), (lbe, 'lc0 enrich')]
+        slices = [(xb, 'true'), (lb, 'lc0 all'), (lbb, 'lc0 blunder')]
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:
@@ -2079,109 +2048,5 @@ def encourage_best_move(visits, played_mv, best_mv, lms):
     d[best_mv] = max(d.get(best_mv, 1), d.get(played_mv, 1))
     items = sorted(d.items(), key=lambda x: x[1], reverse=True)
     return [[u, int(v)] for u, v in items]
-
-
-def launch_retrain_async(run_tag, rt_script, working_cfg, epoch=None, pred_pkl_path=None):
-    cmd = [sys.executable, rt_script, "--run-dir", working_cfg.run_dir]
-    cmd += ["--batch-size", str(working_cfg.retrain_batch_size)]
-    if epoch is not None:
-        cmd += ["--epoch", str(epoch)]
-    if pred_pkl_path is not None:
-        cmd += ["--pred-pkl-path", pred_pkl_path]
-
-    print(f"[retrain] launching worker")
-
-    start_new_session = False
-    creationflags = 0
-    if os.name == "posix":
-        start_new_session = True
-    else:
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
-    try:
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=start_new_session,
-            creationflags=creationflags,
-            text=True,
-            bufsize=1,   # line buffered
-        )
-    
-    except Exception as e:
-        raise RuntimeError(f"[retrain] failed to start retrain worker: {e}")
-
-    return {
-        "p": p,
-        "cmd": cmd,
-        "stdout_buf": deque(),
-        "stderr_buf": deque(),
-        "done": False,
-        "rc": None,
-    }
-
-
-def drain_pipe_lines(pipe, buf, max_lines=200):
-    n = 0
-    if pipe is None:
-        return 0
-
-    # Use readline() in a bounded loop; it may block if no newline is available.
-    # To keep this non-blocking, only call it when poll() indicates process ended,
-    # OR keep max_lines small and accept that it can block if the worker writes
-    # partial lines without '\n'. Most scripts print lines, so this is usually fine.
-    while n < max_lines:
-        ln = pipe.readline()
-        if not ln:
-            break
-        buf.append(ln.rstrip("\n"))
-        n += 1
-    return n
-
-
-def poll_retrain(handle, print_output=True):
-    """
-    Call frequently from your main loop.
-    Returns: (done: bool, rc: int | None)
-    """
-    p = handle["p"]
-
-    rc = p.poll()
-    handle["rc"] = rc
-
-    # If you want "live" output while running, you need non-blocking IO (selectors)
-    # or a reader thread. The simple safe option: only drain once it's done.
-    if rc is None:
-        return False, None
-
-    # Process ended: drain remaining output fully
-    drain_pipe_lines(p.stdout, handle["stdout_buf"], max_lines=10_000)
-    drain_pipe_lines(p.stderr, handle["stderr_buf"], max_lines=10_000)
-
-    if print_output:
-        if handle["stdout_buf"]:
-            print("[retrain] STDOUT:")
-            while handle["stdout_buf"]:
-                print(handle["stdout_buf"].popleft())
-
-        if handle["stderr_buf"]:
-            print("[retrain] STDERR:")
-            while handle["stderr_buf"]:
-                print(handle["stderr_buf"].popleft())
-
-    handle["done"] = True
-    print(f"[retrain] worker finished exit_code={rc}")
-
-    # Close pipes to release resources
-    if p.stdout is not None:
-        p.stdout.close()
-    if p.stderr is not None:
-        p.stderr.close()
-
-    if rc != 0:
-        raise RuntimeError(f"[retrain] worker failed; exit_code={rc}")
-
-    return True, rc
 
 

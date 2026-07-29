@@ -1800,6 +1800,8 @@ class RecordKeeper(object):
         self.black_wins = 0
         self.draws = 0
         self.training_queue = 0
+        self.primary_buffer_dir = None
+        self.primary_buffer_trigger = 0
 
         self.recent_games = []
         self.telemetry = {}
@@ -1907,9 +1909,11 @@ class RecordKeeper(object):
 
         # pretty printer
         print_recent_summary(recent, window=window)
+        primary_count = len(os.listdir(self.primary_buffer_dir)) if self.primary_buffer_dir else 0
         print(
-            f"Length of training queue: {self.training_queue} ",
-            f"Current retrain number: {self.n_retrains}\n"
+            f"live buffer: {self.training_queue}  "
+            f"primary_buffer: {primary_count}/{self.primary_buffer_trigger}  "
+            f"retrain number: {self.n_retrains}\n"
         )
         # chain log_loop_stats here as well
         self.log_loop_stats(summed, avged)

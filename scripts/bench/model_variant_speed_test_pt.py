@@ -8,16 +8,9 @@ Models:
                                          -> 512-d -> 8 global accumulators -> 4x transformer
                                          blocks -> shared trunk_ln -> WDL(0) + SmartGate(1)
                                          + from/to policy(2-7)
-  16m-precond-smartgate-xc0h-K6-5c5t -- same, with 5 conv preconditioner blocks and
-                                         5 transformer blocks instead of 4+4
   18m-precond-smartgate-xc0h-K6-6c4t -- same stem; 6 conv preconditioner blocks, 4
                                         transformer blocks (unchanged), pos concatenated
                                         (CF=256 -> D=512, same as prod)
-  16m-precond-smartgate-xc0h-K6-cfiw -- same stem; pos added once up front (CF=256,
-                                        d_model stays 256); 5x interleaved blocks, each
-                                        1 MHA block (over board+global, 72 tokens) then
-                                        2 conv blocks (over the 64 board tokens reshaped
-                                        to 8x8, global tokens excluded from conv)
   conv-pure                          -- 16x ConvBlock(256) NCHW -> trunk_ln -> WDL conv(8)
                                          -> SmartGate conv(16,3x3)->1024->512 SwiGLU/RMSNorm
                                          -> policy 2xLinear->256->MHA(256)
@@ -55,16 +48,6 @@ CSV_RESULTS  = os.path.join(TRT_CACHE, "speed_results.csv")
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
 XC0H_CFG = dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=6)
-
-XC0H_5C5T_CFG = dict(
-    conv_filters=256, num_heads=8, dropout=0.05,
-    pre_blocks=5, tx_blocks=5, xc0h_K=6,
-)
-
-XC0H_CFIW_CFG = dict(
-    conv_filters=256, num_heads=8, dropout=0.05,
-    xc0h_K=6, add_pos=True, interleave_n=5,
-)
 
 XC0H_6C4T_CFG = dict(
     conv_filters=256, num_heads=8, dropout=0.05,
@@ -405,82 +388,6 @@ def main():
                 del trt_sess_xh; gc.collect()
             except Exception as e:
                 print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 TRT: {e}")
-
-    # 16m-precond-smartgate-xc0h-K6-5c5t
-    print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate-xc0h-K6-5c5t  (same stem as xc0h-K6;"
-          f" 5 conv preconditioner blocks + 5 transformer blocks instead of 4+4)")
-    model_5c5t  = build_pt_precond_smartgate(XC0H_5C5T_CFG)
-    params_5c5t = sum(p.numel() for p in model_5c5t.parameters())
-
-    if not args.dry_run:
-        try:
-            print(f"\n  Building 16m-precond-smartgate-xc0h-K6-5c5t PT eager ...")
-            eager_5c5t = make_pt_eager_infer(model_5c5t, device)
-            lbl = "16m-precond-smartgate-xc0h-K6-5c5t  PT eager"
-            all_results[lbl] = run_or_cached(
-                lbl, eager_5c5t, params_5c5t,
-                input_fn=lambda b: random_xc0h_tokens(b, 6))
-            del eager_5c5t; gc.collect(); torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-5c5t PT eager: {e}")
-
-        if not args.skip_trt:
-            try:
-                lbl        = "16m-precond-smartgate-xc0h-K6-5c5t  ORT TRT"
-                onnx_5c5t  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_5c5t_{params_5c5t}.onnx")
-                if not os.path.exists(onnx_5c5t):
-                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
-                    export_to_onnx(build_pt_precond_smartgate(XC0H_5C5T_CFG), device, onnx_5c5t, dummy=dummy)
-                else:
-                    print(f"  [TRT] ONNX cached: {onnx_5c5t}")
-                trt_5c5t, trt_sess_5c5t = make_trt_infer(
-                    onnx_5c5t, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
-                all_results[lbl] = run_or_cached(
-                    lbl, trt_5c5t, params_5c5t,
-                    input_fn=lambda b: random_xc0h_tokens(b, 6))
-                del trt_sess_5c5t; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-5c5t TRT: {e}")
-
-    # 16m-precond-smartgate-xc0h-K6-cfiw
-    print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate-xc0h-K6-cfiw  (same stem as xc0h-K6; pos added once"
-          f" up front, d_model stays CF=256; 5x [1 MHA block over 72 tokens ->"
-          f" 2 conv blocks over the 64 board tokens reshaped to 8x8, global tokens"
-          f" excluded from conv])")
-    model_cfiw  = build_pt_precond_smartgate(XC0H_CFIW_CFG)
-    params_cfiw = sum(p.numel() for p in model_cfiw.parameters())
-
-    if not args.dry_run:
-        try:
-            print(f"\n  Building 16m-precond-smartgate-xc0h-K6-cfiw PT eager ...")
-            eager_cfiw = make_pt_eager_infer(model_cfiw, device)
-            lbl = "16m-precond-smartgate-xc0h-K6-cfiw  PT eager"
-            all_results[lbl] = run_or_cached(
-                lbl, eager_cfiw, params_cfiw,
-                input_fn=lambda b: random_xc0h_tokens(b, 6))
-            del eager_cfiw; gc.collect(); torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-cfiw PT eager: {e}")
-
-        if not args.skip_trt:
-            try:
-                lbl        = "16m-precond-smartgate-xc0h-K6-cfiw  ORT TRT"
-                onnx_cfiw  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_cfiw_{params_cfiw}.onnx")
-                if not os.path.exists(onnx_cfiw):
-                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
-                    export_to_onnx(build_pt_precond_smartgate(XC0H_CFIW_CFG), device, onnx_cfiw, dummy=dummy)
-                else:
-                    print(f"  [TRT] ONNX cached: {onnx_cfiw}")
-                trt_cfiw, trt_sess_cfiw = make_trt_infer(
-                    onnx_cfiw, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
-                all_results[lbl] = run_or_cached(
-                    lbl, trt_cfiw, params_cfiw,
-                    input_fn=lambda b: random_xc0h_tokens(b, 6))
-                del trt_sess_cfiw; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6-cfiw TRT: {e}")
 
     # 18m-precond-smartgate-xc0h-K6-6c4t
     print(f"\n{'='*60}")

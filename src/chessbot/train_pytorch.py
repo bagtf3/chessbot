@@ -17,6 +17,10 @@ def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
 
 FALLBACK_ARCH = "13m-precond-conformer"
 
+# TEMPORARY cap on how many records retrain_pt puts on the GPU at once.
+# Remove once retrain moves to the tfrec + async EpochBuffer streamer.
+VRAM_CHUNK = 5120
+
 
 def shorten_path(p):
     parts = p.replace("\\", "/").split("/")
@@ -53,7 +57,7 @@ def companion_pt(ts_path: str) -> str:
     return ts_path[:-3] + ".pt"
 
 
-def load_pt_model(path):
+def load_pt_model(path, log_params=False):
     """Returns (model, arch_or_None).
     .ts path: loads ScriptModule directly (no architecture dependency).
               arch read from companion .pt metadata if present.
@@ -66,7 +70,7 @@ def load_pt_model(path):
             if isinstance(meta, dict) and "model" in meta:
                 from chessbot.model import PT_BUILDERS, VARIANTS
                 arch = meta.get("arch", FALLBACK_ARCH)
-                model = PT_BUILDERS[arch](VARIANTS[arch])
+                model = PT_BUILDERS[arch](VARIANTS[arch], log_params=log_params)
                 model.load_state_dict(meta["model"], strict=False)
                 log_policy_mask_status(model)
                 return model, arch
@@ -79,7 +83,7 @@ def load_pt_model(path):
         if isinstance(state_dict, torch.nn.Module):
             return state_dict, FALLBACK_ARCH
         arch = obj.get("arch", FALLBACK_ARCH)
-        model = PT_BUILDERS[arch](VARIANTS[arch])
+        model = PT_BUILDERS[arch](VARIANTS[arch], log_params=log_params)
         model.load_state_dict(state_dict, strict=False)
         log_policy_mask_status(model)
         return model, arch
@@ -113,11 +117,11 @@ def save_pt_model(model, path, arch=None, opt=None):
             with torch.no_grad():
                 traced = torch.jit.trace(trace_model, dummy)
             torch.jit.save(traced, path)
-        print(f"[pytorch] TorchScript saved -> {shorten_path(path)}")
+        print(f"[pytorch] TorchScript saved -> {os.path.basename(path)}")
         pt_path = companion_pt(path)
         payload = {"model": model.state_dict(), "arch": arch}
         torch.save(payload, pt_path)
-        print(f"[pytorch] companion weights saved -> {shorten_path(pt_path)}")
+        print(f"[pytorch] companion weights saved -> {os.path.basename(pt_path)}")
         return
     payload = {"model": model.state_dict(), "arch": arch}
     if opt is not None:
@@ -160,19 +164,18 @@ def print_pt_fit_history(epoch_losses, epoch, label=""):
 def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
     if not epoch_grad_stats:
         return
-    etag    = f"[epoch {epoch:4d}]{(' ' + label) if label else ''}"
+    tag     = f"[retrain{(' ' + label) if label else ''}]"
     clips   = [gs['gn_clips'] for gs in epoch_grad_stats]
     steps   = [gs['gn_steps'] for gs in epoch_grad_stats]
     means   = [gs['gn_mean']   for gs in epoch_grad_stats]
     medians = [gs['gn_median'] for gs in epoch_grad_stats]
     mins    = [gs['gn_min']    for gs in epoch_grad_stats]
     maxs    = [gs['gn_max']    for gs in epoch_grad_stats]
-    breakdown = "  ".join(f"ep{i}: {c}" for i, c in enumerate(clips))
     print(
-        f"{etag} [grad stats] "
+        f"{tag} gradient stats for epoch {epoch}: "
         f"mean={np.mean(means):.2f}  median={np.mean(medians):.2f}  "
         f"min={min(mins):.2f}  max={max(maxs):.2f}  "
-        f"clips={sum(clips)}/{sum(steps)} ({breakdown})"
+        f"clips={sum(clips)}/{sum(steps)}"
     )
 
 
@@ -194,17 +197,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     model  = model.to(device).train()
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
-    n      = len(X)
-    if cfg.encoding_type == "lc0":
-        # raw uint8 lc0 planes -> float, rule50 /99 at the model-input boundary
-        X_t = torch.from_numpy(X).float().to(device)
-        X_t[:, 109] /= 99.0
-    else:
-        X_t = torch.from_numpy(X).long().to(device)
-    P_t    = torch.from_numpy(P).float().to(device)
-    Y_t    = torch.from_numpy(Y_wdl).float().to(device)
-    vwht_t = torch.from_numpy(vwht).float().to(device)
-    pwht_t = torch.from_numpy(pwht).float().to(device)
+    n = len(X)
 
     lr = cfg.learning_rate
     clip_norm = cfg.retrain_clip_norm
@@ -232,74 +225,101 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     else:
         print(f"{tag} no prior Adam state - starting fresh")
 
+    from torch.amp import autocast, GradScaler
+    scaler = GradScaler("cuda")
+
     epoch_losses     = []
     epoch_grad_stats = []
     nan_skips        = 0
     t0 = time.time()
     for ep_idx in range(1):
-        idx          = torch.randperm(n, device=device)
+        # TEMPORARY: chunk the dataset into <=VRAM_CHUNK-record groups so a
+        # single retrain never pushes more than that onto the GPU at once --
+        # loading the whole array upfront was blowing past VRAM on large
+        # retrains and falling back to slow system-RAM spillover. Remove
+        # once retrain moves to the tfrec + async EpochBuffer streamer.
+        perm         = np.random.permutation(n)
         total        = value_total = policy_total = 0.0
         steps        = 0
         grad_norms   = []
         clip_count   = 0
 
-        for start in range(0, n, args.batch_size):
-            batch_idx = idx[start:start + args.batch_size]
-            xb  = X_t[batch_idx]
-            pb  = P_t[batch_idx]
-            yb  = Y_t[batch_idx]
-            vwb = vwht_t[batch_idx]
-            pwb = pwht_t[batch_idx]
+        for chunk_start in range(0, n, VRAM_CHUNK):
+            chunk_idx = perm[chunk_start:chunk_start + VRAM_CHUNK]
 
-            policy_logits, value_out = model(xb)
+            if cfg.encoding_type == "lc0":
+                X_t = torch.from_numpy(X[chunk_idx]).float().to(device)
+                X_t[:, 109] /= 99.0
+            else:
+                X_t = torch.from_numpy(X[chunk_idx]).long().to(device)
+            P_t    = torch.from_numpy(P[chunk_idx]).float().to(device)
+            Y_t    = torch.from_numpy(Y_wdl[chunk_idx]).float().to(device)
+            vwht_t = torch.from_numpy(vwht[chunk_idx]).float().to(device)
+            pwht_t = torch.from_numpy(pwht[chunk_idx]).float().to(device)
 
-            log_probs   = F.log_softmax(policy_logits, dim=-1)
-            policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
+            for start in range(0, len(chunk_idx), args.batch_size):
+                end = start + args.batch_size
+                xb  = X_t[start:end]
+                pb  = P_t[start:end]
+                yb  = Y_t[start:end]
+                vwb = vwht_t[start:end]
+                pwb = pwht_t[start:end]
 
-            log_wdl    = F.log_softmax(value_out, dim=-1)
-            value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
-
-            loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
-            opt.zero_grad()
-            loss.backward()
-            raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
-
-            if not np.isfinite(raw_norm):
-                nan_skips += 1
-                dump_path = os.path.join(
-                    os.path.dirname(model_path),
-                    f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
-                try:
-                    import pickle
-                    with open(dump_path, "wb") as f:
-                        pickle.dump({
-                            'batch_idx': batch_idx.detach().cpu().numpy(),
-                            'X':    xb.detach().cpu().numpy(),
-                            'P':    pb.detach().cpu().numpy(),
-                            'Y':    yb.detach().cpu().numpy(),
-                            'vwht': vwb.detach().cpu().numpy(),
-                            'pwht': pwb.detach().cpu().numpy(),
-                            'loss': loss.item() if torch.isfinite(loss) else float('nan'),
-                            'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
-                            'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
-                        }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
-                          f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
-                except Exception as e:
-                    print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
-                          f"failed to dump offending batch: {e}")
                 opt.zero_grad()
-                continue
+                with autocast("cuda"):
+                    policy_logits, value_out = model(xb)
 
-            grad_norms.append(raw_norm)
-            if raw_norm > clip_norm:
-                clip_count += 1
-            opt.step()
+                    log_probs   = F.log_softmax(policy_logits, dim=-1)
+                    policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
 
-            total        += loss.item()
-            policy_total += policy_loss.item()
-            value_total  += value_loss.item()
-            steps        += 1
+                    log_wdl    = F.log_softmax(value_out, dim=-1)
+                    value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
+
+                    loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
+
+                if not np.isfinite(raw_norm):
+                    nan_skips += 1
+                    dump_path = os.path.join(
+                        os.path.dirname(model_path),
+                        f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
+                    try:
+                        import pickle
+                        with open(dump_path, "wb") as f:
+                            pickle.dump({
+                                'batch_idx': chunk_idx[start:end],
+                                'X':    xb.detach().cpu().numpy(),
+                                'P':    pb.detach().cpu().numpy(),
+                                'Y':    yb.detach().cpu().numpy(),
+                                'vwht': vwb.detach().cpu().numpy(),
+                                'pwht': pwb.detach().cpu().numpy(),
+                                'loss': loss.item() if torch.isfinite(loss) else float('nan'),
+                                'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
+                                'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
+                            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
+                              f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
+                    except Exception as e:
+                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
+                              f"failed to dump offending batch: {e}")
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad()
+                    continue
+
+                grad_norms.append(raw_norm)
+                if raw_norm > clip_norm:
+                    clip_count += 1
+                scaler.step(opt)
+                scaler.update()
+
+                total        += loss.item()
+                policy_total += policy_loss.item()
+                value_total  += value_loss.item()
+                steps        += 1
 
         if nan_skips:
             print(f"{tag} {nan_skips} batch(es) skipped this epoch due to non-finite grad norm")
@@ -321,11 +341,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
     print_pt_fit_history(epoch_losses, epoch, label=label)
-    print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
     torch.save(opt.state_dict(), opt_state_path)
-    print(f"{tag} saved Adam state")
 
     t0 = time.time()
     if model_path.endswith(".ts"):
@@ -335,11 +353,11 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     if os.path.exists(model_path):
         try:
             os.replace(model_path, bak_path)
-            print(f"{tag} backed up existing model")
         except Exception as e:
             print(f"{tag} failed to backup existing model:", e)
 
     save_pt_model(model, model_path, arch)
+    print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
     print(f"{tag} retraining complete for epoch {epoch}")
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)
 
@@ -431,11 +449,8 @@ def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
             },
             do_constant_folding=False,
         )
-    print(f'[export] ONNX -> {onnx_path}')
 
     proto = onnx.load(onnx_path)
     proto = onnx_si.infer_shapes(proto)
     onnx.save(proto, onnx_path)
     del model
-    sz_mb = os.path.getsize(onnx_path) / 1024 / 1024
-    print(f'[export] shape inference complete  ({sz_mb:.1f} MB)')

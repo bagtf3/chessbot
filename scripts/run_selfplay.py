@@ -704,6 +704,9 @@ def main(run_tag):
                         retrain_worker["p"].join(timeout=15.0)
                         if retrain_worker["p"].is_alive():
                             retrain_worker["p"].terminate()
+                            print("[retrain] worker process did not exit in time, terminated")
+                        else:
+                            print("[retrain] worker process exited")
 
                         recorder.n_retrains += 1
                         working_cfg = Config.from_yaml(yaml_path, init=True)

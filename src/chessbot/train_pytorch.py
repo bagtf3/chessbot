@@ -117,11 +117,11 @@ def save_pt_model(model, path, arch=None, opt=None):
             with torch.no_grad():
                 traced = torch.jit.trace(trace_model, dummy)
             torch.jit.save(traced, path)
-        print(f"[pytorch] TorchScript saved -> {shorten_path(path)}")
+        print(f"[pytorch] TorchScript saved -> {os.path.basename(path)}")
         pt_path = companion_pt(path)
         payload = {"model": model.state_dict(), "arch": arch}
         torch.save(payload, pt_path)
-        print(f"[pytorch] companion weights saved -> {shorten_path(pt_path)}")
+        print(f"[pytorch] companion weights saved -> {os.path.basename(pt_path)}")
         return
     payload = {"model": model.state_dict(), "arch": arch}
     if opt is not None:
@@ -164,19 +164,18 @@ def print_pt_fit_history(epoch_losses, epoch, label=""):
 def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
     if not epoch_grad_stats:
         return
-    etag    = f"[epoch {epoch:4d}]{(' ' + label) if label else ''}"
+    tag     = f"[retrain{(' ' + label) if label else ''}]"
     clips   = [gs['gn_clips'] for gs in epoch_grad_stats]
     steps   = [gs['gn_steps'] for gs in epoch_grad_stats]
     means   = [gs['gn_mean']   for gs in epoch_grad_stats]
     medians = [gs['gn_median'] for gs in epoch_grad_stats]
     mins    = [gs['gn_min']    for gs in epoch_grad_stats]
     maxs    = [gs['gn_max']    for gs in epoch_grad_stats]
-    breakdown = "  ".join(f"ep{i}: {c}" for i, c in enumerate(clips))
     print(
-        f"{etag} [grad stats] "
+        f"{tag} gradient stats for epoch {epoch}: "
         f"mean={np.mean(means):.2f}  median={np.mean(medians):.2f}  "
         f"min={min(mins):.2f}  max={max(maxs):.2f}  "
-        f"clips={sum(clips)}/{sum(steps)} ({breakdown})"
+        f"clips={sum(clips)}/{sum(steps)}"
     )
 
 
@@ -342,11 +341,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
     print_pt_fit_history(epoch_losses, epoch, label=label)
-    print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
     torch.save(opt.state_dict(), opt_state_path)
-    print(f"{tag} saved Adam state")
 
     t0 = time.time()
     if model_path.endswith(".ts"):
@@ -356,11 +353,11 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     if os.path.exists(model_path):
         try:
             os.replace(model_path, bak_path)
-            print(f"{tag} backed up existing model")
         except Exception as e:
             print(f"{tag} failed to backup existing model:", e)
 
     save_pt_model(model, model_path, arch)
+    print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
     print(f"{tag} retraining complete for epoch {epoch}")
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)
 
@@ -452,11 +449,8 @@ def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
             },
             do_constant_folding=False,
         )
-    print(f'[export] ONNX -> {onnx_path}')
 
     proto = onnx.load(onnx_path)
     proto = onnx_si.infer_shapes(proto)
     onnx.save(proto, onnx_path)
     del model
-    sz_mb = os.path.getsize(onnx_path) / 1024 / 1024
-    print(f'[export] shape inference complete  ({sz_mb:.1f} MB)')

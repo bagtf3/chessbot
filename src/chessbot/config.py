@@ -132,8 +132,6 @@ class Config(object):
     contempt_fight_c = 0.0
     retrain_clip_norm = 10.0      # grad norm ceiling per retrain step
     retrain_batch_size = 512
-    retrain_size = 10240
-    training_queue_buffer = 30720
 
     # LC0 distillation enrichment
     lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env

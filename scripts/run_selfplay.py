@@ -520,7 +520,7 @@ def main(run_tag):
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
             procs = check_and_reap_procs(procs)
-            while len(procs) or (recorder.training_queue < working_cfg.training_queue_buffer):
+            while len(procs):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
@@ -667,6 +667,9 @@ def main(run_tag):
                         "replay_files": replay_files, "primary_files": None,
                         "stage": "preloading",
                     }
+                    print(f"[retrain] worker launched at {len(primary_files)}/{rb.PRIMARY_TRIGGER_SHARDS} "
+                          f"-- preloading {rb.RETRAIN_REPLAY_SHARDS} replay + "
+                          f"{rb.RETRAIN_HISTORIC_SHARDS} historic shards")
                     print(f"[rescore] KL running medians: "
                           f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
                     rescorer.reset_writer()
@@ -679,6 +682,8 @@ def main(run_tag):
                             retrain_worker["msg_q"].put({"cmd": "start", "primary": primary_sample})
                             retrain_worker["primary_files"] = primary_sample
                             retrain_worker["stage"] = "training"
+                            print(f"[retrain] {len(primary_files)}/{rb.PRIMARY_TRIGGER_SHARDS} -- "
+                                  f"sent start signal, worker validating + building retrain set")
 
                     try:
                         result = retrain_worker["result_q"].get_nowait()
@@ -692,8 +697,10 @@ def main(run_tag):
                         # retrain_done, once workers are back up.
                         for p in procs:
                             p["msg_q"].put("pause")
+                        print("[retrain] validation done, workers paused, training now")
 
                     elif result is not None and result["cmd"] == "retrain_done":
+                        print(f"[retrain] worker done ok={result.get('ok')}")
                         retrain_worker["p"].join(timeout=15.0)
                         if retrain_worker["p"].is_alive():
                             retrain_worker["p"].terminate()
@@ -724,10 +731,12 @@ def main(run_tag):
                         # rebuild above, an unavoidable prerequisite for it).
                         for p in procs:
                             p["msg_q"].put("unpause")
+                        print("[retrain] workers unpaused")
 
                         if result.get("ok"):
                             rb.move_files(retrain_worker["primary_files"], working_cfg.replay_buffer_dir)
                             rb.discard_files(retrain_worker["replay_files"])
+                            print("[retrain] primary -> replay rotated, cycle complete")
                         else:
                             print(f"[retrain] worker failed: {result.get('error')}")
 

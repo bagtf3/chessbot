@@ -1102,7 +1102,9 @@ def build_pt_precond_smartgate(cfg: dict):
             self.scale = nn.Parameter(torch.ones(d))
             self.eps   = eps
         def forward(self, x):
-            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+            xf = x.float()
+            n  = xf / xf.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+            return (n * self.scale.float()).to(x.dtype)
 
     class ConvBlock(nn.Module):
         def __init__(self, prenorm=True):

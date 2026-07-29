@@ -19,7 +19,7 @@ FALLBACK_ARCH = "13m-precond-conformer"
 
 # TEMPORARY cap on how many records retrain_pt puts on the GPU at once.
 # Remove once retrain moves to the tfrec + async EpochBuffer streamer.
-VRAM_CHUNK = 40960
+VRAM_CHUNK = 5120
 
 
 def shorten_path(p):
@@ -226,6 +226,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     else:
         print(f"{tag} no prior Adam state - starting fresh")
 
+    from torch.amp import autocast, GradScaler
+    scaler = GradScaler("cuda")
+
     epoch_losses     = []
     epoch_grad_stats = []
     nan_skips        = 0
@@ -263,17 +266,20 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 vwb = vwht_t[start:end]
                 pwb = pwht_t[start:end]
 
-                policy_logits, value_out = model(xb)
-
-                log_probs   = F.log_softmax(policy_logits, dim=-1)
-                policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
-
-                log_wdl    = F.log_softmax(value_out, dim=-1)
-                value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
-
-                loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
                 opt.zero_grad()
-                loss.backward()
+                with autocast("cuda"):
+                    policy_logits, value_out = model(xb)
+
+                    log_probs   = F.log_softmax(policy_logits, dim=-1)
+                    policy_loss = (-(pb * log_probs).sum(dim=-1) * pwb).mean()
+
+                    log_wdl    = F.log_softmax(value_out, dim=-1)
+                    value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
+
+                    loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
                 raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
 
                 if not np.isfinite(raw_norm):
@@ -300,13 +306,16 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     except Exception as e:
                         print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
                               f"failed to dump offending batch: {e}")
+                    scaler.step(opt)
+                    scaler.update()
                     opt.zero_grad()
                     continue
 
                 grad_norms.append(raw_norm)
                 if raw_norm > clip_norm:
                     clip_count += 1
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
 
                 total        += loss.item()
                 policy_total += policy_loss.item()

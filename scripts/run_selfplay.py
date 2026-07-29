@@ -5,22 +5,22 @@ import multiprocessing as mp
 import sys
 import json
 import queue
+import random
 
 import numpy as np
 import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import (
-    Rescorer, SFRescoreThread,
-    launch_retrain_async, poll_retrain,
-)
+from chessbot.rescore import Rescorer, SFRescoreThread
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
-from chessbot.utils import make_jsonable, format_time, find_script
+from chessbot.utils import make_jsonable, format_time
 from chessbot.validation import build_validation_summary, create_validation_config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
+from chessbot.retrain_worker import run_retrain_worker
+import chessbot.replay_buffer as rb
 
 import pickle
 import signal
@@ -361,24 +361,6 @@ def next_model_epoch(progress_csv_path):
 
 
 
-def launch_retrain(run_tag, working_cfg, epoch=0, pred_pkl_path=None):
-    rt_script = find_script("retrain_worker.py", start_file=__file__)
-    if not rt_script:
-        raise RuntimeError("retrain_worker.py not found")
-    return launch_retrain_async(
-        run_tag, rt_script, working_cfg,
-        epoch=epoch, pred_pkl_path=pred_pkl_path,
-    )
-
-
-def start_retrain(run_tag, working_cfg, rescorer, epoch, pred_pkl_path):
-    print(f"[rescore] KL running medians: "
-          f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
-    retrain = launch_retrain(run_tag, working_cfg, epoch=epoch, pred_pkl_path=pred_pkl_path)
-    rescorer.reset_writer()
-    return retrain
-
-
 def pull_pkl(to_process):
     # might be nested or flat depending on where it came from
     if 'meta' in to_process.keys():
@@ -411,10 +393,13 @@ def main(run_tag):
     remaining_pkl = os.path.join(base_cfg.run_dir, "remaining_untrained.pkl")
     if os.path.exists(remaining_pkl):
         with open(remaining_pkl, "rb") as f:
-            rescorer.training_data = pickle.load(f)
+            rescorer.live_buffer.records = pickle.load(f)
         os.remove(remaining_pkl)
-        n_loaded = len(rescorer.training_data)
+        n_loaded = len(rescorer.live_buffer)
         print(f"[main] loaded {n_loaded} samples from remaining_untrained.pkl")
+        rescorer.live_buffer.flush_all_ready()
+
+    rb.seed_replay_buffer(base_cfg.historic_dir, base_cfg.replay_buffer_dir)
 
     n_retrains = next_model_epoch(base_cfg.progress_csv_path)
 
@@ -429,14 +414,16 @@ def main(run_tag):
     game_queue = None
     sf_queue = None
     game_gen = None
-    retrain = None
+    retrain_worker = None
     total_games = 0
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
             cmd_paused = False
             recorder = RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
-            recorder.training_queue = len(rescorer.training_data)
+            recorder.training_queue = len(rescorer.live_buffer)
+            recorder.primary_buffer_dir = base_cfg.primary_buffer_dir
+            recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
 
             if STOP_REQUESTED.is_set() or STOP_AFTER_ROUND_REQUESTED.is_set():
                 break
@@ -470,7 +457,9 @@ def main(run_tag):
                 rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q)
                 rescorer.import_state(state)
                 recorder = chessbot.review.RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
-                recorder.training_queue = len(rescorer.training_data)
+                recorder.training_queue = len(rescorer.live_buffer)
+                recorder.primary_buffer_dir = working_cfg.primary_buffer_dir
+                recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
                 print("[cmd] reloaded config/rescore/review, rescorer state migrated")
 
             if run_num % base_cfg.validation_every == 0:
@@ -577,11 +566,10 @@ def main(run_tag):
 
                 if SAVE_TRAINING_DATA_REQUESTED.is_set():
                     SAVE_TRAINING_DATA_REQUESTED.clear()
-                    data = rescorer.training_data
+                    data = rescorer.live_buffer.records
                     n = SAVE_TRAINING_DATA_N
                     if n and n < len(data):
-                        import random as _random
-                        data = _random.sample(data, n)
+                        data = random.sample(data, n)
                     ts = int(time.time())
                     snap_path = os.path.join(base_cfg.run_dir, f"training_snapshot_{ts}.pkl")
                     with open(snap_path, "wb") as f:
@@ -654,74 +642,117 @@ def main(run_tag):
 
                 recorder.training_queue = rescorer.training_data_size
 
-                # check for a retrain
-                if recorder.training_queue >= working_cfg.training_queue_buffer:
-                    # drain so write gets accurate data; workers keep playing meanwhile
-                    rescorer.write_training_data_pkl(
-                        size=working_cfg.retrain_size, randomize=True)
-                    recorder.training_queue = rescorer.training_data_size
+                # spawn the retrain worker a shard early (31/32) so replay +
+                # historic loading overlaps with primary_buffer's last fill,
+                # then hand it the primary sample once it actually hits 32/32
+                primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
+                if retrain_worker is None and len(primary_files) >= rb.PRIMARY_TRIGGER_SHARDS - 1:
+                    replay_files = rb.sample_files(
+                        working_cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
+                    historic_files = rb.sample_files(
+                        working_cfg.historic_dir, rb.RETRAIN_HISTORIC_SHARDS)
+                    retrain_msg_q = ctx.Queue()
+                    retrain_result_q = ctx.Queue()
+                    retrain_p = ctx.Process(
+                        target=run_retrain_worker,
+                        args=(working_cfg.run_dir, retrain_msg_q, retrain_result_q, n_retrains),
+                        daemon=True,
+                    )
+                    retrain_p.start()
+                    retrain_msg_q.put({
+                        "cmd": "preload", "replay": replay_files, "historic": historic_files,
+                    })
+                    retrain_worker = {
+                        "p": retrain_p, "msg_q": retrain_msg_q, "result_q": retrain_result_q,
+                        "replay_files": replay_files, "primary_files": None,
+                        "stage": "preloading",
+                    }
+                    print(f"[rescore] KL running medians: "
+                          f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
+                    rescorer.reset_writer()
 
-                    # worker 0 predicts training batch then pauses; rest just pause
-                    pred_pkl_path = os.path.join(working_cfg.run_dir, "predictions_latest.pkl")
-                    if os.path.exists(pred_pkl_path):
-                        os.remove(pred_pkl_path)
-                    if procs:
-                        procs[0]["msg_q"].put({
-                            "cmd": "predict_then_pause",
-                            "training_dir": working_cfg.pending_training_dir,
-                            "pred_pkl_path": pred_pkl_path,
-                        })
-                    for p in procs[1:]:
-                        p["msg_q"].put("pause")
+                while retrain_worker is not None:
+                    if retrain_worker["stage"] == "preloading":
+                        primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
+                        if len(primary_files) >= rb.PRIMARY_TRIGGER_SHARDS:
+                            primary_sample = random.sample(primary_files, rb.RETRAIN_PRIMARY_SHARDS)
+                            retrain_worker["msg_q"].put({"cmd": "start", "primary": primary_sample})
+                            retrain_worker["primary_files"] = primary_sample
+                            retrain_worker["stage"] = "training"
 
-                    if retrain is None:
-                        retrain = start_retrain(
-                            run_tag, working_cfg, rescorer, n_retrains, pred_pkl_path)
+                    try:
+                        result = retrain_worker["result_q"].get_nowait()
+                    except queue.Empty:
+                        result = None
 
-                    while retrain is not None:
-                        done, rc = poll_retrain(retrain, print_output=True)
-                        if done:
-                            retrain = None
-                            recorder.n_retrains += 1
-                            working_cfg = Config.from_yaml(yaml_path, init=True)
-                            if is_validation:
-                                working_cfg = create_validation_config(working_cfg, val_yaml_path)
-                            rescorer.config = working_cfg
-                            for t in sf_rescore_threads:
-                                # preserve throttle state; cap to new base if config lowered depth
-                                current_depth = t.depth
-                                t.update_config(working_cfg)
-                                t.depth = min(current_depth, t.base_depth)
-                            rescorer.current_depth = sf_rescore_threads[0].depth
-                            rescorer.aggregate_metrics(
-                                n_retrains,
-                                working_cfg.progress_csv_path,
-                                pred_pkl_path)
-                            n_retrains += 1
+                    if result is not None and result["cmd"] == "retrain_ready":
+                        # validation is already done and predictions_latest.pkl
+                        # is on disk (self-contained samples+preds) by the time
+                        # this arrives -- just pause here. Metrics run after
+                        # retrain_done, once workers are back up.
+                        for p in procs:
+                            p["msg_q"].put("pause")
 
-                        # keep submitting games while waiting on retrain
-                        pulled_games = drain_queue(recent_q)
-                        for game in pulled_games:
-                            recorder.ingest_recents(game)
-                            update_game_index(game['meta'], base_cfg)
-                            finished_games.append(game)
-                        while finished_games:
-                            to_process = finished_games.popleft()
-                            rescorer.submit(pull_pkl(to_process))
-                        rescorer.tick()
+                    elif result is not None and result["cmd"] == "retrain_done":
+                        retrain_worker["p"].join(timeout=15.0)
+                        if retrain_worker["p"].is_alive():
+                            retrain_worker["p"].terminate()
 
-                        time.sleep(0.05)
+                        recorder.n_retrains += 1
+                        working_cfg = Config.from_yaml(yaml_path, init=True)
+                        if is_validation:
+                            working_cfg = create_validation_config(working_cfg, val_yaml_path)
+                        rescorer.config = working_cfg
+                        for t in sf_rescore_threads:
+                            # preserve throttle state; cap to new base if config lowered depth
+                            current_depth = t.depth
+                            t.update_config(working_cfg)
+                            t.depth = min(current_depth, t.base_depth)
+                        rescorer.current_depth = sf_rescore_threads[0].depth
 
-                    if working_cfg.inference_backend == 'ort_trt' and not is_validation:
-                        trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
-                        working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
+                        if result.get("ok") and working_cfg.inference_backend == 'ort_trt' and not is_validation:
+                            # workers only reload their model/engine after
+                            # unpause, so the TRT engine must be rebuilt for
+                            # the new weights first -- otherwise workers would
+                            # either grab a stale engine or each redundantly
+                            # recompile their own.
+                            trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
+                            working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
 
-                    # unpause workers
-                    for p in procs:
-                        p["msg_q"].put("unpause")
+                        # hard rule: unpause is the first thing that happens
+                        # once retrain has actually finished (plus the TRT
+                        # rebuild above, an unavoidable prerequisite for it).
+                        for p in procs:
+                            p["msg_q"].put("unpause")
 
-                else:
-                    time.sleep(0.5)
+                        if result.get("ok"):
+                            rb.move_files(retrain_worker["primary_files"], working_cfg.replay_buffer_dir)
+                            rb.discard_files(retrain_worker["replay_files"])
+                        else:
+                            print(f"[retrain] worker failed: {result.get('error')}")
+
+                        pred_pkl_path = os.path.join(working_cfg.run_dir, "predictions_latest.pkl")
+                        rescorer.aggregate_metrics(
+                            n_retrains, working_cfg.progress_csv_path, pred_pkl_path)
+
+                        n_retrains += 1
+                        retrain_worker = None
+                        break
+
+                    # keep submitting games while waiting on retrain
+                    pulled_games = drain_queue(recent_q)
+                    for game in pulled_games:
+                        recorder.ingest_recents(game)
+                        update_game_index(game['meta'], base_cfg)
+                        finished_games.append(game)
+                    while finished_games:
+                        to_process = finished_games.popleft()
+                        rescorer.submit(pull_pkl(to_process))
+                    rescorer.tick()
+
+                    time.sleep(0.05)
+
+                time.sleep(0.05)
             
             # when done, close the queues. Workers already got drain_and_stop,
             # so they'll exit on their own once in-flight games finish; only
@@ -755,81 +786,22 @@ def main(run_tag):
                 # we do not train after validation currently
                 continue
 
-            # Only drain/retrain at round-end on the truly last round of the
-            # whole run. Every other round-end just moves on to the next
-            # round with no retrain here -- retraining otherwise only
-            # happens via the mid-round training_queue_buffer trigger, so a
-            # single low bar (retrain_size) at every round boundary can't
-            # slip in a small, poorly-mixed retrain behind that trigger's
-            # back.
-            is_last_round = is_final_round
-            while is_last_round:
+            # No round-end drain/force-retrain needed: primary_buffer/,
+            # replay_buffer/, and historic/ are persistent directories, not
+            # ephemeral per-round state, so any leftover shards just carry
+            # over to the next round/run untouched. On the truly last round,
+            # just wait for any still-in-flight SF rescoring to land so
+            # nothing gets dropped.
+            while is_final_round:
                 if STOP_REQUESTED.is_set():
                     break
-                recorder.training_queue = rescorer.training_data_size
-                k = recorder.training_queue // working_cfg.retrain_size
-                if k > 0:
-                    # one retrain_size batch per pass -- retrain_pt loads the
-                    # whole batch onto the GPU at once, so draining multiple
-                    # multiples into a single call can blow past VRAM and
-                    # fall back to slow system-RAM spillover. Loop back below
-                    # for any remaining multiples instead.
-                    drain_size = working_cfg.retrain_size
-                    print(
-                        f"[main] end of run: draining {drain_size} of "
-                        f"{recorder.training_queue} queued samples "
-                        f"({k} full batches remaining)"
-                    )
-                    rescorer.write_training_data_pkl(size=drain_size, randomize=True)
-                    recorder.training_queue = rescorer.training_data_size
-
-                    if retrain is None:
-                        eor_pred_pkl = os.path.join(
-                            working_cfg.run_dir, "predictions_latest.pkl")
-                        if os.path.exists(eor_pred_pkl):
-                            os.remove(eor_pred_pkl)
-                        retrain = start_retrain(
-                            run_tag, working_cfg, rescorer, n_retrains, eor_pred_pkl)
-
-                    while retrain is not None:
-                        done, rc = poll_retrain(retrain, print_output=True)
-                        if done:
-                            retrain = None
-                            recorder.n_retrains += 1
-                            working_cfg = Config.from_yaml(yaml_path, init=True)
-                            rescorer.config = working_cfg
-                            for t in sf_rescore_threads:
-                                # preserve throttle state; cap to new base if config lowered depth
-                                current_depth = t.depth
-                                t.update_config(working_cfg)
-                                t.depth = min(current_depth, t.base_depth)
-                            rescorer.current_depth = sf_rescore_threads[0].depth
-                            rescorer.aggregate_metrics(
-                                n_retrains,
-                                working_cfg.progress_csv_path,
-                                eor_pred_pkl)
-                            n_retrains += 1
-
-                        # workers for this round are already stopped; just keep
-                        # ticking the rescorer so SF-pending games can finish
-                        while finished_games:
-                            to_process = finished_games.popleft()
-                            rescorer.submit(pull_pkl(to_process))
-                        rescorer.tick()
-
-                        time.sleep(0.05)
-
-                # last round: wait for any still-in-flight SF rescoring to
-                # land, then loop back and check for another full multiple.
                 while finished_games:
                     to_process = finished_games.popleft()
                     rescorer.submit(pull_pkl(to_process))
                 rescorer.tick()
 
-                recorder.training_queue = rescorer.training_data_size
-                more_full_batches = recorder.training_queue >= working_cfg.retrain_size
                 pending_left = finished_games or rescorer.intake or rescorer.pending
-                if (not pending_left and not more_full_batches) or STOP_REQUESTED.is_set():
+                if not pending_left:
                     break
 
                 time.sleep(0.1)
@@ -849,17 +821,19 @@ def main(run_tag):
     
     finally:
         # if Ctrl+C happens mid-round, we land here and still attempt cleanup
+        if retrain_worker is not None and retrain_worker["p"].is_alive():
+            retrain_worker["p"].terminate()
         rescorer.tick()
         rescorer.push_analyzed(report=True)
         for t in sf_rescore_threads:
             t.close()
-        if rescorer.training_data:
+        if rescorer.live_buffer.records:
             remaining_pkl = os.path.join(
                 base_cfg.run_dir, "remaining_untrained.pkl"
             )
             with open(remaining_pkl, "wb") as f:
-                pickle.dump(rescorer.training_data, f)
-            n_saved = len(rescorer.training_data)
+                pickle.dump(rescorer.live_buffer.records, f)
+            n_saved = len(rescorer.live_buffer.records)
             print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
         rescorer.close()
         for q in (game_queue, sf_queue):

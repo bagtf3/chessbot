@@ -173,7 +173,11 @@ class Config(object):
         self.run_dir = resolved_run_dir
 
         self.pending_training_dir = os.path.join(self.run_dir, "pending_training")
-        
+
+        self.primary_buffer_dir = os.path.join(self.run_dir, "primary_buffer")
+        self.replay_buffer_dir = os.path.join(self.run_dir, "replay_buffer")
+        self.historic_dir = os.getenv("BOOTSTRAP_TFREC_DIR", "")
+
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
 
@@ -185,7 +189,8 @@ class Config(object):
         self.model_path = os.path.join(self.run_dir, model_name)
 
         if 'dummy' not in self.run_dir:
-            for d in (self.run_dir, self.game_dir):
+            for d in (self.run_dir, self.game_dir,
+                      self.primary_buffer_dir, self.replay_buffer_dir):
                 os.makedirs(d, exist_ok=True)
 
         # ORT/TRT: fall back to env var if not set explicitly in YAML

@@ -564,7 +564,7 @@ def main(run_tag):
                               f"dropped {dropped} queued-but-unplayed games, "
                               f"queues frozen for rest of round")
                     else:
-                        print("[cmd] no new games -- queues already frozen this round, no-op")
+                        print("[cmd] no new games: queues already frozen, no-op")
 
                 if PAUSE_REQUESTED.is_set():
                     PAUSE_REQUESTED.clear()

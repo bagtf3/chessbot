@@ -182,6 +182,22 @@ def child_looper(
         looper.run(stop_ev)
 
 
+class ValidationSpecSource:
+    """Wraps a pre-generated list of validation GameSpecs so top_up_queues
+    can pull from it the same way it pulls from GameGenerator.next_game()."""
+
+    def __init__(self, specs):
+        self.specs = specs
+        self.idx = 0
+
+    def next_game(self):
+        if self.idx >= len(self.specs):
+            return None
+        spec = self.specs[self.idx]
+        self.idx += 1
+        return spec
+
+
 def top_up_queues(game_queue, sf_queue, game_gen, budget=None, target=None):
     added = 0
     if target is None:
@@ -191,10 +207,12 @@ def top_up_queues(game_queue, sf_queue, game_gen, budget=None, target=None):
 
     while budget is None or added < budget:
         game_ok = game_queue.qsize() >= target
-        sf_ok = sf_queue is None or sf_queue.qsize() >= sf_target
+        sf_ok = sf_queue is not None and sf_queue.qsize() >= sf_target
         if game_ok or sf_ok:
             break
         spec = game_gen.next_game()
+        if spec is None:
+            break
         if spec.meta.get("vs_stockfish") and sf_queue is not None:
             sf_queue.put(spec)
         else:
@@ -416,6 +434,8 @@ def main(run_tag):
     game_gen = None
     retrain_worker = None
     total_games = 0
+
+    PTS = rb.PRIMARY_TRIGGER_SHARDS
     try:    
         for selfplay_round in range(base_cfg.n_rounds):
             run_num = 1 + selfplay_round
@@ -423,7 +443,7 @@ def main(run_tag):
             recorder = RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
             recorder.training_queue = len(rescorer.live_buffer)
             recorder.primary_buffer_dir = base_cfg.primary_buffer_dir
-            recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
+            recorder.primary_buffer_trigger = PTS
 
             if STOP_REQUESTED.is_set() or STOP_AFTER_ROUND_REQUESTED.is_set():
                 break
@@ -456,10 +476,13 @@ def main(run_tag):
                 state = rescorer.export_state()
                 rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q)
                 rescorer.import_state(state)
-                recorder = chessbot.review.RecordKeeper(n_retrains, run_num=run_num, every_sec=45.0)
+                recorder = chessbot.review.RecordKeeper(
+                    n_retrains, run_num=run_num, every_sec=45.0
+                )
+
                 recorder.training_queue = len(rescorer.live_buffer)
                 recorder.primary_buffer_dir = working_cfg.primary_buffer_dir
-                recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
+                recorder.primary_buffer_trigger = PTS
                 print("[cmd] reloaded config/rescore/review, rescorer state migrated")
 
             if run_num % base_cfg.validation_every == 0:
@@ -484,37 +507,31 @@ def main(run_tag):
             n_workers = max(1, working_cfg.n_workers)
             initial_target = n_workers * working_cfg.games_at_once + GAME_QUEUE_MIN
 
+            game_queue = ctx.Queue()
+            n_games = working_cfg.n_games
+
             if is_validation:
-                game_queue = ctx.Queue()
                 sf_queue = None
-                validation_specs = game_gen.validation_games()
-                n_games = len(validation_specs)
-                val_spec_idx = 0
-                total_queued = 0
-                while val_spec_idx < n_games and total_queued < initial_target:
-                    game_queue.put(validation_specs[val_spec_idx])
-                    val_spec_idx += 1
-                    total_queued += 1
-
-                procs = spawn_workers(working_cfg, recent_q, telemetry_q, game_queue)
+                spec_source = ValidationSpecSource(game_gen.validation_games())
             else:
-                game_queue = ctx.Queue()
                 sf_queue = ctx.Queue()
-                n_games = working_cfg.n_games
-                total_queued = top_up_queues(
-                    game_queue, sf_queue, game_gen,
-                    budget=n_games, target=initial_target,
-                )
+                spec_source = game_gen
 
-                procs = spawn_workers(
-                    working_cfg, recent_q, telemetry_q, game_queue, sf_queue
-                )
+            total_queued = top_up_queues(
+                game_queue, sf_queue, spec_source,
+                budget=n_games, target=initial_target,
+            )
 
-            # Both branches now ramp workers up before any stop signal is
-            # sent. Validation used to pre-fill the entire n_games budget and
-            # signal drain_and_stop immediately after spawn, which raced with
-            # pull_from_queue's ramp-up (stop_at_empty short-circuits it) and
-            # capped concurrency well below games_at_once * n_workers.
+            procs = spawn_workers(
+                working_cfg, recent_q, telemetry_q, game_queue, sf_queue
+            )
+
+            # Validation and normal rounds now share identical queue fill/
+            # top-up logic via top_up_queues + spec_source. Validation used
+            # to dump its whole remaining spec backlog into game_queue in one
+            # shot on the first top-up, which pushed total_queued to n_games
+            # before most of those games were ever pulled, triggering
+            # drain_and_stop early and stranding queued-but-unplayed games.
             stop_signal_sent = False
 
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
@@ -588,18 +605,10 @@ def main(run_tag):
                     sf_low = sf_queue is not None and sf_queue.qsize() < GAME_QUEUE_MIN // 2
                     game_low = game_queue.qsize() < GAME_QUEUE_MIN
                     if sf_low or game_low:
-                        if is_validation:
-                            added = 0
-                            while (val_spec_idx < len(validation_specs)
-                                   and game_queue.qsize() < GAME_QUEUE_MIN * 2):
-                                game_queue.put(validation_specs[val_spec_idx])
-                                val_spec_idx += 1
-                                added += 1
-                        else:
-                            added = top_up_queues(
-                                game_queue, sf_queue, game_gen,
-                                budget=n_games - total_queued,
-                            )
+                        added = top_up_queues(
+                            game_queue, sf_queue, spec_source,
+                            budget=n_games - total_queued,
+                        )
                         total_queued += added
                         # n_games reached — tell all workers to drain and exit
                         if total_queued >= n_games:
@@ -646,11 +655,15 @@ def main(run_tag):
                 # historic loading overlaps with primary_buffer's last fill,
                 # then hand it the primary sample once it actually hits 32/32
                 primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
-                if retrain_worker is None and len(primary_files) >= rb.PRIMARY_TRIGGER_SHARDS - 1:
+                n_files = len(primary_files)
+                launch_retrain = retrain_worker is None and not is_validation
+                if launch_retrain and n_files >= PTS - 1:
                     replay_files = rb.sample_files(
                         working_cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
+                    
                     historic_files = rb.sample_files(
                         working_cfg.historic_dir, rb.RETRAIN_HISTORIC_SHARDS)
+                    
                     retrain_msg_q = ctx.Queue()
                     retrain_result_q = ctx.Queue()
                     retrain_p = ctx.Process(
@@ -667,22 +680,22 @@ def main(run_tag):
                         "replay_files": replay_files, "primary_files": None,
                         "stage": "preloading",
                     }
-                    print(f"[retrain] worker launched at {len(primary_files)}/{rb.PRIMARY_TRIGGER_SHARDS} "
+                    print(f"[retrain] worker launched at {n_files}/{PTS} "
                           f"-- preloading {rb.RETRAIN_REPLAY_SHARDS} replay + "
                           f"{rb.RETRAIN_HISTORIC_SHARDS} historic shards")
-                    print(f"[rescore] KL running medians: "
-                          f"q50={rescorer.kl_q50:.3f}  q80={rescorer.kl_q80:.3f}")
                     rescorer.reset_writer()
 
-                while retrain_worker is not None:
+                # check on the retrain worker once per pass -- no nested loop,
+                # we just come back around every outer-loop iteration anyway
+                if retrain_worker is not None:
                     if retrain_worker["stage"] == "preloading":
                         primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
-                        if len(primary_files) >= rb.PRIMARY_TRIGGER_SHARDS:
+                        if len(primary_files) >= PTS:
                             primary_sample = random.sample(primary_files, rb.RETRAIN_PRIMARY_SHARDS)
                             retrain_worker["msg_q"].put({"cmd": "start", "primary": primary_sample})
                             retrain_worker["primary_files"] = primary_sample
                             retrain_worker["stage"] = "training"
-                            print(f"[retrain] {len(primary_files)}/{rb.PRIMARY_TRIGGER_SHARDS} -- "
+                            print(f"[retrain] {len(primary_files)}/{PTS} -- "
                                   f"sent start signal, worker validating + building retrain set")
 
                     try:
@@ -704,7 +717,7 @@ def main(run_tag):
                         retrain_worker["p"].join(timeout=15.0)
                         if retrain_worker["p"].is_alive():
                             retrain_worker["p"].terminate()
-                            print("[retrain] worker process did not exit in time, terminated")
+                            print("[retrain] worker process did not exit, terminated")
                         else:
                             print("[retrain] worker process exited")
 
@@ -720,14 +733,15 @@ def main(run_tag):
                             t.depth = min(current_depth, t.base_depth)
                         rescorer.current_depth = sf_rescore_threads[0].depth
 
-                        if result.get("ok") and working_cfg.inference_backend == 'ort_trt' and not is_validation:
-                            # workers only reload their model/engine after
-                            # unpause, so the TRT engine must be rebuilt for
-                            # the new weights first -- otherwise workers would
-                            # either grab a stale engine or each redundantly
-                            # recompile their own.
-                            trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
-                            working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
+                        if result.get("ok") and not is_validation:
+                            if working_cfg.inference_backend == 'ort_trt':
+                                # workers only reload their model/engine after
+                                # unpause, so the TRT engine must be rebuilt for
+                                # the new weights first -- otherwise workers would
+                                # either grab a stale engine or each redundantly
+                                # recompile their own.
+                                trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
+                                working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
 
                         # hard rule: unpause is the first thing that happens
                         # once retrain has actually finished (plus the TRT
@@ -737,43 +751,39 @@ def main(run_tag):
                         print("[retrain] workers unpaused")
 
                         if result.get("ok"):
-                            rb.move_files(retrain_worker["primary_files"], working_cfg.replay_buffer_dir)
+                            rb.move_files(
+                                retrain_worker["primary_files"],
+                                working_cfg.replay_buffer_dir
+                            )
+
                             rb.discard_files(retrain_worker["replay_files"])
                             print("[retrain] primary -> replay rotated, cycle complete")
                         else:
                             print(f"[retrain] worker failed: {result.get('error')}")
 
-                        pred_pkl_path = os.path.join(working_cfg.run_dir, "predictions_latest.pkl")
+                        pred_pkl_path = os.path.join(
+                            working_cfg.run_dir, "predictions_latest.pkl"
+                        )
+                        
                         rescorer.aggregate_metrics(
                             n_retrains, working_cfg.progress_csv_path, pred_pkl_path)
 
                         n_retrains += 1
                         retrain_worker = None
-                        break
-
-                    # keep submitting games while waiting on retrain
-                    pulled_games = drain_queue(recent_q)
-                    for game in pulled_games:
-                        recorder.ingest_recents(game)
-                        update_game_index(game['meta'], base_cfg)
-                        finished_games.append(game)
-                    while finished_games:
-                        to_process = finished_games.popleft()
-                        rescorer.submit(pull_pkl(to_process))
-                    rescorer.tick()
-                    recorder.maybe_log_results()
-
-                    time.sleep(0.05)
 
                 time.sleep(0.05)
-            
+
             # when done, close the queues. Workers already got drain_and_stop,
             # so they'll exit on their own once in-flight games finish; only
             # force a hard kill deadline on the truly last round, so the
             # process is guaranteed to terminate.
             is_final_round = run_num >= base_cfg.n_rounds
             shutdown_wait_s = 15.0 if is_final_round else None
-            procs = shutdown_round(procs, recent_q, telemetry_q, max_wait_s=shutdown_wait_s)
+            procs = shutdown_round(
+                procs, recent_q, telemetry_q,
+                max_wait_s=shutdown_wait_s
+            )
+
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
 

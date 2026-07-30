@@ -203,8 +203,6 @@ class GameLooper(object):
         self.n_retrains += 1
 
     def pull_from_queue(self):
-        if self.stop_at_empty:
-            return
         from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
         # keep draining until full or both queues empty
@@ -247,7 +245,7 @@ class GameLooper(object):
         macro = cfg.macro_batch
         
         #(batch size, target), counts returned
-        pred_fill, counts = [], []
+        pred_fill, counts, mbs_used = [], [], []
         finished_ids = set()
         #passes_since_trigger = 0
         while True:

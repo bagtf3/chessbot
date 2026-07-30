@@ -185,6 +185,35 @@ def main():
             write_yaml(val_yaml_dst, {"is_validation":True})
             print("[init] wrote minimal validation_config.yaml (no src found)")
 
+        # copy replay_buffer/ and primary_buffer/ dirs if present
+        for buf_name in ("replay_buffer", "primary_buffer"):
+            src_buf = os.path.join(src_dir, buf_name)
+            if os.path.isdir(src_buf):
+                dst_buf = os.path.join(dest_dir, buf_name)
+                shutil.copytree(src_buf, dst_buf, dirs_exist_ok=True)
+                print(f"[clone] copied {buf_name}/ from {clone_tag}")
+
+        # copy TRT builder cache files (trt_cache/ for selfplay, val_trt/ for
+        # validation). Only .profile and .timing -- .engine/.onnx are keyed to
+        # the old model_name + weight-content-hash and would just be dead
+        # weight under the new run_tag. .timing in particular is a
+        # GPU-architecture-keyed builder tactic cache (not model-specific),
+        # so reusing it avoids re-profiling tactics from scratch on a fresh
+        # run_tag; .profile only pays off if trt_model_name ends up matching.
+        for trt_name in ("trt_cache", "val_trt"):
+            src_trt = os.path.join(src_dir, trt_name)
+            if os.path.isdir(src_trt):
+                dst_trt = os.path.join(dest_dir, trt_name)
+                os.makedirs(dst_trt, exist_ok=True)
+                copied = 0
+                for f in os.listdir(src_trt):
+                    if f.endswith(".profile") or f.endswith(".timing"):
+                        shutil.copy2(os.path.join(src_trt, f), os.path.join(dst_trt, f))
+                        copied += 1
+                if copied:
+                    print(f"[clone] copied {copied} TRT profile/timing cache "
+                          f"file(s) from {clone_tag}/{trt_name}")
+
         # move remaining_untrained.pkl if present
         src_remaining = os.path.join(src_dir, "remaining_untrained.pkl")
         if os.path.exists(src_remaining):

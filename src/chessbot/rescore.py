@@ -177,7 +177,7 @@ class SFRescoreThread:
                     info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
                     elapsed += time.time() - t0
                     best_uci = str(info['pv'][0])
-                    pv_ucis  = [str(m) for m in info.get('pv', [])[:4]]
+                    pv_ucis  = [str(m) for m in info.get('pv', [])[:3]]
                     best_cp  = score_cp_stm_pov(info['score'])
                     best_abs = score_cp_white_pov(info['score'], clipped=False)
 
@@ -891,7 +891,7 @@ class Rescorer(object):
             pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
             sf_pv = ply.get('pv_ucis', [])
             if lc0_mode == 'pos_sf_xc0_pov':
-                xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:4]]
+                xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:3]]
                 pv_seqs = [sf_pv, xc0_pv]
             elif lc0_mode == 'pos_sf_pov':
                 pv_seqs = [sf_pv[:2]]
@@ -1140,6 +1140,8 @@ class Rescorer(object):
         print(th)
         print(tc)
         print(tb)
+        print(f"{RS} KL running medians: "
+              f"q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}

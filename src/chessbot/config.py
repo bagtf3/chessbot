@@ -89,12 +89,11 @@ class Config(object):
     collar_reset_cp = 50
     train_on_stockfish = True
 
-    KL_boost_threshold = 1.75
-    KL_weight_boost = 1.0
-
     kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median
     kl_boost_p80_mult    = 3.0   # pwht multiplier when KL > running EMA 80th pctile
     kl_quantile_lr       = 0.0005 # step size for the online trackers (~1/lr sample window, ~2000)
+
+    inaccuracy_downweight = 0.5  # xc0 policy weight mult for inaccuracy-tier plies (lc0_mode='pos_only')
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,

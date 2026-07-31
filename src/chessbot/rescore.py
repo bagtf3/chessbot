@@ -546,10 +546,10 @@ class Rescorer(object):
         # snapshot config fields so hot-reloads don't affect an in-flight game
         game_cfg_keys = (
             'train_on_stockfish',
-            'KL_weight_boost', 'KL_boost_threshold',
             'kl_boost_median_mult', 'kl_boost_p80_mult', 'kl_quantile_lr',
             'rescore_equiv_range', 'rescore_blunder_cp_loser',
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
+            'inaccuracy_downweight',
             'uniform_eps', 'prior_clip_max',
             'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
             'use_collar_rescoring', 'rescore_analyze_batch',
@@ -876,6 +876,10 @@ class Rescorer(object):
                     pwht *= cfg.kl_boost_p80_mult
                 elif kl >= self.kl_q50:
                     pwht *= cfg.kl_boost_median_mult
+
+            if lc0_mode == 'pos_only':
+                pwht *= cfg.inaccuracy_downweight
+                vwht *= cfg.inaccuracy_downweight
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']

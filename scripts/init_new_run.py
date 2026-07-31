@@ -72,6 +72,10 @@ def main():
     p.add_argument("run_tag")
     p.add_argument("--clone", default=None)
     p.add_argument("--ignore-eval-progress", action="store_true")
+    p.add_argument("--do-cleanup", action="store_true",
+                    help="delete replay_buffer/primary_buffer from the clone "
+                         "source after copying (remaining_untrained.pkl is "
+                         "already moved, not copied)")
     args = p.parse_args()
 
     run_tag = args.run_tag
@@ -192,6 +196,9 @@ def main():
                 dst_buf = os.path.join(dest_dir, buf_name)
                 shutil.copytree(src_buf, dst_buf, dirs_exist_ok=True)
                 print(f"[clone] copied {buf_name}/ from {clone_tag}")
+                if args.do_cleanup:
+                    shutil.rmtree(src_buf)
+                    print(f"[clone] deleted {buf_name}/ from {clone_tag} (--do-cleanup)")
 
         # copy TRT builder cache files (trt_cache/ for selfplay, val_trt/ for
         # validation). Only .profile and .timing -- .engine/.onnx are keyed to

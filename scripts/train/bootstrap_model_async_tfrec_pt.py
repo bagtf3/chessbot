@@ -23,7 +23,10 @@ import argparse
 import math
 import multiprocessing as mp
 import os
+import pickle
+import random
 import re
+import shutil
 import time
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -44,6 +47,13 @@ from chessbot.pretrain import (
     make_dataset, EpochBufferThread,
     save_plot,
 )
+
+from chessbot.replay_buffer import new_shard_path, write_pkl_gz_shard
+
+SEED_SOURCE          = "historic_seeded"
+SEED_REPLAY_SHARDS   = 64
+SEED_PRIMARY_SHARDS  = 24
+SEED_REMAINING_SHARDS = 8
 
 from chessbot.model import VARIANTS, PT_BUILDERS
 
@@ -470,6 +480,100 @@ def worker_main(wargs: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# One-time end-of-pretrain seeding: drain the held-out validation split
+# (never trained on, same distribution as the training set) into the
+# selfplay run's buffers so the first ~10 retrains aren't starved of
+# volume and the transition into self-correlated selfplay data is a
+# gradual blend instead of a jolt. Only called when --run-dir is given
+# (i.e. not the default val_test_multi dev/test run_tag).
+# ---------------------------------------------------------------------------
+
+def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
+    replay_dir     = os.path.join(run_dir, "replay_buffer")
+    primary_dir    = os.path.join(run_dir, "primary_buffer")
+    remaining_path = os.path.join(run_dir, "remaining_untrained.pkl")
+
+    os.makedirs(replay_dir, exist_ok=True)
+    os.makedirs(primary_dir, exist_ok=True)
+
+    val_files = list(val_files)
+    status = {}
+
+    # replay: raw .tfrecord.gz copy, same convention as seed_replay_buffer /
+    # the retrain-time historic boosters -- no re-encoding needed.
+    existing_replay = os.listdir(replay_dir)
+    replay_needed = max(0, SEED_REPLAY_SHARDS - len(existing_replay))
+    if replay_needed == 0:
+        status["replay"] = (
+            f"skipped ({len(existing_replay)}/{SEED_REPLAY_SHARDS} already present)"
+        )
+    else:
+        n_take = min(replay_needed, len(val_files))
+        chosen = random.sample(val_files, n_take)
+        for src in chosen:
+            shutil.copy2(src, os.path.join(replay_dir, os.path.basename(src)))
+        chosen_set = set(chosen)
+        val_files = [f for f in val_files if f not in chosen_set]
+        kind = "full fill" if len(existing_replay) == 0 else "partial fill (top up)"
+        status["replay"] = f"{kind}: copied {n_take} tfrecord.gz files"
+        if n_take < replay_needed:
+            status["replay"] += f" (only {n_take}/{replay_needed} val files available)"
+            status["primary"] = "skipped (no val_files left after replay)"
+            status["remaining_untrained"] = "skipped (no val_files left after replay)"
+            print("[seed] " + " | ".join(f"{k}: {v}" for k, v in status.items()))
+            return
+
+    # primary + remaining_untrained: drained/re-encoded via TF pipeline,
+    # reuse=False, into pkl.gz shards matching the live selfplay schema.
+    existing_primary = os.listdir(primary_dir)
+    primary_needed = max(0, SEED_PRIMARY_SHARDS - len(existing_primary))
+    remaining_exists = os.path.exists(remaining_path)
+
+    ds_iter = None
+    if primary_needed > 0 or not remaining_exists:
+        ds = make_dataset(
+            val_files, shuffle_buffer=2 * VAL_SHUFFLE_BUFFER,
+            batch_size=EPOCH_SIZE, repeat=False,
+        )
+        ds_iter = iter(ds)
+
+    def drain_epoch():
+        inp, out, _ = next(ds_iter)
+        enc = inp["enc_in"].numpy()
+        pol = out["policy_logits"].numpy()
+        val = out["value_out"].numpy()
+        return [
+            (enc[i], None, pol[i], val[i], 1.0, 1.0, SEED_SOURCE)
+            for i in range(enc.shape[0])
+        ]
+
+    if primary_needed == 0:
+        status["primary"] = (
+            f"skipped ({len(existing_primary)}/{SEED_PRIMARY_SHARDS} already present)"
+        )
+        
+    else:
+        for _ in range(primary_needed):
+            write_pkl_gz_shard(drain_epoch(), new_shard_path(primary_dir))
+        kind = "full fill" if len(existing_primary) == 0 else "partial fill (top up)"
+        status["primary"] = f"{kind}: wrote {primary_needed} shards"
+
+    if remaining_exists:
+        status["remaining_untrained"] = "skipped (already present)"
+    else:
+        remaining_records = []
+        for _ in range(SEED_REMAINING_SHARDS):
+            remaining_records.extend(drain_epoch())
+        with open(remaining_path, "wb") as f:
+            pickle.dump(remaining_records, f)
+        status["remaining_untrained"] = (
+            f"full fill: wrote {len(remaining_records):,} records"
+        )
+
+    print("[seed] " + " | ".join(f"{k}: {v}" for k, v in status.items()))
+
+
+# ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
 
@@ -492,7 +596,7 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model",    default=DEFAULT_MODEL,   help="model name")
-    parser.add_argument("--run-tag",  default=DEFAULT_RUN_TAG, help="run tag under SP_DIR")
+    parser.add_argument("--run-tag", default=DEFAULT_RUN_TAG, help="run tag under SP_DIR")
     parser.add_argument(
         "--run-dir", default=None, help="explicit run dir (overrides --run-tag)"
     )
@@ -574,6 +678,14 @@ def main() -> None:
         else:
             print("[train] no optimizer state in checkpoint -- "
                   "selfplay retrain will start fresh")
+
+    if args.run_dir:
+        seed_selfplay_buffers(run_dir, val_files)
+    else:
+        print(
+            f"[seed] no --run-dir given (run_tag={args.run_tag}); "
+            "skipping selfplay buffer seeding"
+        )
 
 
 if __name__ == "__main__":

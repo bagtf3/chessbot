@@ -5,6 +5,17 @@ Exports:
     VARIANTS     — shared cfg dict used by speed test and bootstrap
     PT_BUILDERS  — {name: fn(cfg) -> PT nn.Module}
     make_pt_relational_policy_head, make_pt_attn_pool_value_head, make_ln2d
+
+Optimizer note for future models: the current Adam setup (make_adam in the
+bootstrap/train scripts) applies weight_decay to every parameter through a
+single flat param_group, including 1-D LayerNorm gains/biases, conv/linear
+biases, and free learnable scalars (e.g. the xc0h_*_scale terms). Best
+practice is to exclude 1-D/bias/norm params from weight decay entirely
+(they should decay to their own equilibrium, not toward zero) rather than
+rely on weight_decay being small enough not to matter. Measured negligible
+here at weight_decay=1e-6 (decay/step ratio <2% in every param group), but
+worth building the param-group split properly if a future model raises
+weight_decay or adds larger 1-D/bias terms that actually need protecting.
 """
 from __future__ import annotations
 

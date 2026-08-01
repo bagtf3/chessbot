@@ -1,3 +1,4 @@
+import os
 import uuid
 from time import time as _now
 
@@ -10,6 +11,20 @@ from pyfastchess import terminal_value_white_pov
 from chessbot import ENDGAME_LOC
 from chessbot.utils import rnd
 from collections import namedtuple
+
+TABLEBASE = None
+
+
+def get_tablebase():
+    """Open the syzygy tablebase once per process and reuse the handle.
+
+    It used to be opened and closed inside the per-ply terminal check, which
+    reopened the tablebase files on every probe.
+    """
+    global TABLEBASE
+    if TABLEBASE is None and ENDGAME_LOC and os.path.isdir(ENDGAME_LOC):
+        TABLEBASE = chess.syzygy.open_tablebase(ENDGAME_LOC)
+    return TABLEBASE
 
 ESCheck = namedtuple('ESCheck', [
     'sims', 'jsd', 'top_uci', 'second_uci', 'third_uci',
@@ -716,10 +731,9 @@ class ChessGame(object):
                 # may not work so just go as normal
                 try:
                     outcomes = {-2: -1, -1:-1, 0:0, 1:1, 2:1}
-                    with chess.syzygy.open_tablebase(ENDGAME_LOC) as tablebase:
-                        # gotta flip back to python chess here
-                        chess_board = chess.Board(self.board.fen())
-                        table_res = tablebase.probe_wdl(chess_board)
+                    # gotta flip back to python chess here
+                    chess_board = chess.Board(self.board.fen())
+                    table_res = get_tablebase().probe_wdl(chess_board)
 
                     # -1 and 1 are not guaranteed winners
                     if table_res in [-2, 0, 2]:

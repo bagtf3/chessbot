@@ -657,8 +657,7 @@ class ChessGame(object):
             return False
 
         # no eval draws with queen(s) on the board.
-        piece_part = self.board.fen().split(" ")[0]
-        if "q" in piece_part.lower():
+        if self.board.any_queens():
             return False
         
         # if here, agree to draw

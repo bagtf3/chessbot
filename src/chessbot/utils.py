@@ -612,6 +612,16 @@ def format_time(seconds):
         return f"{int(h)}h {int(m)}m {s:.2f}s"
 
 
+def compact_count(n):
+    """Render a big count as 256M / 1.2B so log columns stay narrow."""
+    n = float(n)
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= scale:
+            v = n / scale
+            return f"{v:.1f}{suffix}" if abs(v) < 10 else f"{v:.0f}{suffix}"
+    return f"{n:.0f}"
+
+
 def make_jsonable(obj):
     """Recursively convert numpy types to built-in Python types so json.dump works.
     - ndarray -> list (obj.tolist())

@@ -13,7 +13,7 @@ from pyfastchess import Board
 
 from chessbot import SF_LOC
 from chessbot.engines import lc0_analyze
-from chessbot.utils import print_recent_summary, format_time
+from chessbot.utils import print_recent_summary, format_time, compact_count
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
     score_to_value_stm_pov_tanh, rnd,
@@ -1846,7 +1846,7 @@ class RecordKeeper(object):
             "s_blocked", "s_puct", "preds_per_second",
 
             "s_must_visit",
-            "s_skipped", "s_pruned", "s_penalty",
+            "s_skipped", "s_pruned", "s_penalty", "s_depth",
 
             # priors cache (per-worker) telemetry, aggregate across workers
             "cache_size", "cache_capacity", "cache_queries", "cache_hits"
@@ -1931,6 +1931,7 @@ class RecordKeeper(object):
         s_collect_stops = summed.get("s_collect_stops", 0)
         s_blocked = summed.get("s_blocked", 0)
         s_puct = summed.get("s_puct", 0)
+        s_depth = summed.get("s_depth", 0)
 
         s_must_visit = summed.get("s_must_visit", 0)
 
@@ -1973,9 +1974,13 @@ class RecordKeeper(object):
         right3b = f"ideal preds/s={preds_per_sec:.1f}"
 
         puct_per_leaf = s_puct / total_overall if total_overall else 0.0
+        avg_depth = s_depth / total_overall if total_overall else 0.0
         blocked_pct = 100.0 * s_blocked / (s_blocked + s_collected) if (s_blocked + s_collected) > 0 else 0.0
         left4 = f"[puct stats] blocked={s_blocked:.0f} ({blocked_pct:.3f}%)"
-        right4 = f"evals={s_puct:.0f}  evals/leaf={puct_per_leaf:.1f}"
+        right4 = (
+            f"evals={compact_count(s_puct)}  evals/leaf={puct_per_leaf:.1f}"
+            f"  avg_depth={avg_depth:.1f}"
+        )
 
         tot_skip = s_skipped + s_pruned
         avoided_r = tot_skip / s_puct if s_puct else 0.0

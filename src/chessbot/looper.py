@@ -377,6 +377,7 @@ class GameLooper(object):
         sk = res.total_skipped
         pr = res.total_pruned
         pen = res.total_penalty
+        dp = res.total_depth
 
         n_leafs = nn + nc + nt
         self.lps.tick(n_leafs)
@@ -388,7 +389,7 @@ class GameLooper(object):
 
         counts.append([
             nn, fastpaths, nt, nc, f_stop, c_stop,
-            bl, pu, mv, sk, pr, pen
+            bl, pu, mv, sk, pr, pen, dp
         ])
 
         return nn, n_leafs
@@ -513,21 +514,15 @@ class GameLooper(object):
         lpb = pred_fill
         target = self.config.macro_batch
 
-        s_collected = sum([r[0] for r in counts])
-        s_fast = sum([r[1] for r in counts])
-        s_terminals = sum([r[2] for r in counts])
-        s_cached = sum([r[3] for r in counts])
-        s_fast_stops = sum([r[4] for r in counts])
-        s_collect_stops = sum([r[5] for r in counts])
+        # every column of counts is a plain sum; one pass instead of 13
+        if counts:
+            col = np.array(counts, dtype=np.int64).sum(axis=0)
+        else:
+            col = np.zeros(13, dtype=np.int64)
 
-        s_blocked = sum([r[6] for r in counts])
-        s_puct = sum([r[7] for r in counts])
-
-        s_must_visit = sum([r[8] for r in counts])
-
-        s_skipped = sum([r[9] for r in counts])
-        s_pruned = sum([r[10] for r in counts])
-        s_penalty = sum([r[11] for r in counts])
+        (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
+         s_collect_stops, s_blocked, s_puct, s_must_visit, s_skipped,
+         s_pruned, s_penalty, s_depth) = (int(v) for v in col)
 
         telemetry = {
             "ts": ts_now,
@@ -558,6 +553,7 @@ class GameLooper(object):
             "s_skipped": s_skipped,
             "s_pruned": s_pruned,
             "s_penalty": s_penalty,
+            "s_depth": s_depth,
         }
         tm = telemetry
 

@@ -504,8 +504,9 @@ class ChessGame(object):
             self.next_eval_draw_check = 999
     
     def turn(self, return_bool=True):
-        stm = self.board.side_to_move()
-        return stm == 'w' if return_bool else stm
+        if return_bool:
+            return self.board.white_to_move()
+        return self.board.side_to_move()
     
     def is_stockfish_turn(self):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())

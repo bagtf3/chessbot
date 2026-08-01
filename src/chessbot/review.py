@@ -88,7 +88,7 @@ class GameViewer:
         return self
     
     def turn(self):
-        return self.board.side_to_move() == 'w'
+        return self.board.white_to_move()
     
     def sf_row_for_ply(self, ply):
         if (not self._sf_by_ply) or (self.sf_rows is None):
@@ -269,7 +269,7 @@ class GameViewer:
         cands = (node.get("candidate_moves") or []) if node else []
         xc0_map = {c["uci"]: c for c in cands}
 
-        white_to_move = self.board.side_to_move() == "w"
+        white_to_move = self.board.white_to_move()
         sign = 1 if white_to_move else -1
 
         # stats over all rows using the union of lc0 and xc0 moves
@@ -503,7 +503,7 @@ class GameViewer:
             uci = top[0].get("uci", "")
             return {uci: 1.0}
 
-        flip = 1.0 if self.board.side_to_move() == "w" else -1.0
+        flip = 1.0 if self.board.white_to_move() else -1.0
 
         def minmax(vals):
             lo = min(vals)
@@ -591,7 +591,7 @@ class GameViewer:
         visits = c.get("visits", 0)
         visit_share = c.get("visit_share", 0.0)
 
-        sign = 1 if self.board.side_to_move() == "w" else -1
+        sign = 1 if self.board.white_to_move() else -1
         q = c.get("Q", 0.0) * sign
         qema = c.get("Qema", 0.0) * sign
         ds = c.get("Qdelta_sign", 0.0)

@@ -651,19 +651,23 @@ def main(run_tag):
 
                 recorder.training_queue = rescorer.training_data_size
 
-                # spawn the retrain worker a shard early (31/32) so replay +
-                # historic loading overlaps with primary_buffer's last fill,
-                # then hand it the primary sample once it actually hits 32/32
+                # spawn the retrain worker once primary_buffer is actually full.
+                # It used to launch a shard early (31/32) to overlap replay +
+                # historic loading with the last fill, but the main loop just sat
+                # waiting for 32/32 anyway, so there was nothing to overlap with.
                 primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
                 n_files = len(primary_files)
                 launch_retrain = retrain_worker is None and not is_validation
-                if launch_retrain and n_files >= PTS - 1:
+                if launch_retrain and n_files >= PTS:
                     replay_files = rb.sample_files(
                         working_cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
-                    
+
                     historic_files = rb.sample_files(
                         working_cfg.historic_dir, rb.RETRAIN_HISTORIC_SHARDS)
-                    
+
+                    primary_sample = random.sample(
+                        primary_files, rb.RETRAIN_PRIMARY_SHARDS)
+
                     retrain_msg_q = ctx.Queue()
                     retrain_result_q = ctx.Queue()
                     retrain_p = ctx.Process(
@@ -672,32 +676,25 @@ def main(run_tag):
                         daemon=True,
                     )
                     retrain_p.start()
+                    # both messages up front; the worker still consumes them in
+                    # order and does the same preload -> validate -> train run
                     retrain_msg_q.put({
                         "cmd": "preload", "replay": replay_files, "historic": historic_files,
                     })
+                    retrain_msg_q.put({"cmd": "start", "primary": primary_sample})
                     retrain_worker = {
                         "p": retrain_p, "msg_q": retrain_msg_q, "result_q": retrain_result_q,
-                        "replay_files": replay_files, "primary_files": None,
-                        "stage": "preloading",
+                        "replay_files": replay_files, "primary_files": primary_sample,
                     }
                     print(f"[retrain] worker launched at {n_files}/{PTS} "
-                          f"-- preloading {rb.RETRAIN_REPLAY_SHARDS} replay + "
-                          f"{rb.RETRAIN_HISTORIC_SHARDS} historic shards")
+                          f"-- loading {rb.RETRAIN_REPLAY_SHARDS} replay + "
+                          f"{rb.RETRAIN_HISTORIC_SHARDS} historic shards, "
+                          f"then validating + building retrain set")
                     rescorer.reset_writer()
 
                 # check on the retrain worker once per pass -- no nested loop,
                 # we just come back around every outer-loop iteration anyway
                 if retrain_worker is not None:
-                    if retrain_worker["stage"] == "preloading":
-                        primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
-                        if len(primary_files) >= PTS:
-                            primary_sample = random.sample(primary_files, rb.RETRAIN_PRIMARY_SHARDS)
-                            retrain_worker["msg_q"].put({"cmd": "start", "primary": primary_sample})
-                            retrain_worker["primary_files"] = primary_sample
-                            retrain_worker["stage"] = "training"
-                            print(f"[retrain] {len(primary_files)}/{PTS} -- "
-                                  f"sent start signal, worker validating + building retrain set")
-
                     try:
                         result = retrain_worker["result_q"].get_nowait()
                     except queue.Empty:

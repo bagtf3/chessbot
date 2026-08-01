@@ -443,7 +443,7 @@ def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc
     lc0_pending  = []   # xc0h boards queued for lc0 inference this game
 
     for ply, move_played in enumerate(moves):
-        is_white   = board.side_to_move() == "w"
+        is_white   = board.white_to_move()
         is_sf_move = vs_sf and sf_color is not None and (
             (is_white and sf_color) or (not is_white and not sf_color))
 

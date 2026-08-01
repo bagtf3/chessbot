@@ -62,7 +62,7 @@ def analyze_position(board, topk=4, temp=0.02):
         out.append(d)
         vals.append(v)
     
-    STM = board.side_to_move() == 'w'
+    STM = board.white_to_move()
     min_val = -1.0 if STM else 1.0
     
     # append missing legal moves with worst raw score
@@ -164,8 +164,7 @@ def evaluate_terminal(b):
         raise Exception("Non terminal board found!")
 
     if reason == "checkmate":
-        loser = b.side_to_move()
-        return -1 if loser == "w" else 1
+        return -1 if b.white_to_move() else 1
     return 0
 
 
@@ -480,11 +479,9 @@ class SelfPlayGame:
         self.sample_scores = kwargs.get("sample_scores", False)
 
     def turn(self, return_bool=True):
-        stm = self.board.side_to_move()
         if return_bool:
-            return stm == 'w'
-        else:
-            return stm
+            return self.board.white_to_move()
+        return self.board.side_to_move()
     
     def short_fen(self, fen=None):
         return self.board.fen(include_counters=False)

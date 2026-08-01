@@ -5,11 +5,10 @@ replay_buffer_redesign.md for the full design and message protocol.
 
 Message protocol (msg_q, main -> worker):
   {"cmd": "preload", "replay": [paths], "historic": [paths]}
-      sent as soon as the worker is spawned (primary buffer at 31/32), so
-      replay+historic loading happens in the background while primary_buffer
-      finishes filling.
   {"cmd": "start", "primary": [paths]}
-      sent once primary_buffer hits 32/32 -- the real go-ahead.
+      Both sent back to back the moment the worker is spawned, which only
+      happens once primary_buffer is full at 32/32. They stayed two messages
+      because the worker consumes them in order and the split costs nothing.
 
 Message protocol (result_q, worker -> main):
   {"cmd": "retrain_ready"}

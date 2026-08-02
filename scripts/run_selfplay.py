@@ -15,7 +15,7 @@ from chessbot.looper import init_selfplay
 from chessbot.rescore import Rescorer, SFRescoreThread
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
-from chessbot.utils import make_jsonable, format_time
+from chessbot.utils import make_jsonable, format_time, next_model_epoch
 from chessbot.validation import build_validation_summary, create_validation_config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
@@ -30,6 +30,7 @@ STOP_REQUESTED = threading.Event()
 STOP_AFTER_ROUND_REQUESTED = threading.Event()
 NEXT_ROUND_REQUESTED = threading.Event()
 NO_NEW_GAMES_REQUESTED = threading.Event()
+ROUND_LIVE = threading.Event()
 RELOAD_REQUESTED = threading.Event()
 PAUSE_REQUESTED = threading.Event()
 UNPAUSE_REQUESTED = threading.Event()
@@ -66,11 +67,18 @@ def stdin_listener():
             print("[cmd] will stop after this round completes")
             STOP_AFTER_ROUND_REQUESTED.set()
         elif cmd == 'next round':
-            print("[cmd] next round requested")
-            NEXT_ROUND_REQUESTED.set()
+            if not ROUND_LIVE.is_set():
+                print("[cmd] next round: no round running, ignored")
+            else:
+                print("[cmd] next round requested")
+                NEXT_ROUND_REQUESTED.set()
         elif cmd == 'no new games':
-            print("[cmd] no new games -- draining current games, round ends normally")
-            NO_NEW_GAMES_REQUESTED.set()
+            if not ROUND_LIVE.is_set():
+                print("[cmd] no new games: no round running, ignored")
+            else:
+                print("[cmd] no new games -- draining current games, "
+                      "round ends normally")
+                NO_NEW_GAMES_REQUESTED.set()
         elif cmd == 'reload':
             print("[cmd] reload queued -- applies at next round start")
             RELOAD_REQUESTED.set()
@@ -365,20 +373,6 @@ def parse_paths(run_tag):
     return base_cfg, yaml_path, val_yaml_path
 
 
-def next_model_epoch(progress_csv_path):
-    """Next model_epoch to write. Row count is wrong when the csv has gaps or
-    duplicate epochs (cloned runs, partial rows), so continue past the max."""
-    if not os.path.exists(progress_csv_path):
-        return 0
-
-    df = pd.read_csv(progress_csv_path)
-    if not len(df) or 'model_epoch' not in df.columns:
-        return 0
-
-    return int(df['model_epoch'].max()) + 1
-
-
-
 def pull_pkl(to_process):
     # might be nested or flat depending on where it came from
     if 'meta' in to_process.keys():
@@ -533,6 +527,15 @@ def main(run_tag):
             # before most of those games were ever pulled, triggering
             # drain_and_stop early and stranding queued-but-unplayed games.
             stop_signal_sent = False
+
+            # 'no new games' / 'next round' only mean anything while a round's
+            # worker loop is running. Typed during the gap between rounds
+            # (drain, rescore tick, TRT rebuild) the event stays set and the
+            # next round consumes it on its first pass -- draining the queues
+            # and freezing top-up right after the initial fill.
+            NO_NEW_GAMES_REQUESTED.clear()
+            NEXT_ROUND_REQUESTED.clear()
+            ROUND_LIVE.set()
 
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
@@ -769,6 +772,8 @@ def main(run_tag):
                         retrain_worker = None
 
                 time.sleep(0.05)
+
+            ROUND_LIVE.clear()
 
             # when done, close the queues. Workers already got drain_and_stop,
             # so they'll exit on their own once in-flight games finish; only

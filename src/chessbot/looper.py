@@ -23,7 +23,7 @@ from chessbot import SF_LOC
 from chessbot.infer_ort_trt import make_ort_trt_infer
 
 from chessbot.mcts_utils import ChessGame
-from chessbot.utils import RateMeter, sf_eval
+from chessbot.utils import RateMeter, sf_eval, next_model_epoch
 from chessbot.game_utils import GameSpec
 
 
@@ -597,11 +597,10 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
         game_queue=game_queue, sf_queue=sf_queue,
     )
 
-    # infer number of retrains already done from existing progress csv
-    if os.path.exists(config.progress_csv_path):
-        progress_df = pd.read_csv(config.progress_csv_path)
-        n_retrains = len(progress_df)
-        looper.n_retrains = n_retrains
+    # infer the current epoch from the progress csv. Row count is wrong once the
+    # csv carries pretrain rows (written every Nth epoch), so use the same
+    # max+1 rule run_selfplay uses and stay in agreement with it.
+    looper.n_retrains = next_model_epoch(config.progress_csv_path)
 
     return looper
 

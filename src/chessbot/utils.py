@@ -378,6 +378,20 @@ def batch_policy_metrics_from_priors(samples, uniform_eps=0.05, clip_max=0.8):
     return {k: v / n_valid for k, v in acc.items()}
 
 
+def next_model_epoch(progress_csv_path):
+    """Next model_epoch to write. Row count is wrong when the csv has gaps or
+    duplicate epochs (cloned runs, pretrain rows every Nth epoch, partial rows),
+    so continue past the max."""
+    if not os.path.exists(progress_csv_path):
+        return 0
+
+    df = pd.read_csv(progress_csv_path)
+    if not len(df) or 'model_epoch' not in df.columns:
+        return 0
+
+    return int(df['model_epoch'].max()) + 1
+
+
 def batch_policy_metrics(logits, labels, mask):
     eps = 1e-12
     big_neg = -1e6

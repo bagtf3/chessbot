@@ -100,6 +100,202 @@ def make_ln2d(ch: int):
     return Ln2d()
 
 
+def make_rms2d(ch: int, eps: float = 1e-6):
+    """Channel-wise RMSNorm for (B, C, H, W) tensors.
+
+    Normalizes over the channel dim independently at each board square, so the
+    64 squares never mix. Learned scale, no additive bias.
+    """
+    import torch
+    import torch.nn as nn
+
+    class Rms2d(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(ch))
+
+        def forward(self, x):
+            r = torch.rsqrt(x.pow(2).mean(1, keepdim=True) + eps)
+            return x * r * self.w.view(1, -1, 1, 1)
+
+    return Rms2d()
+
+
+def make_rms1d(d: int, eps: float = 1e-6):
+    """RMSNorm over the last dim. Param is named `scale` to stay key-compatible
+    with the inline RMSNorm the smartgate heads have always used."""
+    import torch
+    import torch.nn as nn
+
+    class Rms1d(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(eps).sqrt() * self.scale
+
+    return Rms1d()
+
+
+def make_rms_conv_block(D: int):
+    """conv-pure's residual block with RMSNorm in place of LayerNorm.
+
+    residual -> rms -> conv3x3 -> leaky_relu -> conv3x3 -> leaky_relu -> add.
+    Exactly one norm per block, and unlike the LayerNorm version every block
+    normalizes -- the first is no longer skipped. bias=True on both convs since
+    RMSNorm has no bias of its own to absorb the offset.
+    """
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class RmsConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_rms2d(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+
+        def forward(self, x):
+            h = self.norm(x)
+            h = F.leaky_relu(self.c1(h), 0.01)
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return x + h
+
+    return RmsConvBlock()
+
+
+def make_globalizer_block(D: int = 256, local_ch: int = None, glob_ch: int = 16):
+    """Split local/global residual block.
+
+    The first conv stage splits into a (D - glob_ch)-channel local 3x3 branch
+    and a 16-channel 1x1 branch. The global branch is flattened to
+    [B, glob_ch * 64], pushed through a SwiGLU bottleneck (halve then restore),
+    reshaped back to [B, glob_ch, 8, 8] and concatenated with the local branch
+    to restore D channels. Every square therefore sees whole-board state
+    without attention.
+
+    One RMSNorm, one outer residual, no LayerScale or residual scaling.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    if local_ch is None:
+        local_ch = D - glob_ch        # 240 at D=256
+
+    gdim = glob_ch * SEQ_LEN          # 1024
+    hidden = gdim // 2                # 512
+
+    class GlobalizerBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_rms2d(D)
+            self.local_conv = nn.Conv2d(D, local_ch, 3, padding=1, bias=True)
+            self.glob_conv = nn.Conv2d(D, glob_ch, 1, padding=0, bias=True)
+            self.lin_in = nn.Linear(gdim, gdim, bias=True)     # emits gate|value
+            self.lin_out = nn.Linear(hidden, gdim, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+
+        def forward(self, x):
+            B = x.shape[0]
+            h = self.norm(x)
+
+            local = F.leaky_relu(self.local_conv(h), 0.01)     # [B, D-16, 8, 8]
+
+            g = self.glob_conv(h).reshape(B, gdim)             # [B, 1024]
+            gate, value = self.lin_in(g).chunk(2, dim=-1)      # [B, 512] each
+            g = F.silu(gate) * value
+            g = self.lin_out(g).reshape(B, glob_ch, 8, 8)      # [B, 16, 8, 8]
+
+            h = torch.cat([local, g], dim=1)                   # [B, D, 8, 8]
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return x + h
+
+    return GlobalizerBlock()
+
+
+def make_signed_attn_block(D: int = 256, logit_scale: float = None):
+    """Signed board-attention residual block.
+
+    Attention weights are tanh-bounded and L1-normalized rather than softmaxed,
+    so they stay signed: a square can subtract another square's value, not just
+    average it in.
+
+    The L1 denominator clamps at 1.0, not at an epsilon, so it caps row
+    magnitude without forcing it. A row whose weights already sum to less than
+    1 passes through untouched and the square contributes little or nothing,
+    which softmax and a plain L1 divide both make impossible -- either would
+    renormalize an all-quiet row back up to full magnitude and inject a mix the
+    position never asked for. Rows can now be weak as well as negative.
+
+    logit_scale defaults to sqrt(D), the usual 1/sqrt(d) attention scale, which
+    reproduces the hardcoded 16.0 this block used when D was always 256. It
+    matters more here than under softmax: tanh saturates, so letting the logits
+    grow with D would flatten the weights toward +/-1 and cost the block its
+    ability to grade how strongly one square pulls on another.
+
+    Values get a SiLU so the mix is a nonlinear feature map rather than a
+    linear re-mix of what c1 already produced. The query path stays linear on
+    purpose: a nonlinearity there would push logits positive and collapse the
+    signed weights back into a worse softmax. Nothing after matmul(w, v)
+    either -- that delta feeds the residual, and squashing it would attenuate
+    negative contributions; c2's leaky_relu is the nonlinearity for that path.
+
+    One RMSNorm, one inner token residual, one outer residual. No output
+    projection after the mix, no softmax, no dropout.
+    """
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    if logit_scale is None:
+        logit_scale = math.sqrt(D)    # 16.0 at D=256
+
+    class SignedAttnBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_rms2d(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+            # WAS: self.interaction = nn.Linear(D, D, bias=True)
+            # WAS: self.value = nn.Linear(D, D, bias=True)
+            # 1x1 conv == per-square Linear(D, D) over the channel dim, so q/v
+            # can be produced without ever leaving NCHW layout.
+            self.interaction = nn.Conv2d(D, D, 1, bias=True)
+            self.value = nn.Conv2d(D, D, 1, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+
+        def forward(self, x):
+            B = x.shape[0]
+            h = self.norm(x)
+            h = F.leaky_relu(self.c1(h), 0.01)
+
+            # WAS:
+            # tokens = h.flatten(2).transpose(1, 2)              # [B, 64, D]
+            # q = self.interaction(tokens)
+            # v = F.silu(self.value(tokens))
+            # logits = torch.matmul(q, tokens.transpose(-1, -2)) / logit_scale
+            h_flat = h.flatten(2)                                # [B, D, 64]
+            q = self.interaction(h).flatten(2)                   # [B, D, 64]
+            v = F.silu(self.value(h)).flatten(2)                 # [B, D, 64]
+
+            logits = torch.einsum("bei,bej->bij", q, h_flat) / logit_scale
+            w = torch.tanh(logits)                             # [B, 64, 64]
+            den = w.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            w = w / den
+
+            # WAS: tokens = tokens + torch.matmul(w, v)          # [B, 64, D]
+            h_flat = h_flat + torch.einsum("bij,bdj->bdi", w, v)  # [B, D, 64]
+
+            # WAS: h = tokens.transpose(1, 2).reshape(B, D, 8, 8)
+            h = h_flat.reshape(B, D, 8, 8)
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return x + h
+
+    return SignedAttnBlock()
+
+
 def make_pt_attn_pool_value_head(C: int, n_heads: int = 4):
     """Attention-pool value head. Accepts (B, C, 8, 8) or (B, N, C)."""
     import torch
@@ -1503,129 +1699,227 @@ def build_pt_conv_shallow_mha(cfg: dict, log_params: bool = False):
     return m
 
 
-def build_pt_conv_pure(cfg: dict, log_params: bool = False):
-    """N x ConvBlock(conv_filters) channels-first (NCHW) backbone -> trunk_ln,
-    N = cfg["num_blocks"] (currently 16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
-    WDL:       Conv(256,8) -> leaky_relu -> reshape [B,512] -> GELU -> Linear(512,3).
-    SmartGate: Conv(256,16,3x3) -> leaky_relu -> reshape [B,1024] -> Linear(1024,512)
-               -> GELU -> LayerNorm(512) -> SwiGLU(512,768,512) -> RMSNorm -> Linear(512,1858),
-               same D=512 SwiGLU/RMSNorm/gate_out shape and zero-init/bias=4.0 convention
-               as the precond-smartgate family's gate.
-    Policy:    board tokens [B,64,256] -> from/to MHA at PDH=256 -> bilinear -> smartgate -> 1858.
+def attach_conv_pure_heads(m, D, PDH, GATE_D, GATE_H, dr, sl_idx):
+    """Attach conv-pure's WDL / SmartGate / from-to policy heads onto `m`.
+
+    Assigns with the same flat attribute names the inline implementation used,
+    so the head half of a state dict stays key-compatible across the conv-*
+    family. Shared by conv-pure, conv-globalizer and conv-signed-attn.
     """
     import math
+    import torch.nn as nn
+
+    # trunk is post-RMSNorm, which rescales without re-centering, so the two
+    # convs reading it carry their own bias -- both feed a leaky_relu whose
+    # kink sits at zero and there is nothing upstream to position them against
+    # it. wdl_out gets one so WDL can learn a base rate directly.
+    m.wdl_conv = nn.Conv2d(D, 16, 3, padding=1, bias=True)        # [B,16,8,8]
+    m.wdl_w1 = nn.Linear(16 * SEQ_LEN, 256)                       # 1024 -> 256
+    m.wdl_norm = make_rms1d(256)
+    m.wdl_out = nn.Linear(256, 3, bias=True)
+
+    m.gate_conv = nn.Conv2d(D, 16, 3, padding=1, bias=True)       # [B,16,8,8]
+    m.gate_proj = nn.Linear(16 * SEQ_LEN, GATE_D)                 # 1024 -> 512
+    m.gate_proj_ln = nn.LayerNorm(GATE_D)
+
+    m.gate_w_gate = nn.Linear(GATE_D, GATE_H, bias=False)
+    m.gate_w_up = nn.Linear(GATE_D, GATE_H, bias=False)
+    m.gate_w_down = nn.Linear(GATE_H, GATE_D, bias=False)
+    m.gate_drop = nn.Dropout(dr)
+    nn.init.zeros_(m.gate_w_down.weight)
+    m.gate_norm = make_rms1d(GATE_D)
+    m.gate_out = nn.Linear(GATE_D, 1858, bias=True)
+    nn.init.zeros_(m.gate_out.weight)
+    nn.init.constant_(m.gate_out.bias, 4.0)
+
+    m.from_proj = nn.Linear(D, PDH)
+    m.from_ln = nn.LayerNorm(PDH)
+    m.from_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+    m.from_out = nn.Linear(PDH, PDH)
+
+    m.to_proj = nn.Linear(D, PDH)
+    m.to_ln = nn.LayerNorm(PDH)
+    m.to_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+    m.to_out = nn.Linear(PDH, PDH)
+
+    m.scale = 1.0 / math.sqrt(PDH)
+    m.promo_from = nn.Linear(PDH, 3, bias=False)
+    m.promo_to = nn.Linear(PDH, 3, bias=False)
+
+    m.register_buffer("sl_idx", sl_idx)
+
+
+def conv_pure_heads_forward(m, trunk, B, D):
+    """Run the heads attached by attach_conv_pure_heads.
+
+    `trunk` is post-trunk-norm [B, D, 8, 8]. Returns (policy_1858, wdl) in the
+    same order and dtypes the inline version returned.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    wdl_h = F.leaky_relu(m.wdl_conv(trunk), 0.01).reshape(B, 16 * SEQ_LEN)
+    wdl_h = F.gelu(m.wdl_norm(m.wdl_w1(wdl_h)))                       # [B, 256]
+    wdl = m.wdl_out(wdl_h)                                            # [B, 3]
+
+    gc = F.leaky_relu(m.gate_conv(trunk), 0.01).reshape(B, 16 * SEQ_LEN)
+    gi = m.gate_proj_ln(F.gelu(m.gate_proj(gc)))                      # [B, 512]
+    h = F.silu(m.gate_w_gate(gi)) * m.gate_w_up(gi)
+    g = gi + m.gate_drop(m.gate_w_down(h))
+    gate_raw = m.gate_out(m.gate_norm(g))                             # [B, 1858]
+
+    board = trunk.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)          # [B, 64, D]
+
+    f_proj = F.gelu(m.from_proj(board))
+    fn = m.from_ln(f_proj)
+    fh, _ = m.from_mha(fn, fn, fn, need_weights=False)
+    fv = m.from_out(f_proj + fh)
+
+    t_proj = F.gelu(m.to_proj(board))
+    tn = m.to_ln(t_proj)
+    th, _ = m.to_mha(tn, tn, tn, need_weights=False)
+    tv = m.to_out(t_proj + th)
+
+    dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(m.scale)        # [B, 64, 64]
+    dots = dots_full.reshape(B, SEQ_LEN * SEQ_LEN)
+
+    dots_sub = dots_full[:, 48:56, 56:64]
+    pf = m.promo_from(fv[:, 48:56, :])
+    pt = m.promo_to(tv[:, 56:64, :])
+    promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+             ).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+    raw_4288 = torch.cat([dots.float(), promo], dim=1)
+    q_sl = raw_4288[:, m.sl_idx]
+    combined = q_sl + F.logsigmoid(gate_raw.float())
+    return combined.to(trunk.dtype), wdl
+
+
+def build_conv_rms_backbone(cfg: dict, block_fn, n_blocks, log_params=False,
+                            name=""):
+    """Shared skeleton for the RMSNorm conv family.
+
+    emb -> 2 standard RMS conv blocks -> n_blocks x block_fn() -> final RMSNorm
+    -> the exact conv-pure heads. `block_fn` is a zero-arg factory so the caller
+    picks globalizer vs signed-attn without duplicating the stem or heads.
+    """
     import torch
     import torch.nn as nn
-    import torch.nn.functional as F
     import pyfastchess
 
-    D       = cfg["conv_filters"]   # 128
-    nb      = cfg["num_blocks"]
-    dr      = cfg["dropout"]
-    PDH     = D                     # 128
-    GATE_D  = 512
-    GATE_H  = GATE_D * 3 // 2
+    D = cfg["conv_filters"]
+    dr = cfg["dropout"]
+    # policy head width is pinned, not tied to the trunk: from_proj/to_proj are
+    # Linear(D, PDH) and rescale either way. Matches conv-pure and the precond
+    # models, so widening the trunk is a body experiment and not a head one.
+    PDH = 256
+    GATE_D = 512
+    GATE_H = GATE_D * 3 // 2
+    n_stem = cfg.get("stem_blocks", 2)
 
-    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
-    class RMSNorm(nn.Module):
-        def __init__(self, d, eps=1e-6):
+    class M(nn.Module):
+        def __init__(self):
             super().__init__()
-            self.scale = nn.Parameter(torch.ones(d))
-            self.eps   = eps
-        def forward(self, x):
-            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
+            self.emb = nn.Embedding(VOCAB_SIZE, D)
+            self.stem = nn.ModuleList(
+                [make_rms_conv_block(D) for _ in range(n_stem)])
+            self.blocks = nn.ModuleList([block_fn() for _ in range(n_blocks)])
+            self.trunk_ln = make_rms2d(D)
+            attach_conv_pure_heads(self, D, PDH, GATE_D, GATE_H, dr, sl_idx)
 
-    class ConvBlock(nn.Module):
-        def __init__(self, prenorm=True):
-            super().__init__()
-            self.ln = make_ln2d(D) if prenorm else None
-            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=False)
-            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
-        def forward(self, x):
-            h = self.ln(x) if self.ln is not None else x
-            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens).reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
+            for blk in self.stem:
+                x = blk(x)
+            for blk in self.blocks:
+                x = blk(x)
+            trunk = self.trunk_ln(x)
+            return conv_pure_heads_forward(self, trunk, B, D)
+
+    m = M()
+    if log_params:
+        n = sum(p.numel() for p in m.parameters())
+        print(f"  {name} PT params: {n:,}")
+    return m
+
+
+def build_pt_conv_globalizer(cfg: dict, log_params: bool = False):
+    """conv-globalizer: 2 RMS conv blocks + N globalizer blocks at D.
+
+    Global mixing via a 16-channel 1x1 branch flattened to 1024 and pushed
+    through a SwiGLU bottleneck, then concatenated back. No attention.
+    ~2.72M params per globalizer block at D=256.
+    """
+    D = cfg["conv_filters"]
+    nb = cfg.get("num_blocks", 8)
+    return build_conv_rms_backbone(
+        cfg,
+        block_fn=lambda: make_globalizer_block(D),
+        n_blocks=nb,
+        log_params=log_params,
+        name=f"conv-globalizer-2c{nb}g",
+    )
+
+
+def build_pt_conv_signed_attn(cfg: dict, log_params: bool = False):
+    """conv-signed-attn: 2 RMS conv blocks + N signed-attention blocks at D.
+
+    Board attention with tanh-bounded, L1-normalized signed weights instead of
+    softmax, so squares can subtract as well as add.
+    ~1.31M params per attention block at D=256.
+    """
+    D = cfg["conv_filters"]
+    nb = cfg.get("num_blocks", 8)
+    return build_conv_rms_backbone(
+        cfg,
+        block_fn=lambda: make_signed_attn_block(D),
+        n_blocks=nb,
+        log_params=log_params,
+        name=f"conv-signed-attn-2c{nb}a",
+    )
+
+
+def build_pt_conv_pure(cfg: dict, log_params: bool = False):
+    """N x RMS conv block (conv_filters) channels-first (NCHW) -> trunk RMSNorm,
+    N = cfg["num_blocks"] (16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
+
+    Converted from LayerNorm to RMSNorm: one RMSNorm per block, every block
+    normalized (the first is no longer skipped), conv bias=True. Heads are the
+    shared conv-pure WDL / SmartGate / from-to policy stack, unchanged.
+    """
+    import torch
+    import torch.nn as nn
+    import pyfastchess
+
+    D      = cfg["conv_filters"]
+    nb     = cfg["num_blocks"]
+    dr     = cfg["dropout"]
+    PDH    = D
+    GATE_D = 512
+    GATE_H = GATE_D * 3 // 2
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
     class M(nn.Module):
         def __init__(self):
             super().__init__()
             self.emb      = nn.Embedding(VOCAB_SIZE, D)
-            self.blocks   = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(nb)])
-            self.trunk_ln = make_ln2d(D)
-
-            self.wdl_conv = nn.Conv2d(D, 8, 1, bias=False)
-            self.wdl_out  = nn.Linear(512, 3, bias=False)
-
-            self.gate_conv    = nn.Conv2d(D, 16, 3, padding=1, bias=False)   # [B,16,8,8]
-            self.gate_proj    = nn.Linear(16 * 64, GATE_D)                    # 1024 -> 512
-            self.gate_proj_ln = nn.LayerNorm(GATE_D)
-
-            self.gate_w_gate = nn.Linear(GATE_D, GATE_H, bias=False)
-            self.gate_w_up   = nn.Linear(GATE_D, GATE_H, bias=False)
-            self.gate_w_down = nn.Linear(GATE_H, GATE_D, bias=False)
-            self.gate_drop   = nn.Dropout(dr)
-            nn.init.zeros_(self.gate_w_down.weight)
-            self.gate_norm = RMSNorm(GATE_D)
-            self.gate_out  = nn.Linear(GATE_D, 1858, bias=True)
-            nn.init.zeros_(self.gate_out.weight)
-            nn.init.constant_(self.gate_out.bias, 4.0)
-
-            self.from_proj = nn.Linear(D, PDH)
-            self.from_ln   = nn.LayerNorm(PDH)
-            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
-            self.from_out  = nn.Linear(PDH, PDH)
-
-            self.to_proj   = nn.Linear(D, PDH)
-            self.to_ln     = nn.LayerNorm(PDH)
-            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
-            self.to_out    = nn.Linear(PDH, PDH)
-
-            self.scale      = 1.0 / math.sqrt(PDH)
-            self.promo_from = nn.Linear(PDH, 3, bias=False)
-            self.promo_to   = nn.Linear(PDH, 3, bias=False)
-
-            self.register_buffer("sl_idx", sl_idx)
+            self.blocks   = nn.ModuleList([make_rms_conv_block(D) for _ in range(nb)])
+            self.trunk_ln = make_rms2d(D)
+            attach_conv_pure_heads(self, D, PDH, GATE_D, GATE_H, dr, sl_idx)
 
         def forward(self, tokens):
             B = tokens.shape[0]
             x = self.emb(tokens).reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
             for blk in self.blocks:
                 x = blk(x)
-            trunk = self.trunk_ln(x)                                            # [B, D, 8, 8]
-
-            wdl_h = F.leaky_relu(self.wdl_conv(trunk), 0.01).reshape(B, 512)
-            wdl   = self.wdl_out(F.gelu(wdl_h))                                # [B, 3]
-
-            gc = F.leaky_relu(self.gate_conv(trunk), 0.01).reshape(B, 16 * 64)  # [B, 1024]
-            gi = self.gate_proj_ln(F.gelu(self.gate_proj(gc)))                  # [B, 512]
-            h  = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
-            g        = gi + self.gate_drop(self.gate_w_down(h))
-            gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
-
-            board  = trunk.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)         # [B, 64, 256]
-
-            f_proj = F.gelu(self.from_proj(board))
-            fn     = self.from_ln(f_proj)
-            fh, _  = self.from_mha(fn, fn, fn, need_weights=False)
-            fv     = self.from_out(f_proj + fh)                                # [B, 64, 128]
-
-            t_proj = F.gelu(self.to_proj(board))
-            tn     = self.to_ln(t_proj)
-            th, _  = self.to_mha(tn, tn, tn, need_weights=False)
-            tv     = self.to_out(t_proj + th)                                  # [B, 64, 128]
-
-            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
-            dots      = dots_full.reshape(B, 64 * 64)
-
-            dots_sub = dots_full[:, 48:56, 56:64]
-            pf       = self.promo_from(fv[:, 48:56, :])
-            pt       = self.promo_to(tv[:, 56:64, :])
-            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
-
-            raw_4288 = torch.cat([dots.float(), promo], dim=1)
-            q_sl     = raw_4288[:, self.sl_idx]
-            combined = q_sl + F.logsigmoid(gate_raw.float())
-            return combined.to(trunk.dtype), wdl
+            trunk = self.trunk_ln(x)
+            return conv_pure_heads_forward(self, trunk, B, D)
 
     m = M()
     if log_params:

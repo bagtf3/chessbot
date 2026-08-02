@@ -1355,13 +1355,13 @@ class Rescorer(object):
                 return
             row = {'model_epoch': epoch}
             for k, v in b.items():
-                row[f'{label}_{k}'] = round(v, 5)
+                row[f'{label}_{k}'] = round(v, 4)
             row_df = pd.DataFrame([row])
             if os.path.exists(path):
                 all_df = pd.concat([pd.read_csv(path), row_df], ignore_index=True)
             else:
                 all_df = row_df
-            all_df.round(5).to_csv(path, index=False)
+            all_df.round(4).to_csv(path, index=False)
 
         vs_true_col_map = {
             'mse': 'value_mse', 'corr': 'value_corr', 'ce': 'value_ce',
@@ -1377,13 +1377,13 @@ class Rescorer(object):
             row = {'model_epoch': epoch}
             for k, col in vs_true_col_map.items():
                 if k in xb:
-                    row[col] = round(xb[k], 5)
+                    row[col] = round(xb[k], 4)
             row_df = pd.DataFrame([row])
             if os.path.exists(progress_csv_path):
                 all_df = pd.concat([pd.read_csv(progress_csv_path), row_df], ignore_index=True)
             else:
                 all_df = row_df
-            all_df.round(5).to_csv(progress_csv_path, index=False)
+            all_df.round(4).to_csv(progress_csv_path, index=False)
         lc0_csv = os.path.join(os.path.dirname(progress_csv_path), 'eval_progress_vs_lc0.csv')
         save_csv(lc0_csv, 'xc0_vs_lc0', lb)
         print(f"{pfx} saved to {os.path.basename(progress_csv_path)}")

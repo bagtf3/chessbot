@@ -4,21 +4,25 @@
 Conv-backbone speed tests for chess policy+value models.
 
 Models:
-  16m-precond-smartgate-xc0h-K6      -- prod: 4x Conv(256) preconditioner -> concat pos(256)
-                                         -> 512-d -> 8 global accumulators -> 4x transformer
-                                         blocks -> shared trunk_ln -> WDL(0) + SmartGate(1)
-                                         + from/to policy(2-7)
-  18m-precond-smartgate-xc0h-K6-6c4t -- same stem; 6 conv preconditioner blocks, 4
-                                        transformer blocks (unchanged), pos concatenated
-                                        (CF=256 -> D=512, same as prod)
-  conv-pure                          -- 16x ConvBlock(256) NCHW -> trunk_ln -> WDL conv(8)
-                                         -> SmartGate conv(16,3x3)->1024->512 SwiGLU/RMSNorm
-                                         -> policy 2xLinear->256->MHA(256)
+  18m-precond-smartgate-xc0h-K6-6c4t -- 6 conv preconditioner blocks, 4 transformer
+                                        blocks, pos concatenated (CF=256 -> D=512).
+                                        Keeps its existing LayerNorm; untouched here.
+  conv-pure                          -- 16x RMS conv block (256) NCHW -> trunk RMSNorm
+                                        -> conv-pure WDL / SmartGate / from-to heads
+  conv-globalizer-2c6g               -- 2 RMS conv blocks + 6 globalizer blocks (384):
+                                        368ch local 3x3 + 16ch 1x1 global branch through
+                                        a 1024->512->1024 SwiGLU, concat back to 384
+  conv-signed-attn-2c10a             -- 2 RMS conv blocks + 10 signed-attention blocks (256):
+                                        tanh-bounded L1-normalized signed board attention
+                                        instead of softmax
+
+The three conv models share the identical conv-pure heads and input stem, and all
+use RMSNorm. The 18m preconditioned model deliberately keeps LayerNorm.
 
 Flags:
-  --dry-run              Build models, print param counts, skip speed test
+  --dry-run              Build models, print param counts + shape checks, skip speed test
   --skip-trt             Skip ORT+TensorRT
-  --skip-convpure        Skip conv-pure model
+  --skip-convpure        Skip all three conv models
   --batch-sizes    Space-separated list (default: 1 2 4 8 16 32 64 128 256 512)
 """
 
@@ -33,7 +37,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
-from chessbot.model import build_pt_precond_smartgate, build_pt_conv_pure
+from chessbot.model import (
+    build_pt_precond_smartgate, build_pt_conv_pure,
+    build_pt_conv_globalizer, build_pt_conv_signed_attn,
+)
 
 SEQ_LEN    = 64
 ENC_VOCAB  = 21
@@ -54,9 +61,37 @@ XC0H_6C4T_CFG = dict(
     pre_blocks=6, tx_blocks=4, xc0h_K=6,
 )
 
+# flat width of board.history_tokens(K): K*64 slim tokens + K rep flags
+# + castling + stm + hmc. Matches random_xc0h_tokens.
+XC0H_IN_LEN = 6 * 64 + 6 + 3
+
 CONV_PURE_CFG = dict(
     conv_filters=256, num_blocks=16, dropout=0.03,
 )
+
+# 2 standard RMS conv blocks + 6 backbone blocks, d_model 384
+CONV_GLOBALIZER_CFG = dict(
+    conv_filters=384, num_blocks=6, stem_blocks=2, dropout=0.03,
+)
+
+# 2 standard RMS conv blocks + 10 backbone blocks, d_model 256
+CONV_SIGNED_ATTN_CFG = dict(
+    conv_filters=256, num_blocks=10, stem_blocks=2, dropout=0.03,
+)
+
+# (label, builder, cfg, onnx stem) -- the three conv models are identical in
+# stem, heads and IO, so they run through one code path.
+CONV_MODELS = [
+    ("conv-pure",            build_pt_conv_pure,        CONV_PURE_CFG,         "conv_pure"),
+    ("conv-globalizer-2c6g",  build_pt_conv_globalizer,  CONV_GLOBALIZER_CFG,   "conv_globalizer_2c6g"),
+    ("conv-signed-attn-2c10a", build_pt_conv_signed_attn, CONV_SIGNED_ATTN_CFG, "conv_signed_attn_2c10a"),
+]
+
+# rough targets from the design spec; reported alongside the real count
+EXPECTED_PARAMS = {
+    "conv-globalizer-2c6g": 34_297_000,
+    "conv-signed-attn-2c10a": 19_275_000,
+}
 
 
 def parse_args():
@@ -179,6 +214,53 @@ def make_pt_eager_infer(model, device, is_lc0=False):
     return infer
 
 
+POLICY_1858 = 1858
+
+
+def verify_outputs(model, device, label, batch=4, input_fn=None):
+    """Forward a small batch and check the head shapes.
+
+    Returns (ok, policy_np, value_np, enc_np) so the caller can reuse the same
+    inputs for the PT-vs-export comparison.
+    """
+    input_fn = input_fn or random_tokens
+    enc_np = input_fn(batch)
+    m = model.half().to(device).eval()
+    with torch.no_grad():
+        p, v = m(torch.from_numpy(enc_np).long().to(device))
+    p_np = p.float().cpu().numpy()
+    v_np = v.float().cpu().numpy()
+
+    ok = True
+    if p_np.shape != (batch, POLICY_1858):
+        print(f"  [SHAPE] {label}: policy {p_np.shape}, expected {(batch, POLICY_1858)}")
+        ok = False
+    if v_np.shape != (batch, 3):
+        print(f"  [SHAPE] {label}: value {v_np.shape}, expected {(batch, 3)}")
+        ok = False
+    if not (np.isfinite(p_np).all() and np.isfinite(v_np).all()):
+        print(f"  [NAN] {label}: non-finite outputs")
+        ok = False
+    if ok:
+        print(f"  shapes ok: policy {p_np.shape}  value {v_np.shape}  (finite)")
+    return ok, p_np, v_np, enc_np
+
+
+def compare_pt_vs_export(pt_policy, pt_value, infer_fn, enc_np, label):
+    """Max/mean absolute difference between the eager and exported paths."""
+    try:
+        ep, ev = infer_fn(enc_np)
+    except Exception as e:
+        print(f"  [ERROR] {label} export comparison: {e}")
+        return None
+    dp = np.abs(ep - pt_policy)
+    dv = np.abs(ev - pt_value)
+    print(f"  PT vs export  policy: max {dp.max():.4e}  mean {dp.mean():.4e}")
+    print(f"                value : max {dv.max():.4e}  mean {dv.mean():.4e}")
+    return {"policy_max": float(dp.max()), "policy_mean": float(dp.mean()),
+            "value_max": float(dv.max()), "value_mean": float(dv.mean())}
+
+
 def export_to_onnx(model, device, onnx_path, dummy=None):
     import warnings
     import onnx
@@ -210,7 +292,7 @@ def export_to_onnx(model, device, onnx_path, dummy=None):
 
 def make_trt_infer(onnx_path, cache_dir, max_bs=512, input_shape="64", preprocess_fn=None):
     """input_shape: profile shape suffix after the batch dim, e.g. "64",
-    "112x8x8", or "391" (xc0h-K6's flat width). preprocess_fn(enc_np) -> np.ndarray
+    "112x8x8", or "393" (xc0h-K6's flat width). preprocess_fn(enc_np) -> np.ndarray
     ready for session.run; defaults to a plain int64 cast (xc0/xc0h token inputs).
     lc0 needs float32->rule50/99->float16, matching train_pytorch.make_pt_infer."""
     import hashlib
@@ -309,7 +391,15 @@ def print_summary_table(all_results, batch_sizes):
     print(f"  {'-'*(label_w + col_w * len(TABLE_BS))}")
     print(header)
     print(f"  {'-'*(label_w + col_w * len(TABLE_BS))}")
-    for label, res in all_results.items():
+    # sort by bs=256 throughput, fastest first; fall back to the largest batch
+    # actually run when 256 isn't in the sweep. Rows missing it sink to the end.
+    sort_bs = 256 if 256 in TABLE_BS else TABLE_BS[-1]
+
+    def sort_key(item):
+        val = item[1].get(sort_bs, {}).get("throughput")
+        return (val is None, -(val or 0))
+
+    for label, res in sorted(all_results.items(), key=sort_key):
         row = f"  {label:<{label_w}}"
         for b in TABLE_BS:
             val = res.get(b, {}).get("throughput")
@@ -351,44 +441,6 @@ def main():
         save_results_csv(lbl, params, result)
         return result
 
-    # 16m-precond-smartgate-xc0h-K6
-    print(f"\n{'='*60}")
-    print(f"  16m-precond-smartgate-xc0h-K6  (compact history-token stem, K=6;"
-          f" everything downstream identical to 16m-precond-smartgate)")
-    model_xh  = build_pt_precond_smartgate(XC0H_CFG)
-    params_xh = sum(p.numel() for p in model_xh.parameters())
-    in_len_xh = 6 * 64 + 6 + 3
-
-    if not args.dry_run:
-        try:
-            print(f"\n  Building 16m-precond-smartgate-xc0h-K6 PT eager ...")
-            eager_xh = make_pt_eager_infer(model_xh, device)
-            lbl = "16m-precond-smartgate-xc0h-K6  PT eager"
-            all_results[lbl] = run_or_cached(
-                lbl, eager_xh, params_xh,
-                input_fn=lambda b: random_xc0h_tokens(b, 6))
-            del eager_xh; gc.collect(); torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 PT eager: {e}")
-
-        if not args.skip_trt:
-            try:
-                lbl     = "16m-precond-smartgate-xc0h-K6  ORT TRT"
-                onnx_xh = os.path.join(TRT_CACHE, f"precond_xc0h_k6_{params_xh}.onnx")
-                if not os.path.exists(onnx_xh):
-                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
-                    export_to_onnx(build_pt_precond_smartgate(XC0H_CFG), device, onnx_xh, dummy=dummy)
-                else:
-                    print(f"  [TRT] ONNX cached: {onnx_xh}")
-                trt_xh, trt_sess_xh = make_trt_infer(
-                    onnx_xh, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
-                all_results[lbl] = run_or_cached(
-                    lbl, trt_xh, params_xh,
-                    input_fn=lambda b: random_xc0h_tokens(b, 6))
-                del trt_sess_xh; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 16m-precond-smartgate-xc0h-K6 TRT: {e}")
-
     # 18m-precond-smartgate-xc0h-K6-6c4t
     print(f"\n{'='*60}")
     print(f"  18m-precond-smartgate-xc0h-K6-6c4t  (same stem as xc0h-K6;"
@@ -414,12 +466,14 @@ def main():
                 lbl        = "18m-precond-smartgate-xc0h-K6-6c4t  ORT TRT"
                 onnx_6c4t  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_6c4t_{params_6c4t}.onnx")
                 if not os.path.exists(onnx_6c4t):
-                    dummy = torch.zeros(1, in_len_xh, dtype=torch.long, device=device)
+                    dummy = torch.zeros(
+                        1, XC0H_IN_LEN, dtype=torch.long, device=device)
                     export_to_onnx(build_pt_precond_smartgate(XC0H_6C4T_CFG), device, onnx_6c4t, dummy=dummy)
                 else:
                     print(f"  [TRT] ONNX cached: {onnx_6c4t}")
                 trt_6c4t, trt_sess_6c4t = make_trt_infer(
-                    onnx_6c4t, TRT_CACHE, max_bs=max(bs), input_shape=str(in_len_xh))
+                    onnx_6c4t, TRT_CACHE, max_bs=max(bs),
+                    input_shape=str(XC0H_IN_LEN))
                 all_results[lbl] = run_or_cached(
                     lbl, trt_6c4t, params_6c4t,
                     input_fn=lambda b: random_xc0h_tokens(b, 6))
@@ -427,38 +481,56 @@ def main():
             except Exception as e:
                 print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t TRT: {e}")
 
-    # conv-pure
+    # conv family: conv-pure, conv-globalizer-2c6g, conv-signed-attn-2c10a.
+    # Same stem, same heads, same IO, so one loop covers all three.
     if not args.skip_convpure:
-        print(f"\n{'='*60}")
-        print(f"  conv-pure  (16x ConvBlock(256) NCHW -> trunk_ln"
-              f" -> WDL conv(8)/reshape/GELU, SmartGate conv(16)->1024->512 SwiGLU,"
-              f" policy 2xLinear->256->MHA(256))")
-        model_cp  = build_pt_conv_pure(CONV_PURE_CFG)
-        params_cp = sum(p.numel() for p in model_cp.parameters())
+        for label, builder, cfg, stem in CONV_MODELS:
+            print(f"\n{'='*60}")
+            print(f"  {label}")
+            model = builder(cfg)
+            params = sum(q.numel() for q in model.parameters())
+            trainable = sum(q.numel() for q in model.parameters() if q.requires_grad)
+            print(f"  params: {params:,}  (trainable {trainable:,})")
+            exp = EXPECTED_PARAMS.get(label)
+            if exp:
+                print(f"  spec estimate: ~{exp:,}  "
+                      f"(delta {params - exp:+,}, {100.0 * (params - exp) / exp:+.2f}%)")
 
-        if not args.dry_run:
+            ok, pt_p, pt_v, enc_np = verify_outputs(model, device, label)
+            if not ok:
+                print(f"  [SKIP] {label}: output verification failed")
+                del model; gc.collect(); torch.cuda.empty_cache()
+                continue
+
+            if args.dry_run:
+                del model; gc.collect(); torch.cuda.empty_cache()
+                continue
+
             try:
-                print(f"\n  Building conv-pure PT eager ...")
-                eager_cp = make_pt_eager_infer(model_cp, device)
-                lbl = "conv-pure  PT eager"
-                all_results[lbl] = run_or_cached(lbl, eager_cp, params_cp)
-                del eager_cp; gc.collect(); torch.cuda.empty_cache()
+                print(f"\n  Building {label} PT eager ...")
+                eager = make_pt_eager_infer(model, device)
+                lbl = f"{label}  PT eager"
+                all_results[lbl] = run_or_cached(lbl, eager, params)
+                del eager
             except Exception as e:
-                print(f"  [ERROR] conv-pure PT eager: {e}")
+                print(f"  [ERROR] {label} PT eager: {e}")
+            del model; gc.collect(); torch.cuda.empty_cache()
 
-            if not args.skip_trt:
-                try:
-                    lbl     = "conv-pure  ORT TRT"
-                    onnx_cp = os.path.join(TRT_CACHE, f"conv_pure_{params_cp}.onnx")
-                    if not os.path.exists(onnx_cp):
-                        export_to_onnx(build_pt_conv_pure(CONV_PURE_CFG), device, onnx_cp)
-                    else:
-                        print(f"  [TRT] ONNX cached: {onnx_cp}")
-                    trt_cp, trt_sess_cp = make_trt_infer(onnx_cp, TRT_CACHE, max_bs=max(bs))
-                    all_results[lbl] = run_or_cached(lbl, trt_cp, params_cp)
-                    del trt_sess_cp; gc.collect()
-                except Exception as e:
-                    print(f"  [ERROR] conv-pure TRT: {e}")
+            if args.skip_trt:
+                continue
+            try:
+                lbl = f"{label}  ORT TRT"
+                onnx_path = os.path.join(TRT_CACHE, f"{stem}_{params}.onnx")
+                if not os.path.exists(onnx_path):
+                    export_to_onnx(builder(cfg), device, onnx_path)
+                else:
+                    print(f"  [TRT] ONNX cached: {onnx_path}")
+                trt_fn, trt_sess = make_trt_infer(onnx_path, TRT_CACHE, max_bs=max(bs))
+                compare_pt_vs_export(pt_p, pt_v, trt_fn, enc_np, label)
+                all_results[lbl] = run_or_cached(lbl, trt_fn, params)
+                del trt_sess; gc.collect()
+            except Exception as e:
+                print(f"  [ERROR] {label} TRT: {e}")
 
     if args.dry_run:
         print("\n  Dry run complete.")

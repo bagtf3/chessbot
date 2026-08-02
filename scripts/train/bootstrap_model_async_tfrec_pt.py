@@ -69,12 +69,45 @@ DEFAULT_MAX_EPOCH = 3501
 DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
 
 
+# Shared schema for the unified eval_progress.csv. The first 15 are selfplay's
+# existing columns in their existing order -- Rescorer.aggregate_metrics writes
+# exactly these and nothing else. The last 5 only pretraining can produce, so
+# they sit at the end and stay blank once selfplay starts appending.
+UNIFIED_COLS = [
+    "model_epoch", "value_mse", "value_corr", "value_ce", "policy_ce",
+    "uniform_ce", "ce_gain", "top1_exact", "top1_mass", "top3_mass",
+    "top5_mass", "n_samples", "mass_on_legal", "avg_top_prob",
+    "avg_top_prob_target",
+    "train_loss", "gn_mean", "exp_prob_model", "exp_prob_uniform",
+    "prob_on_others",
+]
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint utilities
 # ---------------------------------------------------------------------------
 
 def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
     return os.path.join(run_dir, f"{name}_pt_ckpt{epoch:04d}.pt")
+
+
+def normalize_progress_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Bring a loaded progress csv onto UNIFIED_COLS so resumed rows land in the
+    right columns. Files written before unification key on training_epoch; that
+    gets renamed rather than left to collide with model_epoch."""
+    if "model_epoch" not in df.columns and "training_epoch" in df.columns:
+        df = df.rename(columns={"training_epoch": "model_epoch"})
+    extra = [c for c in df.columns if c not in UNIFIED_COLS]
+    return df.reindex(columns=UNIFIED_COLS + extra)
+
+
+def progress_csv_path(run_dir: str, name: str, unified: bool) -> str:
+    """Unified mode writes straight into the selfplay run's eval_progress.csv so
+    the first retrain appends to the same history. Otherwise the standalone
+    pretrain file, unchanged."""
+    if unified:
+        return os.path.join(run_dir, "eval_progress.csv")
+    return os.path.join(run_dir, f"{name}_pt_eval_progress.csv")
 
 
 def find_last_checkpoint(run_dir: str, name: str) -> int:
@@ -103,32 +136,49 @@ def delete_old_checkpoints(run_dir: str, name: str, keep_epoch: int) -> None:
         pass
 
 
-def trim_progress_csv(progress_file: str, max_training_epoch: int) -> None:
+def trim_progress_csv(progress_file: str, max_training_epoch: int,
+                      unified: bool = False) -> None:
     if not os.path.exists(progress_file):
         return
     df = pd.read_csv(progress_file)
-    if "training_epoch" not in df.columns:
+    # training_epoch is the pre-unification key; still accepted so an older
+    # standalone run resumes instead of having its history thrown away
+    epoch_col = next(
+        (c for c in ("model_epoch", "training_epoch") if c in df.columns), None)
+    if epoch_col is None:
+        if unified:
+            print(f"[recovery] {os.path.basename(progress_file)} has no epoch "
+                  f"column; leaving it alone")
+            return
         os.remove(progress_file)
         return
-    df = df[df["training_epoch"] <= max_training_epoch]
-    if df.empty:
+    df = df[df[epoch_col] <= max_training_epoch]
+    if df.empty and not unified:
         os.remove(progress_file)
     else:
         df.to_csv(progress_file, index=False)
 
 
-def get_resume_epoch(run_dir: str, name: str) -> int:
+def get_resume_epoch(run_dir: str, name: str, progress_file: str,
+                     unified: bool = False) -> int:
     os.makedirs(run_dir, exist_ok=True)
-    progress_file = os.path.join(run_dir, f"{name}_pt_eval_progress.csv")
     last_ckpt = find_last_checkpoint(run_dir, name)
 
     if last_ckpt < 0:
         if os.path.exists(progress_file):
-            os.remove(progress_file)
-            print(f"[recovery] no checkpoints found; cleared {progress_file}")
+            # unified mode shares this file with selfplay, so never delete it --
+            # a stale pretrain row is recoverable, a wiped run history is not
+            if unified:
+                print(f"[recovery] no checkpoints found, but "
+                      f"{os.path.basename(progress_file)} is shared with "
+                      f"selfplay -- leaving it in place. Clear it by hand for "
+                      f"a true fresh start.")
+            else:
+                os.remove(progress_file)
+                print(f"[recovery] no checkpoints found; cleared {progress_file}")
         return 0
 
-    trim_progress_csv(progress_file, last_ckpt)
+    trim_progress_csv(progress_file, last_ckpt, unified=unified)
     resume = last_ckpt + 1
     print(
         f"[recovery] last checkpoint epoch={last_ckpt}"
@@ -288,13 +338,17 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
     )
     pol_stats  = batch_policy_metrics(pol_preds, pstack, mstack)
 
+    # one row shape everywhere -- selfplay's schema. Only the filename changes
+    # when this is not aimed at a run_dir.
     row = {
-        "training_epoch": epoch,
-        "train_loss": train_loss, "gn_mean": gn_mean,
+        "model_epoch": epoch,
         "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
         **pol_stats,
+        "n_samples": int(enc.shape[0]),
+        "avg_top_prob_target": float(pstack.max(axis=1).mean()),
+        "train_loss": train_loss, "gn_mean": gn_mean,
     }
-    new_row = pd.DataFrame([row])
+    new_row = pd.DataFrame([row]).reindex(columns=UNIFIED_COLS)
     eval_df = new_row if eval_df is None else pd.concat([eval_df, new_row], ignore_index=True)
     eval_df.round(4).to_csv(progress_file, index=False)
 
@@ -327,10 +381,12 @@ def worker_main(wargs: dict) -> None:
     end_epoch   = wargs["end_epoch"]
     max_epoch   = wargs["max_epoch"]
     model_dir   = wargs.get("model_dir", MODEL_DIR)
+    unified     = wargs.get("unified_csv", False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    progress_file = os.path.join(run_dir, f"{name}_pt_eval_progress.csv")
+    progress_file = wargs.get("progress_file") or progress_csv_path(
+        run_dir, name, unified)
     plot_file     = os.path.join(run_dir, f"{name}_pt_plot.png")
 
     print(f"\n{'#' * 72}")
@@ -359,7 +415,7 @@ def worker_main(wargs: dict) -> None:
     eval_df: pd.DataFrame | None = None
     if os.path.exists(progress_file):
         existing = pd.read_csv(progress_file)
-        eval_df = existing if not existing.empty else None
+        eval_df = normalize_progress_df(existing) if not existing.empty else None
 
     print(
         f"[tfrec] train={len(train_files)}  val={len(val_files)}"
@@ -614,10 +670,17 @@ def main() -> None:
     run_dir = args.run_dir or os.path.join(SP_DIR, args.run_tag)
     os.makedirs(run_dir, exist_ok=True)
 
+    # --run-dir means this directory is the selfplay run, so metrics go straight
+    # into its eval_progress.csv and the first retrain continues the same
+    # history. Same signal that gates seed_selfplay_buffers below.
+    unified = args.run_dir is not None
+
     name = args.model
+    progress_file = progress_csv_path(run_dir, name, unified)
     from chessbot.pretrain import LR_MIN, LR_MAX
     print(f"[train] model={name}")
     print(f"[train] run_dir={run_dir}")
+    print(f"[train] progress_csv={os.path.basename(progress_file)}")
     print(f"[train] tfrec_dir={args.tfrec_dir}")
     print(f"[train] max_epoch={args.max_epoch}")
     print(f"[train] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
@@ -630,17 +693,19 @@ def main() -> None:
     train_files, val_files = split_train_val(all_files)
     print(f"[train] train_files={len(train_files)}  val_files={len(val_files)}")
 
-    resume = get_resume_epoch(run_dir, name)
+    resume = get_resume_epoch(run_dir, name, progress_file, unified=unified)
 
     wargs = {
-        "name":        name,
-        "run_dir":     run_dir,
-        "train_files": train_files,
-        "val_files":   val_files,
-        "model_dir":   MODEL_DIR,
-        "start_epoch": resume,
-        "end_epoch":   args.max_epoch,
-        "max_epoch":   args.max_epoch,
+        "name":          name,
+        "run_dir":       run_dir,
+        "train_files":   train_files,
+        "val_files":     val_files,
+        "model_dir":     MODEL_DIR,
+        "start_epoch":   resume,
+        "end_epoch":     args.max_epoch,
+        "max_epoch":     args.max_epoch,
+        "progress_file": progress_file,
+        "unified_csv":   unified,
     }
     worker_main(wargs)
 

@@ -30,8 +30,35 @@ Rough per-worker cost model (20 outer iters/s x 128 games = 2560 game-steps/s,
 | syzygy FEN round-trip | <=17 | ~0.1% |
 
 Total recoverable is ~8-12% of one core per worker. Stages 1-4 capture most of
-it with no rebuild. There is one unquantified item (GC pressure from retained
-`tree_data`) that could exceed all of the above; stage 2 measures it.
+it with no rebuild.
+
+## Status
+
+Branch `speedups` off `dev`. **Stages 0, 1 and 3 landed** (`c5760c6`).
+**Stage 2 dropped** -- measured, the hypothesis was wrong.
+
+First `--loop` run, 32 games x 150 iters (under CPU contention with the prod
+rig, so absolutes are inflated; the ratios are the signal):
+
+```
+steps/s             10536
+stop_simulating      5.97 us/step
+collect             27.85 us/step
+make_move         1623.05 us/move
+gc                  0.000 s  (0.02%)   gen0=9 gen1=1 gen2=0
+```
+
+Two things that change the plan:
+
+- **GC is a non-issue.** Stage 2 is dropped, see below.
+- **`make_move` dominates**, at ~270x the per-step cost of `stop_simulating`.
+  That is `collect_tree_search_data` + `best()` + `check_for_terminal`. It
+  moves stage 6 (fused snapshot) ahead of stage 5 on pure speed grounds --
+  though stage 5 is still worth doing for the capability reasons below.
+
+No baseline run exists for stages 1/3: the loop mode did not exist before them.
+Measuring their effect means reverting `src/chessbot/` temporarily, which is
+unsafe while the rig is live (see Risks).
 
 ## Stage 0: give the bench a loop mode (prerequisite)
 
@@ -66,21 +93,17 @@ equivalence oracle and must stay byte-stable):
 Behaviour-preserving: same predicate, same value, evaluated where `self.board`
 is identical. No rebuild. **~6%, and ~90k string allocations/s removed.**
 
-## Stage 2: measure GC, then fix `tree_data` retention (pure Python)
+## Stage 2: GC pressure -- DROPPED, measured at 0.02%
 
-`collect_tree_search_data` (`mcts_utils.py:534-620`) retains
-`self.tree_data[ply]` for the whole game: ~35 candidate dicts x 12 keys plus PV
-dicts, x ~200 plies x 128 games ~= 900k live dicts per worker. Every gen-2
-collection walks all of them.
+The hypothesis was that `tree_data` retention (~900k live dicts per worker)
+would make gen-2 collections expensive. Measured with the stage-0
+instrumentation: **gc 0.000s (0.02% of wall), gen0=9 gen1=1 gen2=0**. Gen-2
+never ran at all.
 
-Measure first with the stage-0 instrumentation, then pick the cheapest fix the
-numbers justify:
-
-- If gen-2 time is significant: `gc.freeze()` after worker startup plus raised
-  `gc.set_threshold` for gen1/gen2. Zero structural change.
-- If that is not enough: serialise each ply's `data` at creation and reassemble
-  in `finalize_game_data` (`looper.py:486`). Consumers are `rescore.py:536-580`
-  and `review.py`, both of which index by ply.
+The hypothesis was wrong. `tree_data` is large but it is almost entirely dicts
+of floats and strings, and the *net* allocation rate -- which is what actually
+triggers collections -- is dominated by short-lived objects, most of which
+stages 1 and 3 just removed. No work here.
 
 ## Stage 3: `rnd` and the `counts` churn (pure Python)
 
@@ -122,10 +145,33 @@ pre-1.2 baseline and the current round-3 log. If the gap has closed, stop here
 
 ## Stage 5: move early stopping into C++
 
-Only if Python is still the gap driver. The natural boundary is a
-`should_stop()` on the tree that owns the JSD ring buffer, **not** cheap
-accessors -- `es_checks` never escapes `mcts_utils.py`, and accessors would
-still marshal `ChildDetail` vectors to Python just to compute a bool.
+The natural boundary is a `should_stop()` on the tree that owns the JSD ring
+buffer, **not** cheap accessors -- `es_checks` never escapes `mcts_utils.py`,
+and accessors would still marshal `ChildDetail` vectors to Python just to
+compute a bool.
+
+**The case for this is capability, not just speed.** Living next to the tree
+lets the stop condition see things Python cannot cheaply reach:
+
+- **Hard stop when the root's live children are exhausted.** The pruner already
+  computes, per scan, how many children were cut (`cc.count_pruned`, root-only
+  since `01f617b`). When every child but one is pruned the search is just
+  re-visiting a decided position. Python cannot see this without marshalling
+  the whole child list; C++ has it in the selection loop for free.
+- **Stop exactly on the ceiling.** Today the ceiling is checked in Python
+  *before* `collect_many_leaves`, and that call then adds up to `micro_batch`
+  new leaves **plus up to `n_fastpath` (1024) cached/terminal ones** --
+  `looper.py:339` passes `max_fastpath=1024`. So `sims_completed_this_move` can
+  overshoot `sims_ceiling` by far more than the 4-sim micro-batch suggests,
+  and the overshoot grows with cache hit rate (currently ~65%). A C++ check
+  inside the collect loop stops dead on the ceiling and makes the sim budget
+  mean what it says.
+- **No Python frame per micro-batch.** `stop_simulating` currently costs ~6
+  us/step measured, at ~2500 steps/s per worker.
+
+These are behaviour *changes*, and good ones -- but they must land as separate,
+individually benched steps after the port itself is proven behaviour-neutral.
+Do not bundle them with the move.
 
 New in `pyfastchess/src/mcts.hpp` / `mcts.cpp` / `binding.cpp`:
 
@@ -170,6 +216,42 @@ of `jsd_thresh`. Verify by comparing the stop-ply distribution and stop-reason
 counts across 128 games against the pre-change build via `--equiv`; do not
 demand exact agreement.
 
+## Stage 5b: terminal checking
+
+`check_for_terminal` (`mcts_utils.py:683-761`) runs once per ply. Most of it is
+already backed by C++ predicates, so this is not a wholesale port -- three
+specific pieces are worth moving, the rest should stay in Python.
+
+**Worth moving:**
+
+1. **`is_game_over()` returns two `std::string`s** (`backend.cpp:313`), built
+   from enums by `reason_to_string` / `result_to_string`, then compared against
+   string literals back in Python. Add an enum-returning `game_result()` and
+   keep the string pair for Python display only. `terminal_or_legal_moves()`
+   (`backend.cpp:691`) already computes exactly this without strings and is
+   **not currently bound** -- bind it, or a thin wrapper over it.
+
+2. **`material_count()` scans 64 squares** (`backend.cpp:342-360`) calling
+   `board_.at(sq)` per square. It is pure bitboards underneath: sum
+   `popcount(pieces(pt, WHITE)) * value` minus the black side, 10 popcounts
+   instead of 64 lookups plus branches.
+
+3. **`piece_count()` does the same 64-square scan** (`backend.cpp:362-371`) to
+   answer what is one `popcount(occ())`. It is called per ply from the syzygy
+   gate *and* from `best()`'s sampling gate (`mcts_utils.py:106`), so it runs
+   more often than the material check.
+
+Both (2) and (3) are internal rewrites -- same signature, same result, no API
+or Python change, verifiable by a unit test over random FENs.
+
+**Staying in Python:**
+
+- Resignation counters, the material-diff streak, the eval-draw window. These
+  read `self.recents` (per-game Python history) and fire ~17x/s. Moving them
+  means marshalling that history into C++ and duplicating config for no win.
+- The syzygy probe -- `probe_wdl` is python-chess. Stage 4 fixes the cost by
+  reusing a live board instead of a FEN round-trip.
+
 ## Stage 6: fused search snapshot (only if already rebuilding)
 
 `collect_tree_search_data` makes three tree traversals (`depth_stats`,
@@ -213,6 +295,12 @@ extension.
    pinning that invariant before relying on it.
 5. **Stage 0 is load-bearing.** Landing any stage without it produces a bench run
    that measures nothing.
+6. **`spawn_workers` sits inside the per-round loop** (`run_selfplay.py:440` ->
+   `:525`), so every new selfplay round spawns fresh worker processes that
+   re-import `chessbot` from disk. **Uncommitted edits to `src/chessbot/` are
+   picked up by a live rig at the next round boundary.** Do not leave the
+   working tree half-changed while the rig is up, and do not revert files to
+   take a baseline measurement mid-run.
 
 ## Verification
 

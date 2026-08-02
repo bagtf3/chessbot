@@ -153,11 +153,24 @@ compute a bool.
 **The case for this is capability, not just speed.** Living next to the tree
 lets the stop condition see things Python cannot cheaply reach:
 
-- **Hard stop when the root's live children are exhausted.** The pruner already
-  computes, per scan, how many children were cut (`cc.count_pruned`, root-only
-  since `01f617b`). When every child but one is pruned the search is just
-  re-visiting a decided position. Python cannot see this without marshalling
-  the whole child list; C++ has it in the selection loop for free.
+- **Hard stop when only one root child is still live.** When every child but
+  one has been pruned, the search is just re-visiting a decided position.
+  Python cannot see this without marshalling the whole child list; the root's
+  PUCT scan has it for free.
+
+  Note `cc.count_pruned` is **not** the signal -- it is an event tally summed
+  over every descent in a `collect_many_leaves` call, and it is incremented
+  both per-child and in bulk (`cc->count_pruned += cap_sz - i` on the early
+  break). What is needed is a per-scan count of survivors, overwritten rather
+  than accumulated: in `select_child_lazy_ptr`, when `parent == nullptr`, count
+  the iterations that reach the scoring branch and store it as e.g.
+  `root_live_children`. One live child means decided.
+
+  Two conditions have to hold for that count to mean anything: `cap_sz ==
+  n_child` (already required for `do_prune`, so the `2 + parent_visits` skip
+  window is not truncating), and the scan must have run to completion rather
+  than hitting the `unseen_visits` break -- on that break the remainder is
+  unexamined, not proven dead.
 - **Stop exactly on the ceiling.** Today the ceiling is checked in Python
   *before* `collect_many_leaves`, and that call then adds up to `micro_batch`
   new leaves **plus up to `n_fastpath` (1024) cached/terminal ones** --

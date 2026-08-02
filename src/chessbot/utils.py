@@ -132,7 +132,10 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
 
 
 def rnd(x, n):
-    return np.round(x, n)
+    # np.round on a python scalar is a full numpy dispatch that also returns a
+    # np.float64. Called ~380x per ply from collect_tree_search_data, so use the
+    # builtin: same banker's rounding, and a plain float pickles smaller.
+    return round(x, n)
 
 
 def maybe_random_from_list(item):

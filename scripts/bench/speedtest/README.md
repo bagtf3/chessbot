@@ -28,6 +28,30 @@ python -m scripts.bench.speedtest.bench --fixtures <path> --rebuild
 python -m scripts.bench.speedtest.compare <run_dir_a> <run_dir_b>
 ```
 
+## Two modes
+
+**Default (fixed-work)** measures the C++ search only. It pins the sim count
+and never calls `stop_simulating`, `best()`, `collect_tree_search_data` or
+`check_for_terminal`, and `bench_config()` switches off sampling and noise.
+Use it for changes inside pyfastchess.
+
+**`--loop`** measures the selfplay Python path instead:
+
+```
+python -m scripts.bench.speedtest.bench --fixtures <path> --loop \
+    --games 128 --iters 400 --tag loop_baseline
+```
+
+It mirrors `GameLooper.run` (`looper.py:296-347`) with stubbed inference, so
+Python overhead is the whole signal. Early stopping, sampling and noise stay
+ON -- sim counts vary between runs, so the metric is **microseconds per
+game-step**, not per sim. Reports `stop_simulating`, `collect`, and
+`make_move` buckets plus GC generation counts and total GC time.
+
+Add `--equiv` to also dump, per move, the ply / stop reason / root visit
+vector. Diff that between two builds to prove a change was
+behaviour-preserving.
+
 Everything is a plain function too, so it imports fine into Spyder.
 
 Results land in `chessbot_data/speed_testing/runs/<tag>_<timestamp>/`, stamped

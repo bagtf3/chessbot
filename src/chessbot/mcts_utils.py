@@ -60,6 +60,9 @@ class MCTSTree(fasttree):
         self.board = board
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
+        # only changes when a move is pushed, so cache it instead of
+        # regenerating the whole move list on every stop_simulating call
+        self.n_legal = len(board.legal_moves())
 
         # make sure we're starting at the correct sim schedule entry
         if self.sims_ceiling_schedule:
@@ -213,6 +216,7 @@ class MCTSTree(fasttree):
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
+        self.n_legal = len(board.legal_moves())
 
         self.set_sim_budget(float(self.sims_ceiling))
 
@@ -408,8 +412,8 @@ class MCTSTree(fasttree):
         if self.sims_completed_this_move < 1:
             return False
 
-        # check for only 1 move
-        if len(self.board.legal_moves()) < 2:
+        # check for only 1 move. n_legal is refreshed in advance()
+        if self.n_legal < 2:
             self.sim_stop_reason = "Only 1 legal move"
             return True
 

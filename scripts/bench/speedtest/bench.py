@@ -10,6 +10,7 @@ YAGNI. Add measurement gear when a decision actually needs it, not before.
 """
 
 import argparse
+import gc
 import time
 
 import numpy as np
@@ -20,7 +21,7 @@ from pyfastchess import MCTSForest, raw_cache_bulk_insert_np
 from pyfastchess import priors_cache_clear, raw_cache_clear
 
 from chessbot.config import Config
-from chessbot.mcts_utils import MCTSTree
+from chessbot.mcts_utils import MCTSTree, ChessGame
 
 from . import paths
 from .fixtures import load_fixture_set
@@ -139,6 +140,161 @@ def search(tree, forest, cfg, infer_fn, n_sims, batch, max_fastpath=1024):
         "new_nodes": new_nodes,
         "pruned": pruned,
     }
+
+
+def loop_config(base=None):
+    """Config for the loop bench.
+
+    Unlike bench_config this leaves early stopping, sampling and noise ALONE --
+    the whole point is to exercise stop_simulating / best / check_for_terminal.
+    Sim counts therefore vary run to run; the metric is time per game-step, not
+    time per sim.
+    """
+    cfg = base or Config()
+    cfg.reuse_tree = False
+    return cfg
+
+
+def make_loop_games(cfg, fixtures, n_games):
+    """N ChessGame objects seeded round-robin from the fixture FENs."""
+    games = []
+    for i in range(n_games):
+        fx = fixtures[i % len(fixtures)]
+        meta = {"vs_stockfish": False, "stockfish_is_white": False,
+                "scenario": fx.get("source", "bench")}
+        games.append(ChessGame(board=fastboard(fx["fen"]), meta=meta, cfg=cfg))
+    return games
+
+
+def run_loop_bench(fixtures, n_games=128, iters=400, batch=4, backend="stub",
+                   cfg=None, max_fastpath=1024, equiv=False):
+    """Time the real selfplay Python path, not just the C++ search.
+
+    Mirrors GameLooper.run (looper.py:296-347): resolve inflight, step every
+    game through stop_simulating / make_move_from_tree / check_for_terminal,
+    then encode and infer once for the whole forest. Inference is stubbed so
+    Python overhead is the entire signal.
+
+    Returns per-bucket microseconds plus GC counters. With equiv=True it also
+    returns, per game, the (ply, stop_reason, root visits) triple at every
+    move -- the oracle for behaviour-preserving claims.
+    """
+    cfg = loop_config(cfg)
+    infer_fn = stub_infer if backend == "stub" else build_real_infer(cfg)
+
+    priors_cache_clear()
+    raw_cache_clear()
+
+    games = make_loop_games(cfg, fixtures, n_games)
+    forest = MCTSForest()
+    for g in games:
+        forest.add_tree(g.tree)
+
+    gc0 = gc.get_count()
+    gc_time = [0.0]
+    gc_t0 = [0.0]
+
+    def gc_cb(phase, info):
+        if phase == "start":
+            gc_t0[0] = time.perf_counter()
+        else:
+            gc_time[0] += time.perf_counter() - gc_t0[0]
+
+    gc.callbacks.append(gc_cb)
+
+    stop_us = move_us = collect_us = 0.0
+    steps = moves = sims = 0
+    equiv_rows = []
+
+    t0 = time.perf_counter()
+    try:
+        for _ in range(iters):
+            forest.resolve_all_inflight()
+
+            for g in games:
+                if g.outcome is not None:
+                    continue
+
+                ts = time.perf_counter()
+                stop = g.tree.stop_simulating()
+                stop_us += time.perf_counter() - ts
+                steps += 1
+
+                if stop:
+                    tm = time.perf_counter()
+                    if equiv:
+                        equiv_rows.append({
+                            "game": g.game_id,
+                            "ply": g.plies,
+                            "reason": g.tree.sim_stop_reason,
+                            "sims": g.tree.sims_completed_this_move,
+                            "visits": g.tree.root_child_visits(),
+                        })
+                    terminal = g.make_move_from_tree()
+                    move_us += time.perf_counter() - tm
+                    moves += 1
+                    if terminal or g.outcome is not None:
+                        forest.pop_tree(g.tree)
+                        continue
+                    # fall through and collect on the fresh root, as the
+                    # looper does -- otherwise the game idles a whole iteration
+
+                tc = time.perf_counter()
+                res = g.tree.collect_many_leaves(batch, max_fastpath)
+                collect_us += time.perf_counter() - tc
+                got = res.count_new + res.count_cached + res.count_terminal
+                g.tree.sims_completed_this_move += got
+                sims += got
+
+            keys_np, enc_np = forest.get_all_history_tokens(cfg.history_K)
+            for i in range(0, len(keys_np), cfg.macro_batch):
+                k = keys_np[i:i + cfg.macro_batch]
+                policy, wdl = infer_fn(k, enc_np[i:i + cfg.macro_batch])
+                raw_cache_bulk_insert_np(k, wdl, policy)
+    finally:
+        gc.callbacks.remove(gc_cb)
+
+    wall = time.perf_counter() - t0
+    gc1 = gc.get_count()
+
+    out = {
+        "wall_s": wall,
+        "n_games": n_games,
+        "iters": iters,
+        "game_steps": steps,
+        "moves": moves,
+        "sims": sims,
+        "steps_per_sec": steps / wall if wall else 0.0,
+        "moves_per_sec": moves / wall if wall else 0.0,
+        "stop_us_per_step": stop_us / steps * 1e6 if steps else 0.0,
+        "collect_us_per_step": collect_us / steps * 1e6 if steps else 0.0,
+        "move_us_per_move": move_us / moves * 1e6 if moves else 0.0,
+        "py_us_per_step": (stop_us + move_us + collect_us) / steps * 1e6
+                          if steps else 0.0,
+        "gc_time_s": gc_time[0],
+        "gc_pct": 100.0 * gc_time[0] / wall if wall else 0.0,
+        "gc_gen0": gc1[0] - gc0[0],
+        "gc_gen1": gc1[1] - gc0[1],
+        "gc_gen2": gc1[2] - gc0[2],
+        "tracked_objects": len(gc.get_objects()) if equiv else -1,
+    }
+    if equiv:
+        out["equiv"] = equiv_rows
+    return out
+
+
+def print_loop_summary(r):
+    print(f"\n{r['n_games']} games x {r['iters']} iters "
+          f"-- {r['game_steps']} game-steps, {r['moves']} moves")
+    print(f"  steps/s        {r['steps_per_sec']:>10.0f}")
+    print(f"  moves/s        {r['moves_per_sec']:>10.1f}")
+    print(f"  stop_simulating{r['stop_us_per_step']:>10.2f} us/step")
+    print(f"  collect        {r['collect_us_per_step']:>10.2f} us/step")
+    print(f"  make_move      {r['move_us_per_move']:>10.2f} us/move")
+    print(f"  python total   {r['py_us_per_step']:>10.2f} us/step")
+    print(f"  gc             {r['gc_time_s']:>10.3f} s  ({r['gc_pct']:.2f}%)")
+    print(f"  gc gens        gen0={r['gc_gen0']} gen1={r['gc_gen1']} "
+          f"gen2={r['gc_gen2']}")
 
 
 def run_position(cfg, fen, n_sims, infer_fn, batch, rebuild=False):
@@ -359,6 +515,14 @@ def main():
     ap.add_argument("--sweeps", type=int, default=6,
                     help="repeat the fixture set N times in-process")
     ap.add_argument("--tag", default="bench")
+    ap.add_argument("--loop", action="store_true",
+                    help="time the selfplay python path instead of raw search")
+    ap.add_argument("--games", type=int, default=128,
+                    help="loop mode: concurrent games")
+    ap.add_argument("--iters", type=int, default=400,
+                    help="loop mode: outer iterations")
+    ap.add_argument("--equiv", action="store_true",
+                    help="loop mode: also dump stop plies/reasons/visits")
     args = ap.parse_args()
 
     fixtures = load_fixture_set(args.fixtures)
@@ -366,6 +530,18 @@ def main():
         fixtures = fixtures[:args.limit]
 
     cfg = Config.from_yaml(args.config) if args.config else None
+
+    if args.loop:
+        r = run_loop_bench(fixtures, n_games=args.games, iters=args.iters,
+                           batch=args.batch if args.batch < 32 else 4,
+                           backend=args.backend, cfg=cfg, equiv=args.equiv)
+        run_dir = paths.new_run_dir(args.tag)
+        paths.save_json(run_dir / "loop_result.json",
+                        {**r, "repo_stamps": paths.repo_stamps()})
+        print(f"\nwrote {run_dir}")
+        print_loop_summary(r)
+        return
+
     run_bench(fixtures, n_sims=args.n_sims, batch=args.batch,
               backend=args.backend, cfg=cfg, reuse_tree=args.reuse_tree,
               rebuild=args.rebuild, sweeps=args.sweeps, tag=args.tag)

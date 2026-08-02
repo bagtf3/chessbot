@@ -27,6 +27,30 @@ from chessbot.utils import RateMeter, sf_eval
 from chessbot.game_utils import GameSpec
 
 
+class CountAccumulator(object):
+    """Running column sums for the per-collect telemetry counters.
+
+    Every field is a plain sum over the window, so there is no reason to keep
+    the rows. This used to be a list of 13-element lists appended once per game
+    per outer iteration and only summed at push time -- roughly 115k list
+    allocations per 45s window per worker.
+    """
+
+    fields = (
+        "s_collected", "s_fast", "s_terminals", "s_cached",
+        "s_fast_stops", "s_collect_stops", "s_blocked", "s_puct",
+        "s_must_visit", "s_skipped", "s_pruned", "s_penalty", "s_depth",
+    )
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        for f in self.fields:
+            setattr(self, f, 0)
+        self.n_groups = 0
+
+
 class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
@@ -245,7 +269,8 @@ class GameLooper(object):
         macro = cfg.macro_batch
         
         #(batch size, target), counts returned
-        pred_fill, counts, mbs_used = [], [], []
+        pred_fill, mbs_used = [], []
+        counts = CountAccumulator()
         finished_ids = set()
         #passes_since_trigger = 0
         while True:
@@ -387,10 +412,20 @@ class GameLooper(object):
         if nn < mbs:
             f_stop, c_stop = 1, 0
 
-        counts.append([
-            nn, fastpaths, nt, nc, f_stop, c_stop,
-            bl, pu, mv, sk, pr, pen, dp
-        ])
+        counts.s_collected += nn
+        counts.s_fast += fastpaths
+        counts.s_terminals += nt
+        counts.s_cached += nc
+        counts.s_fast_stops += f_stop
+        counts.s_collect_stops += c_stop
+        counts.s_blocked += bl
+        counts.s_puct += pu
+        counts.s_must_visit += mv
+        counts.s_skipped += sk
+        counts.s_pruned += pr
+        counts.s_penalty += pen
+        counts.s_depth += dp
+        counts.n_groups += 1
 
         return nn, n_leafs
 
@@ -514,15 +549,19 @@ class GameLooper(object):
         lpb = pred_fill
         target = self.config.macro_batch
 
-        # every column of counts is a plain sum; one pass instead of 13
-        if counts:
-            col = np.array(counts, dtype=np.int64).sum(axis=0)
-        else:
-            col = np.zeros(13, dtype=np.int64)
-
-        (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
-         s_collect_stops, s_blocked, s_puct, s_must_visit, s_skipped,
-         s_pruned, s_penalty, s_depth) = (int(v) for v in col)
+        s_collected = counts.s_collected
+        s_fast = counts.s_fast
+        s_terminals = counts.s_terminals
+        s_cached = counts.s_cached
+        s_fast_stops = counts.s_fast_stops
+        s_collect_stops = counts.s_collect_stops
+        s_blocked = counts.s_blocked
+        s_puct = counts.s_puct
+        s_must_visit = counts.s_must_visit
+        s_skipped = counts.s_skipped
+        s_pruned = counts.s_pruned
+        s_penalty = counts.s_penalty
+        s_depth = counts.s_depth
 
         telemetry = {
             "ts": ts_now,
@@ -536,7 +575,7 @@ class GameLooper(object):
             "batch_target": target,
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
-            "n_groups": len(counts),
+            "n_groups": counts.n_groups,
 
             "s_collected": s_collected,
             "s_fast": s_fast,

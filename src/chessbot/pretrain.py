@@ -34,8 +34,11 @@ VAL_SPLIT_SEED     = 42
 PLOT_EVERY         = 20
 DEFAULT_MAX_EPOCH  = 2000
 
-POLICY_LW = 1.0
-VALUE_LW  = 3.0
+# POLICY_LW = 1.0
+# VALUE_LW  = 3.0
+# superseded by the LW-twiddle experiment in bootstrap_model_async_tfrec_pt.py
+# (lw_twiddle branch) -- commented out, not removed, so nothing imports these
+# unnoticed while the experiment is live.
 
 # ---------------------------------------------------------------------------
 # Learning-rate schedule (Adam)

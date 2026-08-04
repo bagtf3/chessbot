@@ -9,8 +9,12 @@ Record schema (used uniformly regardless of source file format):
 - policy: float32[1858] policy target
 - Y: float32[3] WDL target
 - vwht, pwht: value/policy sample weights
-- source: provenance tag string for real selfplay data, or None for
-  historic/pretrain records (which never carry a source)
+- source: provenance tag string for real selfplay data; None for the old
+  tfrec.gz historic booster shards read via read_tfrec_gz_shard, which
+  carry no source; SEED_SOURCE for the bootstrap-seeded primary/
+  remaining_untrained records (see seed_selfplay_buffers), which do carry
+  one -- treated downstream as xc0-quality (validate_lc0 grouping in
+  Rescorer.aggregate_metrics), never as lc0
 """
 import gzip
 import os
@@ -28,6 +32,7 @@ RETRAIN_PRIMARY_SHARDS = 8
 RETRAIN_REPLAY_SHARDS = 8
 RETRAIN_HISTORIC_SHARDS = 4
 REPLAY_SEED_SHARDS = 64
+SEED_SOURCE = "historic_seeded"
 
 
 def new_shard_path(out_dir, suffix=".pkl.gz"):

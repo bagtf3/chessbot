@@ -9,20 +9,47 @@ Models:
                                         Keeps its existing LayerNorm; untouched here.
   conv-pure                          -- 16x RMS conv block (256) NCHW -> trunk RMSNorm
                                         -> conv-pure WDL / SmartGate / from-to heads
-  conv-globalizer-2c6g               -- 2 RMS conv blocks + 6 globalizer blocks (384):
-                                        368ch local 3x3 + 16ch 1x1 global branch through
-                                        a 1024->512->1024 SwiGLU, concat back to 384
-  conv-signed-attn-2c10a             -- 2 RMS conv blocks + 10 signed-attention blocks (256):
-                                        tanh-bounded L1-normalized signed board attention
-                                        instead of softmax
+  precond-mha-8c4t-d384              -- build_pt_precond_signed at
+                                        pre_block="conv", attn="mha": 8 conv
+                                        preconditioner blocks at 256 -> concat
+                                        pos(128) -> D=384 -> 4 MHA tx blocks,
+                                        flat 1024 FFN. Same xc0h stem, same 8
+                                        global accumulators, same WDL /
+                                        SmartGate / from-to heads as 6c4t
+                                        (dims recomputed off D=384) -- RMSNorm
+                                        throughout instead of 6c4t's LayerNorm,
+                                        same 4 tx blocks but 2 more conv
+                                        preconditioner blocks and a narrower D.
+  precond-mha-8c6t-d256              -- build_pt_precond_addpos: 8 conv
+                                        preconditioner blocks at 256, D=256
+                                        throughout (no pos-concat widening) --
+                                        cutover is x = x + pos_scale * pos,
+                                        additive with one learnable scalar,
+                                        no RMS on that step. 6 MHA tx blocks
+                                        at D=256, flat 1024 FFN. SmartGate
+                                        reads acc(1) concat acc(6) (one of
+                                        the from/to-shared slots), so its
+                                        internal width is 512 like prod's
+                                        gate even though the trunk itself
+                                        never widens past 256.
+  precond-mha-10c6t-d256             -- same build_pt_precond_addpos, 10 conv
+                                        preconditioner blocks instead of 8,
+                                        same 6 MHA tx blocks -- isolates the
+                                        cost/value of a deeper preconditioner
+                                        at fixed tx depth.
+  precond-mha-8c8t-d256              -- same build_pt_precond_addpos, 8 conv
+                                        preconditioner blocks, 8 MHA tx blocks
+                                        instead of 6 -- isolates the cost/
+                                        value of more transformer depth at
+                                        fixed preconditioner depth.
 
-The three conv models share the identical conv-pure heads and input stem, and all
-use RMSNorm. The 18m preconditioned model deliberately keeps LayerNorm.
+The conv models share the identical conv-pure heads and input stem, and all use
+RMSNorm. 6c4t deliberately keeps LayerNorm.
 
 Flags:
   --dry-run              Build models, print param counts + shape checks, skip speed test
   --skip-trt             Skip ORT+TensorRT
-  --skip-convpure        Skip all three conv models
+  --skip-convpure        Skip the conv models
   --batch-sizes    Space-separated list (default: 1 2 4 8 16 32 64 128 256 512)
 """
 
@@ -39,7 +66,7 @@ import torch.nn.functional as F
 import math
 from chessbot.model import (
     build_pt_precond_smartgate, build_pt_conv_pure,
-    build_pt_conv_globalizer, build_pt_conv_signed_attn,
+    build_pt_precond_signed, build_pt_precond_addpos,
 )
 
 SEQ_LEN    = 64
@@ -65,33 +92,51 @@ XC0H_6C4T_CFG = dict(
 # + castling + stm + hmc. Matches random_xc0h_tokens.
 XC0H_IN_LEN = 6 * 64 + 6 + 3
 
+# the whole conv family takes the xc0h K=6 history-token stem, same as the
+# precond models -- input is the flat (B, 393) board.history_tokens(6) encoding
+# value branches after 12 blocks, leaving 4 for policy to specialize on
 CONV_PURE_CFG = dict(
-    conv_filters=256, num_blocks=16, dropout=0.03,
+    conv_filters=256, num_blocks=16, dropout=0.03, xc0h_K=6, value_tap=4,
 )
 
-# 2 standard RMS conv blocks + 6 backbone blocks, d_model 384
-CONV_GLOBALIZER_CFG = dict(
-    conv_filters=384, num_blocks=6, stem_blocks=2, dropout=0.03,
+# 8 conv preconditioner blocks at 256 -> concat pos(128) -> D=384 -> 4 MHA
+# tx blocks, flat 1024 FFN
+PRECOND_MHA_8C4T_CFG = dict(
+    conv_filters=256, pos_dim=128, dropout=0.03, pre_blocks=8, tx_blocks=4,
+    ff_dim=1024, pre_block="conv", attn="mha", num_heads=8, xc0h_K=6,
 )
 
-# 2 standard RMS conv blocks + 10 backbone blocks, d_model 256
-CONV_SIGNED_ATTN_CFG = dict(
-    conv_filters=256, num_blocks=10, stem_blocks=2, dropout=0.03,
+# 8 conv preconditioner blocks at 256, D=256 throughout (additive pos, no
+# widening) -> 6 MHA tx blocks, flat 1024 FFN
+PRECOND_MHA_8C6T_CFG = dict(
+    conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=6,
+    ff_dim=1024, num_heads=8, xc0h_K=6,
 )
 
-# (label, builder, cfg, onnx stem) -- the three conv models are identical in
-# stem, heads and IO, so they run through one code path.
+# same addpos design, 10 conv preconditioner blocks, 6 MHA tx blocks
+PRECOND_MHA_10C6T_CFG = dict(
+    conv_filters=256, dropout=0.03, pre_blocks=10, tx_blocks=6,
+    ff_dim=1024, num_heads=8, xc0h_K=6,
+)
+
+# same addpos design, 8 conv preconditioner blocks, 8 MHA tx blocks
+PRECOND_MHA_8C8T_CFG = dict(
+    conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=8,
+    ff_dim=1024, num_heads=8, xc0h_K=6,
+)
+
+# (label, builder, cfg, onnx stem) -- all take the xc0h K=6 input and emit
+# the same 1858/3 heads, so one loop covers them.
 CONV_MODELS = [
-    ("conv-pure",            build_pt_conv_pure,        CONV_PURE_CFG,         "conv_pure"),
-    ("conv-globalizer-2c6g",  build_pt_conv_globalizer,  CONV_GLOBALIZER_CFG,   "conv_globalizer_2c6g"),
-    ("conv-signed-attn-2c10a", build_pt_conv_signed_attn, CONV_SIGNED_ATTN_CFG, "conv_signed_attn_2c10a"),
+    ("conv-pure",              build_pt_conv_pure,      CONV_PURE_CFG,         "conv_pure"),
+    ("precond-mha-8c4t-d384",  build_pt_precond_signed, PRECOND_MHA_8C4T_CFG,  "precond_mha_8c4t_d384"),
+    ("precond-mha-8c6t-d256",  build_pt_precond_addpos, PRECOND_MHA_8C6T_CFG,  "precond_mha_8c6t_d256"),
+    ("precond-mha-10c6t-d256", build_pt_precond_addpos, PRECOND_MHA_10C6T_CFG, "precond_mha_10c6t_d256"),
+    ("precond-mha-8c8t-d256",  build_pt_precond_addpos, PRECOND_MHA_8C8T_CFG,  "precond_mha_8c8t_d256"),
 ]
 
 # rough targets from the design spec; reported alongside the real count
-EXPECTED_PARAMS = {
-    "conv-globalizer-2c6g": 34_297_000,
-    "conv-signed-attn-2c10a": 19_275_000,
-}
+EXPECTED_PARAMS = {}
 
 
 def parse_args():
@@ -174,6 +219,62 @@ def save_results_csv(label, params, results):
         for b, v in sorted(results.items()):
             w.writerow({"label": label, "params": params, "batch_size": b,
                         "latency_ms": v["latency_ms"], "throughput": v["throughput"]})
+
+
+def rewrite_results_csv(csv_data):
+    """Fully overwrites CSV_RESULTS from the in-memory {(label,params): {bs:{...}}}
+    dict -- used after dropping stale rows, unlike save_results_csv which only
+    appends."""
+    import csv
+    with open(CSV_RESULTS, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["label", "params", "batch_size", "latency_ms", "throughput"])
+        w.writeheader()
+        for (label, params), results in csv_data.items():
+            for b, v in sorted(results.items()):
+                w.writerow({"label": label, "params": params, "batch_size": b,
+                            "latency_ms": v["latency_ms"], "throughput": v["throughput"]})
+
+
+def cleanup_stale_artifacts(label, stem, current_params, csv_data):
+    """Removes ONNX/engine/profile files and CSV rows left over from a
+    previous param count for this label -- happens whenever an architecture
+    edit changes shapes but the label/stem stays the same, since the ONNX
+    filename and CSV key both embed the param count.
+    """
+    import glob
+    import re
+    import hashlib
+
+    stale_onnx = []
+    for onnx_path in glob.glob(os.path.join(TRT_CACHE, f"{stem}_*.onnx")):
+        m = re.match(rf"^{re.escape(stem)}_(\d+)\.onnx$", os.path.basename(onnx_path))
+        if m and int(m.group(1)) != current_params:
+            stale_onnx.append((onnx_path, int(m.group(1))))
+
+    for onnx_path, old_params in stale_onnx:
+        h = hashlib.sha256()
+        with open(onnx_path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        prefix = f"bench_{h.hexdigest()[:12]}"
+        os.remove(onnx_path)
+        print(f"  [cleanup] {label}: removed stale onnx (params={old_params:,})")
+        for extra in glob.glob(os.path.join(TRT_CACHE, f"{prefix}_*")):
+            os.remove(extra)
+            print(f"  [cleanup] {label}: removed stale {os.path.basename(extra)}")
+
+    # CSV labels always carry a "  PT eager" / "  ORT TRT" suffix (see
+    # run_or_cached), never the bare label passed in here
+    suffixed = (f"{label}  PT eager", f"{label}  ORT TRT")
+    stale_keys = [k for k in csv_data if k[0] in suffixed and k[1] != current_params]
+    for k in stale_keys:
+        del csv_data[k]
+    if stale_keys:
+        rewrite_results_csv(csv_data)
+        print(f"  [cleanup] {label}: dropped {len(stale_keys)} stale CSV param-group(s)")
 
 
 def display_cached_result(label, cached, batch_sizes):
@@ -448,6 +549,9 @@ def main():
           f" pos concatenated so CF=256 -> D=512, same as prod)")
     model_6c4t  = build_pt_precond_smartgate(XC0H_6C4T_CFG)
     params_6c4t = sum(p.numel() for p in model_6c4t.parameters())
+    cleanup_stale_artifacts(
+        "18m-precond-smartgate-xc0h-K6-6c4t", "precond_xc0h_k6_6c4t",
+        params_6c4t, csv_data)
 
     if not args.dry_run:
         try:
@@ -481,8 +585,8 @@ def main():
             except Exception as e:
                 print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t TRT: {e}")
 
-    # conv family: conv-pure, conv-globalizer-2c6g, conv-signed-attn-2c10a.
-    # Same stem, same heads, same IO, so one loop covers all three.
+    # everything in CONV_MODELS: same xc0h stem, same 1858/3 output, so one
+    # loop covers the conv family and the signed precond clone alike.
     if not args.skip_convpure:
         for label, builder, cfg, stem in CONV_MODELS:
             print(f"\n{'='*60}")
@@ -491,12 +595,15 @@ def main():
             params = sum(q.numel() for q in model.parameters())
             trainable = sum(q.numel() for q in model.parameters() if q.requires_grad)
             print(f"  params: {params:,}  (trainable {trainable:,})")
+            cleanup_stale_artifacts(label, stem, params, csv_data)
             exp = EXPECTED_PARAMS.get(label)
             if exp:
                 print(f"  spec estimate: ~{exp:,}  "
                       f"(delta {params - exp:+,}, {100.0 * (params - exp) / exp:+.2f}%)")
 
-            ok, pt_p, pt_v, enc_np = verify_outputs(model, device, label)
+            conv_input_fn = lambda b: random_xc0h_tokens(b, cfg["xc0h_K"])
+            ok, pt_p, pt_v, enc_np = verify_outputs(
+                model, device, label, input_fn=conv_input_fn)
             if not ok:
                 print(f"  [SKIP] {label}: output verification failed")
                 del model; gc.collect(); torch.cuda.empty_cache()
@@ -510,7 +617,8 @@ def main():
                 print(f"\n  Building {label} PT eager ...")
                 eager = make_pt_eager_infer(model, device)
                 lbl = f"{label}  PT eager"
-                all_results[lbl] = run_or_cached(lbl, eager, params)
+                all_results[lbl] = run_or_cached(
+                    lbl, eager, params, input_fn=conv_input_fn)
                 del eager
             except Exception as e:
                 print(f"  [ERROR] {label} PT eager: {e}")
@@ -522,12 +630,17 @@ def main():
                 lbl = f"{label}  ORT TRT"
                 onnx_path = os.path.join(TRT_CACHE, f"{stem}_{params}.onnx")
                 if not os.path.exists(onnx_path):
-                    export_to_onnx(builder(cfg), device, onnx_path)
+                    dummy = torch.zeros(
+                        1, XC0H_IN_LEN, dtype=torch.long, device=device)
+                    export_to_onnx(builder(cfg), device, onnx_path, dummy=dummy)
                 else:
                     print(f"  [TRT] ONNX cached: {onnx_path}")
-                trt_fn, trt_sess = make_trt_infer(onnx_path, TRT_CACHE, max_bs=max(bs))
+                trt_fn, trt_sess = make_trt_infer(
+                    onnx_path, TRT_CACHE, max_bs=max(bs),
+                    input_shape=str(XC0H_IN_LEN))
                 compare_pt_vs_export(pt_p, pt_v, trt_fn, enc_np, label)
-                all_results[lbl] = run_or_cached(lbl, trt_fn, params)
+                all_results[lbl] = run_or_cached(
+                    lbl, trt_fn, params, input_fn=conv_input_fn)
                 del trt_sess; gc.collect()
             except Exception as e:
                 print(f"  [ERROR] {label} TRT: {e}")

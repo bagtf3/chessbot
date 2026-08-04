@@ -21,7 +21,7 @@ from chessbot.utils import (
     calc_entropy,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
-from chessbot.replay_buffer import LiveBuffer
+from chessbot.replay_buffer import LiveBuffer, SEED_SOURCE
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -1221,7 +1221,7 @@ class Rescorer(object):
             'lc0_blunder': 0, 'lc0_inacc': 0, 'lc0_pv': 0, 'lc0_enrich': 0,
         }
 
-    def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path):
+    def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path, validate_lc0=False):
         if not os.path.exists(pred_pkl_path):
             print(f"[metrics] pred pkl not found, skipping: {pred_pkl_path}")
             return
@@ -1242,7 +1242,7 @@ class Rescorer(object):
 
         eps = 1e-7
         group_names = (
-            'xc0_vs_true', 'xc0_vs_lc0', 'xc0_vs_lc0_blunder',
+            'xc0_vs_true', 'xc0_vs_lc0',
         )
         groups = {k: {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [], 'pol_mask': []}
                   for k in group_names}
@@ -1252,14 +1252,15 @@ class Rescorer(object):
             true_pol = np.array(sample[2], dtype=np.float64)
             source = sample[6] if len(sample) > 6 else 'xc0'
 
-            if source == 'xc0':
+            # historic_seeded is xc0-quality data (held-out pretrain positions),
+            # not lc0 distillation output -- folded into "true", never shown
+            # separately and never counted as lc0.
+            if source in ('xc0', SEED_SOURCE):
                 grp_keys = ['xc0_vs_true']
-            else:
+            elif validate_lc0:
                 grp_keys = ['xc0_vs_lc0']
-                if source in ('lc0_blunder', 'lc0_pv'):
-                    grp_keys.append('xc0_vs_lc0_blunder')
-                # legacy tag 'lc0' and 'lc0_enrich' aren't split out further --
-                # counted in the "all" bucket only
+            else:
+                grp_keys = []
 
             for grp in grp_keys:
                 g = groups[grp]
@@ -1326,7 +1327,6 @@ class Rescorer(object):
 
         xb  = metrics_block(groups['xc0_vs_true'], want_legal_stats=True)
         lb  = metrics_block(groups['xc0_vs_lc0'], want_legal_stats=True)
-        lbb = metrics_block(groups['xc0_vs_lc0_blunder'])
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
@@ -1344,7 +1344,9 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(xb, 'true'), (lb, 'lc0 all'), (lbb, 'lc0 blunder')]
+        slices = [(xb, 'true')]
+        if validate_lc0:
+            slices.append((lb, 'lc0 all'))
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:
@@ -1384,8 +1386,9 @@ class Rescorer(object):
             else:
                 all_df = row_df
             all_df.round(4).to_csv(progress_csv_path, index=False)
-        lc0_csv = os.path.join(os.path.dirname(progress_csv_path), 'eval_progress_vs_lc0.csv')
-        save_csv(lc0_csv, 'xc0_vs_lc0', lb)
+        if validate_lc0:
+            lc0_csv = os.path.join(os.path.dirname(progress_csv_path), 'eval_progress_vs_lc0.csv')
+            save_csv(lc0_csv, 'xc0_vs_lc0', lb)
         print(f"{pfx} saved to {os.path.basename(progress_csv_path)}")
 
         self.save_validation_plots(epoch, os.path.dirname(progress_csv_path), groups)

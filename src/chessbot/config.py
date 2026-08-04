@@ -138,6 +138,11 @@ class Config(object):
     lc0_enrich_frac   = 0.0   # fraction of non-blunder accepted positions to enrich with lc0 (0=off, 1=all)
     lc0_enrich_weight = 0.75  # vwht/pwht multiplier applied to lc0-generated training samples
 
+    # retrain-time validation against lc0-sourced samples is expensive and not
+    # useful every retrain; only run it (and print/save the lc0 breakdown) on
+    # every Nth retrain. Other retrains validate xc0 (incl. historic_seeded) only.
+    lc0_validation_every = 10
+
     # Prior temperature scaling in C++ tree (0 = disabled)
     tempscale_entropy_target = 0.0   # normed entropy target; 0 = disabled
     tempscale_trigger_q      = -2.0  # STM-POV Q floor; -2 = always; 0.5 = winning only

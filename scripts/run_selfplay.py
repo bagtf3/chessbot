@@ -764,9 +764,14 @@ def main(run_tag):
                         pred_pkl_path = os.path.join(
                             working_cfg.run_dir, "predictions_latest.pkl"
                         )
-                        
+
+                        validate_lc0 = (
+                            working_cfg.lc0_validation_every > 0
+                            and n_retrains % working_cfg.lc0_validation_every == 0
+                        )
                         rescorer.aggregate_metrics(
-                            n_retrains, working_cfg.progress_csv_path, pred_pkl_path)
+                            n_retrains, working_cfg.progress_csv_path, pred_pkl_path,
+                            validate_lc0=validate_lc0)
 
                         n_retrains += 1
                         retrain_worker = None

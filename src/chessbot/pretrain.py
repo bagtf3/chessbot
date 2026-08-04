@@ -35,7 +35,7 @@ PLOT_EVERY         = 20
 DEFAULT_MAX_EPOCH  = 2000
 
 POLICY_LW = 1.0
-VALUE_LW  = 4.0
+VALUE_LW  = 3.0
 
 # ---------------------------------------------------------------------------
 # Learning-rate schedule (Adam)

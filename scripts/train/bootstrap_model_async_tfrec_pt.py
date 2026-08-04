@@ -11,7 +11,7 @@ Usage:
     python scripts/bootstrap_model_async_tfrec_pt.py [options]
 
 Options:
-    --model      Model name            (default: hybrid-conv-attn)
+    --model      Model name            (default: conv-pure)
     --run-tag    Sub-dir under SP_DIR  (default: val_test_multi)
     --run-dir    Explicit run dir (overrides --run-tag)
     --tfrec-dir  Path to .tfrecord.gz files  (env: BOOTSTRAP_TFREC_DIR)
@@ -48,9 +48,8 @@ from chessbot.pretrain import (
     save_plot,
 )
 
-from chessbot.replay_buffer import new_shard_path, write_pkl_gz_shard
+from chessbot.replay_buffer import new_shard_path, write_pkl_gz_shard, SEED_SOURCE
 
-SEED_SOURCE          = "historic_seeded"
 SEED_REPLAY_SHARDS   = 64
 SEED_PRIMARY_SHARDS  = 24
 SEED_REMAINING_SHARDS = 8
@@ -63,7 +62,13 @@ PT_ADAM_BETA2      = 0.999
 PT_SHUFFLE_BUFFER  = 384_000
 
 CHECKPOINT_EVERY  = 100
-DEFAULT_MODEL     = "18m-precond-smartgate-xc0h-6c4t"
+
+# --swa: snapshot the tail of the run and average it. SWA_EVERY apart, ending
+# on the final epoch, spanning at most SWA_WINDOW epochs -> 4 snapshots plus
+# the final one at the defaults.
+SWA_WINDOW = 100
+SWA_EVERY  = 20
+DEFAULT_MODEL     = "precond-mha-10c6t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
 DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
@@ -89,6 +94,35 @@ UNIFIED_COLS = [
 
 def ckpt_path(run_dir: str, name: str, epoch: int) -> str:
     return os.path.join(run_dir, f"{name}_pt_ckpt{epoch:04d}.pt")
+
+
+def swa_ckpt_path(run_dir: str, name: str, epoch: int) -> str:
+    """Deliberately not the _pt_ckpt pattern -- delete_old_checkpoints prunes
+    everything but the newest of those, and SWA snapshots have to survive."""
+    return os.path.join(run_dir, f"{name}_pt_swa{epoch:04d}.pt")
+
+
+def swa_epochs(max_epoch: int) -> list[int]:
+    """Snapshot epochs: the final one, then back by SWA_EVERY within SWA_WINDOW."""
+    final = max_epoch - 1
+    eps = [final - k * SWA_EVERY for k in range(SWA_WINDOW // SWA_EVERY)]
+    return sorted(e for e in eps if e >= 0)
+
+
+def average_state_dicts(sds: list[dict]) -> dict:
+    """Mean of float tensors; non-float entries (int index buffers like sl_idx)
+    take the last value since averaging would corrupt the dtype. No BatchNorm
+    anywhere in these models, so there are no running stats to recompute."""
+    import torch
+
+    out = {}
+    for k in sds[0]:
+        vals = [sd[k] for sd in sds]
+        if vals[0].is_floating_point():
+            out[k] = torch.stack([v.float() for v in vals]).mean(0).to(vals[0].dtype)
+        else:
+            out[k] = vals[-1]
+    return out
 
 
 def normalize_progress_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -382,6 +416,7 @@ def worker_main(wargs: dict) -> None:
     max_epoch   = wargs["max_epoch"]
     model_dir   = wargs.get("model_dir", MODEL_DIR)
     unified     = wargs.get("unified_csv", False)
+    swa_set     = set(swa_epochs(max_epoch)) if wargs.get("swa") else set()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -507,6 +542,11 @@ def worker_main(wargs: dict) -> None:
             save_pt_ckpt(model, opt, scaler, ep, name, cp)
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
             save_plot(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
+
+        if ep in swa_set:
+            sp = swa_ckpt_path(run_dir, name, ep)
+            torch.save({"model": model.state_dict(), "arch": name}, sp)
+            print(f"[swa] snapshot {len(swa_set)} -> {os.path.basename(sp)}")
 
         elapsed = time.time() - epoch_start
         epoch_times.append(elapsed)
@@ -662,6 +702,11 @@ def main() -> None:
         help="path to .tfrecord.gz files",
     )
     parser.add_argument("--max-epoch", type=int, default=DEFAULT_MAX_EPOCH)
+    parser.add_argument(
+        "--swa", action="store_true",
+        help=f"snapshot every {SWA_EVERY} epochs over the last {SWA_WINDOW} "
+             f"and export their average as {{run_tag}}_model_SWA.pt/.ts",
+    )
     args = parser.parse_args()
 
     if not args.tfrec_dir:
@@ -706,6 +751,7 @@ def main() -> None:
         "max_epoch":     args.max_epoch,
         "progress_file": progress_file,
         "unified_csv":   unified,
+        "swa":           args.swa,
     }
     worker_main(wargs)
 
@@ -743,6 +789,50 @@ def main() -> None:
         else:
             print("[train] no optimizer state in checkpoint -- "
                   "selfplay retrain will start fresh")
+
+        if args.swa:
+            snaps = [swa_ckpt_path(run_dir, name, e)
+                     for e in swa_epochs(args.max_epoch)]
+            found = [p for p in snaps if os.path.exists(p)]
+            missing = len(snaps) - len(found)
+            if not found:
+                print("[swa] no snapshots found -- skipping SWA export")
+            else:
+                if missing:
+                    print(f"[swa] {missing} of {len(snaps)} snapshots missing, "
+                          f"averaging the {len(found)} that are present")
+                sds = [torch.load(p, map_location="cpu")["model"] for p in found]
+                avg = average_state_dicts(sds)
+
+                swa_model = PT_BUILDERS[arch_name](VARIANTS[arch_name])
+                swa_model.load_state_dict(avg)
+                swa_pt = os.path.join(run_dir, f"{run_tag}_model_SWA.pt")
+                swa_ts = os.path.join(run_dir, f"{run_tag}_model_SWA.ts")
+                torch.save(avg, swa_pt)
+                export_ts(swa_model, swa_ts, arch=arch_name)
+                print(f"[swa] averaged {len(found)} snapshots -> {swa_pt}")
+                print(f"[swa] averaged {len(found)} snapshots -> {swa_ts}")
+
+                # only now, with both artifacts confirmed on disk, drop the
+                # snapshots. The final training checkpoint is a _pt_ckpt file,
+                # a different pattern, so it cannot be caught here -- assert it
+                # anyway rather than trust that by inspection.
+                final_ckpt = ckpt_path(run_dir, name, last_ckpt)
+                if os.path.exists(swa_pt) and os.path.exists(swa_ts):
+                    for p in found:
+                        if p == final_ckpt:
+                            continue
+                        os.remove(p)
+                        print(f"[swa] removed snapshot {os.path.basename(p)}")
+                    if not os.path.exists(final_ckpt):
+                        raise RuntimeError(
+                            f"[swa] final checkpoint {final_ckpt} disappeared "
+                            f"during snapshot cleanup")
+                    print(f"[swa] final checkpoint intact: "
+                          f"{os.path.basename(final_ckpt)}")
+                else:
+                    print("[swa] SWA .pt/.ts not both present -- keeping "
+                          "snapshots")
 
     if args.run_dir:
         seed_selfplay_buffers(run_dir, val_files)

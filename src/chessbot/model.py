@@ -1386,15 +1386,22 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
             to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
 
-            f_proj = F.gelu(self.from_proj(from_set))
+            # from_proj/to_proj and from_out/to_out are residual-wrapped so a
+            # gradient path survives regardless of what those weights do --
+            # relies on D == PDH (true for every config using this builder
+            # today); would need a projection on the skip if that ever
+            # stops holding.
+            f_proj = from_set + F.gelu(self.from_proj(from_set))
             fn     = self.from_ln(f_proj)
             fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
-            fv     = self.from_out(f_proj[:, :64, :] + fh)                 # [B, 64, PDH]
+            f_base = f_proj[:, :64, :] + fh
+            fv     = f_base + self.from_out(f_base)                        # [B, 64, PDH]
 
-            t_proj = F.gelu(self.to_proj(to_set))
+            t_proj = to_set + F.gelu(self.to_proj(to_set))
             tn     = self.to_ln(t_proj)
             th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
-            tv     = self.to_out(t_proj[:, :64, :] + th)                   # [B, 64, PDH]
+            t_base = t_proj[:, :64, :] + th
+            tv     = t_base + self.to_out(t_base)                          # [B, 64, PDH]
 
             dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)  # [B, 64, 64]
             dots      = dots_full.reshape(B, 64 * 64)

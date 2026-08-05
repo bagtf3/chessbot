@@ -42,7 +42,7 @@ from chessbot.pretrain import (
     EPOCH_SIZE, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY,
     LR_WARMUP_EPOCHS,
-    # POLICY_LW, VALUE_LW,  # superseded by LW-twiddle experiment below
+    # POLICY_LW, VALUE_LW,  # superseded by circus-loss experiment below
     lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
@@ -69,21 +69,41 @@ CHECKPOINT_EVERY  = 100
 # the final one at the defaults.
 SWA_WINDOW = 100
 SWA_EVERY  = 20
-DEFAULT_MODEL     = "precond-mha-10c6t-d256"
+DEFAULT_MODEL     = "18m-precond-smartgate-xc0h-6c4t"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
 DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
 
 # ---------------------------------------------------------------------------
-# LW-twiddle experiment (lw_twiddle branch, pretrain-only)
+# Circus-loss experiment (circus_loss branch, pretrain-only)
 #
 # Fixed 1:2 policy:value LW through warmup. After warmup, track EMAs of the
-# raw (unweighted) per-epoch CEs and every LW_RECOMPUTE_EVERY epochs solve
-# A = policy_ce_hat / value_ce_hat, then oscillate value_LW = A*(1+f*sin)
-# and policy_LW = 1-f*sin so that policy_LW*policy_ce_hat + value_LW*value_ce_hat
-# stays fixed at 2*policy_ce_hat (the 1:1-balanced total) throughout the
-# cycle. After LW_N_PERIODS full periods it settles to policy_LW=1,
-# value_LW=A, still recomputed on the same cadence.
+# raw (unweighted) per-epoch composite losses and every LW_RECOMPUTE_EVERY
+# epochs solve A = policy_loss_hat / value_loss_hat -- that fixes the *shape*
+# (value_LW/policy_LW ratio), same as before. But instead of leaving the
+# total at the resulting 1:1-composite scale (policy_LW=1, value_LW=A, total
+# = 2*policy_loss_hat), both are then scaled by a single factor so the
+# weighted total matches LW_TARGET_VALUE_MULT*value_ce_hat +
+# LW_TARGET_POLICY_MULT*policy_ce_hat (raw CE EMAs, not composites) -- the
+# same total magnitude the old fixed 4:1-on-raw-CE scheme would produce.
+# Tests whether the smaller magnitude from equal-composite-balancing (vs.
+# the old larger 4:1-raw magnitude) was itself part of the problem,
+# independent of the policy:value composition ratio question.
+#
+# The composites themselves are funkier than plain CE:
+#   value_loss  = value_ce + CIRCUS_ALPHA_MSE*MSE
+#                          + CIRCUS_ALPHA_CORR*(1 - batch_corr)   [epoch >= 10]
+#   policy_loss = policy_ce + CIRCUS_LAMBDA_TOP5*brier_top5
+# brier_top5 is (p_i - label_i)^2 summed over the label's top-5 indices,
+# using the same unmasked softmax probs policy_ce already uses. Unlike a
+# boosted/reshaped target, Brier score is a proper scoring rule minimized
+# exactly at p=label -- so this term shares CE's own minimum and never asks
+# for a distribution other than the true label, it just adds extra gradient
+# pressure at those 5 indices during training.
+# batch_corr is Pearson correlation between predicted and target Q across
+# the minibatch; excluded entirely for the first CIRCUS_CORR_START_EPOCH
+# epochs (near-constant early predictions make its denominator degenerate),
+# eps-guarded from then on.
 # ---------------------------------------------------------------------------
 LW_WARMUP_POLICY   = 1.0
 LW_WARMUP_VALUE    = 2.0
@@ -92,41 +112,50 @@ LW_EMA_SPAN_EPOCHS = 20             # 400 steps / 20 steps-per-epoch
 LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
 
 LW_RECOMPUTE_EVERY = 25             # epochs between LW recomputes (500 steps)
-LW_PERIOD_EPOCHS   = 600            # one oscillation period (12000 steps)
-LW_N_PERIODS       = 10             # periods before settling to steady balance
-LW_F               = 0.8            # oscillation depth, fraction of A
+
+CIRCUS_ALPHA_MSE    = 4.0
+CIRCUS_ALPHA_CORR   = 2.0
+CIRCUS_LAMBDA_TOP5  = 3.0
+CIRCUS_CORR_START_EPOCH = 10
+CIRCUS_CORR_EPS     = 1e-6
+
+LW_TARGET_VALUE_MULT  = 4.0         # target total = this*value_ce_hat
+LW_TARGET_POLICY_MULT = 1.0         #              + this*policy_ce_hat
 
 
 def lw_ema_update(ema, raw):
     return raw if ema is None else (1.0 - LW_EMA_ALPHA) * ema + LW_EMA_ALPHA * raw
 
 
-def lw_for_epoch(ep, policy_ce_hat, value_ce_hat, active):
+def lw_for_epoch(ep, policy_loss_hat, value_loss_hat, policy_ce_hat, value_ce_hat, active):
     """
-    Return (policy_lw, value_lw, A, phase, recomputed). `active` is the dict
+    Return (policy_lw, value_lw, A, scale, recomputed). `active` is the dict
     of values carried over from the last recompute; passed through unchanged
-    on non-recompute epochs.
+    on non-recompute epochs. Permanent A*-balance once past warmup -- no
+    oscillation -- then rescaled so the weighted total matches the
+    LW_TARGET_*_MULT combination of the raw CE EMAs.
     """
     if ep < LR_WARMUP_EPOCHS:
-        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, "warmup", False
+        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, None, False
 
     osc_ep = ep - LR_WARMUP_EPOCHS
     if osc_ep % LW_RECOMPUTE_EVERY != 0:
-        return active["policy_lw"], active["value_lw"], active["A"], active["phase"], False
+        return (active["policy_lw"], active["value_lw"], active["A"],
+                active["scale"], False)
 
-    A = policy_ce_hat / value_ce_hat
-    if osc_ep < LW_PERIOD_EPOCHS * LW_N_PERIODS:
-        period_idx = osc_ep // LW_PERIOD_EPOCHS + 1
-        phase = f"period {period_idx}/{LW_N_PERIODS}"
-        theta = osc_ep * (2 * math.pi / LW_PERIOD_EPOCHS)
-        value_lw  = A * (1.0 + LW_F * math.sin(theta))
-        policy_lw = 1.0 - LW_F * math.sin(theta)
+    A = policy_loss_hat / value_loss_hat
+    current_total = policy_loss_hat + A * value_loss_hat  # == 2*policy_loss_hat
+    if policy_ce_hat is None or value_ce_hat is None:
+        # resumed from a checkpoint that predates raw-CE tracking, landed
+        # exactly on a recompute epoch before this session rebuilt the EMA --
+        # keep the A-derived shape, skip rescaling just this once.
+        scale = 1.0
     else:
-        phase = "steady"
-        value_lw  = A
-        policy_lw = 1.0
-
-    return policy_lw, value_lw, A, phase, True
+        target_total = (
+            LW_TARGET_VALUE_MULT * value_ce_hat + LW_TARGET_POLICY_MULT * policy_ce_hat
+        )
+        scale = target_total / current_total
+    return scale * 1.0, scale * A, A, scale, True
 
 
 # Shared schema for the unified eval_progress.csv. The first 15 are selfplay's
@@ -312,10 +341,12 @@ def load_pt_model(path: str, name: str, device, lr: float):
         print("[load] optimizer state incompatible (optimizer change?), starting fresh:", e)
         raise
 
-    return model, opt, scaler
+    lw_state = ckpt.get("lw_state")
+    return model, opt, scaler, lw_state
 
 
-def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
+def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str,
+                  lw_state: dict | None = None) -> None:
     import torch
     torch.save({
         "model":     model.state_dict(),
@@ -323,6 +354,7 @@ def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
         "scaler":    scaler.state_dict(),
         "epoch":     epoch,
         "arch":      name,
+        "lw_state":  lw_state,
     }, path)
     print(f"[ckpt] epoch {epoch} -> {path}")
 
@@ -339,7 +371,7 @@ def pt_clipnorm_for_epoch(ep: int) -> float:
     return 20.0
 
 
-def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
+def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device, ep: int):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -352,20 +384,47 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
     n    = enc.shape[0]
     perm = torch.randperm(n, device=device)
     model.train()
-    total_p = total_v = total = 0.0
+    total_p = total_v = total = total_brier = 0.0
+    total_policy_ce = total_value_ce = 0.0
     grad_norms = []
     clip_count = 0
     n_batches  = 0
+    use_corr   = ep >= CIRCUS_CORR_START_EPOCH
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
         opt.zero_grad(set_to_none=True)
         with autocast("cuda"):
             pol, val = model(enc[idx])
-            p_loss = F.cross_entropy(pol, policy_t[idx]) * lw["policy_logits"]
-            v_loss = (
+
+            policy_ce   = F.cross_entropy(pol, policy_t[idx])
+            policy_probs = F.softmax(pol.float(), dim=1)
+            top5_idx    = torch.topk(policy_t[idx], k=5, dim=1).indices
+            p5          = policy_probs.gather(1, top5_idx)
+            y5          = policy_t[idx].gather(1, top5_idx)
+            brier_top5  = ((p5 - y5) ** 2).sum(dim=1).mean()
+            policy_loss_raw = policy_ce + CIRCUS_LAMBDA_TOP5 * brier_top5
+            p_loss = policy_loss_raw * lw["policy_logits"]
+
+            value_ce = (
                 F.cross_entropy(val, value_t[idx], reduction="none") * w[idx]
-            ).mean() * lw["value_out"]
+            ).mean()
+            val_wdl = F.softmax(val.float(), dim=1)
+            val_q   = val_wdl[:, 0] - val_wdl[:, 2]
+            tgt_q   = value_t[idx][:, 0] - value_t[idx][:, 2]
+            mse = ((val_q - tgt_q) ** 2 * w[idx]).mean()
+            value_loss_raw = value_ce + CIRCUS_ALPHA_MSE * mse
+            if use_corr:
+                vx = val_q - val_q.mean()
+                vy = tgt_q - tgt_q.mean()
+                corr_denom = (
+                    torch.sqrt((vx ** 2).sum()) * torch.sqrt((vy ** 2).sum())
+                    + CIRCUS_CORR_EPS
+                )
+                corr = (vx * vy).sum() / corr_denom
+                value_loss_raw = value_loss_raw + CIRCUS_ALPHA_CORR * (1.0 - corr)
+            v_loss = value_loss_raw * lw["value_out"]
+
             loss = p_loss + v_loss
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -378,10 +437,13 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
             clip_count += 1
         scaler.step(opt)
         scaler.update()
-        total_p   += p_loss.item()
-        total_v   += v_loss.item()
-        total     += loss.item()
-        n_batches += 1
+        total_p        += p_loss.item()
+        total_v         += v_loss.item()
+        total           += loss.item()
+        total_brier     += brier_top5.item()
+        total_policy_ce += policy_ce.item()
+        total_value_ce  += value_ce.item()
+        n_batches       += 1
 
     gn = np.array(grad_norms)
     grad_stats = {
@@ -392,7 +454,9 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device):
         "gn_clips": clip_count,
         "gn_steps": n_batches,
     }
-    return total_p / n_batches, total_v / n_batches, total / n_batches, grad_stats
+    return (total_p / n_batches, total_v / n_batches, total / n_batches,
+            grad_stats, total_brier / n_batches,
+            total_policy_ce / n_batches, total_value_ce / n_batches)
 
 
 def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device,
@@ -491,6 +555,7 @@ def worker_main(wargs: dict) -> None:
         model  = PT_BUILDERS[name](cfg).to(device)
         opt    = make_adam(model, lr0)
         scaler = GradScaler("cuda")
+        lw_state = None
         print(f"[worker] fresh init  lr={lr0:.4e}")
     else:
         last_ckpt = find_last_checkpoint(run_dir, name)
@@ -500,7 +565,7 @@ def worker_main(wargs: dict) -> None:
             )
         load_from = ckpt_path(run_dir, name, last_ckpt)
         print(f"[worker] loading {load_from}")
-        model, opt, scaler = load_pt_model(load_from, name, device, lr=lr0)
+        model, opt, scaler, lw_state = load_pt_model(load_from, name, device, lr=lr0)
 
     eval_df: pd.DataFrame | None = None
     if os.path.exists(progress_file):
@@ -519,12 +584,40 @@ def worker_main(wargs: dict) -> None:
     prefetcher.start()
     val_prefetcher.start()
 
-    policy_ce_hat: float | None = None
-    value_ce_hat: float | None = None
-    active_lw = {
-        "policy_lw": LW_WARMUP_POLICY, "value_lw": LW_WARMUP_VALUE,
-        "A": None, "phase": "warmup",
-    }
+    if lw_state is not None:
+        policy_loss_hat = lw_state["policy_loss_hat"]
+        value_loss_hat  = lw_state["value_loss_hat"]
+        policy_ce_hat   = lw_state.get("policy_ce_hat")
+        value_ce_hat    = lw_state.get("value_ce_hat")
+        active_lw = {
+            "policy_lw": lw_state["policy_lw"],
+            "value_lw":  lw_state["value_lw"],
+            "A":         lw_state["A"],
+            "scale":     lw_state.get("scale"),
+        }
+        print(
+            f"[worker] restored LW state: policy_loss_hat={policy_loss_hat:.3f}  "
+            f"value_loss_hat={value_loss_hat:.3f}  A={active_lw['A']}"
+        )
+        if policy_ce_hat is None or value_ce_hat is None:
+            print(
+                "[worker] checkpoint predates raw CE tracking -- "
+                "policy_ce_hat/value_ce_hat rebuilding from scratch"
+            )
+    else:
+        policy_loss_hat: float | None = None
+        value_loss_hat: float | None = None
+        policy_ce_hat: float | None = None
+        value_ce_hat: float | None = None
+        active_lw = {
+            "policy_lw": LW_WARMUP_POLICY, "value_lw": LW_WARMUP_VALUE,
+            "A": None, "scale": None,
+        }
+        if start_epoch > LR_WARMUP_EPOCHS:
+            print(
+                "[worker] no LW state in checkpoint -- resuming with warmup LW "
+                "until the next recompute"
+            )
     current_lr: float | None = None
     begin          = time.time()
     epoch_times: list[float] = []
@@ -567,21 +660,24 @@ def worker_main(wargs: dict) -> None:
         bundle = prefetcher.get()
         t_fetch += time.time() - t0
 
-        policy_lw, value_lw, A, phase, recomputed = lw_for_epoch(
-            ep, policy_ce_hat, value_ce_hat, active_lw)
+        policy_lw, value_lw, A, scale, recomputed = lw_for_epoch(
+            ep, policy_loss_hat, value_loss_hat, policy_ce_hat, value_ce_hat, active_lw)
         active_lw = {
-            "policy_lw": policy_lw, "value_lw": value_lw, "A": A, "phase": phase,
+            "policy_lw": policy_lw, "value_lw": value_lw, "A": A, "scale": scale,
         }
         lw = {"policy_logits": policy_lw, "value_out": value_lw}
 
         t0 = time.time()
         max_norm = pt_clipnorm_for_epoch(ep)
-        p_loss, v_loss, t_loss, gns = fit_epoch(model, opt, scaler, bundle, lw, max_norm, device)
+        p_loss, v_loss, t_loss, gns, brier_top5, policy_ce_raw, value_ce_raw = fit_epoch(
+            model, opt, scaler, bundle, lw, max_norm, device, ep)
         t_fit += time.time() - t0
 
-        policy_ce_hat = lw_ema_update(policy_ce_hat, p_loss / policy_lw)
-        value_ce_hat  = lw_ema_update(value_ce_hat,  v_loss / value_lw)
-        live_A = policy_ce_hat / value_ce_hat
+        policy_loss_hat = lw_ema_update(policy_loss_hat, p_loss / policy_lw)
+        value_loss_hat  = lw_ema_update(value_loss_hat,  v_loss / value_lw)
+        policy_ce_hat    = lw_ema_update(policy_ce_hat, policy_ce_raw)
+        value_ce_hat     = lw_ema_update(value_ce_hat,  value_ce_raw)
+        live_A = policy_loss_hat / value_loss_hat
 
         n_this           = int(bundle["enc_in"].shape[0])
         total_samples   += n_this
@@ -602,13 +698,22 @@ def worker_main(wargs: dict) -> None:
         )
         print(
             f"[epoch {ep:4d}] [{name}] "
-            f"policy_ce_hat: {policy_ce_hat:.2f}  value_ce_hat (raw): {value_ce_hat:.3f}  "
+            f"policy_loss_hat: {policy_loss_hat:.2f}  value_loss_hat (raw): {value_loss_hat:.3f}  "
             f"A = {live_A:.2f}"
+        )
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"policy_ce_hat (raw): {policy_ce_hat:.2f}  value_ce_hat (raw): {value_ce_hat:.3f}"
+        )
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"brier_top5 (raw): {brier_top5:.4f}  "
+            f"lambda*brier_top5: {CIRCUS_LAMBDA_TOP5 * brier_top5:.4f}"
         )
         if recomputed:
             print(
-                f"[lw-twiddle RECOMPUTE] phase={phase}  A: {A:.2f}  "
-                f"new LW: policy={policy_lw:.1f}  value={value_lw:.2f}"
+                f"[circus-loss RECOMPUTE] A: {A:.2f}  scale: {scale:.3f}  "
+                f"new LW: policy={policy_lw:.3f}  value={value_lw:.3f}"
             )
             print()
         print(
@@ -621,7 +726,17 @@ def worker_main(wargs: dict) -> None:
         is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1
         if is_ckpt:
             cp = ckpt_path(run_dir, name, ep)
-            save_pt_ckpt(model, opt, scaler, ep, name, cp)
+            lw_state = {
+                "policy_loss_hat": policy_loss_hat,
+                "value_loss_hat":  value_loss_hat,
+                "policy_ce_hat":   policy_ce_hat,
+                "value_ce_hat":    value_ce_hat,
+                "policy_lw":       active_lw["policy_lw"],
+                "value_lw":        active_lw["value_lw"],
+                "A":               active_lw["A"],
+                "scale":           active_lw["scale"],
+            }
+            save_pt_ckpt(model, opt, scaler, ep, name, cp, lw_state=lw_state)
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
             save_plot(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
 

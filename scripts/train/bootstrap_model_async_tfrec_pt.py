@@ -91,19 +91,22 @@ DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_com
 # independent of the policy:value composition ratio question.
 #
 # The composites themselves are funkier than plain CE:
-#   value_loss  = value_ce + CIRCUS_ALPHA_MSE*MSE
-#                          + CIRCUS_ALPHA_CORR*(1 - batch_corr)   [epoch >= 10]
-#   policy_loss = policy_ce + CIRCUS_LAMBDA_TOP5*brier_top5
+#   value_loss  = value_ce + alpha_mse(ep)*MSE + alpha_corr(ep)*(1 - batch_corr)
+#   policy_loss = policy_ce + lambda_top5(ep)*brier_top5
 # brier_top5 is (p_i - label_i)^2 summed over the label's top-5 indices,
 # using the same unmasked softmax probs policy_ce already uses. Unlike a
 # boosted/reshaped target, Brier score is a proper scoring rule minimized
 # exactly at p=label -- so this term shares CE's own minimum and never asks
 # for a distribution other than the true label, it just adds extra gradient
-# pressure at those 5 indices during training.
-# batch_corr is Pearson correlation between predicted and target Q across
-# the minibatch; excluded entirely for the first CIRCUS_CORR_START_EPOCH
-# epochs (near-constant early predictions make its denominator degenerate),
-# eps-guarded from then on.
+# pressure at those 5 indices during training. batch_corr is Pearson
+# correlation between predicted and target Q across the minibatch, eps-
+# guarded in its denominator always (safe at alpha=0 too).
+#
+# alpha_mse/alpha_corr/lambda_top5 are all ramped in together: 0.0 before
+# CIRCUS_RAMP_START_EPOCH, then starting at 0.01 and incrementing by 0.01
+# every CIRCUS_RAMP_STEP_EPOCHS epochs, capped at each term's own ceiling
+# (CIRCUS_ALPHA_MSE_MAX / CIRCUS_ALPHA_CORR_MAX / CIRCUS_LAMBDA_TOP5_MAX) --
+# corr's lower ceiling means it plateaus well before MSE/brier do.
 # ---------------------------------------------------------------------------
 LW_WARMUP_POLICY   = 1.0
 LW_WARMUP_VALUE    = 2.0
@@ -113,14 +116,24 @@ LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
 
 LW_RECOMPUTE_EVERY = 25             # epochs between LW recomputes (500 steps)
 
-CIRCUS_ALPHA_MSE    = 4.0
-CIRCUS_ALPHA_CORR   = 2.0
-CIRCUS_LAMBDA_TOP5  = 3.0
-CIRCUS_CORR_START_EPOCH = 10
-CIRCUS_CORR_EPS     = 1e-6
+CIRCUS_ALPHA_MSE_MAX   = 1.0
+CIRCUS_ALPHA_CORR_MAX  = 0.3
+CIRCUS_LAMBDA_TOP5_MAX = 1.0
+CIRCUS_CORR_EPS        = 1e-6
+
+CIRCUS_RAMP_START_EPOCH = 2000       # all three alphas are 0.0 before this
+CIRCUS_RAMP_STEP_EPOCHS = 10         # ... then +0.01 every this many epochs
+CIRCUS_RAMP_STEP_SIZE   = 0.01
 
 LW_TARGET_VALUE_MULT  = 4.0         # target total = this*value_ce_hat
 LW_TARGET_POLICY_MULT = 1.0         #              + this*policy_ce_hat
+
+
+def circus_ramped_alpha(ep: int, ceiling: float) -> float:
+    if ep < CIRCUS_RAMP_START_EPOCH:
+        return 0.0
+    steps = (ep - CIRCUS_RAMP_START_EPOCH) // CIRCUS_RAMP_STEP_EPOCHS
+    return min(CIRCUS_RAMP_STEP_SIZE * (steps + 1), ceiling)
 
 
 def lw_ema_update(ema, raw):
@@ -389,7 +402,9 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device, ep:
     grad_norms = []
     clip_count = 0
     n_batches  = 0
-    use_corr   = ep >= CIRCUS_CORR_START_EPOCH
+    alpha_mse   = circus_ramped_alpha(ep, CIRCUS_ALPHA_MSE_MAX)
+    alpha_corr  = circus_ramped_alpha(ep, CIRCUS_ALPHA_CORR_MAX)
+    lambda_top5 = circus_ramped_alpha(ep, CIRCUS_LAMBDA_TOP5_MAX)
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
@@ -403,7 +418,7 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device, ep:
             p5          = policy_probs.gather(1, top5_idx)
             y5          = policy_t[idx].gather(1, top5_idx)
             brier_top5  = ((p5 - y5) ** 2).sum(dim=1).mean()
-            policy_loss_raw = policy_ce + CIRCUS_LAMBDA_TOP5 * brier_top5
+            policy_loss_raw = policy_ce + lambda_top5 * brier_top5
             p_loss = policy_loss_raw * lw["policy_logits"]
 
             value_ce = (
@@ -413,16 +428,16 @@ def fit_epoch(model, opt, scaler, bundle, lw: dict, max_norm: float, device, ep:
             val_q   = val_wdl[:, 0] - val_wdl[:, 2]
             tgt_q   = value_t[idx][:, 0] - value_t[idx][:, 2]
             mse = ((val_q - tgt_q) ** 2 * w[idx]).mean()
-            value_loss_raw = value_ce + CIRCUS_ALPHA_MSE * mse
-            if use_corr:
-                vx = val_q - val_q.mean()
-                vy = tgt_q - tgt_q.mean()
-                corr_denom = (
-                    torch.sqrt((vx ** 2).sum()) * torch.sqrt((vy ** 2).sum())
-                    + CIRCUS_CORR_EPS
-                )
-                corr = (vx * vy).sum() / corr_denom
-                value_loss_raw = value_loss_raw + CIRCUS_ALPHA_CORR * (1.0 - corr)
+            vx = val_q - val_q.mean()
+            vy = tgt_q - tgt_q.mean()
+            corr_denom = (
+                torch.sqrt((vx ** 2).sum()) * torch.sqrt((vy ** 2).sum())
+                + CIRCUS_CORR_EPS
+            )
+            corr = (vx * vy).sum() / corr_denom
+            value_loss_raw = (
+                value_ce + alpha_mse * mse + alpha_corr * (1.0 - corr)
+            )
             v_loss = value_loss_raw * lw["value_out"]
 
             loss = p_loss + v_loss
@@ -705,10 +720,18 @@ def worker_main(wargs: dict) -> None:
             f"[epoch {ep:4d}] [{name}] "
             f"policy_ce_hat (raw): {policy_ce_hat:.2f}  value_ce_hat (raw): {value_ce_hat:.3f}"
         )
+        lambda_top5_ep = circus_ramped_alpha(ep, CIRCUS_LAMBDA_TOP5_MAX)
+        alpha_mse_ep   = circus_ramped_alpha(ep, CIRCUS_ALPHA_MSE_MAX)
+        alpha_corr_ep  = circus_ramped_alpha(ep, CIRCUS_ALPHA_CORR_MAX)
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"alphas: mse={alpha_mse_ep:.2f}  corr={alpha_corr_ep:.2f}  "
+            f"top5={lambda_top5_ep:.2f}"
+        )
         print(
             f"[epoch {ep:4d}] [{name}] "
             f"brier_top5 (raw): {brier_top5:.4f}  "
-            f"lambda*brier_top5: {CIRCUS_LAMBDA_TOP5 * brier_top5:.4f}"
+            f"lambda*brier_top5: {lambda_top5_ep * brier_top5:.4f}"
         )
         if recomputed:
             print(

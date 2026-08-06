@@ -41,7 +41,8 @@ import scipy.special
 from chessbot.pretrain import (
     EPOCH_SIZE, VAL_SHUFFLE_BUFFER,
     PLOT_EVERY,
-    POLICY_LW, VALUE_LW,
+    LR_WARMUP_EPOCHS,
+    # POLICY_LW, VALUE_LW,  # superseded by LW-twiddle experiment below
     lr_for_epoch,
     list_tfrecord_files, split_train_val,
     make_dataset, EpochBufferThread,
@@ -72,6 +73,56 @@ DEFAULT_MODEL     = "precond-mha-10c6t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
 DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
+
+# ---------------------------------------------------------------------------
+# LW-twiddle experiment (lw_twiddle branch, pretrain-only)
+#
+# Twiddling/oscillation paused for now -- fixed 1:2 policy:value shape
+# throughout (policy_ce + 2*value_ce, same ratio warmup already uses), no
+# adaptive A, no sin cycle. After warmup, track EMAs of the raw per-epoch
+# CEs and every LW_RECOMPUTE_EVERY epochs rescale that fixed-shape pair by a
+# single factor so the weighted total matches LW_TARGET_VALUE_MULT*
+# value_ce_hat + LW_TARGET_POLICY_MULT*policy_ce_hat -- i.e. policy_ce +
+# 2*value_ce, upweighted to the magnitude of policy_ce + 4*value_ce.
+# ---------------------------------------------------------------------------
+LW_WARMUP_POLICY   = 1.0
+LW_WARMUP_VALUE    = 2.0
+
+LW_EMA_SPAN_EPOCHS = 20             # 400 steps / 20 steps-per-epoch
+LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
+
+LW_RECOMPUTE_EVERY = 10             # epochs between LW recomputes (200 steps)
+
+LW_TARGET_VALUE_MULT  = 4.0         # target total = this*value_ce_hat
+LW_TARGET_POLICY_MULT = 1.0         #              + this*policy_ce_hat
+
+
+def lw_ema_update(ema, raw):
+    return raw if ema is None else (1.0 - LW_EMA_ALPHA) * ema + LW_EMA_ALPHA * raw
+
+
+def lw_for_epoch(ep, policy_ce_hat, value_ce_hat, active):
+    """
+    Return (policy_lw, value_lw, scale, recomputed). `active` is the dict of
+    values carried over from the last recompute; passed through unchanged
+    on non-recompute epochs. Fixed 1:2 shape, rescaled to the target total.
+    """
+    if ep < LR_WARMUP_EPOCHS:
+        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, False
+
+    osc_ep = ep - LR_WARMUP_EPOCHS
+    if osc_ep % LW_RECOMPUTE_EVERY != 0:
+        return active["policy_lw"], active["value_lw"], active["scale"], False
+
+    current_total = LW_WARMUP_POLICY * policy_ce_hat + LW_WARMUP_VALUE * value_ce_hat
+    target_total = (
+        LW_TARGET_VALUE_MULT * value_ce_hat + LW_TARGET_POLICY_MULT * policy_ce_hat
+    )
+    scale = target_total / current_total
+    policy_lw = scale * LW_WARMUP_POLICY
+    value_lw  = scale * LW_WARMUP_VALUE
+
+    return policy_lw, value_lw, scale, True
 
 
 # Shared schema for the unified eval_progress.csv. The first 15 are selfplay's
@@ -257,10 +308,12 @@ def load_pt_model(path: str, name: str, device, lr: float):
         print("[load] optimizer state incompatible (optimizer change?), starting fresh:", e)
         raise
 
-    return model, opt, scaler
+    lw_state = ckpt.get("lw_state")
+    return model, opt, scaler, lw_state
 
 
-def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
+def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str,
+                  lw_state: dict | None = None) -> None:
     import torch
     torch.save({
         "model":     model.state_dict(),
@@ -268,6 +321,7 @@ def save_pt_ckpt(model, opt, scaler, epoch: int, name: str, path: str) -> None:
         "scaler":    scaler.state_dict(),
         "epoch":     epoch,
         "arch":      name,
+        "lw_state":  lw_state,
     }, path)
     print(f"[ckpt] epoch {epoch} -> {path}")
 
@@ -436,6 +490,7 @@ def worker_main(wargs: dict) -> None:
         model  = PT_BUILDERS[name](cfg).to(device)
         opt    = make_adam(model, lr0)
         scaler = GradScaler("cuda")
+        lw_state = None
         print(f"[worker] fresh init  lr={lr0:.4e}")
     else:
         last_ckpt = find_last_checkpoint(run_dir, name)
@@ -445,7 +500,7 @@ def worker_main(wargs: dict) -> None:
             )
         load_from = ckpt_path(run_dir, name, last_ckpt)
         print(f"[worker] loading {load_from}")
-        model, opt, scaler = load_pt_model(load_from, name, device, lr=lr0)
+        model, opt, scaler, lw_state = load_pt_model(load_from, name, device, lr=lr0)
 
     eval_df: pd.DataFrame | None = None
     if os.path.exists(progress_file):
@@ -464,7 +519,30 @@ def worker_main(wargs: dict) -> None:
     prefetcher.start()
     val_prefetcher.start()
 
-    fixed_lw = {"policy_logits": POLICY_LW, "value_out": VALUE_LW}
+    if lw_state is not None:
+        policy_ce_hat = lw_state["policy_ce_hat"]
+        value_ce_hat  = lw_state["value_ce_hat"]
+        active_lw = {
+            "policy_lw": lw_state["policy_lw"],
+            "value_lw":  lw_state["value_lw"],
+            "scale":     lw_state.get("scale"),
+        }
+        print(
+            f"[worker] restored LW state: policy_ce_hat={policy_ce_hat:.3f}  "
+            f"value_ce_hat={value_ce_hat:.3f}  scale={active_lw['scale']}"
+        )
+    else:
+        policy_ce_hat: float | None = None
+        value_ce_hat: float | None = None
+        active_lw = {
+            "policy_lw": LW_WARMUP_POLICY, "value_lw": LW_WARMUP_VALUE,
+            "scale": None,
+        }
+        if start_epoch > LR_WARMUP_EPOCHS:
+            print(
+                "[worker] no LW state in checkpoint -- resuming with warmup LW "
+                "until the next recompute"
+            )
     current_lr: float | None = None
     begin          = time.time()
     epoch_times: list[float] = []
@@ -507,10 +585,20 @@ def worker_main(wargs: dict) -> None:
         bundle = prefetcher.get()
         t_fetch += time.time() - t0
 
+        policy_lw, value_lw, scale, recomputed = lw_for_epoch(
+            ep, policy_ce_hat, value_ce_hat, active_lw)
+        active_lw = {"policy_lw": policy_lw, "value_lw": value_lw, "scale": scale}
+        lw = {"policy_logits": policy_lw, "value_out": value_lw}
+
         t0 = time.time()
         max_norm = pt_clipnorm_for_epoch(ep)
-        p_loss, v_loss, t_loss, gns = fit_epoch(model, opt, scaler, bundle, fixed_lw, max_norm, device)
+        p_loss, v_loss, t_loss, gns = fit_epoch(
+            model, opt, scaler, bundle, lw, max_norm, device)
         t_fit += time.time() - t0
+
+        policy_ce_hat = lw_ema_update(policy_ce_hat, p_loss / policy_lw)
+        value_ce_hat  = lw_ema_update(value_ce_hat,  v_loss / value_lw)
+        live_A = policy_ce_hat / value_ce_hat
 
         n_this           = int(bundle["enc_in"].shape[0])
         total_samples   += n_this
@@ -526,9 +614,20 @@ def worker_main(wargs: dict) -> None:
 
         print(
             f"[epoch {ep:4d}] [{name}] "
-            f"policy_loss: {p_loss:.4f}  value_loss: {v_loss:.4f}  "
-            f"total: {t_loss:.4f}  samples: {total_samples:,}"
+            f"policy_loss: {p_loss:.2f}  value_loss: {v_loss:.2f}  "
+            f"total: {t_loss:.2f}  samples: {total_samples:,}"
         )
+        print(
+            f"[epoch {ep:4d}] [{name}] "
+            f"policy_ce_hat: {policy_ce_hat:.2f}  value_ce_hat (raw): {value_ce_hat:.3f}  "
+            f"A = {live_A:.2f}"
+        )
+        if recomputed:
+            print(
+                f"[lw-fixed RECOMPUTE] scale: {scale:.3f}  "
+                f"new LW: policy={policy_lw:.3f}  value={value_lw:.3f}"
+            )
+            print()
         print(
             f"[grad norms ] "
             f"mean: {gns['gn_mean']:.3f}  median: {gns['gn_median']:.3f}  "
@@ -539,7 +638,14 @@ def worker_main(wargs: dict) -> None:
         is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1
         if is_ckpt:
             cp = ckpt_path(run_dir, name, ep)
-            save_pt_ckpt(model, opt, scaler, ep, name, cp)
+            lw_state = {
+                "policy_ce_hat": policy_ce_hat,
+                "value_ce_hat":  value_ce_hat,
+                "policy_lw":     active_lw["policy_lw"],
+                "value_lw":      active_lw["value_lw"],
+                "scale":         active_lw["scale"],
+            }
+            save_pt_ckpt(model, opt, scaler, ep, name, cp, lw_state=lw_state)
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
             save_plot(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
 

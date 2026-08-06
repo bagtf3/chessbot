@@ -433,9 +433,15 @@ def batch_policy_metrics(logits, labels, mask):
     top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
     top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
 
+    # same top5_idx, but gathered from the label itself -- how much mass the
+    # target distribution puts on its own top-5 (the ceiling top5_mass can't
+    # meaningfully exceed, since labels are blended with uniform_eps/clipped)
+    top5_target_per = np.take_along_axis(labels, top5_idx, axis=1).sum(axis=1)
+
     top1_mass = top1_per.mean()
     top3_mass = top3_per.mean()
     top5_mass = top5_per.mean()
+    top5_mass_target = top5_target_per.mean()
 
     # other support / distribution metrics
     support_mask = labels > 0
@@ -459,27 +465,25 @@ def batch_policy_metrics(logits, labels, mask):
         "top1_mass": top1_mass,
         "top3_mass": top3_mass,
         "top5_mass": top5_mass,
+        "top5_mass_target": top5_mass_target,
         "prob_on_others": prob_on_others,
         "mass_on_legal": mass_on_legal
     }
 
 
 def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
-    eps = 1e-12
-
     # name_w derived from actual display labels so columns align
     keys = [
         "value_mse", "value_corr", "value_ce",
         "policy_ce", "uniform_ce",
         "top1_exact", "avg_top",
-        "top1_mass",  "true ratio",
+        "top1_mass", "top5_mass", "top5_mass (target)",
     ]
     name_w = max(len(k) for k in keys)
     num_w = 7
     fmt_num = f"{{value:{num_w}.3f}}"
     def pair(k, v):
         return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
-    ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
     pfx = f"[epoch {epoch:4d}] [validation]"
 
     value_ce = stats.get("value_ce", float("nan"))
@@ -491,7 +495,8 @@ def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
           f"{pair('avg_top', stats['avg_top_prob'])}")
     print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "
-          f"{pair('true ratio', ratio)}")
+          f"{pair('top5_mass', stats['top5_mass'])}  "
+          f"{pair('top5_mass (target)', stats['top5_mass_target'])}")
     if mass_on_legal is not None:
         cov_str = f" ({mol_coverage:.0%} coverage)" if mol_coverage is not None else ""
         print(f"{pfx} mass_on_legal (est): {mass_on_legal:.4f}{cov_str}")

@@ -77,30 +77,21 @@ DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_com
 # ---------------------------------------------------------------------------
 # LW-twiddle experiment (lw_twiddle branch, pretrain-only)
 #
-# Fixed 1:2 policy:value LW through warmup. After warmup, track EMAs of the
-# raw (unweighted) per-epoch CEs and every LW_RECOMPUTE_EVERY epochs solve
-# A = policy_ce_hat / value_ce_hat, then oscillate value_LW = A*(1+f*sin)
-# and policy_LW = 1-f*sin so that, before rescaling, policy_LW*policy_ce_hat
-# + value_LW*value_ce_hat stays fixed at 2*policy_ce_hat (the 1:1-balanced
-# total) throughout the cycle. After LW_N_PERIODS full periods it settles to
-# policy_LW=1, value_LW=A, still recomputed on the same cadence.
-#
-# Both LWs are then rescaled by a single factor so the weighted total
-# matches LW_TARGET_VALUE_MULT*value_ce_hat + LW_TARGET_POLICY_MULT*
-# policy_ce_hat instead of sitting at the oscillation's own 2*policy_ce_hat
-# scale -- the twiddle/settle *shape* is unchanged, only the overall
-# magnitude is pulled to match the old fixed 4:1-on-raw-CE scheme.
+# Twiddling/oscillation paused for now -- fixed 1:2 policy:value shape
+# throughout (policy_ce + 2*value_ce, same ratio warmup already uses), no
+# adaptive A, no sin cycle. After warmup, track EMAs of the raw per-epoch
+# CEs and every LW_RECOMPUTE_EVERY epochs rescale that fixed-shape pair by a
+# single factor so the weighted total matches LW_TARGET_VALUE_MULT*
+# value_ce_hat + LW_TARGET_POLICY_MULT*policy_ce_hat -- i.e. policy_ce +
+# 2*value_ce, upweighted to the magnitude of policy_ce + 4*value_ce.
 # ---------------------------------------------------------------------------
 LW_WARMUP_POLICY   = 1.0
-LW_WARMUP_VALUE    = 2.0
+LW_WARMUP_VALUE    = 1.5
 
 LW_EMA_SPAN_EPOCHS = 20             # 400 steps / 20 steps-per-epoch
 LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
 
 LW_RECOMPUTE_EVERY = 10             # epochs between LW recomputes (200 steps)
-LW_PERIOD_EPOCHS   = 600            # one oscillation period (12000 steps)
-LW_N_PERIODS       = 10             # periods before settling to steady balance
-LW_F               = 0.5            # oscillation depth, fraction of A
 
 LW_TARGET_VALUE_MULT  = 4.0         # target total = this*value_ce_hat
 LW_TARGET_POLICY_MULT = 1.0         #              + this*policy_ce_hat
@@ -110,57 +101,28 @@ def lw_ema_update(ema, raw):
     return raw if ema is None else (1.0 - LW_EMA_ALPHA) * ema + LW_EMA_ALPHA * raw
 
 
-def lw_cycle_position(ep):
-    """
-    Live sin-cycle position for epoch `ep`, independent of LW_RECOMPUTE_EVERY
-    -- lets the logs show where we are in the cycle every epoch, not just on
-    recompute epochs. Returns (phase, pct_through_period, sin_theta); the
-    last two are None during warmup or after settling to steady.
-    """
-    if ep < LR_WARMUP_EPOCHS:
-        return "warmup", None, None
-    osc_ep = ep - LR_WARMUP_EPOCHS
-    if osc_ep >= LW_PERIOD_EPOCHS * LW_N_PERIODS:
-        return "steady", None, None
-    period_idx   = osc_ep // LW_PERIOD_EPOCHS + 1
-    pos_in_period = osc_ep % LW_PERIOD_EPOCHS
-    theta = pos_in_period * (2 * math.pi / LW_PERIOD_EPOCHS)
-    pct = 100.0 * pos_in_period / LW_PERIOD_EPOCHS
-    return f"period {period_idx}/{LW_N_PERIODS}", pct, math.sin(theta)
-
-
 def lw_for_epoch(ep, policy_ce_hat, value_ce_hat, active):
     """
-    Return (policy_lw, value_lw, A, phase, scale, recomputed). `active` is
-    the dict of values carried over from the last recompute; passed through
-    unchanged on non-recompute epochs.
+    Return (policy_lw, value_lw, scale, recomputed). `active` is the dict of
+    values carried over from the last recompute; passed through unchanged
+    on non-recompute epochs. Fixed 1:2 shape, rescaled to the target total.
     """
     if ep < LR_WARMUP_EPOCHS:
-        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, "warmup", None, False
+        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, False
 
     osc_ep = ep - LR_WARMUP_EPOCHS
     if osc_ep % LW_RECOMPUTE_EVERY != 0:
-        return (active["policy_lw"], active["value_lw"], active["A"],
-                active["phase"], active["scale"], False)
+        return active["policy_lw"], active["value_lw"], active["scale"], False
 
-    A = policy_ce_hat / value_ce_hat
-    phase, _, sin_theta = lw_cycle_position(ep)
-    if sin_theta is not None:
-        value_lw  = A * (1.0 + LW_F * sin_theta)
-        policy_lw = 1.0 - LW_F * sin_theta
-    else:
-        value_lw  = A
-        policy_lw = 1.0
-
-    current_total = policy_lw * policy_ce_hat + value_lw * value_ce_hat  # == 2*policy_ce_hat
+    current_total = LW_WARMUP_POLICY * policy_ce_hat + LW_WARMUP_VALUE * value_ce_hat
     target_total = (
         LW_TARGET_VALUE_MULT * value_ce_hat + LW_TARGET_POLICY_MULT * policy_ce_hat
     )
     scale = target_total / current_total
-    policy_lw *= scale
-    value_lw  *= scale
+    policy_lw = scale * LW_WARMUP_POLICY
+    value_lw  = scale * LW_WARMUP_VALUE
 
-    return policy_lw, value_lw, A, phase, scale, True
+    return policy_lw, value_lw, scale, True
 
 
 # Shared schema for the unified eval_progress.csv. The first 15 are selfplay's
@@ -563,21 +525,18 @@ def worker_main(wargs: dict) -> None:
         active_lw = {
             "policy_lw": lw_state["policy_lw"],
             "value_lw":  lw_state["value_lw"],
-            "A":         lw_state["A"],
-            "phase":     lw_state["phase"],
-            "scale":     lw_state["scale"],
+            "scale":     lw_state.get("scale"),
         }
         print(
             f"[worker] restored LW state: policy_ce_hat={policy_ce_hat:.3f}  "
-            f"value_ce_hat={value_ce_hat:.3f}  A={active_lw['A']}  "
-            f"phase={active_lw['phase']}"
+            f"value_ce_hat={value_ce_hat:.3f}  scale={active_lw['scale']}"
         )
     else:
         policy_ce_hat: float | None = None
         value_ce_hat: float | None = None
         active_lw = {
             "policy_lw": LW_WARMUP_POLICY, "value_lw": LW_WARMUP_VALUE,
-            "A": None, "phase": "warmup", "scale": None,
+            "scale": None,
         }
         if start_epoch > LR_WARMUP_EPOCHS:
             print(
@@ -626,12 +585,9 @@ def worker_main(wargs: dict) -> None:
         bundle = prefetcher.get()
         t_fetch += time.time() - t0
 
-        policy_lw, value_lw, A, phase, scale, recomputed = lw_for_epoch(
+        policy_lw, value_lw, scale, recomputed = lw_for_epoch(
             ep, policy_ce_hat, value_ce_hat, active_lw)
-        active_lw = {
-            "policy_lw": policy_lw, "value_lw": value_lw, "A": A,
-            "phase": phase, "scale": scale,
-        }
+        active_lw = {"policy_lw": policy_lw, "value_lw": value_lw, "scale": scale}
         lw = {"policy_logits": policy_lw, "value_out": value_lw}
 
         t0 = time.time()
@@ -667,14 +623,8 @@ def worker_main(wargs: dict) -> None:
             f"A = {live_A:.2f}"
         )
         if recomputed:
-            _, cycle_pct, cycle_sin = lw_cycle_position(ep)
-            cycle_str = (
-                f"{cycle_pct:5.1f}% through  sin(theta) = {cycle_sin:+.3f}"
-                if cycle_sin is not None else "n/a"
-            )
             print(
-                f"[lw-twiddle RECOMPUTE] phase={phase}  {cycle_str}  "
-                f"A: {A:.2f}  scale: {scale:.3f}  "
+                f"[lw-fixed RECOMPUTE] scale: {scale:.3f}  "
                 f"new LW: policy={policy_lw:.3f}  value={value_lw:.3f}"
             )
             print()
@@ -693,8 +643,6 @@ def worker_main(wargs: dict) -> None:
                 "value_ce_hat":  value_ce_hat,
                 "policy_lw":     active_lw["policy_lw"],
                 "value_lw":      active_lw["value_lw"],
-                "A":             active_lw["A"],
-                "phase":         active_lw["phase"],
                 "scale":         active_lw["scale"],
             }
             save_pt_ckpt(model, opt, scaler, ep, name, cp, lw_state=lw_state)

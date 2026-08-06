@@ -81,7 +81,7 @@ VARIANTS: dict[str, dict] = {
         ff_dim=1024, num_heads=8, xc0h_K=6,
     ),
     "precond-mha-10c6t-d256": dict(
-        conv_filters=256, dropout=0.03, pre_blocks=10, tx_blocks=6,
+        conv_filters=256, dropout=0.01, pre_blocks=10, tx_blocks=6,
         ff_dim=1024, num_heads=8, xc0h_K=6,
     ),
     "precond-mha-8c8t-d256": dict(

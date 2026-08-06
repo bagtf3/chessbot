@@ -86,7 +86,7 @@ DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_com
 # 2*value_ce, upweighted to the magnitude of policy_ce + 4*value_ce.
 # ---------------------------------------------------------------------------
 LW_WARMUP_POLICY   = 1.0
-LW_WARMUP_VALUE    = 1.5
+LW_WARMUP_VALUE    = 2.0
 
 LW_EMA_SPAN_EPOCHS = 20             # 400 steps / 20 steps-per-epoch
 LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS

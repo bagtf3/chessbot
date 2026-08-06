@@ -1314,8 +1314,20 @@ class Rescorer(object):
             }
 
             if want_legal_stats:
-                legal_mask = np.array(g['pol_mask'], dtype=np.float32) > 0
-                out['mass_on_legal'] = float(np.mean((pred_probs * legal_mask).sum(axis=1)))
+                # SEED_SOURCE records (bootstrap-seeded primary/remaining_untrained,
+                # written by seed_selfplay_buffers) carry mask=None -- exclude
+                # those rows from mass_on_legal rather than let a mixed
+                # None/array list blow up np.array with an inhomogeneous shape.
+                has_mask = np.array([m is not None for m in g['pol_mask']])
+                if has_mask.any():
+                    legal_mask = np.array(
+                        [m for m in g['pol_mask'] if m is not None], dtype=np.float32
+                    ) > 0
+                    out['mass_on_legal'] = float(
+                        np.mean((pred_probs[has_mask] * legal_mask).sum(axis=1))
+                    )
+                else:
+                    out['mass_on_legal'] = float('nan')
                 # model's own confidence -- kept for both groups for code sanitation
                 # even though it's the same measurement type in each file
                 out['avg_top_prob'] = float(np.mean(pred_probs.max(axis=1)))

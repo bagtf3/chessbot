@@ -21,6 +21,49 @@ FALLBACK_ARCH = "13m-precond-conformer"
 # Remove once retrain moves to the tfrec + async EpochBuffer streamer.
 VRAM_CHUNK = 5120
 
+# Dynamic LW: mirrors the pretrain LW-twiddle recipe (bootstrap_model_async_
+# tfrec_pt.py). Fixed 1:2 policy:value shape, rescaled every retrain cycle by
+# an EMA of the raw per-cycle CEs so the weighted total matches
+# RETRAIN_LW_TARGET_POLICY_MULT*policy_ce_hat + RETRAIN_LW_TARGET_VALUE_MULT*
+# value_ce_hat. Each retrain cycle already spans a full pass over a large,
+# variable-sized batch of records (not a fixed 20-step epoch like pretrain),
+# so instead of a fixed per-call alpha, the EMA weight is derived from step
+# count: pretrain's span is LW_EMA_SPAN_EPOCHS(20)*PT_STEPS_PER_EPOCH(20) =
+# 400 steps at batch=512 (matches cfg.retrain_batch_size), so a retrain cycle
+# that runs `steps` steps carries alpha = steps / RETRAIN_LW_EMA_SPAN_STEPS,
+# capped at 1 -- same steps-of-memory invariant, regardless of cycle size.
+RETRAIN_LW_BASE_POLICY        = 1.0
+RETRAIN_LW_BASE_VALUE         = 2.0
+RETRAIN_LW_TARGET_POLICY_MULT = 1.0
+RETRAIN_LW_TARGET_VALUE_MULT  = 4.0
+RETRAIN_LW_EMA_SPAN_STEPS     = 400
+
+
+def retrain_lw_state_path(model_path: str, run_dir: str) -> str:
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(run_dir, "train_ckpts", stem + "_lw_state.pt")
+
+
+def retrain_lw_ema_update(ema, raw, steps: int):
+    if ema is None:
+        return raw
+    alpha = min(1.0, steps / RETRAIN_LW_EMA_SPAN_STEPS)
+    return (1.0 - alpha) * ema + alpha * raw
+
+
+def retrain_lw_from_state(lw_state: dict):
+    policy_ce_hat = lw_state.get("policy_ce_hat")
+    value_ce_hat  = lw_state.get("value_ce_hat")
+    if policy_ce_hat is None or value_ce_hat is None:
+        return RETRAIN_LW_BASE_POLICY, RETRAIN_LW_BASE_VALUE
+    current_total = RETRAIN_LW_BASE_POLICY * policy_ce_hat + RETRAIN_LW_BASE_VALUE * value_ce_hat
+    target_total = (
+        RETRAIN_LW_TARGET_POLICY_MULT * policy_ce_hat
+        + RETRAIN_LW_TARGET_VALUE_MULT * value_ce_hat
+    )
+    scale = target_total / current_total
+    return scale * RETRAIN_LW_BASE_POLICY, scale * RETRAIN_LW_BASE_VALUE
+
 
 def shorten_path(p):
     parts = p.replace("\\", "/").split("/")
@@ -225,6 +268,17 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     else:
         print(f"{tag} no prior Adam state - starting fresh")
 
+    lw_state_path = retrain_lw_state_path(model_path, cfg.run_dir)
+    if os.path.exists(lw_state_path):
+        lw_state = torch.load(lw_state_path, map_location="cpu")
+        print(f"{tag} restored LW state: policy_ce_hat={lw_state.get('policy_ce_hat')}  "
+              f"value_ce_hat={lw_state.get('value_ce_hat')}")
+    else:
+        lw_state = {"policy_ce_hat": None, "value_ce_hat": None}
+        print(f"{tag} no prior LW state - starting fresh")
+    policy_lw, value_lw = retrain_lw_from_state(lw_state)
+    print(f"{tag} dynamic LW: policy={policy_lw:.3f}  value={value_lw:.3f}")
+
     from torch.amp import autocast, GradScaler
     scaler = GradScaler("cuda")
 
@@ -275,7 +329,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     log_wdl    = F.log_softmax(value_out, dim=-1)
                     value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
 
-                    loss = cfg.policy_loss_weight * policy_loss + cfg.value_loss_weight * value_loss
+                    loss = policy_lw * policy_loss + value_lw * value_loss
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -344,6 +398,15 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
     torch.save(opt.state_dict(), opt_state_path)
+
+    cycle_steps = epoch_grad_stats[-1]['gn_steps']
+    lw_state["policy_ce_hat"] = retrain_lw_ema_update(
+        lw_state["policy_ce_hat"], epoch_losses[-1]['policy'], cycle_steps)
+    lw_state["value_ce_hat"] = retrain_lw_ema_update(
+        lw_state["value_ce_hat"], epoch_losses[-1]['value'], cycle_steps)
+    torch.save(lw_state, lw_state_path)
+    print(f"{tag} LW state updated: policy_ce_hat={lw_state['policy_ce_hat']:.3f}  "
+          f"value_ce_hat={lw_state['value_ce_hat']:.3f}  (cycle_steps={cycle_steps})")
 
     t0 = time.time()
     if model_path.endswith(".ts"):

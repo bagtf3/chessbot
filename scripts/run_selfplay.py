@@ -238,7 +238,26 @@ def close_proc(p):
         pass
 
 
-def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
+def log_worker_death(w, crash_log_path=None):
+    """Unexpected exit (we never asked this worker to stop): log id, exit
+    code, and a timestamp. On Windows a segfault/access-violation shows up
+    as a large negative exitcode (e.g. -1073741819 == 0xC0000005) rather
+    than a Python traceback, since a native crash never reaches the
+    interpreter -- this is the only signal available for that case."""
+    p = w["p"]
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] worker {w['id']} died unexpectedly, exitcode={p.exitcode}"
+    print(f"[worker-death] {line}")
+    if crash_log_path:
+        try:
+            with open(crash_log_path, "a") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"[worker-death] failed to write crash log: {e}")
+
+
+def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0,
+                          crash_log_path=None):
     """
     - If a proc exited: join + close + remove from list.
     - If request_stop: set stop_ev once.
@@ -253,6 +272,8 @@ def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0):
 
         if not p.is_alive():
             p.join(timeout=0)
+            if w["stop_sent_at"] is None:
+                log_worker_death(w, crash_log_path)
             close_proc(p)
             continue
 
@@ -539,7 +560,10 @@ def main(run_tag):
 
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
-            procs = check_and_reap_procs(procs)
+            procs = check_and_reap_procs(
+                procs,
+                crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
+            )
             while len(procs):
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
@@ -597,7 +621,10 @@ def main(run_tag):
                     print(f"[cmd] saved {len(data)} samples to training_snapshot_{ts}.pkl")
 
                 # check for finished procs
-                procs = check_and_reap_procs(procs)
+                procs = check_and_reap_procs(
+                    procs,
+                    crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
+                )
 
                 # break if no workers and backlog is small enough to carry into next round
                 if not procs and len(finished_games) < MAX_BACKLOG:

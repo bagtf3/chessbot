@@ -49,10 +49,15 @@ from chessbot.pretrain import (
     save_plot,
 )
 
-from chessbot.replay_buffer import new_shard_path, write_pkl_gz_shard, SEED_SOURCE
+from chessbot.replay_buffer import (
+    new_shard_path, write_pkl_gz_shard, SEED_SOURCE,
+    PRIMARY_SEED_SHARDS, REPLAY_SEED_SHARDS,
+)
 
-SEED_REPLAY_SHARDS   = 64
-SEED_PRIMARY_SHARDS  = 24
+# buffer fill sizes live in replay_buffer so the seeder and the selfplay loop
+# cannot drift apart
+SEED_REPLAY_SHARDS   = REPLAY_SEED_SHARDS
+SEED_PRIMARY_SHARDS  = PRIMARY_SEED_SHARDS
 SEED_REMAINING_SHARDS = 8
 
 from chessbot.model import VARIANTS, PT_BUILDERS

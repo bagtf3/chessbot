@@ -18,7 +18,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
-    calc_entropy,
+    calc_entropy, batch_policy_metrics,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from chessbot.replay_buffer import LiveBuffer, SEED_SOURCE
@@ -26,8 +26,33 @@ from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
 ANALYZE_PKL = "analyze_results_combined.pkl"
+PRETRAIN_CONTINUED_CSV = "eval_progress_pretrain_continued.csv"
+# pretraining validated every 20 epochs; the continued file keeps that step
+PRETRAIN_EPOCH_STEP = 20
+# a ply losing more than this many centipawns counts as a blunder for the
+# L<n> rate in the rescore stats line
+BLUNDER_CP = 30
+# rolling stat window, in push_analyzed chunks (30 games each)
+RECENT_WINDOW = 100
 C = 0.9699
 D = d = np.arctanh(0.5)
+
+# Validation provenance buckets. seaborn "deep" blue/orange/green, keyed by
+# name so a source that is absent this round leaves the others' colors alone.
+SOURCE_COLORS = {'xc0': '#4C72B0', 'lc0': '#DD8452', 'historic': '#55A868'}
+SOURCE_ORDER = ('xc0', 'lc0', 'historic')
+
+
+def plot_source(source):
+    """Collapse a record's provenance tag to a plot bucket. SEED_SOURCE and
+    the untagged tfrec.gz records are both pretrain-distribution data, so both
+    read as historic; the lc0_pv/lc0_blunder/lc0_enrich split survives only in
+    the print_sample_stats counters."""
+    if source is None or source == SEED_SOURCE:
+        return 'historic'
+    if source.startswith('lc0'):
+        return 'lc0'
+    return 'xc0'
 
 
 class Lc0Thread:
@@ -238,6 +263,7 @@ class Rescorer(object):
         self.n_saved = 0
         self.total_cpl_plies = 0.0
         self.total_bmr_plies = 0.0
+        self.total_blunder_plies = 0.0
         self.total_kl_plies = 0.0
         self.total_ce_plies = 0.0
         self.total_plies = 0
@@ -251,13 +277,14 @@ class Rescorer(object):
         self.sf_rerun_count = 0
         self.n_sf_threads = cfg.rescore_n_sf_threads
         self.current_depth = cfg.rescore_depth
-        self.last_10_cpls = []
-        self.last_10_bmrs = []
-        self.last_10_kls = []
-        self.last_10_ces = []
-        self.last_10_plies = []
-        self.last_10_kl_plies = []
-        self.last_10_ce_plies = []
+        self.recent_cpls = []
+        self.recent_bmrs = []
+        self.recent_blunders = []
+        self.recent_kls = []
+        self.recent_ces = []
+        self.recent_plies = []
+        self.recent_kl_plies = []
+        self.recent_ce_plies = []
 
         zero_collar = lambda: {
             'games': 0, 'triggers': 0, 'positions': 0,
@@ -330,6 +357,7 @@ class Rescorer(object):
             'n_saved': self.n_saved,
             'total_cpl_plies': self.total_cpl_plies,
             'total_bmr_plies': self.total_bmr_plies,
+            'total_blunder_plies': self.total_blunder_plies,
             'total_kl_plies': self.total_kl_plies,
             'total_ce_plies': self.total_ce_plies,
             'total_plies': self.total_plies,
@@ -340,13 +368,14 @@ class Rescorer(object):
             'sf_compute_count': self.sf_compute_count,
             'sf_call_count': self.sf_call_count,
             'sf_rerun_count': self.sf_rerun_count,
-            'last_10_cpls': self.last_10_cpls,
-            'last_10_bmrs': self.last_10_bmrs,
-            'last_10_kls': self.last_10_kls,
-            'last_10_ces': self.last_10_ces,
-            'last_10_plies': self.last_10_plies,
-            'last_10_kl_plies': self.last_10_kl_plies,
-            'last_10_ce_plies': self.last_10_ce_plies,
+            'recent_cpls': self.recent_cpls,
+            'recent_bmrs': self.recent_bmrs,
+            'recent_blunders': self.recent_blunders,
+            'recent_kls': self.recent_kls,
+            'recent_ces': self.recent_ces,
+            'recent_plies': self.recent_plies,
+            'recent_kl_plies': self.recent_kl_plies,
+            'recent_ce_plies': self.recent_ce_plies,
             'collar_total': self.collar_total,
             'collar_window': self.collar_window,
             'collar_history': self.collar_history,
@@ -374,6 +403,12 @@ class Rescorer(object):
             if k == 'live_buffer_records':
                 self.live_buffer.records = v
                 continue
+            # rolling stat windows were last_10_* back when they only held 10
+            # entries; they now hold RECENT_WINDOW. Map the old keys across so
+            # a state pickle written before the rename keeps its history
+            # instead of silently restarting the window.
+            if k.startswith('last_10_'):
+                k = 'recent_' + k[len('last_10_'):]
             setattr(self, k, v)
 
     def __enter__(self):
@@ -1221,56 +1256,46 @@ class Rescorer(object):
             'lc0_blunder': 0, 'lc0_inacc': 0, 'lc0_pv': 0, 'lc0_enrich': 0,
         }
 
-    def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path, validate_lc0=False):
+    def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path,
+                          train_stats=None):
+        """train_stats: {'train_loss': ..., 'gn_mean': ...} from the retrain
+        that just finished. Validation is measured on the model going INTO
+        that retrain, matching how pretraining pairs an eval with the loss of
+        the epoch it belongs to."""
         if not os.path.exists(pred_pkl_path):
             print(f"[metrics] pred pkl not found, skipping: {pred_pkl_path}")
             return
 
         with open(pred_pkl_path, 'rb') as f:
-            payload = pickle.load(f)  # {"samples": [...], "preds": [(pred_wdl, pred_pol_logits)]}
+            payload = pickle.load(f)
 
-        samples = payload["samples"]
-        preds = payload["preds"]
+        eps = 1e-7
 
-        if not samples:
+        def build_group(stream):
+            g = {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [],
+                 'pol_mask': [], 'source': []}
+            samples = stream["samples"]
+            preds = stream["preds"]
+            if len(samples) != len(preds):
+                raise RuntimeError(
+                    f"sample/pred count mismatch: {len(samples)} vs {len(preds)}")
+            for (pred_wdl, pred_pol), sample in zip(preds, samples):
+                g['wdl_pred'].append(pred_wdl)
+                g['wdl_true'].append(np.array(sample[3], dtype=np.float64))
+                g['pol_pred'].append(pred_pol)
+                g['pol_true'].append(np.array(sample[2], dtype=np.float64))
+                g['pol_mask'].append(sample[1])
+                g['source'].append(sample[6] if len(sample) > 6 else 'xc0')
+            return g
+
+        primary = build_group(payload["primary"])
+        historic = build_group(payload["historic"])
+
+        if not primary['wdl_pred'] and not historic['wdl_pred']:
             print("[metrics] no samples in pred pkl, skipping")
             return
 
-        if len(samples) != len(preds):
-            print(f"[metrics] sample/pred count mismatch: {len(samples)} vs {len(preds)}, skipping")
-            return
-
-        eps = 1e-7
-        group_names = (
-            'xc0_vs_true', 'xc0_vs_lc0',
-        )
-        groups = {k: {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [], 'pol_mask': []}
-                  for k in group_names}
-
-        for (pred_wdl, pred_pol), sample in zip(preds, samples):
-            true_wdl = np.array(sample[3], dtype=np.float64)
-            true_pol = np.array(sample[2], dtype=np.float64)
-            source = sample[6] if len(sample) > 6 else 'xc0'
-
-            # historic_seeded is xc0-quality data (held-out pretrain positions),
-            # not lc0 distillation output -- folded into "true", never shown
-            # separately and never counted as lc0.
-            if source in ('xc0', SEED_SOURCE):
-                grp_keys = ['xc0_vs_true']
-            elif validate_lc0:
-                grp_keys = ['xc0_vs_lc0']
-            else:
-                grp_keys = []
-
-            for grp in grp_keys:
-                g = groups[grp]
-                g['wdl_pred'].append(pred_wdl)
-                g['wdl_true'].append(true_wdl)
-                g['pol_pred'].append(pred_pol)
-                g['pol_true'].append(true_pol)
-                g['pol_mask'].append(sample[1])
-
-        def metrics_block(g, want_legal_stats=False):
+        def metrics_block(g):
             if not g['wdl_pred']:
                 return None
             pp = np.array(g['wdl_pred'], dtype=np.float64)
@@ -1281,71 +1306,36 @@ class Rescorer(object):
             # scalar value for correlation: expected score from WDL
             pred_v = pp[:, 0] - pp[:, 2]
             true_v = pt[:, 0] - pt[:, 2]
-            ce = float(-np.mean(np.sum(pt * np.log(pp), axis=1)))
-            mse = float(np.mean((pred_v - true_v) ** 2))
-            corr = float(np.corrcoef(pred_v, true_v)[0, 1]) if len(pred_v) > 1 else 0.0
+            ce = -np.mean(np.sum(pt * np.log(pp), axis=1))
+            mse = np.mean((pred_v - true_v) ** 2)
+            corr = np.corrcoef(pred_v, true_v)[0, 1] if len(pred_v) > 1 else 0.0
 
             logits = np.array(g['pol_pred'], dtype=np.float32)
             true_p = np.array(g['pol_true'], dtype=np.float32)
-            logits_max = logits.max(axis=1, keepdims=True)
-            exp_l = np.exp(logits - logits_max)
-            pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
 
-            safe_t = np.clip(true_p, 1e-9, None)
-            n_moves = (true_p > 0).sum(axis=1, keepdims=True).clip(1)
-            uniform_ce = float(np.mean(np.log(n_moves.squeeze())))
-            pol_ce = float(-np.mean(np.sum(safe_t * np.log(np.clip(pred_probs, 1e-9, None)), axis=1)))
-            pol_ce_gain = uniform_ce - pol_ce
-
-            top1_true = np.argmax(true_p, axis=1)
-            top1_pred = np.argmax(pred_probs, axis=1)
-            top1_exact = float(np.mean(top1_true == top1_pred))
-
-            def topk_mass(k):
-                idx = np.argsort(true_p, axis=1)[:, -k:]
-                return float(np.mean(pred_probs[np.arange(len(pred_probs))[:, None], idx].sum(axis=1)))
-
-            out = {
-                'ce': ce, 'mse': mse, 'corr': corr,
-                'pol_ce': pol_ce, 'uniform_ce': uniform_ce, 'pol_ce_gain': pol_ce_gain,
-                'top1_exact': top1_exact,
-                'top1_mass': topk_mass(1), 'top3_mass': topk_mass(3), 'top5_mass': topk_mass(5),
-                'n': len(g['wdl_pred']),
-            }
-
-            if want_legal_stats:
-                # SEED_SOURCE records (bootstrap-seeded primary/remaining_untrained,
-                # written by seed_selfplay_buffers) carry mask=None -- exclude
-                # those rows from mass_on_legal rather than let a mixed
-                # None/array list blow up np.array with an inhomogeneous shape.
-                has_mask = np.array([m is not None for m in g['pol_mask']])
-                if has_mask.any():
-                    legal_mask = np.array(
-                        [m for m in g['pol_mask'] if m is not None], dtype=np.float32
-                    ) > 0
-                    out['mass_on_legal'] = float(
-                        np.mean((pred_probs[has_mask] * legal_mask).sum(axis=1))
-                    )
-                else:
-                    out['mass_on_legal'] = float('nan')
-                # model's own confidence -- kept for both groups for code sanitation
-                # even though it's the same measurement type in each file
-                out['avg_top_prob'] = float(np.mean(pred_probs.max(axis=1)))
-                # mass on the #1 entry of the TARGET distribution -- xc0 search
-                # visits for xc0_vs_true, lc0's own output for xc0_vs_lc0
-                out['avg_top_prob_target'] = float(np.mean(true_p.max(axis=1)))
+            # Same function pretraining validates with, on the same
+            # target-support mask it uses (bootstrap's mstack = pstack > 0),
+            # so every policy column lines up across the pretrain/selfplay
+            # seam instead of being a lookalike reimplementation.
+            support = (true_p > 0).astype(np.int32)
+            out = batch_policy_metrics(logits, true_p, support)
+            out.update({'ce': ce, 'mse': mse, 'corr': corr,
+                        'n': len(g['wdl_pred'])})
+            # mass on the #1 entry of the TARGET distribution -- whichever
+            # source produced the record (xc0 visits, lc0 output, historic)
+            out['avg_top_prob_target'] = np.mean(true_p.max(axis=1))
 
             return out
 
-        xb  = metrics_block(groups['xc0_vs_true'], want_legal_stats=True)
-        lb  = metrics_block(groups['xc0_vs_lc0'], want_legal_stats=True)
+        pb = metrics_block(primary)
+        hb = metrics_block(historic)
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
 
         def wdl_line(b):
             return (f"CE={b['ce']:.3f}  MSE={b['mse']:.3f}  "
-                    f"corr={b['corr']:.2f}  CE_gain={b['pol_ce_gain']:.2f}  n={b['n']}")
+                    f"corr={b['corr']:.2f}  CE_gain={b['ce_gain']:.2f}  n={b['n']}")
 
         def pol_line(b):
             return (f"top1_exact={b['top1_exact']:.2f}  "
@@ -1356,167 +1346,201 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(xb, 'true')]
-        if validate_lc0:
-            slices.append((lb, 'lc0 all'))
+        slices = [(pb, 'primary'), (hb, 'historic')]
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:
             print_slice(b, label, pol_line)
 
-        def save_csv(path, label, b):
-            if not b:
-                return
-            row = {'model_epoch': epoch}
-            for k, v in b.items():
-                row[f'{label}_{k}'] = round(v, 4)
-            row_df = pd.DataFrame([row])
-            if os.path.exists(path):
-                all_df = pd.concat([pd.read_csv(path), row_df], ignore_index=True)
-            else:
-                all_df = row_df
-            all_df.round(4).to_csv(path, index=False)
-
-        vs_true_col_map = {
+        # internal key -> csv column. Names match the pretraining schema
+        # (bootstrap's UNIFIED_COLS) so both files stack on the same axes.
+        col_map = {
             'mse': 'value_mse', 'corr': 'value_corr', 'ce': 'value_ce',
-            'pol_ce': 'policy_ce', 'uniform_ce': 'uniform_ce', 'pol_ce_gain': 'ce_gain',
+            'policy_ce': 'policy_ce', 'uniform_ce': 'uniform_ce', 'ce_gain': 'ce_gain',
             'top1_exact': 'top1_exact',
             'top1_mass': 'top1_mass', 'top3_mass': 'top3_mass', 'top5_mass': 'top5_mass',
             'n': 'n_samples',
             'mass_on_legal': 'mass_on_legal',
             'avg_top_prob': 'avg_top_prob',
             'avg_top_prob_target': 'avg_top_prob_target',
+            'exp_prob_model': 'exp_prob_model',
+            'exp_prob_uniform': 'exp_prob_uniform',
+            'prob_on_others': 'prob_on_others',
         }
-        if xb:
-            row = {'model_epoch': epoch}
-            for k, col in vs_true_col_map.items():
-                if k in xb:
-                    row[col] = round(xb[k], 4)
-            row_df = pd.DataFrame([row])
-            if os.path.exists(progress_csv_path):
-                all_df = pd.concat([pd.read_csv(progress_csv_path), row_df], ignore_index=True)
-            else:
-                all_df = row_df
-            all_df.round(4).to_csv(progress_csv_path, index=False)
-        if validate_lc0:
-            lc0_csv = os.path.join(os.path.dirname(progress_csv_path), 'eval_progress_vs_lc0.csv')
-            save_csv(lc0_csv, 'xc0_vs_lc0', lb)
-        print(f"{pfx} saved to {os.path.basename(progress_csv_path)}")
 
-        self.save_validation_plots(epoch, os.path.dirname(progress_csv_path), groups)
+        def save_csv(path, b, row_epoch):
+            if not b:
+                return
+            row = {'model_epoch': row_epoch}
+            for k, col in col_map.items():
+                if k in b:
+                    row[col] = round(b[k], 4)
+            if train_stats:
+                row.update(train_stats)
 
-    def save_validation_plots(self, epoch, run_dir, groups):
+            if not os.path.exists(path):
+                pd.DataFrame([row]).round(4).to_csv(path, index=False)
+                return
+
+            # positional append rather than concat: a one-row frame whose
+            # pretrain-only columns are all-NA is exactly the case pandas
+            # deprecated the dtype inference for, and it warned every retrain.
+            all_df = pd.read_csv(path)
+            cols = list(dict.fromkeys(list(all_df.columns) + list(row)))
+            all_df = all_df.reindex(columns=cols)
+            all_df.loc[len(all_df)] = [row.get(c, np.nan) for c in cols]
+            all_df.round(4).to_csv(path, index=False)
+
+        run_dir = os.path.dirname(progress_csv_path)
+        historic_csv = os.path.join(run_dir, PRETRAIN_CONTINUED_CSV)
+        save_csv(progress_csv_path, pb, epoch)
+        # the historic stream continues pretraining's own epoch axis, which
+        # advanced 20 at a time -- keep stepping by 20 rather than switching
+        # to the retrain counter, so the two halves of the curve share a scale
+        save_csv(historic_csv, hb, next_pretrain_epoch(historic_csv))
+        print(f"{pfx} saved to {os.path.basename(progress_csv_path)} "
+              f"+ {PRETRAIN_CONTINUED_CSV}")
+
+        combined = {k: primary[k] + historic[k] for k in primary}
+        self.save_validation_plots(
+            epoch, os.path.join(run_dir, 'validation_latest.png'), combined)
+
+    def save_validation_plots(self, epoch, out_path, g):
+        """Single 5-panel figure over the combined primary + historic
+        validation draw, split by provenance wherever a split is meaningful."""
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+
+        if not g['wdl_pred']:
+            return
 
         sqrt3_2 = np.sqrt(3) / 2
         max_scatter = 5000
         eps = 1e-9
 
-        def plot_group(g, label, out_path):
-            if not g['wdl_pred']:
-                return
-            pp = np.array(g['wdl_pred'], dtype=np.float64)
-            pt = np.array(g['wdl_true'], dtype=np.float64)
-            pp = np.clip(pp, eps, 1.0)
-            pp /= pp.sum(axis=1, keepdims=True)
+        pp = np.clip(np.array(g['wdl_pred'], dtype=np.float64), eps, 1.0)
+        pp /= pp.sum(axis=1, keepdims=True)
+        pt = np.array(g['wdl_true'], dtype=np.float64)
+        src = np.array([plot_source(s) for s in g['source']])
 
-            pred_v = pp[:, 0] - pp[:, 2]
-            true_v = pt[:, 0] - pt[:, 2]
-            per_ce = -np.sum(pt * np.log(np.clip(pp, eps, 1.0)), axis=1)
-            mean_ce = float(np.mean(per_ce))
-            mse = float(np.mean((pred_v - true_v) ** 2))
-            corr = float(np.corrcoef(pred_v, true_v)[0, 1]) if len(pred_v) > 1 else 0.0
-            wdl_bias = np.mean(pp - pt, axis=0)
-            ce_comp = -np.mean(pt * np.log(np.clip(pp, eps, 1.0)), axis=0)
+        pred_v = pp[:, 0] - pp[:, 2]
+        true_v = pt[:, 0] - pt[:, 2]
+        per_ce = -np.sum(pt * np.log(pp), axis=1)
+        mean_ce = np.mean(per_ce)
+        mse = np.mean((pred_v - true_v) ** 2)
+        corr = np.corrcoef(pred_v, true_v)[0, 1] if len(pred_v) > 1 else 0.0
 
-            logits = np.array(g['pol_pred'], dtype=np.float32)
-            true_p = np.array(g['pol_true'], dtype=np.float32)
-            exp_l = np.exp(logits - logits.max(axis=1, keepdims=True))
-            pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
+        logits = np.array(g['pol_pred'], dtype=np.float32)
+        true_p = np.array(g['pol_true'], dtype=np.float32)
+        exp_l = np.exp(logits - logits.max(axis=1, keepdims=True))
+        pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
 
-            def topk_mass(k):
-                ki = np.argsort(true_p, axis=1)[:, -k:]
-                return float(np.mean(pred_probs[np.arange(len(pred_probs))[:, None], ki].sum(axis=1)))
+        def topk_mass(k, sel):
+            tp, pr = true_p[sel], pred_probs[sel]
+            ki = np.argsort(tp, axis=1)[:, -k:]
+            return np.mean(pr[np.arange(len(pr))[:, None], ki].sum(axis=1))
 
-            n = len(pred_v)
-            idx = np.random.choice(n, min(max_scatter, n), replace=False)
+        present = [s for s in SOURCE_ORDER if (src == s).any()]
+        n = len(pred_v)
+        width = 0.8 / max(len(present), 1)
 
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            fig.suptitle(f"Epoch {epoch}: {label}  n={n}", fontsize=12)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle(f"Epoch {epoch}: validation  n={n}", fontsize=12)
 
-            axes[0, 0].scatter(true_v[idx], pred_v[idx], s=4, alpha=0.3, c='steelblue')
-            axes[0, 0].set_xlabel("target value (W-L)")
-            axes[0, 0].set_ylabel("pred value (W-L)")
-            axes[0, 0].set_title(f"value scatter  MSE={mse:.3f}  r={corr:.3f}")
-
-            masses = [topk_mass(1), topk_mass(3), topk_mass(5)]
-            axes[0, 1].bar(['top1', 'top3', 'top5'], masses,
-                           color=['#4575b4', '#74add1', '#abd9e9'], width=0.5)
-            for i, v in enumerate(masses):
-                axes[0, 1].text(i, v + 0.005, f'{v:.3f}', ha='center', va='bottom', fontsize=9)
-            axes[0, 1].set_ylim(0, 1.0)
-            axes[0, 1].set_title("policy top-k mass")
-
-            tx = 0.5 * pp[idx, 0] + pp[idx, 1]
-            ty = sqrt3_2 * pp[idx, 0]
-            axes[0, 2].plot([0.5, 1.0, 0.0, 0.5], [sqrt3_2, 0.0, 0.0, sqrt3_2], 'k-', lw=0.8)
-            sc = axes[0, 2].scatter(
-                tx, ty, s=4, alpha=0.4,
-                c=per_ce[idx], cmap='RdYlGn_r', vmin=0, vmax=2.0,
-            )
-            cbar = fig.colorbar(sc, ax=axes[0, 2], shrink=0.8)
-            thresholds = np.arange(0, 2.01, 0.25)
-            cdf_vals = [np.mean(per_ce <= t) for t in thresholds]
-            cbar.set_ticks(thresholds)
-            cbar.set_ticklabels([f'{t:.2f}  ({v:.2f})' for t, v in zip(thresholds, cdf_vals)])
-            axes[0, 2].text(0.5, sqrt3_2 + 0.03, 'W', ha='center', va='bottom', fontsize=9)
-            axes[0, 2].text(1.03, -0.03, 'D', ha='left', va='top', fontsize=9)
-            axes[0, 2].text(-0.03, -0.03, 'L', ha='right', va='top', fontsize=9)
-            axes[0, 2].set_aspect('equal')
-            axes[0, 2].axis('off')
-            axes[0, 2].set_title(f'WDL ternary  mean CE={mean_ce:.3f}')
-
-            wdl_labels = ['W', 'D', 'L']
-            wdl_colors = ['#3cb371', '#ffd700', '#ff8c00']
-            bias_vals = wdl_bias.tolist()
-            bias_colors = ['#d73027' if v > 0 else '#4575b4' for v in bias_vals]
-            bars = axes[1, 0].bar(wdl_labels, bias_vals, color=bias_colors, width=0.5)
-            axes[1, 0].axhline(0, color='black', lw=0.8)
-            axes[1, 0].set_ylabel('mean(pred - target)')
-            axes[1, 0].set_title('WDL bias (red=over, blue=under)')
-            for bar, v in zip(bars, bias_vals):
-                axes[1, 0].text(
-                    bar.get_x() + bar.get_width() / 2,
-                    v + (0.001 if v >= 0 else -0.003),
-                    f'{v:+.4f}', ha='center',
-                    va='bottom' if v >= 0 else 'top', fontsize=9,
-                )
-
-            ce_vals = ce_comp.tolist()
-            axes[1, 1].bar(wdl_labels, ce_vals, color=wdl_colors, width=0.5)
-            axes[1, 1].set_ylabel('mean CE contribution (nats)')
-            axes[1, 1].set_title(f'CE by component  total={mean_ce:.3f}')
-            for i, v in enumerate(ce_vals):
-                axes[1, 1].text(i, v + 0.002, f'{v:.4f}', ha='center', va='bottom', fontsize=9)
-
-            axes[1, 2].set_visible(False)
-
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=120)
-            plt.close(fig)
-
-        plot_group(
-            groups['xc0_vs_true'],
-            'xc0_vs_true',
-            os.path.join(run_dir, 'validation_latest.png'),
+        # one shared source legend -- per-axes legends collide with the
+        # rotated bar value labels on the grouped panels
+        fig.legend(
+            handles=[plt.Rectangle((0, 0), 1, 1, color=SOURCE_COLORS[s], label=s)
+                     for s in present],
+            loc='upper right', ncol=len(present), fontsize=9, framealpha=0.9,
         )
-        plot_group(
-            groups['xc0_vs_lc0'],
-            'xc0_vs_lc0',
-            os.path.join(run_dir, 'validation_vs_lc0_latest.png'),
+
+        def grouped(ax, labels, per_source, fmt, title, ylabel, ylim=None):
+            xpos = np.arange(len(labels))
+            span = max(abs(v) for vals in per_source.values() for v in vals) or 1.0
+            pad = span * 0.03
+            for i, s in enumerate(present):
+                off = (i - (len(present) - 1) / 2) * width
+                ax.bar(xpos + off, per_source[s], width=width * 0.9,
+                       color=SOURCE_COLORS[s], label=s)
+                for x, v in zip(xpos + off, per_source[s]):
+                    ax.text(x, v + (pad if v >= 0 else -pad), fmt.format(v),
+                            ha='center', va='bottom' if v >= 0 else 'top',
+                            fontsize=7, rotation=90)
+            ax.set_xticks(xpos)
+            ax.set_xticklabels(labels)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            if ylim is None:
+                ax.margins(y=0.30)
+            else:
+                ax.set_ylim(*ylim)
+
+        # largest source first so it does not paint over the smaller ones
+        per_plot = max_scatter // max(len(present), 1)
+        counts = {s: int((src == s).sum()) for s in present}
+        for s in sorted(present, key=lambda s: -counts[s]):
+            m = np.flatnonzero(src == s)
+            take = np.random.choice(m, min(per_plot, len(m)), replace=False)
+            axes[0, 0].scatter(true_v[take], pred_v[take], s=4, alpha=0.18,
+                               c=SOURCE_COLORS[s])
+        axes[0, 0].set_xlabel("target value (W-L)")
+        axes[0, 0].set_ylabel("pred value (W-L)")
+        axes[0, 0].set_title(f"value scatter  MSE={mse:.3f}  r={corr:.3f}")
+        # drawn largest-first so big sources do not bury small ones, but
+        # legended in canonical order with opaque proxy markers -- the live
+        # handles inherit the scatter alpha and are unreadable at this size
+        axes[0, 0].legend(
+            handles=[plt.Line2D([], [], marker='o', linestyle='', markersize=6,
+                                color=SOURCE_COLORS[s], label=f"{s} (n={counts[s]})")
+                     for s in present],
+            loc='upper left', fontsize=8, framealpha=0.9)
+
+        masses = {s: [topk_mass(k, src == s) for k in (1, 3, 5)] for s in present}
+        grouped(axes[0, 1], ['top1', 'top3', 'top5'], masses, '{:.3f}',
+                'policy top-k mass by source', 'mass', ylim=(0, 1.0))
+
+        idx = np.random.choice(n, min(max_scatter, n), replace=False)
+        tx = 0.5 * pp[idx, 0] + pp[idx, 1]
+        ty = sqrt3_2 * pp[idx, 0]
+        axes[0, 2].plot([0.5, 1.0, 0.0, 0.5], [sqrt3_2, 0.0, 0.0, sqrt3_2], 'k-', lw=0.8)
+        sc = axes[0, 2].scatter(
+            tx, ty, s=4, alpha=0.4,
+            c=per_ce[idx], cmap='RdYlGn_r', vmin=0, vmax=2.0,
         )
+        cbar = fig.colorbar(sc, ax=axes[0, 2], shrink=0.8)
+        thresholds = np.arange(0, 2.01, 0.25)
+        cdf_vals = [np.mean(per_ce <= t) for t in thresholds]
+        cbar.set_ticks(thresholds)
+        cbar.set_ticklabels([f'{t:.2f}  ({v:.2f})' for t, v in zip(thresholds, cdf_vals)])
+        axes[0, 2].text(0.5, sqrt3_2 + 0.03, 'W', ha='center', va='bottom', fontsize=9)
+        axes[0, 2].text(1.03, -0.03, 'D', ha='left', va='top', fontsize=9)
+        axes[0, 2].text(-0.03, -0.03, 'L', ha='right', va='top', fontsize=9)
+        axes[0, 2].set_aspect('equal')
+        axes[0, 2].axis('off')
+        axes[0, 2].set_title(f'WDL ternary  mean CE={mean_ce:.3f}', pad=18)
+
+        wdl_labels = ['W', 'D', 'L']
+        bias = {s: np.mean(pp[src == s] - pt[src == s], axis=0) for s in present}
+        ce_comp = {
+            s: -np.mean(pt[src == s] * np.log(pp[src == s]), axis=0)
+            for s in present
+        }
+
+        grouped(axes[1, 0], wdl_labels, bias, '{:+.4f}',
+                'WDL bias by source', 'mean(pred - target)')
+        axes[1, 0].axhline(0, color='black', lw=0.8)
+
+        grouped(axes[1, 1], wdl_labels, ce_comp, '{:.4f}',
+                f'CE by component  total={mean_ce:.3f}',
+                'mean CE contribution (nats)')
+
+        axes[1, 2].set_visible(False)
+
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
 
     def push_analyzed(self, report=True):
         # safeguard here
@@ -1524,11 +1548,12 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b, kl, ce, plies, kl_n, ce_n = save_analysis_chunk_simple(
+        outp, c, b, kl, ce, plies, kl_n, ce_n, bl = save_analysis_chunk_simple(
             run_dir, self.analyzed_results)
         self.n_saved += 1
         self.total_cpl_plies += c * plies
         self.total_bmr_plies += b * plies
+        self.total_blunder_plies += bl * plies
         self.total_plies += plies
         # kl/ce are undefined (NaN) for batches with no trainable plies
         # (e.g. all-validation rounds) -- weight/accumulate by valid plies
@@ -1540,50 +1565,47 @@ class Rescorer(object):
             self.total_ce_plies += ce * ce_n
             self.total_ce_valid_plies += ce_n
 
-        self.last_10_cpls.append(c)
-        self.last_10_cpls = self.last_10_cpls[-10:]
-        self.last_10_bmrs.append(b)
-        self.last_10_bmrs = self.last_10_bmrs[-10:]
-        self.last_10_plies.append(plies)
-        self.last_10_plies = self.last_10_plies[-10:]
+        self.recent_cpls.append(c)
+        self.recent_cpls = self.recent_cpls[-RECENT_WINDOW:]
+        self.recent_bmrs.append(b)
+        self.recent_bmrs = self.recent_bmrs[-RECENT_WINDOW:]
+        self.recent_blunders.append(bl)
+        self.recent_blunders = self.recent_blunders[-RECENT_WINDOW:]
+        self.recent_plies.append(plies)
+        self.recent_plies = self.recent_plies[-RECENT_WINDOW:]
         if kl_n:
-            self.last_10_kls.append(kl)
-            self.last_10_kls = self.last_10_kls[-10:]
-            self.last_10_kl_plies.append(kl_n)
-            self.last_10_kl_plies = self.last_10_kl_plies[-10:]
+            self.recent_kls.append(kl)
+            self.recent_kls = self.recent_kls[-RECENT_WINDOW:]
+            self.recent_kl_plies.append(kl_n)
+            self.recent_kl_plies = self.recent_kl_plies[-RECENT_WINDOW:]
         if ce_n:
-            self.last_10_ces.append(ce)
-            self.last_10_ces = self.last_10_ces[-10:]
-            self.last_10_ce_plies.append(ce_n)
-            self.last_10_ce_plies = self.last_10_ce_plies[-10:]
+            self.recent_ces.append(ce)
+            self.recent_ces = self.recent_ces[-RECENT_WINDOW:]
+            self.recent_ce_plies.append(ce_n)
+            self.recent_ce_plies = self.recent_ce_plies[-RECENT_WINDOW:]
 
         if report:
-            if len(self.last_10_cpls) >= 10:
-                w = np.array(self.last_10_plies, dtype=np.float64)
-                last_10_avg_c = np.dot(self.last_10_cpls, w) / w.sum()
-                last_10_avg_b = np.dot(self.last_10_bmrs, w) / w.sum()
-                if self.last_10_kls:
-                    wk = np.array(self.last_10_kl_plies, dtype=np.float64)
-                    last_10_avg_kl = np.dot(self.last_10_kls, wk) / wk.sum()
-                else:
-                    last_10_avg_kl = float('nan')
-                if self.last_10_ces:
-                    wc = np.array(self.last_10_ce_plies, dtype=np.float64)
-                    last_10_avg_ce = np.dot(self.last_10_ces, wc) / wc.sum()
-                else:
-                    last_10_avg_ce = float('nan')
+            for n in (10, RECENT_WINDOW):
+                if len(self.recent_cpls) < n:
+                    continue
                 print(fmt_rescore_stats(
-                    "Last 10 avg:", last_10_avg_c, last_10_avg_b,
-                    last_10_avg_ce, last_10_avg_kl))
+                    f"Last {n} avg",
+                    window_avg(self.recent_cpls, self.recent_plies, n),
+                    window_avg(self.recent_bmrs, self.recent_plies, n),
+                    window_avg(self.recent_ces, self.recent_ce_plies, n),
+                    window_avg(self.recent_kls, self.recent_kl_plies, n),
+                    window_avg(self.recent_blunders, self.recent_plies, n)))
 
             if self.n_saved >= 2:
                 cpl_mean = self.total_cpl_plies / self.total_plies
                 bmr_mean = self.total_bmr_plies / self.total_plies
+                blunder_mean = self.total_blunder_plies / self.total_plies
                 kl_mean = (self.total_kl_plies / self.total_kl_valid_plies
                            if self.total_kl_valid_plies else float('nan'))
                 ce_mean = (self.total_ce_plies / self.total_ce_valid_plies
                            if self.total_ce_valid_plies else float('nan'))
-                print(fmt_rescore_stats("Overall stats:", cpl_mean, bmr_mean, ce_mean, kl_mean))
+                print(fmt_rescore_stats("Overall stats", cpl_mean, bmr_mean,
+                                        ce_mean, kl_mean, blunder_mean))
 
             W = 10
 
@@ -1980,10 +2002,65 @@ def combine_analysis_staging(run_dir):
     return combined_new
 
 
-def fmt_rescore_stats(label, cpl, bmr, ce, kl):
+def fmt_rescore_stats(label, cpl, bmr, ce, kl, blunder):
     # CPL swings between 1 and 2+ digits -- fixed width keeps columns aligned
-    return (f"{RS} {label:<16}CPL {cpl:>5.2f}  BMR {bmr:>4.2f}  "
-            f"CE {ce:>4.2f}  KL {kl:>4.2f}")
+    return (f"{RS} {label:<14}:  CPL {cpl:>5.2f}  BMR {bmr:>4.2f}  "
+            f"CE {ce:>4.2f}  KL {kl:>4.2f}  CPL>{BLUNDER_CP} {blunder:>5.3f}")
+
+
+def migrate_pretrain_progress(run_dir):
+    """First-run split of the unified progress csv.
+
+    Pretraining writes its validation rows straight into eval_progress.csv
+    (bootstrap's unified mode). Selfplay wants that file to hold only its own
+    rows, counting from 0, with the pretraining axis carried on separately in
+    PRETRAIN_CONTINUED_CSV -- which the historic validation stream then keeps
+    extending by PRETRAIN_EPOCH_STEP.
+
+    Call once at startup, before next_model_epoch reads the counter. No-op
+    once PRETRAIN_CONTINUED_CSV exists, so it runs exactly one time per run.
+    Everything in eval_progress.csv at that moment is pretraining output --
+    selfplay has not written a row yet -- so the whole file moves.
+    """
+    progress = os.path.join(run_dir, "eval_progress.csv")
+    historic = os.path.join(run_dir, PRETRAIN_CONTINUED_CSV)
+
+    if os.path.exists(historic) or not os.path.exists(progress):
+        return
+
+    df = pd.read_csv(progress)
+    if not len(df):
+        return
+
+    df.to_csv(historic, index=False)
+    # keep the schema, drop the rows: next_model_epoch then returns 0 and the
+    # selfplay counter starts clean
+    df.iloc[0:0].to_csv(progress, index=False)
+    lo, hi = int(df.model_epoch.min()), int(df.model_epoch.max())
+    print(f"{RS} moved {len(df)} pretrain rows (epoch {lo}..{hi}) -> "
+          f"{PRETRAIN_CONTINUED_CSV}; eval_progress.csv restarts at 0")
+
+
+def next_pretrain_epoch(path, step=PRETRAIN_EPOCH_STEP):
+    """Next model_epoch for the pretrain-continued file: one step past the
+    last row. Pretraining validated every `step` epochs and this file just
+    keeps that axis going."""
+    if not os.path.exists(path):
+        return 0
+    df = pd.read_csv(path)
+    if not len(df) or 'model_epoch' not in df.columns:
+        return 0
+    return int(df['model_epoch'].max()) + step
+
+
+def window_avg(vals, wts, n):
+    """Ply-weighted mean over the last n entries. vals and wts are the same
+    window (kl/ce keep their own, since chunks with no trainable plies never
+    append to them)."""
+    w = np.array(wts[-n:], dtype=np.float64)
+    if not len(w) or not w.sum():
+        return float('nan')
+    return np.dot(vals[-n:], w) / w.sum()
 
 
 def save_analysis_chunk_simple(run_dir, batch):
@@ -2024,6 +2101,9 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()
+    # rate of plies dropping more than BLUNDER_CP -- CPL is a mean and a few
+    # huge losses move it as much as a broad decline, so track the tail too
+    blunder = (df_all.delta > BLUNDER_CP).mean()
     kl_n = int(df_all.kl.notna().sum())
     ce_n = int(df_all.ce.notna().sum())
     kl  = df_all.kl.mean()
@@ -2031,7 +2111,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     plies = len(df_all)
 
     print(f"{RS} Saving {len(batch)} analyzed games")
-    print(fmt_rescore_stats("Batch stats:", cpl, bmr, ce, kl))
+    print(fmt_rescore_stats("Batch stats", cpl, bmr, ce, kl, blunder))
 
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)
@@ -2039,7 +2119,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr, kl, ce, plies, kl_n, ce_n
+    return outp, cpl, bmr, kl, ce, plies, kl_n, ce_n, blunder
 
 
 def make_fake_visits(mv, lms, ratio_best=60):

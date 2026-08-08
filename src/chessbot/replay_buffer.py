@@ -13,8 +13,11 @@ Record schema (used uniformly regardless of source file format):
   tfrec.gz historic booster shards read via read_tfrec_gz_shard, which
   carry no source; SEED_SOURCE for the bootstrap-seeded primary/
   remaining_untrained records (see seed_selfplay_buffers), which do carry
-  one -- treated downstream as xc0-quality (validate_lc0 grouping in
-  Rescorer.aggregate_metrics), never as lc0
+  one. For validation grouping (Rescorer.plot_source) SEED_SOURCE and None
+  both map to "historic" -- they are pretrain-distribution records, not
+  selfplay output. Anything starting with "lc0" maps to "lc0"; the
+  lc0_pv/lc0_blunder/lc0_enrich distinction survives only in the
+  print_sample_stats counters.
 """
 import gzip
 import os
@@ -25,14 +28,23 @@ import uuid
 
 import numpy as np
 
-LIVE_BUFFER_SIZE = 102_400
+LIVE_BUFFER_SIZE = 122_880
 SHARD_SIZE = 10_240
-PRIMARY_TRIGGER_SHARDS = 32
+PRIMARY_TRIGGER_SHARDS = 64
 RETRAIN_PRIMARY_SHARDS = 8
 RETRAIN_REPLAY_SHARDS = 8
-RETRAIN_HISTORIC_SHARDS = 4
-REPLAY_SEED_SHARDS = 64
+RETRAIN_HISTORIC_SHARDS = 8
+REPLAY_SEED_SHARDS = 96
+# initial primary fill, left short of the trigger so selfplay supplies the
+# last few shards of the first cycle rather than retraining on pure seed
+PRIMARY_SEED_SHARDS = 62
 SEED_SOURCE = "historic_seeded"
+
+# Validation draws, taken in-memory from records the retrain worker has
+# already loaded for training -- no extra shard reads. Primary only; the
+# replay buffer has been trained on already and is left alone.
+VAL_PRIMARY_RECORDS = 20_480
+VAL_HISTORIC_RECORDS = 10_240
 
 
 def new_shard_path(out_dir, suffix=".pkl.gz"):
@@ -103,6 +115,14 @@ def sample_files(dir_path, n):
     if len(files) < n:
         raise RuntimeError(f"{dir_path}: need {n} shard files, found {len(files)}")
     return random.sample(files, n)
+
+
+def sample_records(records, n):
+    """Random subset without replacement, for validation draws. Returns the
+    whole list (shuffled) if it holds fewer than n."""
+    if len(records) <= n:
+        return list(records)
+    return random.sample(records, n)
 
 
 def move_files(paths, dest_dir):

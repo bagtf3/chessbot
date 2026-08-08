@@ -7,16 +7,23 @@ Message protocol (msg_q, main -> worker):
   {"cmd": "preload", "replay": [paths], "historic": [paths]}
   {"cmd": "start", "primary": [paths]}
       Both sent back to back the moment the worker is spawned, which only
-      happens once primary_buffer is full at 32/32. They stayed two messages
-      because the worker consumes them in order and the split costs nothing.
+      happens once primary_buffer is full at PRIMARY_TRIGGER_SHARDS. They
+      stayed two messages because the worker consumes them in order and the
+      split costs nothing.
 
 Message protocol (result_q, worker -> main):
   {"cmd": "retrain_ready"}
       validation predictions written, dataset built, about to train. Main
       pauses selfplay workers on receipt of this.
-  {"cmd": "retrain_done", "ok": bool, "error": str or None}
+
+predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
+  {"primary":  {"samples": [...], "preds": [...]},
+   "historic": {"samples": [...], "preds": [...]}}
+  {"cmd": "retrain_done", "ok": bool, "error": str or None,
+   "train_stats": {"train_loss": float, "gn_mean": float}}
       training + save finished (or failed). Main unpauses selfplay workers
-      immediately on receipt of this, before running aggregate_metrics.
+      immediately on receipt of this, before running aggregate_metrics, which
+      folds train_stats into the validation rows.
 """
 import os
 import pickle
@@ -28,7 +35,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from chessbot.config import Config
-from chessbot.replay_buffer import read_shard, write_pkl_gz_shard, SHARD_SIZE
+from chessbot.replay_buffer import (
+    read_shard, sample_records, write_pkl_gz_shard,
+    SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_PRIMARY_RECORDS,
+)
 
 
 def load_records(paths):
@@ -106,13 +116,25 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     model, arch = load_pt_model(cfg.model_path)
     primary_records_raw = load_records(primary_paths)
-    X_primary = [r[0] for r in primary_records_raw]
-    preds = predict_fp16(model, X_primary, batch_size=cfg.retrain_batch_size)
+
+    # Two validation streams, both drawn from records already in RAM for
+    # training: primary (mixed sources, tracks the live distribution) and
+    # historic (pretrain distribution, continues the pretraining curve).
+    # Replay is deliberately excluded -- it has already been trained on.
+    val_primary = sample_records(primary_records_raw, VAL_PRIMARY_RECORDS)
+    val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
+
+    bs = cfg.retrain_batch_size
+    preds_primary = predict_fp16(model, [r[0] for r in val_primary], batch_size=bs)
+    preds_historic = predict_fp16(model, [r[0] for r in val_historic], batch_size=bs)
 
     pred_pkl_path = os.path.join(run_dir, "predictions_latest.pkl")
+    payload = {
+        "primary": {"samples": val_primary, "preds": preds_primary},
+        "historic": {"samples": val_historic, "preds": preds_historic},
+    }
     with open(pred_pkl_path + ".tmp", "wb") as f:
-        pickle.dump({"samples": primary_records_raw, "preds": preds}, f,
-                    protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(pred_pkl_path + ".tmp", pred_pkl_path)
 
     del model
@@ -129,7 +151,8 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     model, arch = load_pt_model(cfg.model_path)
     args = SimpleNamespace(batch_size=cfg.retrain_batch_size)
-    retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
-               model=model, arch=arch)
+    train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
+                             model=model, arch=arch)
 
-    result_q.put({"cmd": "retrain_done", "ok": True, "error": None})
+    result_q.put({"cmd": "retrain_done", "ok": True, "error": None,
+                  "train_stats": train_stats})

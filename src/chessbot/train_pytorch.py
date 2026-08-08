@@ -424,6 +424,12 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     print(f"{tag} retraining complete for epoch {epoch}")
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)
 
+    # same two fields pretraining records alongside each validation row
+    return {
+        'train_loss': epoch_losses[-1]['loss'],
+        'gn_mean': epoch_grad_stats[-1]['gn_mean'],
+    }
+
 
 def make_pt_infer(model, max_bs, encoding_type="xc0"):
     """

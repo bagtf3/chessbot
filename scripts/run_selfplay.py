@@ -12,7 +12,7 @@ import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import Rescorer, SFRescoreThread
+from chessbot.rescore import Rescorer, SFRescoreThread, migrate_pretrain_progress
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, next_model_epoch
@@ -434,6 +434,10 @@ def main(run_tag):
 
     rb.seed_replay_buffer(base_cfg.historic_dir, base_cfg.replay_buffer_dir)
 
+    # split pretraining's rows out of eval_progress.csv before the counter is
+    # read -- no-op after the first startup of a run
+    migrate_pretrain_progress(base_cfg.run_dir)
+
     n_retrains = next_model_epoch(base_cfg.progress_csv_path)
 
     recorder = RecordKeeper(n_retrains, run_num=0, every_sec=45.0)
@@ -792,13 +796,9 @@ def main(run_tag):
                             working_cfg.run_dir, "predictions_latest.pkl"
                         )
 
-                        validate_lc0 = (
-                            working_cfg.lc0_validation_every > 0
-                            and n_retrains % working_cfg.lc0_validation_every == 0
-                        )
                         rescorer.aggregate_metrics(
                             n_retrains, working_cfg.progress_csv_path, pred_pkl_path,
-                            validate_lc0=validate_lc0)
+                            train_stats=result.get("train_stats"))
 
                         n_retrains += 1
                         retrain_worker = None

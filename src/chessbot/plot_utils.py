@@ -8,10 +8,18 @@ def moving_average_pd(arr, window=15):
     return s.rolling(window, center=True, min_periods=1).mean().values
 
 
-def plot_training_progress(metrics_history, epoch=None, ma_max=50):
+def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10,
+                           min_rows=12, title=None):
     """
     metrics_history: pd.DataFrame or dict-like with columns used below.
     Each panel shows raw data as a pale line and MA as a bold line.
+    hide_first: leading rows to drop from the panels. The MA is still
+    computed over the full series, so trimming here only changes what is
+    drawn -- pre-slicing the frame instead would drop these rows AND then
+    drop hide_first more on top.
+    min_rows: bail out below this many *plotted* rows. Gating on the epoch
+    number instead breaks the moment a run rebases its counter to 0.
+    title: suptitle on both figures, to tell one progress file from another.
     """
     import matplotlib.pyplot as plt
 
@@ -28,16 +36,23 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
         else:
             epoch = len(df)
 
-    hide_first = 10
-    if epoch < 12:
+    N = len(df)
+    n_plot = N - hide_first
+    if n_plot < min_rows:
         return
 
-    ma_window = min(ma_max, max(3, int(epoch * 0.2)))
+    ma_window = min(ma_max, max(3, int(n_plot * 0.2)))
     if ma_window % 2 == 0:
         ma_window += 1
 
-    N = len(df)
-    x_full = np.arange(N)
+    # x is model_epoch where available -- row index is meaningless once the
+    # file mixes pretrain (every 20) with selfplay (every retrain)
+    if "model_epoch" in df.columns and N:
+        x_full = np.asarray(df["model_epoch"], dtype=float)
+        x_label = "model epoch"
+    else:
+        x_full = np.arange(N)
+        x_label = "row"
     start = hide_first
     xs = x_full[start:]
 
@@ -52,11 +67,14 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
             ax.plot(xs, ma, lw=2, label=f"MA{ma_window}", **kw)
         if title:
             ax.set_title(title)
+        ax.set_xlabel(x_label)
         ax.legend(fontsize=8)
         return ma
 
     # ---- figure 1: 2x2 ----
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    if title:
+        fig.suptitle(title, fontsize=12)
 
     # policy CE
     raw = np.array(col_vals("policy_ce") or [])
@@ -112,6 +130,8 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
 
     # ---- figure 2: 1x3 ----
     fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
+    if title:
+        fig2.suptitle(title, fontsize=12)
 
     # top1 / top3 / top5
     ax = axs[0]
@@ -126,11 +146,11 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
         colors = ["tab:blue", "tab:orange", "tab:green"]
         for arr, label, c in zip((t1, t3, t5), ("top1", "top3", "top5"), colors):
             if arr.size:
-                x = np.arange(len(arr))
-                ax.plot(x, arr, alpha=0.25, lw=0.8, color=c)
-                ma = moving_average_pd(arr, window=ma_window)
-                ax.plot(np.arange(len(ma)), ma, lw=2, color=c, label=f"{label} MA{ma_window}")
+                ax.plot(xs, arr[start:], alpha=0.25, lw=0.8, color=c)
+                ma = moving_average_pd(arr, window=ma_window)[start:]
+                ax.plot(xs, ma, lw=2, color=c, label=f"{label} MA{ma_window}")
         ax.set_title("mean top-k mass")
+        ax.set_xlabel(x_label)
         ax.legend(fontsize=8)
 
     # mass_on_legal
@@ -140,11 +160,11 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
         ax.text(0.5, 0.5, "missing: mass_on_legal", ha="center", va="center")
         ax.set_axis_off()
     else:
-        x = np.arange(len(mol))
-        ax.plot(x, mol, alpha=0.25, lw=0.8, label="mass_on_legal")
-        ma_mol = moving_average_pd(mol, window=ma_window)
-        ax.plot(x, ma_mol, lw=2, label=f"MA{ma_window}")
+        ax.plot(xs, mol[start:], alpha=0.25, lw=0.8, label="mass_on_legal")
+        ma_mol = moving_average_pd(mol, window=ma_window)[start:]
+        ax.plot(xs, ma_mol, lw=2, label=f"MA{ma_window}")
         ax.set_title("mass_on_legal")
+        ax.set_xlabel(x_label)
         ax.legend(fontsize=8)
 
     # avg_top_prob & top1_exact
@@ -161,13 +181,13 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50):
             (t1_exact, "top1_exact",   "tab:orange"),
         ):
             if arr.size:
-                x = np.arange(len(arr))
-                ax.plot(x, arr, alpha=0.25, lw=0.8, color=c)
-                ma = moving_average_pd(arr, window=ma_window)
-                ax.plot(np.arange(len(ma)), ma, lw=2, color=c, label=f"{label} MA{ma_window}")
+                ax.plot(xs, arr[start:], alpha=0.25, lw=0.8, color=c)
+                ma = moving_average_pd(arr, window=ma_window)[start:]
+                ax.plot(xs, ma, lw=2, color=c, label=f"{label} MA{ma_window}")
                 plotted = True
         if plotted:
             ax.set_title("avg_max_prob & top1_exact")
+            ax.set_xlabel(x_label)
             ax.legend(fontsize=8)
         else:
             ax.text(0.5, 0.5, "no data", ha="center", va="center")

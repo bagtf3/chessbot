@@ -40,7 +40,6 @@ class Config(object):
     min_top_visits = 300
     min_delta = 100
     use_robust = True
-    robust_only_above = 2400
     es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
     es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
     es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop
@@ -75,7 +74,9 @@ class Config(object):
     sf_exclude = ["piece_training"]
 
     # rescoring config
-    rescore_depth = 12
+    # SF searches to whichever binds first: this time budget or a hardcoded
+    # depth backstop. Under backlog it drops by a hardcoded 10ms.
+    rescore_movetime_ms = 90
     rescore_analyze_batch = 30
     rescore_equiv_range = 25
     rescore_inaccuracy_cp = 75

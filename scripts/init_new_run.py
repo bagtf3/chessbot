@@ -3,13 +3,19 @@ init_new_run.py
 
 Usage:
   python init_new_run.py <run_tag> [--clone <existing_run_tag>]
+  python init_new_run.py --iterate <current_run_tag>
 
 Simple: create run_dir, write config.yaml and validation_config.yaml.
 If --clone is given, copy those files from the clone run dir and set
 the new run's init_model to the cloned model (copied into the new run dir).
+
+--iterate is shorthand for the usual next-run case: it increments the
+trailing integer of <current_run_tag> and is equivalent to
+  python init_new_run.py <tag>{N+1} --clone <tag>{N} --do-cleanup
 """
 
 import os
+import re
 import sys
 import argparse
 import yaml
@@ -69,8 +75,11 @@ def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("run_tag")
+    p.add_argument("run_tag", nargs="?", default=None)
     p.add_argument("--clone", default=None)
+    p.add_argument("--iterate", default=None, metavar="CURRENT_RUN_TAG",
+                    help="increment the trailing integer of CURRENT_RUN_TAG "
+                         "and clone it with --do-cleanup")
     p.add_argument("--ignore-eval-progress", action="store_true")
     p.add_argument("--do-cleanup", action="store_true",
                     help="delete replay_buffer/primary_buffer from the clone "
@@ -78,8 +87,24 @@ def main():
                          "already moved, not copied)")
     args = p.parse_args()
 
-    run_tag = args.run_tag
-    clone_tag = args.clone
+    if args.iterate:
+        if args.run_tag or args.clone:
+            p.error("--iterate derives both tags; do not pass run_tag or --clone")
+        m = re.match(r"^(.*?)(\d+)$", args.iterate)
+        if not m:
+            print(f"[iterate] no trailing integer in '{args.iterate}' -- "
+                  f"iterate isn't possible")
+            sys.exit(1)
+        clone_tag = args.iterate
+        run_tag = f"{m.group(1)}{int(m.group(2)) + 1}"
+        do_cleanup = True
+        print(f"[iterate] {clone_tag} -> {run_tag} (clone + cleanup)")
+    elif args.run_tag:
+        run_tag = args.run_tag
+        clone_tag = args.clone
+        do_cleanup = args.do_cleanup
+    else:
+        p.error("need a run_tag, or --iterate <current_run_tag>")
 
     # set run_tag so Config.init_paths will compute the right paths
     Config.run_tag = run_tag
@@ -87,6 +112,12 @@ def main():
     cfg.init_paths()
 
     dest_dir = cfg.run_dir
+    # --iterate deletes the source buffers, so refuse to re-run onto a run
+    # that already exists rather than clobbering it with stale state
+    if args.iterate and os.path.exists(os.path.join(dest_dir, "config.yaml")):
+        print(f"[iterate] {run_tag} already exists -- refusing to overwrite. "
+              f"Use the explicit --clone form if this is intended.")
+        sys.exit(1)
     os.makedirs(dest_dir, exist_ok=True)
 
     cfg_yaml_dst = os.path.join(dest_dir, "config.yaml")
@@ -196,7 +227,7 @@ def main():
                 dst_buf = os.path.join(dest_dir, buf_name)
                 shutil.copytree(src_buf, dst_buf, dirs_exist_ok=True)
                 print(f"[clone] copied {buf_name}/ from {clone_tag}")
-                if args.do_cleanup:
+                if do_cleanup:
                     shutil.rmtree(src_buf)
                     print(f"[clone] deleted {buf_name}/ from {clone_tag} (--do-cleanup)")
 
@@ -235,13 +266,18 @@ def main():
             shutil.move(src_sf_cache, dst_sf_cache)
             print(f"[clone] moved sf_cache.pkl.gz from {clone_tag}")
 
-        # copy eval_progress.csv unless suppressed
+        # copy the progress csvs unless suppressed. Both must travel together:
+        # Rescorer.migrate_pretrain_progress treats "continued file missing"
+        # as "eval_progress.csv still holds pretraining rows" and moves the
+        # whole file across, so cloning only the first one would relabel this
+        # run's selfplay rows as pretraining on the new tag's first startup.
         if not args.ignore_eval_progress:
-            src_eval = os.path.join(src_dir, "eval_progress.csv")
-            if os.path.exists(src_eval):
-                dst_eval = os.path.join(dest_dir, "eval_progress.csv")
-                shutil.copy2(src_eval, dst_eval)
-                print(f"[clone] copied eval_progress.csv from {clone_tag}")
+            for fname in ("eval_progress.csv",
+                          "eval_progress_pretrain_continued.csv"):
+                src_eval = os.path.join(src_dir, fname)
+                if os.path.exists(src_eval):
+                    shutil.copy2(src_eval, os.path.join(dest_dir, fname))
+                    print(f"[clone] copied {fname} from {clone_tag}")
     else:
         # not cloning: write minimal files
         write_yaml(cfg_yaml_dst, {

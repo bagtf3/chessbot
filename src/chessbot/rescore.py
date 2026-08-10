@@ -34,6 +34,10 @@ PRETRAIN_EPOCH_STEP = 20
 BLUNDER_CP = 30
 # rolling stat window, in push_analyzed chunks (30 games each)
 RECENT_WINDOW = 100
+# SF rescore search caps. cfg.rescore_movetime_ms is the tunable budget; the
+# catch-up trim and the depth backstop stay fixed so there is one knob.
+SF_THROTTLE_MS = 10
+SF_MAX_DEPTH = 24
 C = 0.9699
 D = d = np.arctanh(0.5)
 
@@ -150,9 +154,15 @@ class SFRescoreThread:
         self.game_q = sf_game_q
         self.res_q  = sf_res_q
 
-        # config floor; depth may throttle below this
-        self.base_depth = cfg.rescore_depth  
-        self.depth = self.base_depth
+        # SF stops on whichever binds first: the time budget or MAX_DEPTH.
+        # MAX_DEPTH is a backstop, not the primary limit -- a depth-bound call
+        # returns immediately instead of spending the rest of the budget, which
+        # mostly catches warm-TT positions (endgames, the single-root-move
+        # rerun) that would otherwise run away.
+        self.max_depth = SF_MAX_DEPTH
+        self.base_ms = cfg.rescore_movetime_ms
+        self.throttled_ms = max(10, self.base_ms - SF_THROTTLE_MS)
+        self.movetime_ms = self.base_ms
         self.sf_config = {'Hash': 256}
         self.stop_ev = threading.Event()
         self.t = None
@@ -162,9 +172,10 @@ class SFRescoreThread:
         self.game_q.put((gid, positions))
 
     def update_config(self, cfg):
-        self.base_depth = cfg.rescore_depth
-        if self.depth > self.base_depth:
-            self.depth = self.base_depth
+        self.base_ms = cfg.rescore_movetime_ms
+        self.throttled_ms = max(10, self.base_ms - SF_THROTTLE_MS)
+        if self.movetime_ms > self.base_ms:
+            self.movetime_ms = self.base_ms
 
     def start(self):
         self.t = threading.Thread(target=self.run, daemon=True)
@@ -194,13 +205,16 @@ class SFRescoreThread:
             results = []
             try:
                 for ply_idx, board, xerces_uci in positions:
-                    limit = chess.engine.Limit(depth=self.depth)
+                    limit = chess.engine.Limit(time=self.movetime_ms / 1000.0,
+                                               depth=self.max_depth)
                     elapsed = 0.0
+                    depths = []
 
                     # pass 1: full best-move analysis
                     t0 = time.time()
                     info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
                     elapsed += time.time() - t0
+                    depths.append(info.get('depth', 0))
                     best_uci = str(info['pv'][0])
                     pv_ucis  = [str(m) for m in info.get('pv', [])[:3]]
                     best_cp  = score_cp_stm_pov(info['score'])
@@ -216,6 +230,7 @@ class SFRescoreThread:
                             info=chess.engine.INFO_ALL,
                         )
                         elapsed  += time.time() - t0
+                        depths.append(info2.get('depth', 0))
                         played_cp  = score_cp_stm_pov(info2['score'])
                         played_abs = score_cp_white_pov(info2['score'], clipped=False)
                     else:
@@ -231,7 +246,8 @@ class SFRescoreThread:
                         'played_cp':  played_cp,
                         'played_abs': played_abs,
                         'elapsed':    elapsed,
-                        'depth':      self.depth,
+                        'depth':      depths[0],
+                        'depths':     depths,
                         'rerun':      rerun,
                     })
             
@@ -276,7 +292,9 @@ class Rescorer(object):
         self.sf_call_count = 0
         self.sf_rerun_count = 0
         self.n_sf_threads = cfg.rescore_n_sf_threads
-        self.current_depth = cfg.rescore_depth
+        self.sf_depth_sum = 0
+        self.sf_depth_count = 0
+        self.current_movetime_ms = 0
         self.recent_cpls = []
         self.recent_bmrs = []
         self.recent_blunders = []
@@ -368,6 +386,8 @@ class Rescorer(object):
             'sf_compute_count': self.sf_compute_count,
             'sf_call_count': self.sf_call_count,
             'sf_rerun_count': self.sf_rerun_count,
+            'sf_depth_sum': self.sf_depth_sum,
+            'sf_depth_count': self.sf_depth_count,
             'recent_cpls': self.recent_cpls,
             'recent_bmrs': self.recent_bmrs,
             'recent_blunders': self.recent_blunders,
@@ -393,7 +413,7 @@ class Rescorer(object):
             'kl_q50': self.kl_q50,
             'kl_q80': self.kl_q80,
             'start_time': self.start_time,
-            'current_depth': self.current_depth,
+            'current_movetime_ms': self.current_movetime_ms,
             'intake': self.intake,
             'pending': self.pending,
         }
@@ -731,6 +751,9 @@ class Rescorer(object):
 
             self.sf_compute_time  += r['elapsed']
             self.sf_compute_count += 1
+            ds = r.get('depths') or []
+            self.sf_depth_sum   += sum(ds)
+            self.sf_depth_count += len(ds)
             if r.get('rerun'):
                 self.sf_call_count += 2
                 self.sf_rerun_count += 1
@@ -978,7 +1001,10 @@ class Rescorer(object):
                     model_wdl = model_wdl[[2, 1, 0]]
                 row = row_by_ply.get(ply_i)
                 if row is not None:
-                    row[-1] = cross_entropy(Y, model_wdl)
+                    # logged CE only -- scored against the raw game result, not
+                    # Y. Y is half model_wdl, so CE(Y, model_wdl) is partly
+                    # self-referential and barely moves. Y itself is unchanged.
+                    row[-1] = cross_entropy(z_to_wdl(z), model_wdl)
 
             sc['total'] += 1
             scw['total'] += 1
@@ -1612,6 +1638,11 @@ class Rescorer(object):
             def col(val):
                 return f"  {val:>{W}}  |"
 
+            # true search depth reached under the time budget, averaged over
+            # every SF call this window (both passes), not seldepth
+            avg_depth = (self.sf_depth_sum / self.sf_depth_count
+                         if self.sf_depth_count else 0.0)
+
             n_tot = self.games_processed
             if n_tot > self.config.rescore_analyze_batch and self.start_time is not None:
                 elapsed = time.time() - self.start_time
@@ -1622,7 +1653,7 @@ class Rescorer(object):
                     ("games/hr",   f"{games_hr:.1f}"),
                     ("moves/sec",  f"{moves_sec:.2f}"),
                     ("workers",    str(self.n_sf_threads)),
-                    ("depth",      str(self.current_depth)),
+                    ("depth",      f"{avg_depth:.1f}"),
                 ]
                 tg_hdr = (f"{RS}  {'Total':<12} |"
                           + "".join(col(h) for h, _ in tg_cols))
@@ -1639,8 +1670,11 @@ class Rescorer(object):
                 1000 * self.sf_compute_time / self.sf_compute_count
                 if self.sf_compute_count else 0.0
             )
-            rerun_pct = (
-                100 * self.sf_rerun_count / self.sf_compute_count
+            # share of plies where xerces already played SF's best move, so
+            # the second pass was skipped
+            first_run_pct = (
+                100 * (self.sf_compute_count - self.sf_rerun_count)
+                / self.sf_compute_count
                 if self.sf_compute_count else 0.0
             )
             backlog = len(self.intake) + len(self.pending)
@@ -1649,7 +1683,8 @@ class Rescorer(object):
                 ("positions", str(self.n_sf_submitted)),
                 ("ms/pos",    f"{avg_ms_per_pos:.0f}ms"),
                 ("ms/ply",    f"{avg_ms_per_ply:.0f}ms"),
-                ("rerun %",   f"{rerun_pct:.1f}%"),
+                ("1st run %", f"{first_run_pct:.1f}%"),
+                ("budget",    f"{self.current_movetime_ms}ms"),
                 ("backlog",   str(backlog)),
             ]
             sf_hdr = (f"{RS}  {'SF':<12} |"
@@ -1662,6 +1697,8 @@ class Rescorer(object):
             self.sf_compute_count = 0
             self.sf_call_count = 0
             self.sf_rerun_count = 0
+            self.sf_depth_sum = 0
+            self.sf_depth_count = 0
             print()
 
             self.print_collar_stats()

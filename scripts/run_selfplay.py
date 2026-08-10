@@ -272,7 +272,11 @@ def check_and_reap_procs(procs, request_stop=False, grace_s=5.0, term_s=2.0,
 
         if not p.is_alive():
             p.join(timeout=0)
-            if w["stop_sent_at"] is None:
+            # exitcode 0 means the worker's main returned normally, which only
+            # happens on a graceful path -- drain_and_stop at end of round is
+            # the common one, and it does not set stop_sent_at. A real crash
+            # exits non-zero (or negative for a signal).
+            if w["stop_sent_at"] is None and p.exitcode != 0:
                 log_worker_death(w, crash_log_path)
             close_proc(p)
             continue
@@ -568,7 +572,10 @@ def main(run_tag):
                 procs,
                 crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
             )
-            while len(procs):
+            waiting_on_retrain = False
+            # keep spinning while a retrain is in flight even after every
+            # worker has exited -- see the break below
+            while len(procs) or retrain_worker is not None:
                 if STOP_REQUESTED.is_set():
                     procs = check_and_reap_procs(procs, request_stop=True)
                     break
@@ -632,7 +639,18 @@ def main(run_tag):
 
                 # break if no workers and backlog is small enough to carry into next round
                 if not procs and len(finished_games) < MAX_BACKLOG:
-                    break
+                    if retrain_worker is None:
+                        break
+                    # Round is done but a retrain is still running. Hold here
+                    # instead of tearing down: round N+1 would spawn workers
+                    # that build TRT engines and run inference on the same GPU
+                    # this retrain is training on, and its retrain_done would
+                    # never be consumed -- no config reload, no TRT rebuild,
+                    # no primary->replay rotation, no metrics, no epoch bump.
+                    if not waiting_on_retrain:
+                        print("[round] games finished, holding round open for "
+                              "the in-flight retrain before starting the next")
+                        waiting_on_retrain = True
 
                 # refill queues; blunder replays trigger a top-up even if queues aren't low
                 if not stop_signal_sent:
@@ -671,17 +689,23 @@ def main(run_tag):
                 rescorer.tick()
 
                 sf_backlog = len(rescorer.intake) + len(rescorer.pending)
-                is_throttled = sf_rescore_threads[0].depth < sf_rescore_threads[0].base_depth
+                # sync every pass, not just inside the throttle arms, so the
+                # telemetry budget column reflects the threads' real state
+                rescorer.current_movetime_ms = sf_rescore_threads[0].movetime_ms
+                is_throttled = (sf_rescore_threads[0].movetime_ms
+                                < sf_rescore_threads[0].base_ms)
                 if sf_backlog > 100 and not is_throttled:
                     for t in sf_rescore_threads:
-                        t.depth = max(1, t.base_depth - 1)
-                    rescorer.current_depth = sf_rescore_threads[0].depth
-                    print(f"[rescore] backlog {sf_backlog}, depth -> {rescorer.current_depth}")
+                        t.movetime_ms = t.throttled_ms
+                    rescorer.current_movetime_ms = sf_rescore_threads[0].movetime_ms
+                    print(f"[rescore] backlog {sf_backlog}, movetime -> "
+                          f"{rescorer.current_movetime_ms}ms")
                 elif sf_backlog < 10 and is_throttled:
                     for t in sf_rescore_threads:
-                        t.depth = t.base_depth
-                    rescorer.current_depth = sf_rescore_threads[0].depth
-                    print(f"[rescore] backlog cleared, depth -> {rescorer.current_depth}")
+                        t.movetime_ms = t.base_ms
+                    rescorer.current_movetime_ms = sf_rescore_threads[0].movetime_ms
+                    print(f"[rescore] backlog cleared, movetime -> "
+                          f"{rescorer.current_movetime_ms}ms")
 
                 recorder.training_queue = rescorer.training_data_size
 
@@ -691,7 +715,10 @@ def main(run_tag):
                 # waiting for 32/32 anyway, so there was nothing to overlap with.
                 primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
                 n_files = len(primary_files)
-                launch_retrain = retrain_worker is None and not is_validation
+                # `and procs`: once the workers are gone the round is closing,
+                # so don't start a fresh retrain that would hold it open again
+                launch_retrain = (retrain_worker is None and not is_validation
+                                  and bool(procs))
                 if launch_retrain and n_files >= PTS:
                     replay_files = rb.sample_files(
                         working_cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
@@ -758,11 +785,9 @@ def main(run_tag):
                             working_cfg = create_validation_config(working_cfg, val_yaml_path)
                         rescorer.config = working_cfg
                         for t in sf_rescore_threads:
-                            # preserve throttle state; cap to new base if config lowered depth
-                            current_depth = t.depth
+                            # budget is hardcoded, so throttle state survives
                             t.update_config(working_cfg)
-                            t.depth = min(current_depth, t.base_depth)
-                        rescorer.current_depth = sf_rescore_threads[0].depth
+                        rescorer.current_movetime_ms = sf_rescore_threads[0].movetime_ms
 
                         if result.get("ok") and not is_validation:
                             if working_cfg.inference_backend == 'ort_trt':

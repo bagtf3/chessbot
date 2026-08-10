@@ -163,7 +163,7 @@ class MCTSTree(fasttree):
         Deterministic Xerces choice (no sampling), returning:
         (uci, method) where method is "robust" or "most_visited".
         """
-        if self.sims_completed_this_move >= self.config.robust_only_above:
+        if self.sim_stop_reason == "full" and self.config.use_robust:
             uci = self.select_using_robust()
             return uci, "robust"
 
@@ -382,7 +382,8 @@ class MCTSTree(fasttree):
         d0, d1 = details[0], details[1]
         visit_delta = d0.N - d1.N
 
-        jsd_collect_start = cfg.jsd_min_sims - 3 * cfg.es_check_every
+        # first chance to fire stays at jsd_min_sims as n_stable grows
+        jsd_collect_start = cfg.jsd_min_sims - cfg.es_jsd_n_stable * cfg.es_check_every
         if sims_done >= jsd_collect_start:
             self.record_es_check(details, sims_done)
 

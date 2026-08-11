@@ -334,8 +334,8 @@ class GameLooper(object):
                     bonus += g_mbs
                     continue
 
-                # if bonus available we can bump our microbatch up by at most 2
-                this_mbs = g_mbs + max(0, min(bonus, 2))
+                # if bonus available we can bump our microbatch up by at most 4
+                this_mbs = g_mbs + max(0, min(bonus, 4))
                 res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
                 nn, n_leafs = self.process_results(res, counts, this_mbs)
                 mbs_used.append(this_mbs)

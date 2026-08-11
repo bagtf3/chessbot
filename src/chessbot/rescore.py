@@ -1684,7 +1684,6 @@ class Rescorer(object):
                 ("ms/pos",    f"{avg_ms_per_pos:.0f}ms"),
                 ("ms/ply",    f"{avg_ms_per_ply:.0f}ms"),
                 ("1st run %", f"{first_run_pct:.1f}%"),
-                ("budget",    f"{self.current_movetime_ms}ms"),
                 ("backlog",   str(backlog)),
             ]
             sf_hdr = (f"{RS}  {'SF':<12} |"

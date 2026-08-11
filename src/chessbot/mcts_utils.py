@@ -82,6 +82,7 @@ class MCTSTree(fasttree):
         self.set_fpu_reduction(float(cfg.fpu_reduction))
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
+        self.set_root_chunk_size(int(cfg.root_chunk_size))
         self.set_contempt(
             float(cfg.contempt_zero_q),
             float(cfg.contempt_full_q),

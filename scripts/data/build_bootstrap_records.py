@@ -42,6 +42,7 @@ from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 from chessbot import SP_DIR
 from chessbot.review import load_game_index, ANALYZE_PKL
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch
+from chessbot.opening_counts import absolute_ply
 from chessbot.utils import calc_entropy
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
@@ -401,15 +402,6 @@ def align_sf(moves, sf_rows):
                 j = k + 1
                 break
     return sf_rows, by_ply
-
-
-def absolute_ply(board):
-    """True ply of the position, from the FEN move counters.
-
-    Not board.game_ply(): that is a since-construction counter, so a board
-    built from a mid-game FEN reports 0 no matter how deep the position is.
-    """
-    return (board.fullmove_number() - 1) * 2 + (0 if board.white_to_move() else 1)
 
 
 def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc0_eligible=True):

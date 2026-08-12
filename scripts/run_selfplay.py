@@ -426,7 +426,8 @@ def main(run_tag):
     # load any previously saved untrained samples
     remaining_pkl = rb.find_remaining_untrained(base_cfg.run_dir)
     if remaining_pkl:
-        rescorer.live_buffer.records = rb.read_remaining_untrained(remaining_pkl)
+        rescorer.live_buffer.load_records(
+            rb.read_remaining_untrained(remaining_pkl))
         os.remove(remaining_pkl)
         n_loaded = len(rescorer.live_buffer)
         print(f"[main] loaded {n_loaded} samples from "

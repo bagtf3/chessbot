@@ -35,6 +35,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from chessbot.config import Config
+from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
     read_shard, sample_records, stack_policies, write_pkl_gz_shard,
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_PRIMARY_RECORDS,
@@ -114,7 +115,8 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     preload_msg = msg_q.get()
     replay_records = load_records(preload_msg["replay"])
-    historic_records = load_records(preload_msg["historic"])
+    historic_records = apply_historic_dup_weights(
+        load_records(preload_msg["historic"]))
 
     start_msg = msg_q.get()
     primary_paths = start_msg["primary"]

@@ -39,6 +39,8 @@ import uuid
 
 import numpy as np
 
+from chessbot.opening_counts import apply_repeat_weights
+
 LIVE_BUFFER_SIZE = 163_840
 SHARD_SIZE = 10_240
 PRIMARY_TRIGGER_SHARDS = 96
@@ -268,31 +270,60 @@ class LiveBuffer:
     Flushes shard_size records at random (without replacement) to
     primary_dir as pkl.gz whenever it fills to capacity."""
 
-    def __init__(self, primary_dir, capacity=LIVE_BUFFER_SIZE, shard_size=SHARD_SIZE):
+    def __init__(self, primary_dir, capacity=LIVE_BUFFER_SIZE,
+                 shard_size=SHARD_SIZE, counts=None):
         self.primary_dir = primary_dir
         self.capacity = capacity
         self.shard_size = shard_size
         self.records = []
+        # opening-repetition slot per record, parallel to self.records.
+        # UNTRACKED means the position was past the ply window; None means no
+        # key was recorded, and maybe_flush re-derives it from the record's own
+        # x. Kept alongside rather than inside the record so the on-disk schema
+        # stays a 7-tuple.
+        self.keys = []
+        self.counts = counts
 
     def __len__(self):
         return len(self.records)
 
-    def append(self, record):
+    def append(self, record, key=None):
         self.records.append(record)
+        self.keys.append(key)
 
-    def extend(self, records):
+    def extend(self, records, keys=None):
         self.records.extend(records)
+        self.keys.extend(keys if keys is not None else [None] * len(records))
+
+    def load_records(self, records):
+        """Replace the pool wholesale. Used by the state-reload and
+        remaining_untrained paths, whose records outlive the key list; None
+        keys make maybe_flush re-derive each slot from the record's own x, so a
+        restart weights its carryover identically to records that never left
+        memory."""
+        self.records = list(records)
+        self.keys = [None] * len(self.records)
 
     def maybe_flush(self):
         """Write one shard if at capacity. Returns the written path, or
         None if not yet full. Call in a loop if bulk-loading (e.g. from
-        remaining_untrained.pkl) could fill more than one shard at once."""
+        remaining_untrained.pkl) could fill more than one shard at once.
+
+        This is the only place opening reweighting happens. It must not move
+        into write_pkl_gz_shard -- shuffle_rewrite_primary calls that too, and
+        would compound the weighting every retrain cycle."""
         if len(self.records) < self.capacity:
             return None
 
         idx = set(random.sample(range(len(self.records)), self.shard_size))
         chunk = [r for i, r in enumerate(self.records) if i in idx]
+        chunk_keys = [k for i, k in enumerate(self.keys) if i in idx]
         self.records = [r for i, r in enumerate(self.records) if i not in idx]
+        self.keys = [k for i, k in enumerate(self.keys) if i not in idx]
+
+        if self.counts is not None:
+            chunk = apply_repeat_weights(chunk, chunk_keys, self.counts)
+            self.counts.decay()
 
         os.makedirs(self.primary_dir, exist_ok=True)
         path = new_shard_path(self.primary_dir)

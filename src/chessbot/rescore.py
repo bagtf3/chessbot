@@ -24,6 +24,7 @@ from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
 )
+from chessbot.opening_counts import COUNTS_FILE, OpeningCounts
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -276,7 +277,15 @@ class Rescorer(object):
         self.game_q   = sf_game_q
         self.res_q    = sf_res_q
 
-        self.live_buffer = LiveBuffer(cfg.primary_buffer_dir)
+        self.opening_counts = OpeningCounts(
+            os.path.join(cfg.run_dir, COUNTS_FILE))
+        loaded = self.opening_counts.load()
+        n = self.opening_counts.occupancy()
+        print(f"{RS} opening counts: {'loaded' if loaded else 'cold start'}, "
+              f"{n} slots occupied")
+
+        self.live_buffer = LiveBuffer(cfg.primary_buffer_dir,
+                                      counts=self.opening_counts)
         self.analyzed_results = []
 
 
@@ -371,11 +380,14 @@ class Rescorer(object):
         self.init_analyzer()
 
     def close(self):
-        pass
+        path = self.opening_counts.save()
+        print(f"{RS} opening counts saved: {path} "
+              f"({self.opening_counts.occupancy()} slots)")
 
     def export_state(self):
         return {
             'live_buffer_records': self.live_buffer.records,
+            'opening_counts': self.opening_counts.export_state(),
             'analyzed_results': self.analyzed_results,
             'games_seen': self.games_seen,
             'games_processed': self.games_processed,
@@ -430,7 +442,10 @@ class Rescorer(object):
     def import_state(self, state):
         for k, v in state.items():
             if k == 'live_buffer_records':
-                self.live_buffer.records = v
+                self.live_buffer.load_records(v)
+                continue
+            if k == 'opening_counts':
+                self.opening_counts.import_state(v)
                 continue
             # rolling stat windows were last_10_* back when they only held 10
             # entries; they now hold RECENT_WINDOW. Map the old keys across so
@@ -556,8 +571,10 @@ class Rescorer(object):
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         x, policy = self.make_policy_example(board, ucis, visits)
+        okey = self.opening_counts.key(board, x)
+        self.opening_counts.bump(okey)
         self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0'))
+            (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0'), okey)
 
     def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
         cfg = self.config
@@ -719,6 +736,7 @@ class Rescorer(object):
                 'lms': lms,
                 'x': x,
                 'idx_map': idx_map,
+                'okey': self.opening_counts.key(b_fast, x),
                 'skip_training': skip_all_training,
                 'xerces_uci': xerces_uci,
                 'sfen': short_fen,
@@ -962,7 +980,7 @@ class Rescorer(object):
             for idx, p in zip(indices, pi):
                 policy[idx] += p
 
-            pending.append((ply['x'], policy, Q, turn, i, vwht, pwht))
+            pending.append((ply['x'], policy, Q, turn, i, vwht, pwht, ply['okey']))
             sf_pv = ply.get('pv_ucis', [])
             if lc0_mode == 'pos_sf_xc0_pov':
                 xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:3]]
@@ -996,7 +1014,7 @@ class Rescorer(object):
         # loop 2: compute WDL targets, add to training, build lc0 waypoints
         lc0_waypoints = {}
         for tup, aux in zip(pending, pending_aux):
-            x, policy, Q, is_white, ply_i, vwht, pwht = tup
+            x, policy, Q, is_white, ply_i, vwht, pwht, okey = tup
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply_i, result)
             z_eff = eff_z_white if is_white else -eff_z_white
@@ -1024,7 +1042,8 @@ class Rescorer(object):
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
-                self.live_buffer.append(entry)
+                self.opening_counts.bump(okey)
+                self.live_buffer.append(entry, okey)
                 sc['accepted'] += 1
                 scw['accepted'] += 1
 
@@ -1038,7 +1057,12 @@ class Rescorer(object):
                     lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
                     sc['lc0_inacc'] += 1
                     scw['lc0_inacc'] += 1
-                elif random.random() < cfg.lc0_enrich_frac:
+                elif okey is None and random.random() < cfg.lc0_enrich_frac:
+                    # okey is None exactly when the position is past
+                    # MAX_TRACKED_PLY, so random enrichment never spends lc0
+                    # inference on an opening we would only downweight again.
+                    # Blunder and inaccuracy waypoints above are deliberately
+                    # not gated -- those are picked for a reason, not sampled.
                     lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
                     sc['lc0_enrich'] += 1
                     scw['lc0_enrich'] += 1
@@ -1059,7 +1083,8 @@ class Rescorer(object):
                     ucis_now = b_lc0.legal_moves()
                     self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, vwht, 1.0)
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
-                    lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs))))
+                    okey = self.opening_counts.key(b_lc0, x)
+                    lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs)), okey))
 
                     n_pv = 0
                     seen_fens = set()
@@ -1075,13 +1100,15 @@ class Rescorer(object):
                             if fen in seen_fens:
                                 continue
                             seen_fens.add(fen)
+                            x_pv = self.encode_board(b_pv)
                             self.lc0_thread.submit(
                                 b_pv.lc0_features(),
                                 b_pv,
-                                self.encode_board(b_pv),
+                                x_pv,
                                 vwht, 1.0,
                             )
-                            lc0_meta.append(('pv', None, None, None, []))
+                            lc0_meta.append(('pv', None, None, None, [],
+                                             self.opening_counts.key(b_pv, x_pv)))
                             n_pv += 1
                     sc['lc0_pv'] += n_pv
                     scw['lc0_pv'] += n_pv
@@ -1089,7 +1116,7 @@ class Rescorer(object):
 
             self.lc0_thread.flush()
             w = cfg.lc0_enrich_weight
-            for (kind, aux, Y, is_white, uci_flat), result in zip(lc0_meta, self.lc0_thread.drain()):
+            for (kind, aux, Y, is_white, uci_flat, okey), result in zip(lc0_meta, self.lc0_thread.drain()):
                 x, policy, lc0_wdl, vwht, pwht = result
                 if kind == 'pv':
                     source = 'lc0_pv'  # PV nodes only ever come from blunder/inacc waypoints
@@ -1097,9 +1124,10 @@ class Rescorer(object):
                     source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
                 else:
                     source = 'lc0_enrich'  # main position from random enrich sampling
+                self.opening_counts.bump(okey)
                 self.live_buffer.append(
                     (x, None, sparsify_policy(policy), lc0_wdl,
-                     vwht * w, pwht * w, source))
+                     vwht * w, pwht * w, source), okey)
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 

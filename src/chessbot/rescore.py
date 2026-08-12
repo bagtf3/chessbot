@@ -1439,7 +1439,14 @@ class Rescorer(object):
         print(f"{pfx} saved to {os.path.basename(progress_csv_path)} "
               f"+ {PRETRAIN_CONTINUED_CSV}")
 
-        combined = {k: primary[k] + historic[k] for k in primary}
+        # every value is a list except pol_true, which stack_policies builds as
+        # an (N, 1858) array -- `+` on that would add element-wise, not append
+        def cat(a, b):
+            if isinstance(a, np.ndarray):
+                return np.concatenate([a, b])
+            return a + b
+
+        combined = {k: cat(primary[k], historic[k]) for k in primary}
         self.save_validation_plots(
             epoch, os.path.join(run_dir, 'validation_latest.png'), combined)
 

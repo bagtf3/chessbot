@@ -161,7 +161,7 @@ class Config(object):
     history_K                = 6            # xc0h only: history frame count
 
     # inference / retrain backend selection
-    inference_backend        = "pt_eager"  # "pt_eager" | "ort_trt" | "lc0_trt"
+    inference_backend        = "ort_trt"  # "ort_trt" | "lc0_trt"
     retrain_backend          = "pt_eager"  # "pt_eager"
     trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
     trt_cache                = ""          # ort_trt: path to TRT engine cache dir

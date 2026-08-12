@@ -106,14 +106,25 @@ def prepare_trt(cfg, trt_dir, model_name):
     Deletes stale .engine files but preserves .profile and .timing for fast recompile.
     Patches cfg so workers call make_trt_session and get a cache hit, not a recompile.
     """
-    from chessbot.train_pytorch import export_ts_to_onnx
+    from chessbot.train_pytorch import export_ts_to_onnx, player_model_path
 
     os.makedirs(trt_dir, exist_ok=True)
     onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
 
-    print(f'[trt] exporting {os.path.basename(cfg.model_path)} -> '
+    # play the EMA when it exists. The trainer lineage stays at cfg.model_path
+    # and is what retrain resumes from; only inference reads the average.
+    # Check for the .pt: that is the file export_ts_to_onnx actually loads,
+    # and the player has no trace of its own.
+    from chessbot.train_pytorch import companion_pt
+    src_path = cfg.model_path
+    if src_path.endswith('.ts'):
+        swa = player_model_path(src_path)
+        if os.path.exists(companion_pt(swa)):
+            src_path = swa
+
+    print(f'[trt] exporting {os.path.basename(src_path)} -> '
           f'{os.path.basename(onnx_path)}')
-    export_ts_to_onnx(cfg.model_path, onnx_path, encoding_type=cfg.encoding_type)
+    export_ts_to_onnx(src_path, onnx_path, encoding_type=cfg.encoding_type)
 
     for f in os.listdir(trt_dir):
         if f.startswith(model_name) and f.endswith('.engine'):

@@ -180,9 +180,6 @@ def child_looper(
     game_queue,
     sf_queue=None,
 ):
-    if cfg.inference_backend == "pt_eager":
-        import torch
-        torch.backends.cudnn.benchmark = True
     with init_selfplay(
         cfg, recent_games_q, telemetry_q, msg_q,
         game_queue=game_queue, sf_queue=sf_queue,
@@ -427,13 +424,13 @@ def main(run_tag):
     finished_games = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
-    remaining_pkl = os.path.join(base_cfg.run_dir, "remaining_untrained.pkl")
-    if os.path.exists(remaining_pkl):
-        with open(remaining_pkl, "rb") as f:
-            rescorer.live_buffer.records = pickle.load(f)
+    remaining_pkl = rb.find_remaining_untrained(base_cfg.run_dir)
+    if remaining_pkl:
+        rescorer.live_buffer.records = rb.read_remaining_untrained(remaining_pkl)
         os.remove(remaining_pkl)
         n_loaded = len(rescorer.live_buffer)
-        print(f"[main] loaded {n_loaded} samples from remaining_untrained.pkl")
+        print(f"[main] loaded {n_loaded} samples from "
+              f"{os.path.basename(remaining_pkl)}")
         rescorer.live_buffer.flush_all_ready()
 
     rb.seed_replay_buffer(base_cfg.historic_dir, base_cfg.replay_buffer_dir)
@@ -825,6 +822,14 @@ def main(run_tag):
                             n_retrains, working_cfg.progress_csv_path, pred_pkl_path,
                             train_stats=result.get("train_stats"))
 
+                        # aggregation is the only consumer and it has the
+                        # numbers now, so ~880 MB of samples+preds can go. It
+                        # is rewritten from scratch by the next retrain, and a
+                        # raise above leaves it in place for inspection.
+                        if os.path.exists(pred_pkl_path):
+                            os.remove(pred_pkl_path)
+                            print("[retrain] removed predictions_latest.pkl")
+
                         n_retrains += 1
                         retrain_worker = None
 
@@ -910,13 +915,12 @@ def main(run_tag):
         for t in sf_rescore_threads:
             t.close()
         if rescorer.live_buffer.records:
-            remaining_pkl = os.path.join(
-                base_cfg.run_dir, "remaining_untrained.pkl"
+            remaining_pkl = rb.write_remaining_untrained(
+                base_cfg.run_dir, rescorer.live_buffer.records
             )
-            with open(remaining_pkl, "wb") as f:
-                pickle.dump(rescorer.live_buffer.records, f)
             n_saved = len(rescorer.live_buffer.records)
-            print(f"[main] saved {n_saved} samples to remaining_untrained.pkl")
+            print(f"[main] saved {n_saved} samples to "
+                  f"{os.path.basename(remaining_pkl)}")
         rescorer.close()
         for q in (game_queue, sf_queue):
             if q is not None:

@@ -135,15 +135,26 @@ def load_pt_model(path, log_params=False):
     raise ValueError(f"[pytorch] unrecognized checkpoint format in {path}")
 
 
-def save_pt_model(model, path, arch=None, opt=None):
+def save_pt_model(model, path, arch=None, opt=None, trace=True):
     """Save model.
     .ts path: TorchScript trace for inference + companion .pt state_dict for training.
     .pt path: state_dict dict only.
+
+    trace=False writes only the companion. Nothing reads the trace on the
+    selfplay path: pt_eager inference is retired and export_ts_to_onnx loads
+    companion_pt() instead, because TorchScript cannot export
+    aten::_native_multi_head_attention. The model is still moved and halved
+    either way, so the companion is byte-identical to the traced case.
     """
     if path.endswith(".ts"):
         trace_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_fp16 = trace_device.type == "cuda"
         trace_model = model.to(trace_device).half().eval() if use_fp16 else model.to(trace_device).eval()
+        if not trace:
+            pt_path = companion_pt(path)
+            torch.save({"model": model.state_dict(), "arch": arch}, pt_path)
+            print(f"[pytorch] weights saved -> {os.path.basename(pt_path)}")
+            return
         if isinstance(trace_model, torch.jit.ScriptModule):
             torch.jit.save(trace_model, path)
         else:
@@ -177,6 +188,73 @@ def save_pt_model(model, path, arch=None, opt=None):
 def pt_opt_state_path(model_path: str, run_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(model_path))[0]
     return os.path.join(run_dir, "train_ckpts", stem + "_opt_state.pt")
+
+
+PLAYER_SPAN = 7
+
+
+def player_state_path(model_path: str, run_dir: str) -> str:
+    """float32 EMA accumulator for the played model."""
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(run_dir, "train_ckpts", stem + "_player_state.pt")
+
+
+def player_model_path(model_path: str) -> str:
+    """{run}_model.ts (trainer) -> {run}_model_player.ts (played)"""
+    root, ext = os.path.splitext(model_path)
+    return root + "_player" + ext
+
+
+def update_player_ema(model_path, run_dir, model, arch, seed_state=None,
+                      span=PLAYER_SPAN):
+    """Fold the freshly trained weights into the played model's EMA.
+
+    Two lineages. The trainer is model_path: retrain always resumes from it
+    and the optimizer state stays paired with it, so nothing here feeds back
+    into training. This writes a separate _player file that selfplay plays.
+
+    Kept in float32 on disk. The model is fp16 and repeated 2/3:1/3 blending
+    at half precision drifts, so the accumulator carries the extra bits and
+    only the exported model is cast back down.
+    """
+    if arch is None:
+        print("[swa] no arch on the loaded model, skipping EMA export")
+        return None
+
+    alpha = 2.0 / (span + 1.0)
+    new = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+    path = player_state_path(model_path, run_dir)
+    if os.path.exists(path):
+        ema = torch.load(path, map_location="cpu")
+        src = "stored"
+    else:
+        base = seed_state if seed_state is not None else new
+        ema = {k: v.detach().cpu().float() for k, v in base.items()}
+        src = "seeded from pre-retrain weights"
+
+    out = {}
+    for k, v in new.items():
+        # index buffers such as sl_idx are not weights -- carry, never average
+        if v.dtype.is_floating_point and k in ema:
+            out[k] = (1.0 - alpha) * ema[k] + alpha * v.float()
+        else:
+            out[k] = v.clone()
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(out, path)
+
+    # Only the companion .pt is written. export_ts_to_onnx never opens the
+    # trace -- it loads companion_pt(ts_path) and rebuilds an eager fp16 model,
+    # because TorchScript export chokes on aten::_native_multi_head_attention.
+    # So tracing a _player.ts would cost a CUDA trace and 39 MB for nothing.
+    played = {k: (v.half() if v.dtype.is_floating_point else v)
+              for k, v in out.items()}
+    out_path = companion_pt(player_model_path(model_path))
+    torch.save({"model": played, "arch": arch}, out_path)
+    print(f"[swa] EMA{span} alpha={alpha:.3f} ({src}) -> "
+          f"{os.path.basename(out_path)}")
+    return out_path
 
 
 def print_pt_fit_history(epoch_losses, epoch, label=""):
@@ -409,17 +487,19 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
           f"value_ce_hat={lw_state['value_ce_hat']:.3f}  (cycle_steps={cycle_steps})")
 
     t0 = time.time()
-    if model_path.endswith(".ts"):
-        bak_path = model_path[:-3] + "_backup.ts"
-    else:
-        bak_path = model_path[:-3] + "_backup.pt"
-    if os.path.exists(model_path):
+    # Roll aside the weights, not the trace. The trace is no longer written,
+    # and a _backup.ts had no companion anyway, so it could only ever load as
+    # an inference-only ScriptModule -- useless for resuming training.
+    weights_path = companion_pt(model_path) if model_path.endswith(".ts") \
+        else model_path
+    bak_path = weights_path[:-3] + "_backup.pt"
+    if os.path.exists(weights_path):
         try:
-            os.replace(model_path, bak_path)
+            os.replace(weights_path, bak_path)
         except Exception as e:
             print(f"{tag} failed to backup existing model:", e)
 
-    save_pt_model(model, model_path, arch)
+    save_pt_model(model, model_path, arch, trace=False)
     print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
     print(f"{tag} retraining complete for epoch {epoch}")
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)

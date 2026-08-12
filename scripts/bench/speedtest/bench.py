@@ -81,9 +81,12 @@ def build_real_infer(cfg):
             cfg.model_path, cfg.trt_model_name, cfg.trt_cache,
             cfg.macro_batch, encoding_type=cfg.encoding_type)
     elif cfg.inference_backend == "pt_eager":
-        import torch
-        from chessbot.train_pytorch import make_pt_infer
-        model = torch.jit.load(cfg.model_path, map_location="cpu")
+        # eager is no longer a selfplay backend, but it stays here as a
+        # benchmark baseline. Load through load_pt_model rather than
+        # jit.load: retrain stopped writing the .ts, so the weights live in
+        # the companion .pt now.
+        from chessbot.train_pytorch import load_pt_model, make_pt_infer
+        model, _arch = load_pt_model(cfg.model_path)
         _, infer = make_pt_infer(
             model, max_bs=cfg.macro_batch, encoding_type=cfg.encoding_type)
     else:

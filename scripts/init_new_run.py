@@ -39,7 +39,7 @@ def load_yaml(path):
 
 def find_model_in_dir(d):
     p = Path(d)
-    for ext in ("*.pt", "*.ts", "*.h5"):
+    for ext in ("*.pt", "*.h5"):
         matches = sorted(p.glob(ext), key=lambda x: x.stat().st_mtime, reverse=True)
         if matches:
             return str(matches[0])
@@ -142,15 +142,14 @@ def main():
         # if found, copy into new run_dir preserving extension and set cfg.init_model
         if src_model and os.path.exists(src_model):
             src_ext = Path(src_model).suffix
-            if src_ext in (".pt", ".ts"):
-                # copy only the canonical {clone_tag}_model.* files;
-                # ignore *_backup.* stale copies (would otherwise collide
-                # on the single destination filename and silently win)
+            if src_ext == ".pt":
+                # copy only the canonical {clone_tag}_model.pt; ignore
+                # *_backup.* stale copies (would otherwise collide on the
+                # single destination filename and silently win). The .ts is
+                # not copied: nothing reads it any more, and a stale trace
+                # next to live weights is a trap.
                 pt_files = [
-                    f for f in (
-                        list(Path(src_dir).glob("*.pt")) +
-                        list(Path(src_dir).glob("*.ts"))
-                    )
+                    f for f in Path(src_dir).glob("*.pt")
                     if f.stem == f"{clone_tag}_model"
                 ]
                 cfg.init_model = None
@@ -252,12 +251,13 @@ def main():
                     print(f"[clone] copied {copied} TRT profile/timing cache "
                           f"file(s) from {clone_tag}/{trt_name}")
 
-        # move remaining_untrained.pkl if present
-        src_remaining = os.path.join(src_dir, "remaining_untrained.pkl")
-        if os.path.exists(src_remaining):
-            dst_remaining = os.path.join(dest_dir, "remaining_untrained.pkl")
-            shutil.move(src_remaining, dst_remaining)
-            print(f"[clone] moved remaining_untrained.pkl from {clone_tag}")
+        # move the untrained carryover if present, gz or the older plain pkl
+        import chessbot.replay_buffer as rb
+        src_remaining = rb.find_remaining_untrained(src_dir)
+        if src_remaining:
+            name = os.path.basename(src_remaining)
+            shutil.move(src_remaining, os.path.join(dest_dir, name))
+            print(f"[clone] moved {name} from {clone_tag}")
 
         # move sf_cache.pkl.gz if present
         src_sf_cache = os.path.join(src_dir, "sf_cache.pkl.gz")

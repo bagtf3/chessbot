@@ -882,10 +882,12 @@ def main() -> None:
         run_tag   = os.path.basename(run_dir)
         pt_path   = os.path.join(run_dir, f"{run_tag}_model.pt")
         ts_path   = os.path.join(run_dir, f"{run_tag}_model.ts")
-        torch.save(raw["model"], pt_path)
-        export_ts(model, ts_path, arch=arch_name)
+        # trace=False writes only companion_pt(ts_path), which is pt_path.
+        # It still moves and halves the model first, so the payload is the
+        # {model, arch} fp16 dict that load_pt_model and export_ts_to_onnx
+        # both expect -- a bare state_dict would be rejected by both.
+        export_ts(model, ts_path, arch=arch_name, trace=False)
         print(f"[train] export complete -> {pt_path}")
-        print(f"[train] export complete -> {ts_path}")
 
         # Lift-and-shift the pretraining optimizer state into selfplay's
         # retrain opt-state slot, so the first selfplay retrain warm-starts
@@ -919,17 +921,15 @@ def main() -> None:
                 swa_model.load_state_dict(avg)
                 swa_pt = os.path.join(run_dir, f"{run_tag}_model_SWA.pt")
                 swa_ts = os.path.join(run_dir, f"{run_tag}_model_SWA.ts")
-                torch.save(avg, swa_pt)
-                export_ts(swa_model, swa_ts, arch=arch_name)
+                export_ts(swa_model, swa_ts, arch=arch_name, trace=False)
                 print(f"[swa] averaged {len(found)} snapshots -> {swa_pt}")
-                print(f"[swa] averaged {len(found)} snapshots -> {swa_ts}")
 
                 # only now, with both artifacts confirmed on disk, drop the
                 # snapshots. The final training checkpoint is a _pt_ckpt file,
                 # a different pattern, so it cannot be caught here -- assert it
                 # anyway rather than trust that by inspection.
                 final_ckpt = ckpt_path(run_dir, name, last_ckpt)
-                if os.path.exists(swa_pt) and os.path.exists(swa_ts):
+                if os.path.exists(swa_pt):
                     for p in found:
                         if p == final_ckpt:
                             continue

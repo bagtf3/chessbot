@@ -100,6 +100,39 @@ def read_shard(path):
     return read_pkl_gz_shard(path)
 
 
+REMAINING_GZ = "remaining_untrained.pkl.gz"
+REMAINING_PKL = "remaining_untrained.pkl"
+
+
+def find_remaining_untrained(run_dir):
+    """Path to the untrained-sample carryover, gz preferred, else the plain
+    pkl older runs left behind. None when neither is present."""
+    for name in (REMAINING_GZ, REMAINING_PKL):
+        p = os.path.join(run_dir, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def read_remaining_untrained(path):
+    if str(path).lower().endswith(".gz"):
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def write_remaining_untrained(run_dir, records):
+    """Always writes gz. Any plain .pkl left from an older run is removed so
+    the two cannot disagree about which carryover is current."""
+    path = os.path.join(run_dir, REMAINING_GZ)
+    write_pkl_gz_shard(records, path)
+    stale = os.path.join(run_dir, REMAINING_PKL)
+    if os.path.exists(stale):
+        os.remove(stale)
+    return path
+
+
 def list_shard_files(dir_path):
     if not os.path.isdir(dir_path):
         return []

@@ -103,7 +103,7 @@ def run_retrain_worker(run_dir, msg_q, result_q, epoch):
 
 def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     import torch
-    from chessbot.train_pytorch import load_pt_model, retrain_pt
+    from chessbot.train_pytorch import load_pt_model, retrain_pt, update_player_ema
 
     cfg = Config.from_yaml(os.path.join(run_dir, "config.yaml"))
 
@@ -151,8 +151,17 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     model, arch = load_pt_model(cfg.model_path)
     args = SimpleNamespace(batch_size=cfg.retrain_batch_size)
+
+    # snapshot before training. On the first retrain this seeds the EMA with
+    # the weights that have been playing, so the average never starts cold --
+    # this run began from a pretrain SWA, which is already a 5-way blend.
+    seed_state = {k: v.detach().cpu().clone()
+                  for k, v in model.state_dict().items()}
+
     train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
                              model=model, arch=arch)
+
+    update_player_ema(cfg.model_path, run_dir, model, arch, seed_state=seed_state)
 
     result_q.put({"cmd": "retrain_done", "ok": True, "error": None,
                   "train_stats": train_stats})

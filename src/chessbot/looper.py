@@ -93,14 +93,7 @@ class GameLooper(object):
         else:
             self.batch_encoder = self.forest.get_all_encoded
 
-        if cfg.inference_backend == "pt_eager":
-            import torch
-            from chessbot.train_pytorch import make_pt_infer
-            model = torch.jit.load(cfg.model_path, map_location="cpu")
-            self.model, self.infer = make_pt_infer(
-                model, max_bs=cfg.macro_batch, encoding_type=encoding)
-            
-        elif cfg.inference_backend == "ort_trt":
+        if cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
                 cfg.trt_model_name,
@@ -173,12 +166,8 @@ class GameLooper(object):
         del self.model
         self.model = None
 
-        backend = self.config.inference_backend.lower()
-        if backend in ("pytorch", "pt_eager"):
-            import torch
-            torch.cuda.empty_cache()
-        elif backend in ("ort_trt", "lc0_trt"):
-            pass
+        # ort_trt and lc0_trt manage their own device memory, so there is
+        # nothing to reclaim here beyond the python side
         gc.collect()
 
         priors_cache_clear()

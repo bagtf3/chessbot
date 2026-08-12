@@ -36,7 +36,7 @@ import numpy as np
 
 from chessbot.config import Config
 from chessbot.replay_buffer import (
-    read_shard, sample_records, write_pkl_gz_shard,
+    read_shard, sample_records, stack_policies, write_pkl_gz_shard,
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_PRIMARY_RECORDS,
 )
 
@@ -82,7 +82,9 @@ def predict_fp16(model, X_list, batch_size):
 
 def records_to_arrays(records):
     X = np.stack([r[0] for r in records]).astype(np.int32)
-    P = np.stack([r[2] for r in records]).astype(np.float32)
+    # primary + replay + historic meet here, so this is where sparse (new)
+    # and dense (old, and historic tfrec) records mix
+    P = stack_policies(records)
     Y = np.array([r[3] for r in records], dtype=np.float32)
     vwht = np.array([r[4] for r in records], dtype=np.float32)
     pwht = np.array([r[5] for r in records], dtype=np.float32)

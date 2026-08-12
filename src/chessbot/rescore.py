@@ -21,7 +21,7 @@ from chessbot.utils import (
     calc_entropy, batch_policy_metrics,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
-from chessbot.replay_buffer import LiveBuffer, SEED_SOURCE
+from chessbot.replay_buffer import LiveBuffer, SEED_SOURCE, stack_policies
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -1298,8 +1298,7 @@ class Rescorer(object):
         eps = 1e-7
 
         def build_group(stream):
-            g = {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'pol_true': [],
-                 'pol_mask': [], 'source': []}
+            g = {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'source': []}
             samples = stream["samples"]
             preds = stream["preds"]
             if len(samples) != len(preds):
@@ -1309,9 +1308,11 @@ class Rescorer(object):
                 g['wdl_pred'].append(pred_wdl)
                 g['wdl_true'].append(np.array(sample[3], dtype=np.float64))
                 g['pol_pred'].append(pred_pol)
-                g['pol_true'].append(np.array(sample[2], dtype=np.float64))
-                g['pol_mask'].append(sample[1])
+                # guard drops once tick() stops appending Lc0Thread's raw
+                # 6-tuple, which has no source element
                 g['source'].append(sample[6] if len(sample) > 6 else 'xc0')
+            # one shot, and it handles sparse and dense records alike
+            g['pol_true'] = stack_policies(samples)
             return g
 
         primary = build_group(payload["primary"])
@@ -1337,7 +1338,7 @@ class Rescorer(object):
             corr = np.corrcoef(pred_v, true_v)[0, 1] if len(pred_v) > 1 else 0.0
 
             logits = np.array(g['pol_pred'], dtype=np.float32)
-            true_p = np.array(g['pol_true'], dtype=np.float32)
+            true_p = g['pol_true']
 
             # Same function pretraining validates with, on the same
             # target-support mask it uses (bootstrap's mstack = pstack > 0),

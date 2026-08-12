@@ -43,6 +43,8 @@ class Config(object):
     # chunked selection: one PUCT decision reserves N visits for a subtree,
     # delivered by N descents that resume mid-tree. Power of two, 1 = off.
     root_chunk_size = 1
+    # root visits before chunking engages; below it every descent is 1-by-1
+    chunk_warmup_visits = 100
     es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
     es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
     es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop

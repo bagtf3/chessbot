@@ -75,8 +75,8 @@ class Lc0Thread:
     def __init__(self, ort_session, batch_size=64):
         self.sess       = ort_session
         self.batch_size = batch_size
-        self.pending    = []   # (features_uint8, table_index, x, mask, vwht, pwht)
-        self.results    = []   # completed (x, mask, xc0_policy, lc0_wdl, vwht, pwht)
+        self.pending    = []   # (features_uint8, lc0_idx, xc0_idx, x, vwht, pwht)
+        self.results    = []   # completed (x, xc0_policy, lc0_wdl, vwht, pwht)
         self.n_inferences = 0
         self.n_samples    = 0
 
@@ -86,12 +86,12 @@ class Lc0Thread:
         self.input_name   = inputs[0].name
         self.output_names = [o.name for o in outputs]
 
-    def submit(self, features_uint8, board, x, mask, vwht, pwht):
+    def submit(self, features_uint8, board, x, vwht, pwht):
         ti   = lc0_table_index(features_uint8)
         ucis = board.legal_moves()
         lc0_idx = np.array([UCI_TO_IDX[ti][u.rstrip('n')] for u in ucis], dtype=np.int32)
         xc0_idx = np.array(board.moves_to_indices(ucis), dtype=np.int32)
-        self.pending.append((features_uint8, lc0_idx, xc0_idx, x, mask, vwht, pwht))
+        self.pending.append((features_uint8, lc0_idx, xc0_idx, x, vwht, pwht))
         if len(self.pending) >= self.batch_size:
             self.flush()
 
@@ -113,13 +113,20 @@ class Lc0Thread:
         xc0_policies = lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list)
 
         for i, item in enumerate(batch):
-            _, _, _, x, mask, vwht, pwht = item
-            policy = xc0_policies[i] * mask
+            _, _, _, x, vwht, pwht = item
+            # No legal-move mask: lc0_logits_to_xc0_batch scatters into a zeroed
+            # (n, 1858) at exactly this board's legal indices, so the row is
+            # already zero outside the legal set. The old `* mask` was a no-op
+            # that also promoted float32 -> float64, since the mask arrived as a
+            # python list. The renormalise stays -- it still matters when a
+            # position has no legal moves, and when two ucis collide on one
+            # xc0 index.
+            policy = xc0_policies[i].copy()
             s = policy.sum()
             if s > 0:
                 policy /= s
             self.results.append((
-                x, mask,
+                x,
                 policy,
                 np.array(wdl[i], dtype=np.float32),
                 vwht, pwht,
@@ -447,8 +454,12 @@ class Rescorer(object):
 
     def tick(self):
         if self.lc0_thread is not None:
-            for sample in self.lc0_thread.drain():
-                self.live_buffer.append(sample)
+            # Lc0Thread yields (x, policy, wdl, vwht, pwht); normalise to the
+            # 7-slot record schema rather than appending it raw. Unreachable in
+            # practice -- the game path flushes and drains before this runs.
+            for x, policy, wdl, vwht, pwht in self.lc0_thread.drain():
+                self.live_buffer.append(
+                    (x, None, policy, wdl, vwht, pwht, 'lc0_enrich'))
 
         # drain completed game batches from SF threads
         while True:
@@ -538,12 +549,11 @@ class Rescorer(object):
         for idx, p in zip(indices, pi):
             policy[idx] += p
         x = self.encode_board(board)
-        mask = board.legal_move_mask()
-        return x, mask, policy
+        return x, policy
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
-        x, mask, policy = self.make_policy_example(board, ucis, visits)
-        self.live_buffer.append((x, mask, policy, Y, vwht, pwht, 'xc0'))
+        x, policy = self.make_policy_example(board, ucis, visits)
+        self.live_buffer.append((x, None, policy, Y, vwht, pwht, 'xc0'))
 
     def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
         cfg = self.config
@@ -690,7 +700,6 @@ class Rescorer(object):
             lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
             x = self.encode_board(b_fast)
-            mask = b_fast.legal_move_mask()
             # short_fen still needed for the lc0 waypoint FEN check
             short_fen = b_fast.fen(include_counters=False)
 
@@ -705,7 +714,6 @@ class Rescorer(object):
                 'visits': visits,
                 'lms': lms,
                 'x': x,
-                'mask': mask,
                 'idx_map': idx_map,
                 'skip_training': skip_all_training,
                 'xerces_uci': xerces_uci,
@@ -950,7 +958,7 @@ class Rescorer(object):
             for idx, p in zip(indices, pi):
                 policy[idx] += p
 
-            pending.append((ply['x'], ply['mask'], policy, Q, turn, i, vwht, pwht))
+            pending.append((ply['x'], policy, Q, turn, i, vwht, pwht))
             sf_pv = ply.get('pv_ucis', [])
             if lc0_mode == 'pos_sf_xc0_pov':
                 xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:3]]
@@ -984,7 +992,7 @@ class Rescorer(object):
         # loop 2: compute WDL targets, add to training, build lc0 waypoints
         lc0_waypoints = {}
         for tup, aux in zip(pending, pending_aux):
-            x, mask, policy, Q, is_white, ply_i, vwht, pwht = tup
+            x, policy, Q, is_white, ply_i, vwht, pwht = tup
             z_orig = result if is_white else -result
             eff_z_white = eff_z_by_ply.get(ply_i, result)
             z_eff = eff_z_white if is_white else -eff_z_white
@@ -1009,7 +1017,7 @@ class Rescorer(object):
             sc['total'] += 1
             scw['total'] += 1
 
-            entry = (x, mask, policy, Y, vwht, pwht, 'xc0')
+            entry = (x, None, policy, Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
                 self.live_buffer.append(entry)
@@ -1043,9 +1051,9 @@ class Rescorer(object):
                         msg += f"!= {aux['sfen']}"
                         print(msg)
 
-                    x, mask, _, _, vwht, _, _ = entry
+                    x, _, _, _, vwht, _, _ = entry
                     ucis_now = b_lc0.legal_moves()
-                    self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, mask, vwht, 1.0)
+                    self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, vwht, 1.0)
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
                     lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs))))
 
@@ -1067,7 +1075,6 @@ class Rescorer(object):
                                 b_pv.lc0_features(),
                                 b_pv,
                                 self.encode_board(b_pv),
-                                b_pv.legal_move_mask(),
                                 vwht, 1.0,
                             )
                             lc0_meta.append(('pv', None, None, None, []))
@@ -1079,14 +1086,14 @@ class Rescorer(object):
             self.lc0_thread.flush()
             w = cfg.lc0_enrich_weight
             for (kind, aux, Y, is_white, uci_flat), result in zip(lc0_meta, self.lc0_thread.drain()):
-                x, mask, policy, lc0_wdl, vwht, pwht = result
+                x, policy, lc0_wdl, vwht, pwht = result
                 if kind == 'pv':
                     source = 'lc0_pv'  # PV nodes only ever come from blunder/inacc waypoints
                 elif aux.get('lc0_mode'):
                     source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
                 else:
                     source = 'lc0_enrich'  # main position from random enrich sampling
-                self.live_buffer.append((x, mask, policy, lc0_wdl, vwht * w, pwht * w, source))
+                self.live_buffer.append((x, None, policy, lc0_wdl, vwht * w, pwht * w, source))
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 
@@ -1308,9 +1315,7 @@ class Rescorer(object):
                 g['wdl_pred'].append(pred_wdl)
                 g['wdl_true'].append(np.array(sample[3], dtype=np.float64))
                 g['pol_pred'].append(pred_pol)
-                # guard drops once tick() stops appending Lc0Thread's raw
-                # 6-tuple, which has no source element
-                g['source'].append(sample[6] if len(sample) > 6 else 'xc0')
+                g['source'].append(sample[6])
             # one shot, and it handles sparse and dense records alike
             g['pol_true'] = stack_policies(samples)
             return g

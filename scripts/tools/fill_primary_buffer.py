@@ -24,7 +24,7 @@ import sys
 from chessbot.pretrain import EPOCH_SIZE, VAL_SHUFFLE_BUFFER, list_tfrecord_files
 from chessbot.replay_buffer import (
     PRIMARY_SEED_SHARDS, SEED_SOURCE, list_shard_files, new_shard_path,
-    write_pkl_gz_shard,
+    sparsify_policy, write_pkl_gz_shard,
 )
 
 
@@ -74,7 +74,7 @@ def main():
         pol = out["policy_logits"].numpy()
         val = out["value_out"].numpy()
         records = [
-            (enc[j], None, pol[j], val[j], 1.0, 1.0, SEED_SOURCE)
+            (enc[j], None, sparsify_policy(pol[j]), val[j], 1.0, 1.0, SEED_SOURCE)
             for j in range(enc.shape[0])
         ]
         path = new_shard_path(primary_dir)

@@ -148,7 +148,7 @@ def read_tfrec_gz_shard(path):
     dataset = tf.data.TFRecordDataset(path, compression_type="GZIP")
     for raw in dataset:
         feat = tf.io.parse_single_example(raw, feature_spec)
-        x = np.frombuffer(feat["xc0h_board"].numpy(), dtype=np.int16).astype(np.int32)
+        x = np.frombuffer(feat["xc0h_board"].numpy(), dtype=np.int16).copy()
         policy = np.frombuffer(feat["policy"].numpy(), dtype=np.float32).copy()
         policy = policy / policy.sum()
         Y = feat["wdl"].numpy().astype(np.float32)

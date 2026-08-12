@@ -81,7 +81,10 @@ def predict_fp16(model, X_list, batch_size):
 
 
 def records_to_arrays(records):
-    X = np.stack([r[0] for r in records]).astype(np.int32)
+    # x is int16 on every path and torch recasts on the way to the GPU
+    # (.long() for token encodings, .float() for lc0 planes), so an int32
+    # intermediate here just doubles the array for nothing
+    X = np.stack([r[0] for r in records])
     # primary + replay + historic meet here, so this is where sparse (new)
     # and dense (old, and historic tfrec) records mix
     P = stack_policies(records)

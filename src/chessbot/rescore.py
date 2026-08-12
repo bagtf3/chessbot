@@ -21,7 +21,9 @@ from chessbot.utils import (
     calc_entropy, batch_policy_metrics,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
-from chessbot.replay_buffer import LiveBuffer, SEED_SOURCE, stack_policies
+from chessbot.replay_buffer import (
+    LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
+)
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -459,7 +461,8 @@ class Rescorer(object):
             # practice -- the game path flushes and drains before this runs.
             for x, policy, wdl, vwht, pwht in self.lc0_thread.drain():
                 self.live_buffer.append(
-                    (x, None, policy, wdl, vwht, pwht, 'lc0_enrich'))
+                    (x, None, sparsify_policy(policy), wdl, vwht, pwht,
+                     'lc0_enrich'))
 
         # drain completed game batches from SF threads
         while True:
@@ -553,7 +556,8 @@ class Rescorer(object):
 
     def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
         x, policy = self.make_policy_example(board, ucis, visits)
-        self.live_buffer.append((x, None, policy, Y, vwht, pwht, 'xc0'))
+        self.live_buffer.append(
+            (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0'))
 
     def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
         cfg = self.config
@@ -1017,7 +1021,7 @@ class Rescorer(object):
             sc['total'] += 1
             scw['total'] += 1
 
-            entry = (x, None, policy, Y, vwht, pwht, 'xc0')
+            entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
                 self.live_buffer.append(entry)
@@ -1093,7 +1097,9 @@ class Rescorer(object):
                     source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
                 else:
                     source = 'lc0_enrich'  # main position from random enrich sampling
-                self.live_buffer.append((x, None, policy, lc0_wdl, vwht * w, pwht * w, source))
+                self.live_buffer.append(
+                    (x, None, sparsify_policy(policy), lc0_wdl,
+                     vwht * w, pwht * w, source))
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 

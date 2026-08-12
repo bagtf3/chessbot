@@ -50,7 +50,7 @@ from chessbot.pretrain import (
 )
 
 from chessbot.replay_buffer import (
-    new_shard_path, write_pkl_gz_shard, SEED_SOURCE,
+    new_shard_path, sparsify_policy, write_pkl_gz_shard, SEED_SOURCE,
     PRIMARY_SEED_SHARDS, REPLAY_SEED_SHARDS,
 )
 
@@ -750,7 +750,7 @@ def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
         pol = out["policy_logits"].numpy()
         val = out["value_out"].numpy()
         return [
-            (enc[i], None, pol[i], val[i], 1.0, 1.0, SEED_SOURCE)
+            (enc[i], None, sparsify_policy(pol[i]), val[i], 1.0, 1.0, SEED_SOURCE)
             for i in range(enc.shape[0])
         ]
 

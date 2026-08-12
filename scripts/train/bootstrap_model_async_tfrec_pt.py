@@ -50,7 +50,8 @@ from chessbot.pretrain import (
 )
 
 from chessbot.replay_buffer import (
-    new_shard_path, sparsify_policy, write_pkl_gz_shard, SEED_SOURCE,
+    find_remaining_untrained, new_shard_path, sparsify_policy,
+    write_pkl_gz_shard, write_remaining_untrained, SEED_SOURCE,
     PRIMARY_SEED_SHARDS, REPLAY_SEED_SHARDS,
 )
 
@@ -698,7 +699,6 @@ def worker_main(wargs: dict) -> None:
 def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
     replay_dir     = os.path.join(run_dir, "replay_buffer")
     primary_dir    = os.path.join(run_dir, "primary_buffer")
-    remaining_path = os.path.join(run_dir, "remaining_untrained.pkl")
 
     os.makedirs(replay_dir, exist_ok=True)
     os.makedirs(primary_dir, exist_ok=True)
@@ -734,7 +734,7 @@ def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
     # reuse=False, into pkl.gz shards matching the live selfplay schema.
     existing_primary = os.listdir(primary_dir)
     primary_needed = max(0, SEED_PRIMARY_SHARDS - len(existing_primary))
-    remaining_exists = os.path.exists(remaining_path)
+    remaining_exists = find_remaining_untrained(run_dir) is not None
 
     ds_iter = None
     if primary_needed > 0 or not remaining_exists:
@@ -771,8 +771,7 @@ def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
         remaining_records = []
         for _ in range(SEED_REMAINING_SHARDS):
             remaining_records.extend(drain_epoch())
-        with open(remaining_path, "wb") as f:
-            pickle.dump(remaining_records, f)
+        write_remaining_untrained(run_dir, remaining_records)
         status["remaining_untrained"] = (
             f"full fill: wrote {len(remaining_records):,} records"
         )

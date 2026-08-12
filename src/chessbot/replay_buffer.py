@@ -4,9 +4,20 @@ data pipeline. See replay_buffer_redesign.md for the full design.
 Record schema (used uniformly regardless of source file format):
     (x, mask, policy, Y, vwht, pwht, source)
 - x: board encoding array (int, model-input token sequence)
-- mask: legal move mask, unused downstream during retrain (kept for shape
-  parity with live selfplay records)
-- policy: float32[1858] policy target
+- mask: always None. Records written before the sparse-policy change carry a
+  1858-element list of 0/1 legal flags here; nothing reads it. The slot is
+  kept so tuple arity stays 7 and no element is renumbered.
+- policy: either a dense float32[1858] (old records, and records built from
+  historic tfrec.gz) or a sparse (int16 indices, float32 values) pair. At
+  ~1.5% density the sparse form is what makes shards cheap to write and
+  cheap to unpickle. Detect per record with is_sparse_policy; densify at the
+  point of use with densify_policy / stack_policies. Both forms are
+  supported indefinitely -- there is no migration pass, and a single shard
+  can hold a mix, because run_selfplay reloads remaining_untrained straight
+  into the live buffer without normalising. Never densify inside read_shard:
+  records staying sparse through the read is the whole point. Primary shards
+  self-convert as shuffle_rewrite_primary rewrites them each retrain;
+  replay and historic simply age out.
 - Y: float32[3] WDL target
 - vwht, pwht: value/policy sample weights
 - source: provenance tag string for real selfplay data; None for the old
@@ -46,6 +57,13 @@ SEED_SOURCE = "historic_seeded"
 VAL_PRIMARY_RECORDS = 20_480
 VAL_HISTORIC_RECORDS = 10_240
 
+# gzip's default is 9, which costs ~4x the write time of 6 for ~4% less disk.
+# Shard writes are on the rescorer's thread and run ~96 times per retrain
+# cycle, so the trade is heavily in favour of the faster level.
+GZIP_LEVEL = 6
+
+POLICY_DIM = 1858
+
 
 def new_shard_path(out_dir, suffix=".pkl.gz"):
     name = f"{int(time.time())}-{uuid.uuid4().hex}{suffix}"
@@ -54,9 +72,54 @@ def new_shard_path(out_dir, suffix=".pkl.gz"):
 
 def write_pkl_gz_shard(records, path):
     tmp_path = path + ".tmp"
-    with gzip.open(tmp_path, "wb") as f:
+    with gzip.open(tmp_path, "wb", compresslevel=GZIP_LEVEL) as f:
         pickle.dump(records, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp_path, path)
+
+
+def sparsify_policy(policy, dim=POLICY_DIM):
+    """Dense float32[dim] -> (int16 indices, float32 values) over nonzeros.
+
+    flatnonzero rather than `> 0`: a negative value must round-trip, not be
+    silently dropped. int16 holds 1858 with room to spare, but assert so a
+    future POLICY_DIM bump fails loudly instead of wrapping negative.
+    """
+    assert dim <= 32767, f"POLICY_DIM {dim} does not fit int16 indices"
+    p = np.asarray(policy, dtype=np.float32)
+    idx = np.flatnonzero(p).astype(np.int16)
+    return idx, p[idx]
+
+
+def is_sparse_policy(p):
+    """Sparse records carry a 2-tuple; dense ones carry an ndarray."""
+    return isinstance(p, tuple)
+
+
+def densify_policy(p, dim=POLICY_DIM):
+    """Either form -> dense float32[dim]."""
+    if not is_sparse_policy(p):
+        return np.asarray(p, dtype=np.float32)
+    idx, vals = p
+    out = np.zeros(dim, dtype=np.float32)
+    out[idx.astype(np.int32)] = vals
+    return out
+
+
+def stack_policies(records, index=2, dim=POLICY_DIM):
+    """(N, dim) dense stack from a list of records in either format.
+
+    The single densify point. Scatters straight into one preallocated array
+    rather than building N intermediates and stacking them.
+    """
+    out = np.zeros((len(records), dim), dtype=np.float32)
+    for i, r in enumerate(records):
+        p = r[index]
+        if is_sparse_policy(p):
+            idx, vals = p
+            out[i, idx.astype(np.int32)] = vals
+        else:
+            out[i] = p
+    return out
 
 
 def read_pkl_gz_shard(path):

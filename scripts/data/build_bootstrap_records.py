@@ -403,6 +403,15 @@ def align_sf(moves, sf_rows):
     return sf_rows, by_ply
 
 
+def absolute_ply(board):
+    """True ply of the position, from the FEN move counters.
+
+    Not board.game_ply(): that is a since-construction counter, so a board
+    built from a mid-game FEN reports 0 no matter how deep the position is.
+    """
+    return (board.fullmove_number() - 1) * 2 + (0 if board.white_to_move() else 1)
+
+
 def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc0_eligible=True):
     if not os.path.exists(game["pkl_file"]):
         return
@@ -504,7 +513,12 @@ def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc
                                 yield ('xc0', xc0h, policy, wdl)
                                 made_xc0 = True
 
-        lc0d_accept = 1.0 if scenario in LC0_FULL_SCENARIOS else min(1.0, 0.05 + ply * 0.95 / 16)
+        # absolute ply, not the loop index: `ply` counts moves played from the
+        # game's start_fen, so on a pre-opened game ply 0 is already deep into
+        # the game and was being downsampled as if it were an opening.
+        gply = absolute_ply(board)
+        lc0d_accept = (1.0 if scenario in LC0_FULL_SCENARIOS
+                       else min(1.0, 0.05 + gply * 0.95 / 16))
         if not made_xc0 and not dedup_skipped and lc0_batcher is not None and random.random() < lc0d_accept:
             xc0h = np.asarray(board.history_tokens(K), dtype=np.int16)
             lc0_batcher.submit(board.lc0_features(), board)

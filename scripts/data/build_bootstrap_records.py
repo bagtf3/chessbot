@@ -258,7 +258,11 @@ def lc0_stream(chunks, stop_evt):
             game_ply += 1
         prev_pl = pl
 
-        if game_ply < 15 and random.random() >= min(1.0, (game_ply + 1) * 0.05):
+        # Linear 5% at ply 0 -> 100% at ply 15, in even 6.3pt steps. The old
+        # form was (ply+1)*0.05 under a `game_ply < 15` guard, which left ply
+        # 14 at 75% and then jumped straight to 100% -- a 25pt cliff right
+        # where the opening ends. No guard needed now; the ramp reaches 1.0.
+        if random.random() >= min(1.0, 0.05 + 0.95 * game_ply / 15.0):
             continue
 
         probs = np.frombuffer(probs_bytes, dtype=np.float32)

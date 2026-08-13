@@ -30,6 +30,13 @@ only across the part of their opening inside the window. The gate applies at
 bump time, where a board exists; lookups need no gate, because a position that
 was never bumped reads back count 0 and weight 1.0 on its own.
 
+Only xerces-played positions bump the table. lc0 records -- distilled main
+positions and PV children alike -- neither bump it nor get reweighted by it:
+they are appended REWEIGHT_INELIGIBLE at every append site. An lc0 record is a
+second, independent observation of a position, so counting it would penalise
+the position for being studied, and reweighting it would compound the
+suppression already applied to the xc0 record it accompanies.
+
 Counts decay by COUNTS_DECAY_FACTOR on every shard write: half-life 138 shards
 (~10,800 games), steady state 200x the per-shard arrival rate. WEIGHT_BANDS is
 calibrated against that scale. Raising the decay does not merely lengthen
@@ -46,11 +53,13 @@ TABLE_BITS = 25
 TABLE_SIZE = 1 << TABLE_BITS
 KEY_MASK = TABLE_SIZE - 1
 
-# Sentinel for "board was past the ply gate", as distinct from None, which means
-# "no key was recorded, hash the record instead". Without the distinction a
-# known-untracked record would take a needless table lookup and could collide
-# with a hot opening slot.
-UNTRACKED = -1
+# Sentinel for "this record must never be reweighted", as distinct from None,
+# which means "no key was recorded, hash the record instead". Marked at the
+# append site: positions past the ply gate, and every lc0 record without
+# exception. Weighting and shard inclusion are separate concerns -- an
+# ineligible record is sampled into shards exactly like any other, it just
+# keeps the weights it arrived with.
+REWEIGHT_INELIGIBLE = -1
 
 # Length of the current-position frame at the head of every token encoding.
 POS_FRAME = 64
@@ -114,35 +123,40 @@ class OpeningCounts:
         self.n_decays = 0
 
     def key(self, board, x):
-        """Slot for a position we hold a board for, or UNTRACKED past the gate.
+        """Slot for a position we hold a board for, or REWEIGHT_INELIGIBLE
+        past the gate.
 
         Needs both: the board carries the ply, x carries the identity the slot
         is derived from, so a record can be re-keyed later without one.
         """
         if absolute_ply(board) > MAX_TRACKED_PLY:
-            return UNTRACKED
+            return REWEIGHT_INELIGIBLE
         return slot_from_x(x)
 
     def bump(self, key):
-        if key is None or key == UNTRACKED:
+        if key is None or key == REWEIGHT_INELIGIBLE:
             return
         self.counts[key] += 1.0
         self.n_bumps += 1
 
     def weights(self, keys, records):
-        """Per-record weights. UNTRACKED -> 1.0; a None key means the record
-        arrived without one (reloaded carryover, seeder output) and is hashed
-        from its own x here rather than escaping unweighted."""
+        """Per-record weights, plus the eligibility mask they were computed
+        under. REWEIGHT_INELIGIBLE -> weight 1.0 and eligible False; a None key
+        means the record arrived without one (reloaded carryover, seeder
+        output) and is hashed from its own x here rather than escaping
+        unweighted."""
         out = np.ones(len(keys), dtype=np.float32)
+        elig = np.zeros(len(keys), dtype=bool)
         idx, slots = [], []
         for i, k in enumerate(keys):
-            if k == UNTRACKED:
+            if k == REWEIGHT_INELIGIBLE:
                 continue
+            elig[i] = True
             idx.append(i)
             slots.append(slot_from_x(records[i][0]) if k is None else k)
         if idx:
             out[idx] = band_weights(self.counts[np.array(slots, dtype=np.int64)])
-        return out
+        return out, elig
 
     def decay(self, factor=COUNTS_DECAY_FACTOR):
         """Plain full-table multiply, ~16 ms at 1 << 25. Masking to nonzeros
@@ -200,25 +214,33 @@ class OpeningCounts:
         return True
 
 
-def reweight_and_rectify(records, w):
-    """Scale vwht and pwht by w, then restore both sums to what they were.
+def reweight_and_rectify(records, w, elig=None):
+    """Scale vwht and pwht by w on eligible records, then restore the eligible
+    subset's own sums.
+
+    Rectifying inside the eligible subset is what keeps an ineligible record
+    genuinely untouched: it neither sheds mass nor absorbs mass shed by others,
+    so it leaves carrying exactly the weights it arrived with. Total shard mass
+    is preserved either way, since the eligible mass is restored in full.
 
     vwht and pwht are rectified independently against their own pre-weight sums;
     they do not share a scale (lc0 records already sit at pwht 0.5, blunder plies
     at 3.0), so one target cannot serve both.
     """
-    if not (w < 1.0).any():
+    if elig is None:
+        elig = np.ones(len(records), dtype=bool)
+    if not (elig & (w < 1.0)).any():
         return records
 
     v = np.array([r[4] for r in records], dtype=np.float64)
     p = np.array([r[5] for r in records], dtype=np.float64)
-    v_target, p_target = v.sum(), p.sum()
-    v *= w
-    p *= w
-    if v.sum() > 0:
-        v *= v_target / v.sum()
-    if p.sum() > 0:
-        p *= p_target / p.sum()
+    v_target, p_target = v[elig].sum(), p[elig].sum()
+    v[elig] *= w[elig]
+    p[elig] *= w[elig]
+    if v[elig].sum() > 0:
+        v[elig] *= v_target / v[elig].sum()
+    if p[elig].sum() > 0:
+        p[elig] *= p_target / p[elig].sum()
 
     return [(r[0], r[1], r[2], r[3], float(v[i]), float(p[i]), r[6])
             for i, r in enumerate(records)]
@@ -226,14 +248,16 @@ def reweight_and_rectify(records, w):
 
 def apply_repeat_weights(chunk, keys, counts):
     """Downweight repeated openings inside one shard, then restore the shard's
-    mass.
+    mass. Records marked REWEIGHT_INELIGIBLE at append time pass through
+    untouched.
 
     Rectifying per shard rather than globally is what makes the scheme compose:
     each shard leaves with exactly the mass it arrived with, so any subset of
     shards a retrain draws is rectified too, and shuffle_rewrite_primary stirring
     records between shards perturbs that only to ~0.1%.
     """
-    return reweight_and_rectify(chunk, counts.weights(keys, chunk))
+    w, elig = counts.weights(keys, chunk)
+    return reweight_and_rectify(chunk, w, elig)
 
 
 # Historic tfrec shards never pass through LiveBuffer, so they arrive at a flat

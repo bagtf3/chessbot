@@ -300,6 +300,18 @@ def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
     )
 
 
+def print_pt_sample_weight_stats(vwht, pwht, epoch, label=""):
+    tag = f"[retrain{(' ' + label) if label else ''}]"
+    for name, w in (("pwht", np.asarray(pwht)), ("vwht", np.asarray(vwht))):
+        if not w.size:
+            continue
+        print(
+            f"{tag} {name} stats for epoch {epoch}: "
+            f"mean={w.mean():.2f}  median={np.median(w):.2f}  "
+            f"min={w.min():.2f}  max={w.max():.2f}  n={w.size}"
+        )
+
+
 def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                label="", timings=None, model=None, arch=None):
     """Load, train one epoch, save."""
@@ -349,8 +361,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     lw_state_path = retrain_lw_state_path(model_path, cfg.run_dir)
     if os.path.exists(lw_state_path):
         lw_state = torch.load(lw_state_path, map_location="cpu")
-        print(f"{tag} restored LW state: policy_ce_hat={lw_state.get('policy_ce_hat')}  "
-              f"value_ce_hat={lw_state.get('value_ce_hat')}")
+        print(f"{tag} restored LW state: "
+              f"policy_ce_hat={lw_state.get('policy_ce_hat'):.3f}  "
+              f"value_ce_hat={lw_state.get('value_ce_hat'):.3f}")
     else:
         lw_state = {"policy_ce_hat": None, "value_ce_hat": None}
         print(f"{tag} no prior LW state - starting fresh")
@@ -500,6 +513,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
             print(f"{tag} failed to backup existing model:", e)
 
     save_pt_model(model, model_path, arch, trace=False)
+    print_pt_sample_weight_stats(vwht, pwht, epoch, label=label)
     print_pt_grad_stats(epoch_grad_stats, epoch, label=label)
     print(f"{tag} retraining complete for epoch {epoch}")
     timings['save'] = timings.get('save', 0.0) + (time.time() - t0)

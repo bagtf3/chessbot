@@ -277,10 +277,10 @@ class LiveBuffer:
         self.shard_size = shard_size
         self.records = []
         # opening-repetition slot per record, parallel to self.records.
-        # UNTRACKED means the position was past the ply window; None means no
-        # key was recorded, and maybe_flush re-derives it from the record's own
-        # x. Kept alongside rather than inside the record so the on-disk schema
-        # stays a 7-tuple.
+        # REWEIGHT_INELIGIBLE means the record is never reweighted (past the
+        # ply window, or lc0); None means no key was recorded, and maybe_flush
+        # re-derives it from the record's own x. Kept alongside rather than
+        # inside the record so the on-disk schema stays a 7-tuple.
         self.keys = []
         self.counts = counts
 

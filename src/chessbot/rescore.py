@@ -24,7 +24,9 @@ from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
 )
-from chessbot.opening_counts import COUNTS_FILE, OpeningCounts
+from chessbot.opening_counts import (
+    COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts,
+)
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
@@ -287,6 +289,7 @@ class Rescorer(object):
         self.live_buffer = LiveBuffer(cfg.primary_buffer_dir,
                                       counts=self.opening_counts)
         self.analyzed_results = []
+        self.closed = False
 
 
         self.start_time = None  # set on first game to exclude idle startup time
@@ -380,8 +383,13 @@ class Rescorer(object):
         self.init_analyzer()
 
     def close(self):
+        """Idempotent -- run_selfplay closes on the normal path and again in
+        cleanup, and the counts are unchanged between the two."""
+        if self.closed:
+            return
+        self.closed = True
         path = self.opening_counts.save()
-        print(f"{RS} opening counts saved: {path} "
+        print(f"{RS} opening counts saved to {os.path.basename(path)} "
               f"({self.opening_counts.occupancy()} slots)")
 
     def export_state(self):
@@ -477,7 +485,7 @@ class Rescorer(object):
             for x, policy, wdl, vwht, pwht in self.lc0_thread.drain():
                 self.live_buffer.append(
                     (x, None, sparsify_policy(policy), wdl, vwht, pwht,
-                     'lc0_enrich'))
+                     'lc0_enrich'), REWEIGHT_INELIGIBLE)
 
         # drain completed game batches from SF threads
         while True:
@@ -965,6 +973,12 @@ class Rescorer(object):
                 elif kl >= self.kl_q50:
                     pwht *= cfg.kl_boost_median_mult
 
+            # the inaccuracy downweight applies to the xc0 record only. The lc0
+            # record that accompanies it is a second independent observation
+            # and carries its own weight, so it submits vwht_base -- inheriting
+            # the halved vwht would compose 0.5 xc0 + 0.25 lc0 on the value
+            # side against 0.5 + 0.5 on the policy side.
+            vwht_base = vwht
             if lc0_mode == 'pos_only':
                 pwht *= cfg.inaccuracy_downweight
                 vwht *= cfg.inaccuracy_downweight
@@ -995,6 +1009,7 @@ class Rescorer(object):
                 'pv_seqs':         pv_seqs,
                 'skip_xc0':        skip_xc0,
                 'lc0_mode':        lc0_mode,
+                'vwht_base':       vwht_base,
                 'is_blunder':      is_blunder,
                 'ply_i':           i,
                 'best_wdl':        tr.get('best_wdl'),
@@ -1042,8 +1057,13 @@ class Rescorer(object):
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
 
             if not aux.get('skip_xc0'):
+                # an inaccuracy ply is already suppressed to 0.5 to make room
+                # for its lc0 half, so the opening band must not take a second
+                # bite. The bump still happens: the position was played.
+                xc0_key = (REWEIGHT_INELIGIBLE
+                           if aux.get('lc0_mode') == 'pos_only' else okey)
                 self.opening_counts.bump(okey)
-                self.live_buffer.append(entry, okey)
+                self.live_buffer.append(entry, xc0_key)
                 sc['accepted'] += 1
                 scw['accepted'] += 1
 
@@ -1057,12 +1077,15 @@ class Rescorer(object):
                     lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
                     sc['lc0_inacc'] += 1
                     scw['lc0_inacc'] += 1
-                elif okey is None and random.random() < cfg.lc0_enrich_frac:
-                    # okey is None exactly when the position is past
-                    # MAX_TRACKED_PLY, so random enrichment never spends lc0
-                    # inference on an opening we would only downweight again.
-                    # Blunder and inaccuracy waypoints above are deliberately
-                    # not gated -- those are picked for a reason, not sampled.
+                elif random.random() < cfg.lc0_enrich_frac:
+                    # sampled on frac alone. This used to be gated on the
+                    # position being past MAX_TRACKED_PLY, to avoid spending
+                    # inference on an opening the band would suppress anyway --
+                    # but lc0 records are never reweighted now, so inclusion no
+                    # longer has anything to do with weighting. (The gate was
+                    # dead regardless: it tested `okey is None`, and key()
+                    # returns REWEIGHT_INELIGIBLE past the ply window, never
+                    # None, so no enrich record has ever been produced.)
                     lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
                     sc['lc0_enrich'] += 1
                     scw['lc0_enrich'] += 1
@@ -1079,12 +1102,12 @@ class Rescorer(object):
                         msg += f"!= {aux['sfen']}"
                         print(msg)
 
-                    x, _, _, _, vwht, _, _ = entry
+                    x, _, _, _, _, _, _ = entry
+                    vwht = aux['vwht_base']
                     ucis_now = b_lc0.legal_moves()
                     self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, vwht, 1.0)
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
-                    okey = self.opening_counts.key(b_lc0, x)
-                    lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs)), okey))
+                    lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs))))
 
                     n_pv = 0
                     seen_fens = set()
@@ -1107,8 +1130,7 @@ class Rescorer(object):
                                 x_pv,
                                 vwht, 1.0,
                             )
-                            lc0_meta.append(('pv', None, None, None, [],
-                                             self.opening_counts.key(b_pv, x_pv)))
+                            lc0_meta.append(('pv', None, None, None, []))
                             n_pv += 1
                     sc['lc0_pv'] += n_pv
                     scw['lc0_pv'] += n_pv
@@ -1116,7 +1138,7 @@ class Rescorer(object):
 
             self.lc0_thread.flush()
             w = cfg.lc0_enrich_weight
-            for (kind, aux, Y, is_white, uci_flat, okey), result in zip(lc0_meta, self.lc0_thread.drain()):
+            for (kind, aux, Y, is_white, uci_flat), result in zip(lc0_meta, self.lc0_thread.drain()):
                 x, policy, lc0_wdl, vwht, pwht = result
                 if kind == 'pv':
                     source = 'lc0_pv'  # PV nodes only ever come from blunder/inacc waypoints
@@ -1124,10 +1146,11 @@ class Rescorer(object):
                     source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
                 else:
                     source = 'lc0_enrich'  # main position from random enrich sampling
-                self.opening_counts.bump(okey)
+                # no bump and no key: only xerces-played moves count toward the
+                # opening table, and no lc0 record is ever reweighted by it
                 self.live_buffer.append(
                     (x, None, sparsify_policy(policy), lc0_wdl,
-                     vwht * w, pwht * w, source), okey)
+                     vwht * w, pwht * w, source), REWEIGHT_INELIGIBLE)
         
         self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
 

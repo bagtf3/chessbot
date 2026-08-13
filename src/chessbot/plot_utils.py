@@ -128,10 +128,11 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
 
     plt.tight_layout()
 
-    # ---- figure 2: 1x3 ----
-    fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
+    # ---- figure 2: 2x3 ----
+    fig2, axs2d = plt.subplots(2, 3, figsize=(15, 8))
     if title:
         fig2.suptitle(title, fontsize=12)
+    axs = axs2d[0]
 
     # top1 / top3 / top5
     ax = axs[0]
@@ -192,6 +193,39 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
         else:
             ax.text(0.5, 0.5, "no data", ha="center", va="center")
             ax.set_axis_off()
+
+    # bottom row: train loss (4:1 recompute), CE ratio, grad norm mean
+    axs_b = axs2d[1]
+    v_ce = np.array(col_vals("value_ce"))
+    p_ce = np.array(col_vals("policy_ce"))
+    have_ces = v_ce.size and p_ce.size and v_ce.size == p_ce.size
+
+    ax = axs_b[0]
+    if have_ces:
+        plot_panel(ax, 4.0 * v_ce + p_ce, "train_loss",
+                   title="train loss (4*value_ce + policy_ce)")
+    else:
+        ax.text(0.5, 0.5, "missing: value_ce / policy_ce",
+                ha="center", va="center")
+        ax.set_axis_off()
+
+    ax = axs_b[1]
+    if have_ces:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(p_ce != 0, v_ce / p_ce, np.nan)
+        plot_panel(ax, ratio, "value_ce/policy_ce", title="value CE / policy CE")
+    else:
+        ax.text(0.5, 0.5, "missing: value_ce / policy_ce",
+                ha="center", va="center")
+        ax.set_axis_off()
+
+    ax = axs_b[2]
+    gn = np.array(col_vals("gn_mean"))
+    if gn.size:
+        plot_panel(ax, gn, "gn_mean", title="grad norm mean")
+    else:
+        ax.text(0.5, 0.5, "missing: gn_mean", ha="center", va="center")
+        ax.set_axis_off()
 
     plt.tight_layout()
 

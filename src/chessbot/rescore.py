@@ -215,10 +215,11 @@ class SFRescoreThread:
                 break
             gid, positions = item
             results = []
+            TARGET_SEC = self.movetime_ms / 1000.0
+            TARGET_DEPTH = self.max_depth
+            limit = chess.engine.Limit(time=TARGET_SEC, depth=TARGET_DEPTH)
             try:
                 for ply_idx, board, xerces_uci in positions:
-                    limit = chess.engine.Limit(time=self.movetime_ms / 1000.0,
-                                               depth=self.max_depth)
                     elapsed = 0.0
                     depths = []
 
@@ -226,7 +227,7 @@ class SFRescoreThread:
                     t0 = time.time()
                     info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
                     elapsed += time.time() - t0
-                    depths.append(info.get('depth', 0))
+                    depth = info.get('depth', 0)
                     best_uci = str(info['pv'][0])
                     pv_ucis  = [str(m) for m in info.get('pv', [])[:3]]
                     best_cp  = score_cp_stm_pov(info['score'])
@@ -248,6 +249,7 @@ class SFRescoreThread:
                     else:
                         played_cp  = best_cp
                         played_abs = best_abs
+                        depths.append(depth)
 
                     results.append({
                         'ply_idx':    ply_idx,
@@ -273,7 +275,6 @@ class SFRescoreThread:
 
 
 class Rescorer(object):
-
     def __init__(self, cfg, sf_game_q, sf_res_q):
         self.config   = cfg
         self.game_q   = sf_game_q
@@ -352,8 +353,8 @@ class Rescorer(object):
         self.tscale_best_T = 0.0
         self.tscale_time = 0.0
 
-        self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL; hardcoded seed
-        self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL; hardcoded seed
+        self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL
+        self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL
 
         self.intake = deque()
         self.pending = {}
@@ -864,9 +865,10 @@ class Rescorer(object):
                 best_abs = played_abs
 
             loss_this = delta
-            missed_mate = (best_cp >= 1200) and (played_cp >= 500)
+            missed_mate = (best_cp >= 1200) and (played_cp >= 500) and (Z_stm > 0)
+            # missed mates are not really critical and have an oversized CPL penalty.
             if missed_mate:
-                loss_this = min(200, loss_this)
+                loss_this = min(100, loss_this)
             cpl_s += loss_this
             n_plies += 1
 
@@ -899,14 +901,12 @@ class Rescorer(object):
             if Z_stm <= 0.0:
                 blunder_cp = cfg.rescore_blunder_cp_loser
 
-            missed_mate_still_won = missed_mate and Z_stm > 0
-
             is_blunder = loss_this >= blunder_cp
             true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
 
             # mild and big blunders: drop xc0 record, queue lc0 instead
-            skip_xc0 = not missed_mate_still_won and (loss_this >= blunder_cp)
-            if missed_mate_still_won:
+            skip_xc0 = not missed_mate and (loss_this >= blunder_cp)
+            if missed_mate:
                 lc0_mode = None
             elif true_blunder:
                 lc0_mode = 'pos_sf_xc0_pov'
@@ -950,7 +950,9 @@ class Rescorer(object):
                             hi = mid
                     vis_arr = vis_arr ** (1.0 / best)
                     vis = list(vis_arr / vis_arr.sum())
-                    ne_after = calc_entropy(np.array(vis, dtype=np.float64), normed_only=True)
+                    ne_after = calc_entropy(
+                        np.array(vis, dtype=np.float64), normed_only=True)
+                    
                     self.tscale_n += 1
                     self.tscale_iters += iters
                     self.tscale_ne_before += ne
@@ -1107,7 +1109,9 @@ class Rescorer(object):
                     ucis_now = b_lc0.legal_moves()
                     self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, vwht, 1.0)
                     xc0_idxs = b_lc0.moves_to_indices(ucis_now)
-                    lc0_meta.append(('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs))))
+                    lc0_meta.append(
+                        ('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs)))
+                    )
 
                     n_pv = 0
                     seen_fens = set()

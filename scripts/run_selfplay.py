@@ -31,7 +31,6 @@ STOP_AFTER_ROUND_REQUESTED = threading.Event()
 NEXT_ROUND_REQUESTED = threading.Event()
 NO_NEW_GAMES_REQUESTED = threading.Event()
 ROUND_LIVE = threading.Event()
-RELOAD_REQUESTED = threading.Event()
 PAUSE_REQUESTED = threading.Event()
 UNPAUSE_REQUESTED = threading.Event()
 SAVE_TRAINING_DATA_REQUESTED = threading.Event()
@@ -79,9 +78,6 @@ def stdin_listener():
                 print("[cmd] no new games -- draining current games, "
                       "round ends normally")
                 NO_NEW_GAMES_REQUESTED.set()
-        elif cmd == 'reload':
-            print("[cmd] reload queued -- applies at next round start")
-            RELOAD_REQUESTED.set()
         elif parts[0] == 'pause':
             dur = int(parts[1]) if len(parts) > 1 else None
             print(f"[cmd] pausing workers{f' for {dur}s' if dur else ''}")
@@ -480,31 +476,10 @@ def main(run_tag):
                 rescorer_pending = len(rescorer.intake) + len(rescorer.pending)
                 print(f"[main loop] {len(finished_games)} unprocessed + {rescorer_pending} in rescorer queue")
 
-            # fresh reload each pass
+            # config is re-read from yaml each round, so edits to the run's
+            # config.yaml take effect at the next round boundary
             working_cfg = Config.from_yaml(yaml_path, init=True)
             is_validation = False
-
-            if RELOAD_REQUESTED.is_set():
-                RELOAD_REQUESTED.clear()
-                import importlib
-                import chessbot.config
-                import chessbot.rescore
-                import chessbot.review
-                importlib.reload(chessbot.config)
-                importlib.reload(chessbot.rescore)
-                importlib.reload(chessbot.review)
-                Config = chessbot.config.Config
-                state = rescorer.export_state()
-                rescorer = chessbot.rescore.Rescorer(base_cfg, sf_game_q, sf_res_q)
-                rescorer.import_state(state)
-                recorder = chessbot.review.RecordKeeper(
-                    n_retrains, run_num=run_num, every_sec=45.0
-                )
-
-                recorder.training_queue = len(rescorer.live_buffer)
-                recorder.primary_buffer_dir = working_cfg.primary_buffer_dir
-                recorder.primary_buffer_trigger = PTS
-                print("[cmd] reloaded config/rescore/review, rescorer state migrated")
 
             if run_num % base_cfg.validation_every == 0:
                 is_validation = True

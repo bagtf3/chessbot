@@ -215,9 +215,14 @@ class SFRescoreThread:
                 break
             gid, positions = item
             results = []
-            TARGET_SEC = self.movetime_ms / 1000.0
-            TARGET_DEPTH = self.max_depth
-            limit = chess.engine.Limit(time=TARGET_SEC, depth=TARGET_DEPTH)
+            
+            pass1_limit = chess.engine.Limit(
+                time=self.movetime_ms / 1000.0, depth=self.max_depth)
+
+            # longer search for pass2 because Xc0 move may be better
+            pass2_limit = chess.engine.Limit(
+                time=(self.movetime_ms + 10)/ 1000.0, depth=self.max_depth)
+            
             try:
                 for ply_idx, board, xerces_uci in positions:
                     elapsed = 0.0
@@ -225,7 +230,7 @@ class SFRescoreThread:
 
                     # pass 1: full best-move analysis
                     t0 = time.time()
-                    info = self.eng.analyse(board, limit, info=chess.engine.INFO_ALL)
+                    info = self.eng.analyse(board, pass1_limit, info=chess.engine.INFO_ALL)
                     elapsed += time.time() - t0
                     depth = info.get('depth', 0)
                     best_uci = str(info['pv'][0])
@@ -238,7 +243,7 @@ class SFRescoreThread:
                     if rerun:
                         t0 = time.time()
                         info2 = self.eng.analyse(
-                            board, limit,
+                            board, pass2_limit,
                             root_moves=[chess.Move.from_uci(xerces_uci)],
                             info=chess.engine.INFO_ALL,
                         )
@@ -514,7 +519,6 @@ class Rescorer(object):
 
     def init_analyzer(self):
         run_dir = self.config.run_dir
-        idx_path = os.path.join(run_dir, "game_index.json")
 
         # first merge any existing analysis
         _ = combine_analysis_staging(run_dir)
@@ -603,7 +607,6 @@ class Rescorer(object):
 
         priors_map = {c["uci"]: c["P"] for c in cm}
         priors = [priors_map.get(u, 0.0) for u in ucis]
-        kl = kl_divergence(priors, visits)
 
         vwht = value_weight_for_game(cfg, is_draw)
         self.append_flat_policy_example(board, ucis, visits, Y, vwht, policy_weight)
@@ -631,7 +634,6 @@ class Rescorer(object):
         tree_data = game_data.get('tree_search_data', {})
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
-        game_sf_depth = game_data.get('sf_depth')
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
 

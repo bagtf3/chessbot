@@ -265,7 +265,8 @@ class SFRescoreThread:
                         'played_cp':  played_cp,
                         'played_abs': played_abs,
                         'elapsed':    elapsed,
-                        'depth':      depths[0],
+                        'best_depth': depth,      # pass 1, the free search
+                        'depth':      depths[0],  # pass 2, the played move
                         'depths':     depths,
                         'rerun':      rerun,
                     })

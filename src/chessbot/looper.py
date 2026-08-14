@@ -46,6 +46,7 @@ class GameLooper(object):
         self.sf_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         self.forest = MCTSForest()
+        self.probe_records = []  # probe_mode only; see finalize_game_data
 
         self.pull_from_queue()
 
@@ -69,7 +70,13 @@ class GameLooper(object):
         if self.sf_thread is not None:
             self.sf_thread.close()
             self.sf_thread = None
-        
+
+    def write_probe_records(self, out_path):
+        """Dump everything accumulated under probe_mode as one file."""
+        with gzip.open(out_path, "wb") as f:
+            pickle.dump(self.probe_records, f, protocol=pickle.HIGHEST_PROTOCOL)
+        return len(self.probe_records)
+
 
     def __enter__(self):
         return self
@@ -412,6 +419,20 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
+        # probe runs are one move per position: accumulate in memory and let
+        # the driver write a single file, instead of a pkl per position
+        if getattr(self.config, "probe_mode", False):
+            self.games_finished += 1
+            self.probe_records.append({
+                **game.meta,
+                "probe_move": game.moves_played[0] if game.moves_played else None,
+                "search": game.tree_data[0] if game.tree_data else {},
+                "sims_done_total": game.tree.sims_done_total,
+            })
+            game.examples = []
+            game.recents.clear()
+            return
+
         # do not count extremely short games
         if game.plies <= self.config.min_game_length:
             game.examples = []

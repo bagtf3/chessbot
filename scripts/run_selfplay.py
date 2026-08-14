@@ -16,7 +16,10 @@ from chessbot.rescore import Rescorer, SFRescoreThread, migrate_pretrain_progres
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, next_model_epoch
-from chessbot.validation import build_validation_summary, create_validation_config
+from chessbot.validation import (
+    build_validation_summary, create_validation_config, create_probe_config,
+    probe_out_path, run_probe, analyse_probe_file, last_probe_epoch,
+)
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 from chessbot.retrain_worker import run_retrain_worker
@@ -39,6 +42,12 @@ WORKER_PROCS = []
 
 MAX_BACKLOG = 250
 GAME_QUEUE_MIN = 36  # top up when central queue drops below this
+
+# blunder-replay probe: one extra worker every Nth retrain, replaying a random
+# sample of scanned blunder positions. Seeded on the epoch, so each probe draws
+# a fresh sample and any one of them can be reproduced from its history row.
+PROBE_EVERY_RETRAINS = 5
+PROBE_N_POSITIONS = 2048
 
 
 def request_stop(signum=None, frame=None):
@@ -181,6 +190,74 @@ def child_looper(
         game_queue=game_queue, sf_queue=sf_queue,
     ) as looper:
         looper.run(stop_ev)
+
+
+def child_probe_looper(cfg, stop_ev, msg_q, n_positions, seed, out_path):
+    """Blunder-replay probe worker: builds its own games from the scanned
+    position pool, never touches the shared game queue."""
+    run_probe(cfg, n_positions, seed, out_path, stop_ev=stop_ev, msg_q=msg_q)
+
+
+def spawn_probe_worker(cfg, n_retrains, n_positions=PROBE_N_POSITIONS):
+    ctx = mp.get_context()
+    c = create_probe_config(cfg)
+    c.id = "probe"
+    out_path = probe_out_path(c, n_retrains)
+
+    stop_ev = ctx.Event()
+    msg_q = ctx.Queue()
+    p = ctx.Process(
+        target=child_probe_looper,
+        args=(c, stop_ev, msg_q, n_positions, n_retrains, out_path),
+        daemon=True,
+    )
+    p.start()
+    WORKER_PROCS.append(p)
+
+    print(f"[probe] worker up at epoch {n_retrains}: {n_positions} positions "
+          f"-> {os.path.basename(out_path)}")
+
+    return {
+        "id": c.id,
+        "p": p,
+        "stop_ev": stop_ev,
+        "msg_q": msg_q,
+        "out_path": out_path,
+        "n_retrains": n_retrains,
+        "stop_sent_at": None,
+        "term_sent_at": None,
+        "kill_sent_at": None,
+    }
+
+
+def collect_probe_worker(probe_worker, procs):
+    """
+    Once the probe worker is gone from procs the reaper has seen it exit, so
+    its file is final. Hand it to a short-lived process for the deep SF pass;
+    that is minutes of pure Stockfish time and must not block the main loop.
+
+    Returns the probe_worker to keep holding (None once collected).
+    """
+    if probe_worker is None:
+        return None
+
+    if any(w is probe_worker for w in procs):
+        return probe_worker
+
+    out_path = probe_worker["out_path"]
+    if not os.path.exists(out_path):
+        print("[probe] worker exited without writing a file")
+        return None
+
+    p = mp.get_context().Process(
+        target=analyse_probe_file,
+        args=(out_path,),
+        kwargs={"n_retrains": probe_worker["n_retrains"]},
+        daemon=True,
+    )
+    p.start()
+    print(f"[probe] deep SF analysis launched on {os.path.basename(out_path)}")
+    return None
 
 
 class ValidationSpecSource:
@@ -450,6 +527,20 @@ def main(run_tag):
     sf_queue = None
     game_gen = None
     retrain_worker = None
+    probe_worker = None
+    # with nothing on record, probe on the first round; otherwise pick the
+    # cadence back up where the previous process left it
+    last_probe = last_probe_epoch(
+        base_cfg.run_dir,
+        selfplay_dir=base_cfg.selfplay_dir,
+        previous_run_tag=base_cfg.previous_run_tag,
+    )
+    if last_probe is None:
+        last_probe = -PROBE_EVERY_RETRAINS
+        print("[probe] no probe history -- probing on the first round")
+    else:
+        print(f"[probe] last probe at epoch {last_probe}, next at "
+              f"{last_probe + PROBE_EVERY_RETRAINS}")
     total_games = 0
 
     PTS = rb.PRIMARY_TRIGGER_SHARDS
@@ -609,6 +700,21 @@ def main(run_tag):
                     procs,
                     crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
                 )
+                probe_worker = collect_probe_worker(probe_worker, procs)
+
+                # The cadence is measured in retrains, so this is checked every
+                # pass rather than at round start: a round spans many retrains,
+                # and a round-start check fires the probe late and at round
+                # cadence instead. One extra worker on top of the selfplay
+                # ones -- it lives in procs like any other, so pause/unpause,
+                # drain_and_stop and the reaper all apply to it for free.
+                probe_due = (not is_validation and probe_worker is None
+                             and not stop_signal_sent
+                             and n_retrains >= last_probe + PROBE_EVERY_RETRAINS)
+                if probe_due:
+                    last_probe = n_retrains
+                    probe_worker = spawn_probe_worker(working_cfg, n_retrains)
+                    procs.append(probe_worker)
 
                 # break if no workers and backlog is small enough to carry into next round
                 if not procs and len(finished_games) < MAX_BACKLOG:
@@ -826,6 +932,8 @@ def main(run_tag):
 
             if procs:
                 print(f"[warn] {len(procs)} workers still alive after shutdown")
+
+            probe_worker = collect_probe_worker(probe_worker, procs)
 
             for q in (game_queue, sf_queue):
                 if q is not None:

@@ -438,8 +438,8 @@ def run_deep_sf(live, todo, boards, movetime_ms, max_depth, n_threads):
         for r in results:
             scored[r["ply_idx"]] = r
         rate = len(scored) / max(time.time() - started, 1e-9)
-        print(f"{P} deep SF {len(scored)}/{len(todo)} ({rate:.1f} pos/s)",
-              end="\r")
+        print(f"{P} deep SF @{movetime_ms}ms {len(scored)}/{len(todo)} "
+              f"({rate:.1f} pos/s)", end="\r")
 
     for th in threads:
         th.close()

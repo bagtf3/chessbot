@@ -266,6 +266,13 @@ def main():
             shutil.move(src_sf_cache, dst_sf_cache)
             print(f"[clone] moved sf_cache.pkl.gz from {clone_tag}")
 
+        # move opening_counts.npz if present
+        src_opening_counts = os.path.join(src_dir, "opening_counts.npz")
+        if os.path.exists(src_opening_counts):
+            dst_opening_counts = os.path.join(dest_dir, "opening_counts.npz")
+            shutil.move(src_opening_counts, dst_opening_counts)
+            print(f"[clone] moved opening_counts.npz from {clone_tag}")
+
         # copy the progress csvs unless suppressed. Both must travel together:
         # Rescorer.migrate_pretrain_progress treats "continued file missing"
         # as "eval_progress.csv still holds pretraining rows" and moves the

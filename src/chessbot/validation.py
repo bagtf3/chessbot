@@ -216,31 +216,37 @@ def probe_pool_path(pool_path=None):
     return path
 
 
+def short_fen(fen):
+    """
+    Absolute position identity: board + side to move + castling rights + en
+    passant square, dropping the halfmove/fullmove counters. Two paths that
+    reach the same position land on the same key here even though their full
+    FENs differ -- the counters are path-dependent, not position-dependent.
+
+    This is the pool's key directly (not hashed): a live document should be
+    legible without a lookup, and a plain string costs nothing extra at this
+    pool size.
+    """
+    return " ".join(fen.split(" ")[:4])
+
+
 def load_probe_pool(pool_path=None):
     """
     The scanned blunder positions. This file is the probe's long-term memory,
     not a static input: every analysis pass writes back what Stockfish learned
     about the position and what the model played there.
 
-    Keyed by a stable hash of the FEN so records survive being appended to,
-    re-sampled, or merged from another scan.
+    Stored at rest as a dict keyed by short_fen, so the file is already in its
+    final shape -- no recompute-and-dedupe pass on every load.
     """
     path = probe_pool_path(pool_path)
     if not os.path.exists(path):
         raise RuntimeError(f"{P} no position pool at {path!r}")
 
     with gzip.open(path, "rb") as f:
-        raw = pickle.load(f)
+        pool = pickle.load(f)
 
-    pool = {}
-    for rec in raw:
-        rec["pos_id"] = hashlib.sha1(rec["fen"].encode()).hexdigest()[:16]
-        pool[rec["pos_id"]] = rec
-
-    if len(pool) != len(raw):
-        print(f"{P} pool: dropped {len(raw) - len(pool)} duplicate positions")
-
-    return list(pool.values())
+    return pool
 
 
 def save_probe_pool(pool, pool_path=None):
@@ -266,21 +272,20 @@ def probe_specs(cfg, pool, n_positions, seed=0):
     entry the position had in the original game.
 
     The original error travels in the meta, so a probe file carries its own
-    answer key and can be read without the pool it was sampled from.
+    answer key and can be read without the pool it was sampled from. Nothing
+    to filter here any more -- a position that has earned eviction is simply
+    not in the pool dict.
     """
-    n_all = len(pool)
-    pool = [r for r in pool if not r.get("retired")]
-    if len(pool) != n_all:
-        print(f"{P} skipping {n_all - len(pool)} retired positions")
-
-    if n_positions and n_positions < len(pool):
-        pool = random.Random(seed).sample(pool, n_positions)
+    keys = list(pool.keys())
+    if n_positions and n_positions < len(keys):
+        keys = random.Random(seed).sample(keys, n_positions)
 
     startpos = chess.Board().fen()
     specs = []
-    for rec in pool:
+    for key in keys:
+        rec = pool[key]
         meta = {
-            "pos_id": rec["pos_id"],
+            "short_fen": key,
             "src_run_tag": rec["run_tag"],
             "src_game_id": rec["game_id"],
             "src_move_num": rec["move_num"],

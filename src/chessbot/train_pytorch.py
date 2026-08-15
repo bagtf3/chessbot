@@ -293,7 +293,7 @@ def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
     mins    = [gs['gn_min']    for gs in epoch_grad_stats]
     maxs    = [gs['gn_max']    for gs in epoch_grad_stats]
     print(
-        f"{tag} gradient stats for epoch {epoch}: "
+        f"{tag} grad stats for epoch {epoch}: "
         f"mean={np.mean(means):.2f}  median={np.mean(medians):.2f}  "
         f"min={min(mins):.2f}  max={max(maxs):.2f}  "
         f"clips={sum(clips)}/{sum(steps)}"

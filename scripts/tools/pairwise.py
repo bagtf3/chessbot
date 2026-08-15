@@ -1,0 +1,106 @@
+"""Epoch x all uplift, split by move-changed and by improved/not-improved."""
+
+import itertools
+
+import numpy as np
+
+from chessbot.validation import load_probe_pool, PROBE_EQUIV_CPL
+
+pool = load_probe_pool()
+
+seen = {}
+for rec in pool:
+    for p in rec.get('probes') or []:
+        if p.get('epoch') is not None:
+            seen.setdefault(rec['pos_id'], {})[p['epoch']] = p
+
+epochs = sorted({e for v in seen.values() for e in v})
+print(f'positions with any probe : {len(seen)}')
+print(f'epochs                   : {epochs}')
+print(f'probed 2+ times          : {sum(1 for v in seen.values() if len(v) > 1)}\n')
+
+
+def pairs_for(a, b):
+    return [(v[a], v[b]) for v in seen.values() if a in v and b in v]
+
+
+def ci95(x):
+    n = len(x)
+    if n < 2:
+        return float('nan')
+    return 1.96 * np.std(x, ddof=1) / np.sqrt(n)
+
+
+def arrow(before, after):
+    return f'{before.mean():.1f} -> {after.mean():.1f}'
+
+
+def delta_ci(before, after):
+    d = after - before
+    return f'{d.mean():+.1f} +/- {ci95(d):.1f}'
+
+
+def pct_plain(mask):
+    return f'{100 * mask.mean():.1f}%'
+
+
+def pct_ci(mask):
+    return f'{100 * mask.mean():.1f}% +/- {100 * ci95(mask.astype(float)):.1f}%'
+
+
+def row(label, pairs, summary=False):
+    n = len(pairs)
+    before = np.array([x['cpl'] for x, y in pairs], dtype=float)
+    after = np.array([y['cpl'] for x, y in pairs], dtype=float)
+    diff_mv = np.array([x['move'] != y['move'] for x, y in pairs])
+    improved = after < before
+    equiv = after <= PROBE_EQUIV_CPL
+
+    # of the improved ones, how many are now equiv-or-better -- conditional
+    # on improved, not a fraction of n like the other percentage columns
+    imp_eq_cell = pct_plain(equiv[improved]) if improved.any() else ''
+
+    if summary:
+        cpl_cell = delta_ci(before, after)
+        cpl_diff_cell = (delta_ci(before[diff_mv], after[diff_mv])
+                         if diff_mv.any() else '')
+        diff_cell = pct_plain(diff_mv)
+        improved_cell = pct_plain(improved)
+        cpl_imp_cell = (delta_ci(before[improved], after[improved])
+                        if improved.any() else '')
+        cpl_not_imp_cell = (delta_ci(before[~improved], after[~improved])
+                            if (~improved).any() else '')
+    else:
+        cpl_cell = arrow(before, after)
+        cpl_diff_cell = arrow(before[diff_mv], after[diff_mv]) if diff_mv.any() else ''
+        diff_cell = pct_plain(diff_mv)
+        improved_cell = pct_plain(improved)
+        cpl_imp_cell = arrow(before[improved], after[improved]) if improved.any() else ''
+        cpl_not_imp_cell = (arrow(before[~improved], after[~improved])
+                            if (~improved).any() else '')
+
+    return {
+        'split': label, 'n': str(n), 'cpl': cpl_cell, 'diff': diff_cell,
+        'cpl (diff)': cpl_diff_cell, 'improved': improved_cell,
+        'improved & equiv': imp_eq_cell,
+        'cpl (improved)': cpl_imp_cell, 'cpl (!improved)': cpl_not_imp_cell,
+    }
+
+
+rows = []
+for a in epochs[:-1]:
+    pooled = [p for b in epochs if b > a for p in pairs_for(a, b)]
+    if pooled:
+        rows.append(row(f'{a} x all', pooled))
+
+everything = [p for a, b in itertools.combinations(epochs, 2)
+              for p in pairs_for(a, b)]
+rows.append(row('all x all', everything))
+rows.append(row('mean +/- CI', everything, summary=True))
+
+cols = ['split', 'n', 'cpl', 'diff', 'cpl (diff)', 'improved',
+       'improved & equiv', 'cpl (improved)', 'cpl (!improved)']
+widths = {c: max(len(c), max(len(r[c]) for r in rows)) for c in cols}
+print(' | '.join(c.center(widths[c]) for c in cols))
+for r in rows:
+    print(' | '.join(r[c].center(widths[c]) for c in cols))

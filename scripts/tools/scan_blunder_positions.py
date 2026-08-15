@@ -1,25 +1,45 @@
 """
-Scan analyzed validation games for positions worth re-testing.
+Scan analyzed games for positions worth re-testing.
 
-Pulls plies where xc0 made a real error in a game it lost or drew, and stores
-enough to rebuild the position from STARTPOS plus the original search snapshot.
-The deep SF pass that freezes the answer key runs later, on the pooled output.
+Pulls plies where a real error preceded a bad outcome for whoever made it, and
+stores enough to rebuild the position from STARTPOS plus the original search
+snapshot. The deep SF pass that freezes the answer key runs later, on the
+pooled output.
+
+Two modes, differing in which games and which outcome gate:
+
+  --mode validation   paired_validation games only, gated on xc0 losing or
+                      drawing the game. These never reach training, so the
+                      probe measures generalisation.
+
+  --mode selfplay     everything except paired_validation, gated per ply on
+                      Z_stm (the result from the mover's perspective) because
+                      xc0 plays both sides. These DO pass through training, so
+                      the probe measures self-correction through the RL loop.
 
 Classes (V = best_cp, P = played_cp, both STM-POV; cpl = V - P):
-  A  |V| <= 200 and cpl >= 60      tight position, real error
-  B  V >= 120 and P < 50           winning chances thrown away
-  F  V >= 1200 and P < 1000        mate available, not found
+  A   |V| <= 200 and cpl >= 60     tight position, real error
+  B   V >= 120 and P < 50          winning chances thrown away
+  F   V >= 1200 and P < 1000       mate available, not found (validation only)
+  G3  V >= 300 and P < 100         clearly winning, let it slip (selfplay only)
+
+In selfplay mode A is restricted to Z_stm == -1: prod SF only reaches d14-15,
+so an "error" the mover still converted is more likely measurement noise than
+a real one, and A has samples to spare.
 
 Class is not stored: V, P and cpl are, so the rules can be rerun or redefined
 against the pool without rescanning.
 """
 
 import argparse
+import collections
 import glob
 import gzip
 import hashlib
 import os
 import pickle
+import sys
+import time
 
 import chess
 import numpy as np
@@ -27,6 +47,12 @@ import pandas as pd
 
 from chessbot.review import load_game_index
 from chessbot.validation import load_probe_pool, save_probe_pool
+
+# stdout is fully buffered (not line-buffered) when redirected to a file, so
+# a background run's progress prints -- including every \r counter below --
+# sit invisible until the process exits. write_through makes every print land
+# immediately, same effect as `python -u`.
+sys.stdout.reconfigure(write_through=True)
 
 BASE = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
 RUN_PATTERNS = ["18m_*", "16m_xc0hK6_*"]
@@ -37,6 +63,8 @@ B_MIN_V = 120
 B_MAX_P = 50
 F_MIN_V = 1200
 F_MAX_P = 1000
+G_MIN_V = 300
+G_MAX_P = 100
 
 PLY_COLS = [
     "move_num", "played_move", "most_visited_move", "best_move",
@@ -62,6 +90,48 @@ def load_ply_frame(run_dir):
 
     with open(combined, "rb") as f:
         return pickle.load(f)["df_all"]
+
+
+def candidate_plies_selfplay(df, run_dir):
+    """
+    Selfplay plies matching A, B or G3, gated per ply on Z_stm.
+
+    xc0 plays both sides here, so the outcome gate cannot be game-level: it is
+    Z_stm, the result from the perspective of whoever is to move (+1 the mover
+    went on to win, 0 draw, -1 lost). A is restricted to losers -- with prod SF
+    only reaching d14-15, an "error" the mover still converted is more likely
+    measurement noise than a real one, and A has samples to spare.
+    """
+    # only scenarios that push moves from true STARTPOS. piece_odds,
+    # piece_training and random_init seed a custom fastboard(fen) directly, so
+    # history_uci for those never traces back to STARTPOS and build_records'
+    # replay-from-STARTPOS would land on the wrong position.
+    val = df[df["scenario"].isin(
+        ["startpos", "UHO", "pre_opened", "pre_opened_mini"])]
+    if not len(val):
+        return None
+
+    index = pd.DataFrame(load_game_index(run_dir))[["game_id", "result"]]
+    index = index.drop_duplicates("game_id")
+    merged = val.merge(index, on="game_id", how="inner")
+
+    # result is white-POV; flip it for the side actually on move
+    merged["z_stm"] = np.where(
+        merged["stm"].astype(bool), merged["result"], -merged["result"]
+    )
+
+    v = merged["best_cp"]
+    p = merged["played_cp"]
+    cpl = merged["delta"]
+    lost = merged["z_stm"] == -1
+    lost_or_drew = merged["z_stm"] <= 0
+
+    hit_a = lost & (v.abs() <= A_ABS_V) & (cpl >= A_MIN_CPL)
+    hit_b = lost_or_drew & (v >= B_MIN_V) & (p < B_MAX_P)
+    hit_g = lost_or_drew & (v >= G_MIN_V) & (p < G_MAX_P)
+
+    print(f"       A {hit_a.sum():,}  B {hit_b.sum():,}  G3 {hit_g.sum():,}")
+    return merged[hit_a | hit_b | hit_g]
 
 
 def candidate_plies(df, run_dir):
@@ -100,7 +170,15 @@ def log_path(run_dir, game_id):
 def build_records(run_tag, run_dir, hits):
     """Open each source log once and emit one record per candidate ply."""
     records = []
-    for game_id, group in hits.groupby("game_id"):
+    groups = hits.groupby("game_id")
+    n_games = groups.ngroups
+    started = time.time()
+    for i, (game_id, group) in enumerate(groups, 1):
+        if i % 500 == 0 or i == n_games:
+            rate = i / max(time.time() - started, 1e-9)
+            print(f"  {run_tag}: {i:,}/{n_games:,} games "
+                  f"({rate:.0f} games/s, {len(records):,} records so far)",
+                  end="\r")
         path = log_path(run_dir, game_id)
         if not os.path.exists(path):
             continue
@@ -132,16 +210,17 @@ def build_records(run_tag, run_dir, hits):
                 "game_id": game_id,
                 "move_num": ply,
                 "model_epoch": log.get("model_epoch"),
-                "xc0_result": float(row.xc0_result),
+                "xc0_result": getattr(row, "xc0_result", np.nan),
+                "z_stm": getattr(row, "z_stm", np.nan),
                 "played_move": row.played_move,
                 "most_visited_move": row.most_visited_move,
                 "sf_best_move": row.best_move,
-                "best_cp": int(row.best_cp),
-                "played_cp": int(row.played_cp),
-                "cpl": int(row.delta),
+                "best_cp": row.best_cp,
+                "played_cp": row.played_cp,
+                "cpl": row.delta,
                 # older runs predate these columns
-                "kl": float(getattr(row, "kl", np.nan)),
-                "ce": float(getattr(row, "ce", np.nan)),
+                "kl": getattr(row, "kl", np.nan),
+                "ce": getattr(row, "ce", np.nan),
                 "candidate_moves": snap.get("candidate_moves"),
             }
             for col in TREE_COLS:
@@ -149,17 +228,21 @@ def build_records(run_tag, run_dir, hits):
 
             records.append(rec)
 
+    print()
     return records
 
 
-def scan_run(run_dir):
+def scan_run(run_dir, mode="validation"):
     run_tag = os.path.basename(run_dir.rstrip("/\\"))
     df = load_ply_frame(run_dir)
     if df is None:
         print(f"[skip] {run_tag}: no analysis frame")
         return []
 
-    hits = candidate_plies(df, run_dir)
+    if mode == "selfplay":
+        hits = candidate_plies_selfplay(df, run_dir)
+    else:
+        hits = candidate_plies(df, run_dir)
     del df
     if hits is None or not len(hits):
         print(f"[none] {run_tag}: no candidates")
@@ -197,6 +280,33 @@ def merge_into_pool(new_records, pool_path):
     return len(pool), len(added), dupes
 
 
+def report_and_dedupe(records):
+    """Keep one record per FEN, and show which positions recurred."""
+    seen, out, dupes = {}, [], collections.Counter()
+    for rec in records:
+        fen = rec["fen"]
+        dupes[fen] += 1
+        if fen in seen:
+            continue
+        seen[fen] = rec
+        out.append(rec)
+
+    repeats = {f: n for f, n in dupes.items() if n > 1}
+    print(f"\nunique fens {len(out):,} of {len(records):,} records; "
+          f"{len(repeats):,} fens seen more than once")
+    if repeats:
+        hist = collections.Counter(repeats.values())
+        print("  times seen | how many fens")
+        for n in sorted(hist):
+            print(f"  {n:>10} | {hist[n]:,}")
+        print("\n  most repeated:")
+        for fen, n in sorted(repeats.items(), key=lambda kv: -kv[1])[:10]:
+            r = seen[fen]
+            print(f"  {n:>3}x  cpl {r['cpl']:>4}  {r['played_move']} "
+                  f"(best {r['sf_best_move']})  {fen}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default=BASE)
@@ -204,6 +314,8 @@ def main():
     ap.add_argument("--append", default=None,
                     help="merge into this existing pool instead of --out")
     ap.add_argument("--patterns", nargs="*", default=RUN_PATTERNS)
+    ap.add_argument("--mode", choices=("validation", "selfplay"),
+                    default="validation")
     args = ap.parse_args()
 
     run_dirs = []
@@ -220,11 +332,16 @@ def main():
 
     all_records = []
     for run_dir in run_dirs:
-        all_records.extend(scan_run(run_dir))
+        all_records.extend(scan_run(run_dir, args.mode))
         # checkpoint after each run: a scan is minutes long and one bad
         # frame should not cost the dirs already done
         with gzip.open(staging, "wb") as f:
             pickle.dump(all_records, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    all_records = report_and_dedupe(all_records)
+
+    with gzip.open(staging, "wb") as f:
+        pickle.dump(all_records, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     print(f"\ntotal {len(all_records)} records -> {staging}")
 

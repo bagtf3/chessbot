@@ -48,6 +48,12 @@ def cp_to_value_tanh(cp, mid_cp=200.0):
     return np.clip(math.tanh(k * cp), -0.97, 0.97)
 
 
+def scalar_to_wdl(z):
+    """Continuous -1..1 -> WDL, unlike a one-hot game-outcome mapping."""
+    z = float(z)
+    return np.array([max(z, 0.0), 1.0 - abs(z), max(-z, 0.0)], dtype=np.float32)
+
+
 def score_to_value_white(board_score):
     # always look from whites perspective
     from_white = board_score.white()

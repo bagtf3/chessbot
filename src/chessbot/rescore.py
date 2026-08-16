@@ -18,7 +18,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
-    calc_entropy, batch_policy_metrics,
+    calc_entropy, batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
 )
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from chessbot.replay_buffer import (
@@ -46,10 +46,10 @@ BLUNDER_MERGE_EVERY = 256
 # blunder-replay analysis fires purely on collected-row count, not a retrain
 # cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
 # before a summary is computed and the file resets to a fresh window
-BLUNDER_REPLAY_ANALYSIS_EVERY = 2048
+BLUNDER_REPLAY_ANALYSIS_EVERY = 4096
 BLUNDER_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
-    "true_blunder", "false_blunder",
+    "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
 )
 ANALYZE_PKL = "analyze_results_combined.pkl"
 PRETRAIN_CONTINUED_CSV = "eval_progress_pretrain_continued.csv"
@@ -200,7 +200,7 @@ class SFRescoreThread:
         # rerun) that would otherwise run away.
         self.max_depth = 24
         self.base_ms = cfg.rescore_movetime_ms
-        self.throttled_ms = max(10, self.base_ms - 10)
+        self.throttled_ms = max(10, self.base_ms - 15)
         self.movetime_ms = self.base_ms
         self.sf_config = {'Hash': 256}
         self.stop_ev = threading.Event()
@@ -213,7 +213,7 @@ class SFRescoreThread:
 
     def update_config(self, cfg):
         self.base_ms = cfg.rescore_movetime_ms
-        self.throttled_ms = max(10, self.base_ms - 10)
+        self.throttled_ms = max(10, self.base_ms - 15)
         if self.movetime_ms > self.base_ms:
             self.movetime_ms = self.base_ms
 
@@ -908,15 +908,14 @@ class Rescorer(object):
             tr = tree_data.get(i, tree_data.get(str(i), {}))
             xerces_uci = brp_data.get('xerces_uci')
 
-            # no Q/x/lms/idx_map here -- finalize_blunder_replay only reads
-            # xerces_uci/best_uci/best_cp/played_cp/tr, and replays never
-            # build a training example, so skip the board-encode/legal-moves
-            # work that only that would need
+            # cloned pre-move so a qualifying probe can build a training
+            # example at finalize time without backtracking from history_uci
             ply = {
                 'ply_idx': i, 'mv': mv,
                 'turn': bool(turn),
                 'tr': tr,
                 'xerces_uci': xerces_uci,
+                'board': b_fast.clone(),
                 'resolved': False,
             }
 
@@ -1016,11 +1015,12 @@ class Rescorer(object):
             played_depth=ply.get('depth'),
             sims=tr.get('sims'), stop_reason=tr.get('stop_reason'),
             from_cache=False,
+            ply=ply,
         )
 
     def finalize_replay_result(self, brp_data, pool, probe_move, best_uci,
                                 best_cp, played_cp, best_depth, played_depth,
-                                sims, stop_reason, from_cache):
+                                sims, stop_reason, from_cache, ply=None):
         """
         Shared by the normal SF-completion path (finalize_blunder_replay)
         and start_blunder_replay's cache-hit shortcut. Ratchet-stores the
@@ -1063,6 +1063,13 @@ class Rescorer(object):
             if found_equiv:
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
+            elif ply is not None and probe_cpl > 60:
+                added_epoch = src.get('model_epoch')
+                age_ok = (added_epoch is None
+                          or (epoch is not None and epoch - added_epoch > 5))
+                if age_ok:
+                    self.add_blunder_replay_training_example(
+                        ply, epoch, best_uci, best_cp, probe_cpl)
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1091,6 +1098,64 @@ class Rescorer(object):
         self.n_replay_finalized += 1
         if self.n_replay_rows >= BLUNDER_REPLAY_ANALYSIS_EVERY:
             self.analyse_brp_file()
+
+    def add_blunder_replay_training_example(self, ply, epoch, best_uci,
+                                             best_cp, probe_cpl):
+        """
+        Still-live, still-bad, stale-discovery replay probes never earn a
+        normal training example on their own -- this is the only path that
+        turns one into a live_buffer sample. Blends the replaying model's
+        own search (visits + WDL) with the SF probe result: 1 visit on every
+        legal move plus the rest piled on SF's best move, and SF's cp turned
+        into a WDL via the tanh value curve. alpha (SF weight) scales 0.25 at
+        probe_cpl=60 up to 0.75 at probe_cpl>=150 -- the worse xc0's move,
+        the more the sample leans on SF.
+        """
+        board = ply['board']
+        tr = ply.get('tr') or {}
+
+        cm = tr.get('candidate_moves', [])
+        xc0_pairs = [(c['uci'], max(1, c['visits'])) for c in cm]
+        if not xc0_pairs:
+            return
+
+        legal_ucis = board.legal_moves()
+        if best_uci not in legal_ucis:
+            return
+
+        total_visits = sum(v for _, v in xc0_pairs)
+        sf_visits = {u: 1 for u in legal_ucis}
+        sf_visits[best_uci] += max(total_visits - len(legal_ucis), 0)
+
+        xc0_probs = {u: v / total_visits for u, v in xc0_pairs}
+        sf_total = sum(sf_visits.values())
+        sf_probs = {u: v / sf_total for u, v in sf_visits.items()}
+
+        alpha = 0.25 + (min(max(probe_cpl, 60), 150) - 60) / 90.0 * 0.5
+
+        ucis = sorted(set(xc0_probs) | set(sf_probs))
+        blended = np.array([
+            alpha * sf_probs.get(u, 0.0) + (1 - alpha) * xc0_probs.get(u, 0.0)
+            for u in ucis
+        ], dtype=np.float32)
+        blended = blended / blended.sum()
+
+        indices = board.moves_to_indices(ucis)
+        policy = np.zeros(1858, dtype=np.float32)
+        for idx, p in zip(indices, blended):
+            policy[idx] += p
+
+        wdl_xc0 = tr.get('best_wdl')
+        wdl_xc0 = (np.array(wdl_xc0, dtype=np.float32) if wdl_xc0 is not None
+                   else scalar_to_wdl(tr.get('Q_stm', 0.0)))
+        wdl_sf = scalar_to_wdl(cp_to_value_tanh(best_cp, mid_cp=200.0))
+        Y = alpha * wdl_sf + (1.0 - alpha) * wdl_xc0
+
+        x = self.encode_board(board)
+        okey = self.opening_counts.key(board, x)
+        self.opening_counts.bump(okey)
+        self.live_buffer.append(
+            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0'), okey)
 
     def analyse_brp_file(self):
         """
@@ -1270,9 +1335,13 @@ class Rescorer(object):
 
             is_blunder = loss_this >= blunder_cp
             true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
+            is_inaccuracy = (
+                not missed_mate and not is_blunder
+                and loss_this >= cfg.rescore_inaccuracy_cp
+            )
 
             self.accumulate_blunder_stats(
-                missed_mate, is_blunder, true_blunder,
+                missed_mate, is_blunder, true_blunder, is_inaccuracy,
                 best_cp, played_cp, loss_this, Z_stm,
             )
 
@@ -1570,7 +1639,7 @@ class Rescorer(object):
 
 
     def accumulate_blunder_stats(self, missed_mate, is_blunder, true_blunder,
-                                 best_cp, played_cp, cpl, z_stm):
+                                 is_inaccuracy, best_cp, played_cp, cpl, z_stm):
         def bump(key, value):
             for acc in (self.total_blunder, self.window_blunder):
                 acc[key]['n'] += 1
@@ -1592,11 +1661,15 @@ class Rescorer(object):
         elif is_blunder:
             bump('false_blunder', cpl)
 
+        if is_inaccuracy:
+            bump('inaccuracy', cpl)
+
+        if missed_mate or is_blunder:
+            bump('all_blunders', cpl)
+
     def print_blunder_stats(self):
         acc = self.window_blunder
-        primary = ("missed_mate", "A", "B", "G3", "F", "U")
-        weighted_keys = ("A", "B", "G3", "F", "U")
-        secondary = ("true_blunder", "false_blunder")
+        primary = ("A", "B", "G3", "U")
         pool_eligible = ("A", "B", "G3", "F")
 
         def avg(k):
@@ -1610,17 +1683,11 @@ class Rescorer(object):
 
         print(f"{RS} blunder types (last 100):")
         row("total", "total")
+        row("inaccuracies", "inaccuracy")
         for k in primary:
             row(k, k)
-
-        w_n = sum(acc[k]['n'] for k in weighted_keys)
-        if w_n:
-            w_cpl = sum(acc[k]['cpl'] for k in weighted_keys)
-            print(f"{RS}  {'weighted (A/B/G3/F/U)':<24} "
-                  f"n={w_n:>6}  cpl={w_cpl / w_n:6.2f}")
-
-        for k in secondary:
-            row(k, k)
+        row("true_blunder", "true_blunder")
+        row("all blunders", "all_blunders")
 
         # same A/B/G3/F rule maybe_add_blunder_candidate uses -- fraction of
         # all trainable plies this window that would qualify for the pool

@@ -43,7 +43,7 @@ from chessbot import SP_DIR
 from chessbot.review import load_game_index, ANALYZE_PKL
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch
 from chessbot.opening_counts import absolute_ply
-from chessbot.utils import calc_entropy
+from chessbot.utils import calc_entropy, scalar_to_wdl as to_wdl
 from chessbot.game_utils import reconcile_game_boards
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
@@ -126,11 +126,6 @@ def make_example(xc0h_board, policy, wdl):
         "wdl":        tf.train.Feature(float_list=tf.train.FloatList(value=wdl.tolist())),
     }
     return tf.train.Example(features=tf.train.Features(feature=feat)).SerializeToString()
-
-
-def to_wdl(z):
-    z = float(z)
-    return np.array([max(z, 0.0), 1.0 - abs(z), max(-z, 0.0)], dtype=np.float32)
 
 
 def partition(items, n):

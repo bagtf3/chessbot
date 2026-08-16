@@ -414,7 +414,6 @@ def pull_pkl(to_process):
 
 
 def main(run_tag):
-    global Config
     # build base config and work out the yaml paths
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
 

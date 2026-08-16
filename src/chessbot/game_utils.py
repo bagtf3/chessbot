@@ -670,7 +670,15 @@ class GameGenerator:
         replay_cfg = create_blunder_replay_config(self.config)
         specs = blunder_replay_specs(
             replay_cfg, pool, n_to_queue, seed=self.games_queued)
+
+        before = self.brps_queued
         self.brps_queued += len(specs)
+        # heartbeat only, not per-call -- this fires many times per round in
+        # small batches by design
+        if self.brps_queued // 500 != before // 500:
+            print(f"[blunder_replay] {self.brps_queued} queued this round "
+                  f"(target {BLUNDER_REPLAY_PER_ROUND})")
+
         return specs
 
     def validation_games(self, cfg=None):

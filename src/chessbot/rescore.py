@@ -1,4 +1,4 @@
-import os, json, gzip, time
+import os, json, gzip, glob, time
 from types import SimpleNamespace
 from pathlib import Path
 import uuid
@@ -33,6 +33,8 @@ from chessbot.blunder_replay import (
     load_probe_pool, save_probe_pool, evicted_path, evict_position,
     BLUNDER_REPLAY_EQUIV_CPL, BLUNDER_REPLAY_HISTORY_FILENAME,
     blunder_replay_dir, BLUNDER_POOL_MAX_SIZE,
+    BLUNDER_REPLAY_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
+    BLUNDER_REPLAY_START_MS, BLUNDER_REPLAY_MS_STEP, BLUNDER_REPLAY_MS_MAX_MULT,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -369,14 +371,6 @@ class Rescorer(object):
         self.recent_kl_plies = []
         self.recent_ce_plies = []
 
-        zero_collar = lambda: {
-            'games': 0, 'triggers': 0, 'positions': 0,
-            'total_pos': 0, 'seen': 0}
-
-        self.collar_total = zero_collar()
-        self.collar_window = zero_collar()
-        self.collar_history = []
-
         zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
         self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
@@ -438,7 +432,8 @@ class Rescorer(object):
 
     def maybe_add_blunder_candidate(self, pool, game_data, gid, ply_idx,
                                     played_uci, best_uci, best_cp,
-                                    played_cp, cpl, z_stm):
+                                    played_cp, cpl, z_stm,
+                                    best_depth=None, played_depth=None):
         """
         Same A/B/G3/F rules the old scan_blunder_positions.py scan applied
         post-hoc, checked live against the values finalize_game already
@@ -446,7 +441,9 @@ class Rescorer(object):
         maybe_save_pool decides when that hits disk. Only STARTPOS-traceable
         scenarios qualify: piece_odds, piece_training and random_init seed a
         custom FEN directly, so history_uci for those never traces back to
-        STARTPOS.
+        STARTPOS. If the discovering game's own SF pass already reached
+        BLUNDER_REPLAY_MIN_CACHE_DEPTH+, seed the deep cache immediately so
+        the first replay probe can potentially skip SF entirely.
         """
         scenario = game_data.get('scenario')
         if scenario not in BLUNDER_SCENARIOS:
@@ -474,7 +471,7 @@ class Rescorer(object):
             # pool is full -- drop the candidate, no eviction pressure yet
             return
         else:
-            pool[key] = {
+            rec = {
                 "fen": fen,
                 "uci_path": uci_path,
                 "start_ply": offset + ply_idx,
@@ -491,6 +488,14 @@ class Rescorer(object):
                 "cpl": cpl,
                 "times_seen": 1,
             }
+            if (best_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                ratchet_store(rec, best_uci, best_cp, best_depth)
+            if (played_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                ratchet_store(rec, played_uci, played_cp, played_depth)
+            if rec.get("deep_evals", {}).get(best_uci) is not None:
+                rec["deep_best_move"] = best_uci
+                rec["deep_best_cp"] = best_cp
+            pool[key] = rec
 
         self.n_pool_changes += 1
         self.maybe_save_pool(pool)
@@ -565,7 +570,7 @@ class Rescorer(object):
         # larger pending for these because theyre just single moves
         while self.blunder_replay_intake and len(self.pending) < 40:
             brp_data = self.blunder_replay_intake.popleft()
-            self.start_blunder_replay(brp_data=brp_data)
+            self.start_blunder_replay(brp_data=brp_data, pool=pool)
 
         if len(self.intake) > len(self.pending):
             intake_list = list(self.intake)
@@ -716,8 +721,7 @@ class Rescorer(object):
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
             'inaccuracy_downweight',
             'uniform_eps', 'prior_clip_max',
-            'collar_threshold_cp', 'collar_n_consec', 'collar_reset_cp',
-            'use_collar_rescoring', 'rescore_analyze_batch',
+            'rescore_analyze_batch',
             'draw_value_scale',
             'vscale', 'lc0_enrich_frac', 'lc0_enrich_weight'
         )
@@ -844,11 +848,35 @@ class Rescorer(object):
         else:
             self.finalize_game(self.pending.pop(gid), pool)
 
-    def start_blunder_replay(self, brp_data):
+    def start_blunder_replay(self, brp_data, pool):
         gid = str(brp_data.get('game_id'))
         if gid in self.games_seen:
             return
-        
+
+        short_fen_key = brp_data.get('short_fen')
+        xerces_uci = brp_data.get('xerces_uci')
+
+        # both the best move and the move actually played here already
+        # cached at BLUNDER_REPLAY_MIN_CACHE_DEPTH+ from an earlier probe or
+        # from initial pool-add seeding -- skip SF entirely
+        if pool is not None and short_fen_key in pool:
+            hit = cached_deep_score(
+                pool[short_fen_key], xerces_uci, BLUNDER_REPLAY_MIN_CACHE_DEPTH)
+            if hit is not None:
+                self.games_seen.add(gid)
+                self.finalize_replay_result(
+                    brp_data, pool,
+                    probe_move=xerces_uci,
+                    best_uci=hit['deep_best_move'],
+                    best_cp=hit['deep_best_cp'],
+                    played_cp=hit['deep_played_cp'],
+                    best_depth=hit['deep_best_depth'],
+                    played_depth=hit['deep_depth'],
+                    sims=None, stop_reason=None,
+                    from_cache=True,
+                )
+                return
+
         board_ch, b_fast = reconcile_game_boards(
             brp_data['start_fen'], brp_data.get('history_uci'),
             brp_data.get('moves_played'),
@@ -893,7 +921,15 @@ class Rescorer(object):
         if to_sf_positions:
             self.n_sf_submitted += len(to_sf_positions)
             game_state['waiting'] = True
-            self.game_q.put((gid, to_sf_positions, {"movetime_ms": 300}))
+            sf_ms = BLUNDER_REPLAY_START_MS
+            if pool is not None and short_fen_key in pool:
+                src = pool[short_fen_key]
+                if not src.get('sf_ms'):
+                    src['sf_ms'] = BLUNDER_REPLAY_START_MS
+                    self.n_pool_changes += 1
+                    self.maybe_save_pool(pool)
+                sf_ms = src['sf_ms']
+            self.game_q.put((gid, to_sf_positions, {"movetime_ms": sf_ms}))
         else:
             # should never get here (every replay has exactly one move), but
             # if it does, pop instead of leaking a permanent pending slot
@@ -935,6 +971,8 @@ class Rescorer(object):
             ply['pv_ucis']    = r.get('pv_ucis', [])
             ply['played_cp']  = played_cp
             ply['played_abs'] = played_abs
+            ply['best_depth'] = r.get('best_depth')
+            ply['depth']      = r.get('depth')
             ply['resolved']   = True
 
         game['waiting'] = False
@@ -945,42 +983,80 @@ class Rescorer(object):
             self.finalize_game(game_state, pool)
 
     def finalize_blunder_replay(self, game_state, pool):
-        """One SF result per replay -- no ratchet/escalating-budget cache
-        like the old analyse_probe_file. Evicts on the first found_equiv,
-        full stop -- with replays this frequent a streak requirement is
+        """One SF result per replay. Evicts on the first found_equiv, full
+        stop -- with replays this frequent a streak requirement is
         pointless."""
         gid = game_state['gid']
-        self.games_seen.add(gid)
-        self.games_processed += 1
-
         brp_data = game_state['brp_data']
         ply_states = game_state['ply_states']
         if not ply_states or not ply_states[0].get('resolved'):
+            self.games_seen.add(gid)
             return
         ply = ply_states[0]
+        tr = ply.get('tr') or {}
 
+        self.games_seen.add(gid)
+        self.finalize_replay_result(
+            brp_data, pool,
+            probe_move=ply.get('xerces_uci'),
+            best_uci=ply.get('best_uci'),
+            best_cp=ply.get('best_cp'),
+            played_cp=ply.get('played_cp'),
+            best_depth=ply.get('best_depth'),
+            played_depth=ply.get('depth'),
+            sims=tr.get('sims'), stop_reason=tr.get('stop_reason'),
+            from_cache=False,
+        )
+
+    def finalize_replay_result(self, brp_data, pool, probe_move, best_uci,
+                                best_cp, played_cp, best_depth, played_depth,
+                                sims, stop_reason, from_cache):
+        """
+        Shared by the normal SF-completion path (finalize_blunder_replay)
+        and start_blunder_replay's cache-hit shortcut. Ratchet-stores the
+        best/played move eval+depth onto the pool record on every outcome,
+        not just eviction, so a later probe of the same still-live position
+        can skip SF via cached_deep_score.
+        """
         short_fen_key = brp_data.get('short_fen')
         orig_move = brp_data.get('orig_move')
         orig_cpl = brp_data.get('orig_cpl')
         epoch = brp_data.get('model_epoch')
-
-        probe_move = ply.get('xerces_uci')
-        best_uci = ply.get('best_uci')
-        best_cp = ply.get('best_cp')
-        played_cp = ply.get('played_cp')
 
         probe_cpl = best_cp - played_cp
         found_best = probe_move == best_uci
         found_equiv = probe_cpl <= BLUNDER_REPLAY_EQUIV_CPL
         same_move = probe_move == orig_move
 
-        if found_equiv and short_fen_key and pool is not None and short_fen_key in pool:
-            evict_position(pool, short_fen_key, "found_equiv", epoch,
-                           evicted_path(self.blunder_pool_path))
+        if short_fen_key and pool is not None and short_fen_key in pool:
+            src = pool[short_fen_key]
+            if not from_cache:
+                if (best_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                    ratchet_store(src, best_uci, best_cp, best_depth)
+                if (played_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                    ratchet_store(src, probe_move, played_cp, played_depth)
+                depths_map = src.get('deep_depths') or {}
+                prev_depth = depths_map.get(src.get('deep_best_move')) or 0
+                if (best_depth or 0) >= prev_depth:
+                    src['deep_best_move'] = best_uci
+                    src['deep_best_cp'] = best_cp
+
+                # neither resolved (found_equiv) nor locked a deep-enough
+                # best move this probe -- buy more depth next time
+                if not found_equiv and (best_depth or 0) < BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                    current_ms = src.get('sf_ms') or BLUNDER_REPLAY_START_MS
+                    src['sf_ms'] = min(
+                        current_ms + BLUNDER_REPLAY_MS_STEP,
+                        BLUNDER_REPLAY_START_MS * BLUNDER_REPLAY_MS_MAX_MULT,
+                    )
+
+            if found_equiv:
+                evict_position(pool, short_fen_key, "found_equiv", epoch,
+                               evicted_path(self.blunder_pool_path))
+
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
 
-        tr = ply.get('tr') or {}
         row = {
             "short_fen": short_fen_key,
             "src_run_tag": brp_data.get('src_run_tag'),
@@ -994,8 +1070,9 @@ class Rescorer(object):
             "found_best": found_best,
             "found_equiv": found_equiv,
             "evicted": found_equiv,
-            "sims": tr.get('sims'),
-            "stop_reason": tr.get('stop_reason'),
+            "sims": sims,
+            "stop_reason": stop_reason,
+            "from_cache": from_cache,
         }
         with open(self.blunder_replay_jsonl, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=float) + "\n")
@@ -1025,12 +1102,22 @@ class Rescorer(object):
             self.n_replay_rows = 0
             return
 
-        df = pd.DataFrame(rows)
+        new_df = pd.DataFrame(rows)
         epoch = rows[-1].get("model_epoch")
 
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        csv_path = os.path.join(
-            blunder_replay_dir(self.config), f"brp_e{epoch}_{stamp}.csv")
+        # two 2048-row windows can land on the same epoch if replay
+        # throughput outpaces the retrain cadence -- append onto that
+        # epoch's existing CSV instead of splitting across multiple files
+        existing = glob.glob(os.path.join(
+            blunder_replay_dir(self.config), f"brp_e{epoch}_*.csv"))
+        if existing:
+            csv_path = existing[0]
+            df = pd.concat([pd.read_csv(csv_path), new_df], ignore_index=True)
+        else:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            csv_path = os.path.join(
+                blunder_replay_dir(self.config), f"brp_e{epoch}_{stamp}.csv")
+            df = new_df
         df.to_csv(csv_path, index=False)
 
         summary = {
@@ -1105,7 +1192,7 @@ class Rescorer(object):
             delta = best_cp - played_cp
             if abs(delta) <= EQUIV:
                 delta = 0
-            
+
             elif delta <= -EQUIV:
                 # xerces found a notably better move than SF
                 best_uci = xerces_uci
@@ -1113,7 +1200,24 @@ class Rescorer(object):
                 best_abs = played_abs
 
             loss_this = delta
-            missed_mate = (best_cp >= 1200) and (played_cp >= 500) and (Z_stm > 0)
+
+            # variable blunder threshold based on outcome -- computed here
+            # (not just below, where it used to live) so missed_mate can
+            # gate on "did this actually clear the blunder bar", not just
+            # "are both scores huge". A small gap between two huge scores
+            # (e.g. best=1500, played=1450) is not a missed mate. This also
+            # rules out the delta<=-EQUIV case above on its own: delta is
+            # negative there and blunder_cp is always positive, so
+            # delta >= blunder_cp can never be true when xerces outplayed
+            # SF's own recorded best.
+            blunder_cp = cfg.rescore_blunder_cp_winner
+            if Z_stm <= 0.0:
+                blunder_cp = cfg.rescore_blunder_cp_loser
+
+            missed_mate = (
+                best_cp >= 1200 and played_cp >= 500 and Z_stm > 0
+                and delta >= blunder_cp
+            )
             # missed mates are not really critical and have an oversized CPL penalty.
             if missed_mate:
                 loss_this = min(100, loss_this)
@@ -1125,6 +1229,7 @@ class Rescorer(object):
                 self.maybe_add_blunder_candidate(
                     pool, game_data, gid, i, xerces_uci, best_uci, best_cp,
                     played_cp, loss_this, Z_stm,
+                    best_depth=ply.get('best_depth'), played_depth=ply.get('depth'),
                 )
 
             eval_trace.append((i, best_abs))
@@ -1150,11 +1255,6 @@ class Rescorer(object):
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
 
             kl_eligible = loss_this <= EQUIV
-
-            # variable blunder thresholds based on outcome
-            blunder_cp = cfg.rescore_blunder_cp_winner
-            if Z_stm <= 0.0:
-                blunder_cp = cfg.rescore_blunder_cp_loser
 
             is_blunder = loss_this >= blunder_cp
             true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
@@ -1277,10 +1377,6 @@ class Rescorer(object):
                 'best_wdl':        tr.get('best_wdl'),
             })
 
-        # collar-adjusted result targets
-        eff_z_by_ply, n_triggers = collar_z_map(eval_trace, result, cfg, gid)
-
-        n_diff = 0
         sc = self.sample_counts
         scw = self.sample_counts_window
 
@@ -1293,13 +1389,7 @@ class Rescorer(object):
         lc0_waypoints = {}
         for tup, aux in zip(pending, pending_aux):
             x, policy, Q, is_white, ply_i, vwht, pwht, okey = tup
-            z_orig = result if is_white else -result
-            eff_z_white = eff_z_by_ply.get(ply_i, result)
-            z_eff = eff_z_white if is_white else -eff_z_white
-            if eff_z_white != result:
-                n_diff += 1
-
-            z = z_eff if cfg.use_collar_rescoring else z_orig
+            z = result if is_white else -result
             Y = blend_wdl(z, aux.get('best_wdl'), is_white)
 
             wdl_node = aux.get('best_wdl')
@@ -1417,8 +1507,6 @@ class Rescorer(object):
                     (x, None, sparsify_policy(policy), lc0_wdl,
                      vwht * w, pwht * w, source), REWEIGHT_INELIGIBLE)
         
-        self.accumulate_collar_stats(n_triggers, n_diff, len(pending))
-
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
@@ -1495,13 +1583,17 @@ class Rescorer(object):
     def print_blunder_stats(self):
         acc = self.window_blunder
         primary = ("missed_mate", "A", "B", "G3", "F", "U")
+        weighted_keys = ("A", "B", "G3", "F", "U")
         secondary = ("true_blunder", "false_blunder")
+        pool_eligible = ("A", "B", "G3", "F")
 
         def avg(k):
             n = acc[k]['n']
             return acc[k]['cpl'] / n if n else float('nan')
 
         def row(label, k):
+            if acc[k]['n'] == 0:
+                return
             print(f"{RS}  {label:<24} n={acc[k]['n']:>6}  cpl={avg(k):6.2f}")
 
         print(f"{RS} blunder types (last 100):")
@@ -1509,26 +1601,26 @@ class Rescorer(object):
         for k in primary:
             row(k, k)
 
-        w_n = sum(acc[k]['n'] for k in primary)
-        w_cpl = sum(acc[k]['cpl'] for k in primary)
-        w_avg = w_cpl / w_n if w_n else float('nan')
-        print(f"{RS}  {'weighted (A/B/G3/F/U/mm)':<24} "
-              f"n={w_n:>6}  cpl={w_avg:6.2f}")
+        w_n = sum(acc[k]['n'] for k in weighted_keys)
+        if w_n:
+            w_cpl = sum(acc[k]['cpl'] for k in weighted_keys)
+            print(f"{RS}  {'weighted (A/B/G3/F/U)':<24} "
+                  f"n={w_n:>6}  cpl={w_cpl / w_n:6.2f}")
 
         for k in secondary:
             row(k, k)
 
+        # same A/B/G3/F rule maybe_add_blunder_candidate uses -- fraction of
+        # all trainable plies this window that would qualify for the pool
+        pool_n = sum(acc[k]['n'] for k in pool_eligible)
+        total_n = acc['total']['n']
+        if pool_n:
+            pool_pct = pool_n / total_n if total_n else 0.0
+            print(f"{RS}  {'pool-eligible (A/B/G3/F)':<24} "
+                  f"n={pool_n:>6}  of {total_n} moves ({pool_pct:.2%})")
+
         for k in BLUNDER_STAT_KEYS:
             self.window_blunder[k] = {'n': 0, 'cpl': 0.0}
-
-    def accumulate_collar_stats(self, n_triggers, n_diff, n_total):
-        has_collar = n_triggers > 0
-        for acc in (self.collar_total, self.collar_window):
-            acc['seen'] += 1
-            acc['triggers'] += n_triggers
-            acc['games'] += int(has_collar)
-            acc['positions'] += n_diff
-            acc['total_pos'] += n_total
 
     def accumulate_stop_stats(self, stop_stats):
         for st, s in stop_stats.items():
@@ -1592,41 +1684,6 @@ class Rescorer(object):
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
-
-    def print_collar_stats(self):
-        dry = "" if self.config.use_collar_rescoring else " [dry]"
-        tag = f"Collar{dry}"
-        W = 10
-
-        def col(val):
-            return f"  {val:>{W}}  |"
-
-        def row(label, s):
-            pos_pct = s['positions'] / s['total_pos'] if s['total_pos'] else 0.0
-            games_str = f"{s['games']}/{s['seen']}"
-            pos_str = f"{s['positions']} ({pos_pct:.1%})"
-            return (f"{RS}  {label:<12} |"
-                    + col(s['triggers'])
-                    + col(games_str)
-                    + col(pos_str))
-
-        hdr = (f"{RS}  {tag:<12} |"
-               + col("trigs")
-               + col("games")
-               + col("pos (%)"))
-        w = self.collar_window
-        print(hdr)
-        print(row(f"batch {w['seen']:>3}", w))
-
-        if len(self.collar_history) >= 10:
-            combined = {
-                'games': 0, 'triggers': 0, 'positions': 0,
-                'total_pos': 0, 'seen': 0
-            }
-            for h in self.collar_history[-10:]:
-                for k in combined:
-                    combined[k] += h[k]
-            print(row("last 300", combined))
 
     def print_sample_stats(self):
         W = 10
@@ -2040,7 +2097,7 @@ class Rescorer(object):
                     ("games",      str(n_tot)),
                     ("games/hr",   f"{games_hr:.1f}"),
                     ("moves/sec",  f"{moves_sec:.2f}"),
-                    ("workers",    str(self.n_sf_threads)),
+                    ("replays",    str(self.n_replay_finalized)),
                     ("depth",      f"{avg_depth:.1f}"),
                 ]
                 tg_hdr = (f"{RS}  {'Total':<12} |"
@@ -2088,8 +2145,6 @@ class Rescorer(object):
             self.sf_depth_count = 0
             print()
 
-            self.print_collar_stats()
-            print()
             self.print_sample_stats()
 
             n, el = self.tscale_n, self.tscale_eligible
@@ -2110,102 +2165,9 @@ class Rescorer(object):
             print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
             print()
 
-        self.collar_history.append(dict(self.collar_window))
-        self.collar_history = self.collar_history[-10:]
-        zero_collar = {
-            'games': 0, 'triggers': 0, 'positions': 0,
-            'total_pos': 0, 'seen': 0
-        }
-        
-        self.collar_window = dict(zero_collar)
-
         self.analyzed_results = []
 
 # helpers
-def collar_z_map(eval_trace, game_result, cfg, game_id=None):
-    """
-    Walk eval_trace (list of (ply, white_pov_cp)) and return
-    (eff_z_by_ply, n_triggers).
-
-    eff_z_by_ply: dict[ply -> white-pov effective result]
-      - positions inside a collar segment: +1.0 or -1.0 (collar winner)
-      - positions outside any collar: float(game_result)
-    n_triggers: number of collar resets (blunder-induced segment splits)
-
-    Collar activates after n_consec consecutive plies above threshold (white)
-    or below -threshold (black), retroactively marking those plies.
-    Collar resets when the eval crosses back within reset_cp of zero.
-    The reset ply itself starts the new segment (gets game_result).
-    """
-
-    threshold = cfg.collar_threshold_cp
-    n_consec = max(1, cfg.collar_n_consec)
-    reset_cp = cfg.collar_reset_cp
-
-    if not eval_trace:
-        return {}, 0
-
-    plies = [p for p, _ in eval_trace]
-    evals = [e for _, e in eval_trace]
-    n = len(evals)
-
-    collar_state = [None] * n
-    collar = None
-    count = 0
-    n_triggers = 0
-
-    for i, ev in enumerate(evals):
-        if collar is None:
-            if ev > threshold:
-                if count <= 0:
-                    count = 0
-                count += 1
-            elif ev < -threshold:
-                if count >= 0:
-                    count = 0
-                count -= 1
-            else:
-                count = 0
-
-            if count >= n_consec:
-                for j in range(i - count + 1, i + 1):
-                    collar_state[j] = 'white'
-                collar = 'white'
-                count = 0
-            elif count <= -n_consec:
-                for j in range(i + count + 1, i + 1):
-                    collar_state[j] = 'black'
-                collar = 'black'
-                count = 0
-        else:
-            broken = (
-                (collar == 'white' and ev < reset_cp) or
-                (collar == 'black' and ev > -reset_cp)
-            )
-
-            if broken:
-                collar = None
-                count = 0
-                n_triggers += 1
-            else:
-                collar_state[i] = collar
-
-    eff_z = {}
-
-    for i, ply in enumerate(plies):
-        if collar_state[i] == 'white':
-            eff_z[ply] = 1.0
-        elif collar_state[i] == 'black':
-            eff_z[ply] = -1.0
-        else:
-            eff_z[ply] = float(game_result)
-
-    if n_triggers == 0 or all(v == float(game_result) for v in eff_z.values()):
-        return {}, 0
-
-    return eff_z, n_triggers
-
-
 def value_weight_for_game(cfg, is_draw):
     return cfg.draw_value_scale if is_draw else 1.0
 

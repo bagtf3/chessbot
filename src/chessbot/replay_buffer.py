@@ -165,21 +165,26 @@ def read_shard(path):
     return read_pkl_gz_shard(path)
 
 
+LIVE_BUFFER_PKL = "live_buffer.pkl"
+LIVE_BUFFER_BACKUP_GZ = "live_buffer_backup.pkl.gz"
+# old names -- still recognized on load so a run mid-migration to the new
+# names never loses a carryover it already has on disk
 REMAINING_GZ = "remaining_untrained.pkl.gz"
 REMAINING_PKL = "remaining_untrained.pkl"
 
 
-def find_remaining_untrained(run_dir):
-    """Path to the untrained-sample carryover, gz preferred, else the plain
-    pkl older runs left behind. None when neither is present."""
-    for name in (REMAINING_GZ, REMAINING_PKL):
+def find_live_buffer(run_dir):
+    """Path to the untrained-sample carryover. Checks the current canonical
+    name first, then the backup, then the older names a run might still
+    have on disk. None when nothing is present."""
+    for name in (LIVE_BUFFER_PKL, LIVE_BUFFER_BACKUP_GZ, REMAINING_GZ, REMAINING_PKL):
         p = os.path.join(run_dir, name)
         if os.path.exists(p):
             return p
     return None
 
 
-def read_remaining_untrained(path):
+def read_live_buffer(path):
     if str(path).lower().endswith(".gz"):
         with gzip.open(path, "rb") as f:
             return pickle.load(f)
@@ -187,15 +192,28 @@ def read_remaining_untrained(path):
         return pickle.load(f)
 
 
-def write_remaining_untrained(run_dir, records):
-    """Always writes gz. Any plain .pkl left from an older run is removed so
-    the two cannot disagree about which carryover is current."""
-    path = os.path.join(run_dir, REMAINING_GZ)
-    write_pkl_gz_shard(records, path)
-    stale = os.path.join(run_dir, REMAINING_PKL)
-    if os.path.exists(stale):
-        os.remove(stale)
-    return path
+def write_pkl_shard_plain(records, path):
+    """Same atomic tmp-write + swap as write_pkl_gz_shard, uncompressed --
+    for the primary live_buffer.pkl, written often enough that skipping
+    gzip's CPU cost matters."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(records, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def sync_live_buffer(run_dir, records):
+    """
+    Writes both the primary (plain pkl) and backup (gz) copies. Called at
+    load, every retrain, and every round end -- not just on shutdown -- so a
+    crash mid-run loses at most one retrain/round's worth of accumulation
+    instead of the whole run's.
+    """
+    pkl_path = os.path.join(run_dir, LIVE_BUFFER_PKL)
+    gz_path = os.path.join(run_dir, LIVE_BUFFER_BACKUP_GZ)
+    write_pkl_shard_plain(records, pkl_path)
+    write_pkl_gz_shard(records, gz_path)
+    return pkl_path
 
 
 def list_shard_files(dir_path):

@@ -50,8 +50,8 @@ from chessbot.pretrain import (
 )
 
 from chessbot.replay_buffer import (
-    find_remaining_untrained, new_shard_path, sparsify_policy,
-    write_pkl_gz_shard, write_remaining_untrained, SEED_SOURCE,
+    find_live_buffer, new_shard_path, sparsify_policy,
+    write_pkl_gz_shard, sync_live_buffer, SEED_SOURCE,
     PRIMARY_SEED_SHARDS, REPLAY_SEED_SHARDS,
 )
 
@@ -734,7 +734,7 @@ def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
     # reuse=False, into pkl.gz shards matching the live selfplay schema.
     existing_primary = os.listdir(primary_dir)
     primary_needed = max(0, SEED_PRIMARY_SHARDS - len(existing_primary))
-    remaining_exists = find_remaining_untrained(run_dir) is not None
+    remaining_exists = find_live_buffer(run_dir) is not None
 
     ds_iter = None
     if primary_needed > 0 or not remaining_exists:
@@ -771,7 +771,7 @@ def seed_selfplay_buffers(run_dir: str, val_files: list[str]) -> None:
         remaining_records = []
         for _ in range(SEED_REMAINING_SHARDS):
             remaining_records.extend(drain_epoch())
-        write_remaining_untrained(run_dir, remaining_records)
+        sync_live_buffer(run_dir, remaining_records)
         status["remaining_untrained"] = (
             f"full fill: wrote {len(remaining_records):,} records"
         )

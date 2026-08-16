@@ -29,15 +29,19 @@ BLUNDER_REPLAY_DIRNAME = "blunder_probe"
 BLUNDER_REPLAY_HISTORY_FILENAME = "blunder_probe_history.jsonl"
 BLUNDER_REPLAY_MIN_CACHE_DEPTH = 17
 BLUNDER_REPLAY_EQUIV_CPL = 12
-PROBE_MS_STEP = 20
-PROBE_MS_MAX_MULT = 2
+# per-position SF budget: starts here, escalates by MS_STEP each probe that
+# neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
+# capped at START_MS * MS_MAX_MULT
+BLUNDER_REPLAY_START_MS = 300
+BLUNDER_REPLAY_MS_STEP = 20
+BLUNDER_REPLAY_MS_MAX_MULT = 2
 # above this many live positions, stop admitting new candidates -- just drop
 # them, don't evict anything to make room. More eviction pressure is coming
 # later; for now the pool simply stops growing.
 BLUNDER_POOL_MAX_SIZE = 128_000
 # spread this many replay positions across each selfplay round, metered
 # against real games queued/completions so far -- not a retrain-cadence flood
-BLUNDER_REPLAY_PER_ROUND = 4096
+BLUNDER_REPLAY_PER_ROUND = 8192
 
 # candidate rules: V = best_cp, P = played_cp, cpl = V - P (post equiv/mate
 # adjustment), all STM-POV. Z_stm is the result from the mover's own
@@ -361,7 +365,6 @@ def blunder_replay_specs(cfg, pool, n_positions, seed=0):
             fen=startpos, moves=list(rec["uci_path"]), meta=meta, cfg=cfg,
         ))
 
-    print(f"{P} {len(specs)} positions queued (seed {seed})")
     return specs
 
 

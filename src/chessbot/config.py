@@ -84,10 +84,6 @@ class Config(object):
     rescore_blunder_cp_winner = 200
     rescore_n_sf_threads = 1
 
-    use_collar_rescoring = False
-    collar_threshold_cp = 300
-    collar_n_consec = 5
-    collar_reset_cp = 50
     train_on_stockfish = True
 
     kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median

@@ -253,7 +253,7 @@ def main():
 
         # move the untrained carryover if present, gz or the older plain pkl
         import chessbot.replay_buffer as rb
-        src_remaining = rb.find_remaining_untrained(src_dir)
+        src_remaining = rb.find_live_buffer(src_dir)
         if src_remaining:
             name = os.path.basename(src_remaining)
             shutil.move(src_remaining, os.path.join(dest_dir, name))

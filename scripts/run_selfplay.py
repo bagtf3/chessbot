@@ -440,15 +440,21 @@ def main(run_tag):
     finished_games, finished_blunder_replays = rescorer.get_unprocessed()
 
     # load any previously saved untrained samples
-    remaining_pkl = rb.find_remaining_untrained(base_cfg.run_dir)
+    remaining_pkl = rb.find_live_buffer(base_cfg.run_dir)
     if remaining_pkl:
         rescorer.live_buffer.load_records(
-            rb.read_remaining_untrained(remaining_pkl))
-        os.remove(remaining_pkl)
+            rb.read_live_buffer(remaining_pkl))
         n_loaded = len(rescorer.live_buffer)
         print(f"[main] loaded {n_loaded} samples from "
               f"{os.path.basename(remaining_pkl)}")
         rescorer.live_buffer.flush_all_ready()
+        # re-sync to the canonical names immediately -- there's always a
+        # valid on-disk copy from this point on, never a gap between
+        # deleting the old carryover and writing the first new one
+        rb.sync_live_buffer(base_cfg.run_dir, rescorer.live_buffer.records)
+        canonical = os.path.join(base_cfg.run_dir, rb.LIVE_BUFFER_PKL)
+        if os.path.abspath(remaining_pkl) != os.path.abspath(canonical):
+            os.remove(remaining_pkl)
 
     rb.seed_replay_buffer(base_cfg.historic_dir, base_cfg.replay_buffer_dir)
 
@@ -692,7 +698,7 @@ def main(run_tag):
                     rescorer.submit(pull_pkl(to_process))
                 while finished_blunder_replays:
                     to_process_brp = finished_blunder_replays.popleft()
-                    rescorer.submit_blunder_replay(to_process_brp)
+                    rescorer.submit_blunder_replay(to_process_brp['meta'])
                 rescorer.tick(blunder_pool)
 
                 sf_backlog = len(rescorer.intake) + len(rescorer.pending)
@@ -848,6 +854,7 @@ def main(run_tag):
 
                         n_retrains += 1
                         retrain_worker = None
+                        rb.sync_live_buffer(base_cfg.run_dir, rescorer.live_buffer.records)
 
                 time.sleep(0.05)
 
@@ -882,6 +889,7 @@ def main(run_tag):
             # selfplay round report
             recorder.maybe_log_results(force=True)
             total_games += recorder.games_finished
+            rb.sync_live_buffer(base_cfg.run_dir, rescorer.live_buffer.records)
 
             if is_validation:
                 recorder.config = working_cfg
@@ -931,7 +939,7 @@ def main(run_tag):
         for t in sf_rescore_threads:
             t.close()
         if rescorer.live_buffer.records:
-            remaining_pkl = rb.write_remaining_untrained(
+            remaining_pkl = rb.sync_live_buffer(
                 base_cfg.run_dir, rescorer.live_buffer.records
             )
             n_saved = len(rescorer.live_buffer.records)

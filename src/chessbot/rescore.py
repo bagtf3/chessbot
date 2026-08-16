@@ -62,8 +62,7 @@ BLUNDER_CP = 30
 RECENT_WINDOW = 100
 # SF rescore search caps. cfg.rescore_movetime_ms is the tunable budget; the
 # catch-up trim and the depth backstop stay fixed so there is one knob.
-SF_THROTTLE_MS = 10
-SF_MAX_DEPTH = 24
+
 C = 0.9699
 D = d = np.arctanh(0.5)
 
@@ -199,9 +198,9 @@ class SFRescoreThread:
         # returns immediately instead of spending the rest of the budget, which
         # mostly catches warm-TT positions (endgames, the single-root-move
         # rerun) that would otherwise run away.
-        self.max_depth = SF_MAX_DEPTH
+        self.max_depth = 24
         self.base_ms = cfg.rescore_movetime_ms
-        self.throttled_ms = max(10, self.base_ms - SF_THROTTLE_MS)
+        self.throttled_ms = max(10, self.base_ms - 10)
         self.movetime_ms = self.base_ms
         self.sf_config = {'Hash': 256}
         self.stop_ev = threading.Event()
@@ -214,7 +213,7 @@ class SFRescoreThread:
 
     def update_config(self, cfg):
         self.base_ms = cfg.rescore_movetime_ms
-        self.throttled_ms = max(10, self.base_ms - SF_THROTTLE_MS)
+        self.throttled_ms = max(10, self.base_ms - 10)
         if self.movetime_ms > self.base_ms:
             self.movetime_ms = self.base_ms
 
@@ -1080,7 +1079,6 @@ class Rescorer(object):
             "same_move": same_move,
             "found_best": found_best,
             "found_equiv": found_equiv,
-            "best_depth": best_depth,
             "evicted": found_equiv,
             "sims": sims,
             "stop_reason": stop_reason,
@@ -1145,7 +1143,6 @@ class Rescorer(object):
             "same_move": df["same_move"].mean(),
             "found_best": df["found_best"].mean(),
             "found_equiv": df["found_equiv"].mean(),
-            "cache_hit": df["from_cache"].mean(),
             "n_evicted": int(df["evicted"].sum()),
             "file": os.path.basename(csv_path),
         }

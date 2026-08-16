@@ -9,10 +9,9 @@ import chess.engine
 import pandas as pd
 import numpy as np
 
-from pyfastchess import Board
-
 from chessbot import SF_LOC
 from chessbot.engines import lc0_analyze
+from chessbot.game_utils import reconcile_game_boards
 from chessbot.utils import print_recent_summary, format_time, compact_count
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
@@ -72,15 +71,18 @@ class GameViewer:
 
         self.reset()
 
+    def warmed_boards(self):
+        return reconcile_game_boards(
+            self.start_fen, self.log.get('history_uci'), self.moves_uci,
+        )
+
     def reset(self):
-        self.board = Board(self.start_fen)
-        self.board_ch = chess.Board(self.start_fen)
+        self.board_ch, self.board = self.warmed_boards()
         self.ply = 0  # 0 = before first move
 
     def goto(self, ply):
         ply = max(0, min(ply, len(self.moves_uci)))
-        self.board = Board(self.start_fen)
-        self.board_ch = chess.Board(self.start_fen)
+        self.board_ch, self.board = self.warmed_boards()
         for u in self.moves_uci[:ply]:
             self.board.push_uci(u)
             self.board_ch.push(chess.Move.from_uci(u))
@@ -1464,7 +1466,10 @@ def analyze_with_sf_core(game_data, eng, depth=None):
     if depth is None:
         depth = DEPTH
     limit = chess.engine.Limit(depth=depth)
-    board = chess.Board(game_data['start_fen'])
+    board, _ = reconcile_game_boards(
+        game_data['start_fen'], game_data.get('history_uci'),
+        game_data['moves_played'],
+    )
 
     vs_stockfish = game_data['vs_stockfish']
     sf_color = game_data['stockfish_is_white']

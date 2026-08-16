@@ -36,6 +36,64 @@ DEDUP_TYPES = frozenset({
 })
 
 
+def reconcile_game_boards(start_fen, history_uci, moves_played):
+    """
+    Build both board representations for a game log, preserving full move
+    history (lc0 history planes, repetition state) when it can be recovered.
+
+    moves_played only covers the moves scored in this segment (e.g. the
+    model's own moves this game); history_uci is the full move list from
+    true STARTPOS. Scenarios seeded partway through an opening (UHO,
+    pre_opened) make these diverge by a prefix of unscored moves. Replay
+    that prefix from STARTPOS and only trust it if it lands exactly on
+    start_fen -- otherwise fall back to start_fen alone: correct position,
+    just without history.
+
+    Returns (board_ch, b_fast). Never raises -- but a prefix that fails to
+    reconcile is a real data anomaly (history_uci and start_fen should
+    always agree for a well-formed log), not a normal case, so that path
+    prints a warning instead of silently degrading. The "no history to
+    replay" case (prefix_len <= 0) is normal and stays silent.
+    """
+    board_ch = chess.Board(start_fen)
+    b_fast = fastboard(start_fen)
+
+    if not history_uci:
+        return board_ch, b_fast
+
+    prefix_len = len(history_uci) - len(moves_played or [])
+    if prefix_len <= 0:
+        return board_ch, b_fast
+
+    prefix = history_uci[:prefix_len]
+
+    def warn(reason):
+        print(f"[game_utils] reconcile_game_boards: {reason}, "
+              f"falling back to start_fen-only for {start_fen!r}")
+        return board_ch, b_fast
+
+    warm_fast = fastboard()
+    for uci in prefix:
+        if uci not in warm_fast.legal_moves():
+            return warn(f"illegal move {uci!r} in history_uci prefix")
+        warm_fast.push_uci(uci)
+
+    if warm_fast.fen() != start_fen:
+        return warn(
+            f"history_uci prefix landed on {warm_fast.fen()!r}, "
+            f"expected start_fen"
+        )
+
+    warm_ch = chess.Board()
+    try:
+        for uci in prefix:
+            warm_ch.push_uci(uci)
+    except ValueError as e:
+        return warn(f"python-chess rejected prefix move: {e}")
+
+    return warm_ch, warm_fast
+
+
 def random_backrow_fen():
     pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
     random.shuffle(pieces)
@@ -442,6 +500,11 @@ class GameGenerator:
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
         self.sf_cap = int(cfg.play_vs_sf_prob * cfg.n_games)
 
+        # blunder-replay metering, round-scoped (one GameGenerator per round)
+        self.games_queued = 0
+        self.brps_queued = 0
+        self.brp_completed_baseline = None
+
     def generate(self, game_type):
         """Returns (fen, moves, meta). fen is the starting position; moves are
         pushed on top of it to reach the game start position."""
@@ -557,7 +620,58 @@ class GameGenerator:
             self.used_fens.add(key)
 
         self.assign_sf(meta)
+        self.games_queued += 1
         return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
+
+    def maybe_next_blunder_replays(self, pool, n_replay_finalized):
+        """
+        Called after each real game is queued (see top_up_queues in
+        run_selfplay.py). Spread is driven by real games queued so far
+        (linear, hits BLUNDER_REPLAY_PER_ROUND exactly when this round's
+        real games are all queued) -- completions structurally lag queuing,
+        so using the completion gap directly as the order size just floods
+        early and never catches up. n_replay_finalized (Rescorer's live
+        running total) instead throttles: if too much is already queued and
+        not yet finished, pause new queuing until it catches up, so a slow
+        SF pool can't clog game_queue. Once this round's real games are all
+        queued, dumps whatever's left of the round's allotment in one go.
+        """
+        from chessbot.blunder_replay import (
+            create_blunder_replay_config, blunder_replay_specs,
+            BLUNDER_REPLAY_PER_ROUND,
+        )
+
+        if pool is None or self.brps_queued >= BLUNDER_REPLAY_PER_ROUND:
+            return []
+
+        if self.brp_completed_baseline is None:
+            self.brp_completed_baseline = n_replay_finalized
+        completed = n_replay_finalized - self.brp_completed_baseline
+
+        target_real = max(self.config.n_games, 1)
+        remaining = BLUNDER_REPLAY_PER_ROUND - self.brps_queued
+
+        if self.games_queued >= target_real:
+            n_to_queue = remaining
+        else:
+            target_queued = (
+                (self.games_queued / target_real) * BLUNDER_REPLAY_PER_ROUND
+            )
+            n_to_queue = max(0, min(int(target_queued) - self.brps_queued, remaining))
+
+            backlog = self.brps_queued - completed
+            backlog_cap = max(BLUNDER_REPLAY_PER_ROUND // 20, 50)
+            if backlog >= backlog_cap:
+                n_to_queue = 0
+
+        if n_to_queue <= 0:
+            return []
+
+        replay_cfg = create_blunder_replay_config(self.config)
+        specs = blunder_replay_specs(
+            replay_cfg, pool, n_to_queue, seed=self.games_queued)
+        self.brps_queued += len(specs)
+        return specs
 
     def validation_games(self, cfg=None):
         if cfg is None:

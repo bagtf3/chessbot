@@ -44,6 +44,7 @@ from chessbot.review import load_game_index, ANALYZE_PKL
 from chessbot.lc0_utils import lc0_logits_to_xc0_batch
 from chessbot.opening_counts import absolute_ply
 from chessbot.utils import calc_entropy
+from chessbot.game_utils import reconcile_game_boards
 
 DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
 DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_071826\staging"
@@ -427,23 +428,12 @@ def iter_xc0_game(game, sf_df, run_tag, has_wdl, seen=None, lc0_batcher=None, xc
         sf_rows, sf_by_ply = align_sf(moves, sf_df)
 
     if scenario in NO_WARM_SCENARIOS:
+        # these scenarios seed a custom FEN directly, so history_uci never
+        # traces back to STARTPOS -- reconcile_game_boards would just fail
+        # to warm every time and print a spurious warning, so skip it
         board = pf.Board(start_fen)
     else:
-        history = log.get("history_uci") or moves
-        prefix_len = len(history) - len(moves)
-        board = pf.Board()
-        warmed = False
-        if prefix_len >= 0:
-            ok = True
-            for u in history[:prefix_len]:
-                if u not in board.legal_moves():
-                    ok = False
-                    break
-                board.push_uci(u)
-            if ok and board.fen() == start_fen:
-                warmed = True
-        if not warmed:
-            board = pf.Board(start_fen)
+        _, board = reconcile_game_boards(start_fen, log.get("history_uci"), moves)
 
     lc0_pending  = []   # xc0h boards queued for lc0 inference this game
 

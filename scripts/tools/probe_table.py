@@ -62,7 +62,7 @@ def load_rows(run_tags):
                 "same & equiv": (d.same_move & d.found_equiv).mean(),
                 "depth": d.best_depth.mean(),
                 "cache": h["cache_hit"],
-                "ret": h["n_retired"],
+                "ret": h["n_evicted"],
             })
     return pd.DataFrame(rows).sort_values("epoch").reset_index(drop=True)
 

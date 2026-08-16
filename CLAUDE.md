@@ -1,5 +1,19 @@
 # Xerces Chess Engine - Claude Instructions
 
+## CRITICAL: No Unauthorized Edits
+A request to review, audit, dry-run, "trace through", or "look at" code is
+NOT authorization to edit it. This applies even when a future action is
+verbally conditioned on the review going well (e.g. "if it looks good I'll
+start a test run" describes the user's own next decision, not permission
+for you to act on what you find). Report findings — severity, what's wrong,
+the exact proposed diff — and stop. Wait for an explicit, separate go-ahead
+("fix it", "go ahead", "run that shit") before touching a single line, even
+for a fix you're fully confident about, even mid-session after several
+prior "keep coding" exchanges. A review request is a mode switch back to
+look-don't-touch until told otherwise. Violating this already brought the
+user to the edge of cancelling their subscription over it (2026-08-15) —
+treat it as an absolute, not a preference to weigh against convenience.
+
 ## Two-Repo Structure
 This project spans two repositories:
 - `chessbot` (this repo) — Python package: selfplay loop, MCTS wrapper, model, training, review
@@ -94,3 +108,6 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - No comment dividers with dashes or box-drawing characters
 - Minimal comments and code — avoid verbosity, prefer clean readable code over explanation
 - No Unicode characters outside ASCII in print statements or log output — Windows subprocesses use cp1252 and will crash on characters like arrows or other non-ASCII symbols. Use ASCII equivalents (e.g. `->` not `->`).
+
+## Chat Response Format
+User is dyslexic. During iterative status-update style responses (reporting what changed, asking something, flagging a concern, saying what's next), structure with visual headers: `=== DONE ===`, `=== OPEN ===`, `=== FLAGGED ===`, `=== NEXT ===`, each with terse bullet points. Omit a section entirely if empty rather than writing "none". Don't force this onto short direct answers or already-tabular output.

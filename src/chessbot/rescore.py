@@ -27,9 +27,28 @@ from chessbot.replay_buffer import (
 from chessbot.opening_counts import (
     COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts,
 )
+
+from chessbot.blunder_replay import (
+    BLUNDER_POOL_ENV, BLUNDER_SCENARIOS, is_blunder_candidate,
+    load_probe_pool, save_probe_pool, evicted_path, evict_position,
+    BLUNDER_REPLAY_EQUIV_CPL, BLUNDER_REPLAY_HISTORY_FILENAME,
+    blunder_replay_dir, BLUNDER_POOL_MAX_SIZE,
+)
+
+from chessbot.game_utils import reconcile_game_boards, short_fen
+
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
+BLUNDER_MERGE_EVERY = 128
+# blunder-replay analysis fires purely on collected-row count, not a retrain
+# cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
+# before a summary is computed and the file resets to a fresh window
+BLUNDER_REPLAY_ANALYSIS_EVERY = 2048
+BLUNDER_STAT_KEYS = (
+    "total", "missed_mate", "A", "B", "G3", "F", "U",
+    "true_blunder", "false_blunder",
+)
 ANALYZE_PKL = "analyze_results_combined.pkl"
 PRETRAIN_CONTINUED_CSV = "eval_progress_pretrain_continued.csv"
 # pretraining validated every 20 epochs; the continued file keeps that step
@@ -50,6 +69,13 @@ D = d = np.arctanh(0.5)
 # name so a source that is absent this round leaves the others' colors alone.
 SOURCE_COLORS = {'xc0': '#4C72B0', 'lc0': '#DD8452', 'historic': '#55A868'}
 SOURCE_ORDER = ('xc0', 'lc0', 'historic')
+
+
+def count_jsonl_lines(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        return sum([1 for _ in f])
 
 
 def plot_source(source):
@@ -180,8 +206,9 @@ class SFRescoreThread:
         self.t = None
         self.eng = None
 
-    def submit_game(self, gid, positions):
-        self.game_q.put((gid, positions))
+    def submit_game(self, gid, positions, movetime_ms=None):
+        info = {"movetime_ms": movetime_ms} if movetime_ms is not None else {}
+        self.game_q.put((gid, positions, info))
 
     def update_config(self, cfg):
         self.base_ms = cfg.rescore_movetime_ms
@@ -213,15 +240,17 @@ class SFRescoreThread:
                 continue
             if item is None:
                 break
-            gid, positions = item
+            gid, positions, info = item
             results = []
-            
+
+            movetime_ms = info.get("movetime_ms", self.movetime_ms)
+
             pass1_limit = chess.engine.Limit(
-                time=self.movetime_ms / 1000.0, depth=self.max_depth)
+                time= movetime_ms/ 1000.0, depth=self.max_depth)
 
             # longer search for pass2 because Xc0 move may be better
             pass2_limit = chess.engine.Limit(
-                time=(self.movetime_ms + 10)/ 1000.0, depth=self.max_depth)
+                time=(movetime_ms + 20)/ 1000.0, depth=self.max_depth)
             
             try:
                 for ply_idx, board, xerces_uci in positions:
@@ -230,7 +259,9 @@ class SFRescoreThread:
 
                     # pass 1: full best-move analysis
                     t0 = time.time()
-                    info = self.eng.analyse(board, pass1_limit, info=chess.engine.INFO_ALL)
+                    info = self.eng.analyse(
+                        board, pass1_limit, info=chess.engine.INFO_ALL)
+                    
                     elapsed += time.time() - t0
                     depth = info.get('depth', 0)
                     best_uci = str(info['pv'][0])
@@ -286,18 +317,24 @@ class Rescorer(object):
         self.game_q   = sf_game_q
         self.res_q    = sf_res_q
 
-        self.opening_counts = OpeningCounts(
-            os.path.join(cfg.run_dir, COUNTS_FILE))
+        self.opening_counts = OpeningCounts(os.path.join(cfg.run_dir, COUNTS_FILE))
         loaded = self.opening_counts.load()
         n = self.opening_counts.occupancy()
         print(f"{RS} opening counts: {'loaded' if loaded else 'cold start'}, "
               f"{n} slots occupied")
 
-        self.live_buffer = LiveBuffer(cfg.primary_buffer_dir,
-                                      counts=self.opening_counts)
+        self.live_buffer = LiveBuffer(cfg.primary_buffer_dir, counts=self.opening_counts)
         self.analyzed_results = []
         self.closed = False
 
+        # pool itself is never cached here -- it's passed into tick() each
+        # call from the one floating copy in run_selfplay.py's main(), since
+        # this class only ever mutates it (new candidates, replay evictions),
+        # never samples from it. blunder_pool_path is just a string, and
+        # n_pool_changes is this class's own save-cadence counter, so both
+        # are safe to hold as real instance state.
+        self.blunder_pool_path = os.environ.get(BLUNDER_POOL_ENV) or None
+        self.n_pool_changes = 0
 
         self.start_time = None  # set on first game to exclude idle startup time
         self.games_seen = set()
@@ -344,6 +381,10 @@ class Rescorer(object):
         self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
+        zero_blunder = lambda: {'n': 0, 'cpl': 0.0}
+        self.total_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
+        self.window_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
+
         zero_sc = lambda: {
             'total': 0, 'accepted': 0,
             'lc0_blunder': 0, 'lc0_inacc': 0, 'lc0_pv': 0, 'lc0_enrich': 0}
@@ -363,9 +404,15 @@ class Rescorer(object):
         self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL
 
         self.intake = deque()
+        self.blunder_replay_intake = deque()
         self.pending = {}
 
-        lc0_model     = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
+        self.blunder_replay_jsonl = os.path.join(
+            blunder_replay_dir(cfg), "blunder_replay_probe.jsonl")
+        self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
+        self.n_replay_finalized = 0
+
+        lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
         lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
         self.lc0_thread = None
         if lc0_model and lc0_trt_cache:
@@ -389,12 +436,84 @@ class Rescorer(object):
 
         self.init_analyzer()
 
-    def close(self):
+    def maybe_add_blunder_candidate(self, pool, game_data, gid, ply_idx,
+                                    played_uci, best_uci, best_cp,
+                                    played_cp, cpl, z_stm):
+        """
+        Same A/B/G3/F rules the old scan_blunder_positions.py scan applied
+        post-hoc, checked live against the values finalize_game already
+        computed for this ply. Mutates pool directly (dedup by short_fen);
+        maybe_save_pool decides when that hits disk. Only STARTPOS-traceable
+        scenarios qualify: piece_odds, piece_training and random_init seed a
+        custom FEN directly, so history_uci for those never traces back to
+        STARTPOS.
+        """
+        scenario = game_data.get('scenario')
+        if scenario not in BLUNDER_SCENARIOS:
+            return
+        is_candidate, label = is_blunder_candidate(best_cp, played_cp, cpl, z_stm)
+        if not is_candidate:
+            return
+
+        history = game_data.get('history_uci')
+        played = game_data.get('moves_played') or []
+        if not history:
+            return
+
+        offset = len(history) - len(played)
+        uci_path = list(history[:offset + ply_idx])
+        board = chess.Board()
+        for uci in uci_path:
+            board.push_uci(uci)
+
+        fen = board.fen()
+        key = short_fen(fen)
+        if key in pool:
+            pool[key]["times_seen"] = pool[key].get("times_seen", 1) + 1
+        elif len(pool) >= BLUNDER_POOL_MAX_SIZE:
+            # pool is full -- drop the candidate, no eviction pressure yet
+            return
+        else:
+            pool[key] = {
+                "fen": fen,
+                "uci_path": uci_path,
+                "start_ply": offset + ply_idx,
+                "run_tag": self.config.run_tag,
+                "game_id": gid,
+                "move_num": ply_idx,
+                "model_epoch": game_data.get("model_epoch"),
+                "scenario": scenario,
+                "z_stm": z_stm,
+                "played_move": played_uci,
+                "sf_best_move": best_uci,
+                "best_cp": best_cp,
+                "played_cp": played_cp,
+                "cpl": cpl,
+                "times_seen": 1,
+            }
+
+        self.n_pool_changes += 1
+        self.maybe_save_pool(pool)
+
+    def maybe_save_pool(self, pool):
+        """Atomic tmp-write + swap every BLUNDER_MERGE_EVERY mutations
+        (candidate adds, replay evictions) -- not every mutation, since this
+        can fire at full selfplay volume."""
+        if pool is None or self.n_pool_changes < BLUNDER_MERGE_EVERY:
+            return
+        save_probe_pool(pool, self.blunder_pool_path)
+        self.n_pool_changes = 0
+        print(f"{RS} blunder pool saved: {len(pool)} live")
+
+    def close(self, pool=None):
         """Idempotent -- run_selfplay closes on the normal path and again in
         cleanup, and the counts are unchanged between the two."""
         if self.closed:
             return
         self.closed = True
+        if pool is not None and self.n_pool_changes > 0:
+            save_probe_pool(pool, self.blunder_pool_path)
+            self.n_pool_changes = 0
         path = self.opening_counts.save()
         print(f"{RS} opening counts saved to {os.path.basename(path)} "
               f"({self.opening_counts.occupancy()} slots)")
@@ -413,7 +532,10 @@ class Rescorer(object):
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
 
-    def tick(self):
+    def submit_blunder_replay(self, brp_data):
+        self.blunder_replay_intake.append(brp_data)
+
+    def tick(self, pool=None):
         if self.lc0_thread is not None:
             # Lc0Thread yields (x, policy, wdl, vwht, pwht); normalise to the
             # 7-slot record schema rather than appending it raw. Unreachable in
@@ -431,7 +553,7 @@ class Rescorer(object):
                 break
             if gid == '__error__':
                 raise results
-            self.handle_game_results(gid, results)
+            self.handle_game_results(gid, results, pool)
 
         flushed = self.live_buffer.flush_all_ready()
         if flushed:
@@ -439,13 +561,19 @@ class Rescorer(object):
             self.written_this_round += n
             self.written_total += n
 
+        # prefer blunder_replays to clear those
+        # larger pending for these because theyre just single moves
+        while self.blunder_replay_intake and len(self.pending) < 40:
+            brp_data = self.blunder_replay_intake.popleft()
+            self.start_blunder_replay(brp_data=brp_data)
+
         if len(self.intake) > len(self.pending):
             intake_list = list(self.intake)
             random.shuffle(intake_list)
             self.intake = deque(intake_list)
         
-        while self.intake and len(self.pending) < 20:
-            self.start_game(self.intake.popleft())
+        while self.intake and len(self.pending) < 40:
+            self.start_game(self.intake.popleft(), pool)
 
     def init_analyzer(self):
         run_dir = self.config.run_dir
@@ -466,12 +594,19 @@ class Rescorer(object):
                 )
 
     def get_unprocessed(self):
+        """
+        Returns (unprocessed_games, unprocessed_blunder_replays). The second
+        is always empty: replays never write a pkl_file/game_index entry (by
+        design -- see finalize_game_data's blunder_replay_probe branch), so
+        one that died mid-flight leaves no recoverable trace and just gets
+        resampled later.
+        """
         run_dir = self.config.run_dir
         idx_path = os.path.join(run_dir, "game_index.json")
         idx = load_game_index(idx_path)
         entries = [idx] if isinstance(idx, dict) else idx
 
-        unprocessed = deque()
+        unprocessed_games = deque()
         for rec in entries:
             gid = str(rec.get("game_id"))
             pkl_path = rec.get("pkl_file")
@@ -479,13 +614,14 @@ class Rescorer(object):
                 continue
             if gid in self.games_seen:
                 continue
-            unprocessed.append(rec)
-        
-        if len(unprocessed):
-            n = len(unprocessed)
+            unprocessed_games.append(rec)
+
+        if len(unprocessed_games):
+            n = len(unprocessed_games)
             print(f"[rescore] {n} unprocessed game(s) currently in queue")
-        
-        return unprocessed
+
+        unprocessed_blunder_replays = deque()
+        return unprocessed_games, unprocessed_blunder_replays
 
     def reset_writer(self):
         self.written_this_round = 0
@@ -541,7 +677,7 @@ class Rescorer(object):
         vwht = value_weight_for_game(cfg, is_draw)
         self.append_flat_policy_example(board, ucis, visits, Y, vwht, policy_weight)
 
-    def start_game(self, pkl_file):
+    def start_game(self, pkl_file, pool):
         path = str(pkl_file)
         if path.lower().endswith('.pkl.gz'):
             with gzip.open(path, 'rb') as f:
@@ -558,8 +694,10 @@ class Rescorer(object):
             return
 
         cfg = self.config
-        board_ch = chess.Board(game_data['start_fen'])
-        b_fast = Board(game_data['start_fen'])
+        board_ch, b_fast = reconcile_game_boards(
+            game_data['start_fen'], game_data.get('history_uci'),
+            game_data.get('moves_played'),
+        )
 
         tree_data = game_data.get('tree_search_data', {})
         vs_stockfish = game_data.get('vs_stockfish', False)
@@ -583,6 +721,7 @@ class Rescorer(object):
             'draw_value_scale',
             'vscale', 'lc0_enrich_frac', 'lc0_enrich_weight'
         )
+
         game_state = {
             'gid': gid,
             'game_data': game_data,
@@ -592,7 +731,7 @@ class Rescorer(object):
         }
 
         # (ply_idx, board_copy, xerces_uci) queued for SF analysis
-        sf_positions = []
+        to_sf_positions = []
         # walk each move: route SF moves, build ply state
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
@@ -619,9 +758,9 @@ class Rescorer(object):
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q if turn else -this_q
 
-            sf_wdl_tr = tr.get('sf_wdl')
-            if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
-                Y_init = (0.5*z_to_wdl(Z_stm) + 0.5*np.array(sf_wdl_tr, dtype=np.float32))
+            sf_wdl = tr.get('sf_wdl')
+            if sf_wdl is not None and len(sf_wdl) == 3:
+                Y_init = (0.5*z_to_wdl(Z_stm) + 0.5*np.array(sf_wdl, dtype=np.float32))
             else:
                 Y_init = z_to_wdl(Z_stm)
 
@@ -690,7 +829,7 @@ class Rescorer(object):
                 'resolved': False,
             }
 
-            sf_positions.append((i, board_ch.copy(), xerces_uci))
+            to_sf_positions.append((i, board_ch.copy(), xerces_uci))
 
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
@@ -698,14 +837,69 @@ class Rescorer(object):
 
         self.pending[gid] = game_state
         # submit to SF thread, or finalize immediately if every move was SF's own
-        if sf_positions:
-            self.n_sf_submitted += len(sf_positions)
+        if to_sf_positions:
+            self.n_sf_submitted += len(to_sf_positions)
             game_state['waiting'] = True
-            self.game_q.put((gid, sf_positions))
+            self.game_q.put((gid, to_sf_positions, {}))
         else:
-            self.finalize_game(self.pending.pop(gid))
+            self.finalize_game(self.pending.pop(gid), pool)
 
-    def handle_game_results(self, gid, results):
+    def start_blunder_replay(self, brp_data):
+        gid = str(brp_data.get('game_id'))
+        if gid in self.games_seen:
+            return
+        
+        board_ch, b_fast = reconcile_game_boards(
+            brp_data['start_fen'], brp_data.get('history_uci'),
+            brp_data.get('moves_played'),
+        )
+        tree_data = brp_data.get('tree_search_data', {})
+
+        game_state = {
+            'gid': gid,
+            'brp_data': brp_data,
+            'ply_states': [],
+            'waiting': False,  # True once a batch has been submitted to a SF thread
+        }
+
+        to_sf_positions = []
+        for i, mv in enumerate(brp_data.get('moves_played', [])):
+            move_ch = chess.Move.from_uci(mv)
+            turn = board_ch.turn
+
+            tr = tree_data.get(i, tree_data.get(str(i), {}))
+            xerces_uci = brp_data.get('xerces_uci')
+
+            # no Q/x/lms/idx_map here -- finalize_blunder_replay only reads
+            # xerces_uci/best_uci/best_cp/played_cp/tr, and replays never
+            # build a training example, so skip the board-encode/legal-moves
+            # work that only that would need
+            ply = {
+                'ply_idx': i, 'mv': mv,
+                'turn': bool(turn),
+                'tr': tr,
+                'xerces_uci': xerces_uci,
+                'resolved': False,
+            }
+
+            to_sf_positions.append((i, board_ch.copy(), xerces_uci))
+
+            game_state['ply_states'].append(ply)
+            board_ch.push(move_ch)
+            b_fast.push_uci(mv)
+
+        self.pending[gid] = game_state
+        # submit to SF thread, or finalize immediately if every move was SF's own
+        if to_sf_positions:
+            self.n_sf_submitted += len(to_sf_positions)
+            game_state['waiting'] = True
+            self.game_q.put((gid, to_sf_positions, {"movetime_ms": 300}))
+        else:
+            # should never get here (every replay has exactly one move), but
+            # if it does, pop instead of leaking a permanent pending slot
+            self.pending.pop(gid, None)
+
+    def handle_game_results(self, gid, results, pool):
         if gid not in self.pending:
             return
 
@@ -744,9 +938,131 @@ class Rescorer(object):
             ply['resolved']   = True
 
         game['waiting'] = False
-        self.finalize_game(self.pending.pop(gid))
+        game_state = self.pending.pop(gid)
+        if 'brp_data' in game_state:
+            self.finalize_blunder_replay(game_state, pool)
+        else:
+            self.finalize_game(game_state, pool)
 
-    def finalize_game(self, game_state):
+    def finalize_blunder_replay(self, game_state, pool):
+        """One SF result per replay -- no ratchet/escalating-budget cache
+        like the old analyse_probe_file. Evicts on the first found_equiv,
+        full stop -- with replays this frequent a streak requirement is
+        pointless."""
+        gid = game_state['gid']
+        self.games_seen.add(gid)
+        self.games_processed += 1
+
+        brp_data = game_state['brp_data']
+        ply_states = game_state['ply_states']
+        if not ply_states or not ply_states[0].get('resolved'):
+            return
+        ply = ply_states[0]
+
+        short_fen_key = brp_data.get('short_fen')
+        orig_move = brp_data.get('orig_move')
+        orig_cpl = brp_data.get('orig_cpl')
+        epoch = brp_data.get('model_epoch')
+
+        probe_move = ply.get('xerces_uci')
+        best_uci = ply.get('best_uci')
+        best_cp = ply.get('best_cp')
+        played_cp = ply.get('played_cp')
+
+        probe_cpl = best_cp - played_cp
+        found_best = probe_move == best_uci
+        found_equiv = probe_cpl <= BLUNDER_REPLAY_EQUIV_CPL
+        same_move = probe_move == orig_move
+
+        if found_equiv and short_fen_key and pool is not None and short_fen_key in pool:
+            evict_position(pool, short_fen_key, "found_equiv", epoch,
+                           evicted_path(self.blunder_pool_path))
+            self.n_pool_changes += 1
+            self.maybe_save_pool(pool)
+
+        tr = ply.get('tr') or {}
+        row = {
+            "short_fen": short_fen_key,
+            "src_run_tag": brp_data.get('src_run_tag'),
+            "model_epoch": epoch,
+            "orig_move": orig_move,
+            "orig_cpl": orig_cpl,
+            "probe_move": probe_move,
+            "probe_cpl": probe_cpl,
+            "deep_best": best_uci,
+            "same_move": same_move,
+            "found_best": found_best,
+            "found_equiv": found_equiv,
+            "evicted": found_equiv,
+            "sims": tr.get('sims'),
+            "stop_reason": tr.get('stop_reason'),
+        }
+        with open(self.blunder_replay_jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=float) + "\n")
+
+        self.n_replay_rows += 1
+        self.n_replay_finalized += 1
+        if self.n_replay_rows >= BLUNDER_REPLAY_ANALYSIS_EVERY:
+            self.analyse_brp_file()
+
+    def analyse_brp_file(self):
+        """
+        Replaces the old analyse_probe_file: no SF pass here, that already
+        happened per-replay in finalize_blunder_replay, which also evicts
+        immediately on found_equiv. This just summarizes the collected jsonl
+        into a CSV + history line, as if one full probe run just finished,
+        stamped with whatever epoch is current -- not necessarily on any
+        retrain cadence. Fires purely on row count.
+        """
+        rows = []
+        with open(self.blunder_replay_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+
+        if not rows:
+            self.n_replay_rows = 0
+            return
+
+        df = pd.DataFrame(rows)
+        epoch = rows[-1].get("model_epoch")
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(
+            blunder_replay_dir(self.config), f"brp_e{epoch}_{stamp}.csv")
+        df.to_csv(csv_path, index=False)
+
+        summary = {
+            "ts": int(time.time()),
+            "n_retrains": epoch,
+            "n_positions": len(df),
+            "orig_cpl": df["orig_cpl"].mean(),
+            "probe_cpl": df["probe_cpl"].mean(),
+            "improved": (df["probe_cpl"] < df["orig_cpl"]).mean(),
+            "worsened": (df["probe_cpl"] > df["orig_cpl"]).mean(),
+            "same_move": df["same_move"].mean(),
+            "found_best": df["found_best"].mean(),
+            "found_equiv": df["found_equiv"].mean(),
+            "n_evicted": int(df["evicted"].sum()),
+            "file": os.path.basename(csv_path),
+        }
+        hist_path = os.path.join(
+            self.config.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+        with open(hist_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, default=float) + "\n")
+
+        print(f"{RS} blunder replay analysis @ epoch {epoch}: "
+              f"n={summary['n_positions']} "
+              f"cpl {summary['orig_cpl']:.1f} -> {summary['probe_cpl']:.1f}  "
+              f"same_move {summary['same_move']:.1%}  "
+              f"found_equiv {summary['found_equiv']:.1%}  "
+              f"evicted {summary['n_evicted']}")
+
+        open(self.blunder_replay_jsonl, "w", encoding="utf-8").close()
+        self.n_replay_rows = 0
+
+    def finalize_game(self, game_state, pool):
         if self.start_time is None:
             self.start_time = time.time()
         cfg = game_state['cfg']
@@ -804,6 +1120,13 @@ class Rescorer(object):
             cpl_s += loss_this
             n_plies += 1
 
+            # consider adding this position to the blunder replay pool
+            if pool is not None and not missed_mate:
+                self.maybe_add_blunder_candidate(
+                    pool, game_data, gid, i, xerces_uci, best_uci, best_cp,
+                    played_cp, loss_this, Z_stm,
+                )
+
             eval_trace.append((i, best_abs))
             rows.append([
                 i, mv, xerces_uci, best_uci,
@@ -835,6 +1158,11 @@ class Rescorer(object):
 
             is_blunder = loss_this >= blunder_cp
             true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
+
+            self.accumulate_blunder_stats(
+                missed_mate, is_blunder, true_blunder,
+                best_cp, played_cp, loss_this, Z_stm,
+            )
 
             # mild and big blunders: drop xc0 record, queue lc0 instead
             skip_xc0 = not missed_mate and (loss_this >= blunder_cp)
@@ -958,6 +1286,7 @@ class Rescorer(object):
 
         start_fen    = game_data['start_fen']
         moves_played = game_data['moves_played']
+        history_uci  = game_data.get('history_uci')
         row_by_ply   = {r[0]: r for r in rows}
 
         # loop 2: compute WDL targets, add to training, build lc0 waypoints
@@ -1026,7 +1355,7 @@ class Rescorer(object):
 
         if lc0_waypoints and self.lc0_thread is not None:
             lc0_meta = []
-            b_lc0 = Board(start_fen)
+            _, b_lc0 = reconcile_game_boards(start_fen, history_uci, moves_played)
             for ply_i, mv in enumerate(moves_played):
                 if ply_i in lc0_waypoints:
                     entry, aux, Y, is_white = lc0_waypoints[ply_i]
@@ -1135,9 +1464,62 @@ class Rescorer(object):
         self.accumulate_stop_stats(stop_stats)
         if self.games_processed % 100 == 0:
             self.print_stop_stats()
+            self.print_blunder_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
             self.push_analyzed(report=True)
 
+
+    def accumulate_blunder_stats(self, missed_mate, is_blunder, true_blunder,
+                                 best_cp, played_cp, cpl, z_stm):
+        def bump(key, value):
+            for acc in (self.total_blunder, self.window_blunder):
+                acc[key]['n'] += 1
+                acc[key]['cpl'] += value
+
+        bump('total', cpl)
+
+        if missed_mate:
+            bump('missed_mate', cpl)
+        else:
+            _, label = is_blunder_candidate(best_cp, played_cp, cpl, z_stm)
+            if label is not None:
+                bump(label, cpl)
+            elif is_blunder:
+                bump('U', cpl)
+
+        if true_blunder:
+            bump('true_blunder', cpl)
+        elif is_blunder:
+            bump('false_blunder', cpl)
+
+    def print_blunder_stats(self):
+        acc = self.window_blunder
+        primary = ("missed_mate", "A", "B", "G3", "F", "U")
+        secondary = ("true_blunder", "false_blunder")
+
+        def avg(k):
+            n = acc[k]['n']
+            return acc[k]['cpl'] / n if n else float('nan')
+
+        def row(label, k):
+            print(f"{RS}  {label:<24} n={acc[k]['n']:>6}  cpl={avg(k):6.2f}")
+
+        print(f"{RS} blunder types (last 100):")
+        row("total", "total")
+        for k in primary:
+            row(k, k)
+
+        w_n = sum(acc[k]['n'] for k in primary)
+        w_cpl = sum(acc[k]['cpl'] for k in primary)
+        w_avg = w_cpl / w_n if w_n else float('nan')
+        print(f"{RS}  {'weighted (A/B/G3/F/U/mm)':<24} "
+              f"n={w_n:>6}  cpl={w_avg:6.2f}")
+
+        for k in secondary:
+            row(k, k)
+
+        for k in BLUNDER_STAT_KEYS:
+            self.window_blunder[k] = {'n': 0, 'cpl': 0.0}
 
     def accumulate_collar_stats(self, n_triggers, n_diff, n_total):
         has_collar = n_triggers > 0

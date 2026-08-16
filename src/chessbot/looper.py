@@ -46,7 +46,6 @@ class GameLooper(object):
         self.sf_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         self.forest = MCTSForest()
-        self.probe_records = []  # probe_mode only; see finalize_game_data
 
         self.pull_from_queue()
 
@@ -71,11 +70,6 @@ class GameLooper(object):
             self.sf_thread.close()
             self.sf_thread = None
 
-    def write_probe_records(self, out_path):
-        """Dump everything accumulated under probe_mode as one file."""
-        with gzip.open(out_path, "wb") as f:
-            pickle.dump(self.probe_records, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return len(self.probe_records)
 
 
     def __enter__(self):
@@ -419,16 +413,34 @@ class GameLooper(object):
         Attach the final scalar outcome to every per-move example and enqueue.
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
-        # probe runs are one move per position: accumulate in memory and let
+
+        scenario = game.meta.get("scenario", "")
+
+        # bluder replay runs are one move per position: accumulate in memory and let
         # the driver write a single file, instead of a pkl per position
-        if getattr(self.config, "probe_mode", False):
-            self.games_finished += 1
-            self.probe_records.append({
-                **game.meta,
-                "probe_move": game.moves_played[0] if game.moves_played else None,
-                "search": game.tree_data[0] if game.tree_data else {},
+        if scenario == "blunder_replay_probe":
+            brp_result_info = {
+                "ts": now(),
+                "game_id": game.game_id,
+                "scenario": scenario,
+                "vs_stockfish": game.vs_stockfish,
+                "stockfish_color": game.stockfish_is_white,
+                "duration": now() - game.started_at,
+                "mcts_sims_total": game.mcts_sims_total,
+                "mcts_plies": game.mcts_plies,
+                "start_fen": game.starting_fen,
+                "model_epoch": self.n_retrains,
+                "moves_played": game.moves_played,
+                "xerces_uci": game.moves_played[0] if game.moves_played else None,
+                "tree_search_data": game.tree_data,
                 "sims_done_total": game.tree.sims_done_total,
-            })
+            }
+
+            brp_result_info.update({**game.meta})
+
+            # parent process will handle this based on the scenario key 
+            self.recent_games_q.put({"looper_id": self.id, "meta": brp_result_info})
+
             game.examples = []
             game.recents.clear()
             return
@@ -453,7 +465,7 @@ class GameLooper(object):
         mem_summary = {
             "ts": now(),
             "game_id": game.game_id,
-            "scenario": game.meta.get("scenario", ""),
+            "scenario": scenario,
             "plies": game.plies,
             "result": game.outcome or 0.0,
             "end_reason": game.end_reason,
@@ -470,7 +482,7 @@ class GameLooper(object):
             "uniform_eps": cfg.uniform_eps,
         }
 
-        # add any per-game sampled param values (specific value used, not the options list)
+        # add any per-game sampled param values (specific value used, not the options)
         for param in self.config.sampleable:
             val = getattr(cfg, param)
             if param == 'move_sample_temp_range' and isinstance(val, list):

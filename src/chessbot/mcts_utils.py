@@ -111,8 +111,11 @@ class MCTSTree(fasttree):
         if self.config.sample_moves == False:
             sample = False
 
+        elif self.board.piece_count() <= 20:
+            sample = False
+        
         # at/after the convergence ply, just use C++/base behavior
-        elif (self.n_plies >= self.config.move_sample_temp_plies) or (self.board.piece_count() <= 20):
+        elif (self.n_plies >= self.config.move_sample_temp_plies):
             sample = False
 
         else:

@@ -1,18 +1,45 @@
-"""Epoch x all uplift, split by move-changed and by improved/not-improved."""
+"""
+Epoch x all uplift, split by move-changed and by improved/not-improved.
 
+Sourced from the per-epoch probe_e*.csv files on disk, not the live pool:
+the pool's own probes[] only survives for positions that haven't been
+evicted, so it silently loses history the moment a position is solved.
+The CSVs are the permanent record -- every probe that ever ran, regardless
+of what later happened to that position in the pool.
+
+Scoped to --run_tags like probe_table.py: epoch is only meaningful within
+one model lineage's continuous retrain counter, so globbing every run dir
+on disk would silently mix epochs from unrelated model families.
+
+  python pairwise.py --run_tags 18m_10c6t_SWA_selfplay1
+  python pairwise.py --run_tags 18m_10c6t_SWA_selfplay0 18m_10c6t_SWA_selfplay1
+"""
+import argparse
+import glob
 import itertools
+import os
+import re
 
 import numpy as np
+import pandas as pd
 
-from chessbot.validation import load_probe_pool, PROBE_EQUIV_CPL
+from chessbot import SP_DIR
+from chessbot.blunder_replay import BLUNDER_REPLAY_EQUIV_CPL
 
-pool = load_probe_pool()
+ap = argparse.ArgumentParser()
+ap.add_argument("--run_tags", nargs="+", required=True)
+args = ap.parse_args()
 
 seen = {}
-for rec in pool:
-    for p in rec.get('probes') or []:
-        if p.get('epoch') is not None:
-            seen.setdefault(rec['pos_id'], {})[p['epoch']] = p
+for tag in args.run_tags:
+    pattern = os.path.join(SP_DIR, tag, "blunder_probe", "probe_e*.csv")
+    for path in sorted(glob.glob(pattern)):
+        epoch = int(re.search(r"_e(\d+)_", path).group(1))
+        df = pd.read_csv(path)
+        for row in df.itertuples(index=False):
+            seen.setdefault(row.short_fen, {})[epoch] = {
+                'move': row.probe_move, 'cpl': row.probe_cpl,
+            }
 
 epochs = sorted({e for v in seen.values() for e in v})
 print(f'positions with any probe : {len(seen)}')
@@ -54,7 +81,7 @@ def row(label, pairs, summary=False):
     after = np.array([y['cpl'] for x, y in pairs], dtype=float)
     diff_mv = np.array([x['move'] != y['move'] for x, y in pairs])
     improved = after < before
-    equiv = after <= PROBE_EQUIV_CPL
+    equiv = after <= BLUNDER_REPLAY_EQUIV_CPL
 
     # of the improved ones, how many are now equiv-or-better -- conditional
     # on improved, not a fraction of n like the other percentage columns

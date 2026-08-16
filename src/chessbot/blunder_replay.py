@@ -39,9 +39,6 @@ BLUNDER_REPLAY_MS_MAX_MULT = 2
 # them, don't evict anything to make room. More eviction pressure is coming
 # later; for now the pool simply stops growing.
 BLUNDER_POOL_MAX_SIZE = 128_000
-# spread this many replay positions across each selfplay round, metered
-# against real games queued/completions so far -- not a retrain-cadence flood
-BLUNDER_REPLAY_PER_ROUND = 8192
 
 # candidate rules: V = best_cp, P = played_cp, cpl = V - P (post equiv/mate
 # adjustment), all STM-POV. Z_stm is the result from the mover's own

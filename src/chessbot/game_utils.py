@@ -627,21 +627,23 @@ class GameGenerator:
         """
         Called after each real game is queued (see top_up_queues in
         run_selfplay.py). Spread is driven by real games queued so far
-        (linear, hits BLUNDER_REPLAY_PER_ROUND exactly when this round's
-        real games are all queued) -- completions structurally lag queuing,
-        so using the completion gap directly as the order size just floods
-        early and never catches up. n_replay_finalized (Rescorer's live
-        running total) instead throttles: if too much is already queued and
-        not yet finished, pause new queuing until it catches up, so a slow
-        SF pool can't clog game_queue. Once this round's real games are all
-        queued, dumps whatever's left of the round's allotment in one go.
+        (linear, hits cfg.blunder_replay_per_round exactly when this
+        round's real games are all queued) -- completions structurally lag
+        queuing, so using the completion gap directly as the order size
+        just floods early and never catches up. n_replay_finalized
+        (Rescorer's live running total) instead throttles: if too much is
+        already queued and not yet finished, pause new queuing until it
+        catches up, so a slow SF pool can't clog game_queue. Once this
+        round's real games are all queued, dumps whatever's left of the
+        round's allotment in one go.
         """
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
-            BLUNDER_REPLAY_PER_ROUND,
         )
 
-        if pool is None or self.brps_queued >= BLUNDER_REPLAY_PER_ROUND:
+        target = self.config.blunder_replay_per_round
+
+        if pool is None or self.brps_queued >= target:
             return []
 
         if self.brp_completed_baseline is None:
@@ -649,18 +651,16 @@ class GameGenerator:
         completed = n_replay_finalized - self.brp_completed_baseline
 
         target_real = max(self.config.n_games, 1)
-        remaining = BLUNDER_REPLAY_PER_ROUND - self.brps_queued
+        remaining = target - self.brps_queued
 
         if self.games_queued >= target_real:
             n_to_queue = remaining
         else:
-            target_queued = (
-                (self.games_queued / target_real) * BLUNDER_REPLAY_PER_ROUND
-            )
+            target_queued = (self.games_queued / target_real) * target
             n_to_queue = max(0, min(int(target_queued) - self.brps_queued, remaining))
 
             backlog = self.brps_queued - completed
-            backlog_cap = max(BLUNDER_REPLAY_PER_ROUND // 20, 50)
+            backlog_cap = max(target // 20, 50)
             if backlog >= backlog_cap:
                 n_to_queue = 0
 
@@ -677,7 +677,7 @@ class GameGenerator:
         # small batches by design
         if self.brps_queued // 500 != before // 500:
             print(f"[blunder_replay] {self.brps_queued} queued this round "
-                  f"(target {BLUNDER_REPLAY_PER_ROUND})")
+                  f"(target {target})")
 
         return specs
 

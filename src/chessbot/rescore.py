@@ -42,7 +42,7 @@ from chessbot.game_utils import reconcile_game_boards, short_fen
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
-BLUNDER_MERGE_EVERY = 128
+BLUNDER_MERGE_EVERY = 256
 # blunder-replay analysis fires purely on collected-row count, not a retrain
 # cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
 # before a summary is computed and the file resets to a fresh window
@@ -337,6 +337,7 @@ class Rescorer(object):
         # are safe to hold as real instance state.
         self.blunder_pool_path = os.environ.get(BLUNDER_POOL_ENV) or None
         self.n_pool_changes = 0
+        self.pool_save_times = []
 
         self.start_time = None  # set on first game to exclude idle startup time
         self.games_seen = set()
@@ -501,12 +502,22 @@ class Rescorer(object):
         self.maybe_save_pool(pool)
 
     def maybe_save_pool(self, pool):
-        """Atomic tmp-write + swap every BLUNDER_MERGE_EVERY mutations
-        (candidate adds, replay evictions) -- not every mutation, since this
-        can fire at full selfplay volume."""
+        """
+        Atomic tmp-write + swap every BLUNDER_MERGE_EVERY mutations, rate
+        limited on top to at most 2 saves per 30s -- at high replay
+        throughput the count trigger alone could fire many times a second.
+        Changes just stay pending (nothing is lost) until the window opens
+        back up.
+        """
         if pool is None or self.n_pool_changes < BLUNDER_MERGE_EVERY:
             return
+        now = time.time()
+        self.pool_save_times = [
+            t for t in self.pool_save_times if now - t < 30.0]
+        if len(self.pool_save_times) >= 2:
+            return
         save_probe_pool(pool, self.blunder_pool_path)
+        self.pool_save_times.append(now)
         self.n_pool_changes = 0
         print(f"{RS} blunder pool saved: {len(pool)} live")
 
@@ -1069,6 +1080,7 @@ class Rescorer(object):
             "same_move": same_move,
             "found_best": found_best,
             "found_equiv": found_equiv,
+            "best_depth": best_depth,
             "evicted": found_equiv,
             "sims": sims,
             "stop_reason": stop_reason,
@@ -1107,16 +1119,18 @@ class Rescorer(object):
 
         # two 2048-row windows can land on the same epoch if replay
         # throughput outpaces the retrain cadence -- append onto that
-        # epoch's existing CSV instead of splitting across multiple files
+        # epoch's existing CSV instead of splitting across multiple files.
+        # probe_e*.csv naming matches the old convention -- probe_table.py,
+        # pairwise.py, and backfill_probe_csv_keys.py all glob for it.
         existing = glob.glob(os.path.join(
-            blunder_replay_dir(self.config), f"brp_e{epoch}_*.csv"))
+            blunder_replay_dir(self.config), f"probe_e{epoch}_*.csv"))
         if existing:
             csv_path = existing[0]
             df = pd.concat([pd.read_csv(csv_path), new_df], ignore_index=True)
         else:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             csv_path = os.path.join(
-                blunder_replay_dir(self.config), f"brp_e{epoch}_{stamp}.csv")
+                blunder_replay_dir(self.config), f"probe_e{epoch}_{stamp}.csv")
             df = new_df
         df.to_csv(csv_path, index=False)
 
@@ -1131,6 +1145,7 @@ class Rescorer(object):
             "same_move": df["same_move"].mean(),
             "found_best": df["found_best"].mean(),
             "found_equiv": df["found_equiv"].mean(),
+            "cache_hit": df["from_cache"].mean(),
             "n_evicted": int(df["evicted"].sum()),
             "file": os.path.basename(csv_path),
         }

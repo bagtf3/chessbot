@@ -84,6 +84,10 @@ class Config(object):
     rescore_blunder_cp_winner = 200
     rescore_n_sf_threads = 1
 
+    # target replay positions GameGenerator spreads across each round,
+    # metered against real games queued/completions -- not a flood
+    blunder_replay_per_round = 16384
+
     train_on_stockfish = True
 
     kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median

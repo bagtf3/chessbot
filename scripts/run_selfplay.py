@@ -638,8 +638,8 @@ def main(run_tag):
                     crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
                 )
                 # blunder-replay injection lives in GameGenerator: spread
-                # across the round toward BLUNDER_REPLAY_PER_ROUND instead of
-                # a retrain-cadence flood, so replays land across different
+                # across the round toward cfg.blunder_replay_per_round instead
+                # of a retrain-cadence flood, so replays land across different
                 # epochs.
 
                 # break if no workers and backlog is small enough to carry into next round

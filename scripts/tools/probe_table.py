@@ -60,9 +60,10 @@ def load_rows(run_tags):
                 "best": d.found_best.mean(),
                 "equiv": d.found_equiv.mean(),
                 "same & equiv": (d.same_move & d.found_equiv).mean(),
-                "depth": d.best_depth.mean(),
-                "cache": h["cache_hit"],
-                "ret": h["n_evicted"],
+                # older CSVs/history rows predate these columns
+                "depth": d["best_depth"].mean() if "best_depth" in d.columns else float("nan"),
+                "cache": h.get("cache_hit", float("nan")),
+                "ret": h.get("n_evicted", float("nan")),
             })
     return pd.DataFrame(rows).sort_values("epoch").reset_index(drop=True)
 

@@ -83,9 +83,7 @@ def row(label, pairs, summary=False):
     improved = after < before
     equiv = after <= BLUNDER_REPLAY_EQUIV_CPL
 
-    # of the improved ones, how many are now equiv-or-better -- conditional
-    # on improved, not a fraction of n like the other percentage columns
-    imp_eq_cell = pct_plain(equiv[improved]) if improved.any() else ''
+    equiv_cell = pct_plain(equiv)
 
     if summary:
         cpl_cell = delta_ci(before, after)
@@ -109,7 +107,7 @@ def row(label, pairs, summary=False):
     return {
         'split': label, 'n': str(n), 'cpl': cpl_cell, 'diff': diff_cell,
         'cpl (diff)': cpl_diff_cell, 'improved': improved_cell,
-        'improved & equiv': imp_eq_cell,
+        'equiv': equiv_cell,
         'cpl (improved)': cpl_imp_cell, 'cpl (!improved)': cpl_not_imp_cell,
     }
 
@@ -126,7 +124,7 @@ rows.append(row('all x all', everything))
 rows.append(row('mean +/- CI', everything, summary=True))
 
 cols = ['split', 'n', 'cpl', 'diff', 'cpl (diff)', 'improved',
-       'improved & equiv', 'cpl (improved)', 'cpl (!improved)']
+       'equiv', 'cpl (improved)', 'cpl (!improved)']
 widths = {c: max(len(c), max(len(r[c]) for r in rows)) for c in cols}
 print(' | '.join(c.center(widths[c]) for c in cols))
 for r in rows:

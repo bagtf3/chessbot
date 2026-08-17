@@ -12,12 +12,18 @@ import pandas as pd
 
 from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
-from chessbot.rescore import Rescorer, SFRescoreThread, migrate_pretrain_progress
+from chessbot.rescore import (
+    Rescorer, SFRescoreThread, migrate_pretrain_progress,
+    BLUNDER_REPLAY_ANALYSIS_EVERY,
+)
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, next_model_epoch
 from chessbot.validation import build_validation_summary, create_validation_config
-from chessbot.blunder_replay import load_probe_pool, BLUNDER_POOL_ENV
+from chessbot.blunder_replay import (
+    load_probe_pool, BLUNDER_POOL_ENV, BLUNDER_REPLAY_HISTORY_FILENAME,
+    last_epoch_in_blunder_replay_history,
+)
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator, GameSpec, resolve_cfg
 from chessbot.retrain_worker import run_retrain_worker
@@ -96,7 +102,8 @@ def stdin_listener():
             global SAVE_TRAINING_DATA_N
             SAVE_TRAINING_DATA_N = int(parts[3]) if len(parts) > 3 else None
             SAVE_TRAINING_DATA_REQUESTED.set()
-            print(f"[cmd] save training data requested{f' (n={SAVE_TRAINING_DATA_N})' if SAVE_TRAINING_DATA_N else ''}")
+            n_sfx = f" (n={SAVE_TRAINING_DATA_N})" if SAVE_TRAINING_DATA_N else ""
+            print(f"[cmd] save training data requested{n_sfx}")
         else:
             print(f"[cmd] unknown command: {cmd!r}")
 
@@ -200,13 +207,27 @@ class ValidationSpecSource:
         return spec
 
 
+def dump_blunder_replays(game_queue, game_gen, blunder_pool, n, reason):
+    """Bulk injection at the epoch boundaries (round start, post-retrain), so
+    most of an analysis window's probes land on one model instead of smearing
+    across epochs the way the 2:1 trickle alone does."""
+    specs = game_gen.next_blunder_replays(blunder_pool, n)
+    for spec in specs:
+        game_queue.put(spec)
+    if specs:
+        print(f"[blunder_replay] dumped {len(specs)} replays ({reason})")
+    return len(specs)
+
+
 def top_up_queues(game_queue, sf_queue, game_gen, blunder_pool=None,
-                   n_replay_finalized=0, budget=None, target=None):
+                   rescorer=None, budget=None, target=None):
     """
-    blunder_pool/n_replay_finalized only matter when game_gen is a real
-    GameGenerator -- validation passes a ValidationSpecSource instead, which
-    has no maybe_next_blunder_replays, so blunder-replay metering is skipped
-    there automatically.
+    blunder_pool/rescorer only matter when game_gen is a real GameGenerator --
+    validation passes a ValidationSpecSource instead, which has no
+    next_blunder_replays, so blunder-replay metering is skipped there
+    automatically. Replays trickle in at 2 per eligible blunder the rescorer
+    has found since the last top-up; credits accrue while the queues are full
+    and flush on the next refill, so nothing is lost.
     """
     added = 0
     if target is None:
@@ -229,9 +250,9 @@ def top_up_queues(game_queue, sf_queue, game_gen, blunder_pool=None,
             game_queue.put(spec)
         added += 1
 
-        if meter:
-            for brp_spec in game_gen.maybe_next_blunder_replays(
-                blunder_pool, n_replay_finalized):
+        if meter and rescorer is not None:
+            n_brp = 2 * rescorer.take_brp_credits()
+            for brp_spec in game_gen.next_blunder_replays(blunder_pool, n_brp):
                 game_queue.put(brp_spec)
 
     return added
@@ -540,8 +561,7 @@ def main(run_tag):
                 spec_source = game_gen
 
             total_queued = top_up_queues(
-                game_queue, sf_queue, spec_source, blunder_pool,
-                rescorer.n_replay_finalized,
+                game_queue, sf_queue, spec_source, blunder_pool, rescorer,
                 budget=n_games, target=initial_target,
             )
 
@@ -568,9 +588,24 @@ def main(run_tag):
 
             n_retrains = next_model_epoch(working_cfg.progress_csv_path)
 
+            # the current epoch has no analysis on record yet -- open the round
+            # with a bulk batch so this model gets probed properly, rather than
+            # inheriting whatever the trickle happens to deliver
+            if blunder_pool and not is_validation:
+                last_brp_epoch = last_epoch_in_blunder_replay_history(
+                    os.path.join(
+                        working_cfg.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+                )
+                if last_brp_epoch is None or n_retrains > last_brp_epoch:
+                    dump_blunder_replays(
+                        game_queue, game_gen, blunder_pool,
+                        BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
+                        f"round start, epoch {n_retrains}",
+                    )
+
             procs = check_and_reap_procs(
                 procs,
-                crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
+                crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt")
             )
             waiting_on_retrain = False
             # keep spinning while a retrain is in flight even after every
@@ -626,20 +661,24 @@ def main(run_tag):
                     if n and n < len(data):
                         data = random.sample(data, n)
                     ts = int(time.time())
-                    snap_path = os.path.join(base_cfg.run_dir, f"training_snapshot_{ts}.pkl")
+                    snap_path = os.path.join(
+                        base_cfg.run_dir, f"training_snapshot_{ts}.pkl")
+                    
                     with open(snap_path, "wb") as f:
                         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-                    print(f"[cmd] saved {len(data)} samples to training_snapshot_{ts}.pkl")
+
+                    tss_file = f"training_snapshot_{ts}.pkl"
+                    print(f"[cmd] saved {len(data)} samples to {tss_file}")
 
                 # check for finished procs
                 procs = check_and_reap_procs(
                     procs,
-                    crash_log_path=os.path.join(working_cfg.run_dir, "worker_crash_log.txt"),
+                    crash_log_path=os.path.join(
+                        working_cfg.run_dir, "worker_crash_log.txt")
                 )
-                # blunder-replay injection lives in GameGenerator: spread
-                # across the round toward cfg.blunder_replay_per_round instead
-                # of a retrain-cadence flood, so replays land across different
-                # epochs.
+                # blunder-replay injection: a 2:1 trickle off eligible blunders
+                # (drained in top_up_queues) plus the epoch-boundary dumps, so
+                # most of a window's probes share one model.
 
                 # break if no workers and backlog is small enough to carry into next round
                 if not procs and len(finished_games) < MAX_BACKLOG:
@@ -658,13 +697,13 @@ def main(run_tag):
 
                 # refill queues
                 if not stop_signal_sent:
-                    sf_low = sf_queue is not None and sf_queue.qsize() < GAME_QUEUE_MIN // 2
+                    sf_low = sf_queue is not None
+                    sf_low = sf_low and sf_queue.qsize() < GAME_QUEUE_MIN // 2
                     game_low = game_queue.qsize() < GAME_QUEUE_MIN
                     if sf_low or game_low:
                         added = top_up_queues(
                             game_queue, sf_queue, spec_source, blunder_pool,
-                            rescorer.n_replay_finalized,
-                            budget=n_games - total_queued,
+                            rescorer, budget=n_games - total_queued,
                         )
                         total_queued += added
                         # n_games reached — tell all workers to drain and exit
@@ -733,8 +772,8 @@ def main(run_tag):
                 n_files = len(primary_files)
                 # `and procs`: once the workers are gone the round is closing,
                 # so don't start a fresh retrain that would hold it open again
-                launch_retrain = (retrain_worker is None and not is_validation
-                                  and bool(procs))
+                launch_retrain = retrain_worker is None and not is_validation
+                launch_retrain = launch_retrain and bool(procs)
                 
                 if launch_retrain and n_files >= PTS:
                     replay_files = rb.sample_files(
@@ -750,7 +789,9 @@ def main(run_tag):
                     retrain_result_q = ctx.Queue()
                     retrain_p = ctx.Process(
                         target=run_retrain_worker,
-                        args=(working_cfg.run_dir, retrain_msg_q, retrain_result_q, n_retrains),
+                        args=(
+                            working_cfg.run_dir, retrain_msg_q,
+                            retrain_result_q, n_retrains),
                         daemon=True,
                     )
 
@@ -758,13 +799,17 @@ def main(run_tag):
                     # both messages up front; the worker still consumes them in
                     # order and does the same preload -> validate -> train run
                     retrain_msg_q.put({
-                        "cmd": "preload", "replay": replay_files, "historic": historic_files,
+                        "cmd": "preload", "replay": replay_files,
+                        "historic": historic_files
                     })
+
                     retrain_msg_q.put({"cmd": "start", "primary": primary_sample})
                     retrain_worker = {
-                        "p": retrain_p, "msg_q": retrain_msg_q, "result_q": retrain_result_q,
-                        "replay_files": replay_files, "primary_files": primary_sample,
+                        "p": retrain_p, "msg_q": retrain_msg_q,
+                        "result_q": retrain_result_q,
+                        "replay_files": replay_files, "primary_files": primary_sample
                     }
+
                     print(f"[retrain] worker launched at {n_files}/{PTS} "
                           f"-- loading {rb.RETRAIN_REPLAY_SHARDS} replay + "
                           f"{rb.RETRAIN_HISTORIC_SHARDS} historic shards, "
@@ -800,7 +845,10 @@ def main(run_tag):
                         recorder.n_retrains += 1
                         working_cfg = Config.from_yaml(yaml_path, init=True)
                         if is_validation:
-                            working_cfg = create_validation_config(working_cfg, val_yaml_path)
+                            working_cfg = create_validation_config(
+                                working_cfg, val_yaml_path
+                            )
+
                         rescorer.config = working_cfg
                         for t in sf_rescore_threads:
                             # budget is hardcoded, so throttle state survives
@@ -815,7 +863,9 @@ def main(run_tag):
                                 # either grab a stale engine or each redundantly
                                 # recompile their own.
                                 trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
-                                working_cfg = prepare_trt(working_cfg, trt_dir, model_name)
+                                working_cfg = prepare_trt(
+                                    working_cfg, trt_dir, model_name
+                                )
 
                         # hard rule: unpause is the first thing that happens
                         # once retrain has actually finished (plus the TRT
@@ -853,7 +903,20 @@ def main(run_tag):
 
                         n_retrains += 1
                         retrain_worker = None
-                        rb.sync_live_buffer(base_cfg.run_dir, rescorer.live_buffer.records)
+
+                        # new weights are live -- probe the fresh epoch in bulk.
+                        # a retrain from the previous round can land here on a
+                        # validation round, where game_queue holds paired specs
+                        if blunder_pool and not is_validation and not stop_signal_sent:
+                            dump_blunder_replays(
+                                game_queue, game_gen, blunder_pool,
+                                BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
+                                f"post-retrain, epoch {n_retrains}",
+                            )
+
+                        rb.sync_live_buffer(
+                            base_cfg.run_dir, rescorer.live_buffer.records
+                        )
 
                 time.sleep(0.05)
 

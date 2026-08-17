@@ -405,6 +405,8 @@ class Rescorer(object):
             blunder_replay_dir(cfg), "blunder_replay_probe.jsonl")
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
+        # 2:1 replay trickle meter -- drained by top_up_queues
+        self.brp_credits = 0
 
         lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
         lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
@@ -465,6 +467,10 @@ class Rescorer(object):
 
         fen = board.fen()
         key = short_fen(fen)
+        # meter counts every eligible blunder, including the ones that end up
+        # as a dedup bump or get dropped against a full pool
+        self.brp_credits += 1
+
         if key in pool:
             pool[key]["times_seen"] = pool[key].get("times_seen", 1) + 1
         elif len(pool) >= BLUNDER_POOL_MAX_SIZE:
@@ -549,6 +555,12 @@ class Rescorer(object):
 
     def submit_blunder_replay(self, brp_data):
         self.blunder_replay_intake.append(brp_data)
+
+    def take_brp_credits(self):
+        """Read-and-clear the eligible-blunder count since the last call."""
+        n = self.brp_credits
+        self.brp_credits = 0
+        return n
 
     def tick(self, pool=None):
         if self.lc0_thread is not None:
@@ -1037,9 +1049,12 @@ class Rescorer(object):
         found_best = probe_move == best_uci
         found_equiv = probe_cpl <= BLUNDER_REPLAY_EQUIV_CPL
         same_move = probe_move == orig_move
+        added_to_buffer = False
+        added_epoch = None
 
         if short_fen_key and pool is not None and short_fen_key in pool:
             src = pool[short_fen_key]
+            added_epoch = src.get('model_epoch')
             if not from_cache:
                 if (best_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
                     ratchet_store(src, best_uci, best_cp, best_depth)
@@ -1064,11 +1079,10 @@ class Rescorer(object):
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
             elif ply is not None and probe_cpl > 60:
-                added_epoch = src.get('model_epoch')
                 age_ok = (added_epoch is None
                           or (epoch is not None and epoch - added_epoch > 5))
                 if age_ok:
-                    self.add_blunder_replay_training_example(
+                    added_to_buffer = self.add_blunder_replay_training_example(
                         ply, epoch, best_uci, best_cp, probe_cpl)
 
             self.n_pool_changes += 1
@@ -1078,15 +1092,18 @@ class Rescorer(object):
             "short_fen": short_fen_key,
             "src_run_tag": brp_data.get('src_run_tag'),
             "model_epoch": epoch,
+            "added_epoch": added_epoch,
             "orig_move": orig_move,
             "orig_cpl": orig_cpl,
             "probe_move": probe_move,
             "probe_cpl": probe_cpl,
             "deep_best": best_uci,
+            "best_depth": best_depth,
             "same_move": same_move,
             "found_best": found_best,
             "found_equiv": found_equiv,
             "evicted": found_equiv,
+            "added_to_buffer": added_to_buffer,
             "sims": sims,
             "stop_reason": stop_reason,
             "from_cache": from_cache,
@@ -1117,11 +1134,11 @@ class Rescorer(object):
         cm = tr.get('candidate_moves', [])
         xc0_pairs = [(c['uci'], max(1, c['visits'])) for c in cm]
         if not xc0_pairs:
-            return
+            return False
 
         legal_ucis = board.legal_moves()
         if best_uci not in legal_ucis:
-            return
+            return False
 
         total_visits = sum(v for _, v in xc0_pairs)
         sf_visits = {u: 1 for u in legal_ucis}
@@ -1154,8 +1171,12 @@ class Rescorer(object):
         x = self.encode_board(board)
         okey = self.opening_counts.key(board, x)
         self.opening_counts.bump(okey)
+        # distinct source tag so retrain_worker.py can exclude these blended
+        # synthetic-target samples from the validation draw
         self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0'), okey)
+            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0_replay_blend'),
+            okey)
+        return True
 
     def analyse_brp_file(self):
         """
@@ -1178,7 +1199,12 @@ class Rescorer(object):
             return
 
         new_df = pd.DataFrame(rows)
-        epoch = rows[-1].get("model_epoch")
+        # max, not rows[-1] -- a backlogged batch of stale-epoch rows can get
+        # processed well after the run has moved on, and rows[-1] would then
+        # silently attribute the whole window to that old epoch. TODO: use
+        # the live current epoch directly instead of inferring it from the
+        # window's own rows.
+        epoch = max([r.get("model_epoch") for r in rows])
 
         # two 2048-row windows can land on the same epoch if replay
         # throughput outpaces the retrain cadence -- append onto that
@@ -1209,6 +1235,8 @@ class Rescorer(object):
             "found_best": df["found_best"].mean(),
             "found_equiv": df["found_equiv"].mean(),
             "n_evicted": int(df["evicted"].sum()),
+            "n_added_to_buffer": int(df["added_to_buffer"].sum()),
+            "cache_hit": df["from_cache"].mean(),
             "file": os.path.basename(csv_path),
         }
         hist_path = os.path.join(
@@ -1221,7 +1249,8 @@ class Rescorer(object):
               f"cpl {summary['orig_cpl']:.1f} -> {summary['probe_cpl']:.1f}  "
               f"same_move {summary['same_move']:.1%}  "
               f"found_equiv {summary['found_equiv']:.1%}  "
-              f"evicted {summary['n_evicted']}")
+              f"evicted {summary['n_evicted']}  "
+              f"added_to_buffer {summary['n_added_to_buffer']}")
 
         open(self.blunder_replay_jsonl, "w", encoding="utf-8").close()
         self.n_replay_rows = 0

@@ -62,6 +62,8 @@ def load_rows(run_tags):
                 "same & equiv": (d.same_move & d.found_equiv).mean(),
                 # older CSVs/history rows predate these columns
                 "depth": d["best_depth"].mean() if "best_depth" in d.columns else float("nan"),
+                "age": (e - d["added_epoch"]).mean() if "added_epoch" in d.columns else float("nan"),
+                "enq": d["added_to_buffer"].mean() if "added_to_buffer" in d.columns else float("nan"),
                 "cache": h.get("cache_hit", float("nan")),
                 "ret": h.get("n_evicted", float("nan")),
             })
@@ -80,23 +82,41 @@ def ci95(x):
 
 
 def build_table(raw):
-    PCT_COLS = ["improved", "same", "best", "equiv", "same & equiv", "cache"]
+    PCT_COLS = ["improved", "enq", "cache"]
 
     disp = pd.DataFrame({
         "epoch": raw["epoch"].astype(str),
         "n": raw["n"].astype(str),
-        "cpl": [f"{a:.1f} -> {b:.1f}" for a, b in zip(raw.cpl_a, raw.cpl_b)],
-        "cpl (diff move)": [f"{a:.1f} -> {b:.1f}"
+        "cpl": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
+               for a, b in zip(raw.cpl_a, raw.cpl_b)],
+        "cpl (diff move)": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
                             for a, b in zip(raw.dm_a, raw.dm_b)],
-        "cpl (same move)": [f"{a:.1f} -> {b:.1f}"
+        "cpl (same move)": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
                             for a, b in zip(raw.sm_a, raw.sm_b)],
         "depth": raw["depth"].round(1).astype(str),
+        "age": raw["age"].round(1).astype(str),
         "ret": raw["ret"].astype(str),
     })
     for c in PCT_COLS:
         disp[c] = raw[c].map(pct)
+
+    # equiv subsumes best (found_best implies found_equiv), so best is
+    # redundant here -- one column of same/equiv/same&equiv instead, each
+    # sub-percentage right-justified to its own max width so the slashes
+    # line up down the column
+    same_pct = raw["same"].map(pct)
+    equiv_pct = raw["equiv"].map(pct)
+    both_pct = raw["same & equiv"].map(pct)
+    w_same = same_pct.str.len().max()
+    w_equiv = equiv_pct.str.len().max()
+    w_both = both_pct.str.len().max()
+    disp["same/equiv/both"] = [
+        f"{s.rjust(w_same)} / {e.rjust(w_equiv)} / {b.rjust(w_both)}"
+        for s, e, b in zip(same_pct, equiv_pct, both_pct)
+    ]
+
     disp = disp[["epoch", "n", "cpl", "cpl (diff move)", "cpl (same move)",
-                 "improved", "same", "best", "equiv", "same & equiv", "depth",
+                 "improved", "same/equiv/both", "depth", "age", "enq",
                  "cache", "ret"]]
 
     footer = {c: "" for c in disp.columns}

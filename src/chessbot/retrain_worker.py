@@ -128,7 +128,12 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     # training: primary (mixed sources, tracks the live distribution) and
     # historic (pretrain distribution, continues the pretraining curve).
     # Replay is deliberately excluded -- it has already been trained on.
-    val_primary = sample_records(primary_records_raw, VAL_PRIMARY_RECORDS)
+    # 'xc0_replay_blend' (blunder-replay SF/xc0 blend, see
+    # Rescorer.add_blunder_replay_training_example) is synthetic-target and
+    # excluded here too -- it still trains normally via all_records below,
+    # just kept out of the validation metrics/plots.
+    val_pool = [r for r in primary_records_raw if r[6] != 'xc0_replay_blend']
+    val_primary = sample_records(val_pool, VAL_PRIMARY_RECORDS)
     val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
 
     bs = cfg.retrain_batch_size

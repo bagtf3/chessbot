@@ -503,7 +503,6 @@ class GameGenerator:
         # blunder-replay metering, round-scoped (one GameGenerator per round)
         self.games_queued = 0
         self.brps_queued = 0
-        self.brp_completed_baseline = None
 
     def generate(self, game_type):
         """Returns (fen, moves, meta). fen is the starting position; moves are
@@ -623,61 +622,30 @@ class GameGenerator:
         self.games_queued += 1
         return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
 
-    def maybe_next_blunder_replays(self, pool, n_replay_finalized):
+    def next_blunder_replays(self, pool, n_to_queue):
         """
-        Called after each real game is queued (see top_up_queues in
-        run_selfplay.py). Spread is driven by real games queued so far
-        (linear, hits cfg.blunder_replay_per_round exactly when this
-        round's real games are all queued) -- completions structurally lag
-        queuing, so using the completion gap directly as the order size
-        just floods early and never catches up. n_replay_finalized
-        (Rescorer's live running total) instead throttles: if too much is
-        already queued and not yet finished, pause new queuing until it
-        catches up, so a slow SF pool can't clog game_queue. Once this
-        round's real games are all queued, dumps whatever's left of the
-        round's allotment in one go.
+        Sample n_to_queue replay probes from the live pool. All metering
+        lives at the callsites in run_selfplay.py: a 2:1 trickle off every
+        eligible blunder the rescorer finds, plus a bulk dump at round
+        start and after each retrain.
         """
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
         )
 
-        target = self.config.blunder_replay_per_round
-
-        if pool is None or self.brps_queued >= target:
-            return []
-
-        if self.brp_completed_baseline is None:
-            self.brp_completed_baseline = n_replay_finalized
-        completed = n_replay_finalized - self.brp_completed_baseline
-
-        target_real = max(self.config.n_games, 1)
-        remaining = target - self.brps_queued
-
-        if self.games_queued >= target_real:
-            n_to_queue = remaining
-        else:
-            target_queued = (self.games_queued / target_real) * target
-            n_to_queue = max(0, min(int(target_queued) - self.brps_queued, remaining))
-
-            backlog = self.brps_queued - completed
-            backlog_cap = max(target // 20, 50)
-            if backlog >= backlog_cap:
-                n_to_queue = 0
-
-        if n_to_queue <= 0:
+        if pool is None or n_to_queue <= 0:
             return []
 
         replay_cfg = create_blunder_replay_config(self.config)
         specs = blunder_replay_specs(
-            replay_cfg, pool, n_to_queue, seed=self.games_queued)
+            replay_cfg, pool, n_to_queue, seed=self.brps_queued)
 
         before = self.brps_queued
         self.brps_queued += len(specs)
         # heartbeat only, not per-call -- this fires many times per round in
         # small batches by design
         if self.brps_queued // 500 != before // 500:
-            print(f"[blunder_replay] {self.brps_queued} queued this round "
-                  f"(target {target})")
+            print(f"[blunder_replay] {self.brps_queued} queued this round")
 
         return specs
 

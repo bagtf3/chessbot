@@ -83,7 +83,7 @@ def main():
     p.add_argument("--ignore-eval-progress", action="store_true")
     p.add_argument("--do-cleanup", action="store_true",
                     help="delete replay_buffer/primary_buffer from the clone "
-                         "source after copying (remaining_untrained.pkl is "
+                         "source after copying (live_buffer.pkl is "
                          "already moved, not copied)")
     args = p.parse_args()
 
@@ -143,24 +143,33 @@ def main():
         if src_model and os.path.exists(src_model):
             src_ext = Path(src_model).suffix
             if src_ext == ".pt":
-                # copy only the canonical {clone_tag}_model.pt; ignore
-                # *_backup.* stale copies (would otherwise collide on the
-                # single destination filename and silently win). The .ts is
-                # not copied: nothing reads it any more, and a stale trace
-                # next to live weights is a trap.
-                pt_files = [
-                    f for f in Path(src_dir).glob("*.pt")
-                    if f.stem == f"{clone_tag}_model"
+                # Two lineages, both required. _model.pt is the trainer:
+                # retrain resumes from it and init_model must point at it.
+                # _model_player.pt is the EMA selfplay actually plays --
+                # prepare_trt falls back to the trainer without warning when
+                # it is absent, so a missed copy silently un-averages a
+                # round. Named explicitly rather than globbed so *_backup.*
+                # can never collide on the destination name. The .ts is not
+                # copied: nothing reads it, and a stale trace is a trap.
+                copies = [
+                    (f"{clone_tag}_model.pt", f"{run_tag}_model.pt"),
+                    (f"{clone_tag}_model_player.pt",
+                     f"{run_tag}_model_player.pt"),
                 ]
-                cfg.init_model = None
-                for f in pt_files:
-                    dst = os.path.join(dest_dir, f"{run_tag}_model{f.suffix}")
-                    shutil.copy2(f, dst)
-                    print(f"[clone] copied model {f} -> {dst}")
-                    if f.suffix == ".pt":
-                        cfg.init_model = dst
-                if cfg.init_model is None:
-                    cfg.init_model = os.path.join(dest_dir, f"{run_tag}_model{src_ext}")
+                cfg.init_model = os.path.join(dest_dir, f"{run_tag}_model.pt")
+                for src_name, dst_name in copies:
+                    src_pt = os.path.join(src_dir, src_name)
+                    if not os.path.exists(src_pt):
+                        print(f"[clone] WARNING: {src_name} not in source, "
+                              f"not copied")
+                        continue
+                    shutil.copy2(src_pt, os.path.join(dest_dir, dst_name))
+                    print(f"[clone] copied {src_name} -> {dst_name}")
+
+                if not os.path.exists(cfg.init_model):
+                    print(f"[clone] WARNING: init_model points at "
+                          f"{os.path.basename(cfg.init_model)}, which does "
+                          f"not exist -- the run will not start")
             else:
                 dest_model = os.path.join(dest_dir, f"{run_tag}_model{src_ext}")
                 shutil.copy2(src_model, dest_model)

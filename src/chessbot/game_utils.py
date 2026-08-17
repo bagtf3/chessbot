@@ -622,12 +622,15 @@ class GameGenerator:
         self.games_queued += 1
         return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
 
-    def next_blunder_replays(self, pool, n_to_queue):
+    def next_blunder_replays(self, pool, n_to_queue, until_analysis=None,
+                             current_epoch=None):
         """
         Sample n_to_queue replay probes from the live pool. All metering
-        lives at the callsites in run_selfplay.py: a 2:1 trickle off every
+        lives at the callsites in run_selfplay.py: a 1:1 trickle off every
         eligible blunder the rescorer finds, plus a bulk dump at round
-        start and after each retrain.
+        start and after each retrain. until_analysis is display only --
+        finished probes still owed before analyse_brp_file fires.
+        current_epoch applies the min-age gate; the dumps omit it.
         """
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
@@ -638,14 +641,18 @@ class GameGenerator:
 
         replay_cfg = create_blunder_replay_config(self.config)
         specs = blunder_replay_specs(
-            replay_cfg, pool, n_to_queue, seed=self.brps_queued)
+            replay_cfg, pool, n_to_queue, seed=self.brps_queued,
+            current_epoch=current_epoch)
 
         before = self.brps_queued
         self.brps_queued += len(specs)
         # heartbeat only, not per-call -- this fires many times per round in
         # small batches by design
         if self.brps_queued // 500 != before // 500:
-            print(f"[blunder_replay] {self.brps_queued} queued this round")
+            msg = f"[blunder_replay] {self.brps_queued} queued this round"
+            if until_analysis is not None:
+                msg += f", {until_analysis} results until analysis"
+            print(msg)
 
         return specs
 

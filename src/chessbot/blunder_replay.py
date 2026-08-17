@@ -29,6 +29,10 @@ BLUNDER_REPLAY_DIRNAME = "blunder_probe"
 BLUNDER_REPLAY_HISTORY_FILENAME = "blunder_probe_history.jsonl"
 BLUNDER_REPLAY_MIN_CACHE_DEPTH = 17
 BLUNDER_REPLAY_EQUIV_CPL = 12
+# a position discovered this recently has not survived a retrain yet, so
+# replaying it measures nothing. Gates trickle sampling; the epoch-boundary
+# dumps deliberately ignore it.
+BLUNDER_REPLAY_MIN_AGE_EPOCHS = 5
 # per-position SF budget: starts here, escalates by MS_STEP each probe that
 # neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
 # capped at START_MS * MS_MAX_MULT
@@ -47,12 +51,15 @@ A_ABS_V = 200
 A_MIN_CPL = 60
 B_MIN_V = 120
 B_MAX_P = 50
-G_MIN_V = 300
-G_MAX_P = 100
+G_MIN_V = 250
+G_MAX_P = 150
 F_MIN_V = 1200
 F_MAX_P = 1000
 
-BLUNDER_SCENARIOS = ("startpos", "UHO", "pre_opened", "pre_opened_mini")
+# STARTPOS-traceable only -- history_uci gets replayed from a fresh board, so
+# the random_init / piece_odds families can never join this list
+BLUNDER_SCENARIOS = (
+    "startpos", "UHO", "pre_opened", "pre_opened_mini", "paired_validation")
 
 
 def is_blunder_candidate(v, p, cpl, z_stm):
@@ -68,14 +75,12 @@ def is_blunder_candidate(v, p, cpl, z_stm):
     rule matches: rarest and most severe first, so a missed-mate-and-lost
     position labels F rather than whatever else it also happens to satisfy.
 
-    A is restricted to plies the mover actually lost: with prod SF only
-    reaching d14-15, an "error" the mover still converted or drew out of is
-    more likely measurement noise than a real one. B/G3/F fire on loss or
-    draw.
+    All four rules fire on loss or draw. A used to require an outright loss
+    on the theory that a drawn-out error was d14-15 measurement noise, but a
+    thrown-away balanced position is worth replaying either way.
     """
-    lost = z_stm == -1
     lost_or_drew = z_stm <= 0
-    hit_a = lost & (abs(v) <= A_ABS_V) & (cpl >= A_MIN_CPL)
+    hit_a = lost_or_drew & (abs(v) <= A_ABS_V) & (cpl >= A_MIN_CPL)
     hit_b = lost_or_drew & (v >= B_MIN_V) & (p < B_MAX_P)
     hit_g3 = lost_or_drew & (v >= G_MIN_V) & (p < G_MAX_P)
     hit_f = lost_or_drew & (v >= F_MIN_V) & (p < F_MAX_P)
@@ -324,7 +329,7 @@ def last_blunder_replay_epoch(run_dir, selfplay_dir=None, previous_run_tag=None)
     return last
 
 
-def blunder_replay_specs(cfg, pool, n_positions, seed=0):
+def blunder_replay_specs(cfg, pool, n_positions, seed=0, current_epoch=None):
     """
     GameSpecs that replay each position from STARTPOS.
 
@@ -333,11 +338,21 @@ def blunder_replay_specs(cfg, pool, n_positions, seed=0):
     entry the position had in the original game.
 
     The original error travels in the meta, so a probe file carries its own
-    answer key and can be read without the pool it was sampled from. Nothing
-    to filter here any more -- a position that has earned eviction is simply
-    not in the pool dict.
+    answer key and can be read without the pool it was sampled from. A
+    position that has earned eviction is simply not in the pool dict.
+
+    current_epoch restricts sampling to positions older than
+    BLUNDER_REPLAY_MIN_AGE_EPOCHS -- pass it for trickle adds, omit it for
+    the epoch-boundary dumps.
     """
     keys = list(pool.keys())
+    if current_epoch is not None:
+        keys = [
+            k for k in keys
+            if pool[k].get("model_epoch") is None
+            or current_epoch - pool[k]["model_epoch"]
+            > BLUNDER_REPLAY_MIN_AGE_EPOCHS
+        ]
     if n_positions and n_positions < len(keys):
         keys = random.Random(seed).sample(keys, n_positions)
 

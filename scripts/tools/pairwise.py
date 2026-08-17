@@ -26,6 +26,8 @@ import pandas as pd
 from chessbot import SP_DIR
 from chessbot.blunder_replay import BLUNDER_REPLAY_EQUIV_CPL
 
+from probe_table import trim_rows
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--run_tags", nargs="+", required=True)
 args = ap.parse_args()
@@ -117,6 +119,10 @@ for a in epochs[:-1]:
     pooled = [p for b in epochs if b > a for p in pairs_for(a, b)]
     if pooled:
         rows.append(row(f'{a} x all', pooled))
+
+# collapse the middle of the per-epoch block before the summaries are
+# appended -- those span every pair, so nothing trimmed here is lost
+rows = trim_rows(pd.DataFrame(rows)).to_dict('records')
 
 everything = [p for a, b in itertools.combinations(epochs, 2)
               for p in pairs_for(a, b)]

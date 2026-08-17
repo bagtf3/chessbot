@@ -81,6 +81,15 @@ def ci95(x):
     return 1.96 * np.std(x, ddof=1) / np.sqrt(n)
 
 
+def trim_rows(disp, keep_last=19):
+    """Collapse the middle to one ellipsis row: first, ..., last 19."""
+    if len(disp) <= keep_last + 1:
+        return disp
+    gap = pd.DataFrame([{c: "..." for c in disp.columns}])
+    kept = [disp.iloc[[0]], gap, disp.iloc[-keep_last:]]
+    return pd.concat(kept, ignore_index=True)
+
+
 def build_table(raw):
     PCT_COLS = ["improved", "enq", "cache"]
 
@@ -91,8 +100,6 @@ def build_table(raw):
                for a, b in zip(raw.cpl_a, raw.cpl_b)],
         "cpl (diff move)": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
                             for a, b in zip(raw.dm_a, raw.dm_b)],
-        "cpl (same move)": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
-                            for a, b in zip(raw.sm_a, raw.sm_b)],
         "depth": raw["depth"].round(1).astype(str),
         "age": raw["age"].round(1).astype(str),
         "ret": raw["ret"].astype(str),
@@ -115,17 +122,23 @@ def build_table(raw):
         for s, e, b in zip(same_pct, equiv_pct, both_pct)
     ]
 
-    disp = disp[["epoch", "n", "cpl", "cpl (diff move)", "cpl (same move)",
+    disp = disp[["epoch", "n", "cpl", "cpl (diff move)",
                  "improved", "same/equiv/both", "depth", "age", "enq",
                  "cache", "ret"]]
 
     footer = {c: "" for c in disp.columns}
     footer["epoch"] = "mean+/-CI"
     for a_col, b_col, out_col in (("cpl_a", "cpl_b", "cpl"),
-                                  ("dm_a", "dm_b", "cpl (diff move)"),
-                                  ("sm_a", "sm_b", "cpl (same move)")):
+                                  ("dm_a", "dm_b", "cpl (diff move)")):
         delta = raw[b_col] - raw[a_col]
         footer[out_col] = f"{delta.mean():+.1f}+/-{ci95(delta):.1f}"
+
+    # totals/means span every probe, including rows trimmed from the display
+    footer["n"] = f"{raw['n'].sum():.0f}"
+    footer["ret"] = f"{raw['ret'].sum():.0f}"
+    footer["improved"] = pct(raw["improved"].mean())
+
+    disp = trim_rows(disp)
     disp.loc[len(disp)] = footer
     return disp
 

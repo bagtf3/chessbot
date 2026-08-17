@@ -207,11 +207,12 @@ class ValidationSpecSource:
         return spec
 
 
-def dump_blunder_replays(game_queue, game_gen, blunder_pool, n, reason):
+def dump_blunder_replays(game_queue, game_gen, blunder_pool, n, reason,
+                          until_analysis=None):
     """Bulk injection at the epoch boundaries (round start, post-retrain), so
     most of an analysis window's probes land on one model instead of smearing
-    across epochs the way the 2:1 trickle alone does."""
-    specs = game_gen.next_blunder_replays(blunder_pool, n)
+    across epochs the way the 1:1 trickle alone does."""
+    specs = game_gen.next_blunder_replays(blunder_pool, n, until_analysis)
     for spec in specs:
         game_queue.put(spec)
     if specs:
@@ -220,14 +221,15 @@ def dump_blunder_replays(game_queue, game_gen, blunder_pool, n, reason):
 
 
 def top_up_queues(game_queue, sf_queue, game_gen, blunder_pool=None,
-                   rescorer=None, budget=None, target=None):
+                   rescorer=None, budget=None, target=None, n_retrains=None):
     """
     blunder_pool/rescorer only matter when game_gen is a real GameGenerator --
     validation passes a ValidationSpecSource instead, which has no
     next_blunder_replays, so blunder-replay metering is skipped there
-    automatically. Replays trickle in at 2 per eligible blunder the rescorer
+    automatically. Replays trickle in at 1 per eligible blunder the rescorer
     has found since the last top-up; credits accrue while the queues are full
-    and flush on the next refill, so nothing is lost.
+    and flush on the next refill, so nothing is lost. n_retrains gates the
+    trickle to positions the model has actually had a chance to learn.
     """
     added = 0
     if target is None:
@@ -251,8 +253,11 @@ def top_up_queues(game_queue, sf_queue, game_gen, blunder_pool=None,
         added += 1
 
         if meter and rescorer is not None:
-            n_brp = 2 * rescorer.take_brp_credits()
-            for brp_spec in game_gen.next_blunder_replays(blunder_pool, n_brp):
+            n_brp = rescorer.take_brp_credits()
+            specs = game_gen.next_blunder_replays(
+                blunder_pool, n_brp, rescorer.brp_until_analysis(),
+                current_epoch=n_retrains)
+            for brp_spec in specs:
                 game_queue.put(brp_spec)
 
     return added
@@ -444,7 +449,7 @@ def main(run_tag):
     sf_res_q  = queue.Queue()
     sf_rescore_threads = [
         SFRescoreThread(sf_game_q, sf_res_q, base_cfg)
-        for _ in range(max(1, base_cfg.rescore_n_sf_threads))
+        for _ in range(max(1, base_cfg.rescore_n_sf_workers))
     ]
 
     for t in sf_rescore_threads:
@@ -560,9 +565,27 @@ def main(run_tag):
                 sf_queue = ctx.Queue()
                 spec_source = game_gen
 
+            n_retrains = next_model_epoch(working_cfg.progress_csv_path)
+
+            # ahead of the real games on purpose. Probes are single-move, so
+            # workers churn them fast and the SF threads have work from the
+            # first seconds instead of idling until full games start landing.
+            if blunder_pool and not is_validation:
+                last_brp_epoch = last_epoch_in_blunder_replay_history(
+                    os.path.join(
+                        working_cfg.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+                )
+                if last_brp_epoch is None or n_retrains > last_brp_epoch:
+                    dump_blunder_replays(
+                        game_queue, game_gen, blunder_pool,
+                        BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
+                        f"round start, epoch {n_retrains}",
+                        rescorer.brp_until_analysis(),
+                    )
+
             total_queued = top_up_queues(
                 game_queue, sf_queue, spec_source, blunder_pool, rescorer,
-                budget=n_games, target=initial_target,
+                budget=n_games, target=initial_target, n_retrains=n_retrains,
             )
 
             procs = spawn_workers(
@@ -585,23 +608,6 @@ def main(run_tag):
             NO_NEW_GAMES_REQUESTED.clear()
             NEXT_ROUND_REQUESTED.clear()
             ROUND_LIVE.set()
-
-            n_retrains = next_model_epoch(working_cfg.progress_csv_path)
-
-            # the current epoch has no analysis on record yet -- open the round
-            # with a bulk batch so this model gets probed properly, rather than
-            # inheriting whatever the trickle happens to deliver
-            if blunder_pool and not is_validation:
-                last_brp_epoch = last_epoch_in_blunder_replay_history(
-                    os.path.join(
-                        working_cfg.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
-                )
-                if last_brp_epoch is None or n_retrains > last_brp_epoch:
-                    dump_blunder_replays(
-                        game_queue, game_gen, blunder_pool,
-                        BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
-                        f"round start, epoch {n_retrains}",
-                    )
 
             procs = check_and_reap_procs(
                 procs,
@@ -676,7 +682,7 @@ def main(run_tag):
                     crash_log_path=os.path.join(
                         working_cfg.run_dir, "worker_crash_log.txt")
                 )
-                # blunder-replay injection: a 2:1 trickle off eligible blunders
+                # blunder-replay injection: a 1:1 trickle off eligible blunders
                 # (drained in top_up_queues) plus the epoch-boundary dumps, so
                 # most of a window's probes share one model.
 
@@ -704,6 +710,7 @@ def main(run_tag):
                         added = top_up_queues(
                             game_queue, sf_queue, spec_source, blunder_pool,
                             rescorer, budget=n_games - total_queued,
+                            n_retrains=n_retrains,
                         )
                         total_queued += added
                         # n_games reached — tell all workers to drain and exit
@@ -912,6 +919,7 @@ def main(run_tag):
                                 game_queue, game_gen, blunder_pool,
                                 BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
                                 f"post-retrain, epoch {n_retrains}",
+                                rescorer.brp_until_analysis(),
                             )
 
                         rb.sync_live_buffer(

@@ -35,6 +35,7 @@ from chessbot.blunder_replay import (
     blunder_replay_dir, BLUNDER_POOL_MAX_SIZE,
     BLUNDER_REPLAY_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
     BLUNDER_REPLAY_START_MS, BLUNDER_REPLAY_MS_STEP, BLUNDER_REPLAY_MS_MAX_MULT,
+    BLUNDER_REPLAY_MIN_AGE_EPOCHS,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -42,7 +43,7 @@ from chessbot.game_utils import reconcile_game_boards, short_fen
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
-BLUNDER_MERGE_EVERY = 256
+BLUNDER_MERGE_EVERY = 512
 # blunder-replay analysis fires purely on collected-row count, not a retrain
 # cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
 # before a summary is computed and the file resets to a fresh window
@@ -60,6 +61,9 @@ PRETRAIN_EPOCH_STEP = 20
 BLUNDER_CP = 30
 # rolling stat window, in push_analyzed chunks (30 games each)
 RECENT_WINDOW = 100
+# stop/blunder stat blocks print every N analyzed games; their window
+# accumulators reset on print, so this is the cadence and the window both
+STATS_WINDOW_GAMES = 200
 # SF rescore search caps. cfg.rescore_movetime_ms is the tunable budget; the
 # catch-up trim and the depth backstop stay fixed so there is one knob.
 
@@ -202,7 +206,7 @@ class SFRescoreThread:
         self.base_ms = cfg.rescore_movetime_ms
         self.throttled_ms = max(10, self.base_ms - 15)
         self.movetime_ms = self.base_ms
-        self.sf_config = {'Hash': 256}
+        self.sf_config = {'Threads': 1, 'Hash': 256}
         self.stop_ev = threading.Event()
         self.t = None
         self.eng = None
@@ -358,7 +362,7 @@ class Rescorer(object):
         self.sf_compute_count = 0
         self.sf_call_count = 0
         self.sf_rerun_count = 0
-        self.n_sf_threads = cfg.rescore_n_sf_threads
+        self.n_sf_workers = cfg.rescore_n_sf_workers
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
         self.current_movetime_ms = 0
@@ -405,7 +409,7 @@ class Rescorer(object):
             blunder_replay_dir(cfg), "blunder_replay_probe.jsonl")
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
-        # 2:1 replay trickle meter -- drained by top_up_queues
+        # 1:1 replay trickle meter -- drained by top_up_queues
         self.brp_credits = 0
 
         lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
@@ -509,7 +513,7 @@ class Rescorer(object):
     def maybe_save_pool(self, pool):
         """
         Atomic tmp-write + swap every BLUNDER_MERGE_EVERY mutations, rate
-        limited on top to at most 2 saves per 30s -- at high replay
+        limited on top to at most 2 saves per minute -- at high replay
         throughput the count trigger alone could fire many times a second.
         Changes just stay pending (nothing is lost) until the window opens
         back up.
@@ -518,7 +522,7 @@ class Rescorer(object):
             return
         now = time.time()
         self.pool_save_times = [
-            t for t in self.pool_save_times if now - t < 30.0]
+            t for t in self.pool_save_times if now - t < 60.0]
         if len(self.pool_save_times) >= 2:
             return
         save_probe_pool(pool, self.blunder_pool_path)
@@ -561,6 +565,10 @@ class Rescorer(object):
         n = self.brp_credits
         self.brp_credits = 0
         return n
+
+    def brp_until_analysis(self):
+        """Finished replay probes still owed before analyse_brp_file fires."""
+        return max(0, BLUNDER_REPLAY_ANALYSIS_EVERY - self.n_replay_rows)
 
     def tick(self, pool=None):
         if self.lc0_thread is not None:
@@ -1080,7 +1088,9 @@ class Rescorer(object):
                                evicted_path(self.blunder_pool_path))
             elif ply is not None and probe_cpl > 60:
                 age_ok = (added_epoch is None
-                          or (epoch is not None and epoch - added_epoch > 5))
+                          or (epoch is not None
+                              and epoch - added_epoch
+                              > BLUNDER_REPLAY_MIN_AGE_EPOCHS))
                 if age_ok:
                     added_to_buffer = self.add_blunder_replay_training_example(
                         ply, epoch, best_uci, best_cp, probe_cpl)
@@ -1660,7 +1670,7 @@ class Rescorer(object):
         self.games_processed += 1
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
-        if self.games_processed % 100 == 0:
+        if self.games_processed % STATS_WINDOW_GAMES == 0:
             self.print_stop_stats()
             self.print_blunder_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
@@ -1710,7 +1720,7 @@ class Rescorer(object):
                 return
             print(f"{RS}  {label:<24} n={acc[k]['n']:>6}  cpl={avg(k):6.2f}")
 
-        print(f"{RS} blunder types (last 100):")
+        print(f"{RS} blunder types (last {STATS_WINDOW_GAMES}):")
         row("total", "total")
         row("inaccuracies", "inaccuracy")
         for k in primary:
@@ -1777,7 +1787,7 @@ class Rescorer(object):
                 srow += col(avg_sims(acc, st))
             return hdr, srow, crow, brow
 
-        wh, ws, wc, wb = rows("last 100", self.window_stop)
+        wh, ws, wc, wb = rows(f"last {STATS_WINDOW_GAMES}", self.window_stop)
         th, _,  tc, tb = rows("overall",  self.total_stop)
         print(wh)
         print(ws)

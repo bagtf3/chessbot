@@ -82,7 +82,7 @@ class Config(object):
     rescore_inaccuracy_cp = 75
     rescore_blunder_cp_loser = 90
     rescore_blunder_cp_winner = 200
-    rescore_n_sf_threads = 1
+    rescore_n_sf_workers = 1
 
     # target replay positions GameGenerator spreads across each round,
     # metered against real games queued/completions -- not a flood

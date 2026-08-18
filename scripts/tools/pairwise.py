@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from chessbot import SP_DIR
-from chessbot.blunder_replay import BLUNDER_REPLAY_EQUIV_CPL
+from chessbot.blunder_replay import BRP_EQUIV_CPL
 
 from probe_table import trim_rows
 
@@ -83,7 +83,7 @@ def row(label, pairs, summary=False):
     after = np.array([y['cpl'] for x, y in pairs], dtype=float)
     diff_mv = np.array([x['move'] != y['move'] for x, y in pairs])
     improved = after < before
-    equiv = after <= BLUNDER_REPLAY_EQUIV_CPL
+    equiv = after <= BRP_EQUIV_CPL
 
     equiv_cell = pct_plain(equiv)
 

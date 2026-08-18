@@ -23,32 +23,32 @@ from chessbot.game_utils import short_fen
 POOL = "[pool]"
 P = "[probe]"
 
-BLUNDER_POOL_ENV = "BLUNDER_POSITIONS"
-BLUNDER_REPLAY_CONFIG_ENV = "BLUNDER_REPLAY_CONFIG"
-BLUNDER_REPLAY_DIRNAME = "blunder_probe"
-BLUNDER_REPLAY_HISTORY_FILENAME = "blunder_probe_history.jsonl"
-BLUNDER_REPLAY_MIN_CACHE_DEPTH = 17
-BLUNDER_REPLAY_EQUIV_CPL = 12
+BRP_POOL_ENV = "BLUNDER_POSITIONS"
+BRP_CONFIG_ENV = "BLUNDER_REPLAY_CONFIG"
+BRP_DIRNAME = "blunder_probe"
+BRP_HISTORY_FILENAME = "blunder_probe_history.jsonl"
+BRP_MIN_CACHE_DEPTH = 17
+BRP_EQUIV_CPL = 12
 # a position discovered this recently has not survived a retrain yet, so
 # replaying it measures nothing. Gates trickle sampling; the epoch-boundary
 # dumps deliberately ignore it.
-BLUNDER_REPLAY_MIN_AGE_EPOCHS = 5
+BRP_MIN_AGE = 7
 # per-position SF budget: starts here, escalates by MS_STEP each probe that
 # neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
 # capped at START_MS * MS_MAX_MULT
-BLUNDER_REPLAY_START_MS = 300
-BLUNDER_REPLAY_MS_STEP = 20
-BLUNDER_REPLAY_MS_MAX_MULT = 2
+BRP_START_MS = 300
+BRP_MS_STEP = 20
+BRP_MS_MAX_MULT = 2
 # above this many live positions, stop admitting new candidates -- just drop
 # them, don't evict anything to make room. More eviction pressure is coming
 # later; for now the pool simply stops growing.
-BLUNDER_POOL_MAX_SIZE = 128_000
+BRP_POOL_MAX_SIZE = 128_000
 
 # candidate rules: V = best_cp, P = played_cp, cpl = V - P (post equiv/mate
 # adjustment), all STM-POV. Z_stm is the result from the mover's own
 # perspective, since xc0 plays both sides in selfplay.
-A_ABS_V = 200
-A_MIN_CPL = 60
+A_ABS_V = 175
+A_MIN_CPL = 75
 B_MIN_V = 120
 B_MAX_P = 50
 G_MIN_V = 250
@@ -58,7 +58,7 @@ F_MAX_P = 1000
 
 # STARTPOS-traceable only -- history_uci gets replayed from a fresh board, so
 # the random_init / piece_odds families can never join this list
-BLUNDER_SCENARIOS = (
+BRP_SCENARIOS = (
     "startpos", "UHO", "pre_opened", "pre_opened_mini", "paired_validation")
 
 
@@ -97,9 +97,9 @@ def is_blunder_candidate(v, p, cpl, z_stm):
 
 
 def probe_pool_path(pool_path=None):
-    path = pool_path or os.environ.get(BLUNDER_POOL_ENV, "")
+    path = pool_path or os.environ.get(BRP_POOL_ENV, "")
     if not path:
-        raise RuntimeError(f"{POOL} {BLUNDER_POOL_ENV} is not set")
+        raise RuntimeError(f"{POOL} {BRP_POOL_ENV} is not set")
     return path
 
 
@@ -181,7 +181,7 @@ def ratchet_store(src, move_uci, cp, depth):
     return True
 
 
-def cached_deep_score(src, move_uci, min_depth=BLUNDER_REPLAY_MIN_CACHE_DEPTH):
+def cached_deep_score(src, move_uci, min_depth=BRP_MIN_CACHE_DEPTH):
     """
     Deep score for move_uci from the pool's own cache, or None if unknown.
     Reusable only once both the best move and this move are on file at
@@ -234,7 +234,7 @@ def create_blunder_replay_config(cfg, yaml_file=None):
     selfplay workers already compiled instead of building its own.
     """
     pcfg = cfg.copy()
-    p_yaml = yaml_file or os.environ.get(BLUNDER_REPLAY_CONFIG_ENV, "")
+    p_yaml = yaml_file or os.environ.get(BRP_CONFIG_ENV, "")
     if not p_yaml or not os.path.exists(p_yaml):
         raise RuntimeError(f"{P} no frozen probe config at {p_yaml!r}")
 
@@ -274,7 +274,7 @@ def create_blunder_replay_config(cfg, yaml_file=None):
 
 
 def blunder_replay_dir(cfg):
-    d = os.path.join(cfg.run_dir, BLUNDER_REPLAY_DIRNAME)
+    d = os.path.join(cfg.run_dir, BRP_DIRNAME)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -312,7 +312,7 @@ def last_blunder_replay_epoch(run_dir, selfplay_dir=None, previous_run_tag=None)
     restart. Same fallback the validation ladder uses for its SF depth.
     """
     last = last_epoch_in_blunder_replay_history(
-        os.path.join(run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+        os.path.join(run_dir, BRP_HISTORY_FILENAME)
     )
     if last is not None:
         return last
@@ -320,7 +320,7 @@ def last_blunder_replay_epoch(run_dir, selfplay_dir=None, previous_run_tag=None)
     if previous_run_tag and selfplay_dir:
         prev = os.path.abspath(os.path.join(selfplay_dir, previous_run_tag))
         last = last_epoch_in_blunder_replay_history(
-            os.path.join(prev, BLUNDER_REPLAY_HISTORY_FILENAME)
+            os.path.join(prev, BRP_HISTORY_FILENAME)
         )
         if last is not None:
             print(f"{P} continuing cadence from {previous_run_tag} "
@@ -329,7 +329,7 @@ def last_blunder_replay_epoch(run_dir, selfplay_dir=None, previous_run_tag=None)
     return last
 
 
-def blunder_replay_specs(cfg, pool, n_positions, seed=0, current_epoch=None):
+def blunder_replay_specs(cfg, pool, n_positions, current_epoch=None):
     """
     GameSpecs that replay each position from STARTPOS.
 
@@ -341,20 +341,18 @@ def blunder_replay_specs(cfg, pool, n_positions, seed=0, current_epoch=None):
     answer key and can be read without the pool it was sampled from. A
     position that has earned eviction is simply not in the pool dict.
 
-    current_epoch restricts sampling to positions older than
-    BLUNDER_REPLAY_MIN_AGE_EPOCHS -- pass it for trickle adds, omit it for
-    the epoch-boundary dumps.
+    current_epoch restricts sampling to positions older than BRP_MIN_AGE --
+    both the trickle and the dumps pass it.
     """
     keys = list(pool.keys())
     if current_epoch is not None:
         keys = [
             k for k in keys
             if pool[k].get("model_epoch") is None
-            or current_epoch - pool[k]["model_epoch"]
-            > BLUNDER_REPLAY_MIN_AGE_EPOCHS
+            or current_epoch - pool[k]["model_epoch"] > BRP_MIN_AGE
         ]
     if n_positions and n_positions < len(keys):
-        keys = random.Random(seed).sample(keys, n_positions)
+        keys = random.sample(keys, n_positions)
 
     startpos = chess.Board().fen()
     specs = []

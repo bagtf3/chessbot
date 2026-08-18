@@ -44,7 +44,7 @@ import pickle
 import time
 
 from chessbot.blunder_replay import (
-    BLUNDER_REPLAY_EQUIV_CPL, evicted_path, save_probe_pool, short_fen,
+    BRP_EQUIV_CPL, evicted_path, save_probe_pool, short_fen,
 )
 
 SELFPLAY_RUNS_GLOB = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/*"
@@ -91,7 +91,7 @@ def convert_record(old):
     probes = []
     for p in (old.get('probes') or []):
         pp = dict(p)
-        pp.setdefault('found_equiv', pp.get('cpl', 1e9) <= BLUNDER_REPLAY_EQUIV_CPL)
+        pp.setdefault('found_equiv', pp.get('cpl', 1e9) <= BRP_EQUIV_CPL)
         pp.setdefault('same_move', pp.get('move') == old.get('played_move'))
         probes.append(pp)
     if probes:

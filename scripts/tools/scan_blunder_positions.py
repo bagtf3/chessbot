@@ -47,7 +47,7 @@ import pandas as pd
 
 from chessbot.review import load_game_index
 from chessbot.blunder_replay import (
-    BLUNDER_SCENARIOS, is_blunder_candidate, load_probe_pool, save_probe_pool,
+    BRP_SCENARIOS, is_blunder_candidate, load_probe_pool, save_probe_pool,
     short_fen,
 )
 
@@ -100,7 +100,7 @@ def candidate_plies_selfplay(df, run_dir):
     # piece_training and random_init seed a custom fastboard(fen) directly, so
     # history_uci for those never traces back to STARTPOS and build_records'
     # replay-from-STARTPOS would land on the wrong position.
-    val = df[df["scenario"].isin(BLUNDER_SCENARIOS)]
+    val = df[df["scenario"].isin(BRP_SCENARIOS)]
     if not len(val):
         return None
 

@@ -29,13 +29,13 @@ from chessbot.opening_counts import (
 )
 
 from chessbot.blunder_replay import (
-    BLUNDER_POOL_ENV, BLUNDER_SCENARIOS, is_blunder_candidate,
+    BRP_POOL_ENV, BRP_SCENARIOS, is_blunder_candidate,
     load_probe_pool, save_probe_pool, evicted_path, evict_position,
-    BLUNDER_REPLAY_EQUIV_CPL, BLUNDER_REPLAY_HISTORY_FILENAME,
-    blunder_replay_dir, BLUNDER_POOL_MAX_SIZE,
-    BLUNDER_REPLAY_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
-    BLUNDER_REPLAY_START_MS, BLUNDER_REPLAY_MS_STEP, BLUNDER_REPLAY_MS_MAX_MULT,
-    BLUNDER_REPLAY_MIN_AGE_EPOCHS,
+    BRP_EQUIV_CPL, BRP_HISTORY_FILENAME,
+    blunder_replay_dir, BRP_POOL_MAX_SIZE,
+    BRP_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
+    BRP_START_MS, BRP_MS_STEP, BRP_MS_MAX_MULT,
+    BRP_MIN_AGE,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -43,12 +43,12 @@ from chessbot.game_utils import reconcile_game_boards, short_fen
 from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
 
 RS = "[rescore]"
-BLUNDER_MERGE_EVERY = 512
+BRP_MERGE_EVERY = 512
 # blunder-replay analysis fires purely on collected-row count, not a retrain
 # cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
 # before a summary is computed and the file resets to a fresh window
-BLUNDER_REPLAY_ANALYSIS_EVERY = 4096
-BLUNDER_STAT_KEYS = (
+BRP_ANALYSIS_EVERY = 4096
+BRP_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
     "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
 )
@@ -338,7 +338,7 @@ class Rescorer(object):
         # never samples from it. blunder_pool_path is just a string, and
         # n_pool_changes is this class's own save-cadence counter, so both
         # are safe to hold as real instance state.
-        self.blunder_pool_path = os.environ.get(BLUNDER_POOL_ENV) or None
+        self.blunder_pool_path = os.environ.get(BRP_POOL_ENV) or None
         self.n_pool_changes = 0
         self.pool_save_times = []
 
@@ -380,8 +380,8 @@ class Rescorer(object):
         self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
 
         zero_blunder = lambda: {'n': 0, 'cpl': 0.0}
-        self.total_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
-        self.window_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
+        self.total_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
+        self.window_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
 
         zero_sc = lambda: {
             'total': 0, 'accepted': 0,
@@ -448,11 +448,11 @@ class Rescorer(object):
         scenarios qualify: piece_odds, piece_training and random_init seed a
         custom FEN directly, so history_uci for those never traces back to
         STARTPOS. If the discovering game's own SF pass already reached
-        BLUNDER_REPLAY_MIN_CACHE_DEPTH+, seed the deep cache immediately so
+        BRP_MIN_CACHE_DEPTH+, seed the deep cache immediately so
         the first replay probe can potentially skip SF entirely.
         """
         scenario = game_data.get('scenario')
-        if scenario not in BLUNDER_SCENARIOS:
+        if scenario not in BRP_SCENARIOS:
             return
         is_candidate, label = is_blunder_candidate(best_cp, played_cp, cpl, z_stm)
         if not is_candidate:
@@ -477,7 +477,7 @@ class Rescorer(object):
 
         if key in pool:
             pool[key]["times_seen"] = pool[key].get("times_seen", 1) + 1
-        elif len(pool) >= BLUNDER_POOL_MAX_SIZE:
+        elif len(pool) >= BRP_POOL_MAX_SIZE:
             # pool is full -- drop the candidate, no eviction pressure yet
             return
         else:
@@ -498,9 +498,9 @@ class Rescorer(object):
                 "cpl": cpl,
                 "times_seen": 1,
             }
-            if (best_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+            if (best_depth or 0) >= BRP_MIN_CACHE_DEPTH:
                 ratchet_store(rec, best_uci, best_cp, best_depth)
-            if (played_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+            if (played_depth or 0) >= BRP_MIN_CACHE_DEPTH:
                 ratchet_store(rec, played_uci, played_cp, played_depth)
             if rec.get("deep_evals", {}).get(best_uci) is not None:
                 rec["deep_best_move"] = best_uci
@@ -512,13 +512,13 @@ class Rescorer(object):
 
     def maybe_save_pool(self, pool):
         """
-        Atomic tmp-write + swap every BLUNDER_MERGE_EVERY mutations, rate
+        Atomic tmp-write + swap every BRP_MERGE_EVERY mutations, rate
         limited on top to at most 2 saves per minute -- at high replay
         throughput the count trigger alone could fire many times a second.
         Changes just stay pending (nothing is lost) until the window opens
         back up.
         """
-        if pool is None or self.n_pool_changes < BLUNDER_MERGE_EVERY:
+        if pool is None or self.n_pool_changes < BRP_MERGE_EVERY:
             return
         now = time.time()
         self.pool_save_times = [
@@ -568,7 +568,7 @@ class Rescorer(object):
 
     def brp_until_analysis(self):
         """Finished replay probes still owed before analyse_brp_file fires."""
-        return max(0, BLUNDER_REPLAY_ANALYSIS_EVERY - self.n_replay_rows)
+        return max(0, BRP_ANALYSIS_EVERY - self.n_replay_rows)
 
     def tick(self, pool=None):
         if self.lc0_thread is not None:
@@ -887,11 +887,11 @@ class Rescorer(object):
         xerces_uci = brp_data.get('xerces_uci')
 
         # both the best move and the move actually played here already
-        # cached at BLUNDER_REPLAY_MIN_CACHE_DEPTH+ from an earlier probe or
+        # cached at BRP_MIN_CACHE_DEPTH+ from an earlier probe or
         # from initial pool-add seeding -- skip SF entirely
         if pool is not None and short_fen_key in pool:
             hit = cached_deep_score(
-                pool[short_fen_key], xerces_uci, BLUNDER_REPLAY_MIN_CACHE_DEPTH)
+                pool[short_fen_key], xerces_uci, BRP_MIN_CACHE_DEPTH)
             if hit is not None:
                 self.games_seen.add(gid)
                 self.finalize_replay_result(
@@ -950,11 +950,11 @@ class Rescorer(object):
         if to_sf_positions:
             self.n_sf_submitted += len(to_sf_positions)
             game_state['waiting'] = True
-            sf_ms = BLUNDER_REPLAY_START_MS
+            sf_ms = BRP_START_MS
             if pool is not None and short_fen_key in pool:
                 src = pool[short_fen_key]
                 if not src.get('sf_ms'):
-                    src['sf_ms'] = BLUNDER_REPLAY_START_MS
+                    src['sf_ms'] = BRP_START_MS
                     self.n_pool_changes += 1
                     self.maybe_save_pool(pool)
                 sf_ms = src['sf_ms']
@@ -1055,7 +1055,7 @@ class Rescorer(object):
 
         probe_cpl = best_cp - played_cp
         found_best = probe_move == best_uci
-        found_equiv = probe_cpl <= BLUNDER_REPLAY_EQUIV_CPL
+        found_equiv = probe_cpl <= BRP_EQUIV_CPL
         same_move = probe_move == orig_move
         added_to_buffer = False
         added_epoch = None
@@ -1064,9 +1064,9 @@ class Rescorer(object):
             src = pool[short_fen_key]
             added_epoch = src.get('model_epoch')
             if not from_cache:
-                if (best_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                if (best_depth or 0) >= BRP_MIN_CACHE_DEPTH:
                     ratchet_store(src, best_uci, best_cp, best_depth)
-                if (played_depth or 0) >= BLUNDER_REPLAY_MIN_CACHE_DEPTH:
+                if (played_depth or 0) >= BRP_MIN_CACHE_DEPTH:
                     ratchet_store(src, probe_move, played_cp, played_depth)
                 depths_map = src.get('deep_depths') or {}
                 prev_depth = depths_map.get(src.get('deep_best_move')) or 0
@@ -1076,11 +1076,11 @@ class Rescorer(object):
 
                 # neither resolved (found_equiv) nor locked a deep-enough
                 # best move this probe -- buy more depth next time
-                if not found_equiv and (best_depth or 0) < BLUNDER_REPLAY_MIN_CACHE_DEPTH:
-                    current_ms = src.get('sf_ms') or BLUNDER_REPLAY_START_MS
+                if not found_equiv and (best_depth or 0) < BRP_MIN_CACHE_DEPTH:
+                    current_ms = src.get('sf_ms') or BRP_START_MS
                     src['sf_ms'] = min(
-                        current_ms + BLUNDER_REPLAY_MS_STEP,
-                        BLUNDER_REPLAY_START_MS * BLUNDER_REPLAY_MS_MAX_MULT,
+                        current_ms + BRP_MS_STEP,
+                        BRP_START_MS * BRP_MS_MAX_MULT,
                     )
 
             if found_equiv:
@@ -1090,7 +1090,7 @@ class Rescorer(object):
                 age_ok = (added_epoch is None
                           or (epoch is not None
                               and epoch - added_epoch
-                              > BLUNDER_REPLAY_MIN_AGE_EPOCHS))
+                              > BRP_MIN_AGE))
                 if age_ok:
                     added_to_buffer = self.add_blunder_replay_training_example(
                         ply, epoch, best_uci, best_cp, probe_cpl)
@@ -1123,7 +1123,7 @@ class Rescorer(object):
 
         self.n_replay_rows += 1
         self.n_replay_finalized += 1
-        if self.n_replay_rows >= BLUNDER_REPLAY_ANALYSIS_EVERY:
+        if self.n_replay_rows >= BRP_ANALYSIS_EVERY:
             self.analyse_brp_file()
 
     def add_blunder_replay_training_example(self, ply, epoch, best_uci,
@@ -1250,7 +1250,7 @@ class Rescorer(object):
             "file": os.path.basename(csv_path),
         }
         hist_path = os.path.join(
-            self.config.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+            self.config.run_dir, BRP_HISTORY_FILENAME)
         with open(hist_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(summary, default=float) + "\n")
 
@@ -1737,7 +1737,7 @@ class Rescorer(object):
             print(f"{RS}  {'pool-eligible (A/B/G3/F)':<24} "
                   f"n={pool_n:>6}  of {total_n} moves ({pool_pct:.2%})")
 
-        for k in BLUNDER_STAT_KEYS:
+        for k in BRP_STAT_KEYS:
             self.window_blunder[k] = {'n': 0, 'cpl': 0.0}
 
     def accumulate_stop_stats(self, stop_stats):

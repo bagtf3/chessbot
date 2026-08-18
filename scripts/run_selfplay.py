@@ -14,14 +14,15 @@ from chessbot import SP_DIR
 from chessbot.looper import init_selfplay
 from chessbot.rescore import (
     Rescorer, SFRescoreThread, migrate_pretrain_progress,
-    BLUNDER_REPLAY_ANALYSIS_EVERY,
+    BRP_ANALYSIS_EVERY,
 )
 from chessbot.review import RecordKeeper
 from chessbot.config import Config
 from chessbot.utils import make_jsonable, format_time, next_model_epoch
 from chessbot.validation import build_validation_summary, create_validation_config
+
 from chessbot.blunder_replay import (
-    load_probe_pool, BLUNDER_POOL_ENV, BLUNDER_REPLAY_HISTORY_FILENAME,
+    load_probe_pool, BRP_POOL_ENV, BRP_HISTORY_FILENAME,
     last_epoch_in_blunder_replay_history,
 )
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
@@ -208,11 +209,13 @@ class ValidationSpecSource:
 
 
 def dump_blunder_replays(game_queue, game_gen, blunder_pool, n, reason,
-                          until_analysis=None):
+                          until_analysis=None, current_epoch=None):
     """Bulk injection at the epoch boundaries (round start, post-retrain), so
     most of an analysis window's probes land on one model instead of smearing
     across epochs the way the 1:1 trickle alone does."""
-    specs = game_gen.next_blunder_replays(blunder_pool, n, until_analysis)
+    specs = game_gen.next_blunder_replays(
+        blunder_pool, n, until_analysis,
+        current_epoch=current_epoch)
     for spec in specs:
         game_queue.put(spec)
     if specs:
@@ -459,7 +462,7 @@ def main(run_tag):
     # anything that needs it (Rescorer mutates it, the blunder-replay
     # injector samples from it). Never crosses the multiprocessing boundary;
     # only sampled GameSpecs do.
-    blunder_pool = load_probe_pool() if os.environ.get(BLUNDER_POOL_ENV) else None
+    blunder_pool = load_probe_pool() if os.environ.get(BRP_POOL_ENV) else None
 
     rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q)
     finished_games, finished_blunder_replays = rescorer.get_unprocessed()
@@ -573,14 +576,15 @@ def main(run_tag):
             if blunder_pool and not is_validation:
                 last_brp_epoch = last_epoch_in_blunder_replay_history(
                     os.path.join(
-                        working_cfg.run_dir, BLUNDER_REPLAY_HISTORY_FILENAME)
+                        working_cfg.run_dir, BRP_HISTORY_FILENAME)
                 )
                 if last_brp_epoch is None or n_retrains > last_brp_epoch:
                     dump_blunder_replays(
                         game_queue, game_gen, blunder_pool,
-                        BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
+                        BRP_ANALYSIS_EVERY // 2,
                         f"round start, epoch {n_retrains}",
                         rescorer.brp_until_analysis(),
+                        current_epoch=n_retrains,
                     )
 
             total_queued = top_up_queues(
@@ -741,6 +745,7 @@ def main(run_tag):
                 while finished_games:
                     to_process = finished_games.popleft()
                     rescorer.submit(pull_pkl(to_process))
+                
                 while finished_blunder_replays:
                     to_process_brp = finished_blunder_replays.popleft()
                     rescorer.submit_blunder_replay(to_process_brp['meta'])
@@ -771,12 +776,10 @@ def main(run_tag):
 
                 recorder.training_queue = rescorer.training_data_size
 
-                # spawn the retrain worker once primary_buffer is actually full.
-                # It used to launch a shard early (31/32) to overlap replay +
-                # historic loading with the last fill, but the main loop just sat
-                # waiting for 32/32 anyway, so there was nothing to overlap with.
+                # spawn the retrain worker once primary_buffer is full
                 primary_files = rb.list_shard_files(working_cfg.primary_buffer_dir)
                 n_files = len(primary_files)
+
                 # `and procs`: once the workers are gone the round is closing,
                 # so don't start a fresh retrain that would hold it open again
                 launch_retrain = retrain_worker is None and not is_validation
@@ -866,9 +869,7 @@ def main(run_tag):
                             if working_cfg.inference_backend == 'ort_trt':
                                 # workers only reload their model/engine after
                                 # unpause, so the TRT engine must be rebuilt for
-                                # the new weights first -- otherwise workers would
-                                # either grab a stale engine or each redundantly
-                                # recompile their own.
+                                # the new weights first
                                 trt_dir, model_name, _ = selfplay_trt_paths(working_cfg)
                                 working_cfg = prepare_trt(
                                     working_cfg, trt_dir, model_name
@@ -917,9 +918,10 @@ def main(run_tag):
                         if blunder_pool and not is_validation and not stop_signal_sent:
                             dump_blunder_replays(
                                 game_queue, game_gen, blunder_pool,
-                                BLUNDER_REPLAY_ANALYSIS_EVERY // 2,
+                                BRP_ANALYSIS_EVERY // 2,
                                 f"post-retrain, epoch {n_retrains}",
                                 rescorer.brp_until_analysis(),
+                                current_epoch=n_retrains,
                             )
 
                         rb.sync_live_buffer(

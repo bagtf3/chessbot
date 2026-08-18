@@ -134,12 +134,12 @@ def make_rook_for_piece_and_pawn_fen():
     # Standard backrow: R N B Q K B N R (indices 0-7)
     # Pick one minor piece square, replace with extra rook, remove pawn in front
     sq = random.choice([1, 2, 5, 6])  # b1=N, c1=B, f1=B, g1=N
-    white_back = ["R", "N", "B", "Q", "K", "B", "N", "R"]
-    white_back[sq] = "R"
-    white_pawns = list("PPPPPPPP")
-    white_pawns[sq] = "1"
+    w_back = ["R", "N", "B", "Q", "K", "B", "N", "R"]
+    w_back[sq] = "R"
+    w_pawns = list("PPPPPPPP")
+    w_pawns[sq] = "1"
     return (
-        f"rnbqkbnr/pppppppp/8/8/8/8/{''.join(white_pawns)}/{''.join(white_back)} w - - 0 1"
+        f"rnbqkbnr/pppppppp/8/8/8/8/{''.join(w_pawns)}/{''.join(w_back)} w - - 0 1"
     )
 
 
@@ -341,11 +341,15 @@ def random_board_setup(pieces, wk=None, bk=None, queens=True):
     return random_board_setup(max(6, pieces - 1), wk=None, bk=None, queens=False)
 
 
-def make_piece_odds_board():
+def make_piece_odds_board(allow_remove_heavies=True):
+    """allow_remove_heavies=False keeps queens and rooks on: a self-play game
+    at those odds is decided before it starts and teaches little."""
     b = chess.Board()
     meta = {"scenario": "piece_odds", "removed": {"white": [], "black": []}}
     remove_from = random.choice([chess.WHITE, chess.BLACK])
-    removable = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
+    removable = [chess.BISHOP, chess.KNIGHT, chess.PAWN]
+    if allow_remove_heavies:
+        removable = [chess.QUEEN, chess.ROOK] + removable
     to_remove = random.choice(removable)
     need_to_remove = np.random.randint(1, 4) if to_remove == chess.PAWN else 1
     color_str = "white" if remove_from == chess.WHITE else "black"
@@ -538,7 +542,7 @@ class GameGenerator:
             meta = {"scenario": "random_endgame", "pieces": pieces}
 
         elif game_type == "piece_odds":
-            fen, meta = make_piece_odds_board()
+            fen, meta = make_piece_odds_board(allow_remove_heavies=False)
             moves = []
 
         elif game_type == "piece_training":
@@ -630,7 +634,7 @@ class GameGenerator:
         eligible blunder the rescorer finds, plus a bulk dump at round
         start and after each retrain. until_analysis is display only --
         finished probes still owed before analyse_brp_file fires.
-        current_epoch applies the min-age gate; the dumps omit it.
+        current_epoch applies the BRP_MIN_AGE gate.
         """
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
@@ -640,9 +644,11 @@ class GameGenerator:
             return []
 
         replay_cfg = create_blunder_replay_config(self.config)
+
         specs = blunder_replay_specs(
-            replay_cfg, pool, n_to_queue, seed=self.brps_queued,
-            current_epoch=current_epoch)
+            replay_cfg, pool, n_to_queue,
+            current_epoch=current_epoch
+        )
 
         before = self.brps_queued
         self.brps_queued += len(specs)

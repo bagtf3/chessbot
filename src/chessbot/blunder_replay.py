@@ -108,8 +108,14 @@ def load_probe_pool(pool_path=None):
     The scanned blunder positions -- a live document, not a static input:
     every analysis pass and every rescored game writes back what it learned.
     Stored at rest as a dict keyed by short_fen.
+
+    None when no pool is configured: blunder replay is optional. A path that
+    is configured but missing still raises -- that is a misconfiguration,
+    not an opt-out.
     """
-    path = probe_pool_path(pool_path)
+    path = pool_path or os.environ.get(BRP_POOL_ENV, "")
+    if not path:
+        return None
     if not os.path.exists(path):
         raise RuntimeError(f"{POOL} no position pool at {path!r}")
 

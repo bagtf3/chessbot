@@ -220,7 +220,7 @@ def build_validation_summary(looper):
     return build_validation_summary_from_rows(looper.recent_games, looper.config)
 
 
-def build_validation_summary_from_rows(recent, cfg):
+def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
     """
     Build validation summary and apply the two-consecutive >50% bump rule.
 
@@ -228,6 +228,10 @@ def build_validation_summary_from_rows(recent, cfg):
     roundless runner does not have to fake a RecordKeeper. The bump is only
     ever recorded to history -- cfg is not mutated -- so the caller must
     rebuild its validation config afterwards to pick the new depth up.
+
+    model_epoch is the epoch the batch *started* on, not the one it finished
+    on: a retrain can land mid-batch. Stamped so the cadence can later be
+    driven off the history file instead of in-memory state.
     """
     sf_games = [g for g in recent if g.get("vs_stockfish")]
     n = len(sf_games)
@@ -287,6 +291,7 @@ def build_validation_summary_from_rows(recent, cfg):
     # Do NOT persist the validation config file. Only append history.
     summary = {
         "ts": int(time.time()),
+        "model_epoch": model_epoch,
         "run_tag": cfg_dict.get("run_tag"),
         "n_games": n,
         "wins": wins,

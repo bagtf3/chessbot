@@ -18,6 +18,7 @@ import os
 import pickle
 import queue
 import random
+import signal
 import sys
 import threading
 import json
@@ -26,7 +27,7 @@ from collections import deque
 
 from chessbot import SP_DIR
 from chessbot.blunder_replay import (
-    BRP_HISTORY_FILENAME, BRP_POOL_ENV, load_probe_pool,
+    BRP_HISTORY_FILENAME, load_probe_pool,
     last_epoch_in_blunder_replay_history,
 )
 from chessbot.config import Config
@@ -44,16 +45,15 @@ from chessbot.validation import (
 )
 import chessbot.replay_buffer as rb
 
-MAX_BACKLOG = 250
 GAME_QUEUE_MIN = 36
 # validation batches ride the same queue as everything else, which is safe
 # only because that queue is kept shallow -- raise the target much above this
 # and batches start waiting behind selfplay, and the ladder cadence drifts
 GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
-# a batch that has not completed in this long is abandoned: no history row
-# written, so a stall degrades to "validation skipped" rather than a silently
-# frozen ladder
-VAL_BATCH_TIMEOUT_S = 4800.0
+# a batch stuck this long is closed out on whatever came back rather than
+# left to wedge the cadence forever. Generous on purpose: it should only ever
+# fire on a genuinely stuck batch, not a slow one
+VAL_BATCH_TIMEOUT_S = 7200.0
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
@@ -75,6 +75,14 @@ def drain_queue(q):
             out.append(q.get_nowait())
         except Exception:
             return out
+
+
+def pull_pkl(to_process):
+    """Metas arrive nested from recent_q and flat from the unprocessed
+    backlog the rescorer recovers off disk."""
+    if 'meta' in to_process:
+        return to_process['meta']['pkl_file']
+    return to_process['pkl_file']
 
 
 def close_proc(p, registry):
@@ -245,6 +253,7 @@ class SelfPlayRunner:
         self.worker_procs = []
 
         self.current_epoch = 0
+        self.games_at_start = 0
         self.total_games = 0
         self.total_queued = 0
         self.finished_games = deque()
@@ -255,6 +264,7 @@ class SelfPlayRunner:
         self.val_pending = 0
         self.val_rows = []
         self.val_batch_started_at = None
+        self.val_batch_epoch = None
         self.last_validated_epoch = None
 
         self.retrain_worker = None
@@ -279,24 +289,20 @@ class SelfPlayRunner:
             t.start()
 
         # one live in-RAM copy; the Rescorer mutates it and the replay
-        # sampler reads it. Never crosses the process boundary.
-
-        # CLAUDE why not just make load_probe_pool None check and return None safely?
-        # this its just self.blunder_pool = maybe_load_probe_pool() and rename it to
-        # maybe_load_blunder_pool()
-        self.blunder_pool = None
-        if os.environ.get(BRP_POOL_ENV):
-            self.blunder_pool = load_probe_pool()
+        # sampler reads it. Never crosses the process boundary. None when no
+        # pool is configured, which every replay path already handles.
+        self.blunder_pool = load_probe_pool()
 
         self.rescorer = Rescorer(cfg, sf_game_q, sf_res_q)
         finished, finished_brp = self.rescorer.get_unprocessed()
         self.finished_games = finished
         self.finished_brp = finished_brp
 
-        # CLAUDE
-        # put 1 line comment here explaining this method. decide if the next 2 lines can
-        # go inside that method and if the method needs a better name load_live_buffer()
-        self.load_carryover()
+        # three unrelated startup chores: adopt the previous process's
+        # untrained samples, top the replay buffer up from historic, and split
+        # pretraining's rows out of eval_progress.csv before the epoch counter
+        # below reads it
+        self.load_live_buffer()
         rb.seed_replay_buffer(cfg.historic_dir, cfg.replay_buffer_dir)
         migrate_pretrain_progress(cfg.run_dir)
 
@@ -308,12 +314,39 @@ class SelfPlayRunner:
 
         self.reload_config()
         self.val_cfg = create_validation_config(self.cfg, self.val_yaml_path)
+        self.crash_log_path = os.path.join(self.cfg.run_dir, "worker_crash_log.txt")
+
+        # credit games already on disk against the budget. total_queued is
+        # seeded too: anything queued but unplayed when the last process died
+        # went with it, so what is owed is measured from completions.
+        self.games_at_start = self.games_already_completed()
+        self.total_games = self.games_at_start
+        self.total_queued = self.games_at_start
+        if self.games_at_start:
+            left = max(0, self.cfg.n_games - self.games_at_start)
+            print(f"[runner] resuming: {self.games_at_start:,} games already "
+                  f"on disk, {left:,} of {self.cfg.n_games:,} left",
+                  flush=True)
 
         self.game_gen = GameGenerator(self.cfg)
         self.started_at = time.time()
 
-    def load_carryover(self):
-        """Untrained samples left by the previous process, if any."""
+    def games_already_completed(self):
+        """Games this run has already finished, counted off the on-disk index.
+
+        The budget is a property of the run, not of one process, so a restart
+        resumes against it instead of starting the count over. Blunder-replay
+        probes never reach the index -- they return before update_game_index
+        -- so they correctly do not consume budget.
+        """
+        path = self.base_cfg.game_index_file
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+
+    def load_live_buffer(self):
+        """Adopt the untrained samples the previous process left behind."""
         cfg = self.base_cfg
         path = rb.find_live_buffer(cfg.run_dir)
         if not path:
@@ -465,6 +498,9 @@ class SelfPlayRunner:
         self.val_pending = len(specs)
         self.val_rows = []
         self.val_batch_started_at = time.monotonic()
+        # a retrain can land mid-batch, so the stamp is taken here, not at
+        # finish, and every row in the batch belongs to this epoch
+        self.val_batch_epoch = self.current_epoch
         self.last_validated_epoch = self.current_epoch
         print(f"[validation] batch of {len(specs)} queued at epoch "
               f"{self.current_epoch}, sf_depth {self.val_cfg.sf_depth}",
@@ -478,28 +514,33 @@ class SelfPlayRunner:
         self.val_pending = 0
         self.val_batch_started_at = None
 
-        build_validation_summary_from_rows(rows, self.val_cfg)
+        build_validation_summary_from_rows(
+            rows, self.val_cfg, model_epoch=self.val_batch_epoch)
         # engines are built per-spec-config and cached for the worker's life,
         # so they must be dropped or the next batch replays the old depth
         self.broadcast("tear_down_sf")
         self.val_cfg = create_validation_config(self.cfg, self.val_yaml_path)
 
-    def abandon_validation_batch(self, why):
-        """No history row: a partial batch is colour-imbalanced and would
-        bias score, and writing one would also reset consec_over_50."""
-        print(f"[validation] batch abandoned ({why}), "
-              f"{self.val_pending} never returned -- no history row",
-              flush=True)
-        self.val_rows = []
-        self.val_pending = 0
-        self.val_batch_started_at = None
-        self.broadcast("tear_down_sf")
+    def close_partial_validation_batch(self, why):
+        """Summarise whatever came back. The batch is colour-imbalanced, so
+        score is biased and consec_over_50 may be reset by a truncated
+        result -- accepted rather than losing the reading entirely. Nothing
+        came back at all means there is nothing to summarise."""
+        print(f"[validation] closing partial batch ({why}), "
+              f"{self.val_pending} never returned, "
+              f"summarising {len(self.val_rows)}", flush=True)
+        if not self.val_rows:
+            self.val_pending = 0
+            self.val_batch_started_at = None
+            self.broadcast("tear_down_sf")
+            return
+        self.finish_validation_batch()
 
     def check_validation_timeout(self):
         if not self.val_pending or self.val_batch_started_at is None:
             return
         if time.monotonic() - self.val_batch_started_at > VAL_BATCH_TIMEOUT_S:
-            self.abandon_validation_batch("timeout")
+            self.close_partial_validation_batch("timeout")
 
     # ---- results ------------------------------------------------------
 
@@ -523,12 +564,13 @@ class SelfPlayRunner:
             self.finished_games.append(game)
             self.total_games += 1
 
-            if scenario == "paired_validation":
+            # only collect while a batch is actually live, so a straggler
+            # arriving after one closed cannot land in the next one's buffer
+            if scenario == "paired_validation" and self.val_pending:
                 self.val_rows.append(meta)
-                if self.val_pending:
-                    self.val_pending -= 1
-                    if self.val_pending == 0:
-                        self.finish_validation_batch()
+                self.val_pending -= 1
+                if self.val_pending == 0:
+                    self.finish_validation_batch()
 
         self.recorder.maybe_log_results()
 
@@ -631,6 +673,7 @@ class SelfPlayRunner:
             # worker-side validation is done and predictions are on disk;
             # pause so the retrain gets the GPU
             self.broadcast("pause")
+            self.cmd_paused = True
             print("[retrain] workers paused, training now", flush=True)
             return
 
@@ -652,8 +695,15 @@ class SelfPlayRunner:
         self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
 
         # hard rule: unpause as soon as training is done, the TRT rebuild in
-        # reload_config being the one unavoidable prerequisite
+        # reload_config being the one unavoidable prerequisite. This overrides
+        # an operator pause -- holding it would stall the run forever -- so
+        # cmd_paused is cleared to match, rather than left claiming a pause
+        # that no longer exists.
         self.broadcast("unpause")
+        if self.cmd_paused:
+            self.cmd_paused = False
+            print("[retrain] operator pause released by retrain completion",
+                  flush=True)
         print("[retrain] workers unpaused", flush=True)
 
         if ok:
@@ -672,7 +722,10 @@ class SelfPlayRunner:
         if os.path.exists(pred_pkl):
             os.remove(pred_pkl)
 
-        self.current_epoch += 1
+        # re-read rather than increment: aggregate_metrics runs even when the
+        # retrain failed, so a local counter can drift from the csv with
+        # nothing to resync it. Disk is the one source of truth.
+        self.current_epoch = next_model_epoch(self.cfg.progress_csv_path)
         self.retrain_worker = None
 
         # fresh weights: probe the new epoch in bulk so most of an analysis
@@ -706,11 +759,17 @@ class SelfPlayRunner:
                 self.cmd_paused = True
                 print("[cmd] workers paused", flush=True)
 
-        if self.cmd_paused and c.unpause.is_set():
+        # cleared whether or not anything was paused: left set it would latch
+        # and cancel the next pause on the following pass
+        if c.unpause.is_set():
             c.unpause.clear()
-            self.broadcast("unpause")
-            self.cmd_paused = False
-            print("[cmd] workers unpaused", flush=True)
+            if self.cmd_paused:
+                self.broadcast("unpause")
+                self.cmd_paused = False
+                print("[cmd] workers unpaused", flush=True)
+            else:
+                print("[cmd] unpause: workers are not paused, no-op",
+                      flush=True)
 
         if c.save_training_data.is_set():
             c.save_training_data.clear()
@@ -736,8 +795,10 @@ class SelfPlayRunner:
         self.setup()
         self.spawn_workers()
         self.initial_fill()
-        crash_log = os.path.join(self.cfg.run_dir, "worker_crash_log.txt")
         try:
+            # the loop ends when the workers are gone and nothing is training.
+            # Draining the rescore backlog is shutdown's job, not a condition
+            # here -- MAX_BACKLOG used to stall between rounds for that.
             while self.procs or self.retrain_worker is not None:
                 if self.controls.stop.is_set():
                     self.procs = check_and_reap_procs(
@@ -745,18 +806,9 @@ class SelfPlayRunner:
                     break
 
                 self.handle_commands()
-                # CLAUDE crash_log_path can easily be an attribute, doesnt need to float
                 self.procs = check_and_reap_procs(
-                    self.procs, self.worker_procs, crash_log_path=crash_log)
-
-                # CLAUDE if roundless its not clear we need this at all. the MAX_BACKLOG
-                #  was to stall between rounds and let rescoring catch up. we dont have rounds anymore.
-                # workers gone and backlog small: nothing left to do, unless a
-                # retrain is still in flight -- tearing down under it would
-                # strand its result and leave the epoch unbumped
-                if not self.procs and len(self.finished_games) < MAX_BACKLOG:
-                    if self.retrain_worker is None:
-                        break
+                    self.procs, self.worker_procs,
+                    crash_log_path=self.crash_log_path)
 
                 self.top_up_queue()
                 self.drain_results()
@@ -769,9 +821,16 @@ class SelfPlayRunner:
             self.shutdown()
 
     def initial_fill(self):
-        """Probes first: they are single-move, so workers churn them fast and
-        the SF rescore threads have work from the first seconds instead of
-        idling until full games land."""
+        """Seed the queue in priority order: probes, validation, selfplay.
+
+        The queue is FIFO, so this order is the only thing deciding what the
+        workers see first. Probes lead because they are single-move -- workers
+        churn them fast, so the SF rescore threads have work from the first
+        seconds instead of idling until full games land. Validation follows,
+        which also staggers the Stockfish engines: workers reach the first
+        validation game at slightly different times rather than all spinning
+        one up at once.
+        """
         if self.blunder_pool:
             last = last_epoch_in_blunder_replay_history(
                 os.path.join(self.cfg.run_dir, BRP_HISTORY_FILENAME)
@@ -782,23 +841,30 @@ class SelfPlayRunner:
                     BRP_ANALYSIS_EVERY // 2,
                     f"startup, epoch {self.current_epoch}"
                 )
-        
+
+        self.maybe_start_validation()
         self.top_up_queue()
 
     def report(self):
         elapsed = time.time() - self.started_at
-        gph = 3600 * self.total_games / elapsed if elapsed else 0.0
-        print(f"[runner] {format_time(elapsed)} | {self.total_games} games "
-              f"({gph:.1f}/hr)", flush=True)
+        # rate is this process's own games; total_games is seeded from disk,
+        # so using it would divide a whole run's output by one session's clock
+        this_run = self.total_games - self.games_at_start
+        gph = 3600 * this_run / elapsed if elapsed else 0.0
+        print(f"[runner] {format_time(elapsed)} | {this_run:,} games this "
+              f"session ({gph:.1f}/hr) | {self.total_games:,} of "
+              f"{self.cfg.n_games:,} budget", flush=True)
 
     def shutdown(self):
         if self.retrain_worker is not None and self.retrain_worker["p"].is_alive():
             self.retrain_worker["p"].terminate()
         if self.val_pending:
-            self.abandon_validation_batch("shutdown")
+            self.close_partial_validation_batch("shutdown")
 
-        self.rescorer.tick(self.blunder_pool)
+        self.drain_rescorer()
         self.rescorer.push_analyzed(report=True)
+        # after the drain, never before: pending only empties as these threads
+        # return results
         for t in self.sf_rescore_threads:
             t.close()
         if self.rescorer.live_buffer.records:
@@ -809,6 +875,30 @@ class SelfPlayRunner:
         self.rescorer.close(self.blunder_pool)
         self.stop_workers()
         self.report()
+
+    def drain_rescorer(self, timeout_s=300.0):
+        """Finish the SF work already in flight before exiting.
+
+        The rescorer never signals "done" -- it is drained when the four
+        collections below are empty. pending only empties as the SF threads
+        return results, so a dead thread would spin here forever: hence the
+        deadline, which reports what it gave up on rather than hanging.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.tick_rescorer()
+            outstanding = (
+                len(self.finished_games) + len(self.finished_brp)
+                + len(self.rescorer.intake)
+                + len(self.rescorer.blunder_replay_intake)
+                + len(self.rescorer.pending))
+            if not outstanding:
+                return True
+            if time.monotonic() > deadline:
+                print(f"[runner] rescore drain timed out, {outstanding} "
+                      f"games unfinished", flush=True)
+                return False
+            time.sleep(0.1)
 
     def stop_workers(self, max_wait_s=15.0):
         deadline = None if max_wait_s is None else time.monotonic() + max_wait_s
@@ -860,6 +950,17 @@ def run_roundless(run_tag):
     controls = Controls()
     runner = SelfPlayRunner(
         run_tag, base_cfg, yaml_path, val_yaml_path, controls=controls)
+
+    # run_selfplay's __main__ points these at its own STOP_REQUESTED, which
+    # this runner never reads -- and an installed handler stops SIGINT from
+    # raising KeyboardInterrupt, so without this Ctrl-C does nothing at all
+    def on_signal(signum=None, frame=None):
+        print("[signal] stop requested", flush=True)
+        controls.stop.set()
+
+    signal.signal(signal.SIGINT, on_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, on_signal)
     threading.Thread(
         target=stdin_listener,
         args=(controls, runner.worker_procs),

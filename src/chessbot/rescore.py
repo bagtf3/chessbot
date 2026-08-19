@@ -30,7 +30,7 @@ from chessbot.opening_counts import (
 
 from chessbot.blunder_replay import (
     BRP_POOL_ENV, BRP_SCENARIOS, is_blunder_candidate,
-    load_probe_pool, save_probe_pool, evicted_path, evict_position,
+    save_probe_pool, evicted_path, evict_position,
     BRP_EQUIV_CPL, BRP_HISTORY_FILENAME,
     blunder_replay_dir, BRP_POOL_MAX_SIZE,
     BRP_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
@@ -1995,8 +1995,10 @@ class Rescorer(object):
                     f"corr={b['corr']:.2f}  CE_gain={b['ce_gain']:.2f}  n={b['n']}")
 
         def pol_line(b):
-            return (f"top1_exact={b['top1_exact']:.2f}  "
-                    f"mass: top1={b['top1_mass']:.2f}  top3={b['top3_mass']:.2f}  top5={b['top5_mass']:.2f}")
+            return (f"top1_exact={b['top1_exact']:.2f}  mass: "
+                    f"top1={b['top1_mass']:.2f}  "
+                    f"top3={b['top3_mass']:.2f}  "
+                    f"top5={b['top5_mass']:.2f}")
 
         def print_slice(b, label, line_fn):
             if not b:

@@ -22,7 +22,7 @@ from chessbot.utils import make_jsonable, format_time, next_model_epoch
 from chessbot.validation import build_validation_summary, create_validation_config
 
 from chessbot.blunder_replay import (
-    load_probe_pool, BRP_POOL_ENV, BRP_HISTORY_FILENAME,
+    load_probe_pool, BRP_HISTORY_FILENAME,
     last_epoch_in_blunder_replay_history,
 )
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
@@ -462,7 +462,7 @@ def main(run_tag):
     # anything that needs it (Rescorer mutates it, the blunder-replay
     # injector samples from it). Never crosses the multiprocessing boundary;
     # only sampled GameSpecs do.
-    blunder_pool = load_probe_pool() if os.environ.get(BRP_POOL_ENV) else None
+    blunder_pool = load_probe_pool()
 
     rescorer = Rescorer(base_cfg, sf_game_q, sf_res_q)
     finished_games, finished_blunder_replays = rescorer.get_unprocessed()

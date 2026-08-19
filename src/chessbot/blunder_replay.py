@@ -27,8 +27,8 @@ BRP_POOL_ENV = "BLUNDER_POSITIONS"
 BRP_CONFIG_ENV = "BLUNDER_REPLAY_CONFIG"
 BRP_DIRNAME = "blunder_probe"
 BRP_HISTORY_FILENAME = "blunder_probe_history.jsonl"
-BRP_MIN_CACHE_DEPTH = 17
-BRP_EQUIV_CPL = 12
+BRP_MIN_CACHE_DEPTH = 18
+BRP_EQUIV_CPL = 25
 # a position discovered this recently has not survived a retrain yet, so
 # replaying it measures nothing. Gates trickle sampling; the epoch-boundary
 # dumps deliberately ignore it.

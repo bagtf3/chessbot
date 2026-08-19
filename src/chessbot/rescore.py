@@ -35,7 +35,6 @@ from chessbot.blunder_replay import (
     blunder_replay_dir, BRP_POOL_MAX_SIZE,
     BRP_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
     BRP_START_MS, BRP_MS_STEP, BRP_MS_MAX_MULT,
-    BRP_MIN_AGE,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -886,27 +885,6 @@ class Rescorer(object):
         short_fen_key = brp_data.get('short_fen')
         xerces_uci = brp_data.get('xerces_uci')
 
-        # both the best move and the move actually played here already
-        # cached at BRP_MIN_CACHE_DEPTH+ from an earlier probe or
-        # from initial pool-add seeding -- skip SF entirely
-        if pool is not None and short_fen_key in pool:
-            hit = cached_deep_score(
-                pool[short_fen_key], xerces_uci, BRP_MIN_CACHE_DEPTH)
-            if hit is not None:
-                self.games_seen.add(gid)
-                self.finalize_replay_result(
-                    brp_data, pool,
-                    probe_move=xerces_uci,
-                    best_uci=hit['deep_best_move'],
-                    best_cp=hit['deep_best_cp'],
-                    played_cp=hit['deep_played_cp'],
-                    best_depth=hit['deep_best_depth'],
-                    played_depth=hit['deep_depth'],
-                    sims=None, stop_reason=None,
-                    from_cache=True,
-                )
-                return
-
         board_ch, b_fast = reconcile_game_boards(
             brp_data['start_fen'], brp_data.get('history_uci'),
             brp_data.get('moves_played'),
@@ -944,6 +922,32 @@ class Rescorer(object):
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
+
+        # both the best move and the move actually played here already cached
+        # at BRP_MIN_CACHE_DEPTH+ from an earlier probe or from initial
+        # pool-add seeding -- skip SF entirely. The ply states are built above
+        # this check rather than after it so a cache hit still carries its
+        # search (the hit skips Stockfish, not the probe's own MCTS) and can
+        # bank a training example like any other outcome.
+        if pool is not None and short_fen_key in pool:
+            hit = cached_deep_score(
+                pool[short_fen_key], xerces_uci, BRP_MIN_CACHE_DEPTH)
+            if hit is not None:
+                self.games_seen.add(gid)
+                ply_states = game_state['ply_states']
+                self.finalize_replay_result(
+                    brp_data, pool,
+                    probe_move=xerces_uci,
+                    best_uci=hit['deep_best_move'],
+                    best_cp=hit['deep_best_cp'],
+                    played_cp=hit['deep_played_cp'],
+                    best_depth=hit['deep_best_depth'],
+                    played_depth=hit['deep_depth'],
+                    sims=None, stop_reason=None,
+                    from_cache=True,
+                    ply=ply_states[0] if ply_states else None,
+                )
+                return
 
         self.pending[gid] = game_state
         # submit to SF thread, or finalize immediately if every move was SF's own
@@ -1084,16 +1088,14 @@ class Rescorer(object):
                     )
 
             if found_equiv:
+                added_to_buffer = self.add_equiv_replay_training_example(ply)
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
-            elif ply is not None and probe_cpl > 60:
-                age_ok = (added_epoch is None
-                          or (epoch is not None
-                              and epoch - added_epoch
-                              > BRP_MIN_AGE))
-                if age_ok:
-                    added_to_buffer = self.add_blunder_replay_training_example(
-                        ply, epoch, best_uci, best_cp, probe_cpl)
+            # not equiv -- found_equiv took everything at or under
+            # BRP_EQUIV_CPL, so anything reaching here is still wrong
+            elif ply is not None:
+                added_to_buffer = self.add_blunder_replay_training_example(
+                    ply, epoch, best_uci, best_cp, probe_cpl)
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1126,6 +1128,69 @@ class Rescorer(object):
         if self.n_replay_rows >= BRP_ANALYSIS_EVERY:
             self.analyse_brp_file()
 
+    def add_equiv_replay_training_example(self, ply):
+        """
+        Bank an equiv-or-better probe before the position is evicted: own
+        visits, own WDL, no SF blend. Weighted like a selfplay sample so
+        the KL boost applies -- always eligible, since found_equiv is well
+        inside rescore_equiv_range.
+        """
+        if ply is None:
+            return False
+
+        cfg = self.config
+        board = ply['board']
+        tr = ply.get('tr') or {}
+
+        cm = tr.get('candidate_moves', [])
+        wdl = tr.get('best_wdl')
+        if not cm or wdl is None:
+            return False
+
+        vmap = {c['uci']: max(1, c['visits']) for c in cm}
+        for u in board.legal_moves():
+            vmap.setdefault(u, 1)
+        visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+
+        mvs = [v[0] for v in visits]
+        vis = [v[1] for v in visits]
+
+        priors_map = {c['uci']: c['P'] for c in cm}
+        priors = [priors_map.get(u, 0.0) for u in mvs]
+
+        kl = kl_divergence(priors, vis)
+        self.kl_q50 = update_ema_quantile(
+            self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
+        self.kl_q80 = update_ema_quantile(
+            self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
+
+        pwht = 1.0
+        if kl >= self.kl_q80:
+            pwht *= cfg.kl_boost_p80_mult
+        elif kl >= self.kl_q50:
+            pwht *= cfg.kl_boost_median_mult
+
+        policy = np.zeros(1858, dtype=np.float32)
+        pi = np.array(vis, dtype=np.float32)
+        pi = pi / pi.sum()
+        pi = np.clip(pi, 0.0, cfg.prior_clip_max)
+        pi = pi / pi.sum()
+        for idx, p in zip(board.moves_to_indices(mvs), pi):
+            policy[idx] += p
+
+        # best_wdl is white-POV; targets are STM-POV
+        Y = np.array(wdl, dtype=np.float32)
+        if not ply['turn']:
+            Y = Y[[2, 1, 0]]
+
+        x = self.encode_board(board)
+        okey = self.opening_counts.key(board, x)
+        self.opening_counts.bump(okey)
+        self.live_buffer.append(
+            (x, None, sparsify_policy(policy), Y, 1.0, pwht, 'xc0_replay_equiv'),
+            okey)
+        return True
+
     def add_blunder_replay_training_example(self, ply, epoch, best_uci,
                                              best_cp, probe_cpl):
         """
@@ -1134,9 +1199,9 @@ class Rescorer(object):
         turns one into a live_buffer sample. Blends the replaying model's
         own search (visits + WDL) with the SF probe result: 1 visit on every
         legal move plus the rest piled on SF's best move, and SF's cp turned
-        into a WDL via the tanh value curve. alpha (SF weight) scales 0.25 at
-        probe_cpl=60 up to 0.75 at probe_cpl>=150 -- the worse xc0's move,
-        the more the sample leans on SF.
+        into a WDL via the tanh value curve. alpha (SF weight) ramps 0.10 at
+        probe_cpl=25 to 0.85 at 150 -- the worse xc0's move, the more the
+        sample leans on SF.
         """
         board = ply['board']
         tr = ply.get('tr') or {}
@@ -1158,7 +1223,7 @@ class Rescorer(object):
         sf_total = sum(sf_visits.values())
         sf_probs = {u: v / sf_total for u, v in sf_visits.items()}
 
-        alpha = 0.25 + (min(max(probe_cpl, 60), 150) - 60) / 90.0 * 0.5
+        alpha = 0.10 + (min(max(probe_cpl, 25), 150) - 25) / 125.0 * 0.75
 
         ucis = sorted(set(xc0_probs) | set(sf_probs))
         blended = np.array([
@@ -1172,9 +1237,15 @@ class Rescorer(object):
         for idx, p in zip(indices, blended):
             policy[idx] += p
 
+        # best_wdl is white-POV, wdl_sf below is STM-POV -- flip before they
+        # blend. The Q_stm fallback is already STM-POV and must not be flipped.
         wdl_xc0 = tr.get('best_wdl')
-        wdl_xc0 = (np.array(wdl_xc0, dtype=np.float32) if wdl_xc0 is not None
-                   else scalar_to_wdl(tr.get('Q_stm', 0.0)))
+        if wdl_xc0 is not None:
+            wdl_xc0 = np.array(wdl_xc0, dtype=np.float32)
+            if not ply['turn']:
+                wdl_xc0 = wdl_xc0[[2, 1, 0]]
+        else:
+            wdl_xc0 = scalar_to_wdl(tr.get('Q_stm', 0.0))
         wdl_sf = scalar_to_wdl(cp_to_value_tanh(best_cp, mid_cp=200.0))
         Y = alpha * wdl_sf + (1.0 - alpha) * wdl_xc0
 

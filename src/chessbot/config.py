@@ -78,7 +78,12 @@ class Config(object):
     # depth backstop. Under backlog it drops by a hardcoded 10ms.
     rescore_movetime_ms = 90
     rescore_analyze_batch = 30
-    rescore_equiv_range = 25
+    # equiv scales with how sharp the position is: a 20cp slip in a dead even
+    # position is a real error, the same slip at +600 is noise. min applies
+    # below ~100cp, max keeps the slope from handing crushing positions a
+    # tolerance far above the errors actually seen there.
+    rescore_equiv_min = 10
+    rescore_equiv_max = 60
     rescore_inaccuracy_cp = 75
     rescore_blunder_cp_loser = 90
     rescore_blunder_cp_winner = 200

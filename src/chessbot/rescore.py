@@ -746,7 +746,8 @@ class Rescorer(object):
         game_cfg_keys = (
             'train_on_stockfish',
             'kl_boost_median_mult', 'kl_boost_p80_mult', 'kl_quantile_lr',
-            'rescore_equiv_range', 'rescore_blunder_cp_loser',
+            'rescore_equiv_min', 'rescore_equiv_max',
+            'rescore_blunder_cp_loser',
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
             'inaccuracy_downweight',
             'uniform_eps', 'prior_clip_max',
@@ -1133,7 +1134,7 @@ class Rescorer(object):
         Bank an equiv-or-better probe before the position is evicted: own
         visits, own WDL, no SF blend. Weighted like a selfplay sample so
         the KL boost applies -- always eligible, since found_equiv is well
-        inside rescore_equiv_range.
+        inside the equiv band.
         """
         if ply is None:
             return False
@@ -1347,8 +1348,6 @@ class Rescorer(object):
         vs_stockfish = game_data.get('vs_stockfish', False)
         sf_color = game_data.get('stockfish_is_white')
 
-        EQUIV = cfg.rescore_equiv_range
-
         cpl_s = 0.0
         n_plies = 0
         rows = []
@@ -1376,6 +1375,11 @@ class Rescorer(object):
             visits = list(ply['visits'])
 
             best_uci = best_uci_raw
+            # equiv band scales with the position's own eval, off the raw
+            # best_cp before the swap below can overwrite it
+            EQUIV = min(max(abs(best_cp) * 0.1, cfg.rescore_equiv_min),
+                        cfg.rescore_equiv_max)
+
             delta = best_cp - played_cp
             if abs(delta) <= EQUIV:
                 delta = 0

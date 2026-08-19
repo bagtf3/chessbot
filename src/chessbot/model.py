@@ -1,816 +1,2191 @@
-import os
-import numpy as np
-import pandas as pd
-pd.set_option('display.width', None)
-pd.set_option('display.max_columns', None)
+"""model.py — PyTorch model definitions for Xerces chess engine.
 
-import json
-from pathlib import Path
+Exports:
+    VOCAB_SIZE, SEQ_LEN
+    VARIANTS     — shared cfg dict used by speed test and bootstrap
+    PT_BUILDERS  — {name: fn(cfg) -> PT nn.Module}
+    make_pt_relational_policy_head, make_pt_attn_pool_value_head, make_ln2d
 
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models"
-HE = "he_normal"
-BIG_NEG = -1e9
-EPS = 1e-9
+Optimizer note for future models: the current Adam setup (make_adam in the
+bootstrap/train scripts) applies weight_decay to every parameter through a
+single flat param_group, including 1-D LayerNorm gains/biases, conv/linear
+biases, and free learnable scalars (e.g. the xc0h_*_scale terms). Best
+practice is to exclude 1-D/bias/norm params from weight decay entirely
+(they should decay to their own equilibrium, not toward zero) rather than
+rely on weight_decay being small enough not to matter. Measured negligible
+here at weight_decay=1e-6 (decay/step ratio <2% in every param group), but
+worth building the param-group split properly if a future model raises
+weight_decay or adds larger 1-D/bias terms that actually need protecting.
+"""
+from __future__ import annotations
 
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-from tensorflow import keras
+VOCAB_SIZE = 21
+SEQ_LEN    = 64
 
-from tensorflow.keras.models import Model
-from tensorflow.keras.losses import CategoricalCrossentropy
-from tensorflow.keras.utils import unpack_x_y_sample_weight
-from tensorflow.keras.initializers import Zeros, Constant
-from tensorflow.keras.layers import (
-    Input, Conv2D, BatchNormalization, LeakyReLU, Add,
-    GlobalAveragePooling2D, Dense, Lambda
-)
-
-
-def load_model(model_loc):
-    model = keras.models.load_model(model_loc)
-    return model
-
-
-def save_model(model, model_loc):
-    model.save(model_loc, save_format='h5')
-
-
-def res_block(x, filters, leak=0.05):
-    skip = x
-
-    # project skip if channel count doesnt match
-    if x.shape[-1] != filters:
-        skip = Conv2D(
-            filters, 1, padding="same", use_bias=False, kernel_initializer=HE
-        )(skip)
-        skip = BatchNormalization()(skip)
-
-    y = Conv2D(filters, 3, padding="same", use_bias=False, kernel_initializer=HE)(x)
-    y = BatchNormalization()(y)
-    y = LeakyReLU(alpha=leak)(y)
-    y = Conv2D(filters, 3, padding="same", use_bias=False, kernel_initializer=HE)(y)
-    y = BatchNormalization()(y)
-
-    y = Add()([skip, y])
-    return LeakyReLU(alpha=leak)(y)
-
-def build_conv_trunk(input_shape=(8, 8, 70), width=256, n_blocks=8, leak=0.05):
-    """Convolutional trunk with residual blocks, returns feature map + pooled vector."""
-    inputs = layers.Input(shape=input_shape, name="board")
-
-    # fat first conv
-    x = layers.Conv2D(
-        2*width, 3, padding="same", use_bias=False, kernel_initializer=HE
-    )(inputs)
-
-    x = layers.BatchNormalization()(x)
-    x = layers.LeakyReLU(alpha=leak)(x)
-    
-    # residual tower
-    for _ in range(n_blocks):
-        x = res_block(x, width, leak=leak)
-    
-    trunk_feat = layers.LeakyReLU(alpha=leak, name="trunk")(x)
-
-    # global pooling: (8,8,width) -> (width,)
-    trunk_vec = layers.GlobalAveragePooling2D(name="trunk_vec")(trunk_feat)
-
-    return Model(inputs, [trunk_feat, trunk_vec], name="conv_trunk")
-
-
-def make_conv_model(name, input_shape=(8, 8, 70), width=256, n_blocks=8):
-    trunk = build_conv_trunk(input_shape=input_shape, width=width, n_blocks=n_blocks)
-    inputs = trunk.input
-    trunk_feat, trunk_vec = trunk.output
-
-    # Heads
-    val_out, _ = value_head(trunk_vec, hidden=512)
-    best_outputs = policy_factor_head(trunk_vec, prefix="best", hidden=512)
-
-    model = Model(inputs, [val_out] + best_outputs, name=name)
-
-    losses = {
-        "value": tf.keras.losses.MeanSquaredError(),
-        "best_from": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_to":   tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_piece":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "best_promo":tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-    }
-
-    loss_weights = {
-        "value": 0.5,
-        "best_from": 0.5,
-        "best_to": 0.5,
-        "best_piece": 0.5,
-        "best_promo": 0.1,
-    }
-
-    opt = tf.keras.optimizers.Adam(1e-4)
-    model.compile(optimizer=opt, loss=losses, loss_weights=loss_weights)
-    return model
+VARIANTS: dict[str, dict] = {
+    "16m-transformer": dict(
+        transformer=True,
+        d_embed=512, transformer_layers=7, num_heads=16,
+        ff_dim=1024, dropout=0.05,
+    ),
+    "16m-conformer-interweaved": dict(
+        conformer_interweaved=True,
+        d_embed=256, conv_filters=256, conv_blocks=10,
+        num_heads=8, ff_dim=1024, dropout=0.05,
+    ),
+    "16m-transformer-branched": dict(
+        transformer_branched=True,
+        d_embed=512, transformer_layers=4, num_heads=16,
+        ff_dim=1024, dropout=0.05,
+    ),
+    "13m-precond-conformer": dict(
+        precond_conformer=True,
+        conv_filters=256, num_heads=8, dropout=0.05,
+        pre_blocks=4, mha_blocks=4,
+    ),
+    "16m-precond-smartgate": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=4,
+    ),
+    "16m-precond-smartgate-lc0": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=4, lc0_input=True,
+    ),
+    "16m-precond-smartgate-xc0h": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=4, xc0h_K=6,
+    ),
+    "precond-signed-4g6t-d512": dict(
+        conv_filters=256, pos_dim=256, dropout=0.03, pre_blocks=4, tx_blocks=6,
+        ff_dim=1024, pre_block="globalizer", xc0h_K=6,
+    ),
+    "precond-mha-4g6t-d512": dict(
+        conv_filters=256, pos_dim=256, dropout=0.03, pre_blocks=4, tx_blocks=6,
+        ff_dim=1024, pre_block="globalizer", xc0h_K=6,
+        attn="mha", num_heads=8,
+    ),
+    "18m-precond-smartgate-xc0h-6c4t": dict(
+        conv_filters=256, num_heads=8, dropout=0.03,
+        pre_blocks=6, tx_blocks=4, xc0h_K=6,
+    ),
+    "precond-mixer-6m4t-d512": dict(
+        conv_filters=256, pos_dim=256, dropout=0.03, mixer_blocks=6, tx_blocks=4,
+        tok_expansion=4, chan_expansion=4, num_heads=8, xc0h_K=6,
+    ),
+    "precond-mha-8c4t-d384": dict(
+        conv_filters=256, pos_dim=128, dropout=0.03, pre_blocks=8, tx_blocks=4,
+        ff_dim=1024, pre_block="conv", attn="mha", num_heads=8, xc0h_K=6,
+    ),
+    "precond-mha-8c6t-d256": dict(
+        conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=6,
+        ff_dim=1024, num_heads=8, xc0h_K=6,
+    ),
+    "precond-mha-10c6t-d256": dict(
+        conv_filters=256, dropout=0.01, pre_blocks=10, tx_blocks=6,
+        ff_dim=1024, num_heads=8, xc0h_K=6,
+    ),
+    "precond-mha-8c8t-d256": dict(
+        conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=8,
+        ff_dim=1024, num_heads=8, xc0h_K=6,
+    ),
+    "conv-globalizer-2c6g": dict(
+        conv_filters=256, pos_dim=128, num_blocks=6, stem_blocks=2,
+        dropout=0.03, xc0h_K=6,
+    ),
+    "conv-pure": dict(
+        conv_filters=256, num_blocks=16, dropout=0.03, xc0h_K=6, value_tap=4,
+    ),
+}
 
 
-def make_fwd(model, warm_shapes=(64, 256)):
+# ---------------------------------------------------------------------------
+# PyTorch shared helpers
+# ---------------------------------------------------------------------------
+
+def make_ln2d(ch: int):
+    """Channel-wise LayerNorm for (B, C, H, W) tensors."""
+    import torch
+    import torch.nn as nn
+
+    class Ln2d(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(ch))
+            self.b = nn.Parameter(torch.zeros(ch))
+
+        def forward(self, x):
+            c = x - x.mean(1, keepdim=True)
+            return (
+                c * torch.rsqrt((c * c).mean(1, keepdim=True) + 1e-5)
+                * self.w.view(1, -1, 1, 1) + self.b.view(1, -1, 1, 1)
+            )
+
+    return Ln2d()
+
+
+def make_rms2d(ch: int, eps: float = 1e-6):
+    """Channel-wise RMSNorm for (B, C, H, W) tensors.
+
+    Normalizes over the channel dim independently at each board square, so the
+    64 squares never mix. Learned scale, no additive bias.
     """
-    Returns a callable fwd(X_np) that:
-      1) uses a compiled @tf.function on the given model with training=False
-      2) accepts a NumPy batch [B,8,8,70] and returns a list of NumPy arrays
-         in the same order as model.outputs
-      3) warms up the common batch shapes once to stabilize autotune
+    import torch
+    import torch.nn as nn
+
+    class Rms2d(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(ch))
+
+        def forward(self, x):
+            r = torch.rsqrt(x.pow(2).mean(1, keepdim=True) + eps)
+            return x * r * self.w.view(1, -1, 1, 1)
+
+    return Rms2d()
+
+
+def make_rms1d(d: int, eps: float = 1e-6):
+    """RMSNorm over the last dim. Param is named `scale` to stay key-compatible
+    with the inline RMSNorm the smartgate heads have always used."""
+    import torch
+    import torch.nn as nn
+
+    class Rms1d(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(eps).sqrt() * self.scale
+
+    return Rms1d()
+
+
+def make_rms_conv_block(D: int):
+    """conv-pure's residual block with RMSNorm in place of LayerNorm.
+
+    residual -> rms -> conv3x3 -> leaky_relu -> conv3x3 -> leaky_relu -> add.
+    Exactly one norm per block, and unlike the LayerNorm version every block
+    normalizes -- the first is no longer skipped. c1 takes a bias since RMSNorm
+    has no bias of its own to absorb the offset; c2 reads a leaky_relu and does
+    not.
     """
-    @tf.function(input_signature=[tf.TensorSpec([None, 8, 8, 70], tf.float32)])
-    def graph(x):
-        return model(x, training=False)
+    import torch.nn as nn
+    import torch.nn.functional as F
 
-    for B in warm_shapes:
-        _ = graph(tf.zeros([B, 8, 8, 70], tf.float32))
+    class RmsConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_rms2d(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
 
-    def fwd(x_np):
-        x = tf.convert_to_tensor(x_np, dtype=tf.float32)
-        outs = graph(x)
-        if isinstance(outs, (list, tuple)):
-            return [t.numpy() for t in outs]
-        if isinstance(outs, dict):
-            ordered = []
-            for t in model.outputs:
-                key = t.name.split(':')[0].split('/')[0]
-                ordered.append(outs[key].numpy())
-            return ordered
-        return [outs.numpy()]
-    return fwd
+        def forward(self, x):
+            h = self.norm(x)
+            h = F.leaky_relu(self.c1(h), 0.01)
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return x + h
+
+    return RmsConvBlock()
+
+
+def make_globalizer_block(D: int = 256, local_ch: int = None, glob_ch: int = 16):
+    """Split local/global residual block.
+
+    One full-width 3x3 conv, then its output is split: the first local_ch
+    channels stay spatial, the last glob_ch are flattened to [B, glob_ch * 64],
+    pushed through a SwiGLU bottleneck (halve then restore), reshaped back to
+    [B, glob_ch, 8, 8] and concatenated back on. Every square therefore sees
+    whole-board state without attention.
+
+    The global channels come off the same 3x3 as the local ones rather than a
+    separate 1x1, so the board summary is built from local patterns instead of
+    isolated per-square probes. It also keeps every conv at D -> D, which tiles
+    cleanly, and drops a kernel launch per block -- this family runs
+    launch-bound well past batch 64.
+
+    One RMSNorm, one outer residual, no LayerScale or residual scaling.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    if local_ch is None:
+        local_ch = D - glob_ch        # 240 at D=256
+
+    gdim = glob_ch * SEQ_LEN          # 1024
+    hidden = gdim // 2                # 512
+
+    class GlobalizerBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_rms2d(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+            self.lin_in = nn.Linear(gdim, gdim, bias=True)     # emits gate|value
+            self.lin_out = nn.Linear(hidden, gdim, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            B = x.shape[0]
+            h = F.leaky_relu(self.c1(self.norm(x)), 0.01)      # [B, D, 8, 8]
+            local, g = h[:, :local_ch], h[:, local_ch:]
+
+            g = g.reshape(B, gdim)                             # [B, 1024]
+            gate, value = self.lin_in(g).chunk(2, dim=-1)      # [B, 512] each
+            g = F.silu(gate) * value
+            g = self.lin_out(g).reshape(B, glob_ch, 8, 8)      # [B, 16, 8, 8]
+
+            h = torch.cat([local, g], dim=1)                   # [B, D, 8, 8]
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return x + h
+
+    return GlobalizerBlock()
+
+
+def make_pt_attn_pool_value_head(C: int, n_heads: int = 4):
+    """Attention-pool value head. Accepts (B, C, 8, 8) or (B, N, C)."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class AttnPoolValueHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln    = nn.LayerNorm(C)
+            self.proj  = nn.Linear(C, 256)
+            self.mha   = nn.MultiheadAttention(256, n_heads, dropout=0.0, batch_first=True)
+            self.query = nn.Parameter(torch.randn(1, 1, 256))
+            self.out   = nn.Linear(256, 3)
+
+        def forward(self, x):
+            x = F.gelu(self.proj(self.ln(x)))
+            q = self.query.expand(x.shape[0], -1, -1)   # (B, 1, 256)
+            h, _ = self.mha(q, x, x, need_weights=False)
+            return self.out(h.squeeze(1))
+
+    return AttnPoolValueHead()
+
+
+def make_pt_mha_policy_head(C: int, n_heads: int = 4):
+    """MHA-refined bilinear policy head. Accepts (B, C, 8, 8).
+    Each from/to branch gets LN -> proj(256) -> GELU -> MHA -> dense(256),
+    then BMM dot product scaled by 1/sqrt(256) for move logits.
+    Returns (B, 4288): 4096 normal + 192 underpromotion logits."""
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    D = 256
+
+    class MHAPolicyHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln         = nn.LayerNorm(C)
+            self.scale      = 1.0 / math.sqrt(D)
+
+            self.from_proj  = nn.Linear(C, D)
+            self.from_mha   = nn.MultiheadAttention(D, n_heads, dropout=0.0, batch_first=True)
+            self.from_ln    = nn.LayerNorm(D)
+            self.from_out   = nn.Linear(D, D)
+
+            self.to_proj    = nn.Linear(C, D)
+            self.to_mha     = nn.MultiheadAttention(D, n_heads, dropout=0.0, batch_first=True)
+            self.to_ln      = nn.LayerNorm(D)
+            self.to_out     = nn.Linear(D, D)
+
+            self.promo_mix  = nn.Conv2d(C, 64, 1, bias=False)
+            self.promo_mln  = make_ln2d(64)
+            self.promo_c1   = nn.Conv2d(64, 64, 3, padding=1, bias=False)
+            self.promo_ln   = make_ln2d(64)
+            self.promo_out  = nn.Conv2d(64, 3, 1)
+
+            mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("sometimes_legal", mask)
+
+        def forward(self, x):
+            B  = x.shape[0]
+            s  = self.ln(x)                              # (B, 68, C)
+
+            f   = F.gelu(self.from_proj(s))              # (B, 68, 256)
+            fn  = self.from_ln(f)
+            fh, _ = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv  = self.from_out(f[:, :64, :] + fh)      # (B, 64, 256)
+
+            t   = F.gelu(self.to_proj(s))                # (B, 68, 256)
+            tn  = self.to_ln(t)
+            th, _ = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv  = self.to_out(t[:, :64, :] + th)        # (B, 64, 256)
+
+            dots  = torch.bmm(fv.float(), tv.float().transpose(1, 2)).mul(self.scale).reshape(-1, 64 * 64)
+
+            xp    = x[:, :64, :].reshape(B, 8, 8, C).permute(0, 3, 1, 2).contiguous()
+            p     = F.leaky_relu(self.promo_mln(self.promo_mix(xp)), 0.02)
+            sk    = p
+            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3).float()
+
+            logits = torch.cat([dots, promo], dim=1)
+            logits = logits.masked_fill(~self.sometimes_legal, -1e9)
+            return logits.to(x.dtype)
+
+    return MHAPolicyHead()
+
+
+def make_pt_relational_policy_head(C: int):
+    """Bilinear from/to policy head. Accepts (B, C, 8, 8).
+    Returns (B, 4288): 4096 normal + 192 underpromotion logits.
+    Never-legal indices are masked to -1e9 so they carry no gradient."""
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    class RelationalPolicyHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            inner_dim = 512
+            self.ln        = nn.LayerNorm(C)
+            self.from_fc1  = nn.Linear(C, inner_dim)
+            self.from_fc2  = nn.Linear(inner_dim, inner_dim)
+
+            self.to_fc1    = nn.Linear(C, inner_dim)
+            self.to_fc2    = nn.Linear(inner_dim, inner_dim)
+            self.scale     = 1.0 / math.sqrt(inner_dim)
+
+            self.promo_mix = nn.Conv2d(C, 64, 1, bias=False)
+            self.promo_mln = make_ln2d(64)
+            self.promo_c1  = nn.Conv2d(64, 64, 3, padding=1, bias=False)
+            self.promo_ln  = make_ln2d(64)
+            self.promo_out = nn.Conv2d(64, 3, 1)
+
+            mask = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool()
+            self.register_buffer("sometimes_legal", mask)
+
+        def forward(self, x):
+            s     = self.ln(x.permute(0, 2, 3, 1).reshape(-1, 64, C))
+            fv    = self.from_fc2(F.gelu(self.from_fc1(s)))
+            tv    = self.to_fc2(F.gelu(self.to_fc1(s)))
+            dots  = torch.bmm(fv.float(), tv.float().transpose(1, 2)).mul(self.scale).reshape(-1, 64 * 64)
+            p     = F.leaky_relu(self.promo_mln(self.promo_mix(x)), 0.02)
+            sk    = p
+            p     = F.leaky_relu(self.promo_ln(self.promo_c1(p)), 0.02)
+            promo = self.promo_out(p + sk).permute(0, 2, 3, 1).reshape(-1, 8 * 8 * 3).float()
+            logits = torch.cat([dots, promo], dim=1)
+            logits = logits.masked_fill(~self.sometimes_legal, -1e9)
+            return logits.to(x.dtype)
+
+    return RelationalPolicyHead()
+
+
+# ---------------------------------------------------------------------------
+# PyTorch builders
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# PyTorch builders
+# ---------------------------------------------------------------------------
+
+def build_pt_transformer_16m(cfg: dict, log_params: bool = False):
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    de = cfg["d_embed"]
+    tl = cfg["transformer_layers"]
+    nh = cfg["num_heads"]
+    fd = cfg["ff_dim"]
+    dr = cfg["dropout"]
+
+    class TxLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1   = nn.LayerNorm(de)
+            self.attn  = nn.MultiheadAttention(de, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.ln2   = nn.LayerNorm(de)
+            self.ff1   = nn.Linear(de, fd)
+            self.drop2 = nn.Dropout(dr)
+            self.ff2   = nn.Linear(fd, de)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop1(h)
+            return x + self.ff2(self.drop2(F.gelu(self.ff1(self.ln2(x)))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb         = nn.Embedding(VOCAB_SIZE, de)
+            self.pos         = nn.Embedding(SEQ_LEN, de)
+            self.txs         = nn.ModuleList([TxLayer() for _ in range(tl)])
+            self.val_mix     = nn.Conv2d(de, de, 1, bias=False)
+            self.val_mix_ln  = make_ln2d(de)
+            self.policy_head = make_pt_relational_policy_head(de)
+            self.value_head  = make_pt_attn_pool_value_head(de)
+
+        def forward(self, t):
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            x   = self.emb(t) + pos
+            for tx in self.txs:
+                x = tx(x)
+            x_2d = x.reshape(-1, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            v_2d = F.leaky_relu(self.val_mix_ln(self.val_mix(x_2d)), 0.02)
+            return self.policy_head(x_2d), self.value_head(v_2d.permute(0, 2, 3, 1).reshape(-1, 64, de))
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_conformer_interweaved(cfg: dict, log_params: bool = False):
+    """Interweaved conformer: cb x [prenorm-MHA -> ConvRes].
+    Graduated pos injection: block 0=1.0, 2=0.1, 4=0.05, 6=0.025, others=none."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    de = cfg["d_embed"]
+    cf = cfg["conv_filters"]
+    cb = cfg["conv_blocks"]
+    nh = cfg["num_heads"]
+    dr = cfg["dropout"]
+
+    POS_SCALES = {0: 1.0, 2: 0.1, 4: 0.05, 6: 0.025}
+
+    class Block(nn.Module):
+        def __init__(self, pos_scale):
+            super().__init__()
+            self.pos_scale = pos_scale
+            self.ln1   = nn.LayerNorm(cf)
+            self.attn  = nn.MultiheadAttention(cf, nh, dropout=0.0, batch_first=True)
+            self.drop1 = nn.Dropout(dr)
+            self.c1    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.lr1   = nn.LeakyReLU(0.01, True)
+            self.c2    = nn.Conv2d(cf, cf, 3, padding=1, bias=False)
+            self.ln2   = make_ln2d(cf)
+
+        def forward(self, x, pos):
+            b = x.shape[0]
+            s = x.permute(0, 2, 3, 1).reshape(b, 64, cf)
+            if self.pos_scale != 0.0:
+                s = s + self.pos_scale * pos
+            r = s
+            n = self.ln1(s)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            s = r + self.drop1(h)
+            x = s.reshape(b, 8, 8, cf).permute(0, 3, 1, 2).contiguous()
+            r = x
+            h = self.lr1(self.c1(x))
+            h = self.ln2(self.c2(h))
+            return F.leaky_relu(r + h, 0.01)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb         = nn.Embedding(VOCAB_SIZE, de)
+            self.proj        = nn.Conv2d(de, cf, 1, bias=False) if de != cf else None
+            self.lnp         = make_ln2d(cf) if de != cf else None
+            self.pos         = nn.Embedding(SEQ_LEN, cf)
+            self.blocks      = nn.ModuleList(
+                [Block(POS_SCALES.get(i, 0.0)) for i in range(cb)]
+            )
+            self.mix         = nn.Conv2d(cf, cf, 1, bias=False)
+            self.lnm         = make_ln2d(cf)
+            self.policy_head = make_pt_relational_policy_head(cf)
+            self.value_head  = make_pt_attn_pool_value_head(cf)
+
+        def forward(self, t):
+            b = t.shape[0]
+            x = self.emb(t).reshape(b, 8, 8, de).permute(0, 3, 1, 2).contiguous()
+            if self.proj is not None:
+                x = F.leaky_relu(self.lnp(self.proj(x)), 0.01)
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0)
+            for block in self.blocks:
+                x = block(x, pos)
+            x = F.leaky_relu(self.lnm(self.mix(x)), 0.01)
+            return self.policy_head(x), self.value_head(x.permute(0, 2, 3, 1).reshape(-1, 64, cf))
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_precond_conformer(cfg: dict, log_params: bool = False):
+    """
+    4x Conv(256) preconditioner -> concat pos(256) -> 512 ->
+    4x [prenorm-MHA -> FF(512->512->512)] -> heads.
+    """
     
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
 
-def make_fwd_batched(model, max_bs=1024, warm_shapes=(256, 512, 1024)):
-    base = make_fwd(model, warm_shapes=warm_shapes)
+    CF = cfg["conv_filters"]   # 256
+    D  = CF * 2                # 512 after concat
+    nh = cfg["num_heads"]
+    dr = cfg["dropout"]
+    pb = cfg["pre_blocks"]
+    mb = cfg["mha_blocks"]
 
-    def fwd(X_np):
-        B = X_np.shape[0]
-        if B <= max_bs:
-            return base(X_np)
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
 
-        acc = None
-        i = 0
-        while i < B:
-            j = min(i + max_bs, B)
-            part = base(X_np[i:j])
-            if acc is None:
-                acc = [p for p in part]
+        def forward(self, x):
+            r = x
+            h = self.ln(x) if self.ln is not None else x
+            h = F.leaky_relu(self.c1(h), 0.01)
+            h = F.leaky_relu(self.c2(h), 0.01)
+            return r + h
+
+    class TxBlock(nn.Module):
+        def __init__(self, ff_dim=D):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, D)
+
+        def forward(self, x):
+            r = x
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = r + self.drop(h)
+            r = x
+            return r + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb           = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre           = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+            self.pos           = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln       = nn.LayerNorm(CF)
+            self.global_tokens = nn.Parameter(torch.randn(1, 4, D))
+
+            ff_dims = [512, 768, 768, 512]
+            self.blocks        = nn.ModuleList([TxBlock(ff_dim=ffd) for ffd in ff_dims])
+            self.policy_head   = make_pt_mha_policy_head(D, n_heads=8)
+            self.value_head    = make_pt_attn_pool_value_head(D, n_heads=8)
+
+        def forward(self, t):
+            B = t.shape[0]
+            x = self.emb(t).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+
+            conv_seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, 64, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=t.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([conv_seq, pos], dim=-1)
+
+            gt = self.global_tokens.expand(B, -1, -1)
+            x = torch.cat([x, gt], dim=1)
+
+            for blk in self.blocks:
+                x = blk(x)
+
+            return self.policy_head(x), self.value_head(x)
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_precond_smartgate(cfg: dict, log_params: bool = False):
+    """4x Conv(256) preconditioner -> concat pos(256) -> 512-d
+    -> append 8 specialized global accumulators -> 4x transformer blocks
+    -> shared trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
+    Gate is suppress-only (logsigmoid <= 0); bias init=4.0 -> near no-op at init.
+
+    If cfg["lc0_input"] is set, the token embedding stem is replaced by a 1x1
+    conv over (B, 112, 8, 8) lc0 planes; everything downstream is identical.
+    Used for the lc0-vs-xc0 encoding bake-off.
+
+    If cfg["xc0h_K"] is set (xc0h = xc0 with history), the stem instead consumes
+    the flat compact history-token encoding from pyfastchess's
+    board.history_tokens(K) / MCTSForest.get_all_history_tokens(K), K = cfg["xc0h_K"]:
+    K frames of 64 slim tokens + K repetition flags + castling/stm/hmc, flattened
+    to (B, K*64+K+3). A shared per-square token embedding (+ learned per-frame-age
+    bias) plus a learned castling plane and scaled stm/hmc/rep channels are
+    concatenated per square and projected to CF; everything downstream is
+    identical to the xc0/lc0 stems. See PLANS.md section 4.
+    """
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    CF      = cfg["conv_filters"]   # 256
+    add_pos = bool(cfg.get("add_pos", False))
+    D       = CF if add_pos else CF * 2   # 256 if pos is added, else 512 (pos concatenated)
+    nh  = cfg["num_heads"]      # 8
+    dr  = cfg["dropout"]
+    interleave_n = cfg.get("interleave_n")   # if set: N x (1 MHA block, 2 conv blocks)
+    pb  = 0 if interleave_n else cfg["pre_blocks"]     # 4
+    PDH = 256
+    lc0_input = bool(cfg.get("lc0_input", False))
+    XC0H_K    = cfg.get("xc0h_K")      # None -> not xc0h; presence of K IS the flag
+    xc0h_input = XC0H_K is not None
+
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            xf = x.float()
+            n  = xf / xf.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+            return (n * self.scale.float()).to(x.dtype)
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class TxBlock(nn.Module):
+        def __init__(self, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, D)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if lc0_input:
+                self.stem    = nn.Conv2d(112, CF, 1)
+                self.stem_ln = make_ln2d(CF)
+            elif xc0h_input:
+                attach_xc0h_stem(self, CF, XC0H_K)
             else:
-                for k in range(len(acc)):
-                    acc[k] = np.concatenate([acc[k], part[k]], axis=0)
-            i = j
-        return acc
+                self.emb     = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+            self.pos     = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln = nn.LayerNorm(CF)
 
-    return fwd
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
 
-
-def set_loss_weights(model, loss_weights):
-    # Get a fresh optimizer (same config) to avoid double-wrapping
-    opt_candidate = model._default_opt
-    if isinstance(opt_candidate, tf.keras.mixed_precision.LossScaleOptimizer):
-        base_opt = opt_candidate.inner_optimizer
-    else:
-        base_opt = opt_candidate
-
-    # create a new optimizer instance with same config
-    opt_cfg = tf.keras.optimizers.serialize(base_opt)
-    opt = tf.keras.optimizers.deserialize(opt_cfg)
-
-    model.compile(
-        optimizer=opt,
-        loss=model._default_loss_dict,
-        loss_weights=loss_weights
-    )
-    model.loss_weights = loss_weights
-    # remember the fresh optimizer for later use
-    model._default_opt = opt
-    return model
-
-
-def build_conv_64pv(
-    d_model_embed=128,
-    vocab_size=21,
-    filters=288,
-    n_conv=16,
-    proj_dim=96,
-    name="conv_64pv"
-):
-    
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy('mixed_float16')
-    
-    DE, FL, VS = d_model_embed, filters, vocab_size
-
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    tok_emb = layers.Embedding(input_dim=VS, output_dim=DE, name="token_emb")(enc_in)
-    x = layers.Reshape((8, 8, DE), name="to_2d")(tok_emb)
-
-    x = layers.Conv2D(FL, 3, padding="same", activation="relu", name="conv_init")(x)
-    
-    # residual blocks
-    for i in range(n_conv):
-        y = layers.Conv2D(FL, 3, padding="same", activation=None, name=f"conv_{i}")(x)
-        # light regularization
-        if i % 2 == 1:
-            y = layers.LayerNormalization(epsilon=1e-5, center=False, scale=False)(y)
-            
-        y = layers.LeakyReLU(alpha=0.01, name=f"lrelu_{i}")(y)
-        x = layers.Add(name=f"res_{i}")([x, y])
-    
-    # expand to (B, 64, 512) then (B, 64, FL)
-    x = layers.Conv2D(512, 1, padding="same", activation="relu", name="conv_expand")(x)
-    x = layers.Conv2D(512, 3, padding="same", activation="relu", name="conv_mix")(x)
-    
-    x = layers.LayerNormalization(
-        epsilon=1e-5, center=False, scale=False,
-        dtype="float32", name="ln_x512"
-    )(x)
-    
-    x = layers.Conv2D(FL, 1, padding="same", activation="relu", name="conv_project")(x)
-
-    # feat for pairwise head: flatten 8x8 -> 64
-    feat = layers.Reshape((64, FL), name="to_64_x")(x)  # (B,64,FL)
-
-    # from/to projections and outer-product -> (B,64,64)
-    from_proj = layers.Dense(proj_dim, name="from_proj")(feat)  # (B,64,proj)
-    to_proj = layers.Dense(proj_dim, name="to_proj")(feat)      # (B,64,proj)
-    pair_scores = tf.matmul(from_proj, to_proj, transpose_b=True)  # (B,64,64)
-
-    # biases and base flatten
-    b_from = layers.Dense(1, name="b_from")(from_proj)            # (B,64,1)
-    b_from = layers.Reshape((64, 1), name="b_from_reshape")(b_from)
-    b_to = layers.Dense(1, name="b_to")(to_proj)                 # (B,64,1)
-    b_to = layers.Permute((2, 1), name="b_to_permute")(b_to)     # (B,1,64)
-    pair_scores = layers.Add(name="add_biases")([pair_scores, b_from, b_to])
-    
-    # (B,4096)
-    base_flat = layers.Reshape((64 * 64,), name="policy_base_flat")(pair_scores)
-
-    # underpromo conv path: operate on 8x8 feature map x (B,8,8,FL)
-    # produce 3 channels per board square (B,8,8,3)
-    up_conv1 = layers.Conv2D(
-        FL // 2, 2, padding="same", activation="relu", name="under_promo_conv1")(x)
-    
-    # (B,8,8,3)
-    up_conv2 = layers.Conv2D(
-        3, 1, padding="same", activation=None, name="under_promo_conv2")(up_conv1)
-
-    # reshape to (B,64,3) then flatten to (B,192)
-    up_flat_64_3 = layers.Reshape((64, 3), name="promo_64_3")(up_conv2)  # (B,64,3)
-    up_flat = layers.Reshape((64 * 3,), name="promo_flat_raw")(up_flat_64_3)  # (B,192)
-
-    # add a small learned bias/offset per promo slot: create a transform and add it
-    # using Dense with zero kernel init so it's effectively a bias addition at start
-    promo_bias = layers.Dense(64 * 3, use_bias=True, name="promo_bias_dense")(up_flat)
-    promo_logits = layers.Add(name="promo_with_bias")([up_flat, promo_bias])  # (B,192)
-
-    # concat base 4096 + promo 192 -> final logits (B,4288)
-    policy_logits = layers.Concatenate(
-        name="policy_logits")([base_flat, promo_logits])
-
-    # value head
-    v_pool = layers.GlobalAveragePooling1D(name="v_gap")(feat)
-    v = layers.Dense(FL // 2, activation="relu", name="v_fc1")(v_pool)
-    v = layers.Dense(FL // 4, activation="relu", name="v_fc2")(v)
-    value_out = layers.Dense(1, activation="tanh", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-    
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
-
-
-def res_block_layernorm(x, channels, leak=0.01, name=None):
-    """
-    Residual block with Conv2D -> LayerNorm -> activation -> Conv2D ->
-    LayerNorm -> add. This avoids BatchNorm and is stable for small
-    batch sizes.
-    """
-    nm = "" if name is None else name + "_"
-    conv1 = layers.Conv2D(
-        channels, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name=nm + "conv1"
-    )(x)
-
-    ln1 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln1")(conv1)
-    act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(ln1)
-
-    conv2 = layers.Conv2D(
-        channels, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name=nm + "conv2"
-    )(act1)
-
-    ln2 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln2")(conv2)
-
-    out = layers.Add(name=nm + "add")([x, ln2])
-    out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
-    return out
-
-
-def build_conv_flat_64x67(
-    d_model_embed=128,
-    vocab_size=21,
-    filters=256,
-    n_blocks=9,
-    name="conv_flat_64x67",
-):
-    """
-    Conv-heavy model that uses LayerNormalization in the trunk rather
-    than BatchNormalization. This is better for small or variable batch
-    sizes commonly seen in selfplay.
-    """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
-
-    de, fl, vs = d_model_embed, filters, vocab_size
-
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    token_emb = layers.Embedding(input_dim=vs, output_dim=de, name="token_emb")(enc_in)
-    x = layers.Reshape((8, 8, de), name="to_2d")(token_emb)
-
-    x = layers.Conv2D(
-        fl, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name="conv_init"
-    )(x)
-
-    # drop BatchNorm here, rely on LayerNorm inside blocks
-    x = layers.LeakyReLU(alpha=0.01, name="lrelu_init")(x)
-
-    for i in range(n_blocks):
-        x = res_block_layernorm(x, fl, leak=0.01, name=f"res{i}")
-
-    x = layers.Conv2D(fl, 1, padding="same", use_bias=False, name="conv_mix_1x1")(x)
-    x = layers.LayerNormalization(epsilon=1e-5, name="ln_mix")(x)
-    x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
-
-    policy_map = layers.Conv2D(
-        67, 1, padding="same", activation=None, name="policy_conv_67"
-    )(x)
-
-    feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(feat_64_67)
-
-    v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
-    v = layers.Dense(fl // 2, activation="relu", name="v_fc1")(v_pool)
-    v = layers.Dense(fl // 4, activation="relu", name="v_fc2")(v)
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
-
-
-def warm_conv_infer(graph, max_bs):
-    for _ in range(100):
-        rep_mask = (np.random.rand(max_bs, 4288) < 0.02).astype(np.int32)
-        rep_enc = (np.random.rand(max_bs, 64) < 0.32).astype(np.int32)
-        _ = graph(tf.convert_to_tensor(rep_enc), tf.convert_to_tensor(rep_mask))
-
-
-def make_conv_infer(model, max_bs=1024, min_p=0.001, max_p=0.35, vscale=0.9):
-    """
-    Returns fwd((enc_np, legal_np)) -> (probs_np, val_np).
-    enc_np: int32 [B,64], legal_np: int32 [B,4288].
-    min_p, max_p are baked into the closure.
-    vscale scales the model value output (default 0.9 -> range ~[-0.9,0.9])
-    """
-
-    BIG_NEG = tf.constant(-1e9, dtype=tf.float32)
-    EPS = tf.constant(1e-12, dtype=tf.float32)
-
-    min_p_c = tf.constant(float(min_p), dtype=tf.float32)
-    max_p_c = tf.constant(float(max_p), dtype=tf.float32)
-    value_scale_c = tf.constant(float(vscale), dtype=tf.float32)
-
-    @tf.function(input_signature=[
-        tf.TensorSpec([None, 64], tf.int32),
-        tf.TensorSpec([None, 4288], tf.int32),
-    ], experimental_compile=True)
-    def graph(enc, legal):
-        # model returns (policy_logits, value)
-        logits, value = model(enc, training=False)
-        logits = tf.reshape(logits, [tf.shape(logits)[0], -1])  # (B,4288)
-
-        mask = tf.cast(tf.reshape(legal, [tf.shape(logits)[0], -1]), tf.float32)
-        logits32 = tf.cast(logits, tf.float32)
-
-        # mask illegal moves with a large negative in float32
-        masked_logits32 = tf.where(mask > 0.5, logits32, BIG_NEG)
-
-        # softmax in float32 (temperature removed)
-        row_max = tf.reduce_max(masked_logits32, axis=1, keepdims=True)
-        exp = tf.exp(masked_logits32 - row_max) * mask
-        sumexp = tf.reduce_sum(exp, axis=1, keepdims=True)
-        has_any = sumexp > 0.0
-        probs = tf.where(has_any, exp / (sumexp + EPS), tf.zeros_like(exp))
-
-        # clipping on legal slots and renormalize (float32)
-        clipped = tf.where(mask > 0.5,
-                           tf.clip_by_value(probs, min_p_c, max_p_c),
-                           tf.zeros_like(probs))
-        s = tf.reduce_sum(clipped, axis=1, keepdims=True)
-        valid = s > EPS
-        probs_final = tf.where(
-            valid, clipped / (s + (1.0 - tf.cast(valid, tf.float32))),
-            tf.zeros_like(clipped)
-        )
-
-        # scale value to reduce range (helps find mate scores)
-        value_f = tf.cast(value, tf.float32) * value_scale_c
-        return probs_final, value_f
-
-    def base_fwd(pair):
-        if not isinstance(pair, (list, tuple)):
-            raise ValueError("pass (enc_np, legal_np) tuple")
-        enc_np, legal_np = pair
-        e_tf = tf.convert_to_tensor(enc_np, dtype=tf.int32)
-        l_tf = tf.convert_to_tensor(legal_np, dtype=tf.int32)
-        probs_tf, val_tf = graph(e_tf, l_tf)
-        return probs_tf.numpy(), val_tf.numpy()
-
-    if max_bs is None:
-        return base_fwd
-
-    def fwd(pair):
-        enc_np, legal_np = pair
-        B = int(enc_np.shape[0])
-        if B <= max_bs:
-            return base_fwd((enc_np, legal_np))
-        parts = None
-        i = 0
-        while i < B:
-            j = min(i + max_bs, B)
-            p_probs, p_val = base_fwd((enc_np[i:j], legal_np[i:j]))
-            if parts is None:
-                parts = [p_probs, p_val]
+            if interleave_n:
+                ff_dims = [768] + [1024] * (interleave_n - 2) + [768] \
+                    if interleave_n >= 2 else [768] * interleave_n
+                self.interleave_tx   = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
+                self.interleave_conv = nn.ModuleList(
+                    [ConvBlock(prenorm=True) for _ in range(2 * interleave_n)])
             else:
-                parts[0] = np.concatenate([parts[0], p_probs], axis=0)
-                parts[1] = np.concatenate([parts[1], p_val], axis=0)
-            i = j
-        return parts
-    return fwd
+                tx_blocks = cfg.get("tx_blocks", 4)
+                ff_dims   = [768] + [1024] * (tx_blocks - 2) + [768]
+                self.blocks = nn.ModuleList([TxBlock(ffd) for ffd in ff_dims])
+            self.trunk_ln = nn.LayerNorm(D)
+
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=False)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, D * 3 // 2, bias=False)
+            self.gate_w_up   = nn.Linear(D, D * 3 // 2, bias=False)
+            self.gate_w_down = nn.Linear(D * 3 // 2, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            if lc0_input:
+                x = self.stem_ln(self.stem(x_in))                             # [B, CF, 8, 8]
+            elif xc0h_input:
+                x = xc0h_stem_forward(self, x_in, CF, XC0H_K)                 # [B, CF, 8, 8]
+            else:
+                x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+            seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=x_in.device)).unsqueeze(0).expand(B, -1, -1)
+            x = (seq + pos) if add_pos else torch.cat([seq, pos], dim=-1)          # [B, 64, D]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)    # [B, 72, D]
+            if interleave_n:
+                for i, tx in enumerate(self.interleave_tx):
+                    x = tx(x)
+                    board, glob = x[:, :SEQ_LEN], x[:, SEQ_LEN:]
+                    board = board.reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+                    board = self.interleave_conv[2 * i](board)
+                    board = self.interleave_conv[2 * i + 1](board)
+                    board = board.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF)
+                    x = torch.cat([board, glob], dim=1)
+            else:
+                for blk in self.blocks:
+                    x = blk(x)
+            x = self.trunk_ln(x)                                                # [B, 72, D]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))               # [B, 3]
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)  # [B, 68, D]
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)  # [B, 68, D]
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)                     # [B, 64, PDH]
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, PDH]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)          # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                                   # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                             # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                               # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
 
 
-def squeeze_excitation(x, channels, reduction=4, name=None):
-    nm = "" if name is None else name + "_"
-    se = layers.GlobalAveragePooling2D(name=nm + "gap")(x)
-    se = layers.Dense(channels // reduction, activation="relu",
-                      kernel_initializer=HE,
-                      name=nm + "fc1")(se)
-                      
-    # make last dense start as near-identity
-    # zero weights, bias ~3 -> sigmoid(3)=0.95
-    se = layers.Dense(channels, activation="sigmoid",
-                      kernel_initializer=Zeros(),
-                      bias_initializer=Constant(3.0),
-                      name=nm + "fc2")(se)
+def build_pt_precond_signed(cfg: dict, log_params: bool = False):
+    """Precond skeleton with a swappable attention sublayer.
 
-    se = layers.Reshape((1, 1, channels), name=nm + "reshape")(se)
-    return layers.Multiply(name=nm + "scale")([x, se])
+    pre_blocks x preconditioner (globalizer or conv) at CF -> LN -> concat
+    learned pos(pos_dim) -> D = CF + pos_dim -> append 8 global accumulators
+    (72 tokens) -> tx_blocks x TxBlock -> trunk_ln
+    -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
 
+    cfg["attn"] picks the sublayer, everything else held constant:
+      "signed" (default)  one full-rank bilinear form over all 72 tokens,
+                          tanh-bounded and L1-capped, no softmax and no heads
+      "mha"               plain nn.MultiheadAttention at cfg["num_heads"],
+                          the same sublayer 18m-precond-smartgate-xc0h-6c4t
+                          runs, so the two differ only in the attention
 
-def res_block_layernormSE(x, channels, reduction, leak=0.01, name=None):
+    Deliberately a separate builder rather than another flag on
+    build_pt_precond_smartgate: that one carries the in-production
+    18m-precond-smartgate-xc0h-6c4t arch and is already overloaded with
+    lc0/xc0h/interleave branches. The name still says signed because renaming
+    would break every checkpoint that keys off PT_BUILDERS.
+
+    Differences from build_pt_precond_smartgate, all intentional and shared by
+    both attention modes:
+      - RMSNorm throughout, so the heads that read trunk_ln carry biases
+      - FFN is flat ff_dim wide instead of the 768/1024/1024/768 taper
+      - pos concat width is free (pos_dim), not locked to CF
+      - preconditioner can be globalizer blocks (cfg["pre_block"])
     """
-    Residual block reworked to use LayerNorm and a small SE module.
-    Keeps the same public name for easy replacement.
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    CF        = cfg["conv_filters"]
+    POS       = cfg.get("pos_dim", CF)
+    D         = CF + POS
+    dr        = cfg["dropout"]
+    pb        = cfg["pre_blocks"]
+    tx_blocks = cfg.get("tx_blocks", 6)
+    ff_dim    = cfg.get("ff_dim", 1024)
+    pre_block = cfg.get("pre_block", "globalizer")
+    attn      = cfg.get("attn", "signed")
+    nh        = cfg.get("num_heads", 8)
+    PDH       = 256
+    XC0H_K    = cfg.get("xc0h_K")
+    xc0h_input = XC0H_K is not None
+    signed_scale = math.sqrt(D)
+
+    if attn not in ("signed", "mha"):
+        raise ValueError(f"attn must be 'signed' or 'mha', got {attn!r}")
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            xf = x.float()
+            n  = xf / xf.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+            return (n * self.scale.float()).to(x.dtype)
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            # c1 reads straight off RMS (no re-centering, so needs its own
+            # bias); c2 reads a leaky_relu, no bias needed
+            self.ln = make_rms2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=True)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class SignedTxBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1 = RMSNorm(D)
+            # no separate key projection: W_q W_k^T collapses to one matrix,
+            # and at a single head with head_dim == D the collapsed form is
+            # both cheaper and higher rank than the factored one
+            self.interaction = nn.Linear(D, D, bias=True)
+            self.value       = nn.Linear(D, D, bias=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = RMSNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, D)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            q = self.interaction(n)
+            v = F.silu(self.value(n))
+            w = torch.tanh(torch.matmul(q, n.transpose(-1, -2)) / signed_scale)
+            w = w / w.abs().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            x = x + self.drop(torch.matmul(w, v))
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class MhaTxBlock(nn.Module):
+        """Same skeleton as SignedTxBlock with softmax MHA in the sublayer."""
+        def __init__(self):
+            super().__init__()
+            self.ln1  = RMSNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0,
+                                              batch_first=True, bias=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = RMSNorm(D)
+            self.ff1  = nn.Linear(D, ff_dim, bias=True)
+            self.ff2  = nn.Linear(ff_dim, D, bias=False)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    tx_block_cls = MhaTxBlock if attn == "mha" else SignedTxBlock
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if xc0h_input:
+                attach_xc0h_stem(self, CF, XC0H_K, norm_type="rms")
+            else:
+                self.emb = nn.Embedding(VOCAB_SIZE, CF)
+
+            if pre_block == "globalizer":
+                self.pre = nn.ModuleList(
+                    [make_globalizer_block(CF) for _ in range(pb)])
+            else:
+                self.pre = nn.ModuleList(
+                    [ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+
+            self.pos     = nn.Embedding(SEQ_LEN, POS)
+            self.conv_ln = RMSNorm(CF)
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+            self.blocks   = nn.ModuleList([tx_block_cls() for _ in range(tx_blocks)])
+            self.trunk_ln = RMSNorm(D)
+
+            # wdl_w1 / gate_w_gate / gate_w_up read trunk_ln directly, so they
+            # take a bias now that it is RMS instead of LayerNorm. wdl_w2 and
+            # gate_w_down sit after an activation, not a norm, so they keep the
+            # prod head's bias=False.
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=True)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, D * 3 // 2, bias=True)
+            self.gate_w_up   = nn.Linear(D, D * 3 // 2, bias=True)
+            self.gate_w_down = nn.Linear(D * 3 // 2, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH, bias=True)
+            self.from_ln   = RMSNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.from_out  = nn.Linear(PDH, PDH, bias=False)
+
+            self.to_proj   = nn.Linear(D, PDH, bias=True)
+            self.to_ln     = RMSNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.to_out    = nn.Linear(PDH, PDH, bias=False)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            if xc0h_input:
+                x = xc0h_stem_forward(self, x_in, CF, XC0H_K)                 # [B, CF, 8, 8]
+            else:
+                x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+            seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=x_in.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([seq, pos], dim=-1)                                  # [B, 64, D]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)    # [B, 72, D]
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)                                               # [B, 72, D]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))                # [B, 3]
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                        # [B, 1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)                     # [B, 64, PDH]
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, PDH]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                              # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                        # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                          # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+                        ).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_precond_mixer(cfg: dict, log_params: bool = False):
+    """MLP-Mixer preconditioner feeding the production MHA trunk.
+
+    xc0h stem -> mixer_blocks x MLP-Mixer block at CF (token-mix over the 64
+    squares, then channel-mix over CF, expansion 4x both by default) -> RMS
+    -> concat learned pos(pos_dim) -> D = CF + pos_dim -> append 8 global
+    accumulators (72 tokens) -> tx_blocks x MHA TxBlock at D with the same
+    768/1024/.../1024/768 FFN taper 18m-precond-smartgate-xc0h-6c4t uses ->
+    trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
+    Same accumulator layout and head formulas as 6c4t, RMSNorm throughout
+    instead of LayerNorm -- so the tx-block half is matched apples-to-apples
+    and only the preconditioner stage (mixer vs conv) differs.
+
+    The token-mixing sublayer is a fixed learned N=64 map, not attention --
+    it can encode static board geometry (files/ranks/diagonals) for free but,
+    unlike the transformer blocks that follow it, cannot reweight itself
+    based on what is actually on the board. That's deliberate: cheap global
+    mixing up front, real content-dependent attention only where it earns
+    its keep.
+
+    Bias convention: every linear whose input comes directly off an RMSNorm
+    (nothing nonlinear in between) carries a bias, since RMS rescales
+    without re-centering. Everything else (post-GELU/SiLU/residual) does
+    not.
     """
-    nm = "" if name is None else name + "_"
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
 
-    conv1 = layers.Conv2D(
-        channels, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name=nm + "conv1"
-    )(x)
+    CF        = cfg["conv_filters"]           # 256
+    POS       = cfg.get("pos_dim", 256)
+    D         = CF + POS                      # 512
+    dr        = cfg["dropout"]
+    mixer_blocks = cfg.get("mixer_blocks", 6)
+    tx_blocks    = cfg.get("tx_blocks", 4)
+    tok_mult  = cfg.get("tok_expansion", 4)
+    chan_mult = cfg.get("chan_expansion", 4)
+    nh        = cfg.get("num_heads", 8)
+    PDH       = 256
+    XC0H_K    = cfg.get("xc0h_K")
+    xc0h_input = XC0H_K is not None
 
-    ln1 = layers.LayerNormalization(axis=-1, name=nm + "ln1")(conv1)
-    act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(ln1)
+    tok_hidden  = SEQ_LEN * tok_mult          # 64 * 4 = 256
+    chan_hidden = CF * chan_mult              # 256 * 4 = 1024
 
-    conv2 = layers.Conv2D(
-        channels, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name=nm + "conv2"
-    )(act1)
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
-    ln2 = layers.LayerNormalization(axis=-1, name=nm + "ln2")(conv2)
+    class MixerBlock(nn.Module):
+        """One shared RMSNorm feeding both sublayers in parallel -- token-mix
+        and channel-mix each read the same normalized input and add their
+        result back onto the residual independently, rather than the usual
+        sequential pre-norm-each-sublayer arrangement. Halves the norm count
+        per block; same shape family as GPT-J/PaLM's parallel attn+FFN block.
+        """
+        def __init__(self):
+            super().__init__()
+            self.norm      = make_rms1d(CF)
+            self.tok_up    = nn.Linear(SEQ_LEN, tok_hidden, bias=True)
+            self.tok_down  = nn.Linear(tok_hidden, SEQ_LEN, bias=False)
+            self.chan_up   = nn.Linear(CF, chan_hidden, bias=True)
+            self.chan_down = nn.Linear(chan_hidden, CF, bias=False)
 
-    if reduction > 0:
-        se_out = squeeze_excitation(ln2, channels, reduction=reduction,
-                                    name=nm + "se")
-        out = layers.Add(name=nm + "add")([x, se_out])
-    else:
-        out = ln2
+        def forward(self, x):
+            n = self.norm(x)                           # [B, 64, CF]
 
-    out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
-    return out
+            t = n.transpose(1, 2)                      # [B, CF, 64]
+            t = self.tok_down(F.gelu(self.tok_up(t)))
+            t = t.transpose(1, 2)                      # [B, 64, CF]
+
+            c = self.chan_down(F.gelu(self.chan_up(n)))
+
+            return x + t + c
+
+    class MhaTxBlock(nn.Module):
+        def __init__(self, ff_dim):
+            super().__init__()
+            self.ln1  = make_rms1d(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0,
+                                              batch_first=True, bias=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = make_rms1d(D)
+            self.ff1  = nn.Linear(D, ff_dim, bias=True)
+            self.ff2  = nn.Linear(ff_dim, D, bias=False)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            n2 = self.ln2(x)
+            return x + self.ff2(F.gelu(self.ff1(n2)))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if xc0h_input:
+                attach_xc0h_stem(self, CF, XC0H_K, norm_type="rms")
+            else:
+                self.emb = nn.Embedding(VOCAB_SIZE, CF)
+
+            self.mixer = nn.ModuleList(
+                [MixerBlock() for _ in range(mixer_blocks)])
+            self.mixer_out_norm = make_rms1d(CF)
+            self.pos = nn.Embedding(SEQ_LEN, POS)
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D))
+            ff_dims = [768] + [1024] * (tx_blocks - 2) + [768]
+            self.blocks   = nn.ModuleList([MhaTxBlock(ffd) for ffd in ff_dims])
+            self.trunk_ln = make_rms1d(D)
+
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=True)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, D * 3 // 2, bias=True)
+            self.gate_w_up   = nn.Linear(D, D * 3 // 2, bias=True)
+            self.gate_w_down = nn.Linear(D * 3 // 2, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = make_rms1d(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH, bias=True)
+            self.from_ln   = make_rms1d(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.from_out  = nn.Linear(PDH, PDH, bias=False)
+
+            self.to_proj   = nn.Linear(D, PDH, bias=True)
+            self.to_ln     = make_rms1d(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.to_out    = nn.Linear(PDH, PDH, bias=False)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            if xc0h_input:
+                x = xc0h_stem_forward(self, x_in, CF, XC0H_K)          # [B,CF,8,8]
+            else:
+                x = self.emb(x_in).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            x = x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF)          # [B,64,CF]
+
+            for blk in self.mixer:
+                x = blk(x)
+
+            pos = self.pos(torch.arange(SEQ_LEN, device=x_in.device))
+            pos = pos.unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([self.mixer_out_norm(x), pos], dim=-1)       # [B,64,D]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)  # [B,72,D]
+
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)                                       # [B,72,D]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))        # [B,3]
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                 # [B,1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)                     # [B, 64, PDH]
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, PDH]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                              # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                        # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                          # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+                        ).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots.float(), promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
 
 
-def build_conv_flat_64x67SE(
-    name,
-    d_model_embed=128,
-    vocab_size=21,
-    filters=256,
-    n_blocks=9,
-    reduction=16
-):
+def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
+    """Precond skeleton that never widens: D stays at conv_filters the whole
+    way through, no pos-concat step.
+
+    xc0h stem -> pre_blocks x conv preconditioner block at D -> flatten to
+    tokens -> x = x + pos_scale * pos(D) (additive, no RMS on this step --
+    the single learnable pos_scale takes over norm's job of setting relative
+    magnitude, so the raw preconditioner output goes in unnormalized) ->
+    append 8 global accumulators (72 tokens) -> tx_blocks x MHA TxBlock at D
+    -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1 concat acc 6) + from/to MHA
+    policy(acc 2-7). RMSNorm throughout.
+
+    SmartGate reads a concatenation of its own accumulator (slot 1) and one
+    of the two accumulators shared between from/to (slot 6), so its internal
+    width is 2*D regardless of how narrow the trunk itself runs -- the same
+    512-wide gate 18m-precond-smartgate-xc0h-6c4t uses, fed by two narrow
+    reads instead of one wide one.
+
+    Bias convention: every linear whose input comes directly off an RMSNorm
+    (nothing nonlinear in between) carries a bias; everything else does not.
     """
-    Conv-heavy model using LayerNorm in the trunk and SE inside each block.
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    D         = cfg["conv_filters"]           # 256, no widening
+    dr        = cfg["dropout"]
+    pb        = cfg["pre_blocks"]
+    tx_blocks = cfg.get("tx_blocks", 6)
+    ff_dim    = cfg.get("ff_dim", 1024)
+    nh        = cfg.get("num_heads", 8)
+    PDH       = 256
+    XC0H_K    = cfg.get("xc0h_K")
+    xc0h_input = XC0H_K is not None
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_rms2d(D) if prenorm else None
+            self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
+
+    class MhaTxBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1  = make_rms1d(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0,
+                                              batch_first=True, bias=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = make_rms1d(D)
+            self.ff1  = nn.Linear(D, ff_dim, bias=True)
+            self.ff2  = nn.Linear(ff_dim, D, bias=False)
+
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if xc0h_input:
+                attach_xc0h_stem(self, D, XC0H_K, norm_type="rms")
+            else:
+                self.emb = nn.Embedding(VOCAB_SIZE, D)
+
+            self.pre = nn.ModuleList(
+                [ConvBlock(prenorm=(i > 0)) for i in range(pb)])
+
+            self.pos       = nn.Embedding(SEQ_LEN, D)
+            self.pos_scale = nn.Parameter(torch.tensor(1.0))
+
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+            self.blocks   = nn.ModuleList([MhaTxBlock() for _ in range(tx_blocks)])
+            self.trunk_ln = make_rms1d(D)
+
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=True)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            # SmartGate reads acc(1) concat acc(6), so it works at 2*D
+            # regardless of how narrow the trunk itself runs
+            GD = D * 2
+            self.gate_w_gate = nn.Linear(GD, GD * 3 // 2, bias=True)
+            self.gate_w_up   = nn.Linear(GD, GD * 3 // 2, bias=True)
+            self.gate_w_down = nn.Linear(GD * 3 // 2, GD, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = make_rms1d(GD)
+            self.gate_out  = nn.Linear(GD, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH, bias=True)
+            self.from_ln   = make_rms1d(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.from_out  = nn.Linear(PDH, PDH, bias=False)
+
+            self.to_proj   = nn.Linear(D, PDH, bias=True)
+            self.to_ln     = make_rms1d(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                   batch_first=True, bias=True)
+            self.to_out    = nn.Linear(PDH, PDH, bias=False)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            if xc0h_input:
+                x = xc0h_stem_forward(self, x_in, D, XC0H_K)              # [B, D, 8, 8]
+            else:
+                x = self.emb(x_in).reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+
+            board = x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)          # [B, 64, D], unnormed
+            pos   = self.pos(torch.arange(SEQ_LEN, device=x_in.device))
+            pos   = pos.unsqueeze(0).expand(B, -1, -1)
+            x = board + self.pos_scale * pos                              # [B, 64, D]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)  # [B, 72, D]
+
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)                                           # [B, 72, D]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))            # [B, 3]
+
+            gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)       # [B, 2D]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                     # [B, 1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
+
+            # from_proj/to_proj and from_out/to_out are residual-wrapped so a
+            # gradient path survives regardless of what those weights do --
+            # relies on D == PDH (true for every config using this builder
+            # today); would need a projection on the skip if that ever
+            # stops holding.
+            f_proj = from_set + F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            f_base = f_proj[:, :64, :] + fh
+            fv     = f_base + self.from_out(f_base)                        # [B, 64, PDH]
+
+            t_proj = to_set + F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            t_base = t_proj[:, :64, :] + th
+            tv     = t_base + self.to_out(t_base)                          # [B, 64, PDH]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)  # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                          # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                    # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                      # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+                        ).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots.float(), promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_conv_shallow_mha(cfg: dict, log_params: bool = False):
+    """2x Conv(128) -> LN(x) -> concat(x, x, pos(128)) -> 384-d
+    -> append 8 global accumulators -> 8x TxBlock(d=384, ff_dim=1024)
+    -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7) at 384-d.
+    SmartGate intermediate dim stays at 768 (same as 16m-precond-smartgate).
     """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
 
-    de, fl, vs = d_model_embed, filters, vocab_size
+    CF     = cfg["conv_filters"]   # 128
+    D      = CF * 3                # 384  (LN(x) + LN(x) + pos(128))
+    nh     = cfg["num_heads"]      # 8
+    dr     = cfg["dropout"]
+    mb     = cfg["mha_blocks"]     # 8
+    PDH    = D                     # 384, no downstep in policy heads
+    GATE_H = 768
 
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    token_emb = layers.Embedding(input_dim=vs, output_dim=de, name="token_emb")(enc_in)
-    x = layers.Reshape((8, 8, de), name="to_2d")(token_emb)
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
-    x = layers.Conv2D(
-        fl, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name="conv_init"
-    )(x)
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
 
-    x = layers.LayerNormalization(axis=-1, name="ln_init")(x)
-    x = layers.LeakyReLU(alpha=0.01, name="lrelu_init")(x)
+    class ConvBlock(nn.Module):
+        def __init__(self, prenorm=True):
+            super().__init__()
+            self.ln = make_ln2d(CF) if prenorm else None
+            self.c1 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+            self.c2 = nn.Conv2d(CF, CF, 3, padding=1, bias=False)
+        def forward(self, x):
+            h = self.ln(x) if self.ln is not None else x
+            return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
 
-    for i in range(n_blocks):
-        x = res_block_layernormSE(x, fl, reduction=reduction, leak=0.01, name=f"res{i}")
+    class TxBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(D)
+            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(D)
+            self.ff1  = nn.Linear(D, 1024)
+            self.ff2  = nn.Linear(1024, D)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
 
-    x = layers.Conv2D(fl, 1, padding="same", use_bias=False,
-                      name="conv_mix_1x1")(x)
-    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
-    x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb     = nn.Embedding(VOCAB_SIZE, CF)
+            self.pre     = nn.ModuleList([ConvBlock(prenorm=(i > 0)) for i in range(2)])
+            self.pos     = nn.Embedding(SEQ_LEN, CF)
+            self.conv_ln = nn.LayerNorm(CF)
 
-    policy_map = layers.Conv2D(
-        67, 1, padding="same", activation=None, name="policy_conv_67"
-    )(x)
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
 
-    feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(
-        feat_64_67
+            self.blocks   = nn.ModuleList([TxBlock() for _ in range(mb)])
+            self.trunk_ln = nn.LayerNorm(D)
+
+            self.wdl_w1 = nn.Linear(D, D // 2, bias=False)
+            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+
+            self.gate_w_gate = nn.Linear(D, GATE_H, bias=False)
+            self.gate_w_up   = nn.Linear(D, GATE_H, bias=False)
+            self.gate_w_down = nn.Linear(GATE_H, D, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D)
+            self.gate_out  = nn.Linear(D, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
+
+            self.to_proj   = nn.Linear(D, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
+
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
+
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            x = self.emb(tokens).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.pre:
+                x = blk(x)
+            seq = self.conv_ln(x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, CF))
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([seq, seq, pos], dim=-1)                             # [B, 64, 384]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)   # [B, 72, 384]
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk_ln(x)                                               # [B, 72, 384]
+
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))               # [B, 3]
+
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))                         # [B, 1858]
+
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)  # [B, 68, 384]
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)  # [B, 68, 384]
+
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)                     # [B, 64, 256]
+
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)                       # [B, 64, 256]
+
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)      # [B, 64, 64]
+            dots      = dots_full.reshape(B, 64 * 64)
+
+            dots_sub = dots_full[:, 48:56, 56:64]                              # [B, 8, 8]
+            pf       = self.promo_from(fv[:, 48:56, :])                        # [B, 8, 3]
+            pt       = self.promo_to(tv[:, 56:64, :])                          # [B, 8, 3]
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+XC0H_VOCAB = 15   # 0=empty, 1-6 us P/N/B/R/Q/K, 7-12 them P/N/B/R/Q/K, 13=EP, 14=PAD
+XC0H_DEMB  = 18
+
+
+def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
+    """Attach the xc0h history-token stem onto `m`.
+
+    Consumes the flat (B, K*64+K+3) encoding from board.history_tokens(K):
+    K frames of 64 slim tokens + K repetition flags + castling/stm/hmc. Assigns
+    with the same flat xc0h_* attribute names the inline version used, so state
+    dicts stay key-compatible. Pair with xc0h_stem_forward.
+
+    norm_type is "layernorm" or "rms". It defaults to layernorm because the
+    in-production precond models were trained with one there -- switching them
+    would change xc0h_proj_ln's state dict keys (weight+bias -> scale) and
+    break every existing checkpoint. Everything else passes "rms".
+    """
+    import torch
+    import torch.nn as nn
+
+    if norm_type not in ("layernorm", "rms"):
+        raise ValueError(f"norm_type must be 'layernorm' or 'rms', got {norm_type!r}")
+
+    in_ch = K * XC0H_DEMB + K + 3      # frames + rep + castle + stm + hmc
+    m.xc0h_tok_emb = nn.Embedding(XC0H_VOCAB, XC0H_DEMB)
+    with torch.no_grad():
+        d = XC0H_DEMB
+        empty    = torch.randn(d); knight   = torch.randn(d)
+        pawn     = torch.randn(d); diagonal = torch.randn(d)
+        us       = torch.randn(d); orthogon = torch.randn(d)
+        them     = torch.randn(d); king_prim= torch.randn(d)
+        pad      = torch.randn(d)
+        rows = [
+            empty,                          # 0  empty
+            us + pawn,                      # 1  us_P
+            us + knight,                    # 2  us_N
+            us + diagonal,                  # 3  us_B
+            us + orthogon,                  # 4  us_R
+            us + diagonal + orthogon,       # 5  us_Q
+            us + king_prim,                 # 6  us_K
+            them + pawn,                    # 7  them_P
+            them + knight,                  # 8  them_N
+            them + diagonal,                # 9  them_B
+            them + orthogon,                # 10 them_R
+            them + diagonal + orthogon,     # 11 them_Q
+            them + king_prim,               # 12 them_K
+            empty + them,                   # 13 EP
+            pad,                            # 14 PAD
+        ]
+        E = torch.stack(rows)
+        E = E / (E.norm(dim=1, keepdim=True) + 1e-6)
+        E = E + torch.randn_like(E) * 0.02
+        m.xc0h_tok_emb.weight.copy_(E)
+    m.xc0h_cast_emb = nn.Embedding(16, 64)
+    # project to CF-4; 4 spatial planes (ones, checkerboard, rank, file)
+    # appended after the norm so LN can't destroy their constant/gradient
+    # values. Each gets its own learnable scale so convs can attenuate any
+    # plane toward zero if the geometry isn't useful.
+    m.xc0h_proj    = nn.Linear(in_ch, CF - 4)
+    m.xc0h_proj_ln = (make_rms1d(CF - 4) if norm_type == "rms"
+                      else nn.LayerNorm(CF - 4))
+
+    # free learnable scales (init 1.0): 3 for rep/stm/hmc, 4 for spatial planes
+    m.xc0h_rep_scale     = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_stm_scale     = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_hmc_scale     = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_ones_scale    = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_checker_scale = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_rank_scale    = nn.Parameter(torch.tensor(1.0))
+    m.xc0h_file_scale    = nn.Parameter(torch.tensor(1.0))
+
+    sqs = torch.arange(64).float()
+    ranks_sq = sqs // 8
+    files_sq = sqs % 8
+    m.register_buffer("xc0h_spatial", torch.stack([
+        torch.ones(64),
+        ((ranks_sq + files_sq) % 2) * 2 - 1,
+        ranks_sq / 7.0 * 2 - 1,
+        files_sq / 7.0 * 2 - 1,
+    ], dim=-1).unsqueeze(0))                                        # [1, 64, 4]
+
+
+def xc0h_stem_forward(m, x_in, CF, K):
+    """Run the stem attached by attach_xc0h_stem. Returns (B, CF, 8, 8)."""
+    import torch
+
+    B = x_in.shape[0]
+    # model's running dtype (fp16 under half() inference, fp32 in training) --
+    # rep/stm/hmc are cast here and run natively in that dtype throughout,
+    # same as everywhere else in this model past the embed.
+    dtype = m.xc0h_tok_emb.weight.dtype
+    tok  = x_in[:, :K * 64].reshape(B, K, 64).long()
+    rep  = x_in[:, K * 64:K * 64 + K].to(dtype)
+    cast = x_in[:, K * 64 + K].long()
+    stm  = x_in[:, K * 64 + K + 1].to(dtype)
+    hmc  = x_in[:, K * 64 + K + 2].to(dtype)
+
+    tok_emb = m.xc0h_tok_emb(tok)                                       # [B,K,64,d]
+    tok_emb = tok_emb.permute(0, 2, 1, 3).reshape(B, 64, K * XC0H_DEMB)  # [B,64,K*d]
+
+    # rep/stm/hmc are raw 0/1 (or unbounded for hmc) -- rescale to roughly
+    # the same [-1,1] order of magnitude as the (~unit-variance) embeddings
+    # so none of them get washed out or dominate at the projection below.
+    # Each also gets its own free learnable scale (init 1.0).
+    rep_planes = (rep * 2.0 - 1.0).unsqueeze(1).expand(B, 64, K) * m.xc0h_rep_scale
+    cast_plane = m.xc0h_cast_emb(cast).unsqueeze(-1)                    # [B,64,1]
+    stm_plane  = (stm * 2.0 - 1.0).view(B, 1, 1).expand(B, 64, 1) * m.xc0h_stm_scale
+    hmc_plane  = (hmc / 99.0 * 2.0 - 1.0).view(B, 1, 1).expand(B, 64, 1) * m.xc0h_hmc_scale
+
+    fused = torch.cat(
+        [tok_emb, rep_planes, cast_plane, stm_plane, hmc_plane], dim=-1)  # [B,64,in_ch]
+    projected = m.xc0h_proj_ln(m.xc0h_proj(fused))                      # [B, 64, CF-4]
+    scales  = torch.stack([m.xc0h_ones_scale, m.xc0h_checker_scale,
+                           m.xc0h_rank_scale, m.xc0h_file_scale])
+    spatial = m.xc0h_spatial.to(projected.dtype).expand(B, -1, -1) * scales  # [B, 64, 4]
+    x = torch.cat([projected, spatial], dim=-1)                          # [B, 64, CF]
+    return x.reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()       # [B, CF, 8, 8]
+
+
+def attach_value_branch(m, D, block_fn, vd=256, heads=8, ff_mult=2):
+    """Dedicated value branch, tapped off the trunk before its last blocks.
+
+    Gets one block of the trunk's own type (block_fn), so a signed-attn model
+    gets a signed-attn value block and a globalizer model gets a globalizer
+    one -- the branch does its own spatial reasoning on features the remaining
+    trunk blocks never see.
+
+    The readout is an accumulator token: a learned vector appended to the 64
+    squares, run through one attention block so it can gather from them and
+    they can react to it, then pulled back out and used as the query for a
+    second cross-attention over the 64 squares alone. That second attention
+    returns a weighted sum of square values only -- the query contributes
+    nothing but routing -- so its output is added back onto the accumulator.
+    Without that residual everything the accumulator learned in the first
+    attention is discarded, and it also gives the value loss a short path back
+    to the trunk tap.
+
+    vp_proj pins the branch to vd regardless of trunk width, but it is skipped
+    outright when the trunk is already vd wide: nothing nonlinear separates it
+    from vp_mha's in_proj, so the two collapse into one map and the layer buys
+    nothing but a kernel launch.
+
+    Every layer after an RMSNorm carries a bias; RMS rescales without
+    re-centering, so there is nothing upstream to position them against zero.
+    """
+    import torch
+    import torch.nn as nn
+
+    # no norm on the block output: vp_norm below is an RMS over the same
+    # channel axis, and the permute between them is a pure reshape
+    m.value_block = block_fn()
+
+    m.vp_norm  = make_rms1d(D)
+    m.vp_proj  = nn.Linear(D, vd, bias=True) if D != vd else None
+    m.vp_query = nn.Parameter(torch.randn(1, 1, vd))
+
+    m.vp_mha = nn.MultiheadAttention(vd, heads, dropout=0.0, batch_first=True,
+                                     bias=True)
+    m.vp_ff_up   = nn.Linear(vd, vd * ff_mult, bias=True)
+    m.vp_ff_down = nn.Linear(vd * ff_mult, vd, bias=True)
+    m.vp_norm2   = make_rms1d(vd)
+
+    m.wdl_mha = nn.MultiheadAttention(vd, heads, dropout=0.0, batch_first=True,
+                                      bias=True)
+    m.wdl_w1  = nn.Linear(vd, 64, bias=True)
+    m.wdl_out = nn.Linear(64, 3, bias=True)
+
+
+def value_branch_forward(m, x, B):
+    """Run the branch attached by attach_value_branch. x is the tapped trunk
+    activation, [B, D, 8, 8]. Returns WDL logits [B, 3]."""
+    import torch
+    import torch.nn.functional as F
+
+    h = m.value_block(x)                                     # [B, D, 8, 8]
+    board = h.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, -1)    # [B, 64, D]
+
+    bp = m.vp_norm(board)
+    if m.vp_proj is not None:
+        bp = m.vp_proj(bp)                                   # [B, 64, vd]
+    q  = m.vp_query.expand(B, -1, -1).to(bp.dtype)
+    h  = torch.cat([bp, q], dim=1)                           # [B, 65, vd]
+
+    r, _ = m.vp_mha(h, h, h, need_weights=False)
+    r = m.vp_ff_down(F.silu(m.vp_ff_up(r)))
+    h = m.vp_norm2(h + r)                                    # [B, 65, vd]
+
+    w      = h[:, SEQ_LEN:]                                  # [B, 1, vd]
+    squares = h[:, :SEQ_LEN]                                 # [B, 64, vd]
+    v, _ = m.wdl_mha(w, squares, squares, need_weights=False)
+    v = w + F.silu(v)                                        # [B, 1, vd]
+
+    v = F.silu(m.wdl_w1(v.squeeze(1)))
+    return m.wdl_out(v)
+
+
+def attach_conv_pure_heads(m, D, PDH, GATE_D, GATE_H, dr, sl_idx):
+    """Attach conv-pure's SmartGate + from-to policy heads onto `m`.
+
+    Assigns with the same flat attribute names the inline implementation used,
+    so the head half of a state dict stays key-compatible across the conv-*
+    family. Shared by conv-pure and conv-globalizer. The WDL head is not here
+    -- it lives on its own earlier tap, see attach_value_branch.
+    """
+    import math
+    import torch.nn as nn
+
+    # trunk is post-RMSNorm, which rescales without re-centering, so gate_conv
+    # carries its own bias -- it feeds a leaky_relu whose kink sits at zero and
+    # there is nothing upstream to position it against.
+    m.gate_conv = nn.Conv2d(D, 16, 3, padding=1, bias=True)       # [B,16,8,8]
+    m.gate_proj = nn.Linear(16 * SEQ_LEN, GATE_D)                 # 1024 -> 512
+    m.gate_proj_ln = make_rms1d(GATE_D)
+
+    # both read gate_proj_ln, which is RMS and does not re-center, so they take
+    # a bias. gate_w_down follows the SwiGLU product rather than a norm, so it
+    # stays unbiased and zero-init.
+    m.gate_w_gate = nn.Linear(GATE_D, GATE_H, bias=True)
+    m.gate_w_up = nn.Linear(GATE_D, GATE_H, bias=True)
+    m.gate_w_down = nn.Linear(GATE_H, GATE_D, bias=False)
+    m.gate_drop = nn.Dropout(dr)
+    nn.init.zeros_(m.gate_w_down.weight)
+    m.gate_norm = make_rms1d(GATE_D)
+    m.gate_out = nn.Linear(GATE_D, 1858, bias=True)
+    nn.init.zeros_(m.gate_out.weight)
+    nn.init.constant_(m.gate_out.bias, 4.0)
+
+    m.from_proj = nn.Linear(D, PDH)
+    m.from_ln = make_rms1d(PDH)
+    m.from_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+    m.from_out = nn.Linear(PDH, PDH)
+
+    m.to_proj = nn.Linear(D, PDH)
+    m.to_ln = make_rms1d(PDH)
+    m.to_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+    m.to_out = nn.Linear(PDH, PDH)
+
+    m.scale = 1.0 / math.sqrt(PDH)
+    m.promo_from = nn.Linear(PDH, 3, bias=False)
+    m.promo_to = nn.Linear(PDH, 3, bias=False)
+
+    m.register_buffer("sl_idx", sl_idx)
+
+
+def conv_pure_heads_forward(m, trunk, B, D):
+    """Run the heads attached by attach_conv_pure_heads.
+
+    `trunk` is post-trunk-norm [B, D, 8, 8]. Returns policy_1858 only -- WDL
+    comes off the earlier tap via value_branch_forward.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    gc = F.leaky_relu(m.gate_conv(trunk), 0.01).reshape(B, 16 * SEQ_LEN)
+    gi = m.gate_proj_ln(F.gelu(m.gate_proj(gc)))                      # [B, 512]
+    h = F.silu(m.gate_w_gate(gi)) * m.gate_w_up(gi)
+    g = gi + m.gate_drop(m.gate_w_down(h))
+    gate_raw = m.gate_out(m.gate_norm(g))                             # [B, 1858]
+
+    board = trunk.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)          # [B, 64, D]
+
+    f_proj = F.gelu(m.from_proj(board))
+    fn = m.from_ln(f_proj)
+    fh, _ = m.from_mha(fn, fn, fn, need_weights=False)
+    fv = m.from_out(f_proj + fh)
+
+    t_proj = F.gelu(m.to_proj(board))
+    tn = m.to_ln(t_proj)
+    th, _ = m.to_mha(tn, tn, tn, need_weights=False)
+    tv = m.to_out(t_proj + th)
+
+    dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(m.scale)        # [B, 64, 64]
+    dots = dots_full.reshape(B, SEQ_LEN * SEQ_LEN)
+
+    dots_sub = dots_full[:, 48:56, 56:64]
+    pf = m.promo_from(fv[:, 48:56, :])
+    pt = m.promo_to(tv[:, 56:64, :])
+    promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+             ).permute(0, 3, 2, 1).reshape(B, 192).float()
+
+    raw_4288 = torch.cat([dots.float(), promo], dim=1)
+    q_sl = raw_4288[:, m.sl_idx]
+    combined = q_sl + F.logsigmoid(gate_raw.float())
+    return combined.to(trunk.dtype)
+
+
+def build_conv_rms_backbone(cfg: dict, block_fn, n_blocks, log_params=False,
+                            name=""):
+    """Shared skeleton for the RMSNorm conv family.
+
+    stem -> n_stem standard RMS conv blocks at CF -> optional widen to
+    CF + pos_dim by concatenating a learned per-square positional embedding
+    -> n_blocks x block_fn() at D -> final RMSNorm -> the exact conv-pure heads.
+    `block_fn` is a zero-arg factory so the caller picks globalizer vs
+    signed-attn without duplicating the stem or heads.
+
+    cfg["xc0h_K"] selects the xc0h history-token stem (same one the precond
+    models use); without it the plain 64-token embedding.
+
+    cfg["pos_dim"] mirrors what the precond models do at the conv->transformer
+    boundary: normalize the conv output, then concatenate a learned position
+    channel block rather than adding it, so position survives as its own
+    subspace instead of competing with content. Omit it and the trunk stays at
+    CF the whole way (conv-pure).
+    """
+    import torch
+    import torch.nn as nn
+    import pyfastchess
+
+    CF = cfg["conv_filters"]
+    POS = cfg.get("pos_dim", 0)
+    D = CF + POS
+    dr = cfg["dropout"]
+    XC0H_K = cfg.get("xc0h_K")
+    xc0h_input = XC0H_K is not None
+    # policy head width is pinned, not tied to the trunk: from_proj/to_proj are
+    # Linear(D, PDH) and rescale either way. Matches conv-pure and the precond
+    # models, so widening the trunk is a body experiment and not a head one.
+    PDH = 256
+    GATE_D = 512
+    GATE_H = GATE_D * 3 // 2
+    n_stem = cfg.get("stem_blocks", 2)
+    # value branches off this many blocks before the end, so the tail blocks
+    # get policy gradient only and can specialize for it
+    n_tap = min(cfg.get("value_tap", 2), n_blocks)
+    n_body = n_blocks - n_tap
+    value_d = cfg.get("value_dim", 256)
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if xc0h_input:
+                attach_xc0h_stem(self, CF, XC0H_K, norm_type="rms")
+            else:
+                self.emb = nn.Embedding(VOCAB_SIZE, CF)
+            self.stem = nn.ModuleList(
+                [make_rms_conv_block(CF) for _ in range(n_stem)])
+            if POS:
+                self.conv_ln = make_rms2d(CF)
+                self.pos = nn.Embedding(SEQ_LEN, POS)
+            self.blocks = nn.ModuleList([block_fn() for _ in range(n_body)])
+            self.tail   = nn.ModuleList([block_fn() for _ in range(n_tap)])
+            attach_value_branch(self, D, block_fn, value_d)
+            self.trunk_ln = make_rms2d(D)
+            attach_conv_pure_heads(self, D, PDH, GATE_D, GATE_H, dr, sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            if xc0h_input:
+                x = xc0h_stem_forward(self, tokens, CF, XC0H_K)
+            else:
+                x = self.emb(tokens).reshape(B, 8, 8, CF).permute(0, 3, 1, 2).contiguous()
+            for blk in self.stem:
+                x = blk(x)
+            if POS:
+                p = self.pos(torch.arange(SEQ_LEN, device=tokens.device))
+                p = p.reshape(1, 8, 8, POS).permute(0, 3, 1, 2).expand(B, -1, -1, -1)
+                x = torch.cat([self.conv_ln(x), p.to(x.dtype)], dim=1)   # [B, D, 8, 8]
+            for blk in self.blocks:
+                x = blk(x)
+            wdl = value_branch_forward(self, x, B)                       # [B, 3]
+            for blk in self.tail:
+                x = blk(x)
+            trunk = self.trunk_ln(x)
+            return conv_pure_heads_forward(self, trunk, B, D), wdl
+
+    m = M()
+    if log_params:
+        n = sum(p.numel() for p in m.parameters())
+        print(f"  {name} PT params: {n:,}")
+    return m
+
+
+def build_pt_conv_globalizer(cfg: dict, log_params: bool = False):
+    """conv-globalizer: stem_blocks RMS conv blocks at conv_filters, optional
+    pos-concat widen, then N globalizer blocks at D = conv_filters + pos_dim.
+
+    Global mixing via a 16-channel 1x1 branch flattened to 1024 and pushed
+    through a SwiGLU bottleneck, then concatenated back. No attention.
+    ~2.72M params per globalizer block at D=256.
+    """
+    D  = cfg["conv_filters"] + cfg.get("pos_dim", 0)
+    nb = cfg.get("num_blocks", 8)
+    ns = cfg.get("stem_blocks", 2)
+    return build_conv_rms_backbone(
+        cfg,
+        block_fn=lambda: make_globalizer_block(D),
+        n_blocks=nb,
+        log_params=log_params,
+        name=f"conv-globalizer-{ns}c{nb}g",
     )
 
-    v_pool = layers.GlobalAveragePooling2D(name="v_gap")(x)
-    v = layers.Dense(128, activation="relu", name="v_fc1")(v_pool)
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
 
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
+def build_pt_conv_pure(cfg: dict, log_params: bool = False):
+    """N x RMS conv block (conv_filters) channels-first (NCHW) -> trunk RMSNorm,
+    N = cfg["num_blocks"] (16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
 
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
-
-
-def build_conformer_64x67(
-    name,
-    d_model_embed=128,
-    vocab_size=21,
-    conv_filters=256,
-    conv_blocks=4,
-    transformer_layers=4,
-    num_heads=8,
-    ff_dim=1024,
-    dropout=0.05
-):
+    Converted from LayerNorm to RMSNorm: one RMSNorm per block, every block
+    normalized (the first is no longer skipped), conv bias=True. Heads are the
+    shared conv-pure WDL / SmartGate / from-to policy stack, unchanged.
     """
-    Conformer-like model: conv frontend -> transformer encoder stack ->
-    64x67 policy head + value head.
+    import torch
+    import torch.nn as nn
+    import pyfastchess
+
+    D      = cfg["conv_filters"]
+    nb     = cfg["num_blocks"]
+    dr     = cfg["dropout"]
+    PDH    = 256
+    GATE_D = 512
+    GATE_H = GATE_D * 3 // 2
+    XC0H_K = cfg.get("xc0h_K")
+    xc0h_input = XC0H_K is not None
+    n_tap  = min(cfg.get("value_tap", 2), nb)
+    n_body = nb - n_tap
+    value_d = cfg.get("value_dim", 256)
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if xc0h_input:
+                attach_xc0h_stem(self, D, XC0H_K, norm_type="rms")
+            else:
+                self.emb  = nn.Embedding(VOCAB_SIZE, D)
+            self.blocks   = nn.ModuleList(
+                [make_rms_conv_block(D) for _ in range(n_body)])
+            self.tail     = nn.ModuleList(
+                [make_rms_conv_block(D) for _ in range(n_tap)])
+            attach_value_branch(self, D, lambda: make_rms_conv_block(D), value_d)
+            self.trunk_ln = make_rms2d(D)
+            attach_conv_pure_heads(self, D, PDH, GATE_D, GATE_H, dr, sl_idx)
+
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            if xc0h_input:
+                x = xc0h_stem_forward(self, tokens, D, XC0H_K)
+            else:
+                x = self.emb(tokens).reshape(B, 8, 8, D).permute(0, 3, 1, 2).contiguous()
+            for blk in self.blocks:
+                x = blk(x)
+            wdl = value_branch_forward(self, x, B)                       # [B, 3]
+            for blk in self.tail:
+                x = blk(x)
+            trunk = self.trunk_ln(x)
+            return conv_pure_heads_forward(self, trunk, B, D), wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
+def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
+    """No conv. Embedding(256) + pos(128) -> cat -> 384-d [B,64,384]
+    -> append 8 global accum tokens -> 7x TxBlock(d=384) -> Linear(384->512) expander
+    -> 1x TxBlock(d=512) -> trunk_ln(512)
+    -> same WDL/SmartGate/from-to-policy heads as 16m-precond-smartgate at 512-d.
     """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
 
-    de, vs = d_model_embed, vocab_size
+    D_SMALL = 384   # 256 tok + 128 pos
+    D_LARGE = 512   # after expander, used by last block and all heads
+    nh  = cfg["num_heads"]   # 8
+    dr  = cfg["dropout"]
+    PDH = 256
 
-    # internal: residual conv block using LayerNorm (no BatchNorm)
-    def res_block_layernorm(x_in, channels, leak=0.01, name=None):
-        nm = "" if name is None else name + "_"
+    sl_idx = torch.from_numpy(pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
-        conv1 = layers.Conv2D(
-            channels, 3, padding="same", use_bias=False,
-            kernel_initializer=HE, name=nm + "conv1"
-        )(x_in)
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.eps   = eps
+        def forward(self, x):
+            return x / x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt() * self.scale
 
-        act1 = layers.LeakyReLU(alpha=leak, name=nm + "lrelu1")(conv1)
+    class TxBlock(nn.Module):
+        def __init__(self, d, ff_dim):
+            super().__init__()
+            self.ln1  = nn.LayerNorm(d)
+            self.attn = nn.MultiheadAttention(d, nh, dropout=0.0, batch_first=True)
+            self.drop = nn.Dropout(dr)
+            self.ln2  = nn.LayerNorm(d)
+            self.ff1  = nn.Linear(d, ff_dim)
+            self.ff2  = nn.Linear(ff_dim, d)
+        def forward(self, x):
+            n = self.ln1(x)
+            h, _ = self.attn(n, n, n, need_weights=False)
+            x = x + self.drop(h)
+            return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
 
-        conv2 = layers.Conv2D(
-            channels, 3, padding="same", use_bias=False,
-            kernel_initializer=HE, name=nm + "conv2"
-        )(act1)
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tok_emb = nn.Embedding(VOCAB_SIZE, 256)
+            self.pos     = nn.Embedding(SEQ_LEN, 128)
+            self.tok_ln  = nn.LayerNorm(256)
+            self.pos_ln  = nn.LayerNorm(128)
 
-        ln2 = layers.LayerNormalization(epsilon=1e-5, name=nm + "ln2")(conv2)
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D_SMALL) * 0.02)
 
-        out = layers.Add(name=nm + "add")([x_in, ln2])
-        out = layers.LeakyReLU(alpha=leak, name=nm + "lrelu_out")(out)
-        return out
+            small_ff_dims = [512, 768, 768, 768, 768, 768, 768]
+            self.small_blocks = nn.ModuleList([TxBlock(D_SMALL, ffd) for ffd in small_ff_dims])
+            self.expander     = nn.Linear(D_SMALL, D_LARGE, bias=False)
+            self.expand_ln    = nn.LayerNorm(D_LARGE)
+            self.large_block  = TxBlock(D_LARGE, 512)
+            self.trunk_ln     = nn.LayerNorm(D_LARGE)
 
-    # inputs / token embedding -> 2D conv feature map
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    token_emb = layers.Embedding(input_dim=vs, output_dim=de, name="token_emb")(enc_in)
-    x = layers.Reshape((8, 8, de), name="to_2d")(token_emb)
+            self.wdl_w1 = nn.Linear(D_LARGE, D_LARGE // 2, bias=False)
+            self.wdl_w2 = nn.Linear(D_LARGE // 2, 3, bias=False)
 
-    # small conv frontend stack using residual blocks
-    # project if embed depth != conv_filters in first block
-    if de != conv_filters:
-        x = layers.Conv2D(
-            conv_filters, 1, padding="same", use_bias=False,
-            kernel_initializer=HE, name="conv_proj")(x)
-        
-        x = layers.LayerNormalization(axis=-1, name="ln_proj")(x)
-        x = layers.LeakyReLU(alpha=0.01, name="lrelf_proj")(x)
+            self.gate_w_gate = nn.Linear(D_LARGE, D_LARGE * 3 // 2, bias=False)
+            self.gate_w_up   = nn.Linear(D_LARGE, D_LARGE * 3 // 2, bias=False)
+            self.gate_w_down = nn.Linear(D_LARGE * 3 // 2, D_LARGE, bias=False)
+            self.gate_drop   = nn.Dropout(dr)
+            nn.init.zeros_(self.gate_w_down.weight)
+            self.gate_norm = RMSNorm(D_LARGE)
+            self.gate_out  = nn.Linear(D_LARGE, 1858, bias=True)
+            nn.init.zeros_(self.gate_out.weight)
+            nn.init.constant_(self.gate_out.bias, 4.0)
 
-    for i in range(conv_blocks):
-        x = res_block_layernorm(x, conv_filters, leak=0.01, name=f"conv{i}")
+            self.from_proj = nn.Linear(D_LARGE, PDH)
+            self.from_ln   = nn.LayerNorm(PDH)
+            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.from_out  = nn.Linear(PDH, PDH)
 
-    # flatten spatial to sequence for transformer: (batch, 64, C)
-    seq = layers.Reshape((64, conv_filters), name="to_seq")(x)
+            self.to_proj   = nn.Linear(D_LARGE, PDH)
+            self.to_ln     = nn.LayerNorm(PDH)
+            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0, batch_first=True)
+            self.to_out    = nn.Linear(PDH, PDH)
 
-    pos = layers.Embedding(64, conv_filters, name="pos_emb")(
-        layers.Lambda(lambda _: tf.range(64), name="pos_idx")(enc_in)
-    )
-    pos = layers.Lambda(lambda z: tf.expand_dims(z, 0), name="pos_bcast")(pos)
-    seq = layers.Add(name="add_pos")([seq, pos])
+            self.scale      = 1.0 / math.sqrt(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to   = nn.Linear(PDH, 3, bias=False)
 
-    # transformer encoder stack
-    def transformer_encoder_layer(src, layer_idx):
-        nm = f"t{layer_idx}_"
-        ln1 = layers.LayerNormalization(axis=-1, name=nm + "ln1")(src)
-        
-        attn = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=conv_filters // num_heads,
-            name=nm + "mha")(ln1, ln1)
+            self.register_buffer("sl_idx", sl_idx)
 
-        attn = layers.Dropout(dropout, name=nm + "attn_drop")(attn)
-        attn_out = layers.Add(name=nm + "attn_add")([src, attn])
+        def forward(self, tokens):
+            B = tokens.shape[0]
+            pos = self.pos(torch.arange(SEQ_LEN, device=tokens.device)).unsqueeze(0).expand(B, -1, -1)
+            x = torch.cat([self.tok_ln(self.tok_emb(tokens)), self.pos_ln(pos)], dim=-1)  # [B, 64, 384]
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)               # [B, 72, 384]
+            for blk in self.small_blocks:
+                x = blk(x)
+            x = self.expand_ln(self.expander(x))                                           # [B, 72, 512]
+            x = self.large_block(x)
+            x = self.trunk_ln(x)
 
-        ln2 = layers.LayerNormalization(axis=-1, name=nm + "ln2")(attn_out)
-        ff = layers.Dense(ff_dim, activation="gelu",
-                          kernel_initializer=HE, name=nm + "ff1")(ln2)
+            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))
 
-        ff = layers.Dropout(dropout, name=nm + "ff_drop")(ff)
-        ff = layers.Dense(conv_filters, name=nm + "ff2")(ff)
-        ff_out = layers.Add(name=nm + "ff_add")([attn_out, ff])
-        return ff_out
+            gi       = x[:, 65, :]
+            h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
+            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gate_raw = self.gate_out(self.gate_norm(g))
 
-    t = seq
-    for i in range(transformer_layers):
-        t = transformer_encoder_layer(t, i)
+            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)  # [B, 68, 512]
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)  # [B, 68, 512]
 
-    # back to spatial map
-    x = layers.Reshape((8, 8, conv_filters), name="from_seq")(t)
+            f_proj = F.gelu(self.from_proj(from_set))
+            fn     = self.from_ln(f_proj)
+            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            fv     = self.from_out(f_proj[:, :64, :] + fh)
 
-    # small conv mixer before heads
-    x = layers.Conv2D(
-        conv_filters, 1, padding="same", use_bias=False, name="conv_mix_1x1")(x)
+            t_proj = F.gelu(self.to_proj(to_set))
+            tn     = self.to_ln(t_proj)
+            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            tv     = self.to_out(t_proj[:, :64, :] + th)
 
-    x = layers.LayerNormalization(axis=-1, name="ln_mix")(x)
-    x = layers.LeakyReLU(alpha=0.01, name="lrelu_mix")(x)
+            dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)
+            dots      = dots_full.reshape(B, 64 * 64)
 
-    # policy head -> 64 x 67
-    policy_map = layers.Conv2D(
-        67, 1, padding="same", activation=None, name="policy_conv_67")(x)
+            dots_sub = dots_full[:, 48:56, 56:64]
+            pf       = self.promo_from(fv[:, 48:56, :])
+            pt       = self.promo_to(tv[:, 56:64, :])
+            promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]).permute(0, 3, 2, 1).reshape(B, 192).float()
 
-    feat_64_67 = layers.Reshape((64, 67), name="to_64_67")(policy_map)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(feat_64_67)
+            raw_4288 = torch.cat([dots, promo], dim=1)
+            q_sl     = raw_4288[:, self.sl_idx]
+            combined = q_sl + F.logsigmoid(gate_raw.float())
+            return combined.to(x.dtype), wdl
 
-    # value head
-    v = layers.Conv2D(
-        64, 3, padding="same", use_bias=False,
-        kernel_initializer=HE, name="v_conv1")(x)
-
-    v = layers.LayerNormalization(epsilon=1e-5, name="v_ln1")(v)
-    v = layers.LeakyReLU(alpha=0.01, name="v_lrelu1")(v)
-
-    # global descriptor
-    v = layers.GlobalAveragePooling2D(name="v_gap")(v)
-
-    # deeper MLP for value (extra dense layer for more capacity)
-    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
-    v = layers.Dropout(dropout, name="v_fc_drop")(v)
-    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
-
-    # final value output (float32 for numerical stability)
-    value_out = layers.Dense(
-        1, activation="tanh", dtype="float32", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
 
 
-def build_lowrank_res_stack_64x67(
-    name,
-    d_model=64,
-    vocab_size=21,
-    inner_dim=64,
-    num_blocks=6,
-    dropout=0.05,
-):
-    """
-    Low-rank residual stack over a flattened 8x8xC representation.
-    No conv, no transformer. Outputs:
-      - policy head: 64 x 67 logits (flattened)
-      - value head: scalar in [-1, 1]
-    """
-    from tensorflow.keras import mixed_precision
-    mixed_precision.set_global_policy("mixed_float16")
-
-    # inputs -> token embedding
-    enc_in = Input(shape=(64,), dtype="int32", name="enc_in")
-    tok = layers.Embedding(
-        input_dim=vocab_size, output_dim=d_model, name="token_emb"
-    )(enc_in)
-
-    # flatten to global vector: D = 64 * d_model
-    flat_dim = 64 * d_model
-    x = layers.Reshape((flat_dim,), name="to_flat")(tok)
-
-    def lowrank_res_block(x_in, inner_dim, idx, return_dim, final_add=True):
-        nm = f"lr{idx}_"
-
-        # pre-activation (keeps the skip path clean)
-        ln = layers.LayerNormalization(axis=-1, epsilon=1e-5, name=nm + "ln")(x_in)
-
-        # x = x + φ2(A * φ1(Bx))
-        h = layers.Dense(inner_dim, kernel_initializer=HE, name=nm + "fc_b")(ln)
-
-        h = layers.Activation("gelu", name=nm + "gelu1")(h)
-        h = layers.Dense(return_dim, kernel_initializer=HE, name=nm + "fc_a", )(h)
-        h = layers.Activation("gelu", name=nm + "gelu2")(h)
-        h = layers.Dropout(dropout, name=nm + "drop2")(h)
-        
-        if final_add:
-            out = layers.Add(name=nm + "add")([x_in, h])
-
-        return out
-
-    for i in range(num_blocks):
-        x = lowrank_res_block(x, inner_dim, i)
-
-    # back to per-square features: (batch, 64, d_model)
-    tok_out = layers.Reshape((64, d_model), name="from_flat")(x)
-
-    # policy head: per-square logits -> (64, 67) then flatten
-    pol = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="pol_ln")(tok_out)
-    pol = layers.Dense(67, name="pol_fc_67")(pol)
-    pol = layers.Reshape((64, 67), name="to_64_67")(pol)
-    policy_logits = layers.Reshape((64 * 67,), name="policy_logits")(pol)
-
-    # value head (no conv): per-token -> pooled -> MLP
-    v = layers.LayerNormalization(axis=-1, epsilon=1e-5, name="v_ln0")(tok_out)
-    v = layers.Dense(64, activation=tf.nn.gelu, kernel_initializer=HE, name="v_fc0")(v)
-    v = layers.GlobalAveragePooling1D(name="v_gap")(v)
-    v = layers.Dense(256, activation="relu", name="v_fc1")(v)
-    v = layers.Dropout(dropout, name="v_fc_drop")(v)
-    v = layers.Dense(128, activation="relu", name="v_fc2")(v)
-
-    value_out = layers.Dense(1, activation="tanh", dtype="float32", name="value_out")(v)
-
-    model = Model(inputs=[enc_in], outputs=[policy_logits, value_out], name=name)
-
-    opt = tf.keras.optimizers.Adam(learning_rate=1e-4)
-    opt = mixed_precision.LossScaleOptimizer(opt)
-
-    loss_dict = {
-        "policy_logits": tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-        "value_out": "mse",
-    }
-    loss_weights = {"policy_logits": 1.0, "value_out": 1.0}
-    model.compile(optimizer=opt, loss=loss_dict, loss_weights=loss_weights)
-
-    return model, opt, loss_weights, loss_dict
+PT_BUILDERS: dict[str, object] = {
+    "16m-transformer":           build_pt_transformer_16m,
+    "16m-conformer-interweaved": build_pt_conformer_interweaved,
+    "13m-precond-conformer":     build_pt_precond_conformer,
+    "16m-precond-smartgate":                build_pt_precond_smartgate,
+    "16m-precond-smartgate-lc0":            build_pt_precond_smartgate,
+    "16m-precond-smartgate-xc0h":           build_pt_precond_smartgate,
+    "18m-precond-smartgate-xc0h-6c4t":      build_pt_precond_smartgate,
+    "conv-globalizer-2c6g":                 build_pt_conv_globalizer,
+    "precond-signed-4g6t-d512":             build_pt_precond_signed,
+    "precond-mha-4g6t-d512":                build_pt_precond_signed,
+    "precond-mixer-6m4t-d512":              build_pt_precond_mixer,
+    "precond-mha-8c4t-d384":                build_pt_precond_signed,
+    "precond-mha-8c6t-d256":                build_pt_precond_addpos,
+    "precond-mha-10c6t-d256":               build_pt_precond_addpos,
+    "precond-mha-8c8t-d256":                build_pt_precond_addpos,
+    "conv-pure":                            build_pt_conv_pure,
+    "conv-shallow-mha":                      build_pt_conv_shallow_mha,
+    "full-mha-smartgate":                   build_pt_full_mha_smartgate,
+}

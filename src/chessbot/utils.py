@@ -19,7 +19,6 @@ from IPython.display import SVG, display, clear_output
 from pyfastchess import Board as fastboard
 
 from chessbot import SF_LOC
-from chessbot import features as ft
 
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,6 +48,12 @@ def cp_to_value_tanh(cp, mid_cp=200.0):
     return np.clip(math.tanh(k * cp), -0.97, 0.97)
 
 
+def scalar_to_wdl(z):
+    """Continuous -1..1 -> WDL, unlike a one-hot game-outcome mapping."""
+    z = float(z)
+    return np.array([max(z, 0.0), 1.0 - abs(z), max(-z, 0.0)], dtype=np.float32)
+
+
 def score_to_value_white(board_score):
     # always look from whites perspective
     from_white = board_score.white()
@@ -56,9 +61,17 @@ def score_to_value_white(board_score):
 
 
 def score_to_value_stm_pov(board_score):
-    # always look from whites perspective
     rel_score = board_score.relative
     return cp_to_value(rel_score)
+
+
+def score_to_value_stm_pov_tanh(board_score, mid_cp=100.0):
+    # tanh scale: +mid_cp -> 0.5 win probability
+    rel_score = board_score.relative
+    raw = rel_score.score()
+    if raw is None:
+        raw = rel_score.score(mate_score=3000)
+    return cp_to_value_tanh(raw, mid_cp=mid_cp)
 
 # another method of converting scores
 def score_clipped(x, clip_max=CLIP_MAX):
@@ -102,36 +115,36 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
         val = score_fn(info['score'])
         best_move = info.get("pv", [""])[0]
         search_depth = info['depth']
+        wdl_info = info.get('wdl')
+        wdl = (
+            (wdl_info.relative.wins / 1000.0,
+             wdl_info.relative.draws / 1000.0,
+             wdl_info.relative.losses / 1000.0)
+            if wdl_info is not None else None
+        )
     except Exception as e:
         print(e)
 
     finally:
         if new_eng:
             engine.quit()
-    
+
     # if time given, return search depth
     if time_lim is None:
-        return val, str(best_move)
+        return val, str(best_move), wdl
     else:
         return val, str(best_move), search_depth
 
 
-uci_path_path =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_over2.pkl"
-with open(uci_path_path, "rb") as f:
-    PATHS = pickle.load(f)
-    
-
-uci_path_path_mini =  r"C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl"
-with open(uci_path_path_mini, "rb") as f:
-    MINI_PATHS = pickle.load(f)
-
-pgn_path = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
-with open(pgn_path, "r", encoding="utf-8", errors="replace") as f:
-    PGN_TEXT = f.read()
-
 
 def rnd(x, n):
     return np.round(x, n)
+
+
+def maybe_random_from_list(item):
+    if isinstance(item, (list, set)):
+        return np.random.choice(item)
+    return item
 
 
 def show_board(board, flipped=False, sleep=0.1):
@@ -165,15 +178,6 @@ def make_random_move(board):
         return board    
 
 
-def get_all_board_features(board):
-    all_feats = ft.all_king_exposure_features(board)
-    all_feats.update(ft.all_piece_features(board))
-    
-    wt, blk = ft.get_piece_value_sum(board)
-    all_feats['material'] = [wt, blk]
-    
-    return all_feats
-
 
 def softmax(x):
     x = np.asarray(x, dtype=np.float32)
@@ -183,7 +187,7 @@ def softmax(x):
     return y / s if s > 0 else np.full_like(y, 1.0 / len(y))
 
 
-def calc_entropy(visits):
+def calc_entropy(visits, normed_only=False):
     # visits: sequence or ndarray of nonneg weights/probs
     if isinstance(visits, list):
         a = np.array(visits, dtype=float, copy=False)
@@ -191,14 +195,14 @@ def calc_entropy(visits):
         a = visits
 
     if a.size == 0:
-        return 0.0, 0.0
+        return 0.0 if normed_only else (0.0, 0.0)
 
     # force negatives to zero (defensive)
     a = np.where(a > 0.0, a, 0.0)
 
     total = a.sum()
     if total <= 0.0:
-        return 0.0, 0.0
+        return 0.0 if normed_only else (0.0, 0.0)
 
     p = a / total
     mask = p > 0.0
@@ -210,7 +214,7 @@ def calc_entropy(visits):
     n = p.size
     norm = ent / np.log2(n) if n > 1 else 0.0
 
-    return ent, norm
+    return norm if normed_only else (ent, norm)
 
 
 def kl_divergence(p_list, q_list):
@@ -221,6 +225,16 @@ def kl_divergence(p_list, q_list):
     p = p / p.sum()
     q = q / q.sum()
     return np.sum(p * np.log(p / q))
+
+
+def cross_entropy(p_list, q_list):
+    # same p/q convention as kl_divergence: CE(p, q) = -sum(p * log(q))
+    eps = 1e-12
+    p = np.asarray(p_list, dtype=float) + eps
+    q = np.asarray(q_list, dtype=float) + eps
+    p = p / p.sum()
+    q = q / q.sum()
+    return -np.sum(p * np.log(q))
 
 
 def kl_divergence_bits(p, q, eps=1e-12):
@@ -294,6 +308,96 @@ def stable_softmax(logits):
     return e / (s + 1e-9)
 
 
+def batch_policy_metrics_from_priors(samples, uniform_eps=0.05, clip_max=0.8):
+    """
+    Compute policy metrics from per-position prior dicts and visit lists.
+    samples: list of (nn_priors_dict, visit_list) where
+      nn_priors_dict: {uci: prob}  — raw NN distribution over legal moves
+      visit_list:     [(uci, count)] — post-redistribution MCTS visits
+    Returns same keys as batch_policy_metrics (excluding mass_on_legal).
+    """
+    eps_ll = 1e-12
+    keys = [
+        'policy_ce', 'uniform_ce', 'ce_gain',
+        'exp_prob_model', 'exp_prob_uniform',
+        'top1_exact', 'avg_top_prob',
+        'top1_mass', 'top3_mass', 'top5_mass', 'prob_on_others',
+    ]
+    acc = {k: 0.0 for k in keys}
+    n_valid = 0
+
+    for nn_priors, visits in samples:
+        if not nn_priors or not visits:
+            continue
+        all_ucis = sorted(set(nn_priors.keys()) | {u for u, _ in visits})
+        n = len(all_ucis)
+        if n == 0:
+            continue
+
+        p = np.array([nn_priors.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        p_sum = p.sum()
+        if p_sum <= 0:
+            continue
+        p /= p_sum
+
+        visit_map = {u: float(c) for u, c in visits}
+        v = np.array([visit_map.get(u, 0.0) for u in all_ucis], dtype=np.float64)
+        v_sum = v.sum()
+        if v_sum <= 0:
+            continue
+        v /= v_sum
+
+        uniform = np.ones(n, dtype=np.float64) / n
+        labels = uniform_eps * uniform + (1.0 - uniform_eps) * v
+        labels = np.clip(labels, 0.0, clip_max)
+        labels /= labels.sum()
+
+        policy_ce  = -np.sum(labels * np.log(p + eps_ll))
+        uniform_ce = -np.sum(labels * np.log(uniform + eps_ll))
+
+        label_top1 = int(np.argmax(labels))
+        model_top1 = int(np.argmax(p))
+
+        k3 = min(3, n)
+        k5 = min(5, n)
+        top3_idx = np.argpartition(-labels, k3 - 1)[:k3]
+        top5_idx = np.argpartition(-labels, k5 - 1)[:k5]
+
+        support = labels > 0
+        support[label_top1] = False
+
+        acc['policy_ce']        += policy_ce
+        acc['uniform_ce']       += uniform_ce
+        acc['ce_gain']          += uniform_ce - policy_ce
+        acc['exp_prob_model']   += float(np.sum(labels * p))
+        acc['exp_prob_uniform'] += float(np.sum(labels * uniform))
+        acc['top1_exact']       += float(label_top1 == model_top1)
+        acc['avg_top_prob']     += float(p[model_top1])
+        acc['top1_mass']        += float(p[label_top1])
+        acc['top3_mass']        += float(p[top3_idx].sum())
+        acc['top5_mass']        += float(p[top5_idx].sum())
+        acc['prob_on_others']   += float((p * support).sum())
+        n_valid += 1
+
+    if n_valid == 0:
+        return {k: float('nan') for k in keys}
+    return {k: v / n_valid for k, v in acc.items()}
+
+
+def next_model_epoch(progress_csv_path):
+    """Next model_epoch to write. Row count is wrong when the csv has gaps or
+    duplicate epochs (cloned runs, pretrain rows every Nth epoch, partial rows),
+    so continue past the max."""
+    if not os.path.exists(progress_csv_path):
+        return 0
+
+    df = pd.read_csv(progress_csv_path)
+    if not len(df) or 'model_epoch' not in df.columns:
+        return 0
+
+    return int(df['model_epoch'].max()) + 1
+
+
 def batch_policy_metrics(logits, labels, mask):
     eps = 1e-12
     big_neg = -1e6
@@ -335,9 +439,15 @@ def batch_policy_metrics(logits, labels, mask):
     top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
     top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
 
+    # same top5_idx, but gathered from the label itself -- how much mass the
+    # target distribution puts on its own top-5 (the ceiling top5_mass can't
+    # meaningfully exceed, since labels are blended with uniform_eps/clipped)
+    top5_target_per = np.take_along_axis(labels, top5_idx, axis=1).sum(axis=1)
+
     top1_mass = top1_per.mean()
     top3_mass = top3_per.mean()
     top5_mass = top5_per.mean()
+    top5_mass_target = top5_target_per.mean()
 
     # other support / distribution metrics
     support_mask = labels > 0
@@ -361,58 +471,61 @@ def batch_policy_metrics(logits, labels, mask):
         "top1_mass": top1_mass,
         "top3_mass": top3_mass,
         "top5_mass": top5_mass,
+        "top5_mass_target": top5_mass_target,
         "prob_on_others": prob_on_others,
         "mass_on_legal": mass_on_legal
     }
 
 
-def print_validation(epoch, stats):
-    eps = 1e-12
-
+def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
+    # name_w derived from actual display labels so columns align
     keys = [
-        "val_mse", "val_corr",
-        "policy_ce", "uniform_ce", "ce_gain",
-        "top1_exact", "avg_top_prob",
-        "top1_mass", "prob_on_others"
+        "value_mse", "value_corr", "value_ce",
+        "policy_ce", "uniform_ce",
+        "top1_exact", "avg_top",
+        "top1_mass", "top5_mass", "top5_mass (target)",
     ]
     name_w = max(len(k) for k in keys)
-    num_w = 8
-    fmt_num = f"{{value:{num_w}.4f}}"
+    num_w = 7
+    fmt_num = f"{{value:{num_w}.3f}}"
     def pair(k, v):
         return f"{k:<{name_w}}: {fmt_num.format(value=v)}"
-    ratio = stats.get("top1_mass", 0.0) / (stats.get("prob_on_others", 0.0) + eps)
+    pfx = f"[epoch {epoch:4d}] [validation]"
 
-    print(f"[epoch {epoch:4d}] [validation] {pair('value_mse', stats['value_mse'])}  "
-          f"{pair('value_corr', stats['value_corr'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('policy_ce', stats['policy_ce'])}  "
-          f"{pair('uniform_ce', stats['uniform_ce'])}  ce_gain: {stats['ce_gain']:.4f}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_exact', stats['top1_exact'])}  "
-          f"{pair('avg_top_prob', stats['avg_top_prob'])}")
-    print(f"[epoch {epoch:4d}] [validation] {pair('top1_mass', stats['top1_mass'])}  "
-          f"{pair('true ratio', ratio)}")
+    value_ce = stats.get("value_ce", float("nan"))
+    print(f"{pfx} {pair('value_mse', stats['value_mse'])}  "
+          f"{pair('value_corr', stats['value_corr'])}  "
+          f"{pair('value_ce', value_ce)}")
+    print(f"{pfx} {pair('policy_ce', stats['policy_ce'])}  "
+          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
+    print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
+          f"{pair('avg_top', stats['avg_top_prob'])}")
+    print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "
+          f"{pair('top5_mass', stats['top5_mass'])}  "
+          f"{pair('top5_mass (target)', stats['top5_mass_target'])}")
+    if mass_on_legal is not None:
+        cov_str = f" ({mol_coverage:.0%} coverage)" if mol_coverage is not None else ""
+        print(f"{pfx} mass_on_legal (est): {mass_on_legal:.4f}{cov_str}")
 
 
-def score_game_data(model, X, M, Y, epoch, save_path=None):
+def score_game_data(model, X, M, Y, epoch, save_path=None, preds=None):
     """ Run model.predict -> plot -> metrics -> return a single-row """
-    preds = model.predict(X, verbose=0, batch_size=128)
-    value_preds = preds[1].ravel()
+    if preds is None:
+        preds = model.predict(X, verbose=0, batch_size=128)
+    value_preds = preds[1].ravel()  # (B,) numpy from model.predict
 
-    value_preds = preds[1].ravel()  # (B,)
-    targets = Y['value_out'].ravel()
-    value_mse = np.mean((value_preds - targets) ** 2)
+    y_value = Y['value_out']
+    targets = y_value.ravel()
+
+    value_mse  = np.mean((value_preds - targets) ** 2)
     value_corr = np.corrcoef(value_preds, targets)[0, 1]
-    
-    plt.scatter(targets, value_preds, s=6)
-    plt.plot([-1, 1], [-1, 1], linestyle="--", color="red", alpha=0.6)
-    plt.xlim(-1, 1); plt.ylim(-1, 1); plt.gca()
-    plt.xlabel("target"); plt.ylabel("pred"); plt.title("pred vs target")
-    plt.tight_layout()
+
     if save_path is not None:
-        plt.savefig(save_path)
-    plt.close()
+        pd.DataFrame({"target": targets, "pred": value_preds}).to_csv(
+            save_path, index=False)
 
     policy_logits = preds[0]  # (B,4096)
-    policy_true = Y['policy_logits']
+    policy_true   = Y['policy_logits']
     policy_stats = batch_policy_metrics(policy_logits, policy_true, M)
 
     # build print dict and call the printer
@@ -433,180 +546,6 @@ def moving_average_pd(arr, window=15):
     return s.rolling(window, center=True, min_periods=1).mean().values
 
 
-def plot_training_progress(metrics_history, epoch=None, save_path=None):
-    """
-    metrics_history: pd.DataFrame or dict-like with columns used below.
-    If epoch is None, try to infer from metrics_history['model_epoch'].max(),
-    otherwise use number of rows.
-    Produces two figures and either shows them or writes:
-      save_path           -> primary (2x2)
-      save_path + "_extra"-> extra (1x3)
-    """
-
-    df = metrics_history.copy()
-
-    # helper to safely extract column arrays (or empty list)
-    def col_vals(name):
-        if name in df.columns:
-            return df[name].tolist()
-        return []
-
-    # infer epoch if needed
-    if epoch is None:
-        if "model_epoch" in df.columns and len(df):
-            epoch = int(max(df["model_epoch"]))
-        else:
-            epoch = len(df)
-
-    hide_first = 10
-    if epoch < 12:
-        return
-
-    ma_window = min(30, max(3, int(epoch * 0.2)))
-    if ma_window % 2 == 0:
-        ma_window += 1
-
-    # prepare x-axis baseline
-    N = len(df)
-    x_full = np.arange(N)
-    start = hide_first
-    xs = x_full[start:]
-
-    # first figure (2x2)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-
-    # policy CE
-    ax = axes[0, 0]
-    raw = np.array(col_vals("policy_ce") or [])
-    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
-    raw_seg = raw[start:] if raw.size else np.array([])
-    if raw_seg.size:
-        ax.plot(xs, raw_seg, label="policy_ce", alpha=0.6, lw=1)
-    if ma.size:
-        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-    ax.set_title("policy CE (nats)")
-    ax.legend()
-
-    # CE gain vs uniform
-    ax = axes[0, 1]
-    raw = np.array(col_vals("ce_gain") or [])
-    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
-    raw_seg = raw[start:] if raw.size else np.array([])
-    if raw_seg.size:
-        ax.plot(xs, raw_seg, label="ce_gain", alpha=0.6, lw=1)
-    if ma.size:
-        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-    ax.set_title("CE gain vs uniform")
-    ax.legend()
-
-    # value MSE
-    ax = axes[1, 0]
-    raw = np.array(col_vals("value_mse") or [])
-    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
-    raw_seg = raw[start:] if raw.size else np.array([])
-    if raw_seg.size:
-        ax.plot(xs, raw_seg, label="mse", alpha=0.6, lw=1)
-    if ma.size:
-        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-    ax.set_title("value MSE")
-    ax.legend()
-
-    # value corr
-    ax = axes[1, 1]
-    raw = np.array(col_vals("value_corr") or [])
-    ma = moving_average_pd(raw, window=ma_window)[start:] if raw.size else np.array([])
-    raw_seg = raw[start:] if raw.size else np.array([])
-    if raw_seg.size:
-        ax.plot(xs, raw_seg, label="corr", alpha=0.6, lw=1)
-    if ma.size:
-        ax.plot(xs, ma, label=f"MA{ma_window}", lw=2)
-    ax.set_title("value corr")
-    ax.legend()
-    plt.tight_layout()
-
-    # Second figure (1x3)
-    fig2, axs = plt.subplots(1, 3, figsize=(15, 4))
-
-    # (0) left: top1 / top3 / top5 - show only MA
-    ax = axs[0]
-    t1 = col_vals("top1_mass")
-    t3 = col_vals("top3_mass")
-    t5 = col_vals("top5_mass")
-    any_top = any(len(arr) for arr in (t1, t3, t5))
-    if not any_top:
-        ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        l1, l3, l5 = f"top1 MA{ma_window}", f"top3 MA{ma_window}", f"top5 MA{ma_window}"
-        if len(t1):
-            ma_t1 = moving_average_pd(np.array(t1), window=ma_window)
-            ax.plot(np.arange(len(ma_t1)), ma_t1, label=l1, linewidth=2)
-        if len(t3):
-            ma_t3 = moving_average_pd(np.array(t3), window=ma_window)
-            ax.plot(np.arange(len(ma_t3)), ma_t3, label=l3, linewidth=2)
-        if len(t5):
-            ma_t5 = moving_average_pd(np.array(t5), window=ma_window)
-            ax.plot(np.arange(len(ma_t5)), ma_t5, label=l5, linewidth=2)
-        ax.set_title("mean top-k mass (MA shown)")
-        ax.legend(fontsize=8)
-
-    # (1) middle: mass_on_legal (raw + MA)
-    ax = axs[1]
-    mol = col_vals("mass_on_legal")
-    if not len(mol):
-        ax.text(0.5, 0.5, "missing: mass_on_legal", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        x = np.arange(len(mol))
-        ax.plot(x, mol, label="mass_on_legal", alpha=0.6, lw=1)
-        ma_mol = moving_average_pd(np.array(mol), window=ma_window)
-        ax.plot(x, ma_mol, lw=2, alpha=0.7, label=f"MA{ma_window}")
-        ax.set_title("mass_on_legal")
-        ax.legend(fontsize=8)
-
-    # (2) right: avg_top_prob & top1_exact
-    ax = axs[2]
-    avg_tp = col_vals("avg_top_prob")
-    t1_exact = col_vals("top1_exact")
-    have_any = len(avg_tp) or len(t1_exact)
-    if not have_any:
-        ax.text(0.5, 0.5, "missing: avg_top_prob / top1_exact", ha="center", va="center")
-        ax.set_axis_off()
-    else:
-        plotted = False
-        if len(avg_tp):
-            ma_avg = moving_average_pd(np.array(avg_tp), window=ma_window)
-            l = f"avg_max_prob MA{ma_window}"
-            ax.plot(np.arange(len(ma_avg)), ma_avg, label=l, alpha=0.9, lw=2)
-            plotted = True
-        if len(t1_exact):
-            ma_t1ex = moving_average_pd(np.array(t1_exact), window=ma_window)
-            l = f"top1_exact MA{ma_window}"
-            ax.plot(np.arange(len(ma_t1ex)), ma_t1ex, label=l, alpha=0.9, lw=2)
-            plotted = True
-        if not plotted:
-            ax.text(0.5, 0.5, "no data after smoothing", ha="center", va="center")
-            ax.set_axis_off()
-        else:
-            ax.set_title("avg_max_prob & top1_exact (MA shown)")
-            ax.legend(fontsize=8)
-    plt.tight_layout()
-
-    # save (primary and _extra)
-    if save_path is not None:
-        root, ext = os.path.splitext(save_path)
-        if ext == "":
-            ext = ".png"
-            root = save_path
-        out1 = root + ext
-        out2 = root + "_extra" + ext
-        fig.savefig(out1, dpi=150)
-        plt.close(fig)
-        fig2.savefig(out2, dpi=150)
-        plt.close(fig2)
-    else:
-        fig.show()
-        fig2.show()
 
 
 def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
@@ -638,12 +577,12 @@ def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
     print("\n=== Stockfish Analysis (latest) ===")
     print(f"Retrain step: {latest_step}")
     print(f"Games analyzed: {int(s['games'])}")
-    print(f"Overall mean CPL: {float(s['avg_overall_mean_cpl']):.3f}")
-    print(f"  - White mean CPL: {float(s['avg_white_mean_cpl']):.3f}")
-    print(f"  - Black mean CPL: {float(s['avg_black_mean_cpl']):.3f}")
-    print(f"Overall best-move rate: {float(s['avg_overall_best_move_rate'])*100:.1f}%")
-    print(f"  - White best-move rate: {float(s['avg_best_move_rate_white'])*100:.1f}%")
-    print(f"  - Black best-move rate: {float(s['avg_best_move_rate_black'])*100:.1f}%")
+    print(f"Overall mean CPL: {s['avg_overall_mean_cpl']:.3f}")
+    print(f"  - White mean CPL: {s['avg_white_mean_cpl']:.3f}")
+    print(f"  - Black mean CPL: {s['avg_black_mean_cpl']:.3f}")
+    print(f"Overall best-move rate: {s['avg_overall_best_move_rate']*100:.1f}%")
+    print(f"  - White best-move rate: {s['avg_best_move_rate_white']*100:.1f}%")
+    print(f"  - Black best-move rate: {s['avg_best_move_rate_black']*100:.1f}%")
     print("===================================\n")
 
     # Need >=2 points to plot a trend
@@ -696,6 +635,16 @@ def format_time(seconds):
         h, rem = divmod(seconds, 3600)
         m, s = divmod(rem, 60)
         return f"{int(h)}h {int(m)}m {s:.2f}s"
+
+
+def compact_count(n):
+    """Render a big count as 256M / 1.2B so log columns stay narrow."""
+    n = float(n)
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= scale:
+            v = n / scale
+            return f"{v:.1f}{suffix}" if abs(v) < 10 else f"{v:.0f}{suffix}"
+    return f"{n:.0f}"
 
 
 def make_jsonable(obj):
@@ -899,335 +848,6 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     return paths
 
     
-def get_pre_opened_game(index=None, mini=False):
-    b = fastboard()
-    path_list = MINI_PATHS if mini else PATHS
-    if index is None:
-        moves_to_play = random.choice(path_list)
-    else:
-        try:
-            moves_to_play = path_list[index]
-        except:
-            print(
-                f"No premove path found for {index}!",
-                f"please choose 0 - {len(path_list)-1}.",
-                "Selecting random premove path"
-            )
-            moves_to_play = random.choice(path_list)
-
-    for mtp in moves_to_play:
-        b.push_uci(mtp)
-    return b
-
-
-def create_UHO_PGN_game():
-    """
-    Sample a game from PGN_TEXT (already loaded in memory), push mainline moves
-    onto a fastboard(), and return the resulting board.
-
-    index: 0-based game index, or None for random
-    max_plies: cap number of half-moves played (None = all)
-    """
-    UHO_EVENT_START_RE = re.compile(r'(?m)^\[Event "')
-
-    starts = [m.start() for m in UHO_EVENT_START_RE.finditer(PGN_TEXT)]
-    if not starts:
-        raise ValueError("No games found (no [Event at line start).")
-
-    k = random.randrange(len(starts))
-    a = starts[k]
-    b = starts[k + 1] if k + 1 < len(starts) else len(PGN_TEXT)
-    chunk = PGN_TEXT[a:b]
-
-    blank = chunk.find("\n\n")
-    moves_blob = chunk if blank == -1 else chunk[blank + 2:]
-
-    game = chess.pgn.read_game(io.StringIO(moves_blob))
-    if game is None:
-        return fastboard()
-
-    fb = fastboard()
-    n = 0
-    for mv in game.mainline_moves():
-        fb.push_uci(mv.uci())
-        n += 1
-
-    return fb
-
-
-def random_board_setup(pieces, wk=None, bk=None, queens=True, pyfast=True):
-    """
-    Make a legal endgame-like position with exactly `pieces` total pieces.
-    Pieces are drawn from a bag proportional to a real starting set:
-      per color: 8P, 2N, 2B, 2R, 1Q (plus the king already placed)
-    Constraints:
-      - pawns never on 1st/8th rank for their color
-      - never exceed real caps per piece type per color
-      - board is valid and not immediately game-over
-      - if ensure_move, side to move has at least one legal move
-    """
-    if pieces < 6:
-        raise ValueError("pieces must be >= 6")
-    if pieces > 32:
-        raise ValueError("pieces must be <= 32")
-
-    # Max counts per color, mirroring real chess
-    cap = {
-        chess.PAWN: 8,
-        chess.KNIGHT: 2,
-        chess.BISHOP: 2,
-        chess.ROOK: 2,
-        chess.QUEEN: 1,
-    }
-    
-    if not queens:
-        cap[chess.QUEEN] = 0
-    
-    pool_piece_types = [
-        chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
-    ]
-    colors = [chess.WHITE, chess.BLACK]
-
-    # Squares where pawns are allowed
-    pawn_ok_squares = set([i for i in range(8, 56)])
-
-    # Weighted draw from the remaining bag
-    def draw_piece_type_and_color(rem_white, rem_black):
-        bag = []
-        # fill bag with counts so probability ∝ remaining allowed
-        for pt in pool_piece_types:
-            for _ in range(rem_white[pt]):
-                bag.append((pt, chess.WHITE))
-            for _ in range(rem_black[pt]):
-                bag.append((pt, chess.BLACK))
-        if not bag:
-            return None
-        return random.choice(bag)
-
-    # Place a non-pawn on any empty square; pawn on allowed rank squares
-    def place_piece(board, piece_type, color):
-        empties = [sq for sq in chess.SQUARES if board.piece_at(sq) is None]
-        if not empties:
-            return False
-
-        if piece_type == chess.PAWN:
-            candidates = [sq for sq in empties if sq in pawn_ok_squares]
-        else:
-            candidates = empties
-
-        if not candidates:
-            return False
-
-        sq = random.choice(candidates)
-        board.set_piece_at(sq, chess.Piece(piece_type, color))
-        return True
-
-    # Try until we get a valid, non-terminal position
-    for _ in range(1000):
-        board = chess.Board(None)
-
-        # Kings first (any distinct squares is fine; validity checked later)
-        
-        wk = random.choice(chess.SQUARES) if wk is None else wk
-        while True:
-            bk = random.choice(chess.SQUARES) if bk is None else bk
-            if bk != wk:
-                break
-            # prevents spinning forever
-            bk= None
-
-        board.set_piece_at(wk, chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(bk, chess.Piece(chess.KING, chess.BLACK))
-
-        # Remaining counts per color
-        rem_white = dict(cap)
-        rem_black = dict(cap)
-
-        # How many more to place
-        need = pieces - 2
-        ok_build = True
-
-        while need > 0 and ok_build:
-            choice = draw_piece_type_and_color(rem_white, rem_black)
-            if choice is None:
-                ok_build = False
-                break
-
-            pt, color = choice
-            placed = place_piece(board, pt, color)
-            if not placed:
-                # If we failed to place this kind, remove this option once
-                # by temporarily decrementing and continue; if it hits zero
-                # it won't be drawn again.
-                if color == chess.WHITE:
-                    if rem_white[pt] > 0:
-                        rem_white[pt] -= 1
-                else:
-                    if rem_black[pt] > 0:
-                        rem_black[pt] -= 1
-                continue
-
-            # Successful placement consumes from that color's pool
-            if color == chess.WHITE:
-                rem_white[pt] -= 1
-            else:
-                rem_black[pt] -= 1
-            need -= 1
-
-        if not ok_build or need != 0:
-            continue
-
-        # Randomize side to move
-        board.turn = random.choice(colors)
-
-        # Final validity checks
-        if not board.is_valid():
-            # try to flip the turn
-            board.turn = not board.turn
-            if not board.is_valid():
-                continue
-        
-        if board.is_game_over():
-            continue
-        if board.legal_moves.count() == 0:
-            continue
-        
-        return fastboard(board.fen()) if pyfast else board
-    
-    #if we made it here, it couldnt work
-    print("Unable to find valid board. Loosening requirements...")
-    next_pieces = max(6, pieces-1)
-    return random_board_setup(next_pieces, wk=None, bk=None, queens=False, pyfast=pyfast)
-
-
-def make_piece_odds_board():
-    b = chess.Board()
-    meta = {"scenario": "piece_odds", "removed": {"white": [], "black": []}}
-
-    remove_from = random.choice([chess.WHITE, chess.BLACK])
-    removable = [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN]
-    to_remove = random.choice(removable)
-    need_to_remove = np.random.randint(1, 4) if to_remove == chess.PAWN else 1
-
-    color_str = "white" if remove_from == chess.WHITE else "black"
-
-    for _ in range(need_to_remove):
-        # recompute candidates fresh each time (so we never hit an empty square)
-        pool = [sq for sq, pc in b.piece_map().items()
-                if pc.color == remove_from and pc.piece_type == to_remove]
-        if not pool:
-            break  # nothing left of this type/color. bail
-
-        sq = random.choice(pool)
-        pc = b.remove_piece_at(sq)
-        meta["removed"][color_str].append(pc.symbol())
-
-    return fastboard(b.fen()), meta
-
-
-def random_backrow_fen():
-    pieces = ["K", "Q", "R", "R", "B", "B", "N", "N"]
-
-    # shuffle to get a random white backrank
-    random.shuffle(pieces)
-    white_back = "".join(pieces)
-
-    random.shuffle(pieces)
-    black_back = "".join(pieces).lower()
-
-    # pawns and empty ranks standard; castling field '-' disables castling
-    fen = f"{black_back}/pppppppp/8/8/8/8/PPPPPPPP/{white_back} w - - 0 1"
-    return fen
-
-
-def make_piece_training_board():
-    fens = {
-        "rooks": "rrrrkrrr/pppppppp/8/8/8/8/PPPPPPPP/RRRRKRRR w - - 0 1",
-        "bishops": "bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/BBBBKBBB w - - 0 1",
-        "knights": "nnnnknnn/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "b_vs_k":"bbbbkbbb/pppppppp/8/8/8/8/PPPPPPPP/NNNNKNNN w - - 0 1",
-        "extra_queen": 'qnb1kbnq/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1',
-        "random_backrow": random_backrow_fen()
-    }
-    
-    pick = random.choice(list(fens.keys()))
-    board = chess.Board(fens[pick])
-    if np.random.uniform() < 0.5:
-        board = board.mirror()
-    return fastboard(board.fen()), {"scenario": f"pt_{pick}"}
-        
-
-class GameGenerator(object):
-    """ Curriculum game generator """
-    def __init__(self, cfg):
-        self.config = cfg
-        self.game_types = list(self.config.game_probs.keys())
-
-    def new_board(self, game_type=None):
-        # sanity check
-        if game_type is not None and game_type not in self.game_types:
-            raise ValueError(
-                f"Unknown game type {game_type}. "
-                f"Pick one of {self.game_types}")
-
-        # sample if not given
-        if game_type is None:
-            types, probs = zip(*self.config.game_probs.items())
-            game_type = random.choices(types, weights=probs, k=1)[0]
-
-        # dispatch
-        if game_type == "pre_opened":
-            board = get_pre_opened_game()
-            meta = {"scenario": "pre_opened"}
-        
-        elif game_type == "pre_opened_mini":
-            board = get_pre_opened_game(mini=True)
-            meta = {"scenario": "pre_opened_mini"}
-
-        elif game_type == "UHO":
-            board = create_UHO_PGN_game()
-            meta = {"scenario": "UHO"}
-        
-        elif game_type == "random_init":
-            plies = 2*np.random.randint(0, 4)
-            board = random_init(plies)
-            meta = {"scenario": "random_init", "start_plies": plies}
-            
-        elif game_type == "random_middle_game":
-            # just more plies of random_init to land mid-game
-            plies = np.random.randint(20, 31)
-            board = random_init(plies)
-            meta = {"scenario": "random_middle_game", "start_plies": plies}
-            
-        elif game_type == "random_endgame":
-            pieces = np.random.randint(8, 14)
-            wk = np.random.randint(0, 33)
-            bk = np.random.randint(33, 64)
-            board = random_board_setup(pieces, wk, bk, queens=False)
-            meta = {"scenario": "random_endgame", "pieces": pieces}
-            
-        elif game_type == "piece_odds":
-            board, meta = make_piece_odds_board()
-            
-        elif game_type == "piece_training":
-            board, meta = make_piece_training_board()
-            meta['scenario'] = 'piece_training'
-
-        elif game_type == "startpos":
-            board = fastboard()
-            meta = {'scenario': 'startpos'}
-            
-        else:
-            raise ValueError(f"unhandled game_type {game_type}")
-        
-        # quick check to make sure there are legal moves
-        if board.legal_moves():
-            return board, meta
-        # otherwise look for a new board
-        else:
-            return self.new_board(game_type=game_type)
-
-
 def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
     def _score_pov_cp(pov_score, white_to_move, mate_cp):
         s = pov_score.white() if white_to_move else pov_score.black()
@@ -1505,7 +1125,7 @@ def summarize_recent_games(recent, result_is_bot_pov=True):
     return stats, rows, sf_overall
 
 
-def print_recent_summary(recent, window=500, result_is_bot_pov=True):
+def print_recent_summary(recent, window=2000, result_is_bot_pov=True):
     """
     Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).
@@ -1530,15 +1150,17 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
         )
     print("-" * 60)
 
-    # bot vs Stockfish summary
-    def pct(n, d): return (n / d) if d else 0.0
+    # bot vs Stockfish summary (score: W=1, D=0.5, L=0)
     total = sf_overall["N"]
     w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]
-    win = pct(w, total)
     avg = (sf_overall["plies_sum"] / total) if total else 0.0
+
+    score_pts = w + 0.5 * d
+    score = (score_pts / total) if total else 0.0
+
     print(
         f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
-        f"win_rate={win:.1%}  avg_plies={avg:.1f}"
+        f"score={score:.3f}  avg_plies={avg:.1f}"
     )
 
     # compute counts: scenario -> wins (combine colors)
@@ -1557,7 +1179,9 @@ def print_recent_summary(recent, window=500, result_is_bot_pov=True):
 
     if wins_by_scenario:
         print("\nWins by scenario (SF games only):")
-        # sort by descending wins, then alphabetically
-        for s, c in sorted(wins_by_scenario.items(), key=lambda kv: (-kv[1], kv[0])):
+        for s, c in sorted(
+            wins_by_scenario.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        ):
             print(f"  {s:<30} {c}")
     print("~" * 60)

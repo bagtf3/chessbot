@@ -2,41 +2,49 @@ import json
 import math
 import os
 import time
+
 import numpy as np
 import yaml
 
-from pyfastchess import Board as fastboard
-from chessbot.config import Config
 from chessbot.mcts_utils import ChessGame
 import chessbot.utils as cbu
 
 VALIDATION_CONFIG_FILENAME = "validation_config.yaml"
 HISTORY_FILENAME = "validation_history.jsonl"
 V = "[validation]"
+DEFAULT_START_DEPTH = 10
 
 SF_TABLE_DEFAULT = [
-  {"depth": 1,  "elo": 1614, "name": "SF14d1"},
-  {"depth": 2,  "elo": 1699, "name": "SF14d2"},
-  {"depth": 3,  "elo": 1783, "name": "SF14d3"},
-  {"depth": 4,  "elo": 1853, "name": "SF14d4"},
-  {"depth": 5,  "elo": 1922, "name": "SF14d5"},
-  {"depth": 6,  "elo": 2002, "name": "SF14d6"},
-  {"depth": 7,  "elo": 2107, "name": "SF14d7"},
-  {"depth": 9,  "elo": 2336, "name": "SF14d9"},
-  {"depth": 12, "elo": 2644, "name": "SF14d12"},
-  {"depth": 14, "elo": 2727, "name": "SF14d14"},
-  {"depth": 16, "elo": 2810, "name": "SF14d16"},
-  {"depth": 18, "elo": 2847, "name": "SF14d18"},
-  {"depth": 21, "elo": 2903, "name": "SF14d21"},
-  {"depth": 25, "elo": 2965, "name": "SF14d25"},
-  {"depth": 30, "elo": 3043, "name": "SF14d30"}
+  {"depth": 1,  "elo": 1575, "name": "SF17d1"},
+  {"depth": 2,  "elo": 1745, "name": "SF17d2"},
+  {"depth": 3,  "elo": 1837, "name": "SF17d3"},
+  {"depth": 4,  "elo": 1984, "name": "SF17d4"},
+  {"depth": 5,  "elo": 2092, "name": "SF17d5"},
+  {"depth": 6,  "elo": 2245, "name": "SF17d6"},
+  {"depth": 7,  "elo": 2376, "name": "SF17d7"},
+  {"depth": 8,  "elo": 2567, "name": "SF17d8"},
+  {"depth": 9,  "elo": 2759, "name": "SF17d9"},
+  {"depth": 10, "elo": 2912, "name": "SF17d10"},
+  {"depth": 11, "elo": 3035, "name": "SF17d11"},
+  {"depth": 12, "elo": 3137, "name": "SF17d12"},
+  {"depth": 13, "elo": 3223, "name": "SF17d13"},
+  {"depth": 14, "elo": 3297, "name": "SF17d14"},
+  {"depth": 15, "elo": 3363, "name": "SF17d15"},
+  {"depth": 16, "elo": 3422, "name": "SF17d16"},
+  {"depth": 17, "elo": 3477, "name": "SF17d17"},
+  {"depth": 18, "elo": 3529, "name": "SF17d18"},
+  {"depth": 20, "elo": 3625, "name": "SF17d20"},
+  {"depth": 22, "elo": 3716, "name": "SF17d22"},
+  {"depth": 23, "elo": 3761, "name": "SF17d23"},
 ]
-
 
 def create_validation_config(cfg, yaml_file=None):
     vcfg = cfg.copy()
     vcfg.sf_table = SF_TABLE_DEFAULT
-    vcfg.sf_index = 0
+    vcfg.sf_index = next(
+        (i for i, row in enumerate(vcfg.sf_table) if row["depth"] >= DEFAULT_START_DEPTH),
+        len(vcfg.sf_table) - 1,
+    )
     vcfg.sf_depth = vcfg.sf_table[vcfg.sf_index]['depth']
     vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
     vcfg.consec_over_50 = 0
@@ -60,8 +68,9 @@ def create_validation_config(cfg, yaml_file=None):
 
     if prev_last is not None:
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
-    
+
     format_and_print_validation_info(vcfg, prev_last)
+    
     return vcfg
 
 
@@ -112,16 +121,17 @@ def continue_depth_from_previous_cfg(cfg, last_entry):
     the closest matching index in cfg.sf_table. Leaves cfg unchanged if
     nothing usable found.
     """
-
-    prev_index = last_entry.get("depth_index", 0)
+    prev_depth = last_entry.get("depth", 0)
     prev_bumped = last_entry["bumped"]
+    target_depth = prev_depth + (1 if prev_bumped else 0)
 
     n_rows = len(cfg.sf_table)
-    if prev_bumped:
-        new_index = min(n_rows-1, prev_index + 1)
-    else:
-        new_index = prev_index
-    
+    new_index = n_rows - 1
+    for i, row in enumerate(cfg.sf_table):
+        if row["depth"] >= target_depth:
+            new_index = i
+            break
+
     cfg.sf_index = new_index
     cfg.sf_depth = cfg.sf_table[cfg.sf_index]['depth']
     cfg.sf_elo = cfg.sf_table[cfg.sf_index]['elo']
@@ -155,23 +165,30 @@ def paired_validation_games(cfg):
     Return paired ChessGame instances for Stockfish validation.
 
     For each i in range(n):
-      - pick a random UHO premove path index
-      - build two identical fastboard positions from that index
+      - sample a UHO board using GameGenerator
+      - clone it
       - create two ChessGame objects where stockfish plays one as white
         and the other as black
     """
+    gen = cbu.GameGenerator(cfg)
 
     games = []
     n = cfg.n_games // 2
     for i in range(n):
-        board_white = cbu.create_UHO_PGN_game()
+        board_white, _ = gen.new_board(game_type="UHO")
         board_black = board_white.clone()
 
-        meta_w = {"vs_stockfish": True, "stockfish_is_white": True,
-                  "scenario": "paired_validation"}
-        
-        meta_b = {"vs_stockfish": True, "stockfish_is_white": False,
-                  "scenario": "paired_validation"}
+        meta_w = {
+            "vs_stockfish": True,
+            "stockfish_is_white": True,
+            "scenario": "paired_validation"
+        }
+
+        meta_b = {
+            "vs_stockfish": True,
+            "stockfish_is_white": False,
+            "scenario": "paired_validation"
+        }
 
         cg_w = ChessGame(board=board_white, meta=meta_w, cfg=cfg)
         cg_b = ChessGame(board=board_black, meta=meta_b, cfg=cfg)
@@ -250,13 +267,14 @@ def build_validation_summary(looper):
     bumped = False
     action = "none"
 
-    if consec >= 2:
+    dominant = (n >= min_games) and (score > 0.8)
+
+    if dominant or consec >= 2:
         if index < (len(table) - 1):
             bumped = True
-            action = "bumped_depth"
+            action = "bumped_depth_dominant" if dominant else "bumped_depth"
             consec = 0
         else:
-            # at max depth row do not advance
             action = "at_max_depth"
 
     # Do NOT persist the validation config file. Only append history.
@@ -284,6 +302,7 @@ def build_validation_summary(looper):
     # append to JSONL history (this will create the file if needed)
     append_validation_summary(looper.config.run_dir, summary)
     return summary
+
 
 
 def append_validation_summary(run_dir, summary):

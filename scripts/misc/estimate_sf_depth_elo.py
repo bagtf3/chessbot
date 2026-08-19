@@ -1,5 +1,6 @@
 from chessbot import SF_LOC  # do not change or rename this
-from chessbot.utils import get_pre_opened_game, format_time
+from chessbot.utils import format_time
+from chessbot.game_utils import get_pre_opened_game
 import chess
 import chess.engine
 import chess.pgn

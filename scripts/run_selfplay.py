@@ -1041,5 +1041,13 @@ if __name__ == "__main__":
         sys.exit(1)
 
     run_tag = sys.argv[1]
+
+    # --roundless runs the SelfPlayRunner instead of main(): no rounds, one
+    # queue, validation as a batch. Imported lazily so the default path is
+    # untouched. main() stays until the new one has proven itself.
+    if "--roundless" in sys.argv:
+        from chessbot.selfplay_runner import run_roundless
+        sys.exit(run_roundless(run_tag))
+
     main(run_tag)
     

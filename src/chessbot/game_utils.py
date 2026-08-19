@@ -3,7 +3,7 @@ import os
 import pickle
 import random
 import re
-from collections import namedtuple
+from collections import deque, namedtuple
 
 import chess
 import chess.pgn
@@ -31,6 +31,9 @@ GameSpec = namedtuple("GameSpec", ["fen", "moves", "meta", "cfg"])
 
 STARTPOS_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
+# dedup window for generated openings; the source corpora are finite so
+# this saturates, and an unbounded set just wastes retries on duplicates
+USED_FENS_CAP = 50000
 DEDUP_TYPES = frozenset({
     "UHO", "random_init", "random_middle_game", "random_endgame", "pre_opened"
 })
@@ -500,7 +503,12 @@ class GameGenerator:
         self.config = cfg
         self.game_types = list(cfg.game_probs.keys())
         self.sf_count = 0
+        # bounded: the source corpora (UHO pgn, pre_opened pkl path lists)
+        # are finite, so roundless this set saturates and the 20-attempt retry
+        # below burns 20 board rebuilds per game only to return a duplicate
+        # anyway. FIFO eviction keeps dedup useful over a moving window.
         self.used_fens = set()
+        self.used_fens_order = deque()
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
         self.sf_cap = int(cfg.play_vs_sf_prob * cfg.n_games)
 
@@ -620,11 +628,20 @@ class GameGenerator:
                     b.push_uci(mv)
                 key = short_fen(b.fen())
                 attempts += 1
-            self.used_fens.add(key)
+            self.remember_fen(key)
 
         self.assign_sf(meta)
         self.games_queued += 1
         return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
+
+    def remember_fen(self, key):
+        """FIFO-bounded dedup memory."""
+        if key in self.used_fens:
+            return
+        self.used_fens.add(key)
+        self.used_fens_order.append(key)
+        while len(self.used_fens_order) > USED_FENS_CAP:
+            self.used_fens.discard(self.used_fens_order.popleft())
 
     def next_blunder_replays(self, pool, n_to_queue, until_analysis=None,
                              current_epoch=None):
@@ -662,10 +679,13 @@ class GameGenerator:
 
         return specs
 
-    def validation_games(self, cfg=None):
+    def validation_games(self, cfg=None, n_pairs=None):
+        """n_pairs positions, each played from both sides -- 2*n_pairs specs.
+        Defaults to cfg.n_games // 2 for the old round-shaped caller, where
+        the whole round was the batch."""
         if cfg is None:
             cfg = self.config
-        n = cfg.n_games // 2  # pairs needed; each pair = 2 games, total = n_games
+        n = n_pairs if n_pairs is not None else cfg.n_games // 2
 
         val_probs = cfg.validation_game_probs
         types = list(val_probs.keys())

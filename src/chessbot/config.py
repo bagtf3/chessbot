@@ -16,6 +16,11 @@ class Config(object):
     # highest level params
     is_validation_run = False
     validation_every = 5
+    # roundless cadence: validation fires every N retrains as a discrete,
+    # non-overlapping batch. The ladder counts runs, not games, so
+    # overlapping batches would advance depth roughly twice as fast.
+    validate_every_n_retrains = 5
+    validation_games_per_batch = 256
     n_workers = 2
     n_rounds = 51
 

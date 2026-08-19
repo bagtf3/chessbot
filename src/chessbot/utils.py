@@ -1061,79 +1061,109 @@ class RateMeter(object):
         return rate
 
 
+def sf_bucket(vs_sf, sf_flag):
+    if not vs_sf:
+        return "none"
+    return "white" if sf_flag else "black"
+
+
+def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
+    """Fold one game's meta into running counters.
+
+    Every field summarize_recent_games reports is a counter, so the whole-run
+    view can be accumulated once per game rather than recomputed by rescanning
+    a retained list -- which is what makes "all games" O(1) memory roundless.
+    """
+    scenario = g.get("scenario", "unknown")
+    bucket = sf_bucket(g.get("vs_stockfish", False), g.get("stockfish_color"))
+    r = g.get("result", 0.0)
+    plies = int(g.get("plies", 0))
+
+    r_for_table = r
+    if not result_is_bot_pov:
+        bot_is_white = not bool(g.get("stockfish_color"))
+        r_for_table = r if bot_is_white else -r
+
+    s = stats[(scenario, bucket)]
+    s["N"] += 1
+    s["plies_sum"] += plies
+    if r_for_table > 0:
+        s["W"] += 1
+    elif r_for_table < 0:
+        s["L"] += 1
+    else:
+        s["D"] += 1
+
+    if not g.get("vs_stockfish", False):
+        return
+
+    sf_overall["N"] += 1
+    sf_overall["plies_sum"] += plies
+    if r == 0:
+        sf_overall["D"] += 1
+        return
+    # result is WHITE-POV: the bot won iff Stockfish lost
+    sf_is_white = bool(g.get("stockfish_color"))
+    bot_won = (r < 0) if sf_is_white else (r > 0)
+    if bot_won:
+        sf_overall["W"] += 1
+    else:
+        sf_overall["L"] += 1
+
+
+def order_stat_rows(stats):
+    """Scenario rows for display. paired_validation sinks to the bottom: it
+    is a measurement, not part of the training mix, and reads better after
+    the selfplay scenarios rather than alphabetised among them."""
+    bucket_order = {"white": 0, "black": 1, "none": 2}
+    return sorted(
+        stats.items(),
+        key=lambda kv: (kv[0][0] == "paired_validation", kv[0][0],
+                        bucket_order.get(kv[0][1], 99)),
+    )
+
+
 def summarize_recent_games(recent, result_is_bot_pov=True):
     """
     Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/D/L totals.
     For the SF totals we assume `result` is WHITE-POV:
       r > 0 => white won, r < 0 => black won, r == 0 => draw
     """
-    def sf_bucket(vs_sf, sf_flag):
-        if not vs_sf:
-            return "none"
-        return "white" if sf_flag else "black"
-
     stats = defaultdict(lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
-
-    # bot vs Stockfish totals only
     sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
-
     for g in recent:
-        scenario = g.get("scenario", "unknown")
-        bucket = sf_bucket(g.get("vs_stockfish", False), g.get("stockfish_color"))
-        key = (scenario, bucket)
+        accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov)
 
-        r = g.get("result", 0.0)
-
-        # scenario table: keep your existing semantics (bot-POV by default)
-        r_for_table = r
-        if not result_is_bot_pov:
-            sf_is_white = bool(g.get("stockfish_color"))
-            bot_is_white = not sf_is_white
-            r_for_table = r if bot_is_white else -r
-
-        s = stats[key]
-        s["N"] += 1
-        plies = int(g.get("plies", 0))
-        s["plies_sum"] += plies
-        if r_for_table > 0:
-            s["W"] += 1
-        elif r_for_table < 0:
-            s["L"] += 1
-        else:
-            s["D"] += 1
-
-        # bot vs SF: count bot wins by checking if SF lost (WHITE-POV logic)
-        if g.get("vs_stockfish", False):
-            sf_overall["N"] += 1
-            sf_overall["plies_sum"] += plies
-
-            sf_is_white = bool(g.get("stockfish_color"))
-            if r == 0:
-                sf_overall["D"] += 1
-            else:
-                bot_won = (r < 0) if sf_is_white else (r > 0)
-                if bot_won:
-                    sf_overall["W"] += 1
-                else:
-                    sf_overall["L"] += 1
-
-    bucket_order = {"white": 0, "black": 1, "none": 2}
-    rows = sorted(
-        stats.items(), key=lambda kv: (kv[0][0], bucket_order.get(kv[0][1], 99))
-    )
-
-    return stats, rows, sf_overall
+    return stats, order_stat_rows(stats), sf_overall
 
 
 def print_recent_summary(recent, window=2000, result_is_bot_pov=True):
+    """Window-slice entry point, kept for the legacy round-based caller."""
+    recent = recent[-window:]
+    stats, _rows, sf_overall = summarize_recent_games(
+        recent, result_is_bot_pov=result_is_bot_pov
+    )
+    wins = defaultdict(int)
+    for g in recent:
+        if not g.get("vs_stockfish", False):
+            continue
+        r = g.get("result", 0.0)
+        if r == 0:
+            continue
+        if (r < 0) if g.get("stockfish_color") else (r > 0):
+            wins[g.get("scenario", "unknown")] += 1
+    print_summary_from_stats(stats, sf_overall, wins_by_scenario=wins)
+
+
+def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
     """
     Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
     plus a wins-by-scenario breakdown (SF games only).
+
+    Takes counters rather than a games list, so a caller accumulating them
+    incrementally can report on every game ever played without retaining any.
     """
-    recent = recent[-window:]
-    stats, rows, sf_overall = summarize_recent_games(
-        recent, result_is_bot_pov=result_is_bot_pov
-    )
+    rows = order_stat_rows(stats)
 
     # scenario table (unchanged formatting)
     print(
@@ -1162,20 +1192,6 @@ def print_recent_summary(recent, window=2000, result_is_bot_pov=True):
         f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
         f"score={score:.3f}  avg_plies={avg:.1f}"
     )
-
-    # compute counts: scenario -> wins (combine colors)
-    wins_by_scenario = defaultdict(int)
-    for g in recent:
-        if not g.get("vs_stockfish", False):
-            continue
-        r = g.get("result", 0.0)
-        if r == 0:
-            continue
-        sf_is_white = g.get("stockfish_color")
-        bot_won = (r < 0) if sf_is_white else (r > 0)
-        if bot_won:
-            scenario = g.get("scenario", "unknown")
-            wins_by_scenario[scenario] += 1
 
     if wins_by_scenario:
         print("\nWins by scenario (SF games only):")

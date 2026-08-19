@@ -45,6 +45,7 @@ class GameLooper(object):
         self.active_games = []
         self.sf_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
+        self.sf_teardown_pending = False
         self.forest = MCTSForest()
 
         self.pull_from_queue()
@@ -65,10 +66,20 @@ class GameLooper(object):
         self.last_infer_end = None
 
 
-    def close(self):
+    def tear_down_sf(self):
+        """Drop the Stockfish engine. Safe to call when there is none.
+
+        Not just an RSS saving: the engine is built once from the config of
+        whichever spec first needed it, so a thread surviving a validation
+        batch would keep serving the old ladder depth after a bump. Tearing
+        it down is what makes the next batch pick the new depth up.
+        """
         if self.sf_thread is not None:
             self.sf_thread.close()
             self.sf_thread = None
+
+    def close(self):
+        self.tear_down_sf()
 
 
 
@@ -152,6 +163,15 @@ class GameLooper(object):
                 self.active_games = self.active_games[:self.config.games_at_once]
                 continue
 
+            if cmd == "tear_down_sf":
+                # never mid-game: an active vs_stockfish game still needs the
+                # engine, so defer and let the run loop retry
+                if any(g.vs_stockfish for g in self.active_games):
+                    self.sf_teardown_pending = True
+                else:
+                    self.tear_down_sf()
+                continue
+
             continue
 
     def pause_wait_and_reload(self):
@@ -209,8 +229,10 @@ class GameLooper(object):
                 except Exception:
                     break
             if spec.meta.get("vs_stockfish") and self.sf_thread is None:
+                # spec.cfg, not self.config: sf_depth is the ladder's, and it
+                # only ever exists on the validation config
                 self.sf_thread = StockfishThread(
-                    self.config.sf_config, self.config.sf_depth
+                    spec.cfg.sf_config, spec.cfg.sf_depth
                 )
                 self.sf_thread.start()
             game_cfg = spec.cfg
@@ -268,6 +290,13 @@ class GameLooper(object):
             if self.check_for_pause():
                 self.pause_wait_and_reload()
 
+            # a teardown that arrived mid-game retries here until the last
+            # vs_stockfish game has drained out
+            if self.sf_teardown_pending:
+                if not any(g.vs_stockfish for g in self.active_games):
+                    self.tear_down_sf()
+                    self.sf_teardown_pending = False
+
             # drain sf thread queue
             if self.sf_thread is not None:
                 sf_results = self.sf_thread.drain()
@@ -299,7 +328,8 @@ class GameLooper(object):
                         self.sf_games[game.game_id] = game
                         game.sf_pending = True
 
-                    if game.tree.sims_completed_this_move >= cfg.sf_move_sims:
+                    if (game.tree.sims_completed_this_move
+                            >= game.config.sf_move_sims):
                         if game.sf_pending and game.sf_ready:
                             # sets pending, ready, res_tup to False, False, None
                             sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
@@ -445,8 +475,9 @@ class GameLooper(object):
             game.recents.clear()
             return
 
-        # do not count extremely short games
-        if game.plies <= self.config.min_game_length:
+        # game.config, not self.config: validation pins min_game_length to 1 so
+        # an adjudicated game still reports and the batch can complete
+        if game.plies <= game.config.min_game_length:
             game.examples = []
             return
 
@@ -483,7 +514,7 @@ class GameLooper(object):
         }
 
         # add any per-game sampled param values (specific value used, not the options)
-        for param in self.config.sampleable:
+        for param in cfg.sampleable:
             val = getattr(cfg, param)
             if param == 'move_sample_temp_range' and isinstance(val, list):
                 mem_summary['move_sample_temp_min'] = val[0]

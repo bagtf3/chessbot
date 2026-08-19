@@ -215,17 +215,24 @@ def estimate_model_elo(sf_elo, score):
 
 
 def build_validation_summary(looper):
+    """Legacy entry point: a RecordKeeper carrying .recent_games and a
+    bolted-on .config. Kept while run_selfplay.main() is still live."""
+    return build_validation_summary_from_rows(looper.recent_games, looper.config)
+
+
+def build_validation_summary_from_rows(recent, cfg):
     """
     Build validation summary and apply the two-consecutive >50% bump rule.
 
-    Updates the in-memory cfg (ValidationConfig instance) but does not
-    write a validation_config file. Only history JSONL is appended.
+    Takes the batch's game metas plus the validation config directly, so the
+    roundless runner does not have to fake a RecordKeeper. The bump is only
+    ever recorded to history -- cfg is not mutated -- so the caller must
+    rebuild its validation config afterwards to pick the new depth up.
     """
-    recent = looper.recent_games
     sf_games = [g for g in recent if g.get("vs_stockfish")]
     n = len(sf_games)
     if n == 0:
-        raise RuntimeError("no stockfish games in looper.recent_games")
+        raise RuntimeError("no stockfish games in validation batch")
 
     wins = 0
     draws = 0
@@ -245,7 +252,7 @@ def build_validation_summary(looper):
 
     score = (wins + 0.5 * draws) / n
 
-    cfg_dict = looper.config.to_dict()
+    cfg_dict = cfg.to_dict()
     sf_elo = cfg_dict['sf_elo']
     table = cfg_dict["sf_table"]
     index = cfg_dict["sf_index"]
@@ -300,7 +307,7 @@ def build_validation_summary(looper):
     print(f"[sf results] sf_elo {sf_elo}  model_elo {model_elo:.1f}  bumped {bumped}")
 
     # append to JSONL history (this will create the file if needed)
-    append_validation_summary(looper.config.run_dir, summary)
+    append_validation_summary(cfg.run_dir, summary)
     return summary
 
 

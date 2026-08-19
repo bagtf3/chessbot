@@ -1,6 +1,10 @@
 import os, json, gzip, pathlib, time, random
 import pickle
-from collections import defaultdict
+
+# roundless the retained list would grow for the life of the process; the
+# counters carry the whole-run view, this is only for the last-50 line
+RECENT_GAMES_CAP = 20000
+from collections import defaultdict, deque
 
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
@@ -12,7 +16,10 @@ import numpy as np
 from chessbot import SF_LOC
 from chessbot.engines import lc0_analyze
 from chessbot.game_utils import reconcile_game_boards
-from chessbot.utils import print_recent_summary, format_time, compact_count
+from chessbot.utils import (
+    print_recent_summary, print_summary_from_stats, accumulate_game_stats,
+    format_time, compact_count,
+)
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
     score_to_value_stm_pov_tanh, rnd,
@@ -1808,7 +1815,15 @@ class RecordKeeper(object):
         self.primary_buffer_dir = None
         self.primary_buffer_trigger = 0
 
-        self.recent_games = []
+        # every stat summarize_recent_games computes is a counter (N/W/L/D/
+        # plies_sum), so the whole-run view accumulates in O(1) instead of
+        # re-scanning a retained list. recent_games stays for the legacy
+        # round-based path and for the last-50 runtime line, but is bounded:
+        # roundless it would otherwise grow for the life of the process.
+        self.recent_games = deque(maxlen=RECENT_GAMES_CAP)
+        self.scenario_stats = defaultdict(
+            lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
+        self.sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
         self.telemetry = {}
 
     def ingest_recents(self, recent):
@@ -1828,6 +1843,7 @@ class RecordKeeper(object):
             self.draws += 1
         
         self.recent_games.append(meta)
+        accumulate_game_stats(meta, self.scenario_stats, self.sf_overall)
 
     def ingest_telemetry(self, telemetry):
         # store the latest from each only.
@@ -1905,15 +1921,14 @@ class RecordKeeper(object):
             f"avg_len={avg_moves:.1f} moves")
         print("-" * 72)
 
-        recent = self.recent_games[-window:]
-        if not recent:
-            print("(no recent games to break down)")
+        if not self.games_finished:
+            print("(no games to break down)")
             print("~" * 72)
             self.log_loop_stats(summed, avged)
             return
 
-        # pretty printer
-        print_recent_summary(recent, window=window)
+        # counters cover the whole run, not the last `window` games
+        print_summary_from_stats(self.scenario_stats, self.sf_overall)
         primary_count = len(os.listdir(self.primary_buffer_dir)) if self.primary_buffer_dir else 0
         print(
             f"live buffer: {self.training_queue}  "
@@ -2015,7 +2030,7 @@ class RecordKeeper(object):
         print(f"{left6:<{col_width}} | {right6}")
         print(f"{left7:<{col_width}} | {right7}")
 
-        last50 = self.recent_games[-50:]
+        last50 = list(self.recent_games)[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
         avg_runtime = None
         if sum(durations) > 0:

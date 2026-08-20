@@ -6,6 +6,8 @@ combinations of side-to-move and who is winning, by mirroring: a position and
 its colour-mirror are the same position to a STM-relative encoder, so every
 target the rescorer builds for one must come out bit-identical to the other.
 """
+from collections import defaultdict
+
 import chess
 import numpy as np
 import pytest
@@ -51,6 +53,8 @@ def make_rescorer():
     r.live_buffer = FakeBuffer()
     r.kl_q50 = 0.0
     r.kl_q80 = 0.0
+    r.sample_counts = defaultdict(int)
+    r.sample_counts_window = defaultdict(int)
     return r
 
 
@@ -243,7 +247,8 @@ def test_equiv_targets_are_stm_pov(fen, stm_winning):
         ply = make_ply(pos_fen, ucis=cands, best_wdl=wdl_white_pov)
         assert r.add_equiv_replay_training_example(ply)
         x, policy, Y, source = sole_entry(r)
-        assert source == 'xc0_replay_equiv'
+        # an equiv-or-better probe is indistinguishable from a selfplay move
+        assert source == 'xc0'
         results.append((np.asarray(x), policy, Y))
 
     (x_w, pol_w, Y_w), (x_b, pol_b, Y_b) = results

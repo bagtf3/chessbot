@@ -2112,7 +2112,9 @@ class RecordKeeper(object):
         self.maybe_log_results()
 
     def get_agg_metrics(self, print_span=None):
-        time_delta = time.time() - 120
+        # three push windows of slack: at a 60s cadence a tighter filter drops
+        # a worker that is merely a second late and under-reports mps/lps
+        time_delta = time.time() - 180
 
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
@@ -2211,7 +2213,7 @@ class RecordKeeper(object):
         the selfplay numbers stay comparable across runs that do and do not
         have an lc0 worker."""
         fresh = [i for i in self.lc0_telemetry.values()
-                 if i.get("ts", 0) >= time.time() - 120]
+                 if i.get("ts", 0) >= time.time() - 180]
         if not fresh:
             return
 

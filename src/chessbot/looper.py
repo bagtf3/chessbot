@@ -573,7 +573,7 @@ class GameLooper(object):
         game.recents.clear()
         return
     
-    def maybe_push_telemetry(self, counts, pred_fill, mbs_used, every_sec=45.0, force=False):
+    def maybe_push_telemetry(self, counts, pred_fill, mbs_used, every_sec=60.0, force=False):
         ts_now = now()
         if not force:
             if ts_now - self.last_stats_log < every_sec:

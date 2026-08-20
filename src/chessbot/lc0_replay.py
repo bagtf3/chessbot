@@ -4,7 +4,8 @@ lc0 replay probe primitives: config, candidate filter, spec construction.
 Deliberately shares nothing with blunder_replay.py. xc0_BRP is a testing and
 validation-tracking feature with its own pool, ratchet and history; lc0_BRP is
 an oracle/teacher training feature. A position reaching lc0_BRP after failing
-an xc0_BRP is not a promotion and must not be tracked as one.
+an xc0_BRP is an escalation to a better teacher, not a promotion, and must
+not be tracked as one.
 """
 import os
 

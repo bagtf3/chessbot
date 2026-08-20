@@ -65,6 +65,8 @@ RESPAWN_COOLDOWN_S = 30.0
 # brief mop-up for SF work already in flight when an operator stops. Kept
 # short on purpose: anything unfinished is on disk and resumes next run.
 STOP_DRAIN_S = 5.0
+# the two worker fleets. Pause, respawn and status all address them by kind.
+WORKER_KINDS = ("xc0", "lc0")
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
@@ -153,6 +155,38 @@ def check_and_reap_procs(procs, registry, request_stop=False, grace_s=5.0,
     return kept
 
 
+HELP_TEXT = """[cmd] commands:
+  stop                  finish up, save data, exit
+  stop now              hard kill
+  no new games          drain what is in flight
+  pause [kind] [secs]   kind is xc0 or lc0; bare pause holds both
+  unpause [kind]        releases the operator hold on that fleet
+  add sf worker         one more SF rescore thread
+  kill sf worker        retire the oldest SF thread after its current game
+  full clear            drop all pauses, sf back to the config count
+  save training data N  snapshot N live-buffer samples
+  status                fleets, sf threads, pause state, backlog
+  help                  this"""
+
+
+def parse_kinds_and_dur(args):
+    """(kinds, duration) for a pause/unpause argument list.
+
+    A bare command addresses every fleet. Returns (None, None) on an
+    unrecognised fleet name so the caller can complain rather than silently
+    pausing everything.
+    """
+    kinds, dur = set(), None
+    for a in args:
+        if a.isdigit():
+            dur = int(a)
+        elif a in WORKER_KINDS:
+            kinds.add(a)
+        else:
+            return None, None
+    return (kinds or set(WORKER_KINDS)), dur
+
+
 def stdin_listener(controls, worker_procs):
     """Operator console. Takes the Controls it drives rather than reaching
     for module globals, so the listener and the runner provably share one
@@ -183,20 +217,49 @@ def stdin_listener(controls, worker_procs):
             controls.no_new_games.set()
 
         elif parts[0] == 'pause':
-            dur = int(parts[1]) if len(parts) > 1 else None
+            kinds, dur = parse_kinds_and_dur(parts[1:])
+            if kinds is None:
+                print(f"[cmd] unknown fleet: {' '.join(parts[1:])!r}",
+                      flush=True)
+                continue
             suffix = f" for {dur}s" if dur else ""
-            print(f"[cmd] pausing workers{suffix}", flush=True)
+            print(f"[cmd] pausing {'+'.join(sorted(kinds))}{suffix}",
+                  flush=True)
+            controls.pause_kinds |= kinds
             controls.pause.set()
             if dur:
-                def auto_unpause(d=dur):
+                def auto_unpause(d=dur, k=set(kinds)):
                     time.sleep(d)
                     print("[cmd] auto-unpause", flush=True)
+                    controls.unpause_kinds |= k
                     controls.unpause.set()
                 threading.Thread(target=auto_unpause, daemon=True).start()
 
-        elif cmd == 'unpause':
-            print("[cmd] unpausing workers", flush=True)
+        elif parts[0] == 'unpause':
+            kinds, _ = parse_kinds_and_dur(parts[1:])
+            if kinds is None:
+                print(f"[cmd] unknown fleet: {' '.join(parts[1:])!r}",
+                      flush=True)
+                continue
+            print(f"[cmd] unpausing {'+'.join(sorted(kinds))}", flush=True)
+            controls.unpause_kinds |= kinds
             controls.unpause.set()
+
+        elif ' '.join(parts[:3]) == 'add sf worker':
+            controls.add_sf_n += 1
+            print("[cmd] add sf worker requested", flush=True)
+
+        elif ' '.join(parts[:3]) == 'kill sf worker':
+            controls.kill_sf_n += 1
+            print("[cmd] kill sf worker requested", flush=True)
+
+        elif cmd == 'full clear':
+            print("[cmd] full clear -- dropping pauses, sf back to config",
+                  flush=True)
+            controls.full_clear.set()
+
+        elif cmd in ('help', '?'):
+            print(HELP_TEXT, flush=True)
 
         elif parts[0] == 'save' and ' '.join(parts[1:3]) == 'training data':
             n = int(parts[3]) if len(parts) > 3 else None
@@ -223,6 +286,16 @@ class Controls:
         self.save_training_data = threading.Event()
         self.save_training_data_n = None
         self.status = threading.Event()
+        self.full_clear = threading.Event()
+
+        # kinds accumulate rather than overwrite, so two commands typed inside
+        # one loop pass do not lose the first one
+        self.pause_kinds = set()
+        self.unpause_kinds = set()
+
+        # counts, not flags: repeated commands stack
+        self.add_sf_n = 0
+        self.kill_sf_n = 0
 
 
 class SelfPlayRunner:
@@ -274,25 +347,29 @@ class SelfPlayRunner:
         self.last_validated_epoch = None
 
         self.retrain_worker = None
-        self.workers_paused = False
+        # kinds actually paused right now, and the subset the operator is
+        # holding. Retrain may only release what it is not holding.
+        self.paused_kinds = set()
+        self.operator_paused = set()
         self.stop_signal_sent = False
         self.started_at = None
         self.next_worker_id = 0
         self.last_respawn_at = 0.0
 
+        self.sf_game_q = None
+        self.sf_res_q = None
+        self.next_sf_id = 0
+        # retired threads, still finishing the game they were mid-way through
+        self.sf_retiring = []
+
     def setup(self):
         """One-time startup: SF threads, rescorer, buffers, epoch counter."""
         cfg = self.base_cfg
 
-        sf_game_q = queue.Queue()
-        sf_res_q = queue.Queue()
-        self.sf_rescore_threads = [
-            SFRescoreThread(sf_game_q, sf_res_q, cfg)
-            for _ in range(max(1, cfg.rescore_n_sf_workers))
-        ]
-
-        for t in self.sf_rescore_threads:
-            t.start()
+        self.sf_game_q = sf_game_q = queue.Queue()
+        self.sf_res_q = sf_res_q = queue.Queue()
+        for _ in range(max(1, cfg.rescore_n_sf_workers)):
+            self.add_sf_thread()
 
         # one live in-RAM copy; the Rescorer mutates it and the replay
         # sampler reads it. Never crosses the process boundary. None when no
@@ -313,7 +390,7 @@ class SelfPlayRunner:
         migrate_pretrain_progress(cfg.run_dir)
 
         self.current_epoch = next_model_epoch(cfg.progress_csv_path)
-        self.recorder = RecordKeeper(self.current_epoch, every_sec=45.0)
+        self.recorder = RecordKeeper(self.current_epoch, every_sec=60.0)
         self.recorder.training_queue = len(self.rescorer.live_buffer)
         self.recorder.primary_buffer_dir = cfg.primary_buffer_dir
         self.recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
@@ -501,10 +578,6 @@ class SelfPlayRunner:
         """
         if not self.fleet_wanted():
             return 0
-        # a fresh worker starts unpaused and would contend for the GPU with
-        # whatever the pause was protecting; wait for the unpause
-        if self.workers_paused:
-            return 0
 
         now = time.monotonic()
         if now - self.last_respawn_at < RESPAWN_COOLDOWN_S:
@@ -516,6 +589,10 @@ class SelfPlayRunner:
             ("xc0", max(1, self.cfg.n_workers), self.spawn_worker),
             ("lc0", self.lc0_wanted(), self.spawn_lc0_worker),
         ):
+            # a fresh worker starts unpaused and would contend for the GPU
+            # with whatever the pause was protecting; wait for the unpause
+            if kind in self.paused_kinds:
+                continue
             if len(self.procs_of(kind)) >= target:
                 continue
             self.last_respawn_at = now
@@ -525,31 +602,41 @@ class SelfPlayRunner:
             return 1
         return 0
 
-    def broadcast(self, cmd):
+    def broadcast(self, cmd, kinds=None):
         for w in self.procs:
-            w["msg_q"].put(cmd)
+            if kinds is None or w["kind"] in kinds:
+                w["msg_q"].put(cmd)
 
-    def pause_workers(self, why):
-        """Broadcast a pause, but only when the workers are actually running.
+    def pause_workers(self, why, kinds=None):
+        """Pause the named fleets, idempotently.
 
-        Every pause and unpause goes through this pair. An unpause sent to a
-        running worker is not a no-op: the looper buffers it as
-        unpause_queued and the *next* pause is skipped, so the fleet plays
-        straight through a retrain. Pairing here is what prevents that.
+        Only kinds that are actually running are sent anything. An unpause
+        delivered to a running worker is not a no-op -- the looper buffers it
+        as unpause_queued and skips the *next* pause, playing straight through
+        a retrain -- so state is tracked here and never re-sent.
         """
-        if self.workers_paused:
+        kinds = set(kinds) if kinds else set(WORKER_KINDS)
+        todo = kinds - self.paused_kinds
+        if not todo:
             return False
-        self.broadcast("pause")
-        self.workers_paused = True
-        print(f"[runner] workers paused ({why})", flush=True)
+        self.broadcast("pause", todo)
+        self.paused_kinds |= todo
+        print(f"[runner] paused {'+'.join(sorted(todo))} ({why})", flush=True)
         return True
 
-    def unpause_workers(self, why):
-        if not self.workers_paused:
+    def unpause_workers(self, why, kinds=None):
+        """Release the named fleets, minus anything the operator is holding.
+
+        This filter is what stops a finishing retrain from silently undoing an
+        operator pause issued while it was in flight.
+        """
+        kinds = set(kinds) if kinds else set(WORKER_KINDS)
+        todo = (kinds & self.paused_kinds) - self.operator_paused
+        if not todo:
             return False
-        self.broadcast("unpause")
-        self.workers_paused = False
-        print(f"[runner] workers unpaused ({why})", flush=True)
+        self.broadcast("unpause", todo)
+        self.paused_kinds -= todo
+        print(f"[runner] unpaused {'+'.join(sorted(todo))} ({why})", flush=True)
         return True
 
     def top_up_queue(self, target=None):
@@ -740,24 +827,93 @@ class SelfPlayRunner:
         self.throttle_sf()
         self.recorder.training_queue = self.rescorer.training_data_size
 
+    def sf_target(self):
+        cfg = self.cfg or self.base_cfg
+        return max(1, cfg.rescore_n_sf_workers)
+
+    def add_sf_thread(self, why="config"):
+        """Start one SF rescore thread and append it to the tail.
+
+        Matches the fleet's current movetime rather than starting at base:
+        throttle state is read off thread 0, so a fresh thread left at base_ms
+        would never be resynced.
+        """
+        cfg = self.cfg or self.base_cfg
+        t = SFRescoreThread(self.sf_game_q, self.sf_res_q, cfg)
+        t.id = f"sf{self.next_sf_id}"
+        self.next_sf_id += 1
+        if self.sf_rescore_threads:
+            t.movetime_ms = self.sf_rescore_threads[0].movetime_ms
+        t.start()
+        self.sf_rescore_threads.append(t)
+        print(f"[sf] added {t.id} ({why}), now "
+              f"{len(self.sf_rescore_threads)} threads", flush=True)
+        return t.id
+
+    def retire_sf_thread(self, why="operator"):
+        """Retire the oldest thread. Asynchronous by design: the thread checks
+        its stop flag once per game, so joining here would block the run loop
+        for the length of a full analysis."""
+        if len(self.sf_rescore_threads) <= 1:
+            print("[sf] refusing to retire the last thread", flush=True)
+            return None
+        t = self.sf_rescore_threads.pop(0)
+        t.stop_ev.set()
+        self.sf_retiring.append(t)
+        print(f"[sf] retiring {t.id} ({why}), finishing its current game; "
+              f"{len(self.sf_rescore_threads)} threads left", flush=True)
+        return t.id
+
+    def reap_sf_threads(self):
+        """Quit the engine of any retired thread that has exited its loop.
+
+        run() does not quit the engine on the way out -- close() did that after
+        the join -- so the Stockfish process is only released here.
+        """
+        still = []
+        for t in self.sf_retiring:
+            if t.t is not None and t.t.is_alive():
+                still.append(t)
+                continue
+            if t.eng is not None:
+                t.eng.quit()
+                t.eng = None
+            print(f"[sf] {t.id} finished and gone", flush=True)
+        self.sf_retiring = still
+
     def throttle_sf(self):
-        """Back the SF budget off while the rescore backlog is deep."""
+        """Back the SF budget off while the rescore backlog is deep, and size
+        the fleet on the same marks: the config count is the resting state and
+        both levers snap back to it together."""
+        self.reap_sf_threads()
         backlog = len(self.rescorer.intake) + len(self.rescorer.pending)
         sf0 = self.sf_rescore_threads[0]
         # sync every pass so telemetry shows the threads' real state
         self.rescorer.current_movetime_ms = sf0.movetime_ms
         throttled = sf0.movetime_ms < sf0.base_ms
+        target = self.sf_target()
 
-        if backlog > 100 and not throttled:
+        if backlog > 100:
+            # one per pass, so a deep backlog ramps rather than storming
+            if len(self.sf_rescore_threads) < target:
+                self.add_sf_thread("backlog")
+            if throttled:
+                return
             for t in self.sf_rescore_threads:
                 t.movetime_ms = t.throttled_ms
-        elif backlog < 10 and throttled:
+        elif backlog < 10:
+            if len(self.sf_rescore_threads) > target:
+                self.retire_sf_thread("backlog cleared")
+            if not throttled:
+                return
             for t in self.sf_rescore_threads:
                 t.movetime_ms = t.base_ms
         else:
             return
 
-        self.rescorer.current_movetime_ms = sf0.movetime_ms
+        # re-read the head: a retirement above may have popped sf0
+        self.rescorer.current_movetime_ms = (
+            self.sf_rescore_threads[0].movetime_ms)
         print(f"[rescore] backlog {backlog}, movetime -> "
               f"{self.rescorer.current_movetime_ms}ms", flush=True)
 
@@ -767,6 +923,10 @@ class SelfPlayRunner:
 
     def maybe_launch_retrain(self):
         if self.retrain_worker is not None:
+            return
+        # an operator pause blocks retraining, and with it validation and the
+        # bulk BRP enqueue, both of which hang off poll_retrain
+        if self.operator_paused:
             return
         primary = rb.list_shard_files(self.cfg.primary_buffer_dir)
         if len(primary) < rb.PRIMARY_TRIGGER_SHARDS:
@@ -840,8 +1000,9 @@ class SelfPlayRunner:
         self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
 
         # hard rule: unpause as soon as training is done, the TRT rebuild in
-        # reload_config being the one unavoidable prerequisite. This releases
-        # an operator pause too -- holding it would stall the run forever.
+        # reload_config being the one unavoidable prerequisite. A pause the
+        # operator issued mid-retrain survives -- unpause_workers filters it
+        # out -- and blocks the next retrain until they clear it.
         self.unpause_workers("retrain complete")
 
         if ok:
@@ -888,17 +1049,33 @@ class SelfPlayRunner:
 
         if c.pause.is_set():
             c.pause.clear()
-            if not self.pause_workers("operator"):
-                print("[cmd] pause: workers are already paused, no-op",
-                      flush=True)
+            kinds, c.pause_kinds = c.pause_kinds, set()
+            self.operator_paused |= kinds
+            if not self.pause_workers("operator", kinds):
+                print("[cmd] pause: already paused, hold recorded", flush=True)
 
         # cleared whether or not anything was paused: left set it would latch
         # and cancel the next pause on the following pass
         if c.unpause.is_set():
             c.unpause.clear()
-            if not self.unpause_workers("operator"):
-                print("[cmd] unpause: workers are not paused, no-op",
-                      flush=True)
+            kinds, c.unpause_kinds = c.unpause_kinds, set()
+            # drop the hold first, or unpause_workers filters out the very
+            # kinds the operator is asking for
+            self.operator_paused -= kinds
+            if not self.unpause_workers("operator", kinds):
+                print("[cmd] unpause: nothing paused there, no-op", flush=True)
+
+        if c.full_clear.is_set():
+            c.full_clear.clear()
+            self.full_clear()
+
+        while c.add_sf_n > 0:
+            c.add_sf_n -= 1
+            self.add_sf_thread("operator")
+
+        while c.kill_sf_n > 0:
+            c.kill_sf_n -= 1
+            self.retire_sf_thread("operator")
 
         if c.save_training_data.is_set():
             c.save_training_data.clear()
@@ -907,6 +1084,26 @@ class SelfPlayRunner:
         if c.status.is_set():
             c.status.clear()
             self.report()
+
+    def full_clear(self):
+        """Drop every operator hold and return the SF fleet to the config.
+
+        A retrain in flight owns its own pause; releasing that would put the
+        workers back on the GPU underneath it, so the hold is dropped and the
+        unpause is left to the retrain's own completion path.
+        """
+        self.operator_paused = set()
+        if self.retrain_worker is not None:
+            print("[cmd] full clear: holds dropped, but a retrain is in "
+                  "flight -- it will unpause when it finishes", flush=True)
+        else:
+            self.unpause_workers("full clear")
+
+        while len(self.sf_rescore_threads) > self.sf_target():
+            if self.retire_sf_thread("full clear") is None:
+                break
+        while len(self.sf_rescore_threads) < self.sf_target():
+            self.add_sf_thread("full clear")
 
     def save_training_snapshot(self):
         data = self.rescorer.live_buffer.records
@@ -993,6 +1190,33 @@ class SelfPlayRunner:
               f"session ({gph:.1f}/hr) | {self.total_games:,} of "
               f"{self.cfg.n_games:,} budget", flush=True)
 
+        fleets = []
+        for kind, target in (("xc0", max(1, self.cfg.n_workers)),
+                             ("lc0", self.lc0_wanted())):
+            state = "paused" if kind in self.paused_kinds else "running"
+            if kind in self.operator_paused:
+                state = "paused(operator)"
+            fleets.append(f"{kind} {len(self.procs_of(kind))}/{target} {state}")
+        print(f"[status]  {' | '.join(fleets)}", flush=True)
+
+        retiring = f" +{len(self.sf_retiring)} retiring" if self.sf_retiring \
+            else ""
+        ids = ",".join(t.id for t in self.sf_rescore_threads)
+        backlog = len(self.rescorer.intake) + len(self.rescorer.pending)
+        print(f"[status]  sf {len(self.sf_rescore_threads)}/"
+              f"{self.sf_target()}{retiring} [{ids}] at "
+              f"{self.rescorer.current_movetime_ms}ms | backlog {backlog}",
+              flush=True)
+
+        if self.retrain_worker is not None:
+            retrain = "in flight"
+        elif self.operator_paused:
+            retrain = "blocked by operator pause"
+        else:
+            retrain = "idle"
+        print(f"[status]  retrain {retrain} | epoch {self.current_epoch}",
+              flush=True)
+
     def shutdown(self):
         if self.retrain_worker is not None and self.retrain_worker["p"].is_alive():
             self.retrain_worker["p"].terminate()
@@ -1008,8 +1232,9 @@ class SelfPlayRunner:
         self.rescorer.push_analyzed(report=True)
         # after the drain, never before: pending only empties as these threads
         # return results
-        for t in self.sf_rescore_threads:
+        for t in self.sf_rescore_threads + self.sf_retiring:
             t.close()
+        self.sf_retiring = []
         if self.rescorer.live_buffer.records:
             path = rb.sync_live_buffer(
                 self.base_cfg.run_dir, self.rescorer.live_buffer.records)

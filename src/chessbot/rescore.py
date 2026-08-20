@@ -121,6 +121,8 @@ class SFRescoreThread:
         self.stop_ev = threading.Event()
         self.t = None
         self.eng = None
+        # assigned by the runner, which owns the fleet and its numbering
+        self.id = None
 
     def submit_game(self, gid, positions, movetime_ms=None):
         info = {"movetime_ms": movetime_ms} if movetime_ms is not None else {}
@@ -307,6 +309,13 @@ class Rescorer(object):
 
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
+
+        # TEMPORARY lc0_BRP audit: teacher output sent through SF to score it.
+        # Remove this and its three call sites once lc0 quality is trusted.
+        self.lc0_audit = {}
+        self.lc0_audit_n = 0
+        self.lc0_audit_cpl = 0.0
+        self.lc0_audit_best = 0
 
         self.tscale_n = 0
         self.tscale_eligible = 0
@@ -864,6 +873,11 @@ class Rescorer(object):
             self.pending.pop(gid, None)
 
     def handle_game_results(self, gid, results, pool):
+        # TEMPORARY lc0_BRP audit, never enters self.pending
+        if gid in self.lc0_audit:
+            self.record_lc0_audit(gid, results)
+            return
+
         if gid not in self.pending:
             return
 
@@ -989,9 +1003,9 @@ class Rescorer(object):
             # not equiv -- found_equiv took everything at or under
             # BRP_EQUIV_CPL, so anything reaching here is still wrong
             elif ply is not None:
-                # past the cap the blend would be almost pure SF pointmass;
-                # hand it to the teacher instead. Not a promotion -- nothing
-                # about this is recorded on the pool record.
+                # past the cap the blend would be almost pure SF pointmass, so
+                # escalate to a better teacher instead. Nothing about this is
+                # recorded on the pool record.
                 if probe_cpl > self.config.brp_enqueue_max_cpl:
                     self.queue_brp_lc0_replay(src, short_fen_key)
                 else:
@@ -1000,10 +1014,6 @@ class Rescorer(object):
                 # probe_fails only seeds records the seed script never saw --
                 # new blunders enter the pool without an n_fails
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
-                if src['n_fails'] >= BRP_REVIEW_MIN_FAILS:
-                    self.write_brp_reviewable(
-                        brp_data, src, ply, best_uci, best_cp, played_cp,
-                        probe_cpl, best_depth)
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1131,10 +1141,12 @@ class Rescorer(object):
         if self.lc0_cfg is None or not castling_rights_clear(src['fen']):
             return None
 
+        # start_fen is where the path lands, not where it starts: uci_path is
+        # the whole prefix and there are no scored moves after it
         game_data = {
-            'start_fen': STARTPOS_FEN,
+            'start_fen': src['fen'],
             'moves_played': [],
-            'history_uci': list(src['uci_path']),
+            'history_uci': list(src.get('uci_path') or []),
             'game_id': src.get('game_id'),
         }
         aux = {'ply_i': 0, 'sfen': sfen, 'blend_cpl': src.get('cpl')}
@@ -1165,6 +1177,7 @@ class Rescorer(object):
 
         tree_data = meta.get('tree_search_data') or {}
         n = 0
+        audit = []
         for k, mv in enumerate(meta.get('moves_played') or []):
             # collect_tree_search_data runs before plies is bumped, so the
             # search at moves_played[k] is stored under k, not k + 1
@@ -1172,11 +1185,43 @@ class Rescorer(object):
             if tr:
                 if self.add_lc0_replay_training_example(board, tr):
                     n += 1
+                cm = tr.get('candidate_moves') or []
+                if cm:
+                    top = max(cm, key=lambda c: int(c['visits']))['uci']
+                    audit.append((k, chess.Board(board.fen()), top))
             board.push_uci(mv)
+
+        self.submit_lc0_audit(meta.get('game_id'), audit)
 
         self.sample_counts['lc0_samples'] += n
         self.sample_counts_window['lc0_samples'] += n
         return n
+
+    def submit_lc0_audit(self, game_id, positions):
+        """TEMPORARY. Score the teacher's own moves with SF, same budget and
+        throttle as normal rescoring. Prefixed gid so it cannot collide with
+        a real game in self.pending."""
+        if not positions:
+            return
+        gid = f"lc0aud_{game_id}"
+        self.lc0_audit[gid] = True
+        self.game_q.put((gid, positions, {}))
+
+    def record_lc0_audit(self, gid, results):
+        """TEMPORARY. rerun is False exactly when the move we submitted was
+        SF's own best, which is the best-move rate for free."""
+        self.lc0_audit.pop(gid, None)
+        for r in results:
+            self.lc0_audit_n += 1
+            self.lc0_audit_cpl += max(0.0, r['best_cp'] - r['played_cp'])
+            if not r.get('rerun'):
+                self.lc0_audit_best += 1
+
+            if self.lc0_audit_n % 100 == 0:
+                avg = self.lc0_audit_cpl / self.lc0_audit_n
+                bmr = 100.0 * self.lc0_audit_best / self.lc0_audit_n
+                print(f"{RS} [lc0 audit] n={self.lc0_audit_n} "
+                      f"avg_cpl={avg:.1f} bmr={bmr:.1f}%", flush=True)
 
     def add_lc0_replay_training_example(self, board, tr):
         """Teacher visits straight to policy: no clip, no uniform_eps, just a
@@ -1266,8 +1311,10 @@ class Rescorer(object):
         x = self.encode_board(board)
         okey = self.opening_counts.key(board, x)
         self.opening_counts.bump(okey)
+        self.sample_counts['accepted'] += 1
+        self.sample_counts_window['accepted'] += 1
         self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, 1.0, pwht, 'xc0_replay_equiv'),
+            (x, None, sparsify_policy(policy), Y, 1.0, pwht, 'xc0'),
             okey)
         return True
 
@@ -1332,6 +1379,9 @@ class Rescorer(object):
         x = self.encode_board(board)
         okey = self.opening_counts.key(board, x)
         self.opening_counts.bump(okey)
+        for c in (self.sample_counts, self.sample_counts_window):
+            c['accepted'] += 1
+            c['blended'] += 1
         # distinct source tag so retrain_worker.py can exclude these blended
         # synthetic-target samples from the validation draw
         self.live_buffer.append(

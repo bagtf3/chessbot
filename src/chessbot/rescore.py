@@ -829,11 +829,10 @@ class Rescorer(object):
         # search (the hit skips Stockfish, not the probe's own MCTS) and can
         # bank a training example like any other outcome.
         if pool is not None and short_fen_key in pool:
-            # reuse bar is well above the store bar for this run: probes
-            # search to 24, so a shallower cached answer is not worth skipping
-            # a fresh search for
+            # reuse bar matches the probe depth, so anything a probe stores is
+            # reusable by the next one and nothing shallower short-circuits it
             hit = cached_deep_score(
-                pool[short_fen_key], xerces_uci, 22)
+                pool[short_fen_key], xerces_uci, 20)
             if hit is not None:
                 self.games_seen.add(gid)
                 ply_states = game_state['ply_states']
@@ -858,7 +857,7 @@ class Rescorer(object):
             game_state['waiting'] = True
             # flat depth, no time cap -- probes take as long as they take. The
             # sf_ms ratchet is left in place but never fires at this depth.
-            self.game_q.put((gid, to_sf_positions, {"depth": 24}))
+            self.game_q.put((gid, to_sf_positions, {"depth": 20}))
         else:
             # should never get here (every replay has exactly one move), but
             # if it does, pop instead of leaking a permanent pending slot

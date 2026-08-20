@@ -29,6 +29,9 @@ from chessbot.utils import RateMeter, sf_eval, next_model_epoch
 RATE_EMA_SPAN = 8
 SPM_EMA_SPAN = 3
 
+# priors-cache fields that accumulate in C++ rather than reading as a gauge
+CACHE_COUNTERS = ("queries", "hits", "evictions")
+
 
 def ema_step(prev, x, span):
     """Seeded on the first sample so the series does not crawl up from zero."""
@@ -74,6 +77,8 @@ class GameLooper(object):
         self.mps_ema = None
         self.lps_ema = None
         self.spm_ema = None
+        self.cache_hit_ema = None
+        self.cache_prev = {}
         self.last_stats_log = now()
         self.prediction_times = []
         self.infer_gaps = []
@@ -644,9 +649,27 @@ class GameLooper(object):
         if tm["pred_wait"]:
             tm["preds_per_second"] = tm["apl"] / tm["pred_wait"]
 
+        # size and capacity are gauges; queries, hits and evictions are C++
+        # counters that only reset at retrain, so they ship as per-window
+        # deltas. A counter that went backwards means that reset happened.
         pcs = priors_cache_stats()
         for k, v in pcs.items():
-            tm[f"cache_{k}"] = v
+            if k in CACHE_COUNTERS:
+                prev = self.cache_prev.get(k, 0)
+                tm[f"cache_{k}"] = v - prev if v >= prev else v
+                self.cache_prev[k] = v
+            else:
+                tm[f"cache_{k}"] = v
+
+        # smoothed on the ratio rather than the counts, so it stays meaningful
+        # whatever the window length was
+        d_q = tm.get("cache_queries", 0)
+        if d_q:
+            self.cache_hit_ema = ema_step(
+                self.cache_hit_ema, tm.get("cache_hits", 0) / d_q,
+                RATE_EMA_SPAN)
+        if self.cache_hit_ema is not None:
+            tm["cache_hit_ema"] = self.cache_hit_ema
 
         self.telemetry_q.put({
             "looper_id": self.id, "telemetry": tm,

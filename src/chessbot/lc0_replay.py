@@ -72,19 +72,35 @@ def create_lc0_replay_config(cfg, yaml_file=None):
     return pcfg
 
 
+def traces_to_startpos(prefix, start_fen):
+    """Whether replaying prefix from STARTPOS actually reaches start_fen.
+
+    history_uci is relative to the board's own start, so piece_odds,
+    piece_training and random_init seed a custom fen and never trace back.
+    """
+    board = fastboard()
+    for uci in prefix:
+        if uci not in board.legal_moves():
+            return False
+        board.push_uci(uci)
+    return board.fen() == start_fen
+
+
 def replay_path(game_data, ply_i):
     """(fen, moves) reaching the position before moves_played[ply_i].
 
-    Prefers the STARTPOS path so lc0's history planes are real; scenarios
-    seeded partway through fall back to start_fen plus this game's own moves.
+    Prefers the STARTPOS path so lc0's history planes are real, but only once
+    the prefix is shown to land on start_fen.
     """
     moves_played = game_data['moves_played']
-    history = game_data.get('history_uci')
-    if history:
-        prefix_len = len(history) - len(moves_played)
-        if prefix_len >= 0:
-            return STARTPOS_FEN, list(history[:prefix_len + ply_i])
-    return game_data['start_fen'], list(moves_played[:ply_i])
+    history = game_data.get('history_uci') or []
+    start_fen = game_data['start_fen']
+
+    prefix_len = len(history) - len(moves_played)
+    if prefix_len > 0 and traces_to_startpos(history[:prefix_len], start_fen):
+        return STARTPOS_FEN, list(history[:prefix_len + ply_i])
+
+    return start_fen, list(moves_played[:ply_i])
 
 
 def lc0_replay_spec(cfg, game_data, ply_i, sfen, meta_extra=None):

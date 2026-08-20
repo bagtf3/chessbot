@@ -2130,7 +2130,7 @@ class RecordKeeper(object):
         sum_seen = set()
 
         to_avg = ["mbs", "batch_target", "apl", "infer_gap", "pred_wait",
-                  "avg_ply", "spm"]
+                  "avg_ply", "spm", "cache_hit_ema"]
         avged = defaultdict(list)
         avg_seen = set()
 
@@ -2226,9 +2226,8 @@ class RecordKeeper(object):
 
         spm = np.mean([i.get("spm", 0.0) for i in fresh])
         batch = np.mean([i.get("apl", 0.0) for i in fresh])
-        q = sum(i.get("cache_queries", 0) for i in fresh)
-        h = sum(i.get("cache_hits", 0) for i in fresh)
-        hit = f"{100.0 * h / q:.1f}%" if q else "--"
+        rates = [i["cache_hit_ema"] for i in fresh if "cache_hit_ema" in i]
+        hit = f"{100.0 * np.mean(rates):.1f}%" if rates else "--"
 
         print(f"[lc0 queue]   backlog={self.lc0_backlog}  "
               f"probes_done={self.lc0_probes_done}  sims/move={spm:.0f}  "
@@ -2304,8 +2303,10 @@ class RecordKeeper(object):
         left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.1f}"
         right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
 
+        priors_hit = 100.0 * avged.get("cache_hit_ema", 0.0)
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+        right6 = (f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+                  f"  priors={priors_hit:.1f}%")
 
         # EMA of the live rate, not the run average: this should move when
         # validation or a hard probe changes what the search is doing

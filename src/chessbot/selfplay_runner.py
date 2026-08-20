@@ -62,6 +62,9 @@ VAL_BATCH_TIMEOUT_S = 7200.0
 WORKER_PAUSE_SETTLE_S = 10.0
 # a worker that dies on startup would otherwise be respawned every loop pass
 RESPAWN_COOLDOWN_S = 30.0
+# brief mop-up for SF work already in flight when an operator stops. Kept
+# short on purpose: anything unfinished is on disk and resumes next run.
+STOP_DRAIN_S = 5.0
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
@@ -996,7 +999,12 @@ class SelfPlayRunner:
         if self.val_pending:
             self.close_partial_validation_batch("shutdown")
 
-        self.drain_rescorer()
+        # Only on a stop. The run loop will not exit on its own until
+        # rescore_outstanding() is zero, so draining the natural path again
+        # here would always be a no-op.
+        if self.controls.stop.is_set():
+            self.drain_rescorer(STOP_DRAIN_S)
+
         self.rescorer.push_analyzed(report=True)
         # after the drain, never before: pending only empties as these threads
         # return results
@@ -1018,7 +1026,7 @@ class SelfPlayRunner:
                 + len(self.rescorer.blunder_replay_intake)
                 + len(self.rescorer.pending))
 
-    def drain_rescorer(self, timeout_s=300.0):
+    def drain_rescorer(self, timeout_s=STOP_DRAIN_S):
         """Finish the SF work already in flight before exiting.
 
         The rescorer never signals "done" -- it is drained when the four

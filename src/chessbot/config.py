@@ -22,6 +22,11 @@ class Config(object):
     validation_games_per_batch = 256
     n_workers = 2
 
+    # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
+    # its own queue and is counted separately from the selfplay workers.
+    n_lc0_workers = 0
+    telemetry_kind = "xc0"
+
     # per-game parameter sampling; resolved once per game in the main process.
     # each entry: param_name: [list of options to pick from].
     # only 1st-order scalar params are supported (no nested keys).
@@ -87,6 +92,14 @@ class Config(object):
     rescore_blunder_cp_loser = 90
     rescore_blunder_cp_winner = 200
     rescore_n_sf_workers = 1
+
+    # SF weight in the xc0/SF-pointmass blend, ramped across the CPL band
+    # between the clip points. Both replay paths and normal rescoring share it.
+    rescore_blend_alpha_min = 0.10
+    rescore_blend_alpha_max = 0.85
+    # above this CPL an xc0 replay probe is not trained on at all -- the
+    # position goes to the teacher instead
+    brp_enqueue_max_cpl = 90
 
     # target replay positions GameGenerator spreads across each round,
     # metered against real games queued/completions -- not a flood

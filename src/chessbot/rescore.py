@@ -20,7 +20,6 @@ from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
     calc_entropy, batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
 )
-from chessbot.lc0_utils import lc0_logits_to_xc0_batch, lc0_table_index
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
 )
@@ -38,9 +37,11 @@ from chessbot.blunder_replay import (
     BRP_REVIEW_MIN_FAILS, BRP_REVIEWABLES_FILENAME, probe_fails,
 )
 
-from chessbot.game_utils import reconcile_game_boards, short_fen
+from chessbot.lc0_replay import (
+    STARTPOS_FEN, castling_rights_clear, lc0_replay_spec,
+)
 
-from xerces_training.uci_to_idx import uci_to_idx as UCI_TO_IDX
+from chessbot.game_utils import reconcile_game_boards, short_fen
 
 RS = "[rescore]"
 BRP_MERGE_EVERY = 512
@@ -86,102 +87,12 @@ def count_jsonl_lines(path):
 def plot_source(source):
     """Collapse a record's provenance tag to a plot bucket. SEED_SOURCE and
     the untagged tfrec.gz records are both pretrain-distribution data, so both
-    read as historic; the lc0_pv/lc0_blunder/lc0_enrich split survives only in
-    the print_sample_stats counters."""
+    read as historic. Every teacher record is tagged plain 'lc0'."""
     if source is None or source == SEED_SOURCE:
         return 'historic'
     if source.startswith('lc0'):
         return 'lc0'
     return 'xc0'
-
-
-class Lc0Thread:
-    """
-    Synchronous batcher for LC0 distillation inference.
-
-    Accumulates (112,8,8) uint8 feature arrays until batch_size is reached,
-    then runs a single ORT forward pass and converts results to XC0 training
-    samples. No real thread — flushes inline to share the caller's GPU context
-    rather than spawning a competing CUDA stream.
-
-    batch_size is the primary GPU-contention lever: larger = less frequent
-    inference interruptions to the selfplay workers.
-    """
-
-    def __init__(self, ort_session, batch_size=64):
-        self.sess       = ort_session
-        self.batch_size = batch_size
-        self.pending    = []   # (features_uint8, lc0_idx, xc0_idx, x, vwht, pwht)
-        self.results    = []   # completed (x, xc0_policy, lc0_wdl, vwht, pwht)
-        self.n_inferences = 0
-        self.n_samples    = 0
-
-        # discover input/output names from session metadata once
-        inputs  = self.sess.get_inputs()
-        outputs = self.sess.get_outputs()
-        self.input_name   = inputs[0].name
-        self.output_names = [o.name for o in outputs]
-
-    def submit(self, features_uint8, board, x, vwht, pwht):
-        ti   = lc0_table_index(features_uint8)
-        ucis = board.legal_moves()
-        lc0_idx = np.array([UCI_TO_IDX[ti][u.rstrip('n')] for u in ucis], dtype=np.int32)
-        xc0_idx = np.array(board.moves_to_indices(ucis), dtype=np.int32)
-        self.pending.append((features_uint8, lc0_idx, xc0_idx, x, vwht, pwht))
-        if len(self.pending) >= self.batch_size:
-            self.flush()
-
-    def flush(self):
-        if not self.pending:
-            return
-        batch        = self.pending
-        self.pending = []
-
-        feats = np.stack([item[0] for item in batch]).astype(np.float32)
-        feats[:, 109] /= 99.0  # rule50 plane: raw halfmove clock -> [0,1]
-
-        outs   = self.sess.run(self.output_names, {self.input_name: feats})
-        logits = outs[0]  # (N, 1858) policy logits
-        wdl    = outs[1]  # (N, 3) WDL probs, STM-POV
-
-        lc0_idx_list = [item[1] for item in batch]
-        xc0_idx_list = [item[2] for item in batch]
-        xc0_policies = lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list)
-
-        for i, item in enumerate(batch):
-            _, _, _, x, vwht, pwht = item
-            # No legal-move mask: lc0_logits_to_xc0_batch scatters into a zeroed
-            # (n, 1858) at exactly this board's legal indices, so the row is
-            # already zero outside the legal set. The old `* mask` was a no-op
-            # that also promoted float32 -> float64, since the mask arrived as a
-            # python list. The renormalise stays -- it still matters when a
-            # position has no legal moves, and when two ucis collide on one
-            # xc0 index.
-            policy = xc0_policies[i].copy()
-            s = policy.sum()
-            if s > 0:
-                policy /= s
-            self.results.append((
-                x,
-                policy,
-                np.array(wdl[i], dtype=np.float32),
-                vwht, pwht,
-            ))
-
-        self.n_inferences += 1
-        self.n_samples    += len(batch)
-
-    def drain(self):
-        out          = self.results
-        self.results = []
-        return out
-
-    def stats(self):
-        return {
-            'inferences': self.n_inferences,
-            'samples':    self.n_samples,
-            'pending':    len(self.pending),
-        }
 
 
 class SFRescoreThread:
@@ -248,14 +159,21 @@ class SFRescoreThread:
             gid, positions, info = item
             results = []
 
+            # read both keys before the loop rebinds info to an analyse result
             movetime_ms = info.get("movetime_ms", self.movetime_ms)
+            fixed_depth = info.get("depth")
 
-            pass1_limit = chess.engine.Limit(
-                time= movetime_ms/ 1000.0, depth=self.max_depth)
+            if fixed_depth:
+                # replay probes run to a flat depth with no time cap
+                pass1_limit = chess.engine.Limit(depth=fixed_depth)
+                pass2_limit = pass1_limit
+            else:
+                pass1_limit = chess.engine.Limit(
+                    time= movetime_ms/ 1000.0, depth=self.max_depth)
 
-            # longer search for pass2 because Xc0 move may be better
-            pass2_limit = chess.engine.Limit(
-                time=(movetime_ms + 20)/ 1000.0, depth=self.max_depth)
+                # longer search for pass2 because Xc0 move may be better
+                pass2_limit = chess.engine.Limit(
+                    time=(movetime_ms + 20)/ 1000.0, depth=self.max_depth)
             
             try:
                 for ply_idx, board, xerces_uci in positions:
@@ -384,8 +302,8 @@ class Rescorer(object):
         self.window_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0,
-            'lc0_blunder': 0, 'lc0_inacc': 0, 'lc0_pv': 0, 'lc0_enrich': 0}
+            'total': 0, 'accepted': 0, 'blended': 0,
+            'lc0_queued': 0, 'lc0_samples': 0}
 
         self.sample_counts = zero_sc()
         self.sample_counts_window = zero_sc()
@@ -414,27 +332,11 @@ class Rescorer(object):
         # 1:1 replay trickle meter -- drained by top_up_queues
         self.brp_credits = 0
 
-        lc0_model = cfg.lc0_distill_model_name or os.getenv('LC0_DISTILL_MODEL', '')
-        lc0_trt_cache = os.getenv('LC0_DISTILL_TRT_CACHE', '')
-        self.lc0_thread = None
-        if lc0_model and lc0_trt_cache:
-            from chessbot.lc0_utils import make_lc0_trt_session
-            batch_size = cfg.lc0_distill_batch_size
-            lc0_onnx = os.path.join(lc0_trt_cache, f'{lc0_model}.onnx')
-            sess = make_lc0_trt_session(
-                lc0_onnx, lc0_model, lc0_trt_cache,
-                opt_batch=batch_size, max_batch=batch_size * 2)
-            
-            # Hard-fail if TRT didn't load
-            # silent CPU fallback would silently bottleneck training.
-            active = sess.get_providers()[0]
-            if active != 'TensorrtExecutionProvider':
-                msg = f"{RS} Lc0Thread TRT failed, got {active}."
-                msg += " Check CUDA/TRT DLLs in PATH."
-                raise RuntimeError(msg)
-            
-            self.lc0_thread = Lc0Thread(sess, batch_size=batch_size)
-            print(f"{RS} Lc0Thread: TRT batch_size={batch_size}")
+        # teacher probes staged here; the runner drains them onto lc0_q.
+        # lc0_cfg stays None when the run has no lc0 fleet, which turns
+        # queue_lc0_replay into a no-op and leaves every ply on the blend path.
+        self.lc0_pending = []
+        self.lc0_cfg = None
 
         self.init_analyzer()
 
@@ -569,15 +471,6 @@ class Rescorer(object):
         return n
 
     def tick(self, pool=None):
-        if self.lc0_thread is not None:
-            # Lc0Thread yields (x, policy, wdl, vwht, pwht); normalise to the
-            # 7-slot record schema rather than appending it raw. Unreachable in
-            # practice -- the game path flushes and drains before this runs.
-            for x, policy, wdl, vwht, pwht in self.lc0_thread.drain():
-                self.live_buffer.append(
-                    (x, None, sparsify_policy(policy), wdl, vwht, pwht,
-                     'lc0_enrich'), REWEIGHT_INELIGIBLE)
-
         # drain completed game batches from SF threads
         while True:
             try:
@@ -748,11 +641,10 @@ class Rescorer(object):
             'rescore_equiv_min', 'rescore_equiv_max',
             'rescore_blunder_cp_loser',
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
-            'inaccuracy_downweight',
             'uniform_eps', 'prior_clip_max',
             'rescore_analyze_batch',
             'draw_value_scale',
-            'vscale', 'lc0_enrich_frac', 'lc0_enrich_weight'
+            'vscale',
         )
 
         game_state = {
@@ -875,8 +767,8 @@ class Rescorer(object):
             game_state['waiting'] = True
             # validation games are the cleanest quality signal there is --
             # high sims, no training use -- so they buy a deeper SF pass than
-            # selfplay. Blunder replays never come through here; they carry
-            # their own per-position ramp off the pool cache.
+            # selfplay. Blunder replays never come through here; they submit
+            # a flat depth instead of any movetime.
             info = {}
             if is_validation_game and cfg.rescore_movetime_validation_ms:
                 info["movetime_ms"] = cfg.rescore_movetime_validation_ms
@@ -937,8 +829,11 @@ class Rescorer(object):
         # search (the hit skips Stockfish, not the probe's own MCTS) and can
         # bank a training example like any other outcome.
         if pool is not None and short_fen_key in pool:
+            # reuse bar is well above the store bar for this run: probes
+            # search to 24, so a shallower cached answer is not worth skipping
+            # a fresh search for
             hit = cached_deep_score(
-                pool[short_fen_key], xerces_uci, BRP_MIN_CACHE_DEPTH)
+                pool[short_fen_key], xerces_uci, 22)
             if hit is not None:
                 self.games_seen.add(gid)
                 ply_states = game_state['ply_states']
@@ -961,15 +856,9 @@ class Rescorer(object):
         if to_sf_positions:
             self.n_sf_submitted += len(to_sf_positions)
             game_state['waiting'] = True
-            sf_ms = BRP_START_MS
-            if pool is not None and short_fen_key in pool:
-                src = pool[short_fen_key]
-                if not src.get('sf_ms'):
-                    src['sf_ms'] = BRP_START_MS
-                    self.n_pool_changes += 1
-                    self.maybe_save_pool(pool)
-                sf_ms = src['sf_ms']
-            self.game_q.put((gid, to_sf_positions, {"movetime_ms": sf_ms}))
+            # flat depth, no time cap -- probes take as long as they take. The
+            # sf_ms ratchet is left in place but never fires at this depth.
+            self.game_q.put((gid, to_sf_positions, {"depth": 24}))
         else:
             # should never get here (every replay has exactly one move), but
             # if it does, pop instead of leaking a permanent pending slot
@@ -1101,8 +990,14 @@ class Rescorer(object):
             # not equiv -- found_equiv took everything at or under
             # BRP_EQUIV_CPL, so anything reaching here is still wrong
             elif ply is not None:
-                added_to_buffer = self.add_blunder_replay_training_example(
-                    ply, epoch, best_uci, best_cp, probe_cpl)
+                # past the cap the blend would be almost pure SF pointmass;
+                # hand it to the teacher instead. Not a promotion -- nothing
+                # about this is recorded on the pool record.
+                if probe_cpl > self.config.brp_enqueue_max_cpl:
+                    self.queue_brp_lc0_replay(src, short_fen_key)
+                else:
+                    added_to_buffer = self.add_blunder_replay_training_example(
+                        ply, epoch, best_uci, best_cp, probe_cpl)
                 # probe_fails only seeds records the seed script never saw --
                 # new blunders enter the pool without an n_fails
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
@@ -1174,6 +1069,145 @@ class Rescorer(object):
         }
         with open(self.brp_reviewables_jsonl, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=float) + "\n")
+
+    def blend_alpha(self, cpl, lo, hi):
+        """SF weight, ramped across the band between the two clip points."""
+        cfg = self.config
+        a_lo, a_hi = cfg.rescore_blend_alpha_min, cfg.rescore_blend_alpha_max
+        if hi <= lo:
+            return a_hi
+        t = min(max((cpl - lo) / (hi - lo), 0.0), 1.0)
+        return a_lo + t * (a_hi - a_lo)
+
+    def sf_pointmass_policy(self, lms, idx_map, best_uci):
+        """1 visit on every legal move, the rest piled on SF's best."""
+        policy = np.zeros(1858, dtype=np.float32)
+        if best_uci not in idx_map:
+            return None
+
+        share = 1.0 / max(1, len(lms))
+        for u in lms:
+            policy[idx_map[u]] += share
+        policy[idx_map[best_uci]] += float(len(lms))
+        return policy / policy.sum()
+
+    def blend_training_positions(self, A, B, alpha):
+        """Convex mix of two (policy, wdl) targets; alpha weights B."""
+        pa, ya = A
+        pb, yb = B
+        if pb is None:
+            return pa, ya
+
+        policy = (1.0 - alpha) * pa + alpha * pb
+        Y = (1.0 - alpha) * np.asarray(ya, dtype=np.float32) + alpha * yb
+        return policy / policy.sum(), (Y / Y.sum()).astype(np.float32)
+
+    def queue_lc0_replay(self, game_data, aux, meta_extra=None):
+        """Hand one blunder position to the teacher fleet.
+
+        Only stages the spec; the runner drains lc0_pending onto the queue.
+        Nothing is held for the reply -- a probe that never returns just
+        means this position contributes no sample.
+        """
+        if self.lc0_cfg is None:
+            return None
+
+        meta = {
+            'src_game_id': game_data.get('game_id'),
+            'orig_cpl': aux.get('blend_cpl'),
+        }
+        meta.update(meta_extra or {})
+        spec = lc0_replay_spec(
+            self.lc0_cfg, game_data, aux['ply_i'], aux['sfen'], meta)
+        if spec is not None:
+            self.lc0_pending.append(spec)
+        return spec
+
+    def queue_brp_lc0_replay(self, src, sfen):
+        """Send a still-failing probe position to the teacher.
+
+        Writes nothing back to the pool record on purpose: xc0_BRP tracking
+        must stay unaware that lc0_BRP exists.
+        """
+        if self.lc0_cfg is None or not castling_rights_clear(src['fen']):
+            return None
+
+        game_data = {
+            'start_fen': STARTPOS_FEN,
+            'moves_played': [],
+            'history_uci': list(src['uci_path']),
+            'game_id': src.get('game_id'),
+        }
+        aux = {'ply_i': 0, 'sfen': sfen, 'blend_cpl': src.get('cpl')}
+        spec = self.queue_lc0_replay(game_data, aux, {'from_brp': True})
+        if spec is not None:
+            self.sample_counts['lc0_queued'] += 1
+            self.sample_counts_window['lc0_queued'] += 1
+        return spec
+
+    def take_lc0_specs(self):
+        """Read-and-clear the staged teacher probes."""
+        out = self.lc0_pending
+        self.lc0_pending = []
+        return out
+
+    def ingest_lc0_replay(self, meta):
+        """Turn a returned teacher probe into live_buffer samples.
+
+        One per ply actually played -- syzygy or a terminal can end the probe
+        short of LC0_BRP_PLIES. Straight visits and WDL, weight 1.0, no
+        opening-table bump: these are not xerces-played positions.
+        """
+        # rebuilt from the path, not start_fen: a bare FEN has no history and
+        # the run's encoding may stack it
+        board = Board(meta['replay_fen'])
+        for uci in meta['replay_moves']:
+            board.push_uci(uci)
+
+        tree_data = meta.get('tree_search_data') or {}
+        n = 0
+        for k, mv in enumerate(meta.get('moves_played') or []):
+            # collect_tree_search_data runs before plies is bumped, so the
+            # search at moves_played[k] is stored under k, not k + 1
+            tr = tree_data.get(k, tree_data.get(str(k)))
+            if tr:
+                if self.add_lc0_replay_training_example(board, tr):
+                    n += 1
+            board.push_uci(mv)
+
+        self.sample_counts['lc0_samples'] += n
+        self.sample_counts_window['lc0_samples'] += n
+        return n
+
+    def add_lc0_replay_training_example(self, board, tr):
+        """Teacher visits straight to policy: no clip, no uniform_eps, just a
+        1-visit floor so every legal move carries mass."""
+        cm = tr.get('candidate_moves') or []
+        if not cm:
+            return False
+
+        vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
+        for u in board.legal_moves():
+            vmap.setdefault(u, 1)
+
+        ucis = list(vmap)
+        total = float(sum(vmap.values()))
+        policy = np.zeros(1858, dtype=np.float32)
+        for idx, u in zip(board.moves_to_indices(ucis), ucis):
+            policy[idx] += vmap[u] / total
+
+        wdl = tr.get('best_wdl')
+        if wdl is None:
+            return False
+        Y = np.array(wdl, dtype=np.float32)
+        if not tr.get('stm', True):
+            Y = Y[[2, 1, 0]]
+
+        self.live_buffer.append(
+            (self.encode_board(board), None, sparsify_policy(policy),
+             Y, 1.0, 1.0, 'lc0'),
+            REWEIGHT_INELIGIBLE)
+        return True
 
     def add_equiv_replay_training_example(self, ply):
         """
@@ -1505,18 +1539,17 @@ class Rescorer(object):
                 best_cp, played_cp, loss_this, Z_stm,
             )
 
-            # mild and big blunders: drop xc0 record, queue lc0 instead
-            skip_xc0 = not missed_mate and (loss_this >= blunder_cp)
-            if missed_mate:
-                lc0_mode = None
-            elif true_blunder:
-                lc0_mode = 'pos_sf_xc0_pov'
-            elif is_blunder:
-                lc0_mode = 'pos_sf_pov'
-            elif loss_this >= cfg.rescore_inaccuracy_cp:
-                lc0_mode = 'pos_only'
+            # what this ply becomes. A true blunder is handed to the teacher
+            # instead of trained on directly; anything else past EQUIV is
+            # pulled toward SF in proportion to how bad it was.
+            to_lc0 = (not missed_mate and true_blunder
+                      and castling_rights_clear(ply['sfen']))
+            if missed_mate or loss_this <= EQUIV:
+                blend_cpl = None
+            elif loss_this >= blunder_cp and not to_lc0:
+                blend_cpl = blunder_cp
             else:
-                lc0_mode = None
+                blend_cpl = loss_this
 
             # just FYI if we do any adjustments we need to re-sort.
 
@@ -1576,16 +1609,6 @@ class Rescorer(object):
                 elif kl >= self.kl_q50:
                     pwht *= cfg.kl_boost_median_mult
 
-            # the inaccuracy downweight applies to the xc0 record only. The lc0
-            # record that accompanies it is a second independent observation
-            # and carries its own weight, so it submits vwht_base -- inheriting
-            # the halved vwht would compose 0.5 xc0 + 0.25 lc0 on the value
-            # side against 0.5 + 0.5 on the policy side.
-            vwht_base = vwht
-            if lc0_mode == 'pos_only':
-                pwht *= cfg.inaccuracy_downweight
-                vwht *= cfg.inaccuracy_downweight
-
             # build policy from precomputed board state
             idx_map = ply['idx_map']
             indices = [idx_map[u] for u in mvs]
@@ -1598,21 +1621,17 @@ class Rescorer(object):
                 policy[idx] += p
 
             pending.append((ply['x'], policy, Q, turn, i, vwht, pwht, ply['okey']))
-            sf_pv = ply.get('pv_ucis', [])
-            if lc0_mode == 'pos_sf_xc0_pov':
-                xc0_pv = [e['uci'] for e in ply['tr'].get('pv', [])[:3]]
-                pv_seqs = [sf_pv, xc0_pv]
-            elif lc0_mode == 'pos_sf_pov':
-                pv_seqs = [sf_pv[:2]]
-            else:
-                pv_seqs = []
 
             pending_aux.append({
                 'sfen':            ply['sfen'],
-                'pv_seqs':         pv_seqs,
-                'skip_xc0':        skip_xc0,
-                'lc0_mode':        lc0_mode,
-                'vwht_base':       vwht_base,
+                'to_lc0':          to_lc0,
+                'blend_cpl':       blend_cpl,
+                'blunder_cp':      blunder_cp,
+                'equiv':           EQUIV,
+                'best_uci':        best_uci,
+                'best_cp':         best_cp,
+                'lms':             lms,
+                'idx_map':         idx_map,
                 'is_blunder':      is_blunder,
                 'ply_i':           i,
                 'best_wdl':        tr.get('best_wdl'),
@@ -1621,13 +1640,9 @@ class Rescorer(object):
         sc = self.sample_counts
         scw = self.sample_counts_window
 
-        start_fen    = game_data['start_fen']
-        moves_played = game_data['moves_played']
-        history_uci  = game_data.get('history_uci')
-        row_by_ply   = {r[0]: r for r in rows}
+        row_by_ply = {r[0]: r for r in rows}
 
-        # loop 2: compute WDL targets, add to training, build lc0 waypoints
-        lc0_waypoints = {}
+        # loop 2: compute WDL targets and add to training
         for tup, aux in zip(pending, pending_aux):
             x, policy, Q, is_white, ply_i, vwht, pwht, okey = tup
             z = result if is_white else -result
@@ -1648,106 +1663,35 @@ class Rescorer(object):
             sc['total'] += 1
             scw['total'] += 1
 
+            # the position was played either way, so the opening table is
+            # bumped even when the sample itself goes to the teacher
+            self.opening_counts.bump(okey)
+
+            if aux['to_lc0']:
+                spec = self.queue_lc0_replay(game_data, aux)
+                if spec is not None:
+                    sc['lc0_queued'] += 1
+                    scw['lc0_queued'] += 1
+                    continue
+
+            blend_cpl = aux['blend_cpl']
+            if blend_cpl is not None:
+                alpha = self.blend_alpha(
+                    blend_cpl, aux['equiv'], aux['blunder_cp'])
+                sf_policy = self.sf_pointmass_policy(
+                    aux['lms'], aux['idx_map'], aux['best_uci'])
+                sf_Y = scalar_to_wdl(
+                    cp_to_value_tanh(aux['best_cp'], mid_cp=200.0))
+                policy, Y = self.blend_training_positions(
+                    (policy, Y), (sf_policy, sf_Y), alpha)
+                sc['blended'] += 1
+                scw['blended'] += 1
+
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
+            self.live_buffer.append(entry, okey)
+            sc['accepted'] += 1
+            scw['accepted'] += 1
 
-            if not aux.get('skip_xc0'):
-                # an inaccuracy ply is already suppressed to 0.5 to make room
-                # for its lc0 half, so the opening band must not take a second
-                # bite. The bump still happens: the position was played.
-                xc0_key = (REWEIGHT_INELIGIBLE
-                           if aux.get('lc0_mode') == 'pos_only' else okey)
-                self.opening_counts.bump(okey)
-                self.live_buffer.append(entry, xc0_key)
-                sc['accepted'] += 1
-                scw['accepted'] += 1
-
-            if self.lc0_thread is not None:
-                mode = aux.get('lc0_mode')
-                if mode in ('pos_sf_xc0_pov', 'pos_sf_pov'):
-                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-                    sc['lc0_blunder'] += 1
-                    scw['lc0_blunder'] += 1
-                elif mode == 'pos_only':
-                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-                    sc['lc0_inacc'] += 1
-                    scw['lc0_inacc'] += 1
-                elif random.random() < cfg.lc0_enrich_frac:
-                    # sampled on frac alone. This used to be gated on the
-                    # position being past MAX_TRACKED_PLY, to avoid spending
-                    # inference on an opening the band would suppress anyway --
-                    # but lc0 records are never reweighted now, so inclusion no
-                    # longer has anything to do with weighting. (The gate was
-                    # dead regardless: it tested `okey is None`, and key()
-                    # returns REWEIGHT_INELIGIBLE past the ply window, never
-                    # None, so no enrich record has ever been produced.)
-                    lc0_waypoints[aux['ply_i']] = (entry, aux, Y, is_white)
-                    sc['lc0_enrich'] += 1
-                    scw['lc0_enrich'] += 1
-
-        if lc0_waypoints and self.lc0_thread is not None:
-            lc0_meta = []
-            _, b_lc0 = reconcile_game_boards(start_fen, history_uci, moves_played)
-            for ply_i, mv in enumerate(moves_played):
-                if ply_i in lc0_waypoints:
-                    entry, aux, Y, is_white = lc0_waypoints[ply_i]
-                    got_fen = b_lc0.fen(include_counters=False)
-                    if got_fen != aux['sfen']:
-                        msg = f"[rescore] FEN mismatch at ply {ply_i}: {got_fen} "
-                        msg += f"!= {aux['sfen']}"
-                        print(msg)
-
-                    x, _, _, _, _, _, _ = entry
-                    vwht = aux['vwht_base']
-                    ucis_now = b_lc0.legal_moves()
-                    self.lc0_thread.submit(b_lc0.lc0_features(), b_lc0, x, vwht, 1.0)
-                    xc0_idxs = b_lc0.moves_to_indices(ucis_now)
-                    lc0_meta.append(
-                        ('main', aux, Y, is_white, list(zip(ucis_now, xc0_idxs)))
-                    )
-
-                    n_pv = 0
-                    seen_fens = set()
-                    for pv_seq in aux.get('pv_seqs', []):
-                        b_pv = b_lc0.clone()
-                        for pv_mv in pv_seq:
-                            if b_pv.is_terminal():
-                                break
-                            b_pv.push_uci(pv_mv)
-                            if b_pv.is_terminal():
-                                break
-                            fen = b_pv.fen(include_counters=False)
-                            if fen in seen_fens:
-                                continue
-                            seen_fens.add(fen)
-                            x_pv = self.encode_board(b_pv)
-                            self.lc0_thread.submit(
-                                b_pv.lc0_features(),
-                                b_pv,
-                                x_pv,
-                                vwht, 1.0,
-                            )
-                            lc0_meta.append(('pv', None, None, None, []))
-                            n_pv += 1
-                    sc['lc0_pv'] += n_pv
-                    scw['lc0_pv'] += n_pv
-                b_lc0.push_uci(mv)
-
-            self.lc0_thread.flush()
-            w = cfg.lc0_enrich_weight
-            for (kind, aux, Y, is_white, uci_flat), result in zip(lc0_meta, self.lc0_thread.drain()):
-                x, policy, lc0_wdl, vwht, pwht = result
-                if kind == 'pv':
-                    source = 'lc0_pv'  # PV nodes only ever come from blunder/inacc waypoints
-                elif aux.get('lc0_mode'):
-                    source = 'lc0_blunder'  # main position from a blunder/inacc waypoint
-                else:
-                    source = 'lc0_enrich'  # main position from random enrich sampling
-                # no bump and no key: only xerces-played moves count toward the
-                # opening table, and no lc0 record is ever reweighted by it
-                self.live_buffer.append(
-                    (x, None, sparsify_policy(policy), lc0_wdl,
-                     vwht * w, pwht * w, source), REWEIGHT_INELIGIBLE)
-        
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
@@ -1930,34 +1874,28 @@ class Rescorer(object):
         def col(val):
             return f"  {val:>{W}}  |"
 
-        def enrich_row(label, sc):
-            blunder = sc['lc0_blunder']
-            inacc   = sc.get('lc0_inacc', 0)  # absent in state exported before this field existed
-            lc0_total = blunder + inacc + sc['lc0_pv'] + sc['lc0_enrich']
-            total_tr  = sc['accepted'] + sc['lc0_pv'] + sc['lc0_enrich']
-            enrich_pct = f"{lc0_total / total_tr * 100:.1f}%" if total_tr else "--"
+        def teacher_row(label, sc):
+            # queued and samples do not balance within a batch: a probe is
+            # answered a few seconds after it is sent, often after this print
+            total_tr = sc['accepted'] + sc['lc0_samples']
+            lc0_pct = f"{sc['lc0_samples'] / total_tr * 100:.1f}%" if total_tr else "--"
             return (f"{RS}  {label:<12} |"
-                    + col(blunder)
-                    + col(inacc)
-                    + col(sc['lc0_pv'])
-                    + col(sc['lc0_enrich'])
-                    + col(enrich_pct))
+                    + col(sc['accepted'])
+                    + col(sc['blended'])
+                    + col(sc['lc0_queued'])
+                    + col(sc['lc0_samples'])
+                    + col(lc0_pct))
 
-        ehdr = (f"{RS}  {'enrich':<12} |"
-                + "".join(col(lbl) for lbl in ("blunder", "inacc", "pv", "enrich", "lc0-%")))
-        print(ehdr)
-        print(enrich_row("batch", self.sample_counts_window))
-        print(enrich_row("total", self.sample_counts))
-
-        if self.lc0_thread is not None:
-            lst = self.lc0_thread.stats()
-            print(f"{RS}  lc0 output: {lst['samples']} flushed"
-                  f"  {lst['inferences']} batches"
-                  f"  {lst['pending']} pending")
+        thdr = (f"{RS}  {'targets':<12} |"
+                + "".join(col(lbl) for lbl in
+                          ("xc0", "blended", "lc0-sent", "lc0-back", "lc0-%")))
+        print(thdr)
+        print(teacher_row("batch", self.sample_counts_window))
+        print(teacher_row("total", self.sample_counts))
 
         self.sample_counts_window = {
-            'total': 0, 'accepted': 0,
-            'lc0_blunder': 0, 'lc0_inacc': 0, 'lc0_pv': 0, 'lc0_enrich': 0,
+            'total': 0, 'accepted': 0, 'blended': 0,
+            'lc0_queued': 0, 'lc0_samples': 0,
         }
 
     def aggregate_metrics(self, epoch, progress_csv_path, pred_pkl_path,

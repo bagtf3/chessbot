@@ -31,6 +31,11 @@ from chessbot.config import Config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator
 from chessbot.looper import init_selfplay
+
+from chessbot.lc0_replay import (
+    LC0_BRP_SCENARIO, create_lc0_replay_config,
+)
+
 from chessbot.rescore import (
     BRP_ANALYSIS_EVERY, Rescorer, SFRescoreThread, migrate_pretrain_progress,
 )
@@ -243,10 +248,12 @@ class SelfPlayRunner:
 
         self.ctx = mp.get_context()
         self.game_q = None
+        self.lc0_q = None
         self.recent_q = None
         self.telemetry_q = None
         self.procs = []
         self.worker_procs = []
+        self.lc0_cfg = None
 
         self.current_epoch = 0
         self.games_at_start = 0
@@ -398,15 +405,48 @@ class SelfPlayRunner:
         self.worker_procs.append(p)
         self.procs.append({
             "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
-            "stop_sent_at": None, "term_sent_at": None,
+            "kind": "xc0", "stop_sent_at": None, "term_sent_at": None,
             "kill_sent_at": None,
         })
         return c.id
 
+    def spawn_lc0_worker(self):
+        """Start one lc0 teacher probe worker.
+
+        Lives in self.procs so it inherits pause, reap and respawn, but never
+        reads game_q: the two fleets would steal each other's specs.
+        """
+        c = self.lc0_cfg.copy()
+        c.id = f"lc0w{self.next_worker_id}"
+        self.next_worker_id += 1
+        stop_ev = self.ctx.Event()
+        msg_q = self.ctx.Queue()
+        p = self.ctx.Process(
+            target=child_looper,
+            args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
+                  self.lc0_q),
+            daemon=True,
+        )
+        p.start()
+        self.worker_procs.append(p)
+        self.procs.append({
+            "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
+            "kind": "lc0", "stop_sent_at": None, "term_sent_at": None,
+            "kill_sent_at": None,
+        })
+        return c.id
+
+    def procs_of(self, kind):
+        return [w for w in self.procs if w["kind"] == kind]
+
+    def lc0_wanted(self):
+        return self.cfg.n_lc0_workers if self.lc0_cfg is not None else 0
+
     def spawn_workers(self):
-        """One queue to every worker. There is no designated validator:
-        whoever has capacity picks up whatever spec is next, and validation
-        is told apart by spec.meta, not by which process pulled it."""
+        """One queue to every selfplay worker. There is no designated
+        validator: whoever has capacity picks up whatever spec is next, and
+        validation is told apart by spec.meta, not by which process pulled it.
+        """
         self.recent_q = self.ctx.Queue()
         self.telemetry_q = self.ctx.Queue()
         self.game_q = self.ctx.Queue()
@@ -414,6 +454,27 @@ class SelfPlayRunner:
         for _ in range(max(1, self.cfg.n_workers)):
             self.spawn_worker()
         print(f"[runner] spawned {len(self.procs)} workers", flush=True)
+
+        if self.cfg.n_lc0_workers:
+            self.lc0_q = self.ctx.Queue()
+            self.lc0_cfg = create_lc0_replay_config(self.cfg)
+            # handing the rescorer the config is what switches blunders from
+            # the blend path onto the teacher path
+            self.rescorer.lc0_cfg = self.lc0_cfg
+            for _ in range(self.cfg.n_lc0_workers):
+                self.spawn_lc0_worker()
+            print(f"[runner] spawned {self.cfg.n_lc0_workers} lc0 workers "
+                  f"({self.lc0_cfg.lc0_distill_model_name})", flush=True)
+
+    def drain_lc0_specs(self):
+        """Move staged teacher probes from the rescorer onto the lc0 queue."""
+        if self.lc0_q is None:
+            return 0
+        specs = self.rescorer.take_lc0_specs()
+        for spec in specs:
+            self.lc0_q.put(spec)
+        self.recorder.lc0_backlog = self.lc0_q.qsize()
+        return len(specs)
 
     def fleet_wanted(self):
         """True while the run still wants workers running.
@@ -442,20 +503,24 @@ class SelfPlayRunner:
         if self.workers_paused:
             return 0
 
-        target = max(1, self.cfg.n_workers)
-        missing = target - len(self.procs)
-        if missing <= 0:
-            return 0
-
         now = time.monotonic()
         if now - self.last_respawn_at < RESPAWN_COOLDOWN_S:
             return 0
-        self.last_respawn_at = now
 
-        wid = self.spawn_worker()
-        print(f"[runner] respawned worker {wid} "
-              f"(fleet {len(self.procs)}/{target})", flush=True)
-        return 1
+        # one per pass, so a fleet that lost several workers refills over
+        # several cooldowns rather than storming the GPU at once
+        for kind, target, spawn in (
+            ("xc0", max(1, self.cfg.n_workers), self.spawn_worker),
+            ("lc0", self.lc0_wanted(), self.spawn_lc0_worker),
+        ):
+            if len(self.procs_of(kind)) >= target:
+                continue
+            self.last_respawn_at = now
+            wid = spawn()
+            print(f"[runner] respawned {kind} worker {wid} "
+                  f"(fleet {len(self.procs_of(kind))}/{target})", flush=True)
+            return 1
+        return 0
 
     def broadcast(self, cmd):
         for w in self.procs:
@@ -625,6 +690,11 @@ class SelfPlayRunner:
 
             if scenario == "blunder_replay_probe":
                 self.finished_brp.append(game)
+                continue
+
+            if scenario == LC0_BRP_SCENARIO:
+                self.rescorer.ingest_lc0_replay(meta)
+                self.recorder.lc0_probes_done += 1
                 continue
 
             self.recorder.ingest_recents(game)
@@ -871,6 +941,7 @@ class SelfPlayRunner:
                 self.maybe_respawn_workers()
 
                 self.top_up_queue()
+                self.drain_lc0_specs()
                 self.drain_results()
                 self.tick_rescorer()
                 self.check_retrain()
@@ -985,7 +1056,8 @@ class SelfPlayRunner:
                 close_proc(w["p"], self.worker_procs)
         self.procs = [w for w in self.procs if w["p"].is_alive()]
 
-        for q in (self.recent_q, self.telemetry_q, self.game_q):
+        for q in (self.recent_q, self.telemetry_q, self.game_q,
+                  self.lc0_q):
             if q is not None:
                 q.cancel_join_thread()
                 q.close()

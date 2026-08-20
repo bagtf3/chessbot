@@ -442,9 +442,9 @@ class GameLooper(object):
 
         scenario = game.meta.get("scenario", "")
 
-        # bluder replay runs are one move per position: accumulate in memory and let
-        # the driver write a single file, instead of a pkl per position
-        if scenario == "blunder_replay_probe":
+        # replay probes are a handful of moves per position: accumulate in
+        # memory and let the driver route them, instead of a pkl per position
+        if scenario in ("blunder_replay_probe", "lc0_replay_probe"):
             brp_result_info = {
                 "ts": now(),
                 "game_id": game.game_id,
@@ -619,14 +619,21 @@ class GameLooper(object):
         for k, v in pcs.items():
             tm[f"cache_{k}"] = v
 
-        self.telemetry_q.put({"looper_id": self.id, "telemetry": tm})
+        self.telemetry_q.put({
+            "looper_id": self.id, "telemetry": tm,
+            "kind": self.config.telemetry_kind,
+        })
 
         return True
     
     def update_partial_telemetry(self):
-        """send a partial update to the telemetry for more time sensitive metrics"""
+        """Refresh the time-sensitive fields between full pushes.
+
+        Deliberately carries no 'ts': the parent merges these into the last
+        full push, so stamping ts here would make stale rates look fresh.
+        """
         partial_telem = {
-            "ts": time.time(),
+            "partial_ts": time.time(),
             "n_active": len(self.active_games),
             "avg_ply": 0.0
         }
@@ -634,7 +641,10 @@ class GameLooper(object):
         if self.active_games:
             partial_telem['avg_ply'] = np.mean([g.plies for g in self.active_games])
 
-        self.telemetry_q.put({"looper_id": self.id, "telemetry": partial_telem})
+        self.telemetry_q.put({
+            "looper_id": self.id, "telemetry": partial_telem,
+            "kind": self.config.telemetry_kind,
+        })
 
 
 def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, sf_queue=None):

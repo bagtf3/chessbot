@@ -1,17 +1,14 @@
 """
 Roundless selfplay orchestrator.
 
-Replaces run_selfplay.main()'s round loop with one continuous lifetime.
-Workers spawn once and never come down for a boundary; validation is a batch
-of specs dropped into the same queue everything else uses, not a mode the
-whole fleet switches into.
+The run has one continuous lifetime instead of a sequence of rounds. Workers
+spawn once and only come down at the end or to be replaced after a crash;
+validation is a batch of specs dropped into the same queue everything else
+uses, not a mode the whole fleet switches into.
 
-Lives here rather than in scripts/ so it can be imported and exercised --
-run_selfplay.py cannot be imported at all -- and so the mp children import a
-real module instead of re-importing the entry script under spawn.
-
-Nothing here is wired up yet: run_selfplay.main() is untouched and still owns
-the live path until cutover.
+Lives here rather than in scripts/ so it can be imported and exercised, and
+so the mp children import a real module instead of re-importing the entry
+script under spawn. scripts/run_selfplay.py is a shim over run_roundless.
 """
 import multiprocessing as mp
 import os
@@ -54,6 +51,14 @@ GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
 # left to wedge the cadence forever. Generous on purpose: it should only ever
 # fire on a genuinely stuck batch, not a slow one
 VAL_BATCH_TIMEOUT_S = 7200.0
+# probes are queued a few at a time by the trickle and in bulk by the
+# dumps; report every this many queued either way
+BRP_LOG_EVERY = 512
+# the retrain worker sleeps this long after retrain_ready before it touches
+# the GPU; a pause issued outside that handshake gets the same settle window
+WORKER_PAUSE_SETTLE_S = 10.0
+# a worker that dies on startup would otherwise be respawned every loop pass
+RESPAWN_COOLDOWN_S = 30.0
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
@@ -144,10 +149,8 @@ def check_and_reap_procs(procs, registry, request_stop=False, grace_s=5.0,
 
 def stdin_listener(controls, worker_procs):
     """Operator console. Takes the Controls it drives rather than reaching
-    for module globals, so there is no ambiguity about which set is live
-    while the old script still exists alongside.
-
-    'next round' and 'stop after this round' are gone -- there are no rounds.
+    for module globals, so the listener and the runner provably share one
+    set of flags.
     """
     for line in sys.stdin:
         cmd = line.strip().lower()
@@ -204,12 +207,7 @@ def stdin_listener(controls, worker_procs):
 
 
 class Controls:
-    """Operator flags, set by the stdin listener and read by the runner.
-
-    An object rather than module globals so the listener and the runner
-    provably share one set -- during the side-by-side dev period the old
-    script still owns its own copies.
-    """
+    """Operator flags, set by the stdin listener and read by the runner."""
 
     def __init__(self):
         self.stop = threading.Event()
@@ -223,10 +221,10 @@ class Controls:
 
 class SelfPlayRunner:
     """
-    Owns every piece of long-lived state that used to be a main() local.
-    Phase methods take no arguments and read self, which is the point: the
-    old free functions took up to 8 parameters and the bugs came from
-    passing the wrong round's value.
+    Owns every piece of long-lived state for the run. Phase methods take no
+    arguments and read self, which is the point: the free functions this
+    replaced took up to 8 parameters and the bugs came from passing the
+    wrong value.
     """
 
     def __init__(self, run_tag, base_cfg, yaml_path, val_yaml_path, controls=None):
@@ -237,7 +235,7 @@ class SelfPlayRunner:
         self.controls = controls or Controls()
 
         self.cfg = None            # live working config, reloaded at retrain
-        self.val_cfg = None        # ladder config; owns sf_depth
+        self.val_cfg = None        # ladder config; owns sf_validation_depth
 
         self.rescorer = None
         self.recorder = None
@@ -254,6 +252,7 @@ class SelfPlayRunner:
 
         self.current_epoch = 0
         self.games_at_start = 0
+        self.brp_queued = 0
         self.total_games = 0
         self.total_queued = 0
         self.finished_games = deque()
@@ -268,14 +267,14 @@ class SelfPlayRunner:
         self.last_validated_epoch = None
 
         self.retrain_worker = None
-        self.cmd_paused = False
+        self.workers_paused = False
         self.stop_signal_sent = False
         self.started_at = None
-
-    # ---- setup -------------------------------------------------------
+        self.next_worker_id = 0
+        self.last_respawn_at = 0.0
 
     def setup(self):
-        """Everything main() did once before its round loop."""
+        """One-time startup: SF threads, rescorer, buffers, epoch counter."""
         cfg = self.base_cfg
 
         sf_game_q = queue.Queue()
@@ -366,9 +365,9 @@ class SelfPlayRunner:
     def reload_config(self):
         """Re-read the run yaml and rebuild the TRT engine for it.
 
-        Roundless there is one engine for everything: validation shares the
-        selfplay batch shapes exactly, and its search params travel per-game
-        on the spec's own cfg, so the old separate val_trt build is gone.
+        One engine covers everything: validation shares the selfplay batch
+        shapes exactly, and its search params travel per-game on the spec's
+        own cfg, so there is no separate val_trt build.
         """
         self.cfg = Config.from_yaml(self.yaml_path, init=True)
         if self.cfg.inference_backend == 'ort_trt':
@@ -376,12 +375,35 @@ class SelfPlayRunner:
             self.cfg = prepare_trt(self.cfg, trt_dir, model_name)
         if self.rescorer is not None:
             self.rescorer.config = self.cfg
-        # the generator caches its config; rounds used to hide this by
-        # rebuilding it each round, roundless it must be re-pointed
+        # the generator holds a config reference and reads it live, so
+        # re-pointing it here is what makes a yaml edit take effect
         if self.game_gen is not None:
             self.game_gen.config = self.cfg
 
-    # ---- phases ------------------------------------------------------
+    def spawn_worker(self):
+        """Start one worker off the current config, so a replacement picks
+        up the latest TRT engine without any extra plumbing. Ids come from a
+        monotonic counter rather than the fleet index: a respawn must not
+        reuse the dead worker's name or the crash log stops making sense."""
+        c = self.cfg.copy()
+        c.id = f"w{self.next_worker_id}"
+        self.next_worker_id += 1
+        stop_ev = self.ctx.Event()
+        msg_q = self.ctx.Queue()
+        p = self.ctx.Process(
+            target=child_looper,
+            args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
+                  self.game_q),
+            daemon=True,
+        )
+        p.start()
+        self.worker_procs.append(p)
+        self.procs.append({
+            "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
+            "stop_sent_at": None, "term_sent_at": None,
+            "kill_sent_at": None,
+        })
+        return c.id
 
     def spawn_workers(self):
         """One queue to every worker. There is no designated validator:
@@ -391,41 +413,91 @@ class SelfPlayRunner:
         self.telemetry_q = self.ctx.Queue()
         self.game_q = self.ctx.Queue()
 
-        for i in range(max(1, self.cfg.n_workers)):
-            c = self.cfg.copy()
-            c.id = f"w{i}"
-            stop_ev = self.ctx.Event()
-            msg_q = self.ctx.Queue()
-            p = self.ctx.Process(
-                target=child_looper,
-                args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
-                      self.game_q),
-                daemon=True,
-            )
-            p.start()
-            self.worker_procs.append(p)
-            self.procs.append({
-                "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
-                "stop_sent_at": None, "term_sent_at": None,
-                "kill_sent_at": None,
-            })
+        for _ in range(max(1, self.cfg.n_workers)):
+            self.spawn_worker()
         print(f"[runner] spawned {len(self.procs)} workers", flush=True)
+
+    def fleet_wanted(self):
+        """True while the run still wants workers running.
+
+        The main loop needs this as well as self.procs: between the last
+        worker dying and its replacement starting the fleet is empty for up
+        to RESPAWN_COOLDOWN_S, and self.procs alone would end the run there.
+        """
+        if (self.stop_signal_sent
+                or self.controls.stop.is_set()
+                or self.controls.no_new_games.is_set()):
+            return False
+        return self.total_queued < self.cfg.n_games
+
+    def maybe_respawn_workers(self):
+        """Backfill the fleet after a crash.
+
+        Rounds used to hide worker deaths by rebuilding the fleet at every
+        boundary. Roundless nothing does, so without this a 50k-game run
+        degrades 3 -> 2 -> 1 and then exits with budget left.
+        """
+        if not self.fleet_wanted():
+            return 0
+        # a fresh worker starts unpaused and would contend for the GPU with
+        # whatever the pause was protecting; wait for the unpause
+        if self.workers_paused:
+            return 0
+
+        target = max(1, self.cfg.n_workers)
+        missing = target - len(self.procs)
+        if missing <= 0:
+            return 0
+
+        now = time.monotonic()
+        if now - self.last_respawn_at < RESPAWN_COOLDOWN_S:
+            return 0
+        self.last_respawn_at = now
+
+        wid = self.spawn_worker()
+        print(f"[runner] respawned worker {wid} "
+              f"(fleet {len(self.procs)}/{target})", flush=True)
+        return 1
 
     def broadcast(self, cmd):
         for w in self.procs:
             w["msg_q"].put(cmd)
 
-    # ---- queue feeding -----------------------------------------------
+    def pause_workers(self, why):
+        """Broadcast a pause, but only when the workers are actually running.
 
-    def top_up_queue(self):
+        Every pause and unpause goes through this pair. An unpause sent to a
+        running worker is not a no-op: the looper buffers it as
+        unpause_queued and the *next* pause is skipped, so the fleet plays
+        straight through a retrain. Pairing here is what prevents that.
+        """
+        if self.workers_paused:
+            return False
+        self.broadcast("pause")
+        self.workers_paused = True
+        print(f"[runner] workers paused ({why})", flush=True)
+        return True
+
+    def unpause_workers(self, why):
+        if not self.workers_paused:
+            return False
+        self.broadcast("unpause")
+        self.workers_paused = False
+        print(f"[runner] workers unpaused ({why})", flush=True)
+        return True
+
+    def top_up_queue(self, target=None):
         """Keep the queue shallow. Depth is what keeps validation batches
-        from queueing behind selfplay -- see GAME_QUEUE_TARGET."""
+        from queueing behind selfplay -- see GAME_QUEUE_TARGET. The startup
+        fill passes a deeper target so the fleet reaches capacity at once
+        instead of over several loop passes."""
         if self.stop_signal_sent or self.controls.no_new_games.is_set():
             return 0
 
+        target = GAME_QUEUE_TARGET if target is None else target
         budget = self.cfg.n_games - self.total_queued
         added = 0
-        while added < budget and self.game_q.qsize() < GAME_QUEUE_TARGET:
+        while added < budget and self.game_q.qsize() < target:
             spec = self.game_gen.next_game()
             if spec is None:
                 break
@@ -452,29 +524,32 @@ class SelfPlayRunner:
         n = self.rescorer.take_brp_credits()
         if n <= 0:
             return 0
-        return self.enqueue_blunder_replays(n, "trickle")
+        return self.enqueue_blunder_replays(n)
 
-    def enqueue_blunder_replays(self, n, reason):
+    def enqueue_blunder_replays(self, n):
+        """Queue n replay probes, from either the trickle or a bulk dump.
+        Both share one counter and report together every BRP_LOG_EVERY."""
         if self.blunder_pool is None or n <= 0:
             return 0
         specs = self.game_gen.next_blunder_replays(
-            self.blunder_pool, n, self.rescorer.brp_until_analysis(),
-            current_epoch=self.current_epoch,
+            self.blunder_pool, n, current_epoch=self.current_epoch,
         )
         for spec in specs:
             self.game_q.put(spec)
-        if specs:
-            print(f"[blunder_replay] queued {len(specs)} ({reason})",
-                  flush=True)
-        return len(specs)
 
-    # ---- validation ---------------------------------------------------
+        self.brp_queued += len(specs)
+        if self.brp_queued >= BRP_LOG_EVERY:
+            print(f"[blunder_replay] {self.brp_queued} queued | "
+                  f"{self.rescorer.brp_until_analysis()} until analysis",
+                  flush=True)
+            self.brp_queued = 0
+        return len(specs)
 
     def maybe_start_validation(self):
         """Fire on the retrain cadence. A batch is a discrete, non-overlapping
         set: the ladder counts runs, not games, so overlapping windows would
         advance depth roughly twice as fast."""
-        if self.val_pending:
+        if self.val_pending or self.stop_signal_sent:
             return
         every = self.cfg.validate_every_n_retrains
         if not every or self.current_epoch % every:
@@ -503,7 +578,8 @@ class SelfPlayRunner:
         self.val_batch_epoch = self.current_epoch
         self.last_validated_epoch = self.current_epoch
         print(f"[validation] batch of {len(specs)} queued at epoch "
-              f"{self.current_epoch}, sf_depth {self.val_cfg.sf_depth}",
+              f"{self.current_epoch}, sf_depth "
+              f"{self.val_cfg.sf_validation_depth}",
               flush=True)
 
     def finish_validation_batch(self):
@@ -542,12 +618,11 @@ class SelfPlayRunner:
         if time.monotonic() - self.val_batch_started_at > VAL_BATCH_TIMEOUT_S:
             self.close_partial_validation_batch("timeout")
 
-    # ---- results ------------------------------------------------------
-
     def drain_results(self):
-        """Route finished games. Validation metas are counted here -- with
-        the min_game_length fix in the looper they can no longer vanish
-        through the short-game filter, so a plain counter is honest."""
+        """Route finished games. Validation metas are counted here: the
+        validation config pins min_game_length to 1, so they cannot vanish
+        through the looper's short-game filter and a plain counter is
+        honest."""
         for msg in drain_queue(self.telemetry_q):
             self.recorder.ingest_telemetry(msg)
 
@@ -620,14 +695,12 @@ class SelfPlayRunner:
         print(f"[rescore] backlog {backlog}, movetime -> "
               f"{self.rescorer.current_movetime_ms}ms", flush=True)
 
-    # ---- retrain ------------------------------------------------------
-
     def check_retrain(self):
         self.maybe_launch_retrain()
         self.poll_retrain()
 
     def maybe_launch_retrain(self):
-        if self.retrain_worker is not None or not self.procs:
+        if self.retrain_worker is not None:
             return
         primary = rb.list_shard_files(self.cfg.primary_buffer_dir)
         if len(primary) < rb.PRIMARY_TRIGGER_SHARDS:
@@ -672,9 +745,7 @@ class SelfPlayRunner:
         if result["cmd"] == "retrain_ready":
             # worker-side validation is done and predictions are on disk;
             # pause so the retrain gets the GPU
-            self.broadcast("pause")
-            self.cmd_paused = True
-            print("[retrain] workers paused, training now", flush=True)
+            self.pause_workers("retrain")
             return
 
         if result["cmd"] != "retrain_done":
@@ -688,6 +759,14 @@ class SelfPlayRunner:
             p.terminate()
             print("[retrain] worker did not exit, terminated", flush=True)
 
+        # reload_config deletes and rebuilds the .engine file, so the workers
+        # must have dropped their sessions first. retrain_ready already
+        # paused them on the normal path; a worker that died before sending
+        # it did not, so pause here and allow the same settle window the
+        # retrain worker gives itself after the handshake.
+        if self.pause_workers("retrain teardown"):
+            time.sleep(WORKER_PAUSE_SETTLE_S)
+
         self.recorder.n_retrains += 1
         self.reload_config()
         for t in self.sf_rescore_threads:
@@ -695,16 +774,9 @@ class SelfPlayRunner:
         self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
 
         # hard rule: unpause as soon as training is done, the TRT rebuild in
-        # reload_config being the one unavoidable prerequisite. This overrides
-        # an operator pause -- holding it would stall the run forever -- so
-        # cmd_paused is cleared to match, rather than left claiming a pause
-        # that no longer exists.
-        self.broadcast("unpause")
-        if self.cmd_paused:
-            self.cmd_paused = False
-            print("[retrain] operator pause released by retrain completion",
-                  flush=True)
-        print("[retrain] workers unpaused", flush=True)
+        # reload_config being the one unavoidable prerequisite. This releases
+        # an operator pause too -- holding it would stall the run forever.
+        self.unpause_workers("retrain complete")
 
         if ok:
             rb.move_files(self.retrain_worker["primary_files"],
@@ -731,15 +803,11 @@ class SelfPlayRunner:
         # fresh weights: probe the new epoch in bulk so most of an analysis
         # window lands on one model instead of smearing across epochs
         if not self.stop_signal_sent:
-            self.enqueue_blunder_replays(
-                BRP_ANALYSIS_EVERY // 2,
-                f"post-retrain, epoch {self.current_epoch}")
+            self.enqueue_blunder_replays(BRP_ANALYSIS_EVERY // 2)
 
         rb.sync_live_buffer(self.base_cfg.run_dir,
                             self.rescorer.live_buffer.records)
         self.maybe_start_validation()
-
-    # ---- commands -----------------------------------------------------
 
     def handle_commands(self):
         c = self.controls
@@ -754,20 +822,15 @@ class SelfPlayRunner:
 
         if c.pause.is_set():
             c.pause.clear()
-            if not self.cmd_paused:
-                self.broadcast("pause")
-                self.cmd_paused = True
-                print("[cmd] workers paused", flush=True)
+            if not self.pause_workers("operator"):
+                print("[cmd] pause: workers are already paused, no-op",
+                      flush=True)
 
         # cleared whether or not anything was paused: left set it would latch
         # and cancel the next pause on the following pass
         if c.unpause.is_set():
             c.unpause.clear()
-            if self.cmd_paused:
-                self.broadcast("unpause")
-                self.cmd_paused = False
-                print("[cmd] workers unpaused", flush=True)
-            else:
+            if not self.unpause_workers("operator"):
                 print("[cmd] unpause: workers are not paused, no-op",
                       flush=True)
 
@@ -789,17 +852,20 @@ class SelfPlayRunner:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"[cmd] saved {len(data)} samples to {name}", flush=True)
 
-    # ---- main loop ----------------------------------------------------
-
     def run(self):
         self.setup()
         self.spawn_workers()
         self.initial_fill()
         try:
-            # the loop ends when the workers are gone and nothing is training.
-            # Draining the rescore backlog is shutdown's job, not a condition
-            # here -- MAX_BACKLOG used to stall between rounds for that.
-            while self.procs or self.retrain_worker is not None:
+            # the run is over only once the budget is spent, every game has
+            # been played, the rescorer has nothing left, and no retrain is in
+            # flight. Staying in the loop for the backlog is what lets a
+            # retrain that comes due during the final drain still fire; a dead
+            # SF thread surfaces as a raise out of tick, not a hang.
+            while (self.procs
+                   or self.fleet_wanted()
+                   or self.retrain_worker is not None
+                   or self.rescore_outstanding()):
                 if self.controls.stop.is_set():
                     self.procs = check_and_reap_procs(
                         self.procs, self.worker_procs, request_stop=True)
@@ -809,6 +875,7 @@ class SelfPlayRunner:
                 self.procs = check_and_reap_procs(
                     self.procs, self.worker_procs,
                     crash_log_path=self.crash_log_path)
+                self.maybe_respawn_workers()
 
                 self.top_up_queue()
                 self.drain_results()
@@ -830,6 +897,10 @@ class SelfPlayRunner:
         which also staggers the Stockfish engines: workers reach the first
         validation game at slightly different times rather than all spinning
         one up at once.
+
+        Selfplay fills deeper than the steady-state target: every worker slot
+        is empty right now, so the shallow target would take several loop
+        passes to bring the fleet up to capacity.
         """
         if self.blunder_pool:
             last = last_epoch_in_blunder_replay_history(
@@ -837,13 +908,13 @@ class SelfPlayRunner:
             )
 
             if last is None or self.current_epoch > last:
-                self.enqueue_blunder_replays(
-                    BRP_ANALYSIS_EVERY // 2,
-                    f"startup, epoch {self.current_epoch}"
-                )
+                self.enqueue_blunder_replays(BRP_ANALYSIS_EVERY // 2)
 
         self.maybe_start_validation()
-        self.top_up_queue()
+        self.top_up_queue(
+            target=self.cfg.n_workers * self.cfg.games_at_once
+            + GAME_QUEUE_TARGET
+        )
 
     def report(self):
         elapsed = time.time() - self.started_at
@@ -876,6 +947,13 @@ class SelfPlayRunner:
         self.stop_workers()
         self.report()
 
+    def rescore_outstanding(self):
+        """Games still owed a Stockfish pass, anywhere in the pipeline."""
+        return (len(self.finished_games) + len(self.finished_brp)
+                + len(self.rescorer.intake)
+                + len(self.rescorer.blunder_replay_intake)
+                + len(self.rescorer.pending))
+
     def drain_rescorer(self, timeout_s=300.0):
         """Finish the SF work already in flight before exiting.
 
@@ -887,11 +965,7 @@ class SelfPlayRunner:
         deadline = time.monotonic() + timeout_s
         while True:
             self.tick_rescorer()
-            outstanding = (
-                len(self.finished_games) + len(self.finished_brp)
-                + len(self.rescorer.intake)
-                + len(self.rescorer.blunder_replay_intake)
-                + len(self.rescorer.pending))
+            outstanding = self.rescore_outstanding()
             if not outstanding:
                 return True
             if time.monotonic() > deadline:
@@ -944,16 +1018,14 @@ def parse_paths(run_tag):
 
 
 def run_roundless(run_tag):
-    """Entry point. run_selfplay.py calls this once cutover happens; until
-    then it is reachable directly for smoke runs."""
+    """Entry point. scripts/run_selfplay.py is a shim over this."""
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
     controls = Controls()
     runner = SelfPlayRunner(
         run_tag, base_cfg, yaml_path, val_yaml_path, controls=controls)
 
-    # run_selfplay's __main__ points these at its own STOP_REQUESTED, which
-    # this runner never reads -- and an installed handler stops SIGINT from
-    # raising KeyboardInterrupt, so without this Ctrl-C does nothing at all
+    # an installed handler stops SIGINT from raising KeyboardInterrupt, so
+    # these are what make Ctrl-C reach the runner at all
     def on_signal(signum=None, frame=None):
         print("[signal] stop requested", flush=True)
         controls.stop.set()

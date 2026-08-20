@@ -4,10 +4,6 @@ import os
 import time
 
 import numpy as np
-import yaml
-
-from chessbot.mcts_utils import ChessGame
-import chessbot.utils as cbu
 
 VALIDATION_CONFIG_FILENAME = "validation_config.yaml"
 HISTORY_FILENAME = "validation_history.jsonl"
@@ -45,7 +41,7 @@ def create_validation_config(cfg, yaml_file=None):
         (i for i, row in enumerate(vcfg.sf_table) if row["depth"] >= DEFAULT_START_DEPTH),
         len(vcfg.sf_table) - 1,
     )
-    vcfg.sf_depth = vcfg.sf_table[vcfg.sf_index]['depth']
+    vcfg.sf_validation_depth = vcfg.sf_table[vcfg.sf_index]['depth']
     vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
     vcfg.consec_over_50 = 0
     vcfg.init_paths()
@@ -133,7 +129,7 @@ def continue_depth_from_previous_cfg(cfg, last_entry):
             break
 
     cfg.sf_index = new_index
-    cfg.sf_depth = cfg.sf_table[cfg.sf_index]['depth']
+    cfg.sf_validation_depth = cfg.sf_table[cfg.sf_index]['depth']
     cfg.sf_elo = cfg.sf_table[cfg.sf_index]['elo']
     cfg.consec_over_50 = last_entry['consec_over_50']
     return cfg
@@ -154,49 +150,10 @@ def format_and_print_validation_info(cfg, prev_last):
             f"Xerces elo (score): {melo} ({msc})"
         )
 
-    sfd = cfg.sf_depth
+    sfd = cfg.sf_validation_depth
     sfe = cfg.sf_elo
     over50 = cfg.consec_over_50
     print(f"{V} curr run: SF depth: {sfd} SF elo: {sfe} | Consec over 0.5: {over50}")
-
-
-def paired_validation_games(cfg):
-    """
-    Return paired ChessGame instances for Stockfish validation.
-
-    For each i in range(n):
-      - sample a UHO board using GameGenerator
-      - clone it
-      - create two ChessGame objects where stockfish plays one as white
-        and the other as black
-    """
-    gen = cbu.GameGenerator(cfg)
-
-    games = []
-    n = cfg.n_games // 2
-    for i in range(n):
-        board_white, _ = gen.new_board(game_type="UHO")
-        board_black = board_white.clone()
-
-        meta_w = {
-            "vs_stockfish": True,
-            "stockfish_is_white": True,
-            "scenario": "paired_validation"
-        }
-
-        meta_b = {
-            "vs_stockfish": True,
-            "stockfish_is_white": False,
-            "scenario": "paired_validation"
-        }
-
-        cg_w = ChessGame(board=board_white, meta=meta_w, cfg=cfg)
-        cg_b = ChessGame(board=board_black, meta=meta_b, cfg=cfg)
-
-        games.append(cg_w)
-        games.append(cg_b)
-
-    return games
 
 
 def estimate_model_elo(sf_elo, score):
@@ -214,20 +171,13 @@ def estimate_model_elo(sf_elo, score):
     return sf_elo - 400.0 * math.log10((1.0 / s) - 1.0)
 
 
-def build_validation_summary(looper):
-    """Legacy entry point: a RecordKeeper carrying .recent_games and a
-    bolted-on .config. Kept while run_selfplay.main() is still live."""
-    return build_validation_summary_from_rows(looper.recent_games, looper.config)
-
-
 def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
     """
     Build validation summary and apply the two-consecutive >50% bump rule.
 
-    Takes the batch's game metas plus the validation config directly, so the
-    roundless runner does not have to fake a RecordKeeper. The bump is only
-    ever recorded to history -- cfg is not mutated -- so the caller must
-    rebuild its validation config afterwards to pick the new depth up.
+    The bump is only ever recorded to history -- cfg is not mutated -- so the
+    caller must rebuild its validation config afterwards to pick the new
+    depth up.
 
     model_epoch is the epoch the batch *started* on, not the one it finished
     on: a retrain can land mid-batch. Stamped so the cadence can later be
@@ -260,7 +210,6 @@ def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
     sf_elo = cfg_dict['sf_elo']
     table = cfg_dict["sf_table"]
     index = cfg_dict["sf_index"]
-    entry = table[index]
 
     model_elo = estimate_model_elo(sf_elo, score)
 

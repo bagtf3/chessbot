@@ -20,7 +20,7 @@ from pyfastchess import Board as fastboard
 
 from chessbot import SF_LOC
 
-from collections import deque, defaultdict
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import re
@@ -1067,12 +1067,13 @@ def sf_bucket(vs_sf, sf_flag):
     return "white" if sf_flag else "black"
 
 
-def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
+def accumulate_game_stats(g, stats, sf_overall, wins_by_scenario=None,
+                          result_is_bot_pov=True):
     """Fold one game's meta into running counters.
 
-    Every field summarize_recent_games reports is a counter, so the whole-run
-    view can be accumulated once per game rather than recomputed by rescanning
-    a retained list -- which is what makes "all games" O(1) memory roundless.
+    Every field the summary reports is a counter, so the whole-run view is
+    accumulated once per game rather than recomputed by rescanning a retained
+    list -- which is what makes "all games" O(1) memory.
     """
     scenario = g.get("scenario", "unknown")
     bucket = sf_bucket(g.get("vs_stockfish", False), g.get("stockfish_color"))
@@ -1107,6 +1108,8 @@ def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
     bot_won = (r < 0) if sf_is_white else (r > 0)
     if bot_won:
         sf_overall["W"] += 1
+        if wins_by_scenario is not None:
+            wins_by_scenario[scenario] += 1
     else:
         sf_overall["L"] += 1
 
@@ -1121,38 +1124,6 @@ def order_stat_rows(stats):
         key=lambda kv: (kv[0][0] == "paired_validation", kv[0][0],
                         bucket_order.get(kv[0][1], 99)),
     )
-
-
-def summarize_recent_games(recent, result_is_bot_pov=True):
-    """
-    Per-(scenario,sf_bucket) stats (unchanged) + bot-vs-SF W/D/L totals.
-    For the SF totals we assume `result` is WHITE-POV:
-      r > 0 => white won, r < 0 => black won, r == 0 => draw
-    """
-    stats = defaultdict(lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
-    sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
-    for g in recent:
-        accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov)
-
-    return stats, order_stat_rows(stats), sf_overall
-
-
-def print_recent_summary(recent, window=2000, result_is_bot_pov=True):
-    """Window-slice entry point, kept for the legacy round-based caller."""
-    recent = recent[-window:]
-    stats, _rows, sf_overall = summarize_recent_games(
-        recent, result_is_bot_pov=result_is_bot_pov
-    )
-    wins = defaultdict(int)
-    for g in recent:
-        if not g.get("vs_stockfish", False):
-            continue
-        r = g.get("result", 0.0)
-        if r == 0:
-            continue
-        if (r < 0) if g.get("stockfish_color") else (r > 0):
-            wins[g.get("scenario", "unknown")] += 1
-    print_summary_from_stats(stats, sf_overall, wins_by_scenario=wins)
 
 
 def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):

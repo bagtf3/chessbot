@@ -15,14 +15,12 @@ class Config(object):
 
     # highest level params
     is_validation_run = False
-    validation_every = 5
-    # roundless cadence: validation fires every N retrains as a discrete,
-    # non-overlapping batch. The ladder counts runs, not games, so
-    # overlapping batches would advance depth roughly twice as fast.
+    # validation fires every N retrains as a discrete, non-overlapping batch.
+    # The ladder counts runs, not games, so overlapping batches would advance
+    # depth roughly twice as fast.
     validate_every_n_retrains = 5
     validation_games_per_batch = 256
     n_workers = 2
-    n_rounds = 51
 
     # per-game parameter sampling; resolved once per game in the main process.
     # each entry: param_name: [list of options to pick from].
@@ -73,20 +71,16 @@ class Config(object):
     eval_draw_thresh = 0.1
     eval_draw_span = 15
 
-    play_vs_sf_prob = 0.5
-    sf_depth = 10
+    sf_validation_depth = 10
     sf_config = {"Threads": 1, "Hash": 256, "UCI_ShowWDL": True}
-    sf_exclude = ["piece_training"]
 
     # rescoring config
     # SF searches to whichever binds first: this time budget or a hardcoded
     # depth backstop. Under backlog it drops by a hardcoded 10ms.
     rescore_movetime_ms = 90
+    rescore_movetime_validation_ms = 160
     rescore_analyze_batch = 30
-    # equiv scales with how sharp the position is: a 20cp slip in a dead even
-    # position is a real error, the same slip at +600 is noise. min applies
-    # below ~100cp, max keeps the slope from handing crushing positions a
-    # tolerance far above the errors actually seen there.
+    
     rescore_equiv_min = 10
     rescore_equiv_max = 60
     rescore_inaccuracy_cp = 75

@@ -332,7 +332,7 @@ class Rescorer(object):
         self.closed = False
 
         # pool itself is never cached here -- it's passed into tick() each
-        # call from the one floating copy in run_selfplay.py's main(), since
+        # call from the one copy SelfPlayRunner holds, since
         # this class only ever mutates it (new candidates, replay evictions),
         # never samples from it. blunder_pool_path is just a string, and
         # n_pool_changes is this class's own save-cadence counter, so both
@@ -530,7 +530,7 @@ class Rescorer(object):
         print(f"{RS} blunder pool saved: {len(pool)} live")
 
     def close(self, pool=None):
-        """Idempotent -- run_selfplay closes on the normal path and again in
+        """Idempotent -- the runner closes on the normal path and again in
         cleanup, and the counts are unchanged between the two."""
         if self.closed:
             return
@@ -874,7 +874,14 @@ class Rescorer(object):
         if to_sf_positions:
             self.n_sf_submitted += len(to_sf_positions)
             game_state['waiting'] = True
-            self.game_q.put((gid, to_sf_positions, {}))
+            # validation games are the cleanest quality signal there is --
+            # high sims, no training use -- so they buy a deeper SF pass than
+            # selfplay. Blunder replays never come through here; they carry
+            # their own per-position ramp off the pool cache.
+            info = {}
+            if is_validation_game and cfg.rescore_movetime_validation_ms:
+                info["movetime_ms"] = cfg.rescore_movetime_validation_ms
+            self.game_q.put((gid, to_sf_positions, info))
         else:
             self.finalize_game(self.pending.pop(gid), pool)
 

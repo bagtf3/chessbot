@@ -501,20 +501,22 @@ def resolve_cfg(cfg):
 class GameGenerator:
     def __init__(self, cfg):
         self.config = cfg
-        self.game_types = list(cfg.game_probs.keys())
-        self.sf_count = 0
         # bounded: the source corpora (UHO pgn, pre_opened pkl path lists)
-        # are finite, so roundless this set saturates and the 20-attempt retry
-        # below burns 20 board rebuilds per game only to return a duplicate
-        # anyway. FIFO eviction keeps dedup useful over a moving window.
+        # are finite, so over a long run this set saturates and the 20-attempt
+        # retry below burns 20 board rebuilds per game only to return a
+        # duplicate anyway. FIFO eviction keeps dedup useful over a window.
         self.used_fens = set()
         self.used_fens_order = deque()
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
-        self.sf_cap = int(cfg.play_vs_sf_prob * cfg.n_games)
 
-        # blunder-replay metering, round-scoped (one GameGenerator per round)
         self.games_queued = 0
-        self.brps_queued = 0
+
+    @property
+    def game_types(self):
+        """Read live, not cached at construction: the runner re-points
+        .config after every retrain so a game_probs edit takes effect
+        mid-run without a restart."""
+        return list(self.config.game_probs.keys())
 
     def generate(self, game_type):
         """Returns (fen, moves, meta). fen is the starting position; moves are
@@ -575,22 +577,6 @@ class GameGenerator:
 
         return fen, moves, meta
 
-    def assign_sf(self, meta):
-        cfg = self.config
-        meta["vs_stockfish"] = False
-        meta["stockfish_is_white"] = False
-        if cfg.play_vs_sf_prob <= 0.0:
-            return
-        if meta.get("scenario") in cfg.sf_exclude:
-            return
-        if self.sf_count >= self.sf_cap:
-            return
-        if np.random.uniform() > cfg.play_vs_sf_prob:
-            return
-        self.sf_count += 1
-        meta["vs_stockfish"] = True
-        meta["stockfish_is_white"] = bool(self.sf_count % 2)
-
     def new_board(self, game_type=None):
         """Returns (board, meta) — compatibility API for misc scripts."""
         if game_type is None:
@@ -630,7 +616,9 @@ class GameGenerator:
                 attempts += 1
             self.remember_fen(key)
 
-        self.assign_sf(meta)
+        # only paired validation plays SF, but ChessGame reads both keys
+        meta["vs_stockfish"] = False
+        meta["stockfish_is_white"] = False
         self.games_queued += 1
         return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
 
@@ -643,16 +631,10 @@ class GameGenerator:
         while len(self.used_fens_order) > USED_FENS_CAP:
             self.used_fens.discard(self.used_fens_order.popleft())
 
-    def next_blunder_replays(self, pool, n_to_queue, until_analysis=None,
-                             current_epoch=None):
-        """
-        Sample n_to_queue replay probes from the live pool. All metering
-        lives at the callsites in run_selfplay.py: a 1:1 trickle off every
-        eligible blunder the rescorer finds, plus a bulk dump at round
-        start and after each retrain. until_analysis is display only --
-        finished probes still owed before analyse_brp_file fires.
-        current_epoch applies the BRP_MIN_AGE gate.
-        """
+    def next_blunder_replays(self, pool, n_to_queue, current_epoch=None):
+        """Sample n_to_queue probes from the live pool. Metering and logging
+        live at the selfplay_runner callsites. current_epoch gates
+        BRP_MIN_AGE."""
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
         )
@@ -666,16 +648,6 @@ class GameGenerator:
             replay_cfg, pool, n_to_queue,
             current_epoch=current_epoch
         )
-
-        before = self.brps_queued
-        self.brps_queued += len(specs)
-        # heartbeat only, not per-call -- this fires many times per round in
-        # small batches by design
-        if self.brps_queued // 500 != before // 500:
-            msg = f"[blunder_replay] {self.brps_queued} queued this round"
-            if until_analysis is not None:
-                msg += f", {until_analysis} results until analysis"
-            print(msg)
 
         return specs
 

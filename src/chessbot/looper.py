@@ -13,7 +13,6 @@ from chessbot.review import score_to_value_stm_pov_tanh
 now = time.time
 
 import numpy as np
-import pandas as pd
 from pyfastchess import (
     raw_cache_bulk_insert_np, priors_cache_clear, priors_cache_stats, MCTSForest
 )
@@ -24,7 +23,6 @@ from chessbot.infer_ort_trt import make_ort_trt_infer
 
 from chessbot.mcts_utils import ChessGame
 from chessbot.utils import RateMeter, sf_eval, next_model_epoch
-from chessbot.game_utils import GameSpec
 
 
 class GameLooper(object):
@@ -69,10 +67,8 @@ class GameLooper(object):
     def tear_down_sf(self):
         """Drop the Stockfish engine. Safe to call when there is none.
 
-        Not just an RSS saving: the engine is built once from the config of
-        whichever spec first needed it, so a thread surviving a validation
-        batch would keep serving the old ladder depth after a bump. Tearing
-        it down is what makes the next batch pick the new depth up.
+        The engine holds the depth it was built with, so dropping it between
+        validation batches is what lets a bumped ladder take effect.
         """
         if self.sf_thread is not None:
             self.sf_thread.close()
@@ -229,10 +225,10 @@ class GameLooper(object):
                 except Exception:
                     break
             if spec.meta.get("vs_stockfish") and self.sf_thread is None:
-                # spec.cfg, not self.config: sf_depth is the ladder's, and it
-                # only ever exists on the validation config
+                # depth is fixed for this engine's life; a moved ladder only
+                # takes effect after a tear_down_sf rebuilds it
                 self.sf_thread = StockfishThread(
-                    spec.cfg.sf_config, spec.cfg.sf_depth
+                    spec.cfg.sf_config, spec.cfg.sf_validation_depth
                 )
                 self.sf_thread.start()
             game_cfg = spec.cfg
@@ -652,7 +648,7 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, s
 
     # infer the current epoch from the progress csv. Row count is wrong once the
     # csv carries pretrain rows (written every Nth epoch), so use the same
-    # max+1 rule run_selfplay uses and stay in agreement with it.
+    # max+1 rule the runner uses and stay in agreement with it.
     looper.n_retrains = next_model_epoch(config.progress_csv_path)
 
     return looper

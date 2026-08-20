@@ -265,7 +265,6 @@ def create_blunder_replay_config(cfg, yaml_file=None):
 
     # one move per position, no adjudication, no opponent
     pcfg.max_game_length = 0
-    pcfg.play_vs_sf_prob = 0.0
     pcfg.use_syzygy = False
     pcfg.allow_resignation = False
     pcfg.use_eval_draw = False

@@ -35,6 +35,7 @@ from chessbot.blunder_replay import (
     blunder_replay_dir, BRP_POOL_MAX_SIZE,
     BRP_MIN_CACHE_DEPTH, ratchet_store, cached_deep_score,
     BRP_START_MS, BRP_MS_STEP, BRP_MS_MAX_MULT,
+    BRP_REVIEW_MIN_FAILS, BRP_REVIEWABLES_FILENAME, probe_fails,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -406,6 +407,8 @@ class Rescorer(object):
 
         self.blunder_replay_jsonl = os.path.join(
             blunder_replay_dir(cfg), "blunder_replay_probe.jsonl")
+        self.brp_reviewables_jsonl = os.path.join(
+            blunder_replay_dir(cfg), BRP_REVIEWABLES_FILENAME)
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
         # 1:1 replay trickle meter -- drained by top_up_queues
@@ -564,10 +567,6 @@ class Rescorer(object):
         n = self.brp_credits
         self.brp_credits = 0
         return n
-
-    def brp_until_analysis(self):
-        """Finished replay probes still owed before analyse_brp_file fires."""
-        return max(0, BRP_ANALYSIS_EVERY - self.n_replay_rows)
 
     def tick(self, pool=None):
         if self.lc0_thread is not None:
@@ -1104,6 +1103,13 @@ class Rescorer(object):
             elif ply is not None:
                 added_to_buffer = self.add_blunder_replay_training_example(
                     ply, epoch, best_uci, best_cp, probe_cpl)
+                # probe_fails only seeds records the seed script never saw --
+                # new blunders enter the pool without an n_fails
+                src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
+                if src['n_fails'] >= BRP_REVIEW_MIN_FAILS:
+                    self.write_brp_reviewable(
+                        brp_data, src, ply, best_uci, best_cp, played_cp,
+                        probe_cpl, best_depth)
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1135,6 +1141,39 @@ class Rescorer(object):
         self.n_replay_finalized += 1
         if self.n_replay_rows >= BRP_ANALYSIS_EVERY:
             self.analyse_brp_file()
+
+    def write_brp_reviewable(self, brp_data, src, ply, best_uci, best_cp,
+                             played_cp, probe_cpl, best_depth):
+        """Game-log shaped so GameViewer.from_record opens it directly.
+        history_uci is the path to the position plus the probe move, which is
+        the full line from STARTPOS -- reconcile_game_boards needs it whole."""
+        moves = list(brp_data.get('moves_played') or [])
+        row = {
+            "game_id": brp_data.get('game_id'),
+            "start_fen": brp_data.get('start_fen'),
+            "moves_played": moves,
+            "history_uci": list(src.get('uci_path') or []) + moves,
+            "tree_search_data": brp_data.get('tree_search_data') or {},
+            "result": None,
+            "scenario": "blunder_replay_probe",
+            "short_fen": brp_data.get('short_fen'),
+            "model_epoch": brp_data.get('model_epoch'),
+            "n_fails": src.get('n_fails'),
+            "probe_move": ply.get('xerces_uci'),
+            "probe_cpl": probe_cpl,
+            "played_cp": played_cp,
+            "sf_best": best_uci,
+            "sf_best_cp": best_cp,
+            "sf_best_depth": best_depth,
+            "orig_move": brp_data.get('orig_move'),
+            "orig_best": brp_data.get('orig_best'),
+            "orig_cpl": brp_data.get('orig_cpl'),
+            "src_run_tag": brp_data.get('src_run_tag'),
+            "src_game_id": brp_data.get('src_game_id'),
+            "src_move_num": brp_data.get('src_move_num'),
+        }
+        with open(self.brp_reviewables_jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=float) + "\n")
 
     def add_equiv_replay_training_example(self, ply):
         """

@@ -53,13 +53,32 @@ class GameViewer:
                 self.log = pickle.load(f)
         else:
             raise Exception("log_path must be json or pickle")
-        
-        self.start_fen = self.log.get("start_fen")
-        self.moves_uci = self.log.get("moves_played", [])
-        self.tree_data = {int(k): v for k, v in self.log.get("tree_search_data", {}).items()}
-        self.result = self.log.get("result")
-        self.game_id = self.log.get("game_id")
-    
+
+        self.init_from_log(self.log, sf_df)
+
+    @classmethod
+    def from_record(cls, row, sf_df=None):
+        """Viewer over an already-loaded log dict, e.g. one brp_reviewables
+        row. No file behind it, so self.path is None."""
+        v = cls.__new__(cls)
+        v.path = None
+        v.log = row
+        v.init_from_log(row, sf_df)
+        return v
+
+    @classmethod
+    def from_batch(cls, jsonl_path, sf_df=None):
+        """Every row of a brp_reviewables jsonl, steppable one probe at a
+        time. See BrpReviewBatch."""
+        return BrpReviewBatch(jsonl_path, sf_df=sf_df)
+
+    def init_from_log(self, log, sf_df=None):
+        self.start_fen = log.get("start_fen")
+        self.moves_uci = log.get("moves_played", [])
+        self.tree_data = {int(k): v for k, v in log.get("tree_search_data", {}).items()}
+        self.result = log.get("result")
+        self.game_id = log.get("game_id")
+
         self.sf_rows = None
         self._sf_by_ply = {}  # maps ply index -> row index into self.sf_rows
     
@@ -1795,6 +1814,75 @@ def make_training_sample(b, v, visits):
 
 
 
+class BrpReviewBatch:
+    """Step through brp_reviewables.jsonl. Every row is a single probe move,
+    so next/prev walk between positions, not plies."""
+
+    def __init__(self, jsonl_path, sf_df=None):
+        self.path = pathlib.Path(jsonl_path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"reviewables not found: {self.path}")
+        with open(self.path, "r", encoding="utf-8") as f:
+            self.rows = [json.loads(ln) for ln in f if ln.strip()]
+        if not self.rows:
+            raise ValueError(f"no rows in {self.path}")
+        self.sf_df = sf_df
+        self.i = 0
+        self.viewer = GameViewer.from_record(self.rows[0], sf_df)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        return GameViewer.from_record(self.rows[i], self.sf_df)
+
+    def goto(self, i):
+        self.i = max(0, min(i, len(self.rows) - 1))
+        self.viewer = GameViewer.from_record(self.rows[self.i], self.sf_df)
+        return self.show()
+
+    def next(self):
+        return self.goto(self.i + 1)
+
+    def prev(self):
+        return self.goto(self.i - 1)
+
+    def row(self):
+        return self.rows[self.i]
+
+    def summary(self):
+        """Every row minus the tree, for scanning/filtering in pandas."""
+        drop = {"tree_search_data", "moves_played", "history_uci"}
+        return pd.DataFrame([
+            {k: v for k, v in r.items() if k not in drop} for r in self.rows
+        ])
+
+    def seek_fails(self, min_fails):
+        """Jump to the next row at or past min_fails, wrapping once."""
+        n = len(self.rows)
+        for step in range(1, n + 1):
+            j = (self.i + step) % n
+            if (self.rows[j].get("n_fails") or 0) >= min_fails:
+                return self.goto(j)
+        print(f"[brp] no row with n_fails >= {min_fails}")
+        return self.viewer
+
+    def show(self, top_n=5):
+        r = self.row()
+        print(f"[{self.i + 1}/{len(self.rows)}] {r.get('short_fen')}  "
+              f"epoch {r.get('model_epoch')}  fails {r.get('n_fails')}")
+        print(f"  orig  {r.get('orig_move')} (cpl {r.get('orig_cpl')})  "
+              f"orig_best {r.get('orig_best')}")
+        print(f"  probe {r.get('probe_move')} (cpl {r.get('probe_cpl')})  "
+              f"sf_best {r.get('sf_best')} @d{r.get('sf_best_depth')} "
+              f"cp {r.get('sf_best_cp')}")
+        print(f"  from  {r.get('src_run_tag')} / {r.get('src_game_id')} "
+              f"move {r.get('src_move_num')}")
+        self.viewer.show_board()
+        self.viewer.show_moves(top_n=top_n)
+        return self.viewer
+
+
 class RecordKeeper(object):    
     def __init__(self, n_retrains, every_sec=60):
         self.n_retrains = n_retrains
@@ -1921,16 +2009,6 @@ class RecordKeeper(object):
             f"avg_len={avg_moves:.1f} moves")
         print("-" * 72)
 
-        # above the early return: buffer depth is most useful exactly when no
-        # games have finished -- startup, retrain pause, final drain
-        primary_count = (len(os.listdir(self.primary_buffer_dir))
-                         if self.primary_buffer_dir else 0)
-        print(
-            f"live buffer: {self.training_queue}  "
-            f"primary_buffer: {primary_count}/{self.primary_buffer_trigger}  "
-            f"retrain number: {self.n_retrains}"
-        )
-
         if not self.games_finished:
             print("(no games to break down)")
             print("~" * 72)
@@ -1940,7 +2018,13 @@ class RecordKeeper(object):
         # counters cover the whole run, not the last `window` games
         print_summary_from_stats(self.scenario_stats, self.sf_overall,
                                  self.wins_by_scenario)
-        print()
+        primary_count = (len(os.listdir(self.primary_buffer_dir))
+                         if self.primary_buffer_dir else 0)
+        print(
+            f"live buffer: {self.training_queue}  "
+            f"primary_buffer: {primary_count}/{self.primary_buffer_trigger}  "
+            f"retrain number: {self.n_retrains}\n"
+        )
         # chain log_loop_stats here as well
         self.log_loop_stats(summed, avged)
         return

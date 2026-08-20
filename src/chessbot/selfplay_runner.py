@@ -39,6 +39,7 @@ from chessbot.review import RecordKeeper
 from chessbot.utils import format_time, make_jsonable, next_model_epoch
 from chessbot.validation import (
     build_validation_summary_from_rows, create_validation_config,
+    print_validation_info,
 )
 import chessbot.replay_buffer as rb
 
@@ -51,9 +52,6 @@ GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
 # left to wedge the cadence forever. Generous on purpose: it should only ever
 # fire on a genuinely stuck batch, not a slow one
 VAL_BATCH_TIMEOUT_S = 7200.0
-# probes are queued a few at a time by the trickle and in bulk by the
-# dumps; report every this many queued either way
-BRP_LOG_EVERY = 512
 # the retrain worker sleeps this long after retrain_ready before it touches
 # the GPU; a pause issued outside that handshake gets the same settle window
 WORKER_PAUSE_SETTLE_S = 10.0
@@ -252,7 +250,6 @@ class SelfPlayRunner:
 
         self.current_epoch = 0
         self.games_at_start = 0
-        self.brp_queued = 0
         self.total_games = 0
         self.total_queued = 0
         self.finished_games = deque()
@@ -312,7 +309,8 @@ class SelfPlayRunner:
         self.recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
 
         self.reload_config()
-        self.val_cfg = create_validation_config(self.cfg, self.val_yaml_path)
+        self.val_cfg = create_validation_config(
+            self.cfg, self.val_yaml_path, verbose=False)
         self.crash_log_path = os.path.join(self.cfg.run_dir, "worker_crash_log.txt")
 
         # credit games already on disk against the budget. total_queued is
@@ -528,7 +526,7 @@ class SelfPlayRunner:
 
     def enqueue_blunder_replays(self, n):
         """Queue n replay probes, from either the trickle or a bulk dump.
-        Both share one counter and report together every BRP_LOG_EVERY."""
+        Progress shows up in the rescore table's replays column."""
         if self.blunder_pool is None or n <= 0:
             return 0
         specs = self.game_gen.next_blunder_replays(
@@ -536,13 +534,6 @@ class SelfPlayRunner:
         )
         for spec in specs:
             self.game_q.put(spec)
-
-        self.brp_queued += len(specs)
-        if self.brp_queued >= BRP_LOG_EVERY:
-            print(f"[blunder_replay] {self.brp_queued} queued | "
-                  f"{self.rescorer.brp_until_analysis()} until analysis",
-                  flush=True)
-            self.brp_queued = 0
         return len(specs)
 
     def maybe_start_validation(self):
@@ -581,6 +572,7 @@ class SelfPlayRunner:
               f"{self.current_epoch}, sf_depth "
               f"{self.val_cfg.sf_validation_depth}",
               flush=True)
+        print_validation_info(self.val_cfg)
 
     def finish_validation_batch(self):
         """Complete batch only. Writes one history row, then rebuilds the
@@ -595,7 +587,8 @@ class SelfPlayRunner:
         # engines are built per-spec-config and cached for the worker's life,
         # so they must be dropped or the next batch replays the old depth
         self.broadcast("tear_down_sf")
-        self.val_cfg = create_validation_config(self.cfg, self.val_yaml_path)
+        self.val_cfg = create_validation_config(
+            self.cfg, self.val_yaml_path, verbose=False)
 
     def close_partial_validation_batch(self, why):
         """Summarise whatever came back. The batch is colour-imbalanced, so

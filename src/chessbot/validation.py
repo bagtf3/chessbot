@@ -34,7 +34,7 @@ SF_TABLE_DEFAULT = [
   {"depth": 23, "elo": 3761, "name": "SF17d23"},
 ]
 
-def create_validation_config(cfg, yaml_file=None):
+def create_validation_config(cfg, yaml_file=None, verbose=True):
     vcfg = cfg.copy()
     vcfg.sf_table = SF_TABLE_DEFAULT
     vcfg.sf_index = next(
@@ -53,8 +53,9 @@ def create_validation_config(cfg, yaml_file=None):
     
     if os.path.exists(v_yaml):
         vcfg.update_via(v_yaml)
-        print(f"{V} config updated with local yaml")
-    else:
+        if verbose:
+            print(f"{V} config updated with local yaml")
+    elif verbose:
         print(f"{V} no local yaml config found.")
 
     prev_last = find_last_history_entry_for_run(
@@ -65,9 +66,20 @@ def create_validation_config(cfg, yaml_file=None):
     if prev_last is not None:
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
 
-    format_and_print_validation_info(vcfg, prev_last)
-    
+    if verbose:
+        format_and_print_validation_info(vcfg, prev_last)
+
     return vcfg
+
+
+def print_validation_info(cfg):
+    """Ladder status block. Called when a batch starts, not at process start,
+    so it reports the depth that batch is actually about to play."""
+    prev_last = find_last_history_entry_for_run(
+        cfg.run_dir, selfplay_dir=cfg.selfplay_dir,
+        previous_run_tag=cfg.previous_run_tag,
+    )
+    format_and_print_validation_info(cfg, prev_last)
 
 
 def find_last_history_entry_for_run(run_dir, selfplay_dir=None, previous_run_tag=None):

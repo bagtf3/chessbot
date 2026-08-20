@@ -29,6 +29,18 @@ BRP_DIRNAME = "blunder_probe"
 BRP_HISTORY_FILENAME = "blunder_probe_history.jsonl"
 BRP_MIN_CACHE_DEPTH = 18
 BRP_EQUIV_CPL = 25
+# a position this many failed probes deep gets written to the reviewables
+# file, once per failure from there on, so the trend is visible
+BRP_REVIEW_MIN_FAILS = 3
+BRP_REVIEWABLES_FILENAME = "brp_reviewables.jsonl"
+
+
+def probe_fails(src):
+    """Failed probes implied by the escalated SF budget -- a lower bound, since
+    the ratchet skips probes that locked a deep best move, and it saturates at
+    BRP_MS_MAX_MULT."""
+    ms = src.get('sf_ms') or BRP_START_MS
+    return max(0, (ms - BRP_START_MS) // BRP_MS_STEP)
 # a position discovered this recently has not survived a retrain yet, so
 # replaying it measures nothing. Gates trickle sampling; the epoch-boundary
 # dumps deliberately ignore it.

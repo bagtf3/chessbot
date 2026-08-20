@@ -4,6 +4,14 @@ import pickle
 # the retained list would otherwise grow for the life of the process; the
 # counters carry the whole-run view, this is only for the last-50 line
 RECENT_GAMES_CAP = 20000
+
+# per-window counts, as opposed to the rates and gauges alongside them in the
+# telemetry dict. Only these get scaled onto the print's span.
+COUNTER_KEYS = (
+    "n_groups", "s_collected", "s_fast", "s_terminals", "s_cached",
+    "s_fast_stops", "s_collect_stops", "s_blocked", "s_puct", "s_must_visit",
+    "s_skipped", "s_pruned", "s_penalty", "s_depth",
+)
 from collections import defaultdict, deque
 
 import chess, chess.svg
@@ -2103,7 +2111,7 @@ class RecordKeeper(object):
 
         self.maybe_log_results()
 
-    def get_agg_metrics(self):
+    def get_agg_metrics(self, print_span=None):
         time_delta = time.time() - 120
 
         to_sum = [
@@ -2121,7 +2129,8 @@ class RecordKeeper(object):
         summed = defaultdict(float)
         sum_seen = set()
 
-        to_avg = ["mbs", "batch_target", "apl", "infer_gap", "pred_wait", "avg_ply"]
+        to_avg = ["mbs", "batch_target", "apl", "infer_gap", "pred_wait",
+                  "avg_ply", "spm"]
         avged = defaultdict(list)
         avg_seen = set()
 
@@ -2129,8 +2138,15 @@ class RecordKeeper(object):
             if info.get("ts", 0) < time_delta:
                 continue
 
+            # a child's counts cover its own push window, which is not the
+            # span since the last print. Scale each child onto the print's
+            # span so a long or stale window reads at the right size.
+            window = info.get("window_s") or 0.0
+            scale = print_span / window if (print_span and window > 0) else 1.0
+
             for k in to_sum:
-                summed[k] += info.get(k, 0)
+                v = info.get(k, 0)
+                summed[k] += v * scale if k in COUNTER_KEYS else v
                 sum_seen.add(k)
 
             for k in to_avg:
@@ -2147,10 +2163,12 @@ class RecordKeeper(object):
         if not force and (now - self._last_stats_log < self.every_sec):
             return
 
+        # span this print covers, read before the stamp moves
+        print_span = now - self._last_stats_log
         self._last_stats_log = now
 
         # pull stats
-        summed, avged = self.get_agg_metrics()
+        summed, avged = self.get_agg_metrics(print_span)
         avg_moves = (self.total_plies / max(1, self.games_finished))
         gph =  3600 * self.games_finished / (now - self._run_start)
         
@@ -2206,8 +2224,7 @@ class RecordKeeper(object):
               f"preds/s={pps:.1f}  moves/hr={mps * 3600:.0f}  "
               f"active={active}  workers={len(fresh)}")
 
-        # lps/mps is leaves per move, which is sims per move
-        spm = lps / mps if mps else 0.0
+        spm = np.mean([i.get("spm", 0.0) for i in fresh])
         batch = np.mean([i.get("apl", 0.0) for i in fresh])
         q = sum(i.get("cache_queries", 0) for i in fresh)
         h = sum(i.get("cache_hits", 0) for i in fresh)
@@ -2290,8 +2307,9 @@ class RecordKeeper(object):
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
         right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
-        m = self.mcts_plies_total
-        sims_per_move = self.mcts_sims_total / m if m > 0 else 0.0
+        # EMA of the live rate, not the run average: this should move when
+        # validation or a hard probe changes what the search is doing
+        sims_per_move = avged.get("spm", 0.0)
 
         n_active = summed["n_active"]
         avg_ply = avged["avg_ply"]

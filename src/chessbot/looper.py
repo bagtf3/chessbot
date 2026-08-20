@@ -24,6 +24,19 @@ from chessbot.infer_ort_trt import make_ort_trt_infer
 from chessbot.mcts_utils import ChessGame
 from chessbot.utils import RateMeter, sf_eval, next_model_epoch
 
+# telemetry smoothing, counted in pushes rather than seconds. sims/move is
+# deliberately faster: it should visibly react to validation and hard probes.
+RATE_EMA_SPAN = 8
+SPM_EMA_SPAN = 3
+
+
+def ema_step(prev, x, span):
+    """Seeded on the first sample so the series does not crawl up from zero."""
+    if prev is None:
+        return x
+    a = 2.0 / (span + 1.0)
+    return a * x + (1.0 - a) * prev
+
 
 class GameLooper(object):
     """
@@ -55,10 +68,13 @@ class GameLooper(object):
         
         self.n_retrains = 0
         
-        self._run_start = now()
+        self.run_start = now()
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
-        self._last_stats_log = now()
+        self.mps_ema = None
+        self.lps_ema = None
+        self.spm_ema = None
+        self.last_stats_log = now()
         self.prediction_times = []
         self.infer_gaps = []
         self.last_infer_end = None
@@ -555,10 +571,13 @@ class GameLooper(object):
     def maybe_push_telemetry(self, counts, pred_fill, mbs_used, every_sec=45.0, force=False):
         ts_now = now()
         if not force:
-            if ts_now - self._last_stats_log < every_sec:
+            if ts_now - self.last_stats_log < every_sec:
                 return False
 
-        self._last_stats_log = ts_now
+        # the counters below cover exactly this span; the parent needs it to
+        # normalise, since push and print cadences do not divide evenly
+        window_s = ts_now - self.last_stats_log
+        self.last_stats_log = ts_now
 
         lpb = pred_fill
         target = self.config.macro_batch
@@ -573,10 +592,20 @@ class GameLooper(object):
          s_collect_stops, s_blocked, s_puct, s_must_visit, s_skipped,
          s_pruned, s_penalty, s_depth) = (int(v) for v in col)
 
+        # rate() is destructive, so each meter is read exactly once here
+        raw_mps = self.mps.rate()
+        raw_lps = self.lps.rate()
+        self.mps_ema = ema_step(self.mps_ema, raw_mps, RATE_EMA_SPAN)
+        self.lps_ema = ema_step(self.lps_ema, raw_lps, RATE_EMA_SPAN)
+        raw_spm = raw_lps / raw_mps if raw_mps else 0.0
+        self.spm_ema = ema_step(self.spm_ema, raw_spm, SPM_EMA_SPAN)
+
         telemetry = {
             "ts": ts_now,
-            "mps": self.mps.rate(),
-            "lps": self.lps.rate(),
+            "window_s": window_s,
+            "mps": self.mps_ema,
+            "lps": self.lps_ema,
+            "spm": self.spm_ema,
             "mbs": np.mean(mbs_used) if mbs_used else 0.0,
             "apl": np.mean(lpb) if lpb else 0.0,
             "infer_gap": np.mean(self.infer_gaps) if self.infer_gaps else 0.0,

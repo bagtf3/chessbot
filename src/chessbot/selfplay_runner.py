@@ -464,6 +464,12 @@ class SelfPlayRunner:
         # re-pointing it here is what makes a yaml edit take effect
         if self.game_gen is not None:
             self.game_gen.config = self.cfg
+        # search params ride each spec's own cfg, so rebuilding this is enough
+        # for a live lc0 worker to pick them up. Batch sizes, encoding and the
+        # net are read at spawn and still need a restart.
+        if self.lc0_cfg is not None:
+            self.lc0_cfg = create_lc0_replay_config(self.cfg)
+            self.rescorer.lc0_cfg = self.lc0_cfg
 
     def spawn_worker(self):
         """Start one worker off the current config, so a replacement picks
@@ -824,7 +830,7 @@ class SelfPlayRunner:
             self.rescorer.submit_blunder_replay(
                 self.finished_brp.popleft()["meta"])
         self.rescorer.tick(self.blunder_pool)
-        self.throttle_sf()
+        self.scale_sf()
         self.recorder.training_queue = self.rescorer.training_data_size
 
     def sf_target(self):
@@ -832,18 +838,11 @@ class SelfPlayRunner:
         return max(1, cfg.rescore_n_sf_workers)
 
     def add_sf_thread(self, why="config"):
-        """Start one SF rescore thread and append it to the tail.
-
-        Matches the fleet's current movetime rather than starting at base:
-        throttle state is read off thread 0, so a fresh thread left at base_ms
-        would never be resynced.
-        """
+        """Start one SF rescore thread and append it to the tail."""
         cfg = self.cfg or self.base_cfg
         t = SFRescoreThread(self.sf_game_q, self.sf_res_q, cfg)
         t.id = f"sf{self.next_sf_id}"
         self.next_sf_id += 1
-        if self.sf_rescore_threads:
-            t.movetime_ms = self.sf_rescore_threads[0].movetime_ms
         t.start()
         self.sf_rescore_threads.append(t)
         print(f"[sf] added {t.id} ({why}), now "
@@ -881,41 +880,23 @@ class SelfPlayRunner:
             print(f"[sf] {t.id} finished and gone", flush=True)
         self.sf_retiring = still
 
-    def throttle_sf(self):
-        """Back the SF budget off while the rescore backlog is deep, and size
-        the fleet on the same marks: the config count is the resting state and
-        both levers snap back to it together."""
+    def scale_sf(self):
+        """Run one extra SF thread while the rescore backlog is deep.
+
+        Bounded at target + 1, which is what makes it self-limiting: the add
+        condition goes false as soon as the extra exists, so no cooldown or
+        counter is needed. Dropping under the low mark returns it to config.
+        """
         self.reap_sf_threads()
         backlog = len(self.rescorer.intake) + len(self.rescorer.pending)
-        sf0 = self.sf_rescore_threads[0]
-        # sync every pass so telemetry shows the threads' real state
-        self.rescorer.current_movetime_ms = sf0.movetime_ms
-        throttled = sf0.movetime_ms < sf0.base_ms
         target = self.sf_target()
+        n = len(self.sf_rescore_threads)
+        self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
 
-        if backlog > 100:
-            # one per pass, so a deep backlog ramps rather than storming
-            if len(self.sf_rescore_threads) < target:
-                self.add_sf_thread("backlog")
-            if throttled:
-                return
-            for t in self.sf_rescore_threads:
-                t.movetime_ms = t.throttled_ms
-        elif backlog < 10:
-            if len(self.sf_rescore_threads) > target:
-                self.retire_sf_thread("backlog cleared")
-            if not throttled:
-                return
-            for t in self.sf_rescore_threads:
-                t.movetime_ms = t.base_ms
-        else:
-            return
-
-        # re-read the head: a retirement above may have popped sf0
-        self.rescorer.current_movetime_ms = (
-            self.sf_rescore_threads[0].movetime_ms)
-        print(f"[rescore] backlog {backlog}, movetime -> "
-              f"{self.rescorer.current_movetime_ms}ms", flush=True)
+        if backlog > 100 and n < target + 1:
+            self.add_sf_thread("backlog")
+        elif backlog < 10 and n > target:
+            self.retire_sf_thread("backlog cleared")
 
     def check_retrain(self):
         self.maybe_launch_retrain()

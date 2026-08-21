@@ -2222,17 +2222,17 @@ class RecordKeeper(object):
         pps = sum(i.get("preds_per_second", 0.0) for i in fresh)
         active = sum(i.get("n_active", 0) for i in fresh)
 
-        print(f"[lc0 stats]   mps={mps:.2f}  lps={lps:.1f}  "
+        print(f"[lc0 stats] mps={mps:.2f}  lps={lps:.1f}  "
               f"preds/s={pps:.1f}  moves/hr={mps * 3600:.0f}  "
-              f"active={active}  workers={len(fresh)}")
+              f"active={active}")
 
         spm = np.mean([i.get("spm", 0.0) for i in fresh])
         batch = np.mean([i.get("apl", 0.0) for i in fresh])
         rates = [i["cache_hit_ema"] for i in fresh if "cache_hit_ema" in i]
         hit = f"{100.0 * np.mean(rates):.1f}%" if rates else "--"
 
-        print(f"[lc0 queue]   backlog={self.lc0_backlog}  "
-              f"probes_done={self.lc0_probes_done}  sims/move={spm:.0f}  "
+        print(f"[lc0 queue] backlog={self.lc0_backlog}  "
+              f"done={self.lc0_probes_done}  sims/move={spm:.0f}  "
               f"batch={batch:.0f}  cache_hit={hit}")
 
     def log_loop_stats(self, summed, avged):
@@ -2305,10 +2305,8 @@ class RecordKeeper(object):
         left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.1f}"
         right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
 
-        priors_hit = 100.0 * avged.get("cache_hit_ema", 0.0)
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right6 = (f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
-                  f"  priors={priors_hit:.1f}%")
+        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
 
         # EMA of the live rate, not the run average: this should move when
         # validation or a hard probe changes what the search is doing

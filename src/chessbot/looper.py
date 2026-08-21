@@ -22,7 +22,7 @@ from chessbot import SF_LOC
 from chessbot.infer_ort_trt import make_ort_trt_infer
 
 from chessbot.mcts_utils import ChessGame
-from chessbot.utils import RateMeter, sf_eval, next_model_epoch
+from chessbot.utils import RateMeter, ema_step, sf_eval, next_model_epoch
 
 # telemetry smoothing, counted in pushes rather than seconds. sims/move is
 # deliberately faster: it should visibly react to validation and hard probes.
@@ -31,14 +31,6 @@ SPM_EMA_SPAN = 3
 
 # priors-cache fields that accumulate in C++ rather than reading as a gauge
 CACHE_COUNTERS = ("queries", "hits", "evictions")
-
-
-def ema_step(prev, x, span):
-    """Seeded on the first sample so the series does not crawl up from zero."""
-    if prev is None:
-        return x
-    a = 2.0 / (span + 1.0)
-    return a * x + (1.0 - a) * prev
 
 
 class GameLooper(object):

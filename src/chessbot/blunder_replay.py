@@ -35,16 +35,33 @@ BRP_REVIEW_MIN_FAILS = 3
 BRP_REVIEWABLES_FILENAME = "brp_reviewables.jsonl"
 
 
+def last_seen_epoch(src):
+    """Falls back to discovery: a record that has never been probed is due as
+    soon as it clears the same cooldown a probed one would."""
+    ls = src.get("last_seen")
+    return src.get("model_epoch") if ls is None else ls
+
+
+def probe_is_due(src, current_epoch):
+    """Rested long enough since its last probe, and not yet aged out."""
+    if (src.get("n_fails") or 0) > BRP_MAX_FAILS:
+        return False
+    seen = last_seen_epoch(src)
+    return seen is None or current_epoch - seen > BRP_LAST_SEEN_MIN
+
+
 def probe_fails(src):
     """Failed probes implied by the escalated SF budget -- a lower bound, since
     the ratchet skips probes that locked a deep best move, and it saturates at
     BRP_MS_MAX_MULT."""
     ms = src.get('sf_ms') or BRP_START_MS
     return max(0, (ms - BRP_START_MS) // BRP_MS_STEP)
-# a position discovered this recently has not survived a retrain yet, so
-# replaying it measures nothing. Gates trickle sampling; the epoch-boundary
-# dumps deliberately ignore it.
-BRP_MIN_AGE = 7
+# probes are drawn on recency of the last probe, not of discovery, so a
+# position gets a rest between challenges instead of being hammered
+BRP_LAST_SEEN_MIN = 7
+# a position this many failed probes deep is treated as uncorrectable and
+# aged out rather than probed forever
+BRP_MAX_FAILS = 5
 # per-position SF budget: starts here, escalates by MS_STEP each probe that
 # neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
 # capped at START_MS * MS_MAX_MULT
@@ -358,16 +375,13 @@ def blunder_replay_specs(cfg, pool, n_positions, current_epoch=None):
     answer key and can be read without the pool it was sampled from. A
     position that has earned eviction is simply not in the pool dict.
 
-    current_epoch restricts sampling to positions older than BRP_MIN_AGE --
-    both the trickle and the dumps pass it.
+    current_epoch restricts sampling to positions rested since their last
+    probe and not yet aged out -- see probe_is_due. Both the trickle and the
+    dumps pass it.
     """
     keys = list(pool.keys())
     if current_epoch is not None:
-        keys = [
-            k for k in keys
-            if pool[k].get("model_epoch") is None
-            or current_epoch - pool[k]["model_epoch"] > BRP_MIN_AGE
-        ]
+        keys = [k for k in keys if probe_is_due(pool[k], current_epoch)]
     if n_positions and n_positions < len(keys):
         keys = random.sample(keys, n_positions)
 

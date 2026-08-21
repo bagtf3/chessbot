@@ -634,7 +634,7 @@ class GameGenerator:
     def next_blunder_replays(self, pool, n_to_queue, current_epoch=None):
         """Sample n_to_queue probes from the live pool. Metering and logging
         live at the selfplay_runner callsites. current_epoch gates
-        BRP_MIN_AGE."""
+        the last_seen cooldown and the max-fails age-out."""
         from chessbot.blunder_replay import (
             create_blunder_replay_config, blunder_replay_specs,
         )

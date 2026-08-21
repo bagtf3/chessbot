@@ -18,7 +18,6 @@ from chessbot import BLACK_WINNING_WHITE_MOVE, WHITE_WINNING_WHITE_MOVE
 from chessbot.config import Config
 from chessbot.replay_buffer import densify_policy
 from chessbot.rescore import Rescorer, blend_wdl, z_to_wdl
-from chessbot.utils import cp_to_value_tanh, scalar_to_wdl
 
 # both are white-to-move; mirroring each covers the black-to-move half, so the
 # two of them span all four (side-to-move x who-is-winning) combinations
@@ -141,45 +140,41 @@ def test_every_legal_move_carries_mass():
 
 
 def test_blend_weight_is_monotone_in_cpl():
-    """alpha is the only thing cpl drives: the worse xc0's move, the more the
-    target must lean on SF, on both the policy and the value side."""
+    """alpha is the only thing cpl drives, and it now moves the policy alone:
+    the worse xc0's move, the more mass SF's best carries. The value target
+    must not shift with cpl at all."""
     fen = BLEND_FEN
     best_uci = sf_best_of(fen)
     best_cp = 400
     best_wdl = [0.1, 0.3, 0.6]
 
-    sf_mass = []
-    sf_pull = []
+    sf_mass, values = [], []
     for cpl in CPLS:
         board, (x, policy, Y, source) = run_blend(
             fen, best_uci, best_cp, cpl, best_wdl)
         idx = board.moves_to_indices([best_uci])[0]
         sf_mass.append(float(policy[idx]))
-        wdl_sf = scalar_to_wdl(cp_to_value_tanh(best_cp, mid_cp=200.0))
-        sf_pull.append(float(np.abs(Y - wdl_sf).sum()))
+        values.append(Y)
 
     assert sf_mass == sorted(sf_mass)
-    assert sf_pull == sorted(sf_pull, reverse=True)
+    for Y in values[1:]:
+        np.testing.assert_allclose(Y, values[0], atol=1e-6)
 
 
-def test_blend_stays_between_the_two_endpoints():
-    """A convex mix with alpha in [0, 1] can never leave the interval spanned
-    by the pure-xc0 and pure-SF targets. Pins the alpha range without pinning
-    its endpoints."""
+def test_value_target_is_the_search_wdl_unblended():
+    """SF's cp scores its own best move, not the position the played move
+    reaches, so it must never touch the value target -- at any cpl, however
+    hard alpha pulls the policy."""
     fen = BLEND_FEN
-    best_uci = sf_best_of(fen)
-    best_cp = 400
     best_wdl = [0.1, 0.3, 0.6]
-    wdl_sf = scalar_to_wdl(cp_to_value_tanh(best_cp, mid_cp=200.0))
-    wdl_xc0 = np.array(best_wdl, dtype=np.float32)
+    # BLEND_FEN is white to move, so this white-POV wdl is already STM-POV
+    expected = np.array(best_wdl, dtype=np.float32)
 
     for cpl in CPLS:
         board, (x, policy, Y, source) = run_blend(
-            fen, best_uci, best_cp, cpl, best_wdl)
-        lo = np.minimum(wdl_sf, wdl_xc0)
-        hi = np.maximum(wdl_sf, wdl_xc0)
-        assert (Y >= lo - 1e-6).all()
-        assert (Y <= hi + 1e-6).all()
+            fen, sf_best_of(fen), best_cp=400, probe_cpl=cpl,
+            best_wdl=best_wdl)
+        np.testing.assert_allclose(Y, expected, atol=1e-6)
 
 
 POV_CASES = [(STM_WINNING_FEN, True), (STM_LOSING_FEN, False)]

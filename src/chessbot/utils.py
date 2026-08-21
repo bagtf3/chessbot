@@ -1172,3 +1172,11 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
         ):
             print(f"  {s:<30} {c}")
     print("~" * 60)
+
+
+def ema_step(prev, x, span):
+    """Seeded on the first sample so the series does not crawl up from zero."""
+    if prev is None:
+        return x
+    a = 2.0 / (span + 1.0)
+    return a * x + (1.0 - a) * prev

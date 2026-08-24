@@ -45,8 +45,8 @@ def load_rows(run_tags):
             if e not in history:
                 continue
             d = pd.read_csv(path)
-            dm = d[~d.same_move]
-            sm = d[d.same_move]
+            dm = d[d.same_move == 0]
+            sm = d[d.same_move == 1]
             h = history[e]
 
             rows.append({
@@ -59,7 +59,7 @@ def load_rows(run_tags):
                 "same": d.same_move.mean(),
                 "best": d.found_best.mean(),
                 "equiv": d.found_equiv.mean(),
-                "same & equiv": (d.same_move & d.found_equiv).mean(),
+                "same & equiv": ((d.same_move == 1) & (d.found_equiv == 1)).mean(),
                 # older CSVs/history rows predate these columns
                 "depth": d["best_depth"].mean() if "best_depth" in d.columns else float("nan"),
                 "age": (e - d["added_epoch"]).mean() if "added_epoch" in d.columns else float("nan"),

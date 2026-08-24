@@ -124,15 +124,9 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     model, arch = load_pt_model(cfg.model_path)
     primary_records_raw = load_records(primary_paths)
 
-    # Two validation streams, both drawn from records already in RAM for
-    # training: primary (mixed sources, tracks the live distribution) and
-    # historic (pretrain distribution, continues the pretraining curve).
-    # Replay is deliberately excluded -- it has already been trained on.
-    # 'xc0_replay_blend' (blunder-replay SF/xc0 blend, see
-    # Rescorer.add_blunder_replay_training_example) is synthetic-target and
-    # excluded here too -- it still trains normally via all_records below,
-    # just kept out of the validation metrics/plots.
-    val_pool = [r for r in primary_records_raw if r[6] != 'xc0_replay_blend']
+    # primary validation is pure xc0 only; replay, lc0, and blend records
+    # still train via all_records below, just aren't validated on
+    val_pool = [r for r in primary_records_raw if r[6] == 'xc0']
     val_primary = sample_records(val_pool, VAL_PRIMARY_RECORDS)
     val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
 

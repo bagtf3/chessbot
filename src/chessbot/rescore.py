@@ -322,7 +322,9 @@ class Rescorer(object):
         # EMA rather than a lifetime mean: a mid-run change to the sims budget
         # or the scoring rules should show up rather than be diluted forever.
         # ply0 lc0 and xc0 only ever step together, so uplift always reconciles.
-        self.lc0_audit_ema = {}
+        # long span seeded at the observed teacher loss so one lucky first
+        # probe does not own the number for thousands of samples
+        self.lc0_audit_ema = {'lc0_l': 15.0}
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
 
@@ -1052,7 +1054,7 @@ class Rescorer(object):
                 # probe_fails only seeds records the seed script never saw --
                 # new blunders enter the pool without an n_fails
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
-                if src['n_fails'] > BRP_MAX_FAILS:
+                if src['n_fails'] >= BRP_MAX_FAILS:
                     evict_position(pool, short_fen_key, "max_fails", epoch,
                                    evicted_path(self.blunder_pool_path))
 
@@ -1070,11 +1072,14 @@ class Rescorer(object):
             "probe_cpl": probe_cpl,
             "deep_best": best_uci,
             "best_depth": best_depth,
-            "same_move": same_move,
-            "found_best": found_best,
-            "found_equiv": found_equiv,
-            "evicted": found_equiv,
-            "added_to_buffer": added_to_buffer,
+            # floats, not bools: the cache-hit paths carry plain python ints
+            # and the SF path numpy scalars, and a mixed column reads back as
+            # object and breaks every downstream .mean()
+            "same_move": float(same_move),
+            "found_best": float(found_best),
+            "found_equiv": float(found_equiv),
+            "evicted": float(found_equiv),
+            "added_to_buffer": float(added_to_buffer),
             "sims": sims,
             "stop_reason": stop_reason,
             "from_cache": from_cache,
@@ -1366,9 +1371,8 @@ class Rescorer(object):
                   f"uplift={xc0 - lc0:+.1f}", flush=True)
         if self.brp_admit_n:
             pct = 100.0 * self.brp_admit_ok / self.brp_admit_n
-            print(f"{RS} [lc0 audit] admit n={self.brp_admit_n:<5}"
-                  f" ok={self.brp_admit_ok} rej="
-                  f"{self.brp_admit_n - self.brp_admit_ok} ({pct:.1f}%)",
+            print(f"{RS} [lc0 audit] candidates={self.brp_admit_n}  "
+                  f"confirmed blunders={self.brp_admit_ok} ({pct:.1f}%)",
                   flush=True)
 
     def add_lc0_replay_training_example(self, board, tr):

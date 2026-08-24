@@ -107,6 +107,7 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - No `_leading_underscores` in names
 - No comment dividers with dashes or box-drawing characters
 - Minimal comments and code — avoid verbosity, prefer clean readable code over explanation
+- Comments/docstrings describe the current state of the code only — never reference what it used to do, what changed, or "now"/"anymore" framing. A reader with zero history should never hit a comment that only makes sense if they know the prior version. Changelog-type info goes in the commit message or chat, not inline.
 - No Unicode characters outside ASCII in print statements or log output — Windows subprocesses use cp1252 and will crash on characters like arrows or other non-ASCII symbols. Use ASCII equivalents (e.g. `->` not `->`).
 
 ## Chat Response Format

@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from chessbot import SP_DIR
-from chessbot.blunder_replay import BRP_EQUIV_CPL
+from chessbot.blunder_replay import BRP_EQUIV_CPL, BRP_LAST_SEEN_MIN
 
 from probe_table import trim_rows
 
@@ -114,8 +114,15 @@ def row(label, pairs, summary=False):
     }
 
 
+current_epoch = max(epochs)
+
+# same cooldown gate as BRP's own probe_is_due: an epoch that hasn't rested
+# BRP_LAST_SEEN_MIN retrains yet hasn't had a chance to be re-probed, so its
+# "x all" row would be near-empty and misleading -- skip it, don't even pool.
 rows = []
 for a in epochs[:-1]:
+    if current_epoch - a <= BRP_LAST_SEEN_MIN:
+        continue
     pooled = [p for b in epochs if b > a for p in pairs_for(a, b)]
     if pooled:
         rows.append(row(f'{a} x all', pooled))
@@ -125,7 +132,8 @@ for a in epochs[:-1]:
 rows = trim_rows(pd.DataFrame(rows)).to_dict('records')
 
 everything = [p for a, b in itertools.combinations(epochs, 2)
-              for p in pairs_for(a, b)]
+              for p in pairs_for(a, b)
+              if current_epoch - a > BRP_LAST_SEEN_MIN]
 rows.append(row('all x all', everything))
 rows.append(row('mean +/- CI', everything, summary=True))
 

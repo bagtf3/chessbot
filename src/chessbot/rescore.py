@@ -23,6 +23,7 @@ from chessbot.utils import (
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
+    new_shard_path, write_pkl_gz_shard,
 )
 from chessbot.opening_counts import (
     COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts,
@@ -47,8 +48,9 @@ from chessbot.game_utils import reconcile_game_boards, short_fen
 from chessbot.move_scoring import make_scorer
 
 RS = "[rescore]"
+LC0_BRP_SHARD_DIR = os.environ.get("LC0_BRP_SHARD_PATH", "")
 # lc0 audit smoothing, counted in scored positions
-AUDIT_EMA_SPAN = 200
+AUDIT_EMA_SPAN = 500
 AUDIT_EMA_LONG = 10000
 BRP_MERGE_EVERY = 512
 # blunder-replay analysis fires purely on collected-row count, not a retrain
@@ -322,9 +324,11 @@ class Rescorer(object):
         # EMA rather than a lifetime mean: a mid-run change to the sims budget
         # or the scoring rules should show up rather than be diluted forever.
         # ply0 lc0 and xc0 only ever step together, so uplift always reconciles.
-        # long span seeded at the observed teacher loss so one lucky first
+        # seeded at the observed teacher/xerces loss so one lucky first
         # probe does not own the number for thousands of samples
-        self.lc0_audit_ema = {'lc0_l': 15.0}
+        self.lc0_audit_ema = {
+            'lc0': 26.0, 'xc0': 174.9, 'lc0_l': 26.0, 'xc0_l': 174.9,
+        }
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
 
@@ -357,6 +361,10 @@ class Rescorer(object):
         # queue_lc0_replay into a no-op and leaves every ply on the blend path.
         self.lc0_pending = []
         self.lc0_cfg = None
+
+        # fills from lc0 replays whose ply0 clears the SF audit; flushed to a
+        # shard at 10240, for the next pretraining run, not selfplay training
+        self.lc0_pretrain_buffer = []
 
         self.init_analyzer()
 
@@ -1251,13 +1259,16 @@ class Rescorer(object):
         tree_data = meta.get('tree_search_data') or {}
         n = 0
         audit = []
+        records = []
         for k, mv in enumerate(meta.get('moves_played') or []):
             # collect_tree_search_data runs before plies is bumped, so the
             # search at moves_played[k] is stored under k, not k + 1
             tr = tree_data.get(k, tree_data.get(str(k)))
             if tr:
-                if self.add_lc0_replay_training_example(board, tr):
+                rec = self.add_lc0_replay_training_example(board, tr)
+                if rec:
                     n += 1
+                    records.append(rec)
                 # only ply 0 is audited; the continuations go in untested
                 cm = tr.get('candidate_moves') or [] if k == 0 else []
                 if cm:
@@ -1267,14 +1278,14 @@ class Rescorer(object):
 
         self.submit_lc0_audit(
             meta.get('game_id'), audit, meta.get('xc0_cpl'),
-            meta.get('pending_rec'), meta.get('sfen'))
+            meta.get('pending_rec'), meta.get('sfen'), records)
 
         self.sample_counts['lc0_samples'] += n
         self.sample_counts_window['lc0_samples'] += n
         return n
 
     def submit_lc0_audit(self, game_id, positions, xc0_cpl=None,
-                         pending=None, sfen=None):
+                         pending=None, sfen=None, records=None):
         """TEMPORARY. Score the teacher's own moves with SF, same budget and
         throttle as normal rescoring. Prefixed gid so it cannot collide with
         a real game in self.pending."""
@@ -1286,6 +1297,7 @@ class Rescorer(object):
             'ucis': {k: uci for k, _, uci in positions},
             'pending': pending,
             'sfen': sfen,
+            'records': records or [],
         }
         self.game_q.put((gid, positions, {}))
 
@@ -1315,9 +1327,8 @@ class Rescorer(object):
             if k == 0:
                 self.resolve_lc0_candidate(
                     info, ms.loss, ucis.get(0), pool)
-
-            if self.lc0_audit_n and self.lc0_audit_n % 200 == 0:
-                self.print_lc0_audit()
+                if ms.loss <= BRP_EQUIV_CPL:
+                    self.add_to_lc0_pretrain_buffer(info.get('records'))
 
     def resolve_lc0_candidate(self, info, lc0_loss, lc0_move, pool):
         """Admit a deferred blunder, or cache lc0's move on a live record.
@@ -1357,23 +1368,17 @@ class Rescorer(object):
         self.n_pool_changes += 1
         self.maybe_save_pool(pool)
 
-    def print_lc0_audit(self):
-        """TEMPORARY. Fast span reacts to a config change, long span is the
-        run-level verdict. n is the lifetime count."""
-        E = self.lc0_audit_ema
-        if 'lc0' not in E:
+    def add_to_lc0_pretrain_buffer(self, records):
+        """Ply0-confirmed lc0 replays, set aside for the next deep pretrain --
+        not mixed into live_buffer or any other buffer, not trained on now."""
+        if not records or not LC0_BRP_SHARD_DIR:
             return
-        for tag, lk, xk in (("ema200 ", 'lc0', 'xc0'),
-                            ("ema10k ", 'lc0_l', 'xc0_l')):
-            lc0, xc0 = E[lk], E[xk]
-            print(f"{RS} [lc0 audit] ply0 {tag} n={self.lc0_audit_n:<5}"
-                  f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
-                  f"uplift={xc0 - lc0:+.1f}", flush=True)
-        if self.brp_admit_n:
-            pct = 100.0 * self.brp_admit_ok / self.brp_admit_n
-            print(f"{RS} [lc0 audit] candidates={self.brp_admit_n}  "
-                  f"confirmed blunders={self.brp_admit_ok} ({pct:.1f}%)",
-                  flush=True)
+        self.lc0_pretrain_buffer.extend(records)
+        while len(self.lc0_pretrain_buffer) >= 10240:
+            shard, self.lc0_pretrain_buffer = (
+                self.lc0_pretrain_buffer[:10240], self.lc0_pretrain_buffer[10240:])
+            os.makedirs(LC0_BRP_SHARD_DIR, exist_ok=True)
+            write_pkl_gz_shard(shard, new_shard_path(LC0_BRP_SHARD_DIR))
 
     def add_lc0_replay_training_example(self, board, tr):
         """Teacher visits straight to policy: no clip, no uniform_eps, just a
@@ -1399,11 +1404,10 @@ class Rescorer(object):
         if not tr.get('stm', True):
             Y = Y[[2, 1, 0]]
 
-        self.live_buffer.append(
-            (self.encode_board(board), None, sparsify_policy(policy),
-             Y, 1.0, 1.0, 'lc0'),
-            REWEIGHT_INELIGIBLE)
-        return True
+        record = (self.encode_board(board), None, sparsify_policy(policy),
+                  Y, 1.0, 1.0, 'lc0')
+        self.live_buffer.append(record, REWEIGHT_INELIGIBLE)
+        return record
 
     def add_equiv_replay_training_example(self, ply):
         """

@@ -44,9 +44,9 @@ from chessbot.opening_counts import apply_repeat_weights
 LIVE_BUFFER_SIZE = 163_840
 SHARD_SIZE = 10_240
 PRIMARY_TRIGGER_SHARDS = 96
-RETRAIN_PRIMARY_SHARDS = 8
-RETRAIN_REPLAY_SHARDS = 8
-RETRAIN_HISTORIC_SHARDS = 8
+RETRAIN_PRIMARY_SHARDS = 10
+RETRAIN_REPLAY_SHARDS = 10
+RETRAIN_HISTORIC_SHARDS = 4
 REPLAY_SEED_SHARDS = 144
 # initial primary fill, left short of the trigger so selfplay supplies the
 # last few shards of the first cycle rather than retraining on pure seed

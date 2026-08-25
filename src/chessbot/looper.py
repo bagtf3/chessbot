@@ -143,7 +143,12 @@ class GameLooper(object):
             )
             self.model = sess
             self.infer = make_lc0_infer(sess)
-    
+
+        kind = 'lc0' if self.id.startswith('lc0') else 'xc0'
+        wid = self.id[3:] if kind == 'lc0' else self.id
+        print(f'[worker {kind} {wid:<4}] load: OK', flush=True)
+
+
     def check_for_pause(self):
         """
         Drain msg_q (non-blocking). Return True if a pause was requested.

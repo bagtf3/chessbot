@@ -2069,6 +2069,11 @@ class RecordKeeper(object):
         # set by the runner: it owns the queue and sees the replies
         self.lc0_backlog = 0
         self.lc0_probes_done = 0
+        # set by the runner from the rescorer's own audit state each pass
+        self.lc0_audit_ema = {}
+        self.lc0_audit_n = 0
+        self.brp_admit_n = 0
+        self.brp_admit_ok = 0
 
     def ingest_recents(self, recent):
         meta = recent['meta']
@@ -2234,6 +2239,19 @@ class RecordKeeper(object):
         print(f"[lc0 queue] backlog={self.lc0_backlog}  "
               f"done={self.lc0_probes_done}  sims/move={spm:.0f}  "
               f"batch={batch:.0f}  cache_hit={hit}")
+
+        E = self.lc0_audit_ema
+        if 'lc0' in E:
+            if self.brp_admit_n:
+                pct = 100.0 * self.brp_admit_ok / self.brp_admit_n
+                print(f"[lc0 audit] candidates={self.brp_admit_n}  "
+                      f"confirmed blunders={self.brp_admit_ok} ({pct:.1f}%)")
+            for tag, lk, xk in (("ema500 ", 'lc0', 'xc0'),
+                                ("ema10k ", 'lc0_l', 'xc0_l')):
+                lc0, xc0 = E[lk], E[xk]
+                print(f"[lc0 audit] ply0 {tag} n={self.lc0_audit_n:<5}"
+                      f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
+                      f"uplift={xc0 - lc0:+.1f}")
 
     def log_loop_stats(self, summed, avged):
         n_groups = summed.get("n_groups", 0)

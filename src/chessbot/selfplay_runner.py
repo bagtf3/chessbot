@@ -837,6 +837,10 @@ class SelfPlayRunner:
                 if self.val_pending == 0:
                     self.finish_validation_batch()
 
+        self.recorder.lc0_audit_ema = self.rescorer.lc0_audit_ema
+        self.recorder.lc0_audit_n = self.rescorer.lc0_audit_n
+        self.recorder.brp_admit_n = self.rescorer.brp_admit_n
+        self.recorder.brp_admit_ok = self.rescorer.brp_admit_ok
         self.recorder.maybe_log_results()
 
     def update_game_index(self, game):

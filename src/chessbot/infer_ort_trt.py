@@ -54,9 +54,7 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs, encoding_type="xc
 
     engines = [f for f in os.listdir(trt_cache)
                if f.startswith(prefix) and f.endswith('.engine')]
-    if engines:
-        print(f'[ort_trt] loading cached engine: {engines[0]}')
-    else:
+    if not engines:
         print(f'[ort_trt] no cached engine for {prefix!r}, TRT will compile')
 
     providers = [('TensorrtExecutionProvider', trt_opts)]
@@ -64,7 +62,6 @@ def make_trt_session(onnx_path, model_name, trt_cache, max_bs, encoding_type="xc
     active = sess.get_providers()[0]
     if active != 'TensorrtExecutionProvider':
         raise RuntimeError(f'[ort_trt] expected TRT but got {active}')
-    print(f'[ort_trt] provider: TensorrtExecutionProvider')
     return sess
 
 

@@ -188,42 +188,42 @@ def plot_cpl_and_bmr(df, window=30, title=None):
     plt.show()
 
 
-def trend_check(df, window=100):
-    """
-    Sort by ts, smooth (centered rolling mean), then report:
-    - linear slope per 1000 games and per window (with block-permutation p)
+def col_trend(df, col, window=100, weight_col="total_plies"):
+    """Sort by ts, smooth (weighted if weight_col is present, else plain
+    centered rolling mean), then report for one column vs row index:
+    - linear slope per 10% of the series (rounded to the nearest row) and
+      per window (with block-permutation p)
     - Spearman rank correlation (monotonic trend)
+    Single-metric core shared by trend_check and print_trend. Scaling the
+    slope to 10% of whatever n is, rather than a fixed row count, keeps it
+    readable across wildly different series lengths (selfplay games vs
+    validation checkpoints) without per-caller tuning.
     """
     d = df.sort_values("ts").reset_index(drop=True).copy()
     n = len(d)
     x = np.arange(n)
+    per = max(1, round(n * 0.1))
 
-    cpl = weight_moving_avg(d, "overall_cpl", window).values
-    bmr = weight_moving_avg(d, "overall_best_move_rate", window).values
+    if weight_col in d.columns:
+        y = weight_moving_avg(d, col, window, weight_col).values
+    else:
+        y = d[col].rolling(window, center=True, min_periods=1).mean().values
 
     x0 = x - x.mean()
     denom = float(x0 @ x0)
 
-    def slope_per_game(y):
-        # returns slope per one game (index unit)
-        return float((x0 @ (y - y.mean())) / denom)
+    def slope_per_row(v):
+        # returns slope per one row (index unit)
+        return float((x0 @ (v - v.mean())) / denom)
 
-    # observed slopes (per game)
-    cpl_s_pg = slope_per_game(cpl)
-    bmr_s_pg = slope_per_game(bmr)
+    s_pg = slope_per_row(y)
+    s_per = float(per * s_pg)
+    s_per_window = float(window * s_pg)
 
-    # convert to requested units
-    cpl_s_per_1000 = float(1000 * cpl_s_pg)
-    cpl_s_per_window = float(window * cpl_s_pg)
-    bmr_s_per_1000 = float(1000 * bmr_s_pg)
-    bmr_s_per_window = float(window * bmr_s_pg)
-
-    # permutation p-values via block shuffling (block size = window)
+    # permutation p-value via block shuffling (block size = window)
     nperm = 3000
-    cnt_c = 0
-    cnt_b = 0
+    cnt = 0
 
-    # build block slices
     blk = []
     if window <= 1 or window >= n:
         # degenerate: single block = whole series
@@ -235,53 +235,56 @@ def trend_check(df, window=100):
             i += window
 
     for _ in range(nperm):
-        # shuffle blocks to preserve short-range dependence
         order = np.arange(len(blk))
         np.random.shuffle(order)
-
-        seq = np.empty_like(cpl)
+        seq = np.empty_like(y)
         pos = 0
         for j in order:
             s = blk[j]
             ln = s.stop - s.start
-            seq[pos:pos + ln] = cpl[s]
+            seq[pos:pos + ln] = y[s]
             pos += ln
-        perm_cpl = seq
+        bp = slope_per_row(seq) * per
+        if abs(bp) >= abs(s_per):
+            cnt += 1
 
-        order2 = np.arange(len(blk))
-        np.random.shuffle(order2)
-        seq2 = np.empty_like(bmr)
-        pos = 0
-        for j in order2:
-            s = blk[j]
-            ln = s.stop - s.start
-            seq2[pos:pos + ln] = bmr[s]
-            pos += ln
-        perm_bmr = seq2
+    p = (cnt + 1) / (nperm + 1)
 
-        # slope per game for permuted series, then scale to per1000
-        bp_c = slope_per_game(perm_cpl) * 1000.0
-        bp_b = slope_per_game(perm_bmr) * 1000.0
-
-        if abs(bp_c) >= abs(cpl_s_per_1000):
-            cnt_c += 1
-        if abs(bp_b) >= abs(bmr_s_per_1000):
-            cnt_b += 1
-
-    p_cpl = (cnt_c + 1) / (nperm + 1)
-    p_bmr = (cnt_b + 1) / (nperm + 1)
-
-    out = {
-        "cpl_slope_per_1000": rnd(cpl_s_per_1000, 5),
-        "cpl_slope_per_window": rnd(cpl_s_per_window, 5),
-        "cpl_slope_p": rnd(p_cpl, 5),
-        "cpl_spearman": rnd(spearmanr(x, cpl, nan_policy="omit").statistic, 5),
-        "bmr_slope_per_1000": rnd(bmr_s_per_1000, 5),
-        "bmr_slope_per_window": rnd(bmr_s_per_window, 5),
-        "bmr_slope_p": rnd(p_bmr, 5),
-        "bmr_spearman": rnd(spearmanr(x, bmr, nan_policy="omit").statistic, 5),
+    return {
+        "slope_per": rnd(s_per, 5),
+        "per": per,
+        "slope_per_window": rnd(s_per_window, 5),
+        "slope_p": rnd(p, 5),
+        "spearman": rnd(spearmanr(x, y, nan_policy="omit").statistic, 5),
     }
-    return out
+
+
+def print_trend(label, df, col, window=100, weight_col="total_plies"):
+    """One line: direction and significance of col's movement vs row index."""
+    t = col_trend(df, col, window, weight_col)
+    arrow = ("up" if t["slope_per"] > 0
+             else "down" if t["slope_per"] < 0 else "flat")
+    print(f"  {label:<24} slope/{t['per']}={t['slope_per']:>9.4f}  "
+          f"p={t['slope_p']:.3f}  spearman={t['spearman']:+.3f}  ({arrow})")
+
+
+def trend_check(df, window=100):
+    """cpl/bmr trend vs game index -- see col_trend for the single-metric
+    core this wraps."""
+    cpl = col_trend(df, "overall_cpl", window)
+    bmr = col_trend(df, "overall_best_move_rate", window)
+    return {
+        "cpl_slope_per": cpl["slope_per"],
+        "cpl_per": cpl["per"],
+        "cpl_slope_per_window": cpl["slope_per_window"],
+        "cpl_slope_p": cpl["slope_p"],
+        "cpl_spearman": cpl["spearman"],
+        "bmr_slope_per": bmr["slope_per"],
+        "bmr_per": bmr["per"],
+        "bmr_slope_per_window": bmr["slope_per_window"],
+        "bmr_slope_p": bmr["slope_p"],
+        "bmr_spearman": bmr["spearman"],
+    }
 
 
 def report_cpl_and_bmr(df_trim, window):

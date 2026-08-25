@@ -195,9 +195,7 @@ def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
     engines = [f for f in os.listdir(trt_cache)
                if f.startswith(prefix) and f.endswith('.engine')]
 
-    if engines:
-        print(f'TRT engine: {engines[0]}')
-    else:
+    if not engines:
         print(f'No TRT engine for prefix {prefix!r}, will compile now (this may take a few minutes)...')
 
     trt_opts = {
@@ -218,6 +216,4 @@ def make_lc0_trt_session(onnx_path: str, model_name: str, trt_cache: str,
     active = sess.get_providers()[0]
     if active != 'TensorrtExecutionProvider':
         print(f'WARNING: expected TRT but got {active}')
-    else:
-        print(f'Provider: TensorrtExecutionProvider')
     return sess

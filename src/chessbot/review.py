@@ -14,9 +14,13 @@ COUNTER_KEYS = (
 )
 from collections import defaultdict, deque
 
+import io
+
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
 import chess.engine
+import cairosvg
+from PIL import Image
 
 import pandas as pd
 import numpy as np
@@ -31,11 +35,12 @@ from chessbot.utils import (
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
     score_to_value_stm_pov_tanh, rnd,
-    calc_entropy, kl_divergence
+    calc_entropy, kl_divergence, load_json, save_pickle_atomic,
 )
 
 
 ANALYZE_PKL = "analyze_results_combined.pkl"
+VISUALS_DIR = r"C:\Users\Bryan\Data\chessbot_data\visuals"
 
 # default analysis params
 DEPTH = 12
@@ -453,6 +458,35 @@ class GameViewer:
         clear_output(wait=True)
         chess_board = chess.Board(self.board.fen())
         display(SVG(chess.svg.board(board=chess_board, flipped=flipped)))
+
+    def to_gif(self, refresh=0.3, save_to=None, flipped=False):
+        """Render the full game as an animated gif, one frame per ply."""
+        if save_to is None:
+            game_id = self.game_id or self.path.stem
+            save_to = pathlib.Path(VISUALS_DIR) / f"{game_id}.gif"
+        else:
+            save_to = pathlib.Path(save_to)
+        save_to.parent.mkdir(parents=True, exist_ok=True)
+
+        board = chess.Board(self.start_fen) if self.start_fen else chess.Board()
+        frames = []
+        lastmove = None
+        for i in range(len(self.moves_uci) + 1):
+            svg_data = chess.svg.board(
+                board=board, flipped=flipped, lastmove=lastmove,
+            )
+            png_bytes = cairosvg.svg2png(bytestring=svg_data.encode("utf-8"))
+            frames.append(Image.open(io.BytesIO(png_bytes)).convert("RGB"))
+            if i < len(self.moves_uci):
+                move = chess.Move.from_uci(self.moves_uci[i])
+                board.push(move)
+                lastmove = move
+
+        frames[0].save(
+            save_to, format="GIF", save_all=True, append_images=frames[1:],
+            duration=int(refresh * 1000), loop=0,
+        )
+        return save_to
 
     def node_who_chosen(self):
         """ conveniently return node, who move, what move was chosen """
@@ -1409,26 +1443,11 @@ class GameViewer:
         return X, M, P, Z, V, WDL, R
 
 
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-
-    # First, try regular JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: parse line-by-line (JSONL / concatenated objects)
-        items = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
-        return items
-    
-
 def load_game_index(path=None):
     if not path.endswith("game_index.json"):
         path = os.path.join(path, "game_index.json")
+    if not os.path.exists(path):
+        return []
     return load_json(path)
 
 
@@ -1584,59 +1603,6 @@ def analyze_with_sf_core(game_data, eng, depth=None):
     out['df'] = out_df
     return out
 
-def save_pickle_atomic(obj, path, tries=0):
-    try:
-        tmp = str(path) + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, str(path))
-    except Exception as e:
-        if tries <= 5:
-            time.sleep(0.5)
-            save_pickle_atomic(obj, path, tries=tries+1)
-        else:
-            raise e
-
-
-def safe_mean(arr):
-    a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
-    return np.nanmean(a) if a.size else float("nan")
-
-
-def lightweight_summary(results):
-    """
-    Build the small summary dict you use in combined chunk files.
-    'results' is a list of per-game dicts (the merged_results or results).
-    """
-    wm = [r.get("white_cpl", np.nan) for r in results]
-    bm = [r.get("black_cpl", np.nan) for r in results]
-    om = [r.get("overall_cpl", np.nan) for r in results]
-    wb = [r.get("best_move_rate_white", np.nan) for r in results]
-    bb = [r.get("best_move_rate_black", np.nan) for r in results]
-    ob = [r.get("overall_best_move_rate", np.nan) for r in results]
-    t3 = [r.get("plays_in_top3_rate", np.nan) for r in results]
-
-    return {
-        "games": len(results),
-        "avg_white_mean_cpl": round(safe_mean(wm), 3),
-        "avg_black_mean_cpl": round(safe_mean(bm), 3),
-        "avg_overall_mean_cpl": round(safe_mean(om), 3),
-        "avg_best_move_rate_white": round(safe_mean(wb), 3),
-        "avg_best_move_rate_black": round(safe_mean(bb), 3),
-        "avg_overall_best_move_rate": round(safe_mean(ob), 3),
-        "avg_played_in_top3_rate": round(safe_mean(t3), 3),
-    }
-
-
-def dedupe_results(results):
-    df = pd.DataFrame(results)
-    df = df.drop_duplicates(subset='game_id', keep='first')
-    # dont want the raw key, its just extra data
-    if 'raw' in df.columns:
-        df = df.drop(columns=['raw'])
-    
-    return df.to_dict(orient='records')
-
 
 def combine_analysis_staging(run_dir):
     """
@@ -1667,18 +1633,12 @@ def combine_analysis_staging(run_dir):
     if os.path.exists(out_pkl):
         with open(out_pkl, "rb") as f:
             combined = pickle.load(f)
-        prev_results = list(combined.get("results", []))
         prev_df_all = combined.get("df_all", None)
-        prev_df_means = combined.get("df_means", None)
     else:
-        prev_results = []
         prev_df_all = None
-        prev_df_means = None
 
     # accumulate chunk content
-    chunk_results = []
     chunk_dfs = []
-    chunk_means = []
 
     for fn in fns:
         path = os.path.join(staging, fn)
@@ -1686,21 +1646,9 @@ def combine_analysis_staging(run_dir):
         with open(path, "rb") as f:
             chunk = pickle.load(f)
 
-        # expect chunk structure {summary, results, df_all, df_means}
-        cres = chunk.get("results", [])
-        if cres:
-            chunk_results.extend(cres)
-
         cdf = chunk.get("df_all", None)
         if cdf is not None:
             chunk_dfs.append(cdf)
-
-        cmeans = chunk.get("df_means", None)
-        if cmeans is not None:
-            chunk_means.append(cmeans)
-
-    # merge results lists
-    merged_results = prev_results + chunk_results
 
     # merge df_all
     if prev_df_all is None:
@@ -1714,29 +1662,11 @@ def combine_analysis_staging(run_dir):
         else:
             df_all = prev_df_all
 
-    # merge df_means
-    if prev_df_means is None:
-        if chunk_means:
-            df_means = pd.concat(chunk_means, ignore_index=True)
-        else:
-            df_means = None
-    else:
-        if chunk_means:
-            df_means = pd.concat([prev_df_means] + chunk_means, ignore_index=True)
-        else:
-            df_means = prev_df_means
-
-    # de dupe
+    # de dupe, then rebuild the one-row-per-game skeleton from it directly
     df_all = df_all.drop_duplicates(['game_id', 'move_num']).sort_values("ts")
     df_means = df_all.drop_duplicates(['game_id']).sort_values("ts")
-    merged_results = dedupe_results(merged_results)
-
-    # recompute lightweight summary from merged_results
-    summary = lightweight_summary(merged_results)
 
     combined_new = {
-        "summary": summary,
-        "results": merged_results,
         "df_all": df_all,
         "df_means": df_means
     }
@@ -1744,7 +1674,7 @@ def combine_analysis_staging(run_dir):
     # persist atomically using existing helper
     save_pickle_atomic(combined_new, out_pkl)
     print(f"[combine] wrote combined ANALYZE_PKL -> {out_pkl} "
-          f"({len(merged_results)} games)")
+          f"({len(df_means)} games)")
 
     # delete the chunk files that we just combined
     for fn in fns:
@@ -1754,19 +1684,6 @@ def combine_analysis_staging(run_dir):
 
     return combined_new
 
-
-
-def make_fake_visits(mv, lms, ratio_best=60):
-    visits = [[mv, int(ratio_best)]]
-    
-    # may only be 1 legal move
-    if len(lms) < 2:
-        return visits
-    
-    sub_optimal = 100 - ratio_best
-    bad_visits = 1 + min(5, int(sub_optimal / len(lms)))
-    visits += [[m, bad_visits] for m in lms if m != mv]
-    return visits
 
 
 def adjust_visits_from_cm(cm, played_mv, best_mv, lms):

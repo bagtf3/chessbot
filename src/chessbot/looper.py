@@ -527,8 +527,8 @@ class GameLooper(object):
             "uniform_eps": cfg.uniform_eps,
         }
 
-        # add any per-game sampled param values (specific value used, not the options)
-        for param in cfg.sampleable:
+        # cfg.sampleable is wiped by resolve_cfg; param names live on self.config
+        for param in self.config.sampleable:
             val = getattr(cfg, param)
             if param == 'move_sample_temp_range' and isinstance(val, list):
                 mem_summary['move_sample_temp_min'] = val[0]

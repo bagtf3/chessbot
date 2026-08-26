@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 pd.set_option('display.width', None)
@@ -135,6 +136,37 @@ def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=
     else:
         return val, str(best_move), search_depth
 
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+
+    # First, try regular JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: parse line-by-line (JSONL / concatenated objects)
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                items.append(json.loads(line))
+        return items
+
+
+def save_pickle_atomic(obj, path, tries=0):
+    try:
+        tmp = str(path) + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, str(path))
+    except Exception as e:
+        if tries <= 5:
+            time.sleep(0.5)
+            save_pickle_atomic(obj, path, tries=tries+1)
+        else:
+            raise e
 
 
 def rnd(x, n):
@@ -546,83 +578,6 @@ def moving_average_pd(arr, window=15):
     return s.rolling(window, center=True, min_periods=1).mean().values
 
 
-
-
-def log_and_plot_sf(intra_training_summaries, show=True, save_path=None):
-    """
-    Pretty-print the latest Stockfish summary and plot simple trends across retrains.
-
-    Args:
-        intra_training_summaries: {step: {"summary": {...}, "games": [...]}, ...}
-        show: if True, plt.show() the figures (ignored if save_path is given)
-        save_path: if set, save figures as f"{save_path}_cpl.png", f"{save_path}_bmr.png"
-
-    Prints:
-        Latest step's games, CPL (overall/white/black), and best-move rates.
-    Plots (if >=2 steps exist):
-        1) Overall mean CPL vs step
-        2) Overall best-move rate (%) vs step
-    """
-    its = intra_training_summaries
-    
-    if not its:
-        print("No SF analysis yet.")
-        return
-
-    steps = sorted(its.keys())
-    latest_step = steps[-1]
-    s = its[latest_step]["summary"]
-
-    # Pretty print latest
-    print("\n=== Stockfish Analysis (latest) ===")
-    print(f"Retrain step: {latest_step}")
-    print(f"Games analyzed: {int(s['games'])}")
-    print(f"Overall mean CPL: {s['avg_overall_mean_cpl']:.3f}")
-    print(f"  - White mean CPL: {s['avg_white_mean_cpl']:.3f}")
-    print(f"  - Black mean CPL: {s['avg_black_mean_cpl']:.3f}")
-    print(f"Overall best-move rate: {s['avg_overall_best_move_rate']*100:.1f}%")
-    print(f"  - White best-move rate: {s['avg_best_move_rate_white']*100:.1f}%")
-    print(f"  - Black best-move rate: {s['avg_best_move_rate_black']*100:.1f}%")
-    print("===================================\n")
-
-    # Need >=2 points to plot a trend
-    if len(steps) < 2:
-        return
-
-    # Build series
-    overall_cpl = [its[k]["summary"]["avg_overall_mean_cpl"] for k in steps]
-    overall_bmr_pct = [
-        its[k]["summary"]["avg_overall_best_move_rate"] * 100.0 for k in steps
-    ]
-
-    # 1) Overall mean CPL trend
-    fig1 = plt.figure(figsize=(6.4, 3.6))
-    plt.plot(steps, overall_cpl, marker="o")
-    plt.title("Overall Mean CPL vs Retrain Step")
-    plt.xlabel("Retrain step")
-    plt.ylabel("Mean CPL (lower is better)")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    if save_path:
-        fig1.savefig(f"{save_path}_cpl.png", dpi=150)
-    
-    if show:
-        plt.show()
-    plt.close(fig1)
-
-    # 2) Overall best-move rate (%) trend
-    fig2 = plt.figure(figsize=(6.4, 3.6))
-    plt.plot(steps, overall_bmr_pct, marker="o")
-    plt.title("Overall Best-Move Rate vs Retrain Step")
-    plt.xlabel("Retrain step")
-    plt.ylabel("Best-move rate (%)")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.tight_layout()
-    if save_path:
-        fig2.savefig(f"{save_path}_bmr.png", dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig2)
 
 
 def format_time(seconds):

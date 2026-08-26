@@ -19,7 +19,7 @@ from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
     calc_entropy, batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
-    ema_step,
+    ema_step, load_json, save_pickle_atomic,
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
@@ -47,6 +47,8 @@ from chessbot.game_utils import reconcile_game_boards, short_fen
 
 from chessbot.move_scoring import make_scorer
 
+from chessbot.review import load_game_index, ANALYZE_PKL
+
 RS = "[rescore]"
 LC0_BRP_SHARD_DIR = os.environ.get("LC0_BRP_SHARD_PATH", "")
 # lc0 audit smoothing, counted in scored positions
@@ -61,7 +63,6 @@ BRP_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
     "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
 )
-ANALYZE_PKL = "analyze_results_combined.pkl"
 PRETRAIN_CONTINUED_CSV = "eval_progress_pretrain_continued.csv"
 # pretraining validated every 20 epochs; the continued file keeps that step
 PRETRAIN_EPOCH_STEP = 20
@@ -2582,75 +2583,6 @@ def blend_wdl(z_stm, best_wdl_white_pov, is_white):
     return (0.5 * z_wdl + 0.5 * bw).astype(np.float32)
 
 
-def save_pickle_atomic(obj, path, tries=0):
-    try:
-        tmp = str(path) + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, str(path))
-    except Exception as e:
-        if tries <= 5:
-            time.sleep(0.5)
-            save_pickle_atomic(obj, path, tries=tries+1)
-        else:
-            raise e
-
-
-def safe_mean(arr):
-    a = np.asarray([x for x in arr if x is not None and not np.isnan(x)])
-    return np.nanmean(a) if a.size else float("nan")
-
-
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
-
-    # First, try regular JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: parse line-by-line (JSONL / concatenated objects)
-        items = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
-        return items
-    
-
-def load_game_index(path=None):
-    if not path.endswith("game_index.json"):
-        path = os.path.join(path, "game_index.json")
-    if not os.path.exists(path):
-        return []
-    return load_json(path)
-
-
-def dedupe_results(results):
-    df = pd.DataFrame(results)
-    df = df.drop_duplicates(subset='game_id', keep='first')
-    # dont want the raw key, its just extra data
-    if 'raw' in df.columns:
-        df = df.drop(columns=['raw'])
-    
-    return df.to_dict(orient='records')
-
-
-def lightweight_summary(results):
-    """
-    Build the small summary dict you use in combined chunk files.
-    'results' is a list of per-game dicts (the merged_results or results).
-    """
-    om = [r.get("overall_cpl", np.nan) for r in results]
-    ob = [r.get("overall_best_move_rate", np.nan) for r in results]
-
-    return {
-        "games": len(results),
-        "avg_overall_mean_cpl": round(safe_mean(om), 3),
-        "avg_overall_best_move_rate": round(safe_mean(ob), 3)
-    }
-
-
 def combine_analysis_staging(run_dir):
     """
     Combine all chunked pickles in run_dir/analysis_staging into the single
@@ -2680,18 +2612,12 @@ def combine_analysis_staging(run_dir):
     if os.path.exists(out_pkl):
         with open(out_pkl, "rb") as f:
             combined = pickle.load(f)
-        prev_results = list(combined.get("results", []))
         prev_df_all = combined.get("df_all", None)
-        prev_df_means = combined.get("df_means", None)
     else:
-        prev_results = []
         prev_df_all = None
-        prev_df_means = None
 
     # accumulate chunk content
-    chunk_results = []
     chunk_dfs = []
-    chunk_means = []
 
     for fn in fns:
         path = os.path.join(staging, fn)
@@ -2699,21 +2625,9 @@ def combine_analysis_staging(run_dir):
         with open(path, "rb") as f:
             chunk = pickle.load(f)
 
-        # expect chunk structure {summary, results, df_all, df_means}
-        cres = chunk.get("results", [])
-        if cres:
-            chunk_results.extend(cres)
-
         cdf = chunk.get("df_all", None)
         if cdf is not None:
             chunk_dfs.append(cdf)
-
-        cmeans = chunk.get("df_means", None)
-        if cmeans is not None:
-            chunk_means.append(cmeans)
-
-    # merge results lists
-    merged_results = prev_results + chunk_results
 
     # merge df_all
     if prev_df_all is None:
@@ -2727,29 +2641,11 @@ def combine_analysis_staging(run_dir):
         else:
             df_all = prev_df_all
 
-    # merge df_means
-    if prev_df_means is None:
-        if chunk_means:
-            df_means = pd.concat(chunk_means, ignore_index=True)
-        else:
-            df_means = None
-    else:
-        if chunk_means:
-            df_means = pd.concat([prev_df_means] + chunk_means, ignore_index=True)
-        else:
-            df_means = prev_df_means
-
-    # de dupe
+    # de dupe, then rebuild the one-row-per-game skeleton from it directly
     df_all = df_all.drop_duplicates(['game_id', 'move_num']).sort_values("ts")
     df_means = df_all.drop_duplicates(['game_id']).sort_values("ts")
-    merged_results = dedupe_results(merged_results)
-
-    # recompute lightweight summary from merged_results
-    summary = lightweight_summary(merged_results)
 
     combined_new = {
-        "summary": summary,
-        "results": merged_results,
         "df_all": df_all,
         "df_means": df_means
     }
@@ -2757,7 +2653,7 @@ def combine_analysis_staging(run_dir):
     # persist atomically using existing helper
     save_pickle_atomic(combined_new, out_pkl)
     print(f"[combine] wrote combined ANALYZE_PKL -> {Path(out_pkl).name} "
-          f"({len(merged_results)} games)")
+          f"({len(df_means)} games)")
 
     # delete the chunk files that we just combined
     for fn in fns:
@@ -2838,29 +2734,15 @@ def save_analysis_chunk_simple(run_dir, batch):
     staging = os.path.join(run_dir, "analysis_staging")
     os.makedirs(staging, exist_ok=True)
 
-    # results list (one row per game)
-    results = []
-    all_dfs = []
-    for analysis_out in batch:
-        row = {
-            "game_id": analysis_out.get("game_id"),
-            "ts": analysis_out.get("ts"),
-            "overall_cpl": analysis_out.get("overall_cpl"),
-            "overall_best_move_rate": analysis_out.get("overall_best_move_rate")
-        }
-        results.append(row)
-        df = analysis_out.get("df")
-        if df is not None:
-            all_dfs.append(df)
+    all_dfs = [analysis_out.get("df") for analysis_out in batch]
+    all_dfs = [df for df in all_dfs if df is not None]
 
     # df_all is concat of per-game dfs (or None)
     df_all = pd.concat(all_dfs, ignore_index=True) if all_dfs else None
-    df_means = pd.DataFrame.from_records(results) if results else None
-    summary = lightweight_summary(results)
+    df_means = (df_all.drop_duplicates(['game_id']).sort_values("ts")
+                if df_all is not None else None)
 
     chunk_obj = {
-        "summary": summary,
-        "results": results,
         "df_all": df_all,
         "df_means": df_means
     }

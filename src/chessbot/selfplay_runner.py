@@ -164,6 +164,7 @@ HELP_TEXT = """[cmd] commands:
   add sf worker         one more SF rescore thread
   kill sf worker        retire the oldest SF thread after its current game
   respawn lc0           pause, tear down and rebuild the lc0 fleet from yaml
+  respawn xc0           pause, tear down and rebuild the xc0 fleet from yaml
   full clear            drop all pauses, sf back to the config count
   save training data N  snapshot N live-buffer samples
   status                fleets, sf threads, pause state, backlog
@@ -258,6 +259,10 @@ def stdin_listener(controls, worker_procs):
             controls.respawn_lc0.set()
             print("[cmd] respawn lc0 requested", flush=True)
 
+        elif cmd == 'respawn xc0':
+            controls.respawn_xc0.set()
+            print("[cmd] respawn xc0 requested", flush=True)
+
         elif cmd == 'full clear':
             print("[cmd] full clear -- dropping pauses, sf back to config",
                   flush=True)
@@ -293,6 +298,7 @@ class Controls:
         self.status = threading.Event()
         self.full_clear = threading.Event()
         self.respawn_lc0 = threading.Event()
+        self.respawn_xc0 = threading.Event()
 
         # kinds accumulate rather than overwrite, so two commands typed inside
         # one loop pass do not lose the first one
@@ -654,8 +660,7 @@ class SelfPlayRunner:
     def respawn_lc0_workers(self, why="operator"):
         """Pause, tear down and rebuild the lc0 fleet from a fresh read of
         lc0_replay_config.yaml -- the only way spawn-time params like
-        games_at_once take effect without a full run restart. xc0 has no
-        equivalent command; its workers already reload every retrain."""
+        games_at_once take effect without a full run restart."""
         if self.lc0_cfg is None:
             print("[runner] respawn lc0: no lc0 fleet configured", flush=True)
             return
@@ -675,6 +680,26 @@ class SelfPlayRunner:
         for _ in range(self.cfg.n_lc0_workers):
             self.spawn_lc0_worker()
         print(f"[runner] respawned lc0 fleet ({why})", flush=True)
+
+    def respawn_xc0_workers(self, why="operator"):
+        """Pause, tear down and rebuild the xc0 fleet from a fresh read of
+        the run yaml -- the only way spawn-time params like batch size,
+        encoding or the net take effect without a full run restart."""
+        self.pause_workers(why, kinds={"xc0"})
+        self.operator_paused.add("xc0")
+        for w in self.procs_of("xc0"):
+            w["stop_ev"].set()
+            try:
+                w["p"].terminate()
+            except Exception:
+                pass
+        self.procs = [w for w in self.procs if w["kind"] != "xc0"]
+        self.reload_config()
+        self.paused_kinds.discard("xc0")
+        self.operator_paused.discard("xc0")
+        for _ in range(max(1, self.cfg.n_workers)):
+            self.spawn_worker()
+        print(f"[runner] respawned xc0 fleet ({why})", flush=True)
 
     def top_up_queue(self, target=None):
         """Keep the queue shallow. Depth is what keeps validation batches
@@ -1084,6 +1109,10 @@ class SelfPlayRunner:
         if c.respawn_lc0.is_set():
             c.respawn_lc0.clear()
             self.respawn_lc0_workers("operator")
+
+        if c.respawn_xc0.is_set():
+            c.respawn_xc0.clear()
+            self.respawn_xc0_workers("operator")
 
         if c.full_clear.is_set():
             c.full_clear.clear()

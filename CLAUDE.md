@@ -56,7 +56,10 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 
 - Castling rights encoded into the king token — no separate planes needed
 - EP encoded as a token ON the ep square — model gets spatial/file context for free
-- No stacked history planes (intentional design choice — hypothesis: AZ history planes are cargo cult)
+- History planes ARE used: `encoding_type=xc0h` with `history_K` past-ply boards stacked
+  into the position embedding. The "AZ history planes are cargo cult" hypothesis was
+  tested head-to-head against a no-history encoding and rejected decisively — history
+  helps. Do not resurrect the no-history variant as a default.
 - vocab_size=21 in all models
 
 ## Active Model Architecture

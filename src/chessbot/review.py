@@ -1131,6 +1131,112 @@ class GameViewer:
                 return
         print(f"No move with KL >= {threshold} found after ply {self.ply + 1}.")
 
+    SAC_MATERIAL = 2
+    SAC_Q = 0.3
+    SAC_HOLD_PLIES = 5
+
+    def find_sac_ply(self, start_ply=0):
+        """First ply at or after start_ply that gives up >= SAC_MATERIAL pts
+        of material and still shows Q > SAC_Q for the sacrificer through
+        SAC_HOLD_PLIES plies after it (the opponent's three replies plus the
+        sacrificer's two follow-ups) -- long enough that a quick intermezzo
+        exchange that gives the material right back doesn't qualify. Returns
+        the ply index, or None.
+
+        Read-only: does not touch self.ply/self.board. Shared by seek_sac()
+        (jumps the viewer there) and contains_sac() (just wants the bool).
+        """
+        values = {
+            chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+            chess.ROOK: 5, chess.QUEEN: 9,
+        }
+
+        def material_white(board):
+            total = 0
+            for pt, val in values.items():
+                total += val * len(board.pieces(pt, chess.WHITE))
+                total -= val * len(board.pieces(pt, chess.BLACK))
+            return total
+
+        def sac_q(ply, sign):
+            node = self.tree_data.get(ply) or self.tree_data.get(str(ply))
+            wdl = node.get("best_wdl") if node else None
+            if not wdl:
+                return None
+            return (wdl[0] - wdl[2]) * sign
+
+        def nbrq_count(board, color):
+            return sum(
+                len(board.pieces(pt, color))
+                for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+            )
+
+        def stockfish_moved(is_white):
+            if not self.log.get("vs_stockfish", False):
+                return False
+            sf_color = self.log.get("stockfish_color")
+            if sf_color is None:
+                return False
+            return is_white == bool(sf_color)
+
+        board, _ = self.warmed_boards()
+        for u in self.moves_uci[:start_ply]:
+            board.push(chess.Move.from_uci(u))
+
+        n = len(self.moves_uci)
+        for i in range(start_ply, n - self.SAC_HOLD_PLIES):
+            sac_white = board.turn == chess.WHITE
+            sign = 1 if sac_white else -1
+            sac_color = chess.WHITE if sac_white else chess.BLACK
+
+            if stockfish_moved(sac_white):
+                board.push(chess.Move.from_uci(self.moves_uci[i]))
+                continue
+
+            # material must be roughly even (or better) going INTO this move --
+            # otherwise i is just some later move played while already down,
+            # not the move that actually creates the deficit
+            pre_mat = material_white(board) * sign
+            pre_nbrq = nbrq_count(board, sac_color)
+            board.push(chess.Move.from_uci(self.moves_uci[i]))
+
+            if pre_mat <= -self.SAC_MATERIAL:
+                continue
+
+            # material can't drop on your own move -- only the opponent's
+            # reply actually removes a piece from the board, whether i put a
+            # piece en prise or just left an existing one hanging. So the
+            # deficit check starts at i+1 (the opponent's capture), not
+            # right after i itself.
+            ok = True
+            probe = board.copy()
+            for k in range(i + 1, i + 1 + self.SAC_HOLD_PLIES):
+                probe.push(chess.Move.from_uci(self.moves_uci[k]))
+                mat = material_white(probe) * sign
+                q = sac_q(k + 1, sign)
+                if mat > -self.SAC_MATERIAL or q is None or q <= self.SAC_Q:
+                    ok = False
+                    break
+            # net material was lost, but only counts as a sac if a piece
+            # (not just pawns) actually left the board for it
+            if ok and nbrq_count(probe, sac_color) < pre_nbrq:
+                return i
+
+        return None
+
+    def seek_sac(self):
+        ply = self.find_sac_ply(self.ply)
+        if ply is None:
+            print(f"No qualifying sacrifices found after ply {self.ply + 1}.")
+            return
+        self.goto(ply)
+
+    def contains_sac(self):
+        """True if this game has any qualifying sacrifice, anywhere. For
+        scanning a bundle of games: gv.contains_sac() to find showcase
+        material for review, without moving the viewer."""
+        return self.find_sac_ply(0) is not None
+
     def show_options(self):
         # concise CLI help for replay mode commands
         print("Commands:")
@@ -1151,6 +1257,8 @@ class GameViewer:
         print("                       minimum visits, e.g. pv8")
         print("  cpl > <N>            seek next move with CPL >= N, e.g. cpl > 50")
         print("  kl > <N>             seek next move with KL >= N, e.g. kl > 1.5")
+        print("  next sac             seek next sacrifice (>=2pt material, Q>0.3")
+        print("                       held 5 plies)")
         print("  temp <T>             show priors temperature-scaled by T (read-only)")
 
     def replay(self):
@@ -1221,6 +1329,9 @@ class GameViewer:
                     self.seek_kl(threshold)
                 except (ValueError, IndexError):
                     print("Usage: kl > <number>")
+            elif cmd == "next sac":
+                shown = False
+                self.seek_sac()
             elif cmd.startswith("temp"):
                 parts = cmd.split()
                 try:

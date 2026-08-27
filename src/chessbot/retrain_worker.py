@@ -38,7 +38,7 @@ from chessbot.config import Config
 from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
     read_shard, sample_records, stack_policies, write_pkl_gz_shard,
-    SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_PRIMARY_RECORDS,
+    SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
 )
 
 
@@ -129,15 +129,20 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     val_pool = [r for r in primary_records_raw if r[6] == 'xc0']
     val_primary = sample_records(val_pool, VAL_PRIMARY_RECORDS)
     val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
+    # plot-only slice, never validated against in the csv-logged metrics
+    lc0_pool = [r for r in primary_records_raw if r[6].startswith('lc0')]
+    val_lc0 = sample_records(lc0_pool, VAL_LC0_RECORDS)
 
     bs = cfg.retrain_batch_size
     preds_primary = predict_fp16(model, [r[0] for r in val_primary], batch_size=bs)
     preds_historic = predict_fp16(model, [r[0] for r in val_historic], batch_size=bs)
+    preds_lc0 = predict_fp16(model, [r[0] for r in val_lc0], batch_size=bs)
 
     pred_pkl_path = os.path.join(run_dir, "predictions_latest.pkl")
     payload = {
         "primary": {"samples": val_primary, "preds": preds_primary},
         "historic": {"samples": val_historic, "preds": preds_historic},
+        "lc0": {"samples": val_lc0, "preds": preds_lc0},
     }
     with open(pred_pkl_path + ".tmp", "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)

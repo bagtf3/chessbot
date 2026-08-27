@@ -58,6 +58,8 @@ SEED_SOURCE = "historic_seeded"
 # replay buffer has been trained on already and is left alone.
 VAL_PRIMARY_RECORDS = 20_480
 VAL_HISTORIC_RECORDS = 10_240
+# plot-only: never written to a progress csv, just the source-split validation figure
+VAL_LC0_RECORDS = 5_120
 
 # gzip's default is 9, which costs ~4x the write time of 6 for ~4% less disk.
 # Shard writes are on the rescorer's thread and run ~96 times per retrain

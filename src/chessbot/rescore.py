@@ -1880,7 +1880,9 @@ class Rescorer(object):
                     continue
 
             blend_cpl = aux['blend_cpl']
-            if blend_cpl is not None:
+            # z==1 means the mover won despite SF's objection -- trust the
+            # model over SF there instead of blending its edge away
+            if blend_cpl is not None and z < 1:
                 alpha = self.blend_alpha(
                     blend_cpl, aux['equiv'], aux['blunder_cp'])
                 sf_policy = self.sf_pointmass_policy(
@@ -2133,6 +2135,7 @@ class Rescorer(object):
 
         primary = build_group(payload["primary"])
         historic = build_group(payload["historic"])
+        lc0 = build_group(payload.get("lc0", {"samples": [], "preds": []}))
 
         if not primary['wdl_pred'] and not historic['wdl_pred']:
             print("[metrics] no samples in pred pkl, skipping")
@@ -2172,6 +2175,7 @@ class Rescorer(object):
 
         pb = metrics_block(primary)
         hb = metrics_block(historic)
+        lb = metrics_block(lc0)
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
@@ -2191,7 +2195,7 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(pb, 'primary'), (hb, 'historic')]
+        slices = [(pb, 'primary'), (hb, 'historic'), (lb, 'lc0')]
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:
@@ -2253,7 +2257,7 @@ class Rescorer(object):
                 return np.concatenate([a, b])
             return a + b
 
-        combined = {k: cat(primary[k], historic[k]) for k in primary}
+        combined = {k: cat(cat(primary[k], historic[k]), lc0[k]) for k in primary}
         self.save_validation_plots(
             epoch, os.path.join(run_dir, 'validation_latest.png'), combined)
 

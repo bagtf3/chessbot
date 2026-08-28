@@ -1,4 +1,6 @@
+import json
 import os
+import random
 import uuid
 from time import time as _now
 
@@ -9,8 +11,7 @@ from pyfastchess import MCTSTree as fasttree
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
-from chessbot.utils import rnd
-from collections import namedtuple
+from chessbot.utils import kl_divergence, rnd
 
 TABLEBASE = None
 
@@ -25,12 +26,6 @@ def get_tablebase():
     if TABLEBASE is None and ENDGAME_LOC and os.path.isdir(ENDGAME_LOC):
         TABLEBASE = chess.syzygy.open_tablebase(ENDGAME_LOC)
     return TABLEBASE
-
-ESCheck = namedtuple('ESCheck', [
-    'sims', 'jsd', 'top_uci', 'second_uci', 'third_uci',
-    'delta_12', 'delta_23', 'visit_dist',
-])
-
 
 class MCTSTree(fasttree):
     def __init__(self, board, cfg):
@@ -89,13 +84,22 @@ class MCTSTree(fasttree):
         )
         self.set_tempscale_entropy_target(float(cfg.tempscale_entropy_target))
         self.set_tempscale_trigger_q(float(cfg.tempscale_trigger_q))
-        # early-stop rolling state
-        self._es_last_checked_at = 0
-        self._es_tripped = False
+
+        # sim_stop_reason stays Python-owned: apply_stockfish_result writes
+        # "sf" into it directly, which C++ has no way to produce.
         self.sim_stop_reason = ""
 
-        self.es_checks = []
-        self.es_jsd_thresh = cfg.es_jsd_thresh
+        # tiered early-stop rule now lives in C++, evaluated inside
+        # collect_many_leaves's own loop so checkins land on exact sim
+        # counts (see pyfastchess mcts.cpp evaluate_early_stop).
+        self.set_early_stop_params(
+            min_sims=int(cfg.sims_floor),
+            es_check_every=int(cfg.es_check_every),
+            tier1_consec=int(cfg.es_tier1_consec),
+            tier1_jsd_thresh=float(cfg.es_tier1_jsd_thresh),
+            tier2_consec=int(cfg.es_tier2_consec),
+            tier2_jsd_thresh=float(cfg.es_tier2_jsd_thresh),
+        )
 
     def best(self):
         """
@@ -178,7 +182,7 @@ class MCTSTree(fasttree):
         Deterministic robust selector.
         Returns just the uci (so callers can label it however they want).
         """
-        rsc, details = self.robust_selection_criteria(5, 100)
+        rsc, details = self.robust_selection_criteria(5, 60)
         if (not rsc) or (not details) or (len(details) == 1):
             uci, _ = super().best()
             return uci
@@ -223,7 +227,7 @@ class MCTSTree(fasttree):
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
 
-        self.es_checks.clear()
+        self.reset_early_stop()
 
     def set_new_sims_ceiling(self, n_plies=None):
         if n_plies is None:
@@ -240,173 +244,6 @@ class MCTSTree(fasttree):
         # not implemented right now
         return None
 
-    def compute_visit_dist(self):
-        rows = self.root_child_visits()
-        if not rows:
-            return None
-        total = sum(n for _, n in rows)
-        if total <= 0:
-            return None
-        return {uci: n / total for uci, n in rows}
-
-    def js_divergence(self, p, q):
-        """Jensen-Shannon divergence, bounded [0, ln(2)] in nats."""
-        result = 0.0
-        for u in set(p) | set(q):
-            pi = p.get(u, 0.0)
-            qi = q.get(u, 0.0)
-            mi = 0.5 * (pi + qi)
-            if pi > 0:
-                result += 0.5 * pi * np.log(pi / mi)
-            if qi > 0:
-                result += 0.5 * qi * np.log(qi / mi)
-        return result
-
-    def record_es_check(self, details, sims):
-        curr_dist = self.compute_visit_dist()
-        if curr_dist is None:
-            return
-
-        top5 = set(list(curr_dist)[:5])
-        curr_sub = {u: v for u, v in curr_dist.items() if u in top5}
-        curr_sub_total = sum(curr_sub.values())
-        curr_sub = {u: v / curr_sub_total for u, v in curr_sub.items()}
-
-        if not self.es_checks:
-            prior_total = sum(d.prior for d in details)
-            if prior_total > 0:
-                ref = {d.uci: d.prior / prior_total for d in details}
-            else:
-                ref = {d.uci: 1.0 / len(details) for d in details}
-        else:
-            ref = self.es_checks[-1].visit_dist
-
-        ref_sub = {u: v for u, v in ref.items() if u in top5}
-        ref_sub_total = sum(ref_sub.values())
-        if ref_sub_total > 0:
-            ref_sub = {u: v / ref_sub_total for u, v in ref_sub.items()}
-        else:
-            ref_sub = {u: 1.0 / len(top5) for u in top5}
-
-        jsd = self.js_divergence(ref_sub, curr_sub)
-
-        d0 = details[0]
-        d1 = details[1] if len(details) > 1 else None
-        d2 = details[2] if len(details) > 2 else None
-
-        self.es_checks.append(ESCheck(
-            sims=sims,
-            jsd=jsd,
-            top_uci=d0.uci,
-            second_uci=d1.uci if d1 else None,
-            third_uci=d2.uci if d2 else None,
-            delta_12=d0.N - (d1.N if d1 else 0),
-            delta_23=(d1.N if d1 else 0) - (d2.N if d2 else 0),
-            visit_dist=curr_dist,
-        ))
-
-        if len(self.es_checks) > self.config.es_jsd_n_stable + 2:
-            self.es_checks.pop(0)
-
-    def rsc_performance_stop(self, rsc, details):
-        """Rule 1: stop immediately if RSC clearly confirms the top move."""
-        if not rsc or len(rsc) < 2:
-            return True
-
-        d0 = details[0]
-        if max(rsc, key=rsc.get) != d0.uci:
-            return False
-
-        if d0.visit_share < 0.15:
-            return False
-
-        vals = sorted(rsc.values(), reverse=True)
-        if vals[0] - vals[1] < 0.05:
-            return False
-
-        dS_dict = {d.uci: d.Qdelta_sign for d in details if d.uci in rsc}
-        if d0.Qdelta_sign < 0.0 and len(dS_dict) >= 3:
-            if d0.uci in sorted(dS_dict, key=dS_dict.get)[:2]:
-                return False
-        
-        return True
-
-    def jsd_convergence_stop(self):
-        """Rule 2: stop if visit distribution has stabilized across n checks."""
-        cfg = self.config
-        n = cfg.es_jsd_n_stable
-
-        if len(self.es_checks) < n:
-            return False
-
-        recent = self.es_checks[-n:]
-
-        if any(c.jsd > self.es_jsd_thresh for c in recent):
-            return False
-
-        if len(set(c.top_uci for c in recent)) > 1:
-            return False
-
-        if recent[-1].delta_12 < cfg.es_jsd_min_delta:
-            return False
-
-        deltas = [c.delta_12 for c in recent]
-        if not all(deltas[i] >= deltas[i-1] for i in range(1, len(deltas))):
-            return False
-        
-        return True
-
-    def maybe_early_stop(self):
-        if self._es_tripped:
-            return True
-
-        cfg = self.config
-        sims_done = self.sims_completed_this_move
-
-        if sims_done < cfg.sims_floor:
-            return False
-
-        if sims_done >= self.sims_ceiling:
-            self._es_tripped = True
-            self.sim_stop_reason = "full"
-            return True
-
-        if sims_done - self._es_last_checked_at < cfg.es_check_every:
-            return False
-
-        self._es_last_checked_at = sims_done
-        es_time_start = _now()
-
-        rsc, details = self.robust_selection_criteria(5, 100)
-
-        if not details or len(details) < 2:
-            return False
-
-        d0, d1 = details[0], details[1]
-        visit_delta = d0.N - d1.N
-
-        # first chance to fire stays at jsd_min_sims as n_stable grows
-        jsd_collect_start = cfg.jsd_min_sims - cfg.es_jsd_n_stable * cfg.es_check_every
-        if sims_done >= jsd_collect_start:
-            self.record_es_check(details, sims_done)
-
-        # Rule 1: RSC performance stop (active after sims_floor)
-        if cfg.use_robust:
-            if visit_delta >= cfg.min_delta and d0.N >= cfg.min_top_visits:
-                if self.rsc_performance_stop(rsc, details):
-                    self._es_tripped = True
-                    self.sim_stop_reason = "rsc"
-                    return True
-
-        # Rule 2: JSD convergence stop (only after jsd_min_sims)
-        if sims_done >= cfg.jsd_min_sims:
-            if self.jsd_convergence_stop():
-                self._es_tripped = True
-                self.sim_stop_reason = "jsd"
-                return True
-        
-        return False
-
     def stop_simulating(self):
         # do at least 1 sims to stabilize the tree
         if self.sims_completed_this_move < 1:
@@ -417,7 +254,11 @@ class MCTSTree(fasttree):
             self.sim_stop_reason = "Only 1 legal move"
             return True
 
-        return self.maybe_early_stop()
+        if self.es_tripped:
+            self.sim_stop_reason = self.es_stop_reason
+            return True
+
+        return False
 
     def reset_for_new_move(self):
         """
@@ -447,10 +288,6 @@ class MCTSTree(fasttree):
 
         # standard housekeeping
         self._move_started_at = _now()
-
-        # early-stop state
-        self._es_last_checked_at = 0
-        self._es_tripped = False
         self.sim_stop_reason = ""
 
 
@@ -551,7 +388,7 @@ class ChessGame(object):
     
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
-        rsc, details = self.tree.robust_selection_criteria(5, 100)
+        rsc, details = self.tree.robust_selection_criteria(5, 60)
         rsc = {} if not rsc else rsc
         if details is None:
             return
@@ -622,6 +459,31 @@ class ChessGame(object):
         data["pv"] = pv
 
         self.tree_data[self.plies] = data
+
+        es_rows = self.tree.es_debug_rows()
+        if es_rows:
+            visits_list = [cd.N for cd in details]
+            priors_list = [cd.prior for cd in details]
+            kl = kl_divergence(visits_list, priors_list)
+            if random.random() < 0.10 or kl > 0.75:
+                self.dump_jsd_debug(turn, sims, self.tree.sim_stop_reason, es_rows)
+
+    def dump_jsd_debug(self, turn, final_sims, final_stop_reason, es_rows):
+        out_dir = os.path.join(self.config.run_dir, "jsd_debug")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{self.game_id}.jsonl")
+
+        with open(out_path, "a") as f:
+            for row in es_rows:
+                line = {
+                    "game_id": self.game_id, "ply": self.plies, "stm": turn,
+                    "final_sims": final_sims, "final_stop_reason": final_stop_reason,
+                    "sims": row.sims, "jsd": rnd(row.jsd, 6),
+                    "top_uci": row.top_uci, "second_uci": row.second_uci,
+                    "delta_12": row.delta_12, "dQ12": rnd(row.dQ12, 4),
+                    "Q1": rnd(row.Q1, 4), "Qema1": rnd(row.Qema1, 4),
+                }
+                f.write(json.dumps(line) + "\n")
     
     def set_stockfish_result(self, res_tup):
         self.sf_res_tup = res_tup

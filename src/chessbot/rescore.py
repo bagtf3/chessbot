@@ -300,8 +300,8 @@ class Rescorer(object):
         self.recent_ce_plies = []
 
         zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
-        self.total_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
-        self.window_stop = {st: zero_stop() for st in ("full", "rsc", "jsd")}
+        self.total_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
+        self.window_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
 
         zero_blunder = lambda: {'n': 0, 'cpl': 0.0}
         self.total_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
@@ -1922,7 +1922,7 @@ class Rescorer(object):
             out_df[key] = val
 
         stop_stats = {}
-        for st in ('full', 'rsc', 'jsd'):
+        for st in ('full', 'tier1', 'tier2'):
             mask_st = out_df['stop_reason'] == st
             n_st = mask_st.sum()
             stop_stats[st] = {

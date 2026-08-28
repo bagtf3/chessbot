@@ -43,16 +43,15 @@ class Config(object):
     sims_floor = 400
     sims_ceiling = 800
 
-    # early stop
+    # early stop -- tiered rule (C++, pyfastchess mcts.cpp evaluate_early_stop)
     es_check_every = 100
-    min_top_visits = 300
-    min_delta = 100
-    use_robust = True
-    es_jsd_thresh = 0.05    # JSD below this = converged; bounded [0, ln(2)~0.693]; can be a list
-    es_jsd_n_stable = 3     # consecutive stable checks required for JSD stop
-    es_jsd_min_delta = 100  # minimum delta_12 floor for JSD stop
-    jsd_min_sims = 600      # sims before JSD stop is considered; RSC stop is active before this
-    
+    use_robust = True       # fallback selector when a search hits "full" (ceiling)
+
+    es_tier1_consec = 3         # "runaway": consecutive checkins with the same leader
+    es_tier1_jsd_thresh = 0.005
+    es_tier2_consec = 5         # "two-horse race": consecutive checkins, top-2 stable in top-3
+    es_tier2_jsd_thresh = 0.0003
+
     # Game stuff
     n_games = 128
     games_at_once = 128

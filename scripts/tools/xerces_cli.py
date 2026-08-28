@@ -73,7 +73,12 @@ class Cfg:
     dirichlet_alpha  = 0.3
     reuse_tree       = True
     sample_moves     = False
-    es_jsd_thresh    = 0.0
+    use_robust       = True
+    es_check_every   = 100
+    es_tier1_consec       = 3
+    es_tier1_jsd_thresh   = 0.005
+    es_tier2_consec       = 5
+    es_tier2_jsd_thresh   = 0.0003
 
 
 def build_batch_candidates(min_batch, fwd_batch):

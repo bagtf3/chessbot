@@ -20,7 +20,7 @@ from pyfastchess import MCTSForest, raw_cache_bulk_insert_np
 from pyfastchess import priors_cache_clear, raw_cache_clear
 
 from chessbot.config import Config
-from chessbot.mcts_utils import MCTSTree
+from chessbot.mcts_utils import ChessGame, MCTSTree
 
 from . import paths
 from .fixtures import load_fixture_set
@@ -172,6 +172,184 @@ def run_position(cfg, fen, n_sims, infer_fn, batch, rebuild=False):
 
     forest.pop_tree(tree)
     return out
+
+
+def collect_equiv_row(game):
+    """Per-game oracle: stop ply, stop reason and root visit vector per move.
+
+    This is the byte-stable-ish equivalence check for early-stop changes --
+    compare stop-ply/stop-reason *distributions* (not exact equality) across
+    builds, per cpp_migration_plan.md's Stage 5 verification note.
+    """
+    moves = []
+    for ply, data in sorted(game.tree_data.items()):
+        moves.append({
+            "ply": ply,
+            "sims": data.get("sims"),
+            "stop_reason": data.get("stop_reason"),
+            "move_played": data.get("move_played"),
+            "root_visits": [
+                (cm["uci"], cm["visits"]) for cm in data.get("candidate_moves", [])
+            ],
+        })
+    return {
+        "start_fen": game.starting_fen,
+        "n_plies": game.plies,
+        "end_reason": game.end_reason,
+        "outcome": game.outcome,
+        "moves": moves,
+    }
+
+
+def run_loop_bench(fixtures, cfg, infer_fn, n_games=None, max_plies=300,
+                    macro_batch=None, equiv=False):
+    """Drive the real stop_simulating -> make_move_from_tree ->
+    check_for_terminal path across many concurrent games, shaped like
+    looper.py's GameLooper tick loop (looper.py:277-399). Unlike search(),
+    this exercises early stopping, so a change to stop_simulating shows up
+    here and nowhere in the fixed-work search() path above.
+    """
+    priors_cache_clear()
+    raw_cache_clear()
+
+    macro = macro_batch or cfg.macro_batch
+    n_games = n_games or len(fixtures)
+    fixtures = fixtures[:n_games]
+
+    forest = MCTSForest()
+    games = []
+    for fx in fixtures:
+        board = fastboard(fx["fen"])
+        meta = {
+            "vs_stockfish": False, "stockfish_is_white": False,
+            "scenario": fx.get("source", "bench"),
+        }
+        g = ChessGame(board, meta, cfg)
+        forest.add_tree(g.tree)
+        games.append(g)
+
+    active = list(games)
+    finished = []
+
+    outer_iters = 0
+    game_steps = 0
+    stop_time = 0.0
+    move_time = 0.0
+    t0 = time.perf_counter()
+
+    while active:
+        outer_iters += 1
+        forest.resolve_all_inflight()
+        still_active = []
+        for g in active:
+            game_steps += 1
+
+            t_s = time.perf_counter()
+            stopped = g.tree.stop_simulating()
+            stop_time += time.perf_counter() - t_s
+
+            if stopped:
+                t_m = time.perf_counter()
+                terminal = g.make_move_from_tree()
+                move_time += time.perf_counter() - t_m
+                if terminal or g.plies >= max_plies:
+                    forest.pop_tree(g.tree)
+                    finished.append(g)
+                else:
+                    still_active.append(g)
+                continue
+
+            res = g.tree.collect_many_leaves(cfg.micro_batch, 1024)
+            got = res.count_new + res.count_cached + res.count_terminal
+            g.tree.sims_completed_this_move += got
+            still_active.append(g)
+
+        active = still_active
+
+        keys_np, enc_np = forest.get_all_history_tokens(cfg.history_K)
+        for i in range(0, len(keys_np), macro):
+            k = keys_np[i:i + macro]
+            policy, wdl = infer_fn(k, enc_np[i:i + macro])
+            raw_cache_bulk_insert_np(k, wdl, policy)
+
+    wall = time.perf_counter() - t0
+    result = {
+        "wall_s": wall,
+        "outer_iters": outer_iters,
+        "outer_iters_per_s": outer_iters / wall if wall else 0.0,
+        "game_steps": game_steps,
+        "py_us_per_game_step":
+            (stop_time + move_time) / game_steps * 1e6 if game_steps else 0.0,
+        "py_stop_us_per_step": stop_time / game_steps * 1e6 if game_steps else 0.0,
+        "py_move_us_per_step": move_time / game_steps * 1e6 if game_steps else 0.0,
+        "n_games": len(games),
+        "n_finished": len(finished),
+        "total_plies": sum(g.plies for g in finished),
+    }
+    if equiv:
+        result["equiv"] = [collect_equiv_row(g) for g in finished]
+    return result
+
+
+def print_loop_summary(result):
+    print(f"\n{result['n_games']} games, {result['n_finished']} finished, "
+          f"{result['total_plies']} total plies")
+    print(f"  wall_s              {result['wall_s']:>9.2f}")
+    print(f"  outer_iters/s       {result['outer_iters_per_s']:>9.1f}")
+    print(f"  py_us/game_step     {result['py_us_per_game_step']:>9.2f}")
+    print(f"    stop_simulating   {result['py_stop_us_per_step']:>9.2f}")
+    print(f"    make_move_from_tree {result['py_move_us_per_step']:>7.2f}")
+
+
+def run_loop_bench_sweeps(fixtures, cfg, infer_fn, n_games=None,
+                           max_plies=300, macro_batch=None, sweeps=3,
+                           tag="loop_bench", save=True, quiet=False,
+                           equiv=False):
+    """Repeat run_loop_bench `sweeps` times for a mean/sd, same rationale
+    as run_bench's sweeps (same-build spread is real, one sweep can't
+    resolve small changes).
+    """
+    run_dir = paths.new_run_dir(tag) if save else None
+
+    per_sweep = []
+    last_result = None
+    for s in range(sweeps):
+        r = run_loop_bench(fixtures, cfg, infer_fn, n_games=n_games,
+                            max_plies=max_plies, macro_batch=macro_batch,
+                            equiv=(equiv and s == sweeps - 1))
+        per_sweep.append(r)
+        last_result = r
+        if not quiet:
+            print(f"sweep {s + 1}/{sweeps}: "
+                  f"{r['outer_iters_per_s']:.1f} outer_iters/s  "
+                  f"{r['py_us_per_game_step']:.2f} py_us/game_step")
+
+    keys = ["wall_s", "outer_iters_per_s", "py_us_per_game_step",
+            "py_stop_us_per_step", "py_move_us_per_step", "total_plies"]
+    stats = {}
+    for k in keys:
+        m, sd = mean_sd([p[k] for p in per_sweep])
+        stats[k] = m
+        stats[k + "_sd"] = sd
+
+    result = {
+        "n_games": last_result["n_games"],
+        "max_plies": max_plies,
+        "sweeps": sweeps,
+        "repo_stamps": paths.repo_stamps(),
+        "stats": stats,
+        "per_sweep": per_sweep,
+    }
+    if equiv:
+        result["equiv"] = last_result.get("equiv", [])
+
+    if run_dir is not None:
+        paths.save_json(run_dir / "result.json", result)
+        result["run_dir"] = str(run_dir)
+        print(f"\nwrote {run_dir}")
+
+    print_loop_summary(last_result)
+    return result
 
 
 def ply_bucket(ply):
@@ -352,6 +530,9 @@ def print_summary(result):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures", required=True)
+    ap.add_argument("--mode", choices=["fixed", "loop"], default="fixed",
+                    help="fixed: pin sim count via search() (existing). "
+                         "loop: real stop_simulating loop via run_loop_bench.")
     ap.add_argument("--n-sims", type=int, default=2000)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--backend", choices=["stub", "real"], default="stub")
@@ -362,6 +543,13 @@ def main():
     ap.add_argument("--sweeps", type=int, default=6,
                     help="repeat the fixture set N times in-process")
     ap.add_argument("--tag", default="bench")
+    ap.add_argument("--n-games", type=int, default=None,
+                    help="loop mode: number of fixtures to play as full games")
+    ap.add_argument("--max-plies", type=int, default=300,
+                    help="loop mode: per-game ply cap")
+    ap.add_argument("--equiv", action="store_true",
+                    help="loop mode: dump per-game stop-ply/stop-reason/"
+                         "root-visit-vector oracle from the last sweep")
     args = ap.parse_args()
 
     fixtures = load_fixture_set(args.fixtures)
@@ -369,6 +557,17 @@ def main():
         fixtures = fixtures[:args.limit]
 
     cfg = Config.from_yaml(args.config) if args.config else None
+
+    if args.mode == "loop":
+        cfg = bench_config(cfg, reuse_tree=args.reuse_tree)
+        infer_fn = stub_infer if args.backend == "stub" else build_real_infer(cfg)
+        run_loop_bench_sweeps(
+            fixtures, cfg, infer_fn, n_games=args.n_games,
+            max_plies=args.max_plies, sweeps=args.sweeps, tag=args.tag,
+            equiv=args.equiv,
+        )
+        return
+
     run_bench(fixtures, n_sims=args.n_sims, batch=args.batch,
               backend=args.backend, cfg=cfg, reuse_tree=args.reuse_tree,
               rebuild=args.rebuild, sweeps=args.sweeps, tag=args.tag)

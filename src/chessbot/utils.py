@@ -71,7 +71,7 @@ def score_to_value_stm_pov_tanh(board_score, mid_cp=100.0):
     rel_score = board_score.relative
     raw = rel_score.score()
     if raw is None:
-        raw = rel_score.score(mate_score=3000)
+        raw = rel_score.score(mate_score=MATE_CP)
     return cp_to_value_tanh(raw, mid_cp=mid_cp)
 
 # another method of converting scores
@@ -79,14 +79,12 @@ def score_clipped(x, clip_max=CLIP_MAX):
     return np.clip(x.score(mate_score=MATE_CP), -clip_max, clip_max)
 
 
-def score_cp_white_pov(pov_score, clipped=True, mate_cp=MATE_CP):
-    scr = pov_score.white()
-    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+def score_cp_white_pov(pov_score):
+    return score_clipped(pov_score.white())
 
 
-def score_cp_stm_pov(pov_score, clipped=True, mate_cp=MATE_CP):
-    scr = pov_score.relative
-    return score_clipped(scr) if clipped else scr.score(mate_score=mate_cp)
+def score_cp_stm_pov(pov_score):
+    return score_clipped(pov_score.relative)
 
 
 def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=None):
@@ -767,7 +765,7 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
             score = info[0].get("score")
             eval_white = None
             if score is not None:
-                eval_white = score.pov(chess.WHITE).score(mate_score=1500)
+                eval_white = score_clipped(score.pov(chess.WHITE))
 
             # skip positions with mate or undefined score when using margin
             if margin is not None:
@@ -781,12 +779,12 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
             paths.append(path)
 
             # now expand selected multipv moves (filtered by thresh)
-            best_cp = info[0]["score"].pov(board.turn).score(mate_score=1500)
+            best_cp = score_clipped(info[0]["score"].pov(board.turn))
             if best_cp is None:
                 best_cp = 0
 
             for d in info:
-                sc = d["score"].pov(board.turn).score(mate_score=1500)
+                sc = score_clipped(d["score"].pov(board.turn))
                 if sc is None:
                     continue
                 if best_cp - sc > thresh:
@@ -803,10 +801,10 @@ def greedy_sf_tree_paths(n_pos=5000, multipv=4, thresh=90, margin=120):
     return paths
 
     
-def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
+def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=MATE_CP):
     def _score_pov_cp(pov_score, white_to_move, mate_cp):
         s = pov_score.white() if white_to_move else pov_score.black()
-        return float(s.score(mate_score=mate_cp))
+        return float(np.clip(s.score(mate_score=mate_cp), -CLIP_MAX, CLIP_MAX))
 
     board = chess.Board() if start_fen is None else chess.Board(start_fen)
     white_cpl, black_cpl = [], []
@@ -918,7 +916,7 @@ def evaluate_game_sf(moves_uci, start_fen=None, depth=8, mate_cp=1500):
     return out
 
 
-def evaluate_many_games(games, depth=12, workers=4, mate_cp=1500):
+def evaluate_many_games(games, depth=12, workers=4, mate_cp=MATE_CP):
     def worker(moves, fen):
         return evaluate_game_sf(
             moves_uci=list(moves), start_fen=fen, depth=depth, mate_cp=mate_cp)
@@ -1093,18 +1091,18 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
 
     # scenario table (unchanged formatting)
     print(
-        f"{'scenario':<20} {'sf':<6} {'N':>4} "
-        f"{'W':>4} {'D':>4} {'L':>4}   {'avg_plies':>10}"
+        f"{'scenario':<20} {'sf':<6} {'N':>6} "
+        f"{'W':>6} {'D':>6} {'L':>6}   {'avg_plies':>10}"
     )
-    print("-" * 60)
+    print("-" * 64)
     for (scenario, bucket), s in rows:
         avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
         print(
-            f"{scenario:<20} {bucket:<6} {s['N']:>4} "
-            f"{s['W']:>4} {s['D']:>4} {s['L']:>4}  "
+            f"{scenario:<20} {bucket:<6} {s['N']:>6} "
+            f"{s['W']:>6} {s['D']:>6} {s['L']:>6}  "
             f"{avg:>10.1f}"
         )
-    print("-" * 60)
+    print("-" * 64)
 
     # bot vs Stockfish summary (score: W=1, D=0.5, L=0)
     total = sf_overall["N"]
@@ -1115,7 +1113,7 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
     score = (score_pts / total) if total else 0.0
 
     print(
-        f"Total SF games: {total:>4}  W/D/L={w}/{d}/{l}  ",
+        f"Total SF games: {total:>6}  W/D/L={w}/{d}/{l}  "
         f"score={score:.3f}  avg_plies={avg:.1f}"
     )
 

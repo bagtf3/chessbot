@@ -52,8 +52,7 @@ from chessbot.review import load_game_index, ANALYZE_PKL
 RS = "[rescore]"
 LC0_BRP_SHARD_DIR = os.environ.get("LC0_BRP_SHARD_PATH", "")
 # lc0 audit smoothing, counted in scored positions
-AUDIT_EMA_SPAN = 500
-AUDIT_EMA_LONG = 10000
+AUDIT_EMA_SPAN = 2000
 BRP_MERGE_EVERY = 512
 # blunder-replay analysis fires purely on collected-row count, not a retrain
 # cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
@@ -196,7 +195,7 @@ class SFRescoreThread:
                     best_uci = str(info['pv'][0])
                     pv_ucis  = [str(m) for m in info.get('pv', [])[:3]]
                     best_cp  = score_cp_stm_pov(info['score'])
-                    best_abs = score_cp_white_pov(info['score'], clipped=False)
+                    best_abs = score_cp_white_pov(info['score'])
 
                     # pass 2: score xerces's move only if it differs from best
                     rerun = xerces_uci != best_uci
@@ -210,7 +209,7 @@ class SFRescoreThread:
                         elapsed  += time.time() - t0
                         depths.append(info2.get('depth', 0))
                         played_cp  = score_cp_stm_pov(info2['score'])
-                        played_abs = score_cp_white_pov(info2['score'], clipped=False)
+                        played_abs = score_cp_white_pov(info2['score'])
                     else:
                         played_cp  = best_cp
                         played_abs = best_abs
@@ -327,9 +326,7 @@ class Rescorer(object):
         # ply0 lc0 and xc0 only ever step together, so uplift always reconciles.
         # seeded at the observed teacher/xerces loss so one lucky first
         # probe does not own the number for thousands of samples
-        self.lc0_audit_ema = {
-            'lc0': 26.0, 'xc0': 174.9, 'lc0_l': 26.0, 'xc0_l': 174.9,
-        }
+        self.lc0_audit_ema = {'lc0': 13.2, 'xc0': 174.2}
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
 
@@ -549,10 +546,9 @@ class Rescorer(object):
         if os.path.exists(analyze_pkl_path):
             with open(analyze_pkl_path, "rb") as f:
                 combined = pickle.load(f)
-            if "df_means" in combined and combined["df_means"] is not None:
-                self.games_seen = set(
-                    combined["df_means"]["game_id"].astype(str).tolist()
-                )
+            df_all = combined.get("df_all")
+            if df_all is not None:
+                self.games_seen = set(df_all["game_id"].astype(str).unique())
 
     def get_unprocessed(self):
         """
@@ -764,6 +760,17 @@ class Rescorer(object):
             # short_fen still needed for the lc0 waypoint FEN check
             short_fen = b_fast.fen(include_counters=False)
 
+            parentQ_white = np.nan
+            parent_p_draw = np.nan
+            if i > 0:
+                ptr = tree_data.get(i - 1, tree_data.get(str(i - 1), {}))
+                pmv = game_data['moves_played'][i - 1]
+                for c in ptr.get('candidate_moves', []):
+                    if c['uci'] == pmv:
+                        parentQ_white = c['Q']
+                        parent_p_draw = c['Q_draw']
+                        break
+
             ply = {
                 'ply_idx': i,
                 'mv': mv,
@@ -780,6 +787,8 @@ class Rescorer(object):
                 'skip_training': skip_all_training,
                 'xerces_uci': xerces_uci,
                 'sfen': short_fen,
+                'parentQ_white': parentQ_white,
+                'parent_p_draw': parent_p_draw,
                 'best_uci': None,
                 'best_cp': None,
                 'best_abs': None,
@@ -1052,20 +1061,7 @@ class Rescorer(object):
             # not equiv -- found_equiv took everything at or under
             # BRP_EQUIV_CPL, so anything reaching here is still wrong
             elif ply is not None:
-                # past the cap the blend would be almost pure SF pointmass, so
-                # escalate to a better teacher instead. Nothing about this is
-                # recorded on the pool record.
-                if probe_cpl > self.config.brp_enqueue_max_cpl:
-                    self.queue_brp_lc0_replay(src, short_fen_key, probe_cpl)
-                else:
-                    added_to_buffer = self.add_blunder_replay_training_example(
-                        ply, epoch, best_uci, best_cp, probe_cpl)
-                # probe_fails only seeds records the seed script never saw --
-                # new blunders enter the pool without an n_fails
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
-                if src['n_fails'] >= BRP_MAX_FAILS:
-                    evict_position(pool, short_fen_key, "max_fails", epoch,
-                                   evicted_path(self.blunder_pool_path))
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1322,8 +1318,6 @@ class Rescorer(object):
                 self.lc0_audit_n += 1
                 E['lc0'] = ema_step(E.get('lc0'), ms.loss, AUDIT_EMA_SPAN)
                 E['xc0'] = ema_step(E.get('xc0'), xc0_cpl, AUDIT_EMA_SPAN)
-                E['lc0_l'] = ema_step(E.get('lc0_l'), ms.loss, AUDIT_EMA_LONG)
-                E['xc0_l'] = ema_step(E.get('xc0_l'), xc0_cpl, AUDIT_EMA_LONG)
 
             if k == 0:
                 self.resolve_lc0_candidate(
@@ -1707,6 +1701,7 @@ class Rescorer(object):
                 best_abs, played_abs,
                 turn, loss_this,
                 tr.get('stop_reason', ''), tr.get('sims', 0),
+                ply.get('parentQ_white', np.nan), ply.get('parent_p_draw', np.nan),
                 np.nan, np.nan,  # kl, ce -- filled in below if this ply trains
             ])
 
@@ -1900,6 +1895,7 @@ class Rescorer(object):
             'move_num', 'played_move', 'most_visited_move', 'best_move',
             'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
+            'parentQ_white', 'parent_p_draw',
             'kl', 'ce',
         ]
 
@@ -2022,7 +2018,7 @@ class Rescorer(object):
                     acc[st]['sims'] += s['sims'] * n
 
     def print_stop_stats(self):
-        stops = ("rsc", "jsd", "full")
+        stops = ("tier1", "tier2", "full")
         W = 12
 
         def col(val):
@@ -2645,19 +2641,21 @@ def combine_analysis_staging(run_dir):
         else:
             df_all = prev_df_all
 
-    # de dupe, then rebuild the one-row-per-game skeleton from it directly
-    df_all = df_all.drop_duplicates(['game_id', 'move_num']).sort_values("ts")
-    df_means = df_all.drop_duplicates(['game_id']).sort_values("ts")
+    # columns dropped from the written file are recoverable: ts/scenario/
+    # stockfish_color from game_index on game_id; best_cp/played_cp as
+    # clip(<absolute> * stm_sign); loss is an exact duplicate of delta
+    drop_cols = ['ts', 'scenario', 'stockfish_color',
+                 'best_cp', 'played_cp', 'loss']
+    df_all = (df_all.drop_duplicates(['game_id', 'move_num'])
+              .sort_values(['game_id', 'move_num']))
+    df_all = df_all.drop(columns=[c for c in drop_cols if c in df_all.columns])
 
-    combined_new = {
-        "df_all": df_all,
-        "df_means": df_means
-    }
+    combined_new = {"df_all": df_all}
 
     # persist atomically using existing helper
     save_pickle_atomic(combined_new, out_pkl)
     print(f"[combine] wrote combined ANALYZE_PKL -> {Path(out_pkl).name} "
-          f"({len(df_means)} games)")
+          f"({df_all['game_id'].nunique()} games)")
 
     # delete the chunk files that we just combined
     for fn in fns:
@@ -2743,13 +2741,8 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     # df_all is concat of per-game dfs (or None)
     df_all = pd.concat(all_dfs, ignore_index=True) if all_dfs else None
-    df_means = (df_all.drop_duplicates(['game_id']).sort_values("ts")
-                if df_all is not None else None)
 
-    chunk_obj = {
-        "df_all": df_all,
-        "df_means": df_means
-    }
+    chunk_obj = {"df_all": df_all}
 
     cpl = df_all.delta.mean()
     bmr = df_all.played_best_move.mean()

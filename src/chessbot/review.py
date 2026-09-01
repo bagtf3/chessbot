@@ -33,7 +33,7 @@ from chessbot.utils import (
     format_time, compact_count,
 )
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, score_to_value_stm_pov,
+    score_cp_stm_pov, score_cp_white_pov, score_clipped, score_to_value_stm_pov,
     score_to_value_stm_pov_tanh, rnd,
     calc_entropy, kl_divergence, load_json, save_pickle_atomic,
 )
@@ -159,7 +159,7 @@ class GameViewer:
                 score_obj = info.get("score")
                 cp = None
                 if score_obj is not None:
-                    cp = score_obj.white().score(mate_score=1500)
+                    cp = score_clipped(score_obj.white())
                 out.append((move_uci, san, cp, pv))
         return out
 
@@ -228,7 +228,7 @@ class GameViewer:
             score_obj = info.get("score")
             cp_stm = None
             if score_obj is not None:
-                cp_w = score_obj.white().score(mate_score=1500)
+                cp_w = score_clipped(score_obj.white())
                 cp_stm = None if cp_w is None else int(cp_w * sign)
             cp_str = "mate" if cp_stm is None else str(cp_stm)
             pv = info.get("pv", [])
@@ -272,7 +272,7 @@ class GameViewer:
                 if score_obj is None:
                     print("  played move eval not available")
                 else:
-                    cp = score_obj.white().score(mate_score=1500)
+                    cp = score_clipped(score_obj.white())
                     print(f"  {upcoming_san:<6}  cp={int(cp * sign)}")
                 pv = info.get("pv", [])
                 if pv:
@@ -1569,7 +1569,7 @@ def analyze_with_rank(move, board, limit, eng):
     
     best_move = best['pv'][0]
     best_cp   = score_cp_stm_pov(best["score"])
-    best_abs  = score_cp_white_pov(best["score"], clipped=False)
+    best_abs  = score_cp_white_pov(best["score"])
     
     # default
     res = {}
@@ -1598,7 +1598,7 @@ def analyze_with_rank(move, board, limit, eng):
         in_top3 = True
     
     played_cp = score_cp_stm_pov(played['score'])
-    played_abs = score_cp_white_pov(played["score"], clipped=False)
+    played_abs = score_cp_white_pov(played["score"])
     delta = best_cp - played_cp
 
     # within equivalence range -> wash: treat as equal, loss=0 and mark both as best
@@ -2274,12 +2274,10 @@ class RecordKeeper(object):
                 pct = 100.0 * self.brp_admit_ok / self.brp_admit_n
                 print(f"[lc0 audit] candidates={self.brp_admit_n}  "
                       f"confirmed blunders={self.brp_admit_ok} ({pct:.1f}%)")
-            for tag, lk, xk in (("ema500 ", 'lc0', 'xc0'),
-                                ("ema10k ", 'lc0_l', 'xc0_l')):
-                lc0, xc0 = E[lk], E[xk]
-                print(f"[lc0 audit] ply0 {tag} n={self.lc0_audit_n:<5}"
-                      f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
-                      f"uplift={xc0 - lc0:+.1f}")
+            lc0, xc0 = E['lc0'], E['xc0']
+            print(f"[lc0 audit] ply0 ema2k  n={self.lc0_audit_n:<5}"
+                  f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
+                  f"uplift={xc0 - lc0:+.1f}")
 
     def log_loop_stats(self, summed, avged):
         n_groups = summed.get("n_groups", 0)

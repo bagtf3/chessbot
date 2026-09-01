@@ -497,6 +497,7 @@ class GameLooper(object):
 
         # aggregate stats
         self.games_finished += 1
+
         sims_total = game.tree.sims_done_total
         cfg = game.config
 

@@ -92,14 +92,40 @@ class MCTSTree(fasttree):
         # tiered early-stop rule now lives in C++, evaluated inside
         # collect_many_leaves's own loop so checkins land on exact sim
         # counts (see pyfastchess mcts.cpp evaluate_early_stop).
-        self.set_early_stop_params(
-            min_sims=int(cfg.sims_floor),
+        self.es_params = dict(
             es_check_every=int(cfg.es_check_every),
             tier1_consec=int(cfg.es_tier1_consec),
             tier1_jsd_thresh=float(cfg.es_tier1_jsd_thresh),
             tier2_consec=int(cfg.es_tier2_consec),
             tier2_jsd_thresh=float(cfg.es_tier2_jsd_thresh),
         )
+        self.set_early_stop_params(min_sims=int(cfg.sims_floor), **self.es_params)
+
+        self.effort_lut = {}
+        self.effort_q_edges = None
+        self.effort_d_edges = None
+        self.effort_ply_edges = None
+        if getattr(cfg, "effort_scale_table", ""):
+            import json
+            from chessbot.effort_scale import Q_EDGES, D_EDGES, PLY_EDGES, bin_key
+            lut_data = json.load(open(cfg.effort_scale_table))
+            self.effort_lut = lut_data.get(str(getattr(cfg, "effort_alpha", 0.0)), {})
+            edges = lut_data.get("edges", {})
+            self.effort_q_edges   = tuple(edges.get("Q",   Q_EDGES))
+            self.effort_d_edges   = tuple(edges.get("D",   D_EDGES))
+            self.effort_ply_edges = tuple(edges.get("PLY", PLY_EDGES))
+            if self.effort_lut:
+                test_key = bin_key(
+                    20, 0.15, 0.45,
+                    self.effort_q_edges, self.effort_d_edges, self.effort_ply_edges,
+                )
+                if test_key not in self.effort_lut:
+                    sample = next(iter(self.effort_lut))
+                    raise RuntimeError(
+                        f"effort LUT key mismatch: {test_key!r} not in table "
+                        f"(sample key: {sample!r})")
+        self.saved_parent_q = 0.0
+        self.saved_parent_pdraw = 0.0
 
     def best(self):
         """
@@ -211,6 +237,12 @@ class MCTSTree(fasttree):
         Safe root advance: mutate the C++ tree, then sync Python-side bookeeping.
         Drops any queued (stale) leaf pointers.
         """
+        # Capture parent Q/pdraw before the tree resets on advance.
+        r = self.root()
+        if r is not None and r.N > 0:
+            self.saved_parent_q = r.Q
+            self.saved_parent_pdraw = r.p_draw / r.N
+
         # Never try to assign self.root in Python; C++ owns the root.
         self.advance_root(move_uci)
 
@@ -227,7 +259,24 @@ class MCTSTree(fasttree):
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
 
+        if self.effort_lut:
+            self.set_early_stop_params(
+                min_sims=int(self.sims_floor), **self.es_params)
+            self.apply_effort_scale()
+
         self.reset_early_stop()
+
+    def apply_effort_scale(self):
+        from chessbot.effort_scale import bin_key
+        key = bin_key(
+            self.n_plies, self.saved_parent_q, self.saved_parent_pdraw,
+            self.effort_q_edges, self.effort_d_edges, self.effort_ply_edges,
+        )
+        s = self.effort_lut.get(key, 1.0)
+        if s != 1.0:
+            self.set_sim_budget(float(round(self.sims_ceiling * s)))
+            self.set_early_stop_params(
+                min_sims=int(round(self.sims_floor * s)), **self.es_params)
 
     def set_new_sims_ceiling(self, n_plies=None):
         if n_plies is None:

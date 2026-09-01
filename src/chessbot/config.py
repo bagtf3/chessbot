@@ -43,6 +43,10 @@ class Config(object):
     sims_floor = 400
     sims_ceiling = 800
 
+    # per-bin sims scaling; "" disables. effort_alpha is sampled per game.
+    effort_scale_table = ""
+    effort_alpha = 0.0
+
     # early stop -- tiered rule (C++, pyfastchess mcts.cpp evaluate_early_stop)
     es_check_every = 100
     use_robust = True       # fallback selector when a search hits "full" (ceiling)

@@ -14,6 +14,17 @@ look-don't-touch until told otherwise. Violating this already brought the
 user to the edge of cancelling their subscription over it (2026-08-15) —
 treat it as an absolute, not a preference to weigh against convenience.
 
+## CRITICAL: Know Your Permission Mode
+Default/manual mode is the assumption unless the session state clearly says
+otherwise. In manual mode EVERY tool call is gated individually — one
+approved call is not blanket approval for the next, not even adjacent
+read-only diagnostics (grep, sed, cat, ls, find, python -). Do not batch a
+run of shell commands on the assumption they will pass. If you are not
+certain a call will prompt, or not certain which mode is active, stop and
+ask before making it. An allowlist entry silently permitting something is
+not a signal to lean on it — when in doubt, ask for permission. This holds
+even mid-session after a long stretch of approvals.
+
 ## Two-Repo Structure
 This project spans two repositories:
 - `chessbot` (this repo) — Python package: selfplay loop, MCTS wrapper, model, training, review

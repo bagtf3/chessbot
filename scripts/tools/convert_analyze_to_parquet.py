@@ -1,13 +1,14 @@
 """Convert one run's analyze_results_combined.pkl to parquet and drop the pkl.
 
 df_all is ~99% of that file, and most of its bulk is repeated strings: game_id,
-scenario, stop_reason and the three move columns hold a few thousand distinct
-values across millions of rows. Parquet dictionary-encodes them on disk, so the
-pandas dtypes stay exactly as they were -- no categoricals, no groupby surprises.
+stop_reason and the three move columns hold a few thousand distinct values
+across millions of rows. Parquet dictionary-encodes them on disk, so the pandas
+dtypes stay exactly as they were -- no categoricals, no groupby surprises.
 Measured 635 MB -> 109 MB on 18m_10c6t_d256_pretrain, and reads back 4x faster.
 
-summary and results are small and are kept in analyze_meta.pkl so nothing is
-lost when the big pkl goes away.
+df_all is the only required frame. Older pkls also carry df_means (a
+one-row-per-game slice) and small summary/results dicts; df_means converts
+alongside when present and any other keys go to analyze_meta.pkl.
 
 ONLY run this on a cold run. rescore.py, build_bootstrap_records.py,
 clean_training_data.py, eval_selfplay.py, mine_search.py and review_cli.py all
@@ -26,6 +27,7 @@ BASE = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 META_PKL = "analyze_meta.pkl"
 FRAMES = {"df_all": "df_all.parquet", "df_means": "df_means.parquet"}
+REQUIRED = ("df_all",)
 
 
 def shrink(df):
@@ -85,10 +87,9 @@ def same(a, b, tol=0.0, skip_object=False):
 
 def convert(run_dir, dry_run):
     pkl = os.path.join(run_dir, ANALYZE_PKL)
-    outs = {k: os.path.join(run_dir, v) for k, v in FRAMES.items()}
 
     if not os.path.exists(pkl):
-        if all(os.path.exists(p) for p in outs.values()):
+        if os.path.exists(os.path.join(run_dir, FRAMES["df_all"])):
             print("already converted, nothing to do")
             return 0
         raise SystemExit(f"no {ANALYZE_PKL} and no parquet in {run_dir}")
@@ -98,12 +99,15 @@ def convert(run_dir, dry_run):
     with open(pkl, "rb") as f:
         blob = pickle.load(f)
 
-    missing = [k for k in FRAMES if k not in blob]
+    missing = [k for k in REQUIRED if k not in blob]
     if missing:
         raise SystemExit(f"pkl is missing {missing}, refusing to convert")
 
+    frames = [k for k in FRAMES if k in blob]
+    outs = {k: os.path.join(run_dir, FRAMES[k]) for k in frames}
+
     small = {}
-    for key in FRAMES:
+    for key in frames:
         df = blob[key]
         s = shrink(df)
         # downcast must not change a single value, floats within float32 eps.
@@ -146,11 +150,12 @@ def convert(run_dir, dry_run):
     print("verified: parquet round-trips by value")
 
     meta = {k: v for k, v in blob.items() if k not in FRAMES}
-    meta_path = os.path.join(run_dir, META_PKL)
-    with open(meta_path, "wb") as f:
-        pickle.dump(meta, f, protocol=5)
-    after += os.path.getsize(meta_path)
-    print(f"kept {sorted(meta)} in {META_PKL}")
+    if meta:
+        meta_path = os.path.join(run_dir, META_PKL)
+        with open(meta_path, "wb") as f:
+            pickle.dump(meta, f, protocol=5)
+        after += os.path.getsize(meta_path)
+        print(f"kept {sorted(meta)} in {META_PKL}")
 
     os.remove(pkl)
     print(f"removed {ANALYZE_PKL}")

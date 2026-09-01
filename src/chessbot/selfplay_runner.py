@@ -162,7 +162,7 @@ HELP_TEXT = """[cmd] commands:
   pause [kind] [secs]   kind is xc0 or lc0; bare pause holds both
   unpause [kind]        releases the operator hold on that fleet
   add sf worker         one more SF rescore thread
-  kill sf worker        retire the oldest SF thread after its current game
+  kill sf worker        retire the newest SF thread after its current game
   respawn lc0           pause, tear down and rebuild the lc0 fleet from yaml
   respawn xc0           pause, tear down and rebuild the xc0 fleet from yaml
   full clear            drop all pauses, sf back to the config count
@@ -910,13 +910,14 @@ class SelfPlayRunner:
         return t.id
 
     def retire_sf_thread(self, why="operator"):
-        """Retire the oldest thread. Asynchronous by design: the thread checks
-        its stop flag once per game, so joining here would block the run loop
-        for the length of a full analysis."""
+        """Retire the newest thread, keeping the long-lived engines and their
+        warm TTs. Asynchronous by design: the thread checks its stop flag once
+        per game, so joining here would block the run loop for the length of a
+        full analysis."""
         if len(self.sf_rescore_threads) <= 1:
             print("[sf] refusing to retire the last thread", flush=True)
             return None
-        t = self.sf_rescore_threads.pop(0)
+        t = self.sf_rescore_threads.pop()
         t.stop_ev.set()
         self.sf_retiring.append(t)
         print(f"[sf] retiring {t.id} ({why}), finishing its current game; "
@@ -953,7 +954,7 @@ class SelfPlayRunner:
         n = len(self.sf_rescore_threads)
         self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
 
-        if backlog > 100 and n < target + 1:
+        if backlog > 150 and n < target + 1:
             self.add_sf_thread("backlog")
         elif backlog < 10 and n > target:
             self.retire_sf_thread("backlog cleared")

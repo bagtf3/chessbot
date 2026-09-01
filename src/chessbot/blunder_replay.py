@@ -61,7 +61,7 @@ def probe_fails(src):
 BRP_LAST_SEEN_MIN = 7
 # a position this many failed probes deep is treated as uncorrectable and
 # aged out rather than probed forever
-BRP_MAX_FAILS = 5
+BRP_MAX_FAILS = 9999
 # per-position SF budget: starts here, escalates by MS_STEP each probe that
 # neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
 # capped at START_MS * MS_MAX_MULT
@@ -76,7 +76,7 @@ BRP_POOL_MAX_SIZE = 128_000
 # candidate rules: V = best_cp, P = played_cp, cpl = V - P (post equiv/mate
 # adjustment), all STM-POV. Z_stm is the result from the mover's own
 # perspective, since xc0 plays both sides in selfplay.
-A_ABS_V = 175
+A_ABS_V = 250
 A_MIN_CPL = 75
 B_MIN_V = 120
 B_MAX_P = 50

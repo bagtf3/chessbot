@@ -482,9 +482,10 @@ class GameViewer:
                 board.push(move)
                 lastmove = move
 
+        durations = [int(refresh * 1000)] * (len(frames) - 1) + [int(refresh * 3000)]
         frames[0].save(
             save_to, format="GIF", save_all=True, append_images=frames[1:],
-            duration=int(refresh * 1000), loop=0,
+            duration=durations, loop=0,
         )
         return save_to
 

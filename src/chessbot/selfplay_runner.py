@@ -53,10 +53,6 @@ GAME_QUEUE_MIN = 36
 # only because that queue is kept shallow -- raise the target much above this
 # and batches start waiting behind selfplay, and the ladder cadence drifts
 GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
-# a batch stuck this long is closed out on whatever came back rather than
-# left to wedge the cadence forever. Generous on purpose: it should only ever
-# fire on a genuinely stuck batch, not a slow one
-VAL_BATCH_TIMEOUT_S = 7200.0
 # the retrain worker sleeps this long after retrain_ready before it touches
 # the GPU; a pause issued outside that handshake gets the same settle window
 WORKER_PAUSE_SETTLE_S = 10.0
@@ -757,7 +753,10 @@ class SelfPlayRunner:
         """Fire on the retrain cadence. A batch is a discrete, non-overlapping
         set: the ladder counts runs, not games, so overlapping windows would
         advance depth roughly twice as fast."""
-        if self.val_pending or self.stop_signal_sent:
+        if self.stop_signal_sent:
+            return
+        if self.val_pending:
+            self.close_partial_validation_batch("superseded by next cadence")
             return
         every = self.cfg.validate_every_n_retrains
         if not every or self.current_epoch % every:
@@ -821,12 +820,6 @@ class SelfPlayRunner:
             self.broadcast("tear_down_sf")
             return
         self.finish_validation_batch()
-
-    def check_validation_timeout(self):
-        if not self.val_pending or self.val_batch_started_at is None:
-            return
-        if time.monotonic() - self.val_batch_started_at > VAL_BATCH_TIMEOUT_S:
-            self.close_partial_validation_batch("timeout")
 
     def drain_results(self):
         """Route finished games. Validation metas are counted here: the
@@ -1195,7 +1188,6 @@ class SelfPlayRunner:
                 self.drain_results()
                 self.tick_rescorer()
                 self.check_retrain()
-                self.check_validation_timeout()
                 time.sleep(0.05)
             return 0 if not self.controls.stop.is_set() else 1
         finally:

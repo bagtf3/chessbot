@@ -17,6 +17,7 @@ on disk would silently mix epochs from unrelated model families.
 import argparse
 import glob
 import itertools
+import json
 import os
 import re
 
@@ -33,20 +34,33 @@ ap.add_argument("--run_tags", nargs="+", required=True)
 args = ap.parse_args()
 
 seen = {}
+epoch_fens = {}
 for tag in args.run_tags:
     pattern = os.path.join(SP_DIR, tag, "blunder_probe", "probe_e*.csv")
     for path in sorted(glob.glob(pattern)):
         epoch = int(re.search(r"_e(\d+)_", path).group(1))
         df = pd.read_csv(path)
+        epoch_fens.setdefault(epoch, []).extend(df['short_fen'])
         for row in df.itertuples(index=False):
             seen.setdefault(row.short_fen, {})[epoch] = {
                 'move': row.probe_move, 'cpl': row.probe_cpl,
             }
 
+CLEARED_REASONS = {'found_equiv', 'found_equiv_retroactive', 'same_equiv'}
+cleared_fens = set()
+_data_dir = os.path.dirname(os.path.normpath(SP_DIR))
+for _ev in glob.glob(os.path.join(_data_dir, '*_evicted.jsonl')):
+    with open(_ev, encoding='utf-8') as _f:
+        for _line in _f:
+            _rec = json.loads(_line)
+            if _rec.get('reason') in CLEARED_REASONS:
+                cleared_fens.add(_rec['short_fen'])
+
 epochs = sorted({e for v in seen.values() for e in v})
 print(f'positions with any probe : {len(seen)}')
 print(f'epochs                   : {epochs}')
-print(f'probed 2+ times          : {sum(1 for v in seen.values() if len(v) > 1)}\n')
+print(f'probed 2+ times          : {sum(1 for v in seen.values() if len(v) > 1)}')
+print(f'cleared (equiv) loaded   : {len(cleared_fens)}\n')
 
 
 def pairs_for(a, b):
@@ -125,7 +139,11 @@ for a in epochs[:-1]:
         continue
     pooled = [p for b in epochs if b > a for p in pairs_for(a, b)]
     if pooled:
-        rows.append(row(f'{a} x all', pooled))
+        r = row(f'{a} x all', pooled)
+        fens_a = epoch_fens.get(a, [])
+        n_ret = sum(1 for f in fens_a if f in cleared_fens)
+        r["ret'd"] = f'{n_ret} ({100*n_ret/len(fens_a):.0f}%)' if fens_a else '-'
+        rows.append(r)
 
 # collapse the middle of the per-epoch block before the summaries are
 # appended -- those span every pair, so nothing trimmed here is lost
@@ -134,11 +152,15 @@ rows = trim_rows(pd.DataFrame(rows)).to_dict('records')
 everything = [p for a, b in itertools.combinations(epochs, 2)
               for p in pairs_for(a, b)
               if current_epoch - a > BRP_LAST_SEEN_MIN]
-rows.append(row('all x all', everything))
-rows.append(row('mean +/- CI', everything, summary=True))
+r_all = row('all x all', everything)
+r_all["ret'd"] = ''
+rows.append(r_all)
+r_sum = row('mean +/- CI', everything, summary=True)
+r_sum["ret'd"] = ''
+rows.append(r_sum)
 
 cols = ['split', 'n', 'cpl', 'diff', 'cpl (diff)', 'improved',
-       'equiv', 'cpl (improved)', 'cpl (!improved)']
+       'equiv', "ret'd", 'cpl (improved)', 'cpl (!improved)']
 widths = {c: max(len(c), max(len(r[c]) for r in rows)) for c in cols}
 print(' | '.join(c.center(widths[c]) for c in cols))
 for r in rows:

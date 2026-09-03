@@ -755,14 +755,13 @@ class SelfPlayRunner:
         advance depth roughly twice as fast."""
         if self.stop_signal_sent:
             return
-        if self.val_pending:
-            self.close_partial_validation_batch("superseded by next cadence")
-            return
         every = self.cfg.validate_every_n_retrains
         if not every or self.current_epoch % every:
             return
         if self.last_validated_epoch == self.current_epoch:
             return
+        if self.val_pending:
+            self.close_partial_validation_batch("superseded by next cadence")
 
         n_pairs = max(1, self.cfg.validation_games_per_batch // 2)
         specs = self.game_gen.validation_games(

@@ -44,8 +44,8 @@ from chessbot.opening_counts import apply_repeat_weights
 LIVE_BUFFER_SIZE = 204_800
 SHARD_SIZE = 10_240
 PRIMARY_TRIGGER_SHARDS = 144
-RETRAIN_PRIMARY_SHARDS = 10
-RETRAIN_REPLAY_SHARDS = 10
+RETRAIN_PRIMARY_SHARDS = 12
+RETRAIN_REPLAY_SHARDS = 12
 RETRAIN_HISTORIC_SHARDS = 4
 REPLAY_SEED_SHARDS = 144
 # initial primary fill, left short of the trigger so selfplay supplies the
@@ -126,9 +126,18 @@ def stack_policies(records, index=2, dim=POLICY_DIM):
     return out
 
 
+def normalize_record_arity(records):
+    """Expand 4-tuple pretrain/historic records (x, policy, Y, source) to the
+    7-tuple schema in memory: mask None, unit sample weights. 7-tuple shards
+    pass through untouched."""
+    if not records or len(records[0]) == 7:
+        return records
+    return [(r[0], None, r[1], r[2], 1.0, 1.0, r[3]) for r in records]
+
+
 def read_pkl_gz_shard(path):
     with gzip.open(path, "rb") as f:
-        return pickle.load(f)
+        return normalize_record_arity(pickle.load(f))
 
 
 def read_tfrec_gz_shard(path):

@@ -257,6 +257,26 @@ def kl_divergence(p_list, q_list):
     return np.sum(p * np.log(p / q))
 
 
+def blend_to_uniform(p, uniform_eps, prior_clip_max):
+    """Single-pass blend of a distribution toward uniform.
+
+    eps is the larger of uniform_eps and the amount needed to pull the max mass
+    down to prior_clip_max (only when len(p) >= 5). Sum is preserved.
+    """
+    n = len(p)
+    if n == 0:
+        return p
+    u = 1.0 / n
+    eps = uniform_eps
+    if prior_clip_max is not None and prior_clip_max < 1.0 and n >= 5:
+        top = float(p.max())
+        if top > prior_clip_max and top > u:
+            eps = max(eps, (top - prior_clip_max) / (top - u))
+    if eps <= 0.0:
+        return p
+    return (1.0 - eps) * p + eps * u
+
+
 def cross_entropy(p_list, q_list):
     # same p/q convention as kl_divergence: CE(p, q) = -sum(p * log(q))
     eps = 1e-12

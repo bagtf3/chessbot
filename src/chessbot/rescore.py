@@ -18,7 +18,7 @@ from pyfastchess import Board
 from chessbot import SF_LOC
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
-    calc_entropy, batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
+    batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
     ema_step, load_json, save_pickle_atomic,
 )
 from chessbot.replay_buffer import (
@@ -329,14 +329,6 @@ class Rescorer(object):
         self.lc0_audit_ema = {'lc0': 13.2, 'xc0': 174.2}
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
-
-        self.tscale_n = 0
-        self.tscale_eligible = 0
-        self.tscale_iters = 0
-        self.tscale_ne_before = 0.0
-        self.tscale_ne_after = 0.0
-        self.tscale_best_T = 0.0
-        self.tscale_time = 0.0
 
         self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL
         self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL
@@ -1748,44 +1740,6 @@ class Rescorer(object):
             mvs = [v[0] for v in visits]
             vis = [v[1] for v in visits]
 
-            if Z_stm >= 0 and loss_this <= EQUIV and len(mvs) >= 5:
-                self.tscale_eligible += 1
-                vis_arr = np.array(vis, dtype=np.float64)
-                vis_arr /= vis_arr.sum()
-                ne = calc_entropy(vis_arr, normed_only=True)
-                target_e = 0.65
-                if ne > target_e:
-                    t0 = time.perf_counter()
-                    lo, hi, best, best_dist = 0.3, 1.0, 0.75, float('inf')
-                    iters = 0
-                    for _ in range(5):
-                        mid = (lo + hi) / 2
-                        scaled = vis_arr ** (1.0 / mid)
-                        scaled /= scaled.sum()
-                        ne_mid = calc_entropy(scaled, normed_only=True)
-                        iters += 1
-                        if ne_mid < ne:
-                            dist = abs(ne_mid - target_e)
-                            if dist < best_dist:
-                                best, best_dist = mid, dist
-                            if dist < 0.05:
-                                break
-                        if ne_mid < target_e:
-                            lo = mid
-                        else:
-                            hi = mid
-                    vis_arr = vis_arr ** (1.0 / best)
-                    vis = list(vis_arr / vis_arr.sum())
-                    ne_after = calc_entropy(
-                        np.array(vis, dtype=np.float64), normed_only=True)
-                    
-                    self.tscale_n += 1
-                    self.tscale_iters += iters
-                    self.tscale_ne_before += ne
-                    self.tscale_ne_after += ne_after
-                    self.tscale_best_T += best
-                    self.tscale_time += time.perf_counter() - t0
-
             priors_map = {c['uci']: c['P'] for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
@@ -2527,19 +2481,6 @@ class Rescorer(object):
             print()
 
             self.print_sample_stats()
-
-            n, el = self.tscale_n, self.tscale_eligible
-            if el > 0:
-                frac = n / el
-                avg_iters = self.tscale_iters / n if n else 0
-                avg_ne_b  = self.tscale_ne_before / n if n else 0
-                avg_ne_a  = self.tscale_ne_after / n if n else 0
-                avg_T     = self.tscale_best_T / n if n else 0
-                avg_us    = self.tscale_time / n * 1e6 if n else 0
-                print(f"{RS}  tscale: {n}/{el} ({frac:.1%})  ne {avg_ne_b:.3f}->{avg_ne_a:.3f}  delta={avg_ne_a-avg_ne_b:+.3f}  avg_T={avg_T:.3f}")
-                print(f"{RS}  tscale: avg_iters={avg_iters:.1f}  avg={avg_us:.1f}us  total={self.tscale_time*1000:.1f}ms")
-            self.tscale_n = self.tscale_eligible = self.tscale_iters = 0
-            self.tscale_ne_before = self.tscale_ne_after = self.tscale_best_T = self.tscale_time = 0.0
 
             w_this = self.written_this_round
             wtot = self.written_total

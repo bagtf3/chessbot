@@ -22,6 +22,8 @@ from pyfastchess import priors_cache_clear, raw_cache_clear
 from chessbot.config import Config
 from chessbot.mcts_utils import ChessGame, MCTSTree
 
+from chessbot.game_utils import GameSpec
+
 from . import paths
 from .fixtures import load_fixture_set
 
@@ -193,7 +195,7 @@ def collect_equiv_row(game):
             ],
         })
     return {
-        "start_fen": game.starting_fen,
+        "start_fen": game.start_fen,
         "n_plies": game.plies,
         "end_reason": game.end_reason,
         "outcome": game.outcome,
@@ -219,12 +221,12 @@ def run_loop_bench(fixtures, cfg, infer_fn, n_games=None, max_plies=300,
     forest = MCTSForest()
     games = []
     for fx in fixtures:
-        board = fastboard(fx["fen"])
         meta = {
             "vs_stockfish": False, "stockfish_is_white": False,
             "scenario": fx.get("source", "bench"),
         }
-        g = ChessGame(board, meta, cfg)
+        spec = GameSpec(fen=fx["fen"], moves=[], meta=meta, cfg=cfg)
+        g = ChessGame(spec=spec)
         forest.add_tree(g.tree)
         games.append(g)
 

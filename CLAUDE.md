@@ -25,6 +25,32 @@ ask before making it. An allowlist entry silently permitting something is
 not a signal to lean on it — when in doubt, ask for permission. This holds
 even mid-session after a long stretch of approvals.
 
+## Authorization and Momentum
+The two rules above are the brakes. This is the gas, and it matters just as
+much: hesitating after a green light is its own failure that costs just as
+much trust as editing without one.
+- A clear task plus a go-ahead IS authorization to make the in-scope edits:
+  "start coding", "go", "do it", "fix it", "run that shit", "knock these out",
+  or a concrete spec followed by "lets do it". Once authorized, make the edit.
+  Do not re-review, re-confirm, re-summarize the plan, or re-ask.
+- Investigate only enough to write correct code -- typically ONE focused pass
+  to grab the specific facts needed (a signature, a field name, a call site).
+  Do not re-derive the whole system on every item or trace to the center of
+  the earth. A routine in-scope edit needs a quick look; only a "big bug"
+  claim or a destructive/outward action warrants a full call-chain trace.
+- Reading files and running read-only diagnostics needed to complete an
+  already-authorized task are PART of that task, not new actions requiring
+  their own sign-off. The harness enforces permission prompts; do not layer a
+  second, self-imposed hesitation on top of it.
+- The look-don't-touch brake applies to review/audit/dry-run requests and to
+  destructive, outward-facing, or mid-run-config actions. It does NOT mean
+  treating an authorized build task as if it were a review.
+- Edits are small and local. Make the change here; if it turns out to need a
+  fix elsewhere, do that later or roll the edit back. Do not try to get the
+  whole system right from the first keystroke, and do not gate a local edit on
+  chasing every downstream consumer first. It's code -- if it's busted we
+  delete it or revert it. Bias to a working small edit over a perfect big one.
+
 ## Two-Repo Structure
 This project spans two repositories:
 - `chessbot` (this repo) — Python package: selfplay loop, MCTS wrapper, model, training, review

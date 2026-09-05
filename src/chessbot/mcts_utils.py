@@ -8,12 +8,27 @@ import chess, chess.syzygy
 import numpy as np
 
 from pyfastchess import MCTSTree as fasttree
+from pyfastchess import Board as fastboard
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
 from chessbot.utils import kl_divergence, rnd
 
+POLICY_DIM = 1858
+
 TABLEBASE = None
+
+
+def build_raw_visits_sparse(board, ucis, visits):
+    """Every legal move as sparse (int16 idx, int16 count), index-sorted. Legal
+    but unvisited moves are kept with count 0 so rescore sees the full move set
+    and derives the policy target from this."""
+    vmap = {u: v for u, v in zip(ucis, visits)}
+    legal = board.legal_moves()
+    idxs = np.asarray(board.moves_to_indices(legal), dtype=np.int16)
+    counts = np.array([vmap.get(u, 0) for u in legal], dtype=np.int16)
+    order = np.argsort(idxs, kind="stable")
+    return (idxs[order], counts[order])
 
 
 def get_tablebase():
@@ -48,8 +63,10 @@ class MCTSTree(fasttree):
             self.sims_ceiling = cfg.sims_ceiling
 
         self.pruning_factor = cfg.pruning_factor
-        super().__init__(board, self.c_puct, self.sims_ceiling, self.pruning_factor,
-                         cfg.uniform_eps, cfg.prior_clip_max)
+        super().__init__(
+            board, self.c_puct, self.sims_ceiling, self.pruning_factor,
+            cfg.uniform_eps, cfg.prior_clip_max
+        )
 
         # bookkeeping
         self.board = board
@@ -66,7 +83,6 @@ class MCTSTree(fasttree):
         self.sims_completed_this_move = 0
 
         self.n_moves_played = 0
-        self.sims_done_total = 0
 
         # configure C++ tree
         # explicit casts required — these are passed directly to C++
@@ -119,6 +135,7 @@ class MCTSTree(fasttree):
                     20, 0.15, 0.45,
                     self.effort_q_edges, self.effort_d_edges, self.effort_ply_edges,
                 )
+
                 if test_key not in self.effort_lut:
                     sample = next(iter(self.effort_lut))
                     raise RuntimeError(
@@ -315,8 +332,7 @@ class MCTSTree(fasttree):
         """
 
         self.n_moves_played += 1
-        self.sims_done_total += self.sims_completed_this_move
-        
+
         existing = 0
         try:
             r = self.root()
@@ -341,19 +357,28 @@ class MCTSTree(fasttree):
 
 
 class ChessGame(object):
-    def __init__(self, board, meta, cfg):
+    def __init__(self, spec):
         self.game_id = str(uuid.uuid4())
         self.started_at = _now()
 
-        self.config = cfg
+        self.config = spec.cfg
+        self.init_fen = spec.fen
+        self.preopen_moves_uci = spec.moves or []
 
+        # build the board
+        board = fastboard(spec.fen)
+        for mv in spec.moves:
+            board.push_uci(mv)
+
+        self.start_fen = board.fen()
         self.board = board
-        self.starting_fen = self.board.fen()
+
+        meta = spec.meta
         self.meta = meta
         
         self.vs_stockfish = meta['vs_stockfish']
 
-        # if vs stockfish, we need to maintain a python-chess boardas well
+        # if vs stockfish, we need to maintain a python-chess board as well
         self.python_chess_board = None
         if self.vs_stockfish:
             self.python_chess_board = chess.Board(self.board.fen())
@@ -361,6 +386,7 @@ class ChessGame(object):
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
         tree_cfg = self.config
+        
         scenario = meta.get('scenario', '')
         if scenario == 'piece_training' and not self.config.is_validation_run:
             tree_cfg = self.config.copy()
@@ -371,7 +397,6 @@ class ChessGame(object):
         self.moves_played = []
         self.recents = []
         
-        self.mat_adv_counter = 0
         self.resign_counter_white = 0
         self.resign_counter_black = 0
         self.outcome = None
@@ -392,7 +417,52 @@ class ChessGame(object):
             self.next_eval_draw_check = self.config.eval_draw_min_plies
         else:
             self.next_eval_draw_check = 999
-    
+
+    def emit_header(self, model_epoch):
+        """Two dicts: mem_summary (light index/telemetry essentials) and rest
+        (seed, config, and replay fields). Merged they are the on-disk header;
+        mem_summary alone is the index row. Called at game end, so outcome,
+        history, and timing are final. model_epoch and game_end come from looper."""
+        cfg = self.config
+        game_end = _now()
+        
+        mem_summary = {
+            "ts": self.started_at,
+            "game_start": self.started_at,
+            "game_end": game_end,
+            "duration": game_end - self.started_at,
+            "model_epoch": model_epoch,
+            "game_id": self.game_id,
+            "scenario": self.meta.get("scenario", ""),
+            "plies": self.plies,
+            "result": int(self.outcome or 0),
+            "end_reason": self.end_reason,
+            "vs_stockfish": self.vs_stockfish,
+            "stockfish_color": self.stockfish_is_white,
+            "mcts_sims_total": self.mcts_sims_total,
+            "mcts_plies": self.mcts_plies,
+            "start_fen": self.start_fen,
+        }
+        rest = {
+            "run_tag": cfg.run_tag,
+            "run_number": cfg.run_number,
+            "init_fen": self.init_fen,
+            "start_ply": len(self.preopen_moves_uci),
+            "preopen_moves_uci": self.preopen_moves_uci,
+            "history_uci": self.board.history_uci(),
+            "encoding": cfg.encoding_type,
+            "c_puct": cfg.c_puct,
+            "sims_floor": cfg.sims_floor,
+            "sims_ceiling": cfg.sims_ceiling,
+            "dirichlet_alpha": cfg.dirichlet_alpha,
+            "dirichlet_eps": cfg.dirichlet_eps,
+            "uniform_eps": cfg.uniform_eps,
+            "fpu_reduction": cfg.fpu_reduction,
+            "move_sample_temp_range": cfg.move_sample_temp_range,
+            "move_sample_temp_plies": cfg.move_sample_temp_plies,
+        }
+        return mem_summary, rest
+
     def turn(self, return_bool=True):
         if return_bool:
             return self.board.white_to_move()
@@ -446,19 +516,19 @@ class ChessGame(object):
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
 
-        turn = self.turn() # STM
-        data = {
-            "move_played": mv, "selection_method":method, "xc0_move": xc0_move,
-            "sims": sims, "time": rnd(elapsed, 3),
-            "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
-            "children_visited": visited_children,
-            "total_children": total_children,
-            "stop_reason": self.tree.sim_stop_reason, "stm": turn
-        }
-        
-        # IMPORTANT, this MUST happen before the move is pushed otherwise the vals change
+        turn = self.turn()  # STM, True = white
+        history_K = self.config.history_K
+
+        # IMPORTANT: read node stats and encode the board BEFORE the move is
+        # pushed, otherwise the values change.
         best_d = details[0]
-        best_wdl = (rnd(best_d.win, 4), rnd(best_d.draw, 4), rnd(best_d.loss, 4))
+        if turn:
+            best_wdl = (rnd(best_d.win, 4), rnd(best_d.draw, 4), rnd(best_d.loss, 4))
+        else:
+            best_wdl = (rnd(best_d.loss, 4), rnd(best_d.draw, 4), rnd(best_d.win, 4))
+        rw = root.nn_wdl_stm
+        root_wdl_nn = (rnd(rw[0], 4), rnd(rw[1], 4), rnd(rw[2], 4))
+
         best_q = rnd(best_d.Q, 4)
         Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
@@ -466,15 +536,31 @@ class ChessGame(object):
             Q_stm = self.sf_eval
             Q_white = Q_stm if turn else -Q_stm
 
-        data['best_wdl'] = best_wdl
-        data['Q_stm'] = Q_stm
-        data['Q_white'] = Q_white
-
-        if self.is_stockfish_turn() and self.sf_wdl is not None:
-            data['sf_wdl'] = self.sf_wdl
-        
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
+
+        ucis = [cd.uci for cd in details]
+        visits = [cd.N for cd in details]
+
+        data = {
+            "abs_ply": self.board.history_size(),
+            "stm": turn,
+            "move_played": mv,
+            "xc0_move": xc0_move,
+            "sel_method": method,
+            "stop_reason": self.tree.sim_stop_reason,
+            "time": rnd(elapsed, 3),
+            "sims": sims,
+            "sims_floor": int(self.tree.min_sims()),
+            "sims_ceiling": int(self.tree.sim_budget()),
+            "best_wdl": best_wdl,
+            "root_wdl_nn": root_wdl_nn,
+            "xc0h": np.asarray(self.board.history_tokens(history_K), dtype=np.int16),
+            "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
+            "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
+            "children_visited": visited_children,
+            "total_children": total_children,
+        }
 
         # sumN for U term
         sumN = max(1, root.N)
@@ -603,19 +689,6 @@ class ChessGame(object):
             self.outcome = terminal_value_white_pov(self.board)
             self.end_reason = reason
             return True
-
-        # raw material difference
-        if cfg.use_material_diff:
-            mat_diff = self.board.material_count()
-            if abs(mat_diff) >= cfg.material_diff_cutoff:
-                self.mat_adv_counter += 1
-            else:
-                self.mat_adv_counter = 0
-
-            if self.mat_adv_counter >= cfg.material_diff_cutoff_span:
-                self.outcome = 1.0 if mat_diff > 0 else -1.0
-                self.end_reason = "material_diff"
-                return True
 
         # resignation
         if cfg.allow_resignation and self.plies >= cfg.resign_min_plies and self.recents:

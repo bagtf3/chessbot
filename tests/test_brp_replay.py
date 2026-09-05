@@ -13,7 +13,7 @@ import pytest
 from pyfastchess import Board as fastboard
 
 from chessbot.config import Config
-from chessbot.game_utils import reconcile_game_boards, short_fen
+from chessbot.game_utils import reconcile_game_boards, short_fen, GameSpec, STARTPOS_FEN
 from chessbot.mcts_utils import ChessGame
 
 POOL_DIR = r"C:\Users\Bryan\Data\chessbot_data"
@@ -116,7 +116,7 @@ def test_max_game_length_plays_one_move_too_many(max_game_length):
     cfg.sims_ceiling = 8
 
     meta = {"vs_stockfish": False, "stockfish_is_white": False}
-    game = ChessGame(fastboard(), meta, cfg)
+    game = ChessGame(GameSpec(fen=STARTPOS_FEN, moves=[], meta=meta, cfg=cfg))
 
     played = 0
     for _ in range(max_game_length + 5):

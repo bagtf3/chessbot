@@ -227,7 +227,6 @@ class GameLooper(object):
         self.n_retrains += 1
 
     def pull_from_queue(self):
-        from pyfastchess import Board as fastboard
         games_at_once = self.config.games_at_once
         # keep draining until full or both queues empty
         while len(self.active_games) < games_at_once:
@@ -242,6 +241,7 @@ class GameLooper(object):
                     spec = self.game_queue.get_nowait()
                 except Exception:
                     break
+            
             if spec.meta.get("vs_stockfish") and self.sf_thread is None:
                 # depth is fixed for this engine's life; a moved ladder only
                 # takes effect after a tear_down_sf rebuilds it
@@ -249,11 +249,8 @@ class GameLooper(object):
                     spec.cfg.sf_config, spec.cfg.sf_validation_depth
                 )
                 self.sf_thread.start()
-            game_cfg = spec.cfg
-            board = fastboard(spec.fen)
-            for mv in spec.moves:
-                board.push_uci(mv)
-            cg = ChessGame(board=board, meta=spec.meta, cfg=game_cfg)
+            
+            cg = ChessGame(spec=spec)
             self.active_games.append(cg)
             self.forest.add_tree(cg.tree)
 
@@ -460,30 +457,23 @@ class GameLooper(object):
 
         scenario = game.meta.get("scenario", "")
 
+        # mem_summary = light index/telemetry essentials; rest = seed/config/
+        # replay fields. merged they are the on-disk header.
+        mem_summary, rest = game.emit_header(self.n_retrains)
+
         # replay probes are a handful of moves per position: accumulate in
-        # memory and let the driver route them, instead of a pkl per position
+        # memory and let the driver route them, instead of a pkl per position.
+        # they sit outside the LEAN/FATTY convention -- fat tree_search_data, no pkl.
         if scenario in ("blunder_replay_probe", "lc0_replay_probe"):
-            brp_result_info = {
-                "ts": now(),
-                "game_id": game.game_id,
-                "scenario": scenario,
-                "vs_stockfish": game.vs_stockfish,
-                "stockfish_color": game.stockfish_is_white,
-                "duration": now() - game.started_at,
-                "mcts_sims_total": game.mcts_sims_total,
-                "mcts_plies": game.mcts_plies,
-                "start_fen": game.starting_fen,
-                "model_epoch": self.n_retrains,
+            meta = {
+                **mem_summary, **rest,
                 "moves_played": game.moves_played,
                 "xerces_uci": game.moves_played[0] if game.moves_played else None,
                 "tree_search_data": game.tree_data,
-                "sims_done_total": game.tree.sims_done_total,
             }
 
-            brp_result_info.update({**game.meta})
-
-            # parent process will handle this based on the scenario key 
-            self.recent_games_q.put({"looper_id": self.id, "meta": brp_result_info})
+            meta.update(game.meta)
+            self.recent_games_q.put({"looper_id": self.id, "meta": meta})
 
             game.examples = []
             game.recents.clear()
@@ -498,36 +488,9 @@ class GameLooper(object):
         # aggregate stats
         self.games_finished += 1
 
-        sims_total = game.tree.sims_done_total
         cfg = game.config
 
-        # encode adjudicator flags: bit0=material, bit1=syzygy, bit2=eval_draw
-        mat = cfg.use_material_diff
-        tb = cfg.use_syzygy
-        dr = cfg.use_eval_draw
-        adjudication_index = (mat) | (tb << 1) | (dr << 2)
-
-        # cast types for JSON 
-        mem_summary = {
-            "ts": now(),
-            "game_id": game.game_id,
-            "scenario": scenario,
-            "plies": game.plies,
-            "result": game.outcome or 0.0,
-            "end_reason": game.end_reason,
-            "vs_stockfish": game.vs_stockfish,
-            "stockfish_color": game.stockfish_is_white,
-            "duration": now() - game.started_at,
-            "sims_done_total": sims_total,
-            "mcts_sims_total": game.mcts_sims_total,
-            "mcts_plies": game.mcts_plies,
-            "start_fen": game.starting_fen,
-            "adjudication_index": adjudication_index,
-            "c_puct": cfg.c_puct,
-            "dirichlet_eps": cfg.dirichlet_eps,
-            "uniform_eps": cfg.uniform_eps,
-        }
-
+        # index/telemetry row: essentials + this game's sampled params
         # cfg.sampleable is wiped by resolve_cfg; param names live on self.config
         for param in self.config.sampleable:
             val = getattr(cfg, param)
@@ -539,29 +502,28 @@ class GameLooper(object):
             else:
                 mem_summary[param] = val
 
-        # on-disk record (full)
-        res = {
-            "history_uci": game.board.history_uci(),
-            "moves_played": game.moves_played,
-            "model_epoch": self.n_retrains
-        }
-        
-        res.update(cfg.to_dict())
-        res.update(mem_summary)
-        res.update(game.meta)
+        # on-disk record: lean {header, plies} FATTY payload. Rescore reads it,
+        # trims non-reviewable games to LEAN, adds cpl, and writes the final
+        # .pkl.gz + official game_index.json.
+        plies = []
+        for i, mv in enumerate(game.moves_played):
+            entry = game.tree_data.get(i)
+            if entry is None:
+                entry = {"abs_ply": None, "stm": None, "move_played": mv,
+                         "xc0_move": None, "sel_method": None, "stop_reason": None}
+            plies.append(entry)
 
-        # attach tree search data to disk record
-        res["tree_search_data"] = game.tree_data
+        record = {"header": {**mem_summary, **rest}, "plies": plies}
 
-        out_file = os.path.join(cfg.game_dir, game.game_id + "_log.pkl.gz")
+        out_file = os.path.join(cfg.game_dir, game.game_id + ".pkl")
         out_path = pathlib.Path(out_file)
         mem_summary['pkl_file'] = str(out_path)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(out_path, "wb") as f:
-            pickle.dump(res, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        # this is small, push it to parent process via Queue instead on appending
+        with open(out_path, "wb") as f:
+            pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # this is small, push it to parent process via Queue instead of appending
         self.recent_games_q.put({"looper_id": self.id, "meta": mem_summary})
 
         # this keeps games and plies in sync for logging

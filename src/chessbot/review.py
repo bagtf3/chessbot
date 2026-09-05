@@ -2104,7 +2104,6 @@ class RecordKeeper(object):
         self._last_stats_log = time.time()
         self._run_start = time.time()
 
-        self.sims_done_total = 0
         self.total_plies = 0
         self.mcts_sims_total = 0
         self.mcts_plies_total = 0
@@ -2141,7 +2140,6 @@ class RecordKeeper(object):
 
         self.games_finished += 1
         self.total_plies += meta['plies']
-        self.sims_done_total += meta['sims_done_total']
         self.mcts_sims_total += meta['mcts_sims_total']
         self.mcts_plies_total += meta['mcts_plies']
 

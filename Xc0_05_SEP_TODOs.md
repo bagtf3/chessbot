@@ -34,3 +34,9 @@ feeding `18m_gen2_pretrain` (running, ~33h ETA).
 - Draining historic = the signal that it's time for a new re-pretrain.
 - Overturns the "NEVER delete/modify historic" rule in CLAUDE.md notes + memory
   -- update those when this lands.
+- Budget: 13,081 shards / 4 per retrain = ~3,270 retrains before depletion.
+
+## 8. sp-retrainment consumes 4-tuple natively
+- Don't open + convert each historic shard to a 7-tuple at load time.
+- sp-retrainment should read the 4-tuple `(xc0h, policy_sparse, wdl_target,
+  "pretraining")` directly and just apply weights -- no per-shard rewrite.

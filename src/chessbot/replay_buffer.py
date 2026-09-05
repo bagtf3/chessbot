@@ -41,16 +41,16 @@ import numpy as np
 
 from chessbot.opening_counts import apply_repeat_weights
 
-LIVE_BUFFER_SIZE = 163_840
+LIVE_BUFFER_SIZE = 204_800
 SHARD_SIZE = 10_240
-PRIMARY_TRIGGER_SHARDS = 96
+PRIMARY_TRIGGER_SHARDS = 144
 RETRAIN_PRIMARY_SHARDS = 10
 RETRAIN_REPLAY_SHARDS = 10
 RETRAIN_HISTORIC_SHARDS = 4
 REPLAY_SEED_SHARDS = 144
 # initial primary fill, left short of the trigger so selfplay supplies the
 # last few shards of the first cycle rather than retraining on pure seed
-PRIMARY_SEED_SHARDS = 94
+PRIMARY_SEED_SHARDS = 140
 SEED_SOURCE = "historic_seeded"
 
 # Validation draws, taken in-memory from records the retrain worker has

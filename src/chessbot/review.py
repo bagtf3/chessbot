@@ -67,7 +67,39 @@ class GameViewer:
         else:
             raise Exception("log_path must be json or pickle")
 
+        self.log = GameViewer._normalize(self.log)
         self.init_from_log(self.log, sf_df)
+
+    @staticmethod
+    def _normalize(log):
+        """Convert migrated {header, plies} format to the flat format GameViewer expects."""
+        if 'header' not in log or 'plies' not in log:
+            return log
+        header = log['header']
+        plies = log['plies']
+        moves_played = [p['move_played'] for p in plies]
+        tree_search_data = {
+            str(i): {
+                'best_wdl':          p.get('best_wdl'),
+                'selection_method':  p.get('sel_method'),
+                'xc0_move':          p.get('xc0_move'),
+                'stop_reason':       p.get('stop_reason'),
+                'sims':              p.get('sims'),
+                'time':              p.get('time'),
+                'avg_depth':         p.get('avg_depth'),
+                'max_depth':         p.get('max_depth'),
+                'children_visited':  p.get('children_visited'),
+                'total_children':    p.get('total_children'),
+                'candidate_moves':   p.get('candidate_moves', []),
+                'pv':                p.get('pv', []),
+            }
+            for i, p in enumerate(plies)
+        }
+        flat = dict(header)
+        flat['moves_played'] = moves_played
+        flat['tree_search_data'] = tree_search_data
+        flat['_plies'] = plies
+        return flat
 
     @classmethod
     def from_record(cls, row, sf_df=None):

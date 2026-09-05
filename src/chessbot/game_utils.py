@@ -58,6 +58,7 @@ def reconcile_game_boards(start_fen, history_uci, moves_played):
     prints a warning instead of silently degrading. The "no history to
     replay" case (prefix_len <= 0) is normal and stays silent.
     """
+    start_fen = start_fen or STARTPOS_FEN
     board_ch = chess.Board(start_fen)
     b_fast = fastboard(start_fen)
 

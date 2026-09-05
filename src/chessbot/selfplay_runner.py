@@ -868,6 +868,11 @@ class SelfPlayRunner:
             game["beat_sf"] = bool(
                 (result > 0 and not sf_white) or (result < 0 and sf_white))
 
+        if game.get("scenario") == "paired_validation":
+            game["reviewable"] = True
+        else:
+            game["reviewable"] = random.random() < 0.005
+
         game = make_jsonable(game)
         idx_file = self.base_cfg.game_index_file
         os.makedirs(os.path.dirname(idx_file), exist_ok=True)

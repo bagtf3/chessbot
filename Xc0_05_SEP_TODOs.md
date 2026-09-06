@@ -31,6 +31,17 @@ pyfastchess rebuilt (nn_wdl_stm / min_sims / sim_budget getters live).
   update those if this lands.
 - Budget: 13,081 / 4 = ~3,270 retrains before depletion. Riskiest; defer.
 
+## 9. Auto-archive the pretrain eval CSV  [DARKHORSE -- do before selfplay restarts]
+- `eval_progress.csv` is UNIFIED: once selfplay starts in the same run_dir the
+  looper appends its rows to the very same file (next_model_epoch reads it), so
+  the pure-pretrain curve gets mixed in and is lost unless snapshotted first.
+- Neither bootstrap_model_async_sparse_pkl.py nor retrain_worker.py renames or
+  copies it -- the `_pretrain_continued.csv` in the d256 dir was a manual rename.
+- Fix: on the pretrain->selfplay handoff, freeze a copy (e.g.
+  eval_progress.csv -> eval_progress_pretrain.csv) so the pretrain-only history
+  survives. Small local edit; land it BEFORE the selfplay gauntlet reboots or
+  the gen2 pretrain curve gets clobbered.
+
 ## Possible follow-up (not on original list)
 - tempscale entropy path (mcts.cpp:1016-1079) still uses the old two-step
   blend+clamp; could share the unified blend if desired. Separate from #4.

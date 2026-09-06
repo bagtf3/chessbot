@@ -49,19 +49,10 @@ from chessbot.validation import (
 import chessbot.replay_buffer as rb
 
 GAME_QUEUE_MIN = 36
-# validation batches ride the same queue as everything else, which is safe
-# only because that queue is kept shallow -- raise the target much above this
-# and batches start waiting behind selfplay, and the ladder cadence drifts
 GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
-# the retrain worker sleeps this long after retrain_ready before it touches
-# the GPU; a pause issued outside that handshake gets the same settle window
 WORKER_PAUSE_SETTLE_S = 10.0
-# a worker that dies on startup would otherwise be respawned every loop pass
 RESPAWN_COOLDOWN_S = 30.0
-# brief mop-up for SF work already in flight when an operator stops. Kept
-# short on purpose: anything unfinished is on disk and resumes next run.
 STOP_DRAIN_S = 5.0
-# the two worker fleets. Pause, respawn and status all address them by kind.
 WORKER_KINDS = ("xc0", "lc0")
 
 
@@ -70,7 +61,7 @@ def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
     replays all arrive on it and are told apart by spec.meta."""
     with init_selfplay(
         cfg, recent_games_q, telemetry_q, 
-        msg_q, game_queue=game_queue
+        msg_q, game_q=game_queue
     ) as looper:
         looper.run(stop_ev)
 

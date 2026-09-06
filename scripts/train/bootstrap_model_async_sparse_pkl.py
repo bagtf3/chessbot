@@ -135,6 +135,21 @@ def normalize_progress_df(df):
     return df.reindex(columns=UNIFIED_COLS + extra)
 
 
+def save_progress_csv(df, path):
+    try:
+        df.round(4).to_csv(path, index=False)
+    except OSError as e:
+        print(f"[csv] write skipped, file busy ({os.path.basename(path)}): {e}",
+              flush=True)
+
+
+def save_plot_safe(*args, **kwargs):
+    try:
+        save_plot(*args, **kwargs)
+    except OSError as e:
+        print(f"[plot] write skipped, file busy: {e}", flush=True)
+
+
 def progress_csv_path(run_dir, name, unified):
     if unified:
         return os.path.join(run_dir, "eval_progress.csv")
@@ -474,13 +489,13 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
     }
     new_row = pd.DataFrame([row]).reindex(columns=UNIFIED_COLS)
     eval_df = new_row if eval_df is None else pd.concat([eval_df, new_row], ignore_index=True)
-    eval_df.round(4).to_csv(progress_file, index=False)
+    save_progress_csv(eval_df, progress_file)
 
     print_validation(epoch, {
         "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
         **pol_stats,
     })
-    save_plot(eval_df, f"{name}  [PT]", epoch, plot_file, tgt_q, val_q)
+    save_plot_safe(eval_df, f"{name}  [PT]", epoch, plot_file, tgt_q, val_q)
     return eval_df, tgt_q, val_q
 
 
@@ -623,7 +638,7 @@ def worker_main(wargs):
         if ep == start_epoch and ep % PLOT_EVERY == 0 and eval_df is not None:
             eval_df.loc[eval_df.index[-1], "train_loss"] = t_loss
             eval_df.loc[eval_df.index[-1], "gn_mean"]   = gns["gn_mean"]
-            eval_df.round(4).to_csv(progress_file, index=False)
+            save_progress_csv(eval_df, progress_file)
 
         print(f"[epoch {ep:4d}] [{name}] policy_loss: {p_loss:.2f}  "
               f"value_loss: {v_loss:.2f}  total: {t_loss:.2f}  "
@@ -647,7 +662,7 @@ def worker_main(wargs):
             save_pt_ckpt(model, opt, scaler, ep, name, ckpt_path(run_dir, name, ep),
                          lw_state=lw_state)
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
-            save_plot(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
+            save_plot_safe(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
 
         if ep in swa_set:
             sp = swa_ckpt_path(run_dir, name, ep)

@@ -1,51 +1,36 @@
 # Xc0 Data + Retrain Overhaul TODOs (2026-09-05)
 
 Corpus snapshot: 13,081 pretrain shards = ~133.95M records (13,081 x 10,240)
-feeding `18m_gen2_pretrain` (running, ~33h ETA).
+feeding `18m_gen2_pretrain`.
 
-Ordered by dependency. Take sequentially top-to-bottom.
+DONE: #1 (rescorer tscaler strip), #3 (looper lean {header,plies} pkl + FATTY
+collector + emit_header), #4 (unified prior_clip/uniform_eps blend, C++
+mcts.cpp:997-1013 and Py utils.blend_to_uniform), #6 (buffer 12/12/4), #7
+(4-tuple native read via normalize_record_arity; only bootstrap rewrites).
+pyfastchess rebuilt (nn_wdl_stm / min_sims / sim_budget getters live).
 
-## 1. Rescorer: remove tscaler
-- Strip the temperature-scaler path out of the rescore / target build.
-- First because it clears the deck inside the rescorer before #2 reshapes it.
+## 2. Rescorer: mirror the migration script  [NOT STARTED -- the only real build left]
+- Rescore becomes the live-migrator. Read `<game_id>.pkl` ({header, plies}) from
+  game_logs, then per ply: run SF and add `cpl` (+ `cpl_depth`), build the
+  blended `policy` target from `raw_visits` (item #5 -- call blend_to_uniform),
+  compute `z_wdl` / `wdl_target`.
+- Decide `reviewable` (paired_validation OR random < review_rate); if not, trim
+  the FATTY extras to LEAN.
+- Write final `<game_id>.pkl.gz`, update official `game_index.json`
+  (+ mean_cpl / mean_bmr), then delete the looper's `.pkl`.
+- Touches rescore's current reader (analyze_and_rescore ~651) + the brp reader.
 
-## 2. Rescorer: mirror the migration script
-- Restructure rescorer target build to match `migrate_game_logs_mp.py` shape
-  (sparse policy, 50/50 result+search WDL, cpl, sel_method, ...).
-- The spine: defines the lean per-game format everything downstream consumes.
+## 5. Blend on retrain policy targets  [folds into #2]
+- `blend_to_uniform` exists (utils.py) with no callers yet. Wire it into #2's
+  policy-target build so retrain doesn't sharpen. `raw_visits` stays un-blended.
 
-## 3. Looper data-save -> new protocol
-- Make selfplay write the lean per-game sparse pkl.gz (migrated format), not the
-  fat game log.
-- Depends on #2 (the lean write = whatever the rescorer now emits).
-- Open Qs: write per-game or straight-to-shard? keep the fat `game_logs` log at
-  all or replace it? which fields survive (raw_visits, sel_method, cpl, ...)?
+## 8. Historic -> cold storage drain (HDD)  [UNDECIDED -- may not do]
+- After 4 historic shards sampled, move them to HDD cold storage.
+- Draining historic = signal it's time for a new re-pretrain.
+- Overturns the "NEVER delete/modify historic" rule in CLAUDE.md + memory --
+  update those if this lands.
+- Budget: 13,081 / 4 = ~3,270 retrains before depletion. Riskiest; defer.
 
-## 4. Unified prior_clip_max <-> uniform_eps (one-stop shop)
-- `uniform_eps = max(uniform_eps, eps_needed_so_max_prior <= prior_clip_max)`.
-- Single function used at MCTS prior-blend time.
-- Independent (MCTS-side); must precede #5.
-
-## 5. Apply #4 to retrain targets too
-- Same clip-via-eps blend on stored policy targets so retrain doesn't sharpen
-  the model.
-- Depends on #4 (the function) and #2 (applied inside the reshaped target build).
-
-## 6. Retrain buffer sizing -> 12 / 12 / 4
-- primary 12, replay 12, historic 4 shards per retrain draw.
-- Reconcile with the current replay_buffer constants (144/144, live 204,800) --
-  these are sample counts, not buffer caps.
-
-## 7. sp-retrainment consumes 4-tuple natively
-- Don't open + convert each historic shard to a 7-tuple at load time.
-- sp-retrainment should read the 4-tuple `(xc0h, policy_sparse, wdl_target,
-  "pretraining")` directly and just apply weights -- no per-shard rewrite.
-- Precedes #8 (read natively before draining historic).
-
-## 8. Historic -> cold storage drain (HDD)
-- After 4 historic shards are sampled, move them to cold storage on the HDD.
-- Draining historic = the signal that it's time for a new re-pretrain.
-- Overturns the "NEVER delete/modify historic" rule in CLAUDE.md notes + memory
-  -- update those when this lands.
-- Budget: 13,081 shards / 4 per retrain = ~3,270 retrains before depletion.
-- Last: riskiest (deletes/moves historic); depends on #6 (4-historic draw) and #7.
+## Possible follow-up (not on original list)
+- tempscale entropy path (mcts.cpp:1016-1079) still uses the old two-step
+  blend+clamp; could share the unified blend if desired. Separate from #4.

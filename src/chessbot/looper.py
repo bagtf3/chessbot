@@ -659,13 +659,13 @@ class GameLooper(object):
         })
 
 
-def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_queue=None, sf_queue=None):
+def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_q=None, sf_q=None):
     model = None  # loaded per-worker in load_reload_model
-
+    
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_q=recent_games_q, telem_q=telemetry_q, msg_q=msg_q,
-        game_queue=game_queue, sf_queue=sf_queue,
+        recent_q=recent_games_q, telem_q=telemetry_q,
+        msg_q=msg_q, game_queue=game_q, sf_queue=sf_q
     )
 
     # infer the current epoch from the progress csv. Row count is wrong once the

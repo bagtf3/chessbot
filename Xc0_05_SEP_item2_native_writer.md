@@ -1,19 +1,18 @@
 # Item #2 Design: Native lean data writer (looper + rescore)
 
 Goal: selfplay writes the lean per-game sparse format directly to `game_logs/`
-and `game_index.json` -- the shape `migrate_game_logs_mp.py` currently produces
-from fat logs -- so no post-hoc migration is ever needed again.
+and `game_index.json`, so no post-hoc migration is ever needed.
 
 ## Output artifacts (final names, no _tmp / _migrated)
 - `<run_dir>/game_logs/<game_id>.pkl.gz` -- lean per-game dict (below).
-- `<run_dir>/game_index.json` -- per-game index rows (as migration writes today).
+- `<run_dir>/game_index.json` -- per-game index rows.
 - Fat log retained ONLY for reviewables: `is_review = (scenario ==
   'paired_validation') or (random.random() < review_rate)`. Reviewable games keep
   the full fat pkl in addition to the lean file; non-reviewable games get lean
   only.
 
 ## Who writes what
-The migration is a pure transform of the fat log (no inference); split it across
+The lean write is a pure transform of the fat log (no inference); split it across
 the two places that already hold the inputs live:
 
 - looper.py (has live board + per-ply `tree_data` from `collect_tree_search_data`)
@@ -29,7 +28,7 @@ the two places that already hold the inputs live:
   -- the two things that need SF / final result.
 
 ## Per-ply schema (lean)
-Same as migrated format, plus `root_wdl_nn`:
+All STM-POV:
 `stm, move_played, sel_method, xc0_move, stop_reason, best_wdl(STM),
 root_wdl_nn(STM), z_wdl, wdl_target, xc0h, policy(sparse, blended),
 raw_visits(sparse, pristine), kl, cpl`.

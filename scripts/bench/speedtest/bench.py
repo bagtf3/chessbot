@@ -19,7 +19,7 @@ from pyfastchess import Board as fastboard
 from pyfastchess import MCTSForest, raw_cache_bulk_insert_np
 from pyfastchess import priors_cache_clear, raw_cache_clear
 
-from chessbot.config import Config
+from chessbot.config import Config, XC0H_K
 from chessbot.mcts_utils import ChessGame, MCTSTree
 
 from chessbot.game_utils import GameSpec
@@ -131,7 +131,7 @@ def search(tree, forest, cfg, infer_fn, n_sims, batch, max_fastpath=1024):
         pruned += res.total_pruned
         tree.sims_completed_this_move += got
 
-        keys_np, enc_np = forest.get_all_history_tokens(cfg.history_K)
+        keys_np, enc_np = forest.get_all_history_tokens(XC0H_K)
         for i in range(0, len(keys_np), cfg.macro_batch):
             k = keys_np[i:i + cfg.macro_batch]
             policy, wdl = infer_fn(k, enc_np[i:i + cfg.macro_batch])
@@ -268,7 +268,7 @@ def run_loop_bench(fixtures, cfg, infer_fn, n_games=None, max_plies=300,
 
         active = still_active
 
-        keys_np, enc_np = forest.get_all_history_tokens(cfg.history_K)
+        keys_np, enc_np = forest.get_all_history_tokens(XC0H_K)
         for i in range(0, len(keys_np), macro):
             k = keys_np[i:i + macro]
             policy, wdl = infer_fn(k, enc_np[i:i + macro])

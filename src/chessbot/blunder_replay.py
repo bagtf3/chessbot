@@ -286,7 +286,6 @@ def create_blunder_replay_config(cfg, yaml_file=None):
     # compiled ONNX, but init_paths derives it back to the .ts from run_tag,
     # so restore it last or the probe recompiles its own engine.
     pcfg.encoding_type = cfg.encoding_type
-    pcfg.history_K = cfg.history_K
     pcfg.inference_backend = cfg.inference_backend
     pcfg.model_path = cfg.model_path
     pcfg.trt_model_name = cfg.trt_model_name

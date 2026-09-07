@@ -17,7 +17,18 @@ from pyfastchess import Board as fastboard
 from chessbot import BLACK_WINNING_WHITE_MOVE, WHITE_WINNING_WHITE_MOVE
 from chessbot.config import Config
 from chessbot.replay_buffer import densify_policy
-from chessbot.rescore import Rescorer, blend_wdl, z_to_wdl
+from chessbot.rescore import Rescorer, blend_wdl, blend_wdl_stm, z_to_wdl
+
+
+def test_native_stm_wdl_winning_mover():
+    # A winning Black mover has the same STM target as a winning White mover.
+    target = blend_wdl_stm(1, [0.8, 0.1, 0.1])
+    np.testing.assert_allclose(target, [0.9, 0.05, 0.05])
+    assert target.dtype == np.float32
+
+
+def test_native_stm_wdl_missing_search():
+    np.testing.assert_array_equal(blend_wdl_stm(-1, None), [0.0, 0.0, 1.0])
 
 # both are white-to-move; mirroring each covers the black-to-move half, so the
 # two of them span all four (side-to-move x who-is-winning) combinations

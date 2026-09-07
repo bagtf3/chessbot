@@ -2,6 +2,9 @@ from chessbot import SP_DIR, MODEL_DIR
 import os
 import yaml, json
 
+# xc0h history frame count; fixed, never modulated.
+XC0H_K = 6
+
 class Config(object):
     """
     Central knobs. Keep simple; override from a dict or flags as needed.
@@ -168,16 +171,11 @@ class Config(object):
     tempscale_entropy_target = 0.0   # normed entropy target; 0 = disabled
     tempscale_trigger_q      = -2.0  # STM-POV Q floor; -2 = always; 0.5 = winning only
 
-    # board encoding fed to the model. Sole driver of the encoder on every path
-    # (selfplay drain, training-data board field, retrain input). "xc0" = 64 int16
-    # tokens; "lc0" = 112x8x8 lc0 planes. Selfplay and retrain MUST agree or the
-    # model is fed garbage. Orthogonal to inference_backend (lc0_trt requires lc0).
+    # board encoding fed to the model; selfplay and retrain must agree.
     encoding_type            = "xc0"        # "xc0" | "xc0h" | "lc0"
-    history_K                = 6            # xc0h only: history frame count
 
-    # inference / retrain backend selection
+    # inference backend; retrain is always pt_eager, not a config knob.
     inference_backend        = "ort_trt"  # "ort_trt" | "lc0_trt"
-    retrain_backend          = "pt_eager"  # "pt_eager"
     trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
     trt_cache                = ""          # ort_trt: path to TRT engine cache dir
     ort_trt_engine_cache_dir = ""          # legacy alias for trt_cache
@@ -205,6 +203,8 @@ class Config(object):
         self.game_dir = game_dir
 
         self.game_index_file = os.path.join(self.run_dir, "game_index.json")
+        self.game_index_staging_file = os.path.join(
+            self.run_dir, "game_index_staging.json")
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
 

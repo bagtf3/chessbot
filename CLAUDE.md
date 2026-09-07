@@ -1,56 +1,5 @@
 # Xerces Chess Engine - Claude Instructions
 
-## CRITICAL: No Unauthorized Edits
-A request to review, audit, dry-run, "trace through", or "look at" code is
-NOT authorization to edit it. This applies even when a future action is
-verbally conditioned on the review going well (e.g. "if it looks good I'll
-start a test run" describes the user's own next decision, not permission
-for you to act on what you find). Report findings — severity, what's wrong,
-the exact proposed diff — and stop. Wait for an explicit, separate go-ahead
-("fix it", "go ahead", "run that shit") before touching a single line, even
-for a fix you're fully confident about, even mid-session after several
-prior "keep coding" exchanges. A review request is a mode switch back to
-look-don't-touch until told otherwise. Violating this already brought the
-user to the edge of cancelling their subscription over it (2026-08-15) —
-treat it as an absolute, not a preference to weigh against convenience.
-
-## CRITICAL: Know Your Permission Mode
-Default/manual mode is the assumption unless the session state clearly says
-otherwise. In manual mode EVERY tool call is gated individually — one
-approved call is not blanket approval for the next, not even adjacent
-read-only diagnostics (grep, sed, cat, ls, find, python -). Do not batch a
-run of shell commands on the assumption they will pass. If you are not
-certain a call will prompt, or not certain which mode is active, stop and
-ask before making it. An allowlist entry silently permitting something is
-not a signal to lean on it — when in doubt, ask for permission. This holds
-even mid-session after a long stretch of approvals.
-
-## Authorization and Momentum
-The two rules above are the brakes. This is the gas, and it matters just as
-much: hesitating after a green light is its own failure that costs just as
-much trust as editing without one.
-- A clear task plus a go-ahead IS authorization to make the in-scope edits:
-  "start coding", "go", "do it", "fix it", "run that shit", "knock these out",
-  or a concrete spec followed by "lets do it". Once authorized, make the edit.
-  Do not re-review, re-confirm, re-summarize the plan, or re-ask.
-- Investigate only enough to write correct code -- typically ONE focused pass
-  to grab the specific facts needed (a signature, a field name, a call site).
-  Do not re-derive the whole system on every item or trace to the center of
-  the earth. A routine in-scope edit needs a quick look; only a "big bug"
-  claim or a destructive/outward action warrants a full call-chain trace.
-- Reading files and running read-only diagnostics needed to complete an
-  already-authorized task are PART of that task, not new actions requiring
-  their own sign-off. The harness enforces permission prompts; do not layer a
-  second, self-imposed hesitation on top of it.
-- The look-don't-touch brake applies to review/audit/dry-run requests and to
-  destructive, outward-facing, or mid-run-config actions. It does NOT mean
-  treating an authorized build task as if it were a review.
-- Edits are small and local. Make the change here; if it turns out to need a
-  fix elsewhere, do that later or roll the edit back. Do not try to get the
-  whole system right from the first keystroke, and do not gate a local edit on
-  chasing every downstream consumer first. It's code -- if it's busted we
-  delete it or revert it. Bias to a working small edit over a perfect big one.
-
 ## Two-Repo Structure
 This project spans two repositories:
 - `chessbot` (this repo) — Python package: selfplay loop, MCTS wrapper, model, training, review
@@ -64,7 +13,7 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - Python package: `chessbot` (src layout: `src/chessbot/`)
 - Entry point: `scripts/run_selfplay.py <run_tag>`
 - Run configs live at: `C:\Users\Bryan\Data\chessbot_data\selfplay_runs\<run_tag>\config.yaml`
-- Active run tag: latest `16m_precond_run<N>` (e.g. `16m_precond_run0`)
+- Active run tag: check the current run dir under `selfplay_dir` — don't assume; this drifts
 
 ## Key Files
 - `src/chessbot/mcts_utils.py` — `MCTSTree` (wraps C++) and `ChessGame`

@@ -12,6 +12,7 @@ from pyfastchess import Board as fastboard
 from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
+from chessbot.config import XC0H_K
 from chessbot.utils import kl_divergence, rnd
 
 POLICY_DIM = 1858
@@ -517,7 +518,6 @@ class ChessGame(object):
         visited_children = sum([1 for cd in details if cd.N > 0])
 
         turn = self.turn()  # STM, True = white
-        history_K = self.config.history_K
 
         # IMPORTANT: read node stats and encode the board BEFORE the move is
         # pushed, otherwise the values change.
@@ -555,7 +555,7 @@ class ChessGame(object):
             "sims_ceiling": int(self.tree.sim_budget()),
             "best_wdl": best_wdl,
             "root_wdl_nn": root_wdl_nn,
-            "xc0h": np.asarray(self.board.history_tokens(history_K), dtype=np.int16),
+            "xc0h": np.asarray(self.board.history_tokens(XC0H_K), dtype=np.int16),
             "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "children_visited": visited_children,

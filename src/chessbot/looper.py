@@ -18,6 +18,7 @@ from pyfastchess import (
 )
 
 from chessbot import SF_LOC
+from chessbot.config import XC0H_K
 
 from chessbot.infer_ort_trt import make_ort_trt_infer
 
@@ -109,8 +110,7 @@ class GameLooper(object):
         if encoding == "lc0":
             self.batch_encoder = self.forest.get_all_lc0_features
         elif encoding == "xc0h":
-            K = cfg.history_K
-            self.batch_encoder = lambda: self.forest.get_all_history_tokens(K)
+            self.batch_encoder = lambda: self.forest.get_all_history_tokens(XC0H_K)
         else:
             self.batch_encoder = self.forest.get_all_encoded
 

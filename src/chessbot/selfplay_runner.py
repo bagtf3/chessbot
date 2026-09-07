@@ -32,9 +32,7 @@ from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator
 from chessbot.looper import init_selfplay
 
-from chessbot.lc0_replay import (
-    LC0_BRP_SCENARIO, create_lc0_replay_config,
-)
+from chessbot.lc0_replay import LC0_BRP_SCENARIO, create_lc0_replay_config
 
 from chessbot.rescore import (
     BRP_ANALYSIS_EVERY, Rescorer, SFRescoreThread, migrate_pretrain_progress,
@@ -42,10 +40,12 @@ from chessbot.rescore import (
 from chessbot.retrain_worker import run_retrain_worker
 from chessbot.review import RecordKeeper
 from chessbot.utils import format_time, make_jsonable, next_model_epoch
+
 from chessbot.validation import (
     build_validation_summary_from_rows, create_validation_config,
-    print_validation_info,
+    print_validation_info
 )
+
 import chessbot.replay_buffer as rb
 
 GAME_QUEUE_MIN = 36
@@ -422,7 +422,7 @@ class SelfPlayRunner:
         probes never reach the index -- they return before update_game_index
         -- so they correctly do not consume budget.
         """
-        path = self.base_cfg.game_index_file
+        path = self.base_cfg.game_index_staging_file
         if not os.path.exists(path):
             return 0
         with open(path, "r", encoding="utf-8") as f:
@@ -865,7 +865,7 @@ class SelfPlayRunner:
             game["reviewable"] = random.random() < 0.005
 
         game = make_jsonable(game)
-        idx_file = self.base_cfg.game_index_file
+        idx_file = self.base_cfg.game_index_staging_file
         os.makedirs(os.path.dirname(idx_file), exist_ok=True)
         with open(idx_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(game, ensure_ascii=False) + '\n')

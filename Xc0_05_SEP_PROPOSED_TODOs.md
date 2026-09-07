@@ -114,9 +114,9 @@ PROPOSE (light):
 WHY: 134M records swamp critical positions; user hypothesis = CPL 0 + high KL.
 
 STATE (found) - the signals ALREADY EXIST:
-- `cpl` stored per ply (`migrate_game_logs_mp.py:518`; 0 = best move).
-- `kl` stored per ply (`migrate_game_logs_mp.py:497`, visits||priors divergence) -
-  exactly the "target diverges from prior" signal.
+- `cpl` stored per ply (0 = best move).
+- `kl` stored per ply (search||prior divergence) - exactly the "target diverges
+  from prior" signal.
 - KL-boost upsampling ALREADY implemented on the SELFPLAY retrain path: `pwht`
   boosted by `kl_boost_median_mult=1.5` / `kl_boost_p80_mult=3.0`
   (`rescore.py:1443-1447`), plus opening-repetition reweight.
@@ -162,10 +162,9 @@ PROPOSE (light) - two flavors, pick later:
 
 ## Notes on original TODO list (brief, non-scoping)
 
-- #1 (looper->lean pkl): fat logs at `<run_dir>/game_logs/<id>_log.pkl` are what
-  the migration scripts consume; replacing them at write-time removes the whole
-  migration step. Interacts with P5 - decide if the lean format keeps cpl+kl for
-  importance (it should).
+- #1 (looper->lean pkl): writing the lean format at game-end removes any post-hoc
+  transform of the fat logs at `<run_dir>/game_logs/<id>_log.pkl`. Interacts with
+  P5 - decide if the lean format keeps cpl+kl for importance (it should).
 - #5/#6 (prior_clip_max<->uniform_eps): `prior_clip_max=0.75` in memory,
   `uniform_eps=0.25`. Unifying at MCTS prior-blend AND on stored retrain targets
   is coherent; just make sure P5 importance-weight is applied AFTER the clip so a

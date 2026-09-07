@@ -16,10 +16,11 @@ import numpy as np
 from pyfastchess import Board
 
 from chessbot import SF_LOC
+from chessbot.config import XC0H_K
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
     batch_policy_metrics, cp_to_value_tanh, scalar_to_wdl,
-    ema_step, load_json, save_pickle_atomic,
+    ema_step, load_json, save_pickle_atomic, blend_to_uniform,
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
@@ -543,34 +544,43 @@ class Rescorer(object):
                 self.games_seen = set(df_all["game_id"].astype(str).unique())
 
     def get_unprocessed(self):
+        """Returns (unprocessed_games, unprocessed_blunder_replays). Replays never
+        reach an index, so the second is always empty.
+
+        write_lean_record writes <gid>.pkl.gz, appends the final game_index.json
+        row, then deletes the looper .pkl, in that order. So a game is done once
+        it has a final row (which guarantees its gz), and a surviving .pkl marks
+        an unprocessed game. Resume off the staging inbox: reprocess any staged
+        game not yet in the final index whose .pkl is still on disk, clearing a
+        partial gz left by a crash between the gz write and the row append.
         """
-        Returns (unprocessed_games, unprocessed_blunder_replays). The second
-        is always empty: replays never write a pkl_file/game_index entry (by
-        design -- see finalize_game_data's blunder_replay_probe branch), so
-        one that died mid-flight leaves no recoverable trace and just gets
-        resampled later.
-        """
-        run_dir = self.config.run_dir
-        idx_path = os.path.join(run_dir, "game_index.json")
-        idx = load_game_index(idx_path)
-        entries = [idx] if isinstance(idx, dict) else idx
+        game_dir = self.config.game_dir
+        final = load_game_index(self.config.game_index_file)
+        final = [final] if isinstance(final, dict) else final
+        done = {str(r.get("game_id")) for r in final}
+
+        staging_path = self.config.game_index_staging_file
+        staging = load_json(staging_path) if os.path.exists(staging_path) else []
+        staging = [staging] if isinstance(staging, dict) else staging
 
         unprocessed_games = deque()
-        for rec in entries:
+        for rec in staging:
             gid = str(rec.get("game_id"))
-            pkl_path = rec.get("pkl_file")
-            if not pkl_path or not os.path.exists(pkl_path):
+            if gid in done or gid in self.games_seen:
                 continue
-            if gid in self.games_seen:
-                continue
+            raw_pkl = os.path.join(game_dir, gid + ".pkl")
+            if not os.path.exists(raw_pkl):
+                continue  # no source to reprocess from; skip (rare, accepted)
+            gz = os.path.join(game_dir, gid + ".pkl.gz")
+            if os.path.exists(gz):
+                os.remove(gz)  # partial gz from a pre-row crash; redo clean
+            rec["pkl_file"] = raw_pkl
             unprocessed_games.append(rec)
 
         if len(unprocessed_games):
-            n = len(unprocessed_games)
-            print(f"[rescore] {n} unprocessed game(s) currently in queue")
+            print(f"[rescore] {len(unprocessed_games)} unprocessed game(s) currently in queue")
 
-        unprocessed_blunder_replays = deque()
-        return unprocessed_games, unprocessed_blunder_replays
+        return unprocessed_games, deque()
 
     def reset_writer(self):
         self.written_this_round = 0
@@ -582,7 +592,7 @@ class Rescorer(object):
         if self.config.encoding_type == "lc0":
             return board.lc0_features()
         if self.config.encoding_type == "xc0h":
-            return board.history_tokens(self.config.history_K)
+            return board.history_tokens(XC0H_K)
         return board.encode_64_tokens()
 
     def make_policy_example(self, board, ucis, visits):
@@ -628,33 +638,32 @@ class Rescorer(object):
 
     def start_game(self, pkl_file, pool):
         path = str(pkl_file)
-        if path.lower().endswith('.pkl.gz'):
-            with gzip.open(path, 'rb') as f:
-                game_data = pickle.load(f)
-        elif path.lower().endswith('.pkl'):
-            with open(path, 'rb') as f:
-                game_data = pickle.load(f)
-        else:
-            with open(path, 'r', encoding='utf-8') as f:
-                game_data = json.load(f)
+        opener = gzip.open if path.lower().endswith('.gz') else open
+        with opener(path, 'rb') as f:
+            record = pickle.load(f)
 
-        gid = str(game_data.get('game_id'))
+        header = record['header']
+        plies = record['plies']
+        gid = str(header.get('game_id'))
         if gid in self.games_seen:
             return
 
         cfg = self.config
+        moves_played = [p['move_played'] for p in plies]
         board_ch, b_fast = reconcile_game_boards(
-            game_data['start_fen'], game_data.get('history_uci'),
-            game_data.get('moves_played'),
+            header['start_fen'], header.get('history_uci'), moves_played,
         )
 
-        tree_data = game_data.get('tree_search_data', {})
-        vs_stockfish = game_data.get('vs_stockfish', False)
-        sf_color = game_data.get('stockfish_is_white')
-        result = game_data['result']
+        # working game object: the FATTY header carried forward plus the
+        # derived move list the blunder-pool and lc0-replay helpers consume
+        game_data = {**header, 'moves_played': moves_played}
+        tree_data = {i: p for i, p in enumerate(plies)}
+        vs_stockfish = header.get('vs_stockfish', False)
+        sf_color = header.get('stockfish_color')
+        result = header['result']
         is_draw = (result == 0) or (result == 0.0)
 
-        is_validation_game = 'validation' in game_data.get('scenario', '').lower()
+        is_validation_game = 'validation' in header.get('scenario', '').lower()
         skip_all_training = is_validation_game
 
         # snapshot config fields so hot-reloads don't affect an in-flight game
@@ -673,6 +682,10 @@ class Rescorer(object):
         game_state = {
             'gid': gid,
             'game_data': game_data,
+            'header': header,
+            'plies': plies,
+            'result': result,
+            'pkl_path': path,
             'cfg': SimpleNamespace(**{k: getattr(cfg, k) for k in game_cfg_keys}),
             'ply_states': [],
             'waiting': False,  # True once a batch has been submitted to a SF thread
@@ -685,14 +698,29 @@ class Rescorer(object):
             move_ch = chess.Move.from_uci(mv)
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
+            tr = plies[i]
+            tr['stm'] = bool(turn)
+            tr['z_wdl'] = z_to_wdl(result if turn else -result)
+            tr['wdl_target'] = blend_wdl_stm(result if turn else -result,
+                                              tr.get('best_wdl'))
+            tr['training_route'] = 'excluded'
+            cm = tr.get('candidate_moves', [])
+            if cm:
+                tr['policy'] = policy_from_raw_visits(tr['raw_visits'], cfg.prior_clip_max)
+                tr['kl'] = float(kl_divergence(
+                    [c['visits'] for c in cm], [c['P'] for c in cm]))
+            else:
+                tr['policy'] = []
+                tr['kl'] = 0.0
+            wdl, nn_wdl = tr.get('best_wdl'), tr.get('root_wdl_nn')
+            tr['kl_value'] = (float(kl_divergence(wdl, nn_wdl))
+                              if wdl is not None and nn_wdl is not None else 0.0)
 
             if is_sf_move and ((not cfg.train_on_stockfish) or skip_all_training):
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
 
-            tr = tree_data.get(i, tree_data.get(str(i), {}))
-            cm = tr.get('candidate_moves', [])
             if not cm:
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
@@ -704,7 +732,7 @@ class Rescorer(object):
             else:
                 wdl = tr.get('best_wdl')
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
-                Q = this_q if turn else -this_q
+                Q = this_q
 
             sf_wdl = tr.get('sf_wdl')
             if sf_wdl is not None and len(sf_wdl) == 3:
@@ -729,7 +757,7 @@ class Rescorer(object):
                 b_fast.push_uci(mv)
                 continue
 
-            sel_method = tr.get('selection_method')
+            sel_method = tr.get('sel_method')
             xc0_move = tr.get('xc0_move')
             xerces_uci = mv
             if xc0_move and xc0_move != mv:
@@ -737,18 +765,9 @@ class Rescorer(object):
             elif not sel_method:
                 xerces_uci = visits[0][0]
 
-            top_uci = visits[0][0]
-            if xerces_uci != top_uci:
-                vmap = {u: n for u, n in visits}
-                top_n = vmap.get(top_uci, 1)
-                xc0_n = vmap.get(xerces_uci, 1)
-                vmap[top_uci] = max(1, xc0_n)
-                vmap[xerces_uci] = max(1, top_n)
-                visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
-
             lms = b_fast.legal_moves()
             idx_map = dict(zip(lms, b_fast.moves_to_indices(lms)))
-            x = self.encode_board(b_fast)
+            x = tr['xc0h']
             # short_fen still needed for the lc0 waypoint FEN check
             short_fen = b_fast.fen(include_counters=False)
 
@@ -1388,8 +1407,6 @@ class Rescorer(object):
         if wdl is None:
             return False
         Y = np.array(wdl, dtype=np.float32)
-        if not tr.get('stm', True):
-            Y = Y[[2, 1, 0]]
 
         record = (self.encode_board(board), None, sparsify_policy(policy),
                   Y, 1.0, 1.0, 'lc0')
@@ -1441,15 +1458,11 @@ class Rescorer(object):
         policy = np.zeros(1858, dtype=np.float32)
         pi = np.array(vis, dtype=np.float32)
         pi = pi / pi.sum()
-        pi = np.clip(pi, 0.0, cfg.prior_clip_max)
-        pi = pi / pi.sum()
+        pi = blend_to_uniform(pi, 1e-6, cfg.prior_clip_max)
         for idx, p in zip(board.moves_to_indices(mvs), pi):
             policy[idx] += p
 
-        # best_wdl is white-POV; targets are STM-POV
         Y = np.array(wdl, dtype=np.float32)
-        if not ply['turn']:
-            Y = Y[[2, 1, 0]]
 
         x = self.encode_board(board)
         okey = self.opening_counts.key(board, x)
@@ -1505,14 +1518,10 @@ class Rescorer(object):
         for idx, p in zip(indices, blended):
             policy[idx] += p
 
-        # best_wdl is white-POV, the target is STM-POV -- flip before use. The
-        # Q_stm fallback is already STM-POV and must not be flipped. Only the
-        # policy takes an SF blend; the value stays the search's own.
+        # Only the policy takes an SF blend; the value stays the search's own.
         wdl_xc0 = tr.get('best_wdl')
         if wdl_xc0 is not None:
             wdl_xc0 = np.array(wdl_xc0, dtype=np.float32)
-            if not ply['turn']:
-                wdl_xc0 = wdl_xc0[[2, 1, 0]]
         else:
             wdl_xc0 = scalar_to_wdl(tr.get('Q_stm', 0.0))
         Y = wdl_xc0
@@ -1627,10 +1636,11 @@ class Rescorer(object):
         result = game_data['result']
         is_draw = (result == 0) or (result == 0.0)
         vs_stockfish = game_data.get('vs_stockfish', False)
-        sf_color = game_data.get('stockfish_is_white')
+        sf_color = game_data.get('stockfish_color')
 
         cpl_s = 0.0
         n_plies = 0
+        cpl_by_ply = {}
         rows = []
         eval_trace = []
         turn_at = {}
@@ -1676,6 +1686,7 @@ class Rescorer(object):
             loss_this = ms.loss
             cpl_s += loss_this
             n_plies += 1
+            cpl_by_ply[i] = (int(round(loss_this)), ply.get('best_depth'))
 
             # consider adding this position to the blunder replay pool
             sent_to_lc0 = False
@@ -1757,14 +1768,9 @@ class Rescorer(object):
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']
-            indices = [idx_map[u] for u in mvs]
             policy = np.zeros(1858, dtype=np.float32)
-            s = sum(vis)
-            pi = np.array([v / s for v in vis], dtype=np.float32)
-            pi = np.clip(pi, 0.0, cfg.prior_clip_max)
-            pi = pi / pi.sum()
-            for idx, p in zip(indices, pi):
-                policy[idx] += p
+            for idx, prob in tr['policy']:
+                policy[idx] = prob
 
             pending.append((ply['x'], policy, Q, turn, i, vwht, pwht, ply['okey']))
 
@@ -1795,13 +1801,12 @@ class Rescorer(object):
         for tup, aux in zip(pending, pending_aux):
             x, policy, Q, is_white, ply_i, vwht, pwht, okey = tup
             z = result if is_white else -result
-            Y = blend_wdl(z, aux.get('best_wdl'), is_white)
+            node = game_state['plies'][ply_i]
+            Y = node['wdl_target']
 
             wdl_node = aux.get('best_wdl')
             if wdl_node is not None:
                 model_wdl = np.array(wdl_node, dtype=np.float32)
-                if not is_white:
-                    model_wdl = model_wdl[[2, 1, 0]]
                 row = row_by_ply.get(ply_i)
                 if row is not None:
                     # logged CE only -- scored against the raw game result, not
@@ -1820,10 +1825,12 @@ class Rescorer(object):
                 # already queued as a pool candidate, counted there, and
                 # carrying the pending record this path could not supply
                 if aux['sent_to_lc0']:
+                    node['training_route'] = 'lc0'
                     continue
                 spec = self.queue_lc0_replay(
                     game_data, aux, {'xc0_cpl': aux['blend_cpl']})
                 if spec is not None:
+                    node['training_route'] = 'lc0'
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
                     continue
@@ -1841,6 +1848,8 @@ class Rescorer(object):
                 scw['blended'] += 1
 
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
+            node['policy'] = list(zip(entry[2][0].tolist(), entry[2][1].tolist()))
+            node['training_route'] = 'xc0'
             self.live_buffer.append(entry, okey)
             sc['accepted'] += 1
             scw['accepted'] += 1
@@ -1887,6 +1896,7 @@ class Rescorer(object):
 
         self.analyzed_results.append(out)
         self.games_processed += 1
+        self.write_lean_record(game_state, cpl_by_ply)
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
         if self.games_processed % STATS_WINDOW_GAMES == 0:
@@ -1895,6 +1905,78 @@ class Rescorer(object):
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
             self.push_analyzed(report=True)
 
+
+    def decide_reviewable(self, scenario):
+        """Keep the fat record for review. Later this may fold in KL/CPL/RMS(Q)
+        signal; for now paired validation plus a flat sample rate."""
+        return (scenario == 'paired_validation') or (random.random() < REVIEW_RATE)
+
+    def write_lean_record(self, game_state, cpl_by_ply):
+        """Transform the fat {header, plies} into the on-disk retrain-ready
+        record: STM-POV lean plies (+ fat extras when reviewable), write
+        <game_id>.pkl.gz, append the final game_index row, drop the looper .pkl."""
+        header = dict(game_state['header'])
+        plies_in = game_state['plies']
+        reviewable = self.decide_reviewable(header.get('scenario', ''))
+
+        out_plies = []
+        for i, node in enumerate(plies_in):
+            entry = {k: node[k] for k in (
+                'stm', 'move_played', 'z_wdl', 'wdl_target', 'policy',
+                'kl', 'kl_value', 'training_route')}
+            for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
+                      'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits'):
+                entry[k] = node.get(k)
+
+            hit = cpl_by_ply.get(i)
+            if hit is not None:
+                entry['cpl'], entry['cpl_depth'] = hit
+            elif (node.get('sel_method') == 'stockfish'
+                  and node.get('xc0_move') == node.get('move_played')):
+                entry['cpl'] = 0
+                entry['cpl_depth'] = None
+
+            if reviewable:
+                for k in ('sims', 'time', 'avg_depth', 'max_depth',
+                          'children_visited', 'total_children', 'pv'):
+                    if k in node:
+                        entry[k] = node[k]
+                entry['candidate_moves'] = node.get('candidate_moves', [])
+
+            out_plies.append(entry)
+
+        cpl_vals = [p['cpl'] for p in out_plies if 'cpl' in p]
+        n = len(cpl_vals)
+        header['reviewable'] = reviewable
+        header['mean_cpl'] = round(sum(cpl_vals) / n, 4) if n else None
+        header['mean_bmr'] = round(sum([1 for c in cpl_vals if c == 0]) / n, 4) if n else None
+
+        record = {'header': header, 'plies': out_plies}
+        out_path = os.path.join(self.config.game_dir, header['game_id'] + '.pkl.gz')
+        with gzip.open(out_path + '.tmp', 'wb', compresslevel=6) as f:
+            pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(out_path + '.tmp', out_path)
+
+        self.append_final_index(header, out_path)
+
+        old_pkl = game_state.get('pkl_path')
+        if old_pkl and old_pkl.lower().endswith('.pkl') and os.path.exists(old_pkl):
+            os.remove(old_pkl)
+        return record
+
+    def append_final_index(self, header, pkl_gz_path):
+        """Append the closed-out game_index.json row: the header plus the final
+        pkl path, beat_sf, and analysis stats. This row is the done marker."""
+        beat_sf = False
+        if header.get('vs_stockfish'):
+            result = header.get('result', 0)
+            sf_white = header.get('stockfish_color')
+            beat_sf = bool((result > 0 and not sf_white) or (result < 0 and sf_white))
+
+        row = {**header, 'pkl_file': pkl_gz_path, 'beat_sf': beat_sf}
+        with open(self.config.game_index_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row, default=str) + '\n')
+            f.flush()
 
     def accumulate_blunder_stats(self, missed_mate, is_blunder, true_blunder,
                                  is_inaccuracy, best_cp, played_cp, cpl, z_stm):
@@ -2510,6 +2592,14 @@ def z_to_wdl(z_stm):
     return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
+def blend_wdl_stm(z_stm, best_wdl_stm):
+    """Blend the game result and search WDL, both in STM perspective."""
+    z_wdl = z_to_wdl(z_stm)
+    if best_wdl_stm is None:
+        return z_wdl
+    return (0.5 * z_wdl + 0.5 * np.asarray(best_wdl_stm, dtype=np.float32))
+
+
 def blend_wdl(z_stm, best_wdl_white_pov, is_white):
     """50% game result (one-hot), 50% Xerces search WDL."""
     z_wdl = z_to_wdl(z_stm)
@@ -2522,6 +2612,36 @@ def blend_wdl(z_stm, best_wdl_white_pov, is_white):
         bw = z_wdl
 
     return (0.5 * z_wdl + 0.5 * bw).astype(np.float32)
+
+
+REVIEW_RATE = 0.005
+
+
+def policy_from_raw_visits(raw_visits, prior_clip_max):
+    indices, visits = raw_visits
+    counts = np.maximum(np.asarray(visits, dtype=np.float32), 1)
+    counts /= counts.sum()
+    probs = blend_to_uniform(counts, 1e-6, prior_clip_max)
+    return list(zip(np.asarray(indices).tolist(), probs.tolist()))
+
+
+def build_policy_sparse(board, candidate_moves, prior_clip_max):
+    """Blended sparse training policy: floor every legal move to 1 visit,
+    normalize, blend toward uniform (clip-only via 1e-6 eps), keep legal entries.
+    Returns [(index, probability)] with float32 precision."""
+    vmap = {c['uci']: c['visits'] for c in candidate_moves}
+    for u in board.legal_moves():
+        vmap[u] = max(vmap.get(u, 0), 1)
+    ucis = list(vmap.keys())
+    counts = np.array([vmap[u] for u in ucis], dtype=np.float32)
+    counts /= counts.sum()
+    # 1e-6 eps: clip-only, no uniform floor unless prior_clip_max forces it
+    counts = blend_to_uniform(counts, 1e-6, prior_clip_max)
+    policy = np.zeros(1858, dtype=np.float32)
+    for ci, prob in zip(board.moves_to_indices(ucis), counts):
+        policy[ci] += prob
+    nz = np.nonzero(policy)[0]
+    return list(zip(nz.tolist(), policy[nz].tolist()))
 
 
 def combine_analysis_staging(run_dir):

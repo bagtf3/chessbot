@@ -703,7 +703,6 @@ class Rescorer(object):
             tr['z_wdl'] = z_to_wdl(result if turn else -result)
             tr['wdl_target'] = blend_wdl_stm(result if turn else -result,
                                               tr.get('best_wdl'))
-            tr['training_route'] = 'excluded'
             cm = tr.get('candidate_moves', [])
             if cm:
                 tr['policy'] = policy_from_raw_visits(tr['raw_visits'], cfg.prior_clip_max)
@@ -1825,12 +1824,10 @@ class Rescorer(object):
                 # already queued as a pool candidate, counted there, and
                 # carrying the pending record this path could not supply
                 if aux['sent_to_lc0']:
-                    node['training_route'] = 'lc0'
                     continue
                 spec = self.queue_lc0_replay(
                     game_data, aux, {'xc0_cpl': aux['blend_cpl']})
                 if spec is not None:
-                    node['training_route'] = 'lc0'
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
                     continue
@@ -1848,8 +1845,6 @@ class Rescorer(object):
                 scw['blended'] += 1
 
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
-            node['policy'] = list(zip(entry[2][0].tolist(), entry[2][1].tolist()))
-            node['training_route'] = 'xc0'
             self.live_buffer.append(entry, okey)
             sc['accepted'] += 1
             scw['accepted'] += 1
@@ -1923,7 +1918,7 @@ class Rescorer(object):
         for i, node in enumerate(plies_in):
             entry = {k: node[k] for k in (
                 'stm', 'move_played', 'z_wdl', 'wdl_target', 'policy',
-                'kl', 'kl_value', 'training_route')}
+                'kl', 'kl_value')}
             for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
                       'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits'):
                 entry[k] = node.get(k)

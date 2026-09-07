@@ -446,7 +446,6 @@ class ChessGame(object):
         }
         rest = {
             "run_tag": cfg.run_tag,
-            "run_number": cfg.run_number,
             "init_fen": self.init_fen,
             "start_ply": len(self.preopen_moves_uci),
             "preopen_moves_uci": self.preopen_moves_uci,

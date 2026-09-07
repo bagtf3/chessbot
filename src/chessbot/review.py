@@ -1592,7 +1592,8 @@ def load_game_index(path=None):
         path = os.path.join(path, "game_index.json")
     if not os.path.exists(path):
         return []
-    return load_json(path)
+    rows = load_json(path)
+    return [rows] if isinstance(rows, dict) else rows
 
 
 def analyze_with_rank(move, board, limit, eng):

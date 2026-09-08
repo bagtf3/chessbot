@@ -197,7 +197,8 @@ class Config(object):
 
         self.primary_buffer_dir = os.path.join(self.run_dir, "primary_buffer")
         self.replay_buffer_dir = os.path.join(self.run_dir, "replay_buffer")
-        self.historic_dir = os.getenv("BOOTSTRAP_TFREC_DIR", "")
+        self.historic_dir = os.getenv("BOOTSTRAP_PKL_GZ", "")
+        self.historic_cold_dir = os.getenv("HISTORIC_COLD_DIR", "")
 
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir

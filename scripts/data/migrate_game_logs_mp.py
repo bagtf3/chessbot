@@ -556,8 +556,8 @@ def count_games(run_tag):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--run_tags', nargs='+', required=True)
-    ap.add_argument('--max-workers', type=int, default=0, dest='max_workers',
-                    help='max concurrent worker processes (default: one per run_tag)')
+    ap.add_argument('--max-workers', type=int, default=6, dest='max_workers',
+                    help='max concurrent worker processes')
     ap.add_argument('--review_rate', type=float, default=0.005)
     ap.add_argument('--prior-max-clip', type=float, default=None, dest='prior_max_clip')
     ap.add_argument('--lc0_model', default='',

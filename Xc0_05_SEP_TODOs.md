@@ -24,12 +24,19 @@ pyfastchess rebuilt (nn_wdl_stm / min_sims / sim_budget getters live).
 - `blend_to_uniform` exists (utils.py) with no callers yet. Wire it into #2's
   policy-target build so retrain doesn't sharpen. `raw_visits` stays un-blended.
 
-## 8. Historic -> cold storage drain (HDD)  [UNDECIDED -- may not do]
-- After 4 historic shards sampled, move them to HDD cold storage.
-- Draining historic = signal it's time for a new re-pretrain.
-- Overturns the "NEVER delete/modify historic" rule in CLAUDE.md + memory --
-  update those if this lands.
-- Budget: 13,081 / 4 = ~3,270 retrains before depletion. Riskiest; defer.
+## 8. Historic -> cold storage drain (HDD)  [DONE]
+- `rb.cold_store_files` (shutil.move, cross-drive) retires the 4 consumed
+  historic shards after a successful retrain, in poll_retrain's `if ok:` block
+  alongside the existing primary->replay rotation. Skipped when
+  `historic_cold_dir` is empty, so the drain is opt-in via env.
+- Env: `BOOTSTRAP_PKL_GZ` (was BOOTSTRAP_TFREC_DIR -- historic is pkl.gz now)
+  -> training_data/pretrain_shards; `HISTORIC_COLD_DIR` ->
+  D:/chessbot_cold/training_data/18m_gen_pretraining_shards.
+- Draining historic = signal it's time for a new re-pretrain. Documented in
+  CLAUDE.md's Training Loop section. (The "NEVER delete/modify historic" rule
+  this item claimed to overturn was never actually in CLAUDE.md or memory.)
+- Budget: 13,081 / 4 = ~3,270 retrains before depletion. `sample_files` raises
+  once fewer than 4 remain, which is the intended loud stop.
 
 ## 9. Auto-archive the pretrain eval CSV  [DONE]
 - `rescore.migrate_pretrain_progress(run_dir)` freezes the whole pretrain

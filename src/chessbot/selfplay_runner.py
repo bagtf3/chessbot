@@ -63,7 +63,8 @@ def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
         cfg, recent_games_q, telemetry_q, 
         msg_q, game_q=game_queue
     ) as looper:
-        looper.run(stop_ev)
+        # lc0 is demand-driven and idles far longer between teacher probes
+        looper.run(stop_ev, wait_time=1200 if cfg.id.startswith("lc0") else 600)
 
 
 def drain_queue(q):
@@ -978,6 +979,7 @@ class SelfPlayRunner:
         self.retrain_worker = {
             "p": p, "msg_q": msg_q, "result_q": result_q,
             "replay_files": replay_files, "primary_files": primary_sample,
+            "historic_files": historic_files,
         }
         print(f"[retrain] launched at {len(primary)}/"
               f"{rb.PRIMARY_TRIGGER_SHARDS}", flush=True)
@@ -1035,6 +1037,13 @@ class SelfPlayRunner:
                           self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
+            if self.cfg.historic_cold_dir:
+                cold = rb.cold_store_files(
+                    self.retrain_worker["historic_files"],
+                    self.cfg.historic_cold_dir)
+                left = len(rb.list_shard_files(self.cfg.historic_dir))
+                print(f"[retrain] {len(cold)} historic -> cold storage, "
+                      f"{left} left", flush=True)
         else:
             print(f"[retrain] failed: {result.get('error')}", flush=True)
 

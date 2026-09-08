@@ -1,23 +1,28 @@
 """Build shuffled, pretrain-ready 10240 shards from every data source.
 
 Sources: the 19 run_tag per-game pkls (game_logs_tmp else game_logs), lc0_pkl
-per-game pkls, and the lc0_distilled_positions / lc0_BRP shard files. The parent
+per-game pkls, and the lc0_distilled_positions shard files. The parent
 gathers every file across sources, shuffles the mega-list, and round-robins it to
 4 workers (each gets a random cross-section of all sources). Each worker streams
 its files -- read, CPL<=30 filter, opening accumulator, per-file shuffle, scatter
 across 16 buffers -- and flushes a buffer only once it passes 40960, drawing 10240
 at random for hyper-mixing. Reads and writes are async within each worker.
 
+Whole-game exclusion (mean-CPL + collar) comes from the {run_tag}.json keep/exclude
+lists in --filter-dir, built by scan_game_filters_mp.py; excluded games are dropped
+before dispatch. The --cpl-max here is the separate per-ply CPL cap.
+
 Close-out: each worker drains its buffers to full shards and writes the sub-10240
 remainder to a _tail_<wid>.pkl.gz; the parent merges the tails into a final shard.
 
 Usage:
-    python scripts/data/build_pretrain_shards.py [--out-dir DIR] [--workers 4]
-        [--npz PATH] [--cpl-max 30]
+    python scripts/data/build_pretrain_shards.py [--out-dir DIR] [--workers 5]
+        [--npz PATH] [--cpl-max 10] [--filter-dir DIR]
 """
 import argparse
 import glob
 import gzip
+import json
 import multiprocessing as mp
 import os
 import pickle
@@ -42,6 +47,7 @@ N_BUFFERS   = 16
 CPL_MAX     = 30
 SRC         = "pretraining"
 DEFAULT_NPZ = os.path.join(SP_DIR, "18m_10c6t_SWA_selfplay6", "opening_counts.npz")
+FILTER_DIR  = os.path.join(TD, "pretrain_filter_lists")
 
 MERGE_BANDS = [(2000, 128), (501, 64), (201, 32), (61, 16), (31, 4), (10, 2)]
 
@@ -232,13 +238,36 @@ def run_tag_dir(tag):
     return os.path.join(rd, 'game_logs')
 
 
-def gather_files():
+def load_exclude_set(filter_dir):
+    """Union of every {run_tag}.json 'exclude' list produced by the pre-scan."""
+    excl = set()
+    if os.path.isdir(filter_dir):
+        for p in glob.glob(os.path.join(filter_dir, '*.json')):
+            with open(p) as f:
+                excl.update(json.load(f).get('exclude', []))
+    return excl
+
+
+def game_id_from_path(path):
+    b = os.path.basename(path)
+    for suf in ('.pkl.gz', '.pkl'):
+        if b.endswith(suf):
+            b = b[:-len(suf)]
+            break
+    return b[:-4] if b.endswith('_log') else b
+
+
+def gather_files(exclude):
     files = []
+    n_excl = 0
     for tag in RUN_TAGS:
         d = run_tag_dir(tag)
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if f.endswith('.pkl.gz'):
+                    if game_id_from_path(f) in exclude:
+                        n_excl += 1
+                        continue
                     files.append((os.path.join(d, f), 'pergame'))
 
     lc0_pkl = os.path.join(TD, 'lc0_pkl')
@@ -250,22 +279,24 @@ def gather_files():
                     if f.endswith('.pkl.gz'):
                         files.append((os.path.join(dd, f), 'pergame'))
 
-    for name in ('lc0_distilled_positions', 'lc0_BRP'):
+    for name in ('lc0_distilled_positions',):
         d = os.path.join(TD, name)
         if os.path.isdir(d):
             for f in os.listdir(d):
                 if f.endswith('.pkl.gz'):
                     files.append((os.path.join(d, f), 'shard'))
-    return files
+    return files, n_excl
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out-dir', default=os.path.join(TD, 'pretrain_shards'),
                     dest='out_dir')
-    ap.add_argument('--workers', type=int, default=4)
+    ap.add_argument('--workers', type=int, default=5)
     ap.add_argument('--npz', default=DEFAULT_NPZ)
     ap.add_argument('--cpl-max', type=int, default=CPL_MAX, dest='cpl_max')
+    ap.add_argument('--filter-dir', default=FILTER_DIR, dest='filter_dir',
+                    help="dir of {run_tag}.json keep/exclude lists; '' to disable")
     ap.add_argument('--limit', type=int, default=0,
                     help="cap total input files (0 = all); for a quick real run")
     ap.add_argument('--seed', type=int, default=0)
@@ -274,11 +305,16 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     random.seed(args.seed)
 
+    exclude = load_exclude_set(args.filter_dir) if args.filter_dir else set()
+    print(f"[main] {len(exclude):,} game_ids on the exclude list "
+          f"({args.filter_dir or 'disabled'})", flush=True)
+
     print("[main] gathering files across all sources...", flush=True)
-    files = gather_files()
+    files, n_excl = gather_files(exclude)
     n_shard = sum(1 for f in files if f[1] == 'shard')
     print(f"[main] {len(files):,} files ({n_shard:,} shard-files, "
-          f"{len(files)-n_shard:,} per-game)", flush=True)
+          f"{len(files)-n_shard:,} per-game); {n_excl:,} per-game files "
+          f"skipped by filter list", flush=True)
 
     random.shuffle(files)
     if args.limit and args.limit < len(files):

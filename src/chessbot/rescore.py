@@ -333,6 +333,8 @@ class Rescorer(object):
 
         self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL
         self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL
+        self.kl_value_q50 = 0.0  # EMA median of eligible-ply best_wdl||root_wdl_nn KL
+        self.kl_value_q80 = 0.0  # EMA 80th percentile of the same
 
         self.intake = deque()
         self.blunder_replay_intake = deque()
@@ -600,7 +602,7 @@ class Rescorer(object):
         policy = np.zeros(1858, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, 0.0, self.config.prior_clip_max)
+        pi = np.clip(pi, 0.0, 0.95)   # train-target clip, decoupled from search-side cfg
         pi = pi / pi.sum()
         for idx, p in zip(indices, pi):
             policy[idx] += p
@@ -705,7 +707,7 @@ class Rescorer(object):
                                               tr.get('best_wdl'))
             cm = tr.get('candidate_moves', [])
             if cm:
-                tr['policy'] = policy_from_raw_visits(tr['raw_visits'], cfg.prior_clip_max)
+                tr['policy'] = policy_from_raw_visits(tr['raw_visits'], 0.95)
                 tr['kl'] = float(kl_divergence(
                     [c['visits'] for c in cm], [c['P'] for c in cm]))
             else:
@@ -1386,10 +1388,11 @@ class Rescorer(object):
             write_pkl_gz_shard(shard, new_shard_path(LC0_BRP_SHARD_DIR))
 
     def add_lc0_replay_training_example(self, board, tr):
-        """Teacher visits straight to policy: no clip, no uniform_eps, just a
-        1-visit floor so every legal move carries mass."""
+        """Teacher visits to policy: 1-visit floor on every legal move, then the
+        unified blend_to_uniform(prior_clip_max), same as every other target."""
         cm = tr.get('candidate_moves') or []
-        if not cm:
+        wdl = tr.get('best_wdl')
+        if not cm or wdl is None:
             return False
 
         vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
@@ -1397,16 +1400,14 @@ class Rescorer(object):
             vmap.setdefault(u, 1)
 
         ucis = list(vmap)
-        total = float(sum(vmap.values()))
+        counts = np.array([vmap[u] for u in ucis], dtype=np.float32)
+        counts /= counts.sum()
+        counts = blend_to_uniform(counts, 1e-6, 0.95)   # train-target clip
         policy = np.zeros(1858, dtype=np.float32)
-        for idx, u in zip(board.moves_to_indices(ucis), ucis):
-            policy[idx] += vmap[u] / total
+        for idx, p in zip(board.moves_to_indices(ucis), counts):
+            policy[idx] += p
 
-        wdl = tr.get('best_wdl')
-        if wdl is None:
-            return False
         Y = np.array(wdl, dtype=np.float32)
-
         record = (self.encode_board(board), None, sparsify_policy(policy),
                   Y, 1.0, 1.0, 'lc0')
         self.live_buffer.append(record, REWEIGHT_INELIGIBLE)
@@ -1457,7 +1458,7 @@ class Rescorer(object):
         policy = np.zeros(1858, dtype=np.float32)
         pi = np.array(vis, dtype=np.float32)
         pi = pi / pi.sum()
-        pi = blend_to_uniform(pi, 1e-6, cfg.prior_clip_max)
+        pi = blend_to_uniform(pi, 1e-6, 0.95)   # train-target clip
         for idx, p in zip(board.moves_to_indices(mvs), pi):
             policy[idx] += p
 
@@ -1511,6 +1512,7 @@ class Rescorer(object):
             for u in ucis
         ], dtype=np.float32)
         blended = blended / blended.sum()
+        blended = blend_to_uniform(blended, 1e-6, 0.95)   # train-target clip
 
         indices = board.moves_to_indices(ucis)
         policy = np.zeros(1858, dtype=np.float32)
@@ -1759,6 +1761,12 @@ class Rescorer(object):
             rows[-1][-2] = kl
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
             self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
+            klv = tr.get('kl_value')
+            if klv is not None:
+                self.kl_value_q50 = update_ema_quantile(
+                    self.kl_value_q50, klv, 0.5, cfg.kl_quantile_lr)
+                self.kl_value_q80 = update_ema_quantile(
+                    self.kl_value_q80, klv, 0.8, cfg.kl_quantile_lr)
             if kl_eligible:
                 if kl >= self.kl_q80:
                     pwht *= cfg.kl_boost_p80_mult
@@ -2095,6 +2103,8 @@ class Rescorer(object):
         print(tb)
         print(f"{RS} KL running medians: "
               f"q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
+        print(f"{RS} KL_value running medians: "
+              f"q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}

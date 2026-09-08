@@ -254,7 +254,7 @@ class GameLooper(object):
             self.active_games.append(cg)
             self.forest.add_tree(cg.tree)
 
-    def run(self, stop_event=None):
+    def run(self, stop_event=None, wait_time=600):
         """
         Main loop. Each round: for each game either let SF move (if applicable)
         or run MCTS step (collect/predict/apply).
@@ -289,8 +289,8 @@ class GameLooper(object):
             if not self.active_games:
                 if self.stop_at_empty:
                     break
-                # queue transiently empty — wait up to 3min for parent to refill
-                for _ in range(360):
+                # queue transiently empty -- wait for the parent to refill
+                for _ in range(wait_time):
                     time.sleep(0.5)
                     self.pull_from_queue()
                     if self.active_games:

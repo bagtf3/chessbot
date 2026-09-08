@@ -84,6 +84,10 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, dropout=0.01, pre_blocks=10, tx_blocks=6,
         ff_dim=1024, num_heads=8, xc0h_K=6,
     ),
+    "precond-mha-10c6t-d256-wdl3": dict(
+        conv_filters=256, dropout=0.02, pre_blocks=10, tx_blocks=6,
+        ff_dim=1024, num_heads=8, xc0h_K=6, wdl_split=True,
+    ),
     "precond-mha-8c8t-d256": dict(
         conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=8,
         ff_dim=1024, num_heads=8, xc0h_K=6,
@@ -1273,6 +1277,7 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
     PDH       = 256
     XC0H_K    = cfg.get("xc0h_K")
     xc0h_input = XC0H_K is not None
+    wdl_split = cfg.get("wdl_split", False)   # 3 independent W/D/L heads off acc0
 
     sl_idx = torch.from_numpy(
         pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
@@ -1323,8 +1328,17 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             self.blocks   = nn.ModuleList([MhaTxBlock() for _ in range(tx_blocks)])
             self.trunk_ln = make_rms1d(D)
 
-            self.wdl_w1 = nn.Linear(D, D // 2, bias=True)
-            self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
+            if wdl_split:
+                vh = 64   # per-head readout width; gives each W/D/L head real capacity
+                self.wdl_hw = nn.Linear(D, vh, bias=True)
+                self.wdl_hd = nn.Linear(D, vh, bias=True)
+                self.wdl_hl = nn.Linear(D, vh, bias=True)
+                self.wdl_ow = nn.Linear(vh, 1, bias=False)
+                self.wdl_od = nn.Linear(vh, 1, bias=False)
+                self.wdl_ol = nn.Linear(vh, 1, bias=False)
+            else:
+                self.wdl_w1 = nn.Linear(D, D // 2, bias=True)
+                self.wdl_w2 = nn.Linear(D // 2, 3, bias=False)
 
             # SmartGate reads acc(1) concat acc(6), so it works at 2*D
             # regardless of how narrow the trunk itself runs
@@ -1376,15 +1390,26 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
                 x = blk(x)
             x = self.trunk_ln(x)                                           # [B, 72, D]
 
-            wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))            # [B, 3]
+            if wdl_split:
+                w = self.wdl_ow(F.gelu(self.wdl_hw(x[:, 64, :])))          # acc0
+                d = self.wdl_od(F.gelu(self.wdl_hd(x[:, 65, :])))          # acc1
+                l = self.wdl_ol(F.gelu(self.wdl_hl(x[:, 66, :])))          # acc2
+                wdl = torch.cat([w, d, l], dim=-1)                         # [B, 3]
+            else:
+                wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))         # [B, 3]
 
-            gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)       # [B, 2D]
+            if wdl_split:
+                # acc3 own + acc4 shared; from=acc4,acc5,acc6; to=acc4,acc5,acc7
+                gi       = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)    # [B, 2D]
+                from_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:71, :]], dim=1)
+                to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 71:72, :]], dim=1)
+            else:
+                gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)    # [B, 2D]
+                from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
+                to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
             h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
             g        = gi + self.gate_drop(self.gate_w_down(h))
             gate_raw = self.gate_out(self.gate_norm(g))                     # [B, 1858]
-
-            from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
-            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
 
             # from_proj/to_proj and from_out/to_out are residual-wrapped so a
             # gradient path survives regardless of what those weights do --
@@ -2184,6 +2209,7 @@ PT_BUILDERS: dict[str, object] = {
     "precond-mha-8c4t-d384":                build_pt_precond_signed,
     "precond-mha-8c6t-d256":                build_pt_precond_addpos,
     "precond-mha-10c6t-d256":               build_pt_precond_addpos,
+    "precond-mha-10c6t-d256-wdl3":          build_pt_precond_addpos,
     "precond-mha-8c8t-d256":                build_pt_precond_addpos,
     "conv-pure":                            build_pt_conv_pure,
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,

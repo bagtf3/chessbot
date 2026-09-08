@@ -34,6 +34,7 @@ import gzip
 import os
 import pickle
 import random
+import shutil
 import time
 import uuid
 
@@ -265,6 +266,22 @@ def move_files(paths, dest_dir):
 def discard_files(paths):
     for p in paths:
         os.remove(p)
+
+
+def cold_store_files(paths, dest_dir):
+    """Retire consumed historic shards to cold storage. shutil.move, not
+    os.replace: cold storage is a different drive, which os.replace cannot
+    cross. Skips a shard already sitting in the destination."""
+    os.makedirs(dest_dir, exist_ok=True)
+    moved = []
+    for p in paths:
+        dest = os.path.join(dest_dir, os.path.basename(p))
+        if os.path.exists(dest):
+            os.remove(p)
+            continue
+        shutil.move(p, dest)
+        moved.append(dest)
+    return moved
 
 
 def seed_replay_buffer(historic_dir, replay_dir, n_files=REPLAY_SEED_SHARDS):

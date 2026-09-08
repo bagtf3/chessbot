@@ -9,7 +9,7 @@ tfrecord trainer; this is meant to replace it once proven.
 
 Usage:
     python scripts/train/bootstrap_model_async_sparse_pkl.py
-        [--model precond-mha-10c6t-d256] [--run-tag TAG | --run-dir DIR]
+        [--model precond-mha-10c6t-d256-wdl3] [--run-tag TAG | --run-dir DIR]
         [--shard-dir DIR] [--max-epoch 3501] [--val-shards 20] [--swa]
 """
 from __future__ import annotations
@@ -40,21 +40,22 @@ from chessbot.replay_buffer import POLICY_DIM
 
 PT_BATCH_SIZE      = 512
 PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
-PT_ADAM_BETA2      = 0.999
+PT_ADAM_BETA2      = 0.95
+PT_WEIGHT_DECAY    = 0.008   # AdamW decoupled; applied to 2D+ weights only
 
 BUFFER_CAP     = 256_000       # shuffle pool high-water mark
 REFILL_BAND    = 56_000        # refill once the pool drains below high - band (-> 200k)
 VAL_BUFFER_CAP = 96_000
 
-# cosine LR: floor raised to 1e-4 (was 5e-5), ceiling unchanged
-LR_MIN = 1e-4
-LR_MAX = 3e-4
+# cosine LR floor and ceiling
+LR_MIN = 5e-5
+LR_MAX = 6e-4
 
 CHECKPOINT_EVERY = 100
 SWA_WINDOW = 100
 SWA_EVERY  = 20
 
-DEFAULT_MODEL     = "precond-mha-10c6t-d256"
+DEFAULT_MODEL     = "precond-mha-10c6t-d256-wdl3"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
 DEFAULT_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
@@ -213,8 +214,16 @@ def get_resume_epoch(run_dir, name, progress_file, unified=False):
 
 def make_adam(model, lr):
     import torch
-    return torch.optim.Adam(model.parameters(), lr=lr,
-                            betas=(0.9, PT_ADAM_BETA2), weight_decay=1e-6)
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.ndim >= 2 else no_decay).append(p)   # no decay on bias/norm
+    groups = [
+        {"params": decay,    "weight_decay": PT_WEIGHT_DECAY},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, PT_ADAM_BETA2))
 
 
 def load_pt_model(path, name, device, lr):
@@ -249,8 +258,7 @@ def pt_clipnorm_for_epoch(ep):
     if ep < 10:  return 1.0
     if ep < 20:  return 2.5
     if ep < 30:  return 5.0
-    if ep < 40:  return 10.0
-    return 20.0
+    return 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +863,11 @@ def main():
                 swa_ts = os.path.join(run_dir, f"{run_tag}_model_SWA.ts")
                 export_ts(swa_model, swa_ts, arch=arch_name, trace=False)
                 print(f"[swa] averaged {len(found)} snapshots -> {swa_pt}")
+
+                # SWA becomes the trainer lineage selfplay loads and retrain
+                # resumes from; else the non-averaged final model plays.
+                export_ts(swa_model, ts_path, arch=arch_name, trace=False)
+                print(f"[swa] trainer lineage set to SWA -> {pt_path}")
                 final_ckpt = ckpt_path(run_dir, name, last_ckpt)
                 if os.path.exists(swa_pt):
                     for p in found:

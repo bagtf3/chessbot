@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import uuid
 from time import time as _now
 
@@ -13,7 +12,7 @@ from pyfastchess import terminal_value_white_pov
 
 from chessbot import ENDGAME_LOC
 from chessbot.config import XC0H_K
-from chessbot.utils import kl_divergence, rnd
+from chessbot.utils import rnd
 
 POLICY_DIM = 1858
 
@@ -594,31 +593,6 @@ class ChessGame(object):
 
         self.tree_data[self.plies] = data
 
-        es_rows = self.tree.es_debug_rows()
-        if es_rows:
-            visits_list = [cd.N for cd in details]
-            priors_list = [cd.prior for cd in details]
-            kl = kl_divergence(visits_list, priors_list)
-            if random.random() < 0.10 or kl > 0.75:
-                self.dump_jsd_debug(turn, sims, self.tree.sim_stop_reason, es_rows)
-
-    def dump_jsd_debug(self, turn, final_sims, final_stop_reason, es_rows):
-        out_dir = os.path.join(self.config.run_dir, "jsd_debug")
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{self.game_id}.jsonl")
-
-        with open(out_path, "a") as f:
-            for row in es_rows:
-                line = {
-                    "game_id": self.game_id, "ply": self.plies, "stm": turn,
-                    "final_sims": final_sims, "final_stop_reason": final_stop_reason,
-                    "sims": row.sims, "jsd": rnd(row.jsd, 6),
-                    "top_uci": row.top_uci, "second_uci": row.second_uci,
-                    "delta_12": row.delta_12, "dQ12": rnd(row.dQ12, 4),
-                    "Q1": rnd(row.Q1, 4), "Qema1": rnd(row.Qema1, 4),
-                }
-                f.write(json.dumps(line) + "\n")
-    
     def set_stockfish_result(self, res_tup):
         self.sf_res_tup = res_tup
         self.sf_ready = True

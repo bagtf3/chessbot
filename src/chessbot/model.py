@@ -86,7 +86,7 @@ VARIANTS: dict[str, dict] = {
     ),
     "precond-mha-10c6t-d256-wdl3": dict(
         conv_filters=256, dropout=0.02, pre_blocks=10, tx_blocks=6,
-        ff_dim=1024, num_heads=8, xc0h_K=6, wdl_split=True,
+        ff_dim=1024, num_heads=8, xc0h_K=6, wdl_split=True, attn_impl="sdpa",
     ),
     "precond-mha-8c8t-d256": dict(
         conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=8,
@@ -142,8 +142,10 @@ def make_rms2d(ch: int, eps: float = 1e-6):
             self.w = nn.Parameter(torch.ones(ch))
 
         def forward(self, x):
-            r = torch.rsqrt(x.pow(2).mean(1, keepdim=True) + eps)
-            return x * r * self.w.view(1, -1, 1, 1)
+            x = x.clamp(-250.0, 250.0)
+            xf = x.float()
+            r = torch.rsqrt(xf.pow(2).mean(1, keepdim=True) + eps)
+            return (xf * r * self.w.float().view(1, -1, 1, 1)).to(x.dtype)
 
     return Rms2d()
 
@@ -160,7 +162,10 @@ def make_rms1d(d: int, eps: float = 1e-6):
             self.scale = nn.Parameter(torch.ones(d))
 
         def forward(self, x):
-            return x / x.pow(2).mean(-1, keepdim=True).add(eps).sqrt() * self.scale
+            x = x.clamp(-250.0, 250.0)
+            xf = x.float()
+            y = xf / xf.pow(2).mean(-1, keepdim=True).add(eps).sqrt()
+            return (y * self.scale.float()).to(x.dtype)
 
     return Rms1d()
 
@@ -1278,6 +1283,11 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
     XC0H_K    = cfg.get("xc0h_K")
     xc0h_input = XC0H_K is not None
     wdl_split = cfg.get("wdl_split", False)   # 3 independent W/D/L heads off acc0
+    attn_impl = cfg.get("attn_impl", "mha")   # "mha" (nn.MultiheadAttention) or "sdpa"
+    norm_impl = cfg.get("norm_impl", "rms")   # "rms" or "ln" (nn.LayerNorm, fusable)
+    mk1d = nn.LayerNorm if norm_impl == "ln" else make_rms1d
+    mk2d = make_ln2d    if norm_impl == "ln" else make_rms2d
+    stem_norm = "layernorm" if norm_impl == "ln" else "rms"
 
     sl_idx = torch.from_numpy(
         pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
@@ -1285,7 +1295,7 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
     class ConvBlock(nn.Module):
         def __init__(self, prenorm=True):
             super().__init__()
-            self.ln = make_rms2d(D) if prenorm else None
+            self.ln = mk2d(D) if prenorm else None
             self.c1 = nn.Conv2d(D, D, 3, padding=1, bias=True)
             self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
 
@@ -1293,20 +1303,45 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             h = self.ln(x) if self.ln is not None else x
             return x + F.leaky_relu(self.c2(F.leaky_relu(self.c1(h), 0.01)), 0.01)
 
+    class SdpaMHA(nn.Module):
+        def __init__(self, dim, heads):
+            super().__init__()
+            self.h  = heads
+            self.dh = dim // heads
+            self.q  = nn.Linear(dim, dim, bias=True)
+            self.k  = nn.Linear(dim, dim, bias=True)
+            self.v  = nn.Linear(dim, dim, bias=True)
+            self.o  = nn.Linear(dim, dim, bias=True)
+
+        def forward(self, q_in, kv_in):
+            B, Sq, dim = q_in.shape
+            Sk = kv_in.shape[1]
+            q = self.q(q_in).view(B, Sq, self.h, self.dh).transpose(1, 2)
+            k = self.k(kv_in).view(B, Sk, self.h, self.dh).transpose(1, 2)
+            v = self.v(kv_in).view(B, Sk, self.h, self.dh).transpose(1, 2)
+            a = F.scaled_dot_product_attention(q, k, v)
+            return self.o(a.transpose(1, 2).reshape(B, Sq, dim))
+
     class MhaTxBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.ln1  = make_rms1d(D)
-            self.attn = nn.MultiheadAttention(D, nh, dropout=0.0,
-                                              batch_first=True, bias=True)
+            self.ln1  = mk1d(D)
+            if attn_impl == "sdpa":
+                self.attn = SdpaMHA(D, nh)
+            else:
+                self.attn = nn.MultiheadAttention(D, nh, dropout=0.0,
+                                                  batch_first=True, bias=True)
             self.drop = nn.Dropout(dr)
-            self.ln2  = make_rms1d(D)
+            self.ln2  = mk1d(D)
             self.ff1  = nn.Linear(D, ff_dim, bias=True)
             self.ff2  = nn.Linear(ff_dim, D, bias=False)
 
         def forward(self, x):
             n = self.ln1(x)
-            h, _ = self.attn(n, n, n, need_weights=False)
+            if attn_impl == "sdpa":
+                h = self.attn(n, n)
+            else:
+                h, _ = self.attn(n, n, n, need_weights=False)
             x = x + self.drop(h)
             return x + self.ff2(F.gelu(self.ff1(self.ln2(x))))
 
@@ -1314,7 +1349,7 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
         def __init__(self):
             super().__init__()
             if xc0h_input:
-                attach_xc0h_stem(self, D, XC0H_K, norm_type="rms")
+                attach_xc0h_stem(self, D, XC0H_K, norm_type=stem_norm)
             else:
                 self.emb = nn.Embedding(VOCAB_SIZE, D)
 
@@ -1326,7 +1361,7 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
 
             self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
             self.blocks   = nn.ModuleList([MhaTxBlock() for _ in range(tx_blocks)])
-            self.trunk_ln = make_rms1d(D)
+            self.trunk_ln = mk1d(D)
 
             if wdl_split:
                 vh = 64   # per-head readout width; gives each W/D/L head real capacity
@@ -1348,21 +1383,27 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             self.gate_w_down = nn.Linear(GD * 3 // 2, GD, bias=False)
             self.gate_drop   = nn.Dropout(dr)
             nn.init.zeros_(self.gate_w_down.weight)
-            self.gate_norm = make_rms1d(GD)
+            self.gate_norm = mk1d(GD)
             self.gate_out  = nn.Linear(GD, 1858, bias=True)
             nn.init.zeros_(self.gate_out.weight)
             nn.init.constant_(self.gate_out.bias, 4.0)
 
             self.from_proj = nn.Linear(D, PDH, bias=True)
-            self.from_ln   = make_rms1d(PDH)
-            self.from_mha  = nn.MultiheadAttention(PDH, 4, dropout=0.0,
-                                                   batch_first=True, bias=True)
+            self.from_ln   = mk1d(PDH)
+            if attn_impl == "sdpa":
+                self.from_mha = SdpaMHA(PDH, 4)
+            else:
+                self.from_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                      batch_first=True, bias=True)
             self.from_out  = nn.Linear(PDH, PDH, bias=False)
 
             self.to_proj   = nn.Linear(D, PDH, bias=True)
-            self.to_ln     = make_rms1d(PDH)
-            self.to_mha    = nn.MultiheadAttention(PDH, 4, dropout=0.0,
-                                                   batch_first=True, bias=True)
+            self.to_ln     = mk1d(PDH)
+            if attn_impl == "sdpa":
+                self.to_mha = SdpaMHA(PDH, 4)
+            else:
+                self.to_mha = nn.MultiheadAttention(PDH, 4, dropout=0.0,
+                                                    batch_first=True, bias=True)
             self.to_out    = nn.Linear(PDH, PDH, bias=False)
 
             self.scale      = 1.0 / math.sqrt(PDH)
@@ -1399,16 +1440,19 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
                 wdl = self.wdl_w2(F.gelu(self.wdl_w1(x[:, 64, :])))         # [B, 3]
 
             if wdl_split:
-                # acc3 own + acc4 shared; from=acc4,acc5,acc6; to=acc4,acc5,acc7
-                gi       = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)    # [B, 2D]
+                gi       = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)      # [B, 2D]
                 from_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:71, :]], dim=1)
                 to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 71:72, :]], dim=1)
             else:
-                gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)    # [B, 2D]
+                gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)      # [B, 2D]
                 from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
                 to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
+            self._mon_gi_max = float(gi.detach().abs().max())
             h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
-            g        = gi + self.gate_drop(self.gate_w_down(h))
+            gd       = self.gate_w_down(h)
+            self._mon_gd_max = float(gd.detach().abs().max())
+            g        = gi + self.gate_drop(gd)
+            g        = g.clamp(-250.0, 250.0)
             gate_raw = self.gate_out(self.gate_norm(g))                     # [B, 1858]
 
             # from_proj/to_proj and from_out/to_out are residual-wrapped so a
@@ -1418,29 +1462,38 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             # stops holding.
             f_proj = from_set + F.gelu(self.from_proj(from_set))
             fn     = self.from_ln(f_proj)
-            fh, _  = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
+            if attn_impl == "sdpa":
+                fh = self.from_mha(fn[:, :64, :], fn)
+            else:
+                fh, _ = self.from_mha(fn[:, :64, :], fn, fn, need_weights=False)
             f_base = f_proj[:, :64, :] + fh
             fv     = f_base + self.from_out(f_base)                        # [B, 64, PDH]
 
             t_proj = to_set + F.gelu(self.to_proj(to_set))
             tn     = self.to_ln(t_proj)
-            th, _  = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
+            if attn_impl == "sdpa":
+                th = self.to_mha(tn[:, :64, :], tn)
+            else:
+                th, _ = self.to_mha(tn[:, :64, :], tn, tn, need_weights=False)
             t_base = t_proj[:, :64, :] + th
             tv     = t_base + self.to_out(t_base)                          # [B, 64, PDH]
 
+            self._mon_fv_max  = float(fv.detach().abs().max())
+            self._mon_tv_max  = float(tv.detach().abs().max())
             dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)  # [B, 64, 64]
+            self._mon_bmm_max = float(dots_full.detach().abs().max())
             dots      = dots_full.reshape(B, 64 * 64)
 
             dots_sub = dots_full[:, 48:56, 56:64]                          # [B, 8, 8]
             pf       = self.promo_from(fv[:, 48:56, :])                    # [B, 8, 3]
             pt       = self.promo_to(tv[:, 56:64, :])                      # [B, 8, 3]
             promo    = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
-                        ).permute(0, 3, 2, 1).reshape(B, 192).float()
+                        ).permute(0, 3, 2, 1).reshape(B, 192)
 
-            raw_4288 = torch.cat([dots.float(), promo], dim=1)
+            raw_4288 = torch.cat([dots, promo], dim=1)
             q_sl     = raw_4288[:, self.sl_idx]
-            combined = q_sl + F.logsigmoid(gate_raw.float())
-            return combined.to(x.dtype), wdl
+            combined = q_sl + F.logsigmoid(gate_raw)
+            return combined, wdl
 
     m = M()
     if log_params:

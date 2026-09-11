@@ -55,6 +55,10 @@ RESPAWN_COOLDOWN_S = 30.0
 STOP_DRAIN_S = 5.0
 WORKER_KINDS = ("xc0", "lc0")
 
+# xc0 blunder-replay probes are held off the worker queue until this epoch;
+# credits and the blunder pool keep accruing, and lc0 BRP runs unaffected.
+BRP_WORKER_START_EPOCH = 5
+
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
     """mp.Process target. One queue now -- selfplay, validation and blunder
@@ -724,6 +728,8 @@ class SelfPlayRunner:
         since the last pass. Credits accrue while the queue is full."""
         if self.blunder_pool is None:
             return 0
+        if self.current_epoch < BRP_WORKER_START_EPOCH:
+            return 0
         n = self.rescorer.take_brp_credits()
         if n <= 0:
             return 0
@@ -733,6 +739,8 @@ class SelfPlayRunner:
         """Queue n replay probes, from either the trickle or a bulk dump.
         Progress shows up in the rescore table's replays column."""
         if self.blunder_pool is None or n <= 0:
+            return 0
+        if self.current_epoch < BRP_WORKER_START_EPOCH:
             return 0
         specs = self.game_gen.next_blunder_replays(
             self.blunder_pool, n, current_epoch=self.current_epoch,

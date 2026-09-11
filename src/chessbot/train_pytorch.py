@@ -574,8 +574,10 @@ def make_pt_infer(model, max_bs, encoding_type="xc0"):
 def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
     """
     Export model to ONNX with dynamic batch axis.
-    Loads from companion .pt as an eager half-precision model — TorchScript export
-    fails because aten::_native_multi_head_attention is not ONNX-exportable.
+    Loads from companion .pt as an eager fp32 model — TorchScript export fails
+    because aten::_native_multi_head_attention is not ONNX-exportable. fp32 is
+    required: fp16 graph weights make TRT run the wide policy bmm in fp16, which
+    overflows and collapses the policy. Precision is chosen at engine build.
     Tries dynamo first; falls back to legacy opset-18.
     """
     import onnx
@@ -585,11 +587,11 @@ def export_ts_to_onnx(ts_path, onnx_path, encoding_type="xc0"):
     pt_path = companion_pt(ts_path)
     ckpt = torch.load(pt_path, map_location='cuda')
     arch = ckpt.get('arch', FALLBACK_ARCH)
-    model = PT_BUILDERS[arch](VARIANTS[arch]).half().cuda().eval()
+    model = PT_BUILDERS[arch](VARIANTS[arch]).cuda().eval()
     model.load_state_dict(ckpt['model'])
 
     if encoding_type == "lc0":
-        dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float16, device='cuda')
+        dummy = torch.zeros(1, 112, 8, 8, dtype=torch.float32, device='cuda')
     elif encoding_type == "xc0h":
         dummy = torch.zeros(1, 393, dtype=torch.long, device='cuda')
     else:

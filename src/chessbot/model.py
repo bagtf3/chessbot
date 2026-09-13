@@ -1447,10 +1447,8 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
                 gi       = torch.cat([x[:, 65, :], x[:, 70, :]], dim=-1)      # [B, 2D]
                 from_set = torch.cat([x[:, :64, :], x[:, 66:68, :], x[:, 70:72, :]], dim=1)
                 to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:72, :]], dim=1)
-            self._mon_gi_max = float(gi.detach().abs().max())
             h        = F.silu(self.gate_w_gate(gi)) * self.gate_w_up(gi)
             gd       = self.gate_w_down(h)
-            self._mon_gd_max = float(gd.detach().abs().max())
             g        = gi + self.gate_drop(gd)
             g        = g.clamp(-250.0, 250.0)
             gate_raw = self.gate_out(self.gate_norm(g))                     # [B, 1858]
@@ -1478,10 +1476,7 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
             t_base = t_proj[:, :64, :] + th
             tv     = t_base + self.to_out(t_base)                          # [B, 64, PDH]
 
-            self._mon_fv_max  = float(fv.detach().abs().max())
-            self._mon_tv_max  = float(tv.detach().abs().max())
             dots_full = torch.bmm(fv, tv.transpose(1, 2)).mul(self.scale)  # [B, 64, 64]
-            self._mon_bmm_max = float(dots_full.detach().abs().max())
             dots      = dots_full.reshape(B, 64 * 64)
 
             dots_sub = dots_full[:, 48:56, 56:64]                          # [B, 8, 8]

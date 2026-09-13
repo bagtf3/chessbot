@@ -2101,10 +2101,8 @@ class Rescorer(object):
         print(th)
         print(tc)
         print(tb)
-        print(f"{RS} KL running medians: "
-              f"q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
-        print(f"{RS} KL_value running medians: "
-              f"q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
+        print(f"{RS} KL        q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
+        print(f"{RS} KL_value  q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}

@@ -239,7 +239,7 @@ def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
     bumped = False
     action = "none"
 
-    dominant = (n >= min_games) and (score > 0.8)
+    dominant = (n >= min_games) and (score > 0.72)
 
     if dominant or consec >= 2:
         if index < (len(table) - 1):

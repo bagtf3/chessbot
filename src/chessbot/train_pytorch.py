@@ -22,7 +22,7 @@ FALLBACK_ARCH = "13m-precond-conformer"
 VRAM_CHUNK = 5120
 
 # Dynamic LW: mirrors the pretrain LW-twiddle recipe (bootstrap_model_async_
-# tfrec_pt.py). Fixed 1:2 policy:value shape, rescaled every retrain cycle by
+# tfrec_pt.py). Fixed 1:1 policy:value shape, rescaled every retrain cycle by
 # an EMA of the raw per-cycle CEs so the weighted total matches
 # RETRAIN_LW_TARGET_POLICY_MULT*policy_ce_hat + RETRAIN_LW_TARGET_VALUE_MULT*
 # value_ce_hat. Each retrain cycle already spans a full pass over a large,
@@ -33,7 +33,7 @@ VRAM_CHUNK = 5120
 # that runs `steps` steps carries alpha = steps / RETRAIN_LW_EMA_SPAN_STEPS,
 # capped at 1 -- same steps-of-memory invariant, regardless of cycle size.
 RETRAIN_LW_BASE_POLICY        = 1.0
-RETRAIN_LW_BASE_VALUE         = 2.0
+RETRAIN_LW_BASE_VALUE         = 1.0
 RETRAIN_LW_TARGET_POLICY_MULT = 1.0
 RETRAIN_LW_TARGET_VALUE_MULT  = 4.0
 RETRAIN_LW_EMA_SPAN_STEPS     = 400
@@ -300,6 +300,24 @@ def print_pt_grad_stats(epoch_grad_stats, epoch, label=""):
     )
 
 
+def normalize_bounded_mean(x, lo=0.05, hi=3.0, target=1.0, iters=100, tol=1e-9):
+    """Pin a weight array to mean == target while holding hard bounds [lo, hi].
+
+    Iterative clamp-then-rescale: clamp to [lo, hi], scale toward the target mean,
+    repeat.  Values pinned at a bound stay there; the interior carries the mean.
+    Bounds are never violated (max cannot exceed hi, min cannot fall below lo); to
+    keep the mean exact the realized extremes may sit inside the bounds.  Always
+    feasible here since lo < target < hi.
+    """
+    x = np.clip(np.asarray(x, dtype=np.float64), lo, hi)
+    for _ in range(iters):
+        m = x.mean()
+        if m <= 0 or abs(m - target) <= tol:
+            break
+        x = np.clip(x * (target / m), lo, hi)
+    return x
+
+
 def print_pt_sample_weight_stats(vwht, pwht, epoch, label=""):
     tag = f"[retrain{(' ' + label) if label else ''}]"
     for name, w in (("pwht", np.asarray(pwht)), ("vwht", np.asarray(vwht))):
@@ -331,6 +349,12 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
     n = len(X)
+
+    # Pin the assembled batch weights to mean 1.0 within [0.05, 3.0], all told
+    # (every source, lc0 shards included).  The KL boost and opening reweight only
+    # push mass around; this is where the final invariant is enforced.
+    vwht = normalize_bounded_mean(vwht).astype(np.float32)
+    pwht = normalize_bounded_mean(pwht).astype(np.float32)
 
     lr = cfg.learning_rate
     clip_norm = cfg.retrain_clip_norm
@@ -371,7 +395,11 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     print(f"{tag} dynamic LW: policy={policy_lw:.3f}  value={value_lw:.3f}")
 
     from torch.amp import autocast, GradScaler
-    scaler = GradScaler("cuda")
+    # Scaler is recreated each retrain (state not persisted), so the default
+    # init_scale=2**16 cold-starts too high for this model's ~O(0.1-2) grads and
+    # burns one overflow-skip early every epoch calibrating down. Start one
+    # notch below that known-overflow point instead.
+    scaler = GradScaler("cuda", init_scale=2**15)
 
     epoch_losses     = []
     epoch_grad_stats = []

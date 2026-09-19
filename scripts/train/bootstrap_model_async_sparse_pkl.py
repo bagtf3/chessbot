@@ -61,7 +61,7 @@ DEFAULT_MAX_EPOCH = 3501
 DEFAULT_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
 
 LW_WARMUP_POLICY   = 1.0
-LW_WARMUP_VALUE    = 2.0
+LW_WARMUP_VALUE    = 1.0
 LW_EMA_SPAN_EPOCHS = 20
 LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
 LW_RECOMPUTE_EVERY = 10

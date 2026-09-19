@@ -1736,16 +1736,17 @@ class Rescorer(object):
             )
 
             # what this ply becomes. A true blunder is handed to the teacher
-            # instead of trained on directly; anything else past EQUIV is
-            # pulled toward SF in proportion to how bad it was.
+            # instead of trained on directly, or blended hard toward SF if it
+            # can't go to lc0. Everything below blunder_cp trains on its raw
+            # visit policy -- no SF blend across the EQUIV..blunder band.
             to_lc0 = (not missed_mate and true_blunder
                       and castling_rights_clear(ply['sfen']))
-            if missed_mate or loss_this <= EQUIV:
-                blend_cpl = None
-            elif loss_this >= blunder_cp and not to_lc0:
+            if to_lc0:
+                blend_cpl = loss_this
+            elif loss_this >= blunder_cp and not missed_mate:
                 blend_cpl = blunder_cp
             else:
-                blend_cpl = loss_this
+                blend_cpl = None
 
             # just FYI if we do any adjustments we need to re-sort.
 
@@ -1756,7 +1757,7 @@ class Rescorer(object):
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
             vwht = value_weight_for_game(cfg, is_draw)
-            pwht = 1.0
+            pwht = value_weight_for_game(cfg, is_draw)
             kl = kl_divergence(priors, vis)
             rows[-1][-2] = kl
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
@@ -1772,6 +1773,14 @@ class Rescorer(object):
                     pwht *= cfg.kl_boost_p80_mult
                 elif kl >= self.kl_q50:
                     pwht *= cfg.kl_boost_median_mult
+                # value-KL boost on the value weight, mirroring the policy boost.
+                # max(0.01, .) floors the quantile so a zeroed tracker doesn't make
+                # every ply eligible.
+                if klv is not None:
+                    if klv >= max(0.03, self.kl_value_q80):
+                        vwht *= cfg.kl_boost_p80_mult
+                    elif klv >= max(0.01, self.kl_value_q50):
+                        vwht *= cfg.kl_boost_median_mult
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']

@@ -587,6 +587,28 @@ class TxBlockSwiGLU(nn.Module):
         return x + self.down(product)
 
 
+class TxBlockSwiGLUNoOut(nn.Module):
+    """SwiGLU transformer block whose attention has no output projection."""
+
+    def __init__(self):
+        super().__init__()
+        self.n1 = L1Norm(D)
+        self.attn = Attention(D, HEADS, output_proj=False)
+        self.n2 = L1Norm(D)
+        self.gate = nn.Linear(D, 4 * D)
+        self.up = nn.Linear(D, 4 * D)
+        self.down = nn.Linear(4 * D, D, bias=False)
+        self.last_product = None
+
+    def forward(self, x):
+        n = self.n1(x)
+        x = x + self.attn(n, n)
+        n = self.n2(x)
+        product = F.silu(self.gate(n)) * self.up(n)
+        self.last_product = product.detach()
+        return x + self.down(product)
+
+
 class BakeoffModel(nn.Module):
     """Configurable 4c2t d256 trunk.  conv_mode picks the conv-trunk variant;
     tx_mode picks the transformer variant.  Value head is the d256 single-head
@@ -637,6 +659,19 @@ class BakeoffModel(nn.Module):
             self.convs = nn.ModuleList([ConvBlock() for _ in range(2)])
             self.expandy_convs = nn.ModuleList(
                 [ExpandyFastConvBlock() for _ in range(2)])
+        elif conv_mode == "expandy_fast_2":
+            self.convs = nn.ModuleList([])
+            self.expandy_convs = nn.ModuleList(
+                [ExpandyFastConvBlock() for _ in range(2)])
+        elif conv_mode == "expandy_fast_3":
+            self.convs = nn.ModuleList([])
+            self.expandy_convs = nn.ModuleList(
+                [ExpandyFastConvBlock() for _ in range(3)])
+        elif conv_mode == "expandy_fast_1_gated_expandy_2":
+            self.convs = nn.ModuleList([])
+            self.expandy_convs = nn.ModuleList([ExpandyFastConvBlock()])
+            self.gated_expandy_convs = nn.ModuleList(
+                [GatedExpandedConvBlock() for _ in range(2)])
         elif conv_mode == "expandy_fat":
             self.convs = nn.ModuleList([ConvBlock() for _ in range(2)])
             self.expandy_convs = nn.ModuleList(
@@ -645,6 +680,22 @@ class BakeoffModel(nn.Module):
             self.convs = nn.ModuleList([ConvBlock() for _ in range(2)])
             self.gated_expandy_convs = nn.ModuleList(
                 [GatedExpandedConvBlock() for _ in range(2)])
+        elif conv_mode == "gated_expandy_2":
+            self.convs = nn.ModuleList([])
+            self.gated_expandy_convs = nn.ModuleList(
+                [GatedExpandedConvBlock() for _ in range(2)])
+        elif conv_mode == "gated_expandy_3c":
+            self.convs = nn.ModuleList([ConvBlock()])
+            self.gated_expandy_convs = nn.ModuleList(
+                [GatedExpandedConvBlock() for _ in range(2)])
+        elif conv_mode == "gated_expandy_3":
+            self.convs = nn.ModuleList([])
+            self.gated_expandy_convs = nn.ModuleList(
+                [GatedExpandedConvBlock() for _ in range(3)])
+        elif conv_mode == "gated_expandy_1plain_3":
+            self.convs = nn.ModuleList([ConvBlock()])
+            self.gated_expandy_convs = nn.ModuleList(
+                [GatedExpandedConvBlock() for _ in range(3)])
         elif conv_mode == "se_expandy":
             self.convs = nn.ModuleList([ConvBlock() for _ in range(2)])
             self.gated_expandy_convs = nn.ModuleList(
@@ -672,14 +723,34 @@ class BakeoffModel(nn.Module):
 
         if tx_mode == "vanilla":
             self.blocks = nn.ModuleList([TxBlockFF() for _ in range(2)])
+        elif tx_mode == "vanilla_4":
+            self.blocks = nn.ModuleList([TxBlockFF() for _ in range(4)])
         elif tx_mode == "dc":
             self.blocks = nn.ModuleList([TxBlockDC(dc_hidden) for _ in range(2)])
         elif tx_mode == "swiglu":
             self.blocks = nn.ModuleList([TxBlockSwiGLU() for _ in range(2)])
+        elif tx_mode == "swiglu_3":
+            self.blocks = nn.ModuleList([TxBlockSwiGLU() for _ in range(3)])
         elif tx_mode == "noout":
             self.blocks = nn.ModuleList([TxBlockFFNoOut() for _ in range(2)])
         elif tx_mode == "ff_swiglu":
             self.blocks = nn.ModuleList([TxBlockFF(), TxBlockSwiGLU()])
+        elif tx_mode == "ff2_swiglu2":
+            self.blocks = nn.ModuleList(
+                [TxBlockFF() for _ in range(2)] +
+                [TxBlockSwiGLU() for _ in range(2)])
+        elif tx_mode == "ff_swiglu_4_noout":
+            self.blocks = nn.ModuleList(
+                [TxBlockFFNoOut() for _ in range(2)] +
+                [TxBlockSwiGLUNoOut() for _ in range(2)])
+        elif tx_mode == "ff4_swiglu2":
+            self.blocks = nn.ModuleList(
+                [TxBlockFF() for _ in range(4)] +
+                [TxBlockSwiGLU() for _ in range(2)])
+        elif tx_mode == "ff3_swiglu2":
+            self.blocks = nn.ModuleList(
+                [TxBlockFF() for _ in range(3)] +
+                [TxBlockSwiGLU() for _ in range(2)])
         else:
             raise ValueError(f"tx_mode={tx_mode}")
         self.trunk = L1Norm(D)
@@ -825,6 +896,168 @@ class BakeoffModel(nn.Module):
         gate_raw = self.gate_out(g)
         self.last_gate_raw = gate_raw
 
+        gate_act = F.logsigmoid(gate_raw.clamp(-250.0, 250.0))
+        self.last_gate_act = gate_act
+        return policy + gate_act, wdl
+
+
+class TxBlockFFDim(nn.Module):
+    """Plain FF transformer block with an explicit width and FF multiplier."""
+
+    def __init__(self, dim, heads, ff_mult=3):
+        super().__init__()
+        self.n1 = L1Norm(dim)
+        self.attn = Attention(dim, heads)
+        self.n2 = L1Norm(dim)
+        self.ff1 = nn.Linear(dim, ff_mult * dim)
+        self.ff2 = nn.Linear(ff_mult * dim, dim, bias=False)
+
+    def forward(self, x):
+        n = self.n1(x)
+        x = x + self.attn(n, n)
+        return x + self.ff2(F.gelu(self.ff1(self.n2(x))))
+
+
+class BakeoffM11M13_4c2tD256_512(nn.Module):
+    """2 fast Expandy + 2 Gated-Expandy d256 convs, then d512 2xFF3 trunk."""
+
+    conv_mode = "m11_m13_d256_512"
+    tx_mode = "vanilla_ff3_d512"
+    stem_dim = D
+    dim = 512
+    heads = 8
+
+    def __init__(self):
+        super().__init__()
+        self.tok_emb = nn.Embedding(XC0H_VOCAB, XC0H_DEMB)
+        self.cast_emb = nn.Embedding(16, 64)
+        self.stem_proj = nn.Linear(XC0H_IN, self.stem_dim - 4)
+        self.stem_norm = L1Norm(self.stem_dim - 4)
+        for name in ("rep", "stm", "hmc", "ones", "checker", "rank", "file"):
+            setattr(self, f"{name}_scale", nn.Parameter(torch.tensor(1.0)))
+        sqs = torch.arange(TOKENS).float()
+        ranks_sq, files_sq = sqs // 8, sqs % 8
+        self.register_buffer("xc0h_spatial", torch.stack([
+            torch.ones(TOKENS), ((ranks_sq + files_sq) % 2) * 2 - 1,
+            ranks_sq / 7.0 * 2 - 1, files_sq / 7.0 * 2 - 1,
+        ], dim=-1).unsqueeze(0))
+
+        self.convs = nn.ModuleList([ExpandyFastConvBlock() for _ in range(2)])
+        self.gated_expandy_convs = nn.ModuleList(
+            [GatedExpandedConvBlock() for _ in range(2)])
+        self.max_convs = nn.ModuleList([])
+        self.dc_convs = nn.ModuleList([])
+        self.gated_convs = nn.ModuleList([])
+        self.sm_convs = nn.ModuleList([])
+        self.reverse_convs = nn.ModuleList([])
+
+        self.pos = nn.Parameter(torch.randn(TOKENS, self.stem_dim) * 0.02)
+        self.pos_scale = nn.Parameter(torch.tensor(1.0))
+        self.global_tokens = nn.Parameter(torch.randn(1, 8, self.dim) * 0.02)
+        self.blocks = nn.ModuleList([TxBlockFFDim(self.dim, self.heads, ff_mult=3)
+                                     for _ in range(2)])
+        self.trunk = L1Norm(self.dim)
+
+        self.wdl_w1 = nn.Linear(self.dim, self.dim)
+        self.wdl_norm = nn.RMSNorm(self.dim)
+        self.wdl_w2 = nn.Linear(self.dim, 3)
+
+        self.from_proj = nn.Linear(self.dim, PDH)
+        self.from_skip = nn.Linear(self.dim, PDH, bias=False)
+        self.from_norm = L1Norm(PDH)
+        self.from_mha = Attention(PDH, POLICY_HEADS)
+        self.from_out = nn.Linear(PDH, PDH, bias=False)
+        self.to_proj = nn.Linear(self.dim, PDH)
+        self.to_skip = nn.Linear(self.dim, PDH, bias=False)
+        self.to_norm = L1Norm(PDH)
+        self.to_mha = Attention(PDH, POLICY_HEADS)
+        self.to_out = nn.Linear(PDH, PDH, bias=False)
+        self.from_dot_norm = L1Norm(PDH)
+        self.to_dot_norm = L1Norm(PDH)
+        self.promo_from = nn.Linear(PDH, 3, bias=False)
+        self.promo_to = nn.Linear(PDH, 3, bias=False)
+
+        gate_d = 2 * self.dim
+        self.gate_w_gate = nn.Linear(gate_d, SMARTGATE_H)
+        self.gate_w_up = nn.Linear(gate_d, SMARTGATE_H)
+        self.gate_w_down = nn.Linear(SMARTGATE_H, gate_d, bias=False)
+        self.gate_norm = L1Norm(gate_d)
+        self.gate_out = nn.Linear(gate_d, POLICY_DIM)
+        with torch.no_grad():
+            self.gate_w_down.weight.normal_(std=10 ** -1.5)
+            self.gate_out.weight.normal_(std=10 ** -1.5)
+            self.gate_out.bias.fill_(4.0)
+        self.last_gate_raw = None
+        self.last_gate_act = None
+        self.last_dot_raw = None
+        self.last_wdl_hidden = None
+        self.last_wdl_logits = None
+        self.register_buffer("sl_idx", torch.from_numpy(
+            pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0])
+
+    def stem(self, x):
+        b = x.shape[0]
+        k = poc.XC0H_K
+        dtype = self.tok_emb.weight.dtype
+        tok = x[:, :k * 64].long().view(b, k, TOKENS)
+        rep = x[:, k * 64:k * 64 + k].to(dtype)
+        cast = x[:, k * 64 + k].long()
+        stm = x[:, k * 64 + k + 1].to(dtype)
+        hmc = x[:, k * 64 + k + 2].to(dtype)
+        te = self.tok_emb(tok).permute(0, 2, 1, 3).reshape(b, TOKENS, k * XC0H_DEMB)
+        rep_planes = (rep * 2.0 - 1.0).unsqueeze(1).expand(b, TOKENS, k) * self.rep_scale
+        cast_plane = self.cast_emb(cast).unsqueeze(-1)
+        stm_plane = (stm * 2.0 - 1.0).view(b, 1, 1).expand(b, TOKENS, 1) * self.stm_scale
+        hmc_plane = (hmc / 99.0 * 2.0 - 1.0).view(b, 1, 1).expand(b, TOKENS, 1) * self.hmc_scale
+        fused = torch.cat([te, rep_planes, cast_plane, stm_plane, hmc_plane], dim=-1)
+        proj = self.stem_norm(self.stem_proj(fused))
+        scales = torch.stack([self.ones_scale, self.checker_scale, self.rank_scale, self.file_scale])
+        spatial = self.xc0h_spatial.to(proj.dtype).expand(b, -1, -1) * scales
+        return torch.cat([proj, spatial], dim=-1).reshape(b, BOARD, BOARD, self.stem_dim).permute(0, 3, 1, 2)
+
+    def forward(self, x):
+        if x.shape[1] != XC0H_LEN:
+            raise ValueError(f"expected xc0h [B,{XC0H_LEN}], got {tuple(x.shape)}")
+        b = x.shape[0]
+        x = self.stem(x)
+        for block in self.convs:
+            x = block(x)
+        for block in self.gated_expandy_convs:
+            x = block(x)
+        x = x.permute(0, 2, 3, 1).reshape(b, TOKENS, self.stem_dim)
+        x = torch.cat([x, self.pos_scale * self.pos.unsqueeze(0).expand(b, -1, -1)], dim=-1)
+        x = torch.cat([x, self.global_tokens.expand(b, -1, -1)], dim=1)
+        for block in self.blocks:
+            x = block(x)
+        x = self.trunk(x)
+        wdl_hidden = self.wdl_norm(F.gelu(self.wdl_w1(x[:, TOKENS, :])))
+        self.last_wdl_hidden = wdl_hidden
+        wdl = self.wdl_w2(wdl_hidden)
+        self.last_wdl_logits = wdl
+
+        from_set = torch.cat([x[:, :64], x[:, 68:70], x[:, 70:71]], dim=1)
+        to_set = torch.cat([x[:, :64], x[:, 68:70], x[:, 71:72]], dim=1)
+        f_proj = self.from_skip(from_set) + F.gelu(self.from_proj(from_set))
+        fn = self.from_norm(f_proj)
+        f_base = f_proj[:, :64] + self.from_mha(fn[:, :64], fn)
+        f_vec = f_base + self.from_out(f_base)
+        t_proj = self.to_skip(to_set) + F.gelu(self.to_proj(to_set))
+        tn = self.to_norm(t_proj)
+        t_base = t_proj[:, :64] + self.to_mha(tn[:, :64], tn)
+        t_vec = t_base + self.to_out(t_base)
+        dots_raw = torch.bmm(self.from_dot_norm(f_vec), self.to_dot_norm(t_vec).transpose(1, 2)).clamp(-FP16_CLIP, FP16_CLIP)
+        self.last_dot_raw = dots_raw
+        dots_full = dots_raw * (PDH ** -0.5)
+        dots = dots_full.reshape(b, TOKENS * TOKENS)
+        promo = (dots_full[:, 48:56, 56:64, None] + self.promo_from(f_vec[:, 48:56])[:, :, None] + self.promo_to(t_vec[:, 56:64])[:, None, :]).permute(0, 3, 2, 1).reshape(b, 192)
+        policy = torch.cat([dots, promo], dim=-1)[:, self.sl_idx]
+
+        gi = torch.cat([x[:, 67], x[:, 68]], dim=-1)
+        gate = soft_clamp(F.silu(self.gate_w_gate(gi)))
+        up = soft_clamp(self.gate_w_up(gi))
+        down = soft_clamp(self.gate_w_down(soft_clamp(gate * up)))
+        gate_raw = self.gate_out(self.gate_norm((gi + down).clamp(-250.0, 250.0)))
+        self.last_gate_raw = gate_raw
         gate_act = F.logsigmoid(gate_raw.clamp(-250.0, 250.0))
         self.last_gate_act = gate_act
         return policy + gate_act, wdl
@@ -1047,6 +1280,21 @@ def warm_start(model, ckpt_path, blend, conv_src=1):
     policy heads, gate.  L1Norm scales/biases are intentionally fresh.  Also fresh:
     expandy convs, DeciderCombiner projections, and the d256 value head."""
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)["model"]
+    if isinstance(model, BakeoffM11M13_4c2tD256_512):
+        # The stem and d256 positional half are shareable.  The d512 trunk,
+        # widened value/policy paths, and 1024-wide smartgate are intentionally
+        # fresh rather than forcing an invalid reshape from the d256 checkpoint.
+        load_param(model.tok_emb.weight, sd["xc0h_tok_emb.weight"])
+        load_param(model.cast_emb.weight, sd["xc0h_cast_emb.weight"])
+        load_linear(model.stem_proj, sd, "xc0h_proj", blend)
+        for name in ("rep", "stm", "hmc", "ones", "checker", "rank", "file"):
+            load_param(getattr(model, f"{name}_scale"), sd[f"xc0h_{name}_scale"])
+        load_param(model.pos, sd["pos.weight"])
+        load_param(model.pos_scale, sd["pos_scale"])
+        print(f"[init] warm-started d256 stem/position half for "
+              f"{model.conv_mode} from {Path(ckpt_path).name}; "
+              "d512 trunk and heads fresh", flush=True)
+        return
     load_param(model.tok_emb.weight, sd["xc0h_tok_emb.weight"])
     load_param(model.cast_emb.weight, sd["xc0h_cast_emb.weight"])
     load_linear(model.stem_proj, sd, "xc0h_proj", blend)
@@ -1161,6 +1409,35 @@ MODEL_SPECS = {
     "m15": dict(name="m15_conv-reverse_tx-van", conv="reverse", tx="vanilla"),
     "m16": dict(name="m16_conv-van_tx-noout", conv="vanilla", tx="noout"),
     "m69": dict(name="m69-rainbow-variant", conv="rainbow", tx="ff_swiglu"),
+    "m13-7-3c3t-d256": dict(
+        name="m13-7-3c3t-d256_conv-plain2gated-expandy_tx-3swiglu4x",
+        conv="gated_expandy_3c", tx="swiglu_3"
+    ),
+    "m11-1-3c3t-d256": dict(
+        name="m11-1-3c3t-d256_conv-3expandy_tx-3swiglu4x",
+        conv="expandy_fast_3", tx="swiglu_3"
+    ),
+    "m11-1-3c4t": dict(
+        name="m11-1-3c4t_conv-3expandy_tx-4ff4x",
+        conv="expandy_fast_3", tx="vanilla_4"
+    ),
+    "m11-13-1-7-3c5t": dict(
+        name="m11-13-1-7-3c5t",
+        conv="expandy_fast_1_gated_expandy_2", tx="ff3_swiglu2"
+    ),
+    "m13-7-4c4t": dict(
+        name="m13-7-4c4t",
+        conv="gated_expandy_1plain_3", tx="ff2_swiglu2"
+    ),
+    "m13-1-7-3c6t": dict(
+        name="m13-1-7-3c6t_conv-3gated-expandy_tx-4ff2swiglu",
+        conv="gated_expandy_3", tx="ff4_swiglu2"
+    ),
+    "m11-13-1-4c2t-d256-512": dict(
+        name="m11-13-1-4c2t-d256-512_conv-2expandy2gated-expandy_tx-2ff3x-d512",
+        conv="m11_m13_d256_512", tx="vanilla_ff3_d512",
+        builder="m11_m13_4c2t_d256_512"
+    ),
 
     "m2-6": dict(
         name="m2-6_conv-maxnet_tx-dc1024", conv="maxnet",
@@ -1222,8 +1499,11 @@ def train_one(spec, args, train_data, val_files, writer, fh, out_dir):
                                   files=val_files,
                                   batch_size=args.val_batch, pool_shards=2,
                                   ready_batches=4)
-    model = BakeoffModel(conv_mode=spec["conv"], tx_mode=spec["tx"],
-                         dc_hidden=spec.get("dc_hidden")).to(args.device)
+    if spec.get("builder") == "m11_m13_4c2t_d256_512":
+        model = BakeoffM11M13_4c2tD256_512().to(args.device)
+    else:
+        model = BakeoffModel(conv_mode=spec["conv"], tx_mode=spec["tx"],
+                             dc_hidden=spec.get("dc_hidden")).to(args.device)
     start_step = 0
     prev_steps = 0
     if args.resume:
@@ -1249,7 +1529,10 @@ def train_one(spec, args, train_data, val_files, writer, fh, out_dir):
     total_steps = args.steps
     has_maxnet = spec["conv"] == "maxnet"
     has_gated = spec["conv"] == "gated"
-    has_gated_expandy = spec["conv"] in ("gated_expandy", "se_expandy")
+    has_gated_expandy = spec["conv"] in (
+        "gated_expandy", "gated_expandy_3c", "gated_expandy_3",
+        "gated_expandy_1plain_3", "expandy_fast_1_gated_expandy_2",
+        "se_expandy", "m11_m13_d256_512")
     has_dcconv = spec["conv"] == "dcconv"
     has_sm = spec["conv"] == "dcsoftmax"
     has_dc = spec["tx"] == "dc"

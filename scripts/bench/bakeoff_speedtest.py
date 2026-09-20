@@ -6,7 +6,7 @@ ORT+TensorRT (fp16), across a handful of batch sizes.  Follows the TRT recipe
 in scripts/bench/model_variant_speed_test_pt.py (ORT TensorrtExecutionProvider,
 fp16 engine + timing cache, opset-18 ONNX with a dynamic batch axis).
 
-Models (from bakeoff_4c2t_d256.MODEL_SPECS): m2-6 m2-7 m11-6 m11-7.  Each is
+Models (from bakeoff_4c2t_d256.MODEL_SPECS): m1 m7 m11 m13 by default.  Each is
 loaded from out-dir / <name><tag>.pt.  ema tracking buffers absent from a
 checkpoint are tolerated (they do not affect inference).
 
@@ -33,7 +33,7 @@ VALUE_DIM = 3
 N_WARMUP = 50
 N_ITERS = 100
 
-MODELS_TO_TEST = ["m2-6", "m2-7", "m11-6", "m11-7"]
+MODELS_TO_TEST = ["m1", "m7", "m11", "m13"]
 DEFAULT_BATCH_SIZES = [32, 64, 128, 256]
 
 TRT_CACHE = os.path.join(os.path.expanduser("~"), ".cache",
@@ -77,8 +77,7 @@ def load_model(mid, tag, out_dir):
     """Build the spec's BakeoffModel and load its checkpoint. Missing *_ema
     buffers are tolerated; any other missing/unexpected key raises."""
     spec = MODEL_SPECS[mid]
-    model = BakeoffModel(conv_mode=spec["conv"], tx_mode=spec["tx"],
-                         dc_hidden=spec.get("dc_hidden"))
+    model = BakeoffModel(conv_mode=spec["conv"], tx_mode=spec["tx"])
     ckpt = os.path.join(out_dir, f"{spec['name']}{tag}.pt")
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)["model"]
     res = model.load_state_dict(sd, strict=False)

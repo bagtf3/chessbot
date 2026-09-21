@@ -10,15 +10,13 @@ tfrecord trainer; this is meant to replace it once proven.
 Usage:
     python scripts/train/bootstrap_model_async_sparse_pkl.py
         [--model m13-7-8c8t-d256] [--run-tag TAG | --run-dir DIR]
-        [--shard-dir DIR] [--max-epoch 28001] [--val-shards 20] [--swa]
+        [--shard-dir DIR] [--max-epoch 26001] [--val-shards 20] [--swa]
 """
 from __future__ import annotations
 
 import argparse
 import glob
 import gzip
-import math
-import multiprocessing as mp
 import os
 import pickle
 import queue
@@ -32,14 +30,14 @@ import pandas as pd
 import scipy.special
 
 from chessbot.pretrain import (
-    EPOCH_SIZE, PLOT_EVERY, LR_WARMUP_EPOCHS, VAL_FRACTION, lr_for_epoch,
+    EPOCH_SIZE, PLOT_EVERY, VAL_FRACTION, lr_for_epoch,
     save_plot, split_train_val as split_train_val_frac,
 )
 from chessbot.model import VARIANTS, PT_BUILDERS
 from chessbot.replay_buffer import POLICY_DIM
 
-PT_BATCH_SIZE      = 512
-PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
+PT_BATCH_SIZE      = 320
+PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 32
 PT_ADAM_BETA2      = 0.95
 PT_WEIGHT_DECAY    = 0.008   # AdamW decoupled; applied to 2D+ weights only
 
@@ -53,37 +51,32 @@ LR_MAX = 8e-4
 LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
 
 CHECKPOINT_EVERY = 200
+SAVE_PLOTS = False   # progress png is slow to render; csv has everything
 SWA_WINDOW = 100
 SWA_EVERY  = 20
 
 DEFAULT_MODEL     = "m13-7-8c8t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
-DEFAULT_MAX_EPOCH = 28001
+DEFAULT_MAX_EPOCH = 26001
 DEFAULT_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
 
-LW_WARMUP_POLICY   = 1.0
-LW_WARMUP_VALUE    = 1.0
-LW_EMA_SPAN_EPOCHS = 20
-LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
-LW_RECOMPUTE_EVERY = 10
-LW_TARGET_VALUE_MULT  = 4.0
-LW_TARGET_POLICY_MULT = 1.0
+# per-draw subsampling (train pool only): drawish positions (soft D past the
+# threshold) are dropped with DRAW_DROP_P, then decided positions (any WDL
+# element past DECIDED_THRESH) with DECIDED_DROP_P. Records are revisited across
+# passes, so a drop is not permanent. The drop is the only downweighting.
+DRAW_P_THRESH  = 0.6
+DRAW_DROP_P    = 0.175
+DECIDED_THRESH = 0.9
+DECIDED_DROP_P = 0.125
+DRAW_OVERDRAW  = 1.15   # pool must hold this many epochs before a draw
 
-# fp16 range bangers, sum-relu over the overage (models exposing last_gate_raw)
-GATE_LOGIT_CEIL = 127.0   # raw policy-gate logits
-GACT_CEIL       = 16.0    # logsigmoid suppression term
-BOUNDS_WEIGHT   = 1e-6
-DOT_CAP_START   = 20480.0 # raw policy dot product cap, ramped down over epochs
-DOT_CAP_END     = 1024.0
-DOT_CAP_HOLD_EPOCHS = 1
-DOT_CAP_RAMP_EPOCHS = 100
-DOT_WEIGHT      = 1e-6
-
-# drawish positions (soft D target past the threshold) get this policy+value weight
-DRAW_P_THRESH = 0.6
-DRAW_WEIGHT   = 0.85
-
-GRAD_REPORT_EVERY = 10
+GRAD_REPORT_EVERY = 10   # report epochs: full grad scan + extremes printout
+# grad scanning (nan_to_num + clip) arms off after CLIP_CALM_STEPS consecutive
+# steps with <= CLIP_CALM_MAX clips; while off it runs only on report epochs and
+# re-arms if a report epoch would have clipped >= CLIP_REARM_CLIPS steps
+CLIP_CALM_STEPS  = 1000
+CLIP_CALM_MAX    = 2
+CLIP_REARM_CLIPS = 10
 FP16_MIN = 5.960464477539063e-8
 FP16_MAX = 65504.0
 
@@ -95,27 +88,9 @@ UNIFIED_COLS = [
     "train_loss", "gn_mean", "exp_prob_model", "exp_prob_uniform",
     "prob_on_others",
 ]
-
-
-# ---------------------------------------------------------------------------
-# LW schedule
-# ---------------------------------------------------------------------------
-
-def lw_ema_update(ema, raw):
-    return raw if ema is None else (1.0 - LW_EMA_ALPHA) * ema + LW_EMA_ALPHA * raw
-
-
-def lw_for_epoch(ep, policy_ce_hat, value_ce_hat, active):
-    if ep < LR_WARMUP_EPOCHS:
-        return LW_WARMUP_POLICY, LW_WARMUP_VALUE, None, False
-    osc_ep = ep - LR_WARMUP_EPOCHS
-    if osc_ep % LW_RECOMPUTE_EVERY != 0:
-        return active["policy_lw"], active["value_lw"], active["scale"], False
-    current_total = LW_WARMUP_POLICY * policy_ce_hat + LW_WARMUP_VALUE * value_ce_hat
-    target_total  = (LW_TARGET_VALUE_MULT * value_ce_hat
-                     + LW_TARGET_POLICY_MULT * policy_ce_hat)
-    scale = target_total / current_total
-    return scale * LW_WARMUP_POLICY, scale * LW_WARMUP_VALUE, scale, True
+# explicit float dtypes so an all-NaN column (e.g. train_loss at epoch 0) never
+# lands as object and trips pandas' concat dtype-inference warning
+EVAL_DTYPES = {c: "float64" for c in UNIFIED_COLS if c not in ("model_epoch", "n_samples")}
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +139,8 @@ def save_progress_csv(df, path):
 
 
 def save_plot_safe(*args, **kwargs):
+    if not SAVE_PLOTS:
+        return
     try:
         save_plot(*args, **kwargs)
     except OSError as e:
@@ -222,9 +199,11 @@ def get_resume_epoch(run_dir, name, progress_file, unified=False):
     os.makedirs(run_dir, exist_ok=True)
     last_ckpt = find_last_checkpoint(run_dir, name)
     if last_ckpt < 0:
-        if os.path.exists(progress_file) and not unified:
-            os.remove(progress_file)
-            print(f"[recovery] no checkpoints found; cleared {progress_file}")
+        if os.path.exists(progress_file):
+            bak = progress_file + ".bak"
+            os.replace(progress_file, bak)
+            print(f"[recovery] no checkpoints found; fresh start, "
+                  f"old csv -> {os.path.basename(bak)}")
         return 0
     trim_progress_csv(progress_file, last_ckpt, unified=unified)
     print(f"[recovery] last checkpoint epoch={last_ckpt} -> resuming {last_ckpt + 1}")
@@ -251,7 +230,7 @@ def load_pt_model(path, name, device, lr):
     cfg    = VARIANTS[name]
     model  = PT_BUILDERS[name](cfg).to(device)
     opt    = make_adam(model, lr)
-    scaler = GradScaler("cuda")
+    scaler = GradScaler("cuda", init_scale=2 ** 15)
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     if "scaler" in ckpt:
@@ -260,15 +239,14 @@ def load_pt_model(path, name, device, lr):
         opt.load_state_dict(ckpt["optimizer"])
         for pg in opt.param_groups:
             pg["lr"] = lr
-    return model, opt, scaler, ckpt.get("lw_state")
+    return model, opt, scaler
 
 
-def save_pt_ckpt(model, opt, scaler, epoch, name, path, lw_state=None):
+def save_pt_ckpt(model, opt, scaler, epoch, name, path):
     import torch
     torch.save({
         "model": model.state_dict(), "optimizer": opt.state_dict(),
         "scaler": scaler.state_dict(), "epoch": epoch, "arch": name,
-        "lw_state": lw_state,
     }, path)
     print(f"[ckpt] epoch {epoch} -> {path}")
 
@@ -278,12 +256,6 @@ def pt_clipnorm_for_epoch(ep):
     if ep < 20:  return 2.5
     if ep < 30:  return 5.0
     return 10.0
-
-
-def dot_cap_for_epoch(ep):
-    span = DOT_CAP_RAMP_EPOCHS - DOT_CAP_HOLD_EPOCHS
-    t = min(max((ep - DOT_CAP_HOLD_EPOCHS) / span, 0.0), 1.0)
-    return DOT_CAP_START + (DOT_CAP_END - DOT_CAP_START) * t
 
 
 def ema_summary(ema):
@@ -360,35 +332,20 @@ def print_grad_report(r):
           f"  n<=fp16_min {r['n_fp16_min']}", flush=True)
 
 
-def range_penalty(model, dot_cap):
-    """Weighted fp16 range bangers on the raw gate logits, the logsigmoid term
-    and the raw policy dot product. Only a site whose peak is past its ceiling
-    contributes a term. Zero for models without the hooks."""
-    import torch.nn.functional as F
-    if getattr(model, "last_gate_raw", None) is None:
-        return 0.0
-    sites = (
-        (model.last_gate_raw, GATE_LOGIT_CEIL, BOUNDS_WEIGHT),
-        (model.last_gate_act, GACT_CEIL, BOUNDS_WEIGHT),
-        (model.last_dot_raw, dot_cap, DOT_WEIGHT),
-    )
-    total = 0.0
-    for t, ceil, w in sites:
-        a = t.abs()
-        if float(a.detach().max()) > ceil:
-            total = total + w * F.relu(a - ceil).sum()
-    return total
-
-
 # ---------------------------------------------------------------------------
 # Async sparse-shard data layer
 # ---------------------------------------------------------------------------
 
-def densify(sp):
-    idx, vals = sp
-    d = np.zeros(POLICY_DIM, dtype=np.float32)
-    if len(idx):
-        d[np.asarray(idx, dtype=np.int32)] = np.asarray(vals, dtype=np.float32)
+def densify_batch(sparse_list):
+    """Scatter a list of (idx, vals) sparse policies into one [n, POLICY_DIM]
+    array with a single fancy-index assignment."""
+    lens = np.fromiter((len(sp[0]) for sp in sparse_list), dtype=np.int64,
+                       count=len(sparse_list))
+    rows = np.repeat(np.arange(len(sparse_list)), lens)
+    cols = np.concatenate([np.asarray(sp[0], dtype=np.int64) for sp in sparse_list])
+    vals = np.concatenate([np.asarray(sp[1], dtype=np.float32) for sp in sparse_list])
+    d = np.zeros((len(sparse_list), POLICY_DIM), dtype=np.float32)
+    d[rows, cols] = vals
     return d
 
 
@@ -412,14 +369,17 @@ class AsyncShardPool:
     """
 
     def __init__(self, shard_files, high, low, epoch_size, drain,
-                 n_ready=2, name="train"):
+                 n_ready=2, name="train", subsample=True):
         self.files      = list(shard_files)
+        self.subsample  = subsample
         self.high       = high
         self.low        = max(epoch_size, min(low, high))
         self.epoch_size = epoch_size
+        self.draw_size  = int(epoch_size * DRAW_OVERDRAW)
         self.drain      = drain
         self.name       = name
         self.pool = []
+        self.meta = np.zeros((0, 2), dtype=np.float32)   # per record: (D, max WDL)
         self.size = 0
         self.lock = threading.Lock()
         self.loader_done = threading.Event()
@@ -449,8 +409,11 @@ class AsyncShardPool:
         for recs in stream:
             if self.stop_evt.is_set():
                 return
+            wdl = np.array([r[2] for r in recs], dtype=np.float32)
+            meta = np.stack([wdl[:, 1], wdl.max(1)], axis=1)
             with self.lock:
                 self.pool.extend(recs)
+                self.meta = np.concatenate([self.meta, meta])
                 self.size = len(self.pool)
                 full = self.size >= self.high
             if full:
@@ -471,32 +434,46 @@ class AsyncShardPool:
                 time.sleep(0.05)
 
     def sample_bundle(self):
+        """Walk a random permutation of the pool, dropping drawish records with
+        DRAW_DROP_P and decided ones with DECIDED_DROP_P (subsample=True only),
+        until epoch_size survivors. Everything walked (kept or dropped) leaves the
+        pool; the untouched tail stays. Pure numpy up to the final record gather."""
         with self.lock:
             n = self.size
-            k = min(self.epoch_size, n)
-            picked = np.random.choice(n, size=k, replace=False)
-            recs = [self.pool[i] for i in picked]
+            perm = np.random.permutation(n)
+            if self.subsample:
+                d, mx = self.meta[perm, 0], self.meta[perm, 1]
+                dropped = (d > DRAW_P_THRESH) & (np.random.rand(n) < DRAW_DROP_P)
+                dropped |= ~dropped & (mx > DECIDED_THRESH) & (np.random.rand(n) < DECIDED_DROP_P)
+                surv = np.flatnonzero(~dropped)[:self.epoch_size]
+            else:
+                surv = np.arange(min(self.epoch_size, n))
+            walked = surv[-1] + 1
+            keep = perm[surv]
+            recs = [self.pool[i] for i in keep]
             if self.drain:
-                drop = set(picked.tolist())
-                self.pool = [self.pool[i] for i in range(n) if i not in drop]
+                stay = np.ones(n, dtype=bool)
+                stay[perm[:walked]] = False
+                self.pool = [self.pool[i] for i in np.flatnonzero(stay)]
+                self.meta = self.meta[stay]
                 self.size = len(self.pool)
         enc = np.stack([r[0] for r in recs]).astype(np.int64)
-        pol = np.stack([densify(r[1]) for r in recs])
+        pol = densify_batch([r[1] for r in recs])
         val = np.stack([r[2] for r in recs]).astype(np.float32)
-        w   = np.where(val[:, 1] > DRAW_P_THRESH, DRAW_WEIGHT, 1.0).astype(np.float32)
+        w   = np.ones(len(recs), dtype=np.float32)
         return {"enc_in": enc, "policy_logits": pol, "value_out": val, "weight": w}
 
     def prefetch(self):
         while not self.stop_evt.is_set():
             with self.lock:
-                enough = self.size >= self.epoch_size
+                enough = self.size >= self.draw_size
             if enough or self.loader_done.is_set():
                 break
             time.sleep(0.1)
         while not self.stop_evt.is_set():
             while not self.stop_evt.is_set():
                 with self.lock:
-                    enough = self.size >= self.epoch_size
+                    enough = self.size >= self.draw_size
                 if enough or self.loader_done.is_set():
                     break
                 time.sleep(0.05)   # loader catching back up after a drain
@@ -524,8 +501,31 @@ class AsyncShardPool:
 # Train / eval
 # ---------------------------------------------------------------------------
 
-def fit_epoch(model, opt, scaler, bundle, lw, max_norm, dot_cap, device,
-              report=False):
+def new_clip_state():
+    return {"on": True, "window_steps": 0, "window_clips": 0}
+
+
+def update_clip_state(state, clipped, report):
+    """Advance the arm/disarm window with this epoch's per-step clip flags.
+    Returns a log line when the state flips, else None."""
+    if state["on"]:
+        for c in clipped:
+            state["window_steps"] += 1
+            state["window_clips"] += int(c)
+            if state["window_clips"] > CLIP_CALM_MAX:
+                state["window_steps"] = state["window_clips"] = 0
+        if state["window_steps"] >= CLIP_CALM_STEPS:
+            state["on"] = False
+            return (f"[clip] off: {CLIP_CALM_STEPS} steps with "
+                    f"<= {CLIP_CALM_MAX} clips; scanning every {GRAD_REPORT_EVERY} epochs")
+    elif report and int(clipped.sum()) >= CLIP_REARM_CLIPS:
+        state["on"] = True
+        state["window_steps"] = state["window_clips"] = 0
+        return f"[clip] on: {int(clipped.sum())}/{len(clipped)} steps clipped on a report epoch"
+    return None
+
+
+def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state, report=False):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -538,49 +538,48 @@ def fit_epoch(model, opt, scaler, bundle, lw, max_norm, dot_cap, device,
     n    = enc.shape[0]
     perm = torch.randperm(n, device=device)
     model.train()
-    total_p = total_v = total_r = total = 0.0
+    losses     = []   # (p, v) per step, kept on device; one sync at the end
     grad_norms = []
-    clip_count = 0
     n_batches  = 0
     grad_rep   = None
+    scan = clip_state["on"] or report
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
         opt.zero_grad(set_to_none=True)
         with autocast("cuda"):
             pol, val = model(enc[idx])
-            p_loss = (F.cross_entropy(pol, policy_t[idx], reduction="none")
-                      * w[idx]).mean() * lw["policy_logits"]
-            v_loss = (F.cross_entropy(val, value_t[idx], reduction="none")
-                      * w[idx]).mean() * lw["value_out"]
-            r_loss = range_penalty(model, dot_cap)
-            loss = p_loss + v_loss + r_loss
+            p_loss = (F.cross_entropy(pol, policy_t[idx], reduction="none") * w[idx]).mean()
+            v_loss = (F.cross_entropy(val, value_t[idx], reduction="none") * w[idx]).mean()
+            loss = p_loss + v_loss
         scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        for p in model.parameters():
-            if p.grad is not None:
-                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
-        if report and start + PT_BATCH_SIZE >= n:
-            grad_rep = grad_report(model, scaler.get_scale())
-        raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm).item()
-        grad_norms.append(raw_norm)
-        if raw_norm > max_norm or math.isnan(raw_norm):
-            clip_count += 1
+        scaler.unscale_(opt)   # records found_inf here, so the scrub below can't mask it
+        if scan:
+            for p in model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+            if report and start + PT_BATCH_SIZE >= n:
+                grad_rep = grad_report(model, scaler.get_scale())
+            grad_norms.append(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
         scaler.step(opt)
         scaler.update()
-        total_p += p_loss.item()
-        total_v += v_loss.item()
-        total_r += float(r_loss)
-        total   += loss.item()
+        losses.append((p_loss.detach(), v_loss.detach()))
         n_batches += 1
 
-    gn = np.array(grad_norms)
+    pv = torch.tensor(losses, device=device).float().cpu().numpy()
+    total_p, total_v = pv[:, 0].mean(), pv[:, 1].mean()
+    if scan:
+        gn = torch.stack(grad_norms).float().cpu().numpy()
+        clipped = (gn > max_norm) | np.isnan(gn)
+        flip = update_clip_state(clip_state, clipped, report)
+    else:
+        gn, clipped, flip = np.array([np.nan]), np.zeros(0, dtype=bool), None
     grad_stats = {
         "gn_mean": gn.mean(), "gn_median": np.median(gn), "gn_min": gn.min(),
-        "gn_max": gn.max(), "gn_clips": clip_count, "gn_steps": n_batches,
-        "range_pen": total_r / n_batches, "report": grad_rep,
+        "gn_max": gn.max(), "gn_clips": int(clipped.sum()),
+        "gn_steps": n_batches, "scanned": scan, "report": grad_rep, "flip": flip,
     }
-    return total_p / n_batches, total_v / n_batches, total / n_batches, grad_stats
+    return total_p, total_v, total_p + total_v, grad_stats
 
 
 def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device,
@@ -622,7 +621,7 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
         "avg_top_prob_target": float(pstack.max(axis=1).mean()),
         "train_loss": train_loss, "gn_mean": gn_mean,
     }
-    new_row = pd.DataFrame([row]).reindex(columns=UNIFIED_COLS)
+    new_row = pd.DataFrame([row]).reindex(columns=UNIFIED_COLS).astype(EVAL_DTYPES)
     eval_df = new_row if eval_df is None else pd.concat([eval_df, new_row], ignore_index=True)
     save_progress_csv(eval_df, progress_file)
 
@@ -657,6 +656,7 @@ def worker_main(wargs):
     swa_set     = set(swa_epochs(max_epoch)) if wargs.get("swa") else set()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True   # fixed shapes: batch never varies
     progress_file = wargs.get("progress_file") or progress_csv_path(run_dir, name, unified)
     plot_file     = os.path.join(run_dir, f"{name}_pt_plot.png")
 
@@ -671,8 +671,7 @@ def worker_main(wargs):
         cfg    = VARIANTS[name]
         model  = PT_BUILDERS[name](cfg).to(device)
         opt    = make_adam(model, lr0)
-        scaler = GradScaler("cuda")
-        lw_state = None
+        scaler = GradScaler("cuda", init_scale=2 ** 15)
         print(f"[worker] fresh init  lr={lr0:.4e}")
     else:
         last_ckpt = find_last_checkpoint(run_dir, name)
@@ -680,7 +679,7 @@ def worker_main(wargs):
             raise RuntimeError(f"start_epoch={start_epoch} but no checkpoint in {run_dir}")
         load_from = ckpt_path(run_dir, name, last_ckpt)
         print(f"[worker] loading {load_from}")
-        model, opt, scaler, lw_state = load_pt_model(load_from, name, device, lr=lr0)
+        model, opt, scaler = load_pt_model(load_from, name, device, lr=lr0)
 
     eval_df = None
     if os.path.exists(progress_file):
@@ -696,30 +695,19 @@ def worker_main(wargs):
         epoch_size=EPOCH_SIZE, drain=True, n_ready=2, name="train")
     val_pool = AsyncShardPool(
         val_files, high=VAL_BUFFER_CAP, low=VAL_BUFFER_CAP - REFILL_BAND,
-        epoch_size=EPOCH_SIZE, drain=True, n_ready=1, name="val")
+        epoch_size=EPOCH_SIZE, drain=True, n_ready=1, name="val", subsample=False)
     train_pool.start()
     val_pool.start()
 
-    if lw_state is not None:
-        policy_ce_hat = lw_state["policy_ce_hat"]
-        value_ce_hat  = lw_state["value_ce_hat"]
-        active_lw = {"policy_lw": lw_state["policy_lw"],
-                     "value_lw": lw_state["value_lw"],
-                     "scale": lw_state.get("scale")}
-        print(f"[worker] restored LW: policy_ce_hat={policy_ce_hat:.3f}  "
-              f"value_ce_hat={value_ce_hat:.3f}  scale={active_lw['scale']}")
-    else:
-        policy_ce_hat = value_ce_hat = None
-        active_lw = {"policy_lw": LW_WARMUP_POLICY, "value_lw": LW_WARMUP_VALUE,
-                     "scale": None}
 
     current_lr = None
+    clip_state = new_clip_state()
     begin = time.time()
     epoch_times = []
     t_fetch = t_fit = t_eval = 0.0
     total_samples = window_samples = 0
     window_loss_sum = window_gn_sum = 0.0
-    window_count = 0
+    window_count = window_gn_count = 0
     last_tgt_q = last_val_q = None
 
     for ep in range(start_epoch, end_epoch):
@@ -738,42 +726,34 @@ def worker_main(wargs):
             t0 = time.time()
             val_bundle = val_pool.get()
             avg_loss = window_loss_sum / window_count if window_count > 0 else None
-            avg_gn   = window_gn_sum   / window_count if window_count > 0 else None
+            avg_gn   = window_gn_sum / window_gn_count if window_gn_count > 0 else None
             eval_df, last_tgt_q, last_val_q = do_eval(
                 model, name, ep, val_bundle, eval_df, progress_file, plot_file,
                 device, train_loss=avg_loss, gn_mean=avg_gn)
             print_gate_ema(model)
             window_loss_sum = window_gn_sum = 0.0
-            window_count = 0
+            window_count = window_gn_count = 0
             t_eval += time.time() - t0
 
         t0 = time.time()
         bundle = train_pool.get()
         t_fetch += time.time() - t0
 
-        policy_lw, value_lw, scale, recomputed = lw_for_epoch(
-            ep, policy_ce_hat, value_ce_hat, active_lw)
-        active_lw = {"policy_lw": policy_lw, "value_lw": value_lw, "scale": scale}
-        lw = {"policy_logits": policy_lw, "value_out": value_lw}
-
         t0 = time.time()
         max_norm = pt_clipnorm_for_epoch(ep)
-        dot_cap  = dot_cap_for_epoch(ep)
         p_loss, v_loss, t_loss, gns = fit_epoch(
-            model, opt, scaler, bundle, lw, max_norm, dot_cap, device,
+            model, opt, scaler, bundle, max_norm, device, clip_state,
             report=(ep % GRAD_REPORT_EVERY == 0))
         t_fit += time.time() - t0
-
-        policy_ce_hat = lw_ema_update(policy_ce_hat, p_loss / policy_lw)
-        value_ce_hat  = lw_ema_update(value_ce_hat,  v_loss / value_lw)
-        live_A = policy_ce_hat / value_ce_hat
 
         n_this = int(bundle["enc_in"].shape[0])
         total_samples  += n_this
         window_samples += n_this
         window_loss_sum += t_loss
-        window_gn_sum   += gns["gn_mean"]
         window_count    += 1
+        if gns["scanned"]:
+            window_gn_sum   += gns["gn_mean"]
+            window_gn_count += 1
 
         if ep == start_epoch and ep % PLOT_EVERY == 0 and eval_df is not None:
             eval_df.loc[eval_df.index[-1], "train_loss"] = t_loss
@@ -781,29 +761,21 @@ def worker_main(wargs):
             save_progress_csv(eval_df, progress_file)
 
         print(f"[epoch {ep:4d}] [{name}] policy_loss: {p_loss:.2f}  "
-              f"value_loss: {v_loss:.2f}  range_pen: {gns['range_pen']:.4f}  "
-              f"dot_cap: {dot_cap:.0f}  total: {t_loss:.2f}  "
+              f"value_loss: {v_loss:.2f}  total: {t_loss:.2f}  "
               f"samples: {total_samples:,}")
-        print(f"[epoch {ep:4d}] [{name}] policy_ce_hat: {policy_ce_hat:.2f}  "
-              f"value_ce_hat (raw): {value_ce_hat:.3f}  A = {live_A:.2f}")
-        if recomputed:
-            print(f"[lw-fixed RECOMPUTE] scale: {scale:.3f}  "
-                  f"new LW: policy={policy_lw:.3f}  value={value_lw:.3f}\n")
-        print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
-              f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
-              f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
+        if gns["scanned"]:
+            print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
+                  f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
+                  f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
+        if gns["flip"]:
+            print(gns["flip"], flush=True)
         if gns["report"] is not None:
             print_grad_report(gns["report"])
+            print(f"  grad scale      {scaler.get_scale():.0f}", flush=True)
 
-        is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1
+        is_ckpt = (ep % CHECKPOINT_EVERY == 0 and ep > 0) or ep == end_epoch - 1 or ep == max_epoch - 1
         if is_ckpt:
-            lw_state = {
-                "policy_ce_hat": policy_ce_hat, "value_ce_hat": value_ce_hat,
-                "policy_lw": active_lw["policy_lw"], "value_lw": active_lw["value_lw"],
-                "scale": active_lw["scale"],
-            }
-            save_pt_ckpt(model, opt, scaler, ep, name, ckpt_path(run_dir, name, ep),
-                         lw_state=lw_state)
+            save_pt_ckpt(model, opt, scaler, ep, name, ckpt_path(run_dir, name, ep))
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
             save_plot_safe(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
 

@@ -2313,6 +2313,17 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     def norm_nchw(norm, x):
         return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
+    class RMSNorm(nn.Module):
+        """nn.RMSNorm in exportable ops, no dtype cast."""
+
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(d))
+            self.eps = eps
+
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
     class Attention(nn.Module):
         def __init__(self, dim, heads):
             super().__init__()
@@ -2329,8 +2340,8 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             q = self.q(xq).view(bq, nq, self.heads, self.head_dim).transpose(1, 2)
             k = self.k(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
             v = self.v(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
-            a = F.scaled_dot_product_attention(q, k, v)
-            return self.o(a.transpose(1, 2).reshape(bq, nq, dim))
+            a = ((q @ k.transpose(-1, -2)) * (self.head_dim ** -0.5)).softmax(dim=-1)
+            return self.o((a @ v).transpose(1, 2).reshape(bq, nq, dim))
 
     class ConvBlock(nn.Module):
         def __init__(self):
@@ -2431,7 +2442,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.trunk = make_l1norm(D)
 
             self.wdl_w1 = nn.Linear(D, D)
-            self.wdl_norm = make_rms1d(D)
+            self.wdl_norm = RMSNorm(D)
             self.wdl_w2 = nn.Linear(D, 3)
 
             self.from_proj = nn.Linear(D, PDH)

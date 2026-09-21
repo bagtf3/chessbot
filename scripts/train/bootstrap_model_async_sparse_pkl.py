@@ -9,8 +9,8 @@ tfrecord trainer; this is meant to replace it once proven.
 
 Usage:
     python scripts/train/bootstrap_model_async_sparse_pkl.py
-        [--model precond-mha-10c6t-d256-wdl3] [--run-tag TAG | --run-dir DIR]
-        [--shard-dir DIR] [--max-epoch 3501] [--val-shards 20] [--swa]
+        [--model m13-7-8c8t-d256] [--run-tag TAG | --run-dir DIR]
+        [--shard-dir DIR] [--max-epoch 28001] [--val-shards 20] [--swa]
 """
 from __future__ import annotations
 
@@ -47,17 +47,18 @@ BUFFER_CAP     = 256_000       # shuffle pool high-water mark
 REFILL_BAND    = 56_000        # refill once the pool drains below high - band (-> 200k)
 VAL_BUFFER_CAP = 96_000
 
-# cosine LR floor and ceiling
-LR_MIN = 5e-5
-LR_MAX = 6e-4
+# cosine LR floor and ceiling; ceiling matches the bakeoff start lr
+LR_MIN = 1e-4
+LR_MAX = 8e-4
+LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
 
-CHECKPOINT_EVERY = 100
+CHECKPOINT_EVERY = 200
 SWA_WINDOW = 100
 SWA_EVERY  = 20
 
-DEFAULT_MODEL     = "precond-mha-10c6t-d256-wdl3"
+DEFAULT_MODEL     = "m13-7-8c8t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
-DEFAULT_MAX_EPOCH = 3501
+DEFAULT_MAX_EPOCH = 28001
 DEFAULT_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
 
 LW_WARMUP_POLICY   = 1.0
@@ -67,6 +68,24 @@ LW_EMA_ALPHA       = 1.0 / LW_EMA_SPAN_EPOCHS
 LW_RECOMPUTE_EVERY = 10
 LW_TARGET_VALUE_MULT  = 4.0
 LW_TARGET_POLICY_MULT = 1.0
+
+# fp16 range bangers, sum-relu over the overage (models exposing last_gate_raw)
+GATE_LOGIT_CEIL = 127.0   # raw policy-gate logits
+GACT_CEIL       = 16.0    # logsigmoid suppression term
+BOUNDS_WEIGHT   = 1e-6
+DOT_CAP_START   = 20480.0 # raw policy dot product cap, ramped down over epochs
+DOT_CAP_END     = 1024.0
+DOT_CAP_HOLD_EPOCHS = 1
+DOT_CAP_RAMP_EPOCHS = 100
+DOT_WEIGHT      = 1e-6
+
+# drawish positions (soft D target past the threshold) get this policy+value weight
+DRAW_P_THRESH = 0.6
+DRAW_WEIGHT   = 0.85
+
+GRAD_REPORT_EVERY = 10
+FP16_MIN = 5.960464477539063e-8
+FP16_MAX = 65504.0
 
 UNIFIED_COLS = [
     "model_epoch", "value_mse", "value_corr", "value_ce", "policy_ce",
@@ -261,6 +280,106 @@ def pt_clipnorm_for_epoch(ep):
     return 10.0
 
 
+def dot_cap_for_epoch(ep):
+    span = DOT_CAP_RAMP_EPOCHS - DOT_CAP_HOLD_EPOCHS
+    t = min(max((ep - DOT_CAP_HOLD_EPOCHS) / span, 0.0), 1.0)
+    return DOT_CAP_START + (DOT_CAP_END - DOT_CAP_START) * t
+
+
+def ema_summary(ema):
+    """(min, max, mean, p25, p50, p75) of an EMA tensor."""
+    import torch
+    e = ema.detach().float().flatten()
+    p25, p50, p75 = torch.quantile(e, torch.tensor([0.25, 0.5, 0.75], device=e.device)).tolist()
+    return np.array([float(e.min()), float(e.max()), float(e.mean()), p25, p50, p75])
+
+
+def print_gate_ema(model):
+    """Gate-EMA six-number readout for mean/std/range, each averaged across
+    every block carrying gate_*_ema buffers. Silent for models without any."""
+    blocks = [b for b in model.modules() if hasattr(b, "gate_range_ema")]
+    if not blocks:
+        return
+    for label in ("mean", "std", "range"):
+        s = np.mean([ema_summary(getattr(b, f"gate_{label}_ema")) for b in blocks], axis=0)
+        print(f"  GE gate-EMA {label:<5}  x{len(blocks)}  min {s[0]:5.2f}  max {s[1]:5.2f}"
+              f"  mean {s[2]:5.2f}  p25 {s[3]:5.2f}  p50 {s[4]:5.2f}  p75 {s[5]:5.2f}",
+              flush=True)
+
+
+def gfmt(v):
+    return f"{v:.6f}" if v == 0 or abs(v) >= 1e-5 else f"{v:.2e}"
+
+
+def grad_report(model, backward_scale):
+    """Per-parameter grad extremes after unscale_: min/max L2 over 2D+ weights,
+    min nonzero / max scaled |grad| with their names, and the count of scaled
+    grads that are nonzero yet at or below the fp16 subnormal floor."""
+    import torch
+    names, l2s = [], []
+    min_grad, min_name = float("inf"), ""
+    max_grad, max_name = 0.0, ""
+    n_fp16_min = 0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.detach().float()
+        if p.ndim >= 2:
+            names.append(name)
+            l2s.append(g.norm())
+        ga = g.abs() * backward_scale
+        nz = ga[ga > 0]
+        n_fp16_min += int((nz <= FP16_MIN).sum())
+        gmax = float(ga.max())
+        if gmax > max_grad:
+            max_grad, max_name = gmax, name
+        if nz.numel():
+            gmin = float(nz.min())
+            if gmin < min_grad:
+                min_grad, min_name = gmin, name
+    pgn = torch.stack(l2s)
+    lo, hi = int(pgn.argmin()), int(pgn.argmax())
+    return {
+        "min_l2": float(pgn[lo]), "min_l2_name": names[lo],
+        "max_l2": float(pgn[hi]), "max_l2_name": names[hi],
+        "min_grad": min_grad, "min_grad_name": min_name,
+        "max_grad": max_grad, "max_grad_name": max_name,
+        "n_fp16_min": n_fp16_min,
+    }
+
+
+def print_grad_report(r):
+    min_box = "[x]" if r["min_grad"] < FP16_MIN else "[ ]"
+    max_box = "[x]" if r["max_grad"] > FP16_MAX else "[ ]"
+    nw = max(len(r["min_l2_name"]), len(r["min_grad_name"]))
+    vw = max(len(gfmt(r["max_l2"])), len(gfmt(r["max_grad"])))
+    print(f"  grad L2         {gfmt(r['min_l2'])} {r['min_l2_name']:<{nw}}"
+          f"  ->     {gfmt(r['max_l2']):<{vw}}  {r['max_l2_name']}", flush=True)
+    print(f"  scaled grad {min_box} {gfmt(r['min_grad'])} {r['min_grad_name']:<{nw}}"
+          f"  -> {max_box} {gfmt(r['max_grad']):<{vw}}  {r['max_grad_name']}"
+          f"  n<=fp16_min {r['n_fp16_min']}", flush=True)
+
+
+def range_penalty(model, dot_cap):
+    """Weighted fp16 range bangers on the raw gate logits, the logsigmoid term
+    and the raw policy dot product. Only a site whose peak is past its ceiling
+    contributes a term. Zero for models without the hooks."""
+    import torch.nn.functional as F
+    if getattr(model, "last_gate_raw", None) is None:
+        return 0.0
+    sites = (
+        (model.last_gate_raw, GATE_LOGIT_CEIL, BOUNDS_WEIGHT),
+        (model.last_gate_act, GACT_CEIL, BOUNDS_WEIGHT),
+        (model.last_dot_raw, dot_cap, DOT_WEIGHT),
+    )
+    total = 0.0
+    for t, ceil, w in sites:
+        a = t.abs()
+        if float(a.detach().max()) > ceil:
+            total = total + w * F.relu(a - ceil).sum()
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Async sparse-shard data layer
 # ---------------------------------------------------------------------------
@@ -364,7 +483,7 @@ class AsyncShardPool:
         enc = np.stack([r[0] for r in recs]).astype(np.int64)
         pol = np.stack([densify(r[1]) for r in recs])
         val = np.stack([r[2] for r in recs]).astype(np.float32)
-        w   = np.ones(len(recs), dtype=np.float32)
+        w   = np.where(val[:, 1] > DRAW_P_THRESH, DRAW_WEIGHT, 1.0).astype(np.float32)
         return {"enc_in": enc, "policy_logits": pol, "value_out": val, "weight": w}
 
     def prefetch(self):
@@ -405,7 +524,8 @@ class AsyncShardPool:
 # Train / eval
 # ---------------------------------------------------------------------------
 
-def fit_epoch(model, opt, scaler, bundle, lw, max_norm, device):
+def fit_epoch(model, opt, scaler, bundle, lw, max_norm, dot_cap, device,
+              report=False):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -418,25 +538,30 @@ def fit_epoch(model, opt, scaler, bundle, lw, max_norm, device):
     n    = enc.shape[0]
     perm = torch.randperm(n, device=device)
     model.train()
-    total_p = total_v = total = 0.0
+    total_p = total_v = total_r = total = 0.0
     grad_norms = []
     clip_count = 0
     n_batches  = 0
+    grad_rep   = None
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
         opt.zero_grad(set_to_none=True)
         with autocast("cuda"):
             pol, val = model(enc[idx])
-            p_loss = F.cross_entropy(pol, policy_t[idx]) * lw["policy_logits"]
+            p_loss = (F.cross_entropy(pol, policy_t[idx], reduction="none")
+                      * w[idx]).mean() * lw["policy_logits"]
             v_loss = (F.cross_entropy(val, value_t[idx], reduction="none")
                       * w[idx]).mean() * lw["value_out"]
-            loss = p_loss + v_loss
+            r_loss = range_penalty(model, dot_cap)
+            loss = p_loss + v_loss + r_loss
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         for p in model.parameters():
             if p.grad is not None:
                 torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        if report and start + PT_BATCH_SIZE >= n:
+            grad_rep = grad_report(model, scaler.get_scale())
         raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm).item()
         grad_norms.append(raw_norm)
         if raw_norm > max_norm or math.isnan(raw_norm):
@@ -445,6 +570,7 @@ def fit_epoch(model, opt, scaler, bundle, lw, max_norm, device):
         scaler.update()
         total_p += p_loss.item()
         total_v += v_loss.item()
+        total_r += float(r_loss)
         total   += loss.item()
         n_batches += 1
 
@@ -452,6 +578,7 @@ def fit_epoch(model, opt, scaler, bundle, lw, max_norm, device):
     grad_stats = {
         "gn_mean": gn.mean(), "gn_median": np.median(gn), "gn_min": gn.min(),
         "gn_max": gn.max(), "gn_clips": clip_count, "gn_steps": n_batches,
+        "range_pen": total_r / n_batches, "report": grad_rep,
     }
     return total_p / n_batches, total_v / n_batches, total / n_batches, grad_stats
 
@@ -537,7 +664,8 @@ def worker_main(wargs):
     print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
     print(f"{'#' * 72}\n")
 
-    lr0 = lr_for_epoch(start_epoch, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX)
+    lr0 = lr_for_epoch(start_epoch, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX,
+                       hold_epochs=LR_HOLD_EPOCHS)
     if start_epoch == 0:
         from torch.amp import GradScaler
         cfg    = VARIANTS[name]
@@ -595,7 +723,8 @@ def worker_main(wargs):
     last_tgt_q = last_val_q = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lr = lr_for_epoch(ep, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX)
+        target_lr = lr_for_epoch(ep, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX,
+                                 hold_epochs=LR_HOLD_EPOCHS)
         if target_lr != current_lr:
             current_lr = target_lr
             for pg in opt.param_groups:
@@ -613,6 +742,7 @@ def worker_main(wargs):
             eval_df, last_tgt_q, last_val_q = do_eval(
                 model, name, ep, val_bundle, eval_df, progress_file, plot_file,
                 device, train_loss=avg_loss, gn_mean=avg_gn)
+            print_gate_ema(model)
             window_loss_sum = window_gn_sum = 0.0
             window_count = 0
             t_eval += time.time() - t0
@@ -628,8 +758,10 @@ def worker_main(wargs):
 
         t0 = time.time()
         max_norm = pt_clipnorm_for_epoch(ep)
+        dot_cap  = dot_cap_for_epoch(ep)
         p_loss, v_loss, t_loss, gns = fit_epoch(
-            model, opt, scaler, bundle, lw, max_norm, device)
+            model, opt, scaler, bundle, lw, max_norm, dot_cap, device,
+            report=(ep % GRAD_REPORT_EVERY == 0))
         t_fit += time.time() - t0
 
         policy_ce_hat = lw_ema_update(policy_ce_hat, p_loss / policy_lw)
@@ -649,7 +781,8 @@ def worker_main(wargs):
             save_progress_csv(eval_df, progress_file)
 
         print(f"[epoch {ep:4d}] [{name}] policy_loss: {p_loss:.2f}  "
-              f"value_loss: {v_loss:.2f}  total: {t_loss:.2f}  "
+              f"value_loss: {v_loss:.2f}  range_pen: {gns['range_pen']:.4f}  "
+              f"dot_cap: {dot_cap:.0f}  total: {t_loss:.2f}  "
               f"samples: {total_samples:,}")
         print(f"[epoch {ep:4d}] [{name}] policy_ce_hat: {policy_ce_hat:.2f}  "
               f"value_ce_hat (raw): {value_ce_hat:.3f}  A = {live_A:.2f}")
@@ -659,6 +792,8 @@ def worker_main(wargs):
         print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
               f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
               f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
+        if gns["report"] is not None:
+            print_grad_report(gns["report"])
 
         is_ckpt = ep % CHECKPOINT_EVERY == 0 or ep == end_epoch - 1 or ep == max_epoch - 1
         if is_ckpt:

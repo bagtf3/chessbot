@@ -99,6 +99,10 @@ VARIANTS: dict[str, dict] = {
     "conv-pure": dict(
         conv_filters=256, num_blocks=16, dropout=0.03, xc0h_K=6, value_tap=4,
     ),
+    "m13-7-8c8t-d256": dict(
+        conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ff=4, n_swiglu=4,
+    ),
 }
 
 
@@ -168,6 +172,26 @@ def make_rms1d(d: int, eps: float = 1e-6):
             return (y * self.scale.float()).to(x.dtype)
 
     return Rms1d()
+
+
+def make_l1norm(d: int, eps: float = 1e-6):
+    """Mean-abs norm over the last dim, learned per-channel scale and bias. The
+    +/-250 clamp caps the residual stream so it cannot grow past fp16 range."""
+    import torch
+    import torch.nn as nn
+
+    class L1Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.b = nn.Parameter(torch.zeros(d))
+
+        def forward(self, x):
+            x = x.clamp(-250.0, 250.0)
+            y = x / (x.abs().mean(-1, keepdim=True) + eps)
+            return y * self.scale.to(x.dtype) + self.b.to(x.dtype)
+
+    return L1Norm()
 
 
 def make_rms_conv_block(D: int):
@@ -1657,16 +1681,17 @@ def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
     with the same flat xc0h_* attribute names the inline version used, so state
     dicts stay key-compatible. Pair with xc0h_stem_forward.
 
-    norm_type is "layernorm" or "rms". It defaults to layernorm because the
-    in-production precond models were trained with one there -- switching them
-    would change xc0h_proj_ln's state dict keys (weight+bias -> scale) and
-    break every existing checkpoint. Everything else passes "rms".
+    norm_type is "layernorm", "rms" or "l1". It defaults to layernorm because
+    the in-production precond models were trained with one there -- switching
+    them would change xc0h_proj_ln's state dict keys (weight+bias -> scale) and
+    break every existing checkpoint.
     """
     import torch
     import torch.nn as nn
 
-    if norm_type not in ("layernorm", "rms"):
-        raise ValueError(f"norm_type must be 'layernorm' or 'rms', got {norm_type!r}")
+    norms = {"layernorm": nn.LayerNorm, "rms": make_rms1d, "l1": make_l1norm}
+    if norm_type not in norms:
+        raise ValueError(f"norm_type must be one of {sorted(norms)}, got {norm_type!r}")
 
     in_ch = K * XC0H_DEMB + K + 3      # frames + rep + castle + stm + hmc
     m.xc0h_tok_emb = nn.Embedding(XC0H_VOCAB, XC0H_DEMB)
@@ -1704,8 +1729,7 @@ def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
     # values. Each gets its own learnable scale so convs can attenuate any
     # plane toward zero if the geometry isn't useful.
     m.xc0h_proj    = nn.Linear(in_ch, CF - 4)
-    m.xc0h_proj_ln = (make_rms1d(CF - 4) if norm_type == "rms"
-                      else nn.LayerNorm(CF - 4))
+    m.xc0h_proj_ln = norms[norm_type](CF - 4)
 
     # free learnable scales (init 1.0): 3 for rep/stm/hmc, 4 for spatial planes
     m.xc0h_rep_scale     = nn.Parameter(torch.tensor(1.0))
@@ -2242,6 +2266,251 @@ def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
     return m
 
 
+def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
+    """Bake-off m13-7 lineage: L1Norm throughout, no dropout, d stays at
+    conv_filters end to end.
+
+    xc0h stem (L1) -> n_plain ConvBlock -> n_expandy ExpandyConvBlock -> n_gated
+    GatedExpandyConvBlock -> tokens + pos_scale * pos -> 8 global accumulators
+    -> n_ff gelu-FF TxBlocks then n_swiglu SwiGLU TxBlocks -> trunk L1
+    -> WDL(acc0) + SmartGate(acc3 cat acc4, GELU MLP-1024, soft-clamped)
+    + from/to MHA policy with L1-normed dot product.
+
+    Expandy = grouped 3x3 expand D->2D, leaky, 1x1 contract, twice.  Gated
+    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  Forward stashes
+    last_gate_raw / last_gate_act / last_dot_raw for the trainer's fp16 range
+    penalties.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    D         = cfg["conv_filters"]
+    nh        = cfg.get("num_heads", 8)
+    ff_dim    = cfg.get("ff_dim", 1024)
+    n_plain   = cfg.get("n_plain", 0)
+    n_expandy = cfg.get("n_expandy", 0)
+    n_gated   = cfg.get("n_gated", 0)
+    n_ff      = cfg.get("n_ff", 0)
+    n_swiglu  = cfg.get("n_swiglu", 0)
+    groups    = cfg.get("expandy_groups", 4)
+    XC0H_K    = cfg["xc0h_K"]
+    PDH, POLICY_HEADS = 256, 4
+    GATE_D, SMARTGATE_H = 2 * D, 1024
+    SOFTCLAMP_M, SOFTCLAMP_C = 100.0, 80.0
+    FP16_CLIP = 60000.0
+    GATE_EMA_BETA = 1.0 - 1.0 / 500.0
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+
+    def soft_clamp(x, m=SOFTCLAMP_M, c=SOFTCLAMP_C):
+        a = x.abs()
+        mag = a.clamp(max=c) + (m - c) * torch.tanh(F.relu(a - c) / (m - c))
+        return torch.sign(x) * mag
+
+    def norm_nchw(norm, x):
+        return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    class Attention(nn.Module):
+        def __init__(self, dim, heads):
+            super().__init__()
+            self.q = nn.Linear(dim, dim)
+            self.k = nn.Linear(dim, dim)
+            self.v = nn.Linear(dim, dim)
+            self.o = nn.Linear(dim, dim)
+            self.heads = heads
+            self.head_dim = dim // heads
+
+        def forward(self, xq, xkv):
+            bq, nq, dim = xq.shape
+            nk = xkv.shape[1]
+            q = self.q(xq).view(bq, nq, self.heads, self.head_dim).transpose(1, 2)
+            k = self.k(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
+            v = self.v(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
+            a = F.scaled_dot_product_attention(q, k, v)
+            return self.o(a.transpose(1, 2).reshape(bq, nq, dim))
+
+    class ConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = make_l1norm(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+
+        def forward(self, x):
+            h = F.leaky_relu(self.c1(norm_nchw(self.norm, x)), 0.01)
+            return x + F.leaky_relu(self.c2(h), 0.01)
+
+    class ExpandyConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n1 = make_l1norm(D)
+            self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p2 = nn.Conv2d(2 * D, D, 1, bias=False)
+
+        def forward(self, x):
+            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.05))
+            return x + self.p2(F.leaky_relu(self.c2(h), 0.05))
+
+    class GatedExpandyConvBlock(nn.Module):
+        """Gate mean/std/range per (channel, square) tracked as 500-step EMAs
+        during training for the trainer's gate-health readout."""
+
+        def __init__(self):
+            super().__init__()
+            self.n1 = make_l1norm(D)
+            self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.c_gate = nn.Conv2d(D, D, 1)
+            self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p2 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.register_buffer("gate_mean_ema", torch.full((D, 8, 8), 0.5))
+            self.register_buffer("gate_std_ema", torch.full((D, 8, 8), 0.16))
+            self.register_buffer("gate_range_ema", torch.zeros(D, 8, 8))
+
+        def forward(self, x):
+            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.05))
+            gate = torch.sigmoid(self.c_gate(h))
+            if self.training and torch.is_grad_enabled():
+                with torch.no_grad():
+                    gf = gate.detach().float()
+                    self.gate_mean_ema.lerp_(gf.mean(0), 1 - GATE_EMA_BETA)
+                    self.gate_std_ema.lerp_(gf.std(0), 1 - GATE_EMA_BETA)
+                    self.gate_range_ema.lerp_(gf.amax(0) - gf.amin(0), 1 - GATE_EMA_BETA)
+            return x + gate * self.p2(F.leaky_relu(self.c2(h), 0.05))
+
+    class TxBlockFF(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n1 = make_l1norm(D)
+            self.attn = Attention(D, nh)
+            self.n2 = make_l1norm(D)
+            self.ff1 = nn.Linear(D, ff_dim)
+            self.ff2 = nn.Linear(ff_dim, D, bias=False)
+
+        def forward(self, x):
+            n = self.n1(x)
+            x = x + self.attn(n, n)
+            return x + self.ff2(F.gelu(self.ff1(self.n2(x))))
+
+    class TxBlockSwiGLU(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n1 = make_l1norm(D)
+            self.attn = Attention(D, nh)
+            self.n2 = make_l1norm(D)
+            self.gate = nn.Linear(D, 4 * D)
+            self.up = nn.Linear(D, 4 * D)
+            self.down = nn.Linear(4 * D, D, bias=False)
+
+        def forward(self, x):
+            n = self.n1(x)
+            x = x + self.attn(n, n)
+            n = self.n2(x)
+            return x + self.down(F.silu(self.gate(n)) * self.up(n))
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            attach_xc0h_stem(self, D, XC0H_K, norm_type="l1")
+            self.convs = nn.ModuleList(
+                [ConvBlock() for _ in range(n_plain)]
+                + [ExpandyConvBlock() for _ in range(n_expandy)]
+                + [GatedExpandyConvBlock() for _ in range(n_gated)])
+
+            self.pos = nn.Parameter(torch.randn(SEQ_LEN, D) * 0.02)
+            self.pos_scale = nn.Parameter(torch.tensor(1.0))
+            self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+            self.blocks = nn.ModuleList(
+                [TxBlockFF() for _ in range(n_ff)]
+                + [TxBlockSwiGLU() for _ in range(n_swiglu)])
+            self.trunk = make_l1norm(D)
+
+            self.wdl_w1 = nn.Linear(D, D)
+            self.wdl_norm = make_rms1d(D)
+            self.wdl_w2 = nn.Linear(D, 3)
+
+            self.from_proj = nn.Linear(D, PDH)
+            self.from_norm = make_l1norm(PDH)
+            self.from_mha = Attention(PDH, POLICY_HEADS)
+            self.from_out = nn.Linear(PDH, PDH, bias=False)
+            self.to_proj = nn.Linear(D, PDH)
+            self.to_norm = make_l1norm(PDH)
+            self.to_mha = Attention(PDH, POLICY_HEADS)
+            self.to_out = nn.Linear(PDH, PDH, bias=False)
+            self.from_dot_norm = make_l1norm(PDH)
+            self.to_dot_norm = make_l1norm(PDH)
+            self.promo_from = nn.Linear(PDH, 3, bias=False)
+            self.promo_to = nn.Linear(PDH, 3, bias=False)
+
+            self.gate_ff1 = nn.Linear(GATE_D, SMARTGATE_H)
+            self.gate_ff2 = nn.Linear(SMARTGATE_H, GATE_D, bias=False)
+            self.gate_norm = make_l1norm(GATE_D)
+            self.gate_out = nn.Linear(GATE_D, 1858)
+            with torch.no_grad():
+                self.gate_ff2.weight.normal_(std=10 ** -1.5)
+                self.gate_out.weight.normal_(std=10 ** -1.5)
+                self.gate_out.bias.fill_(4.0)
+            self.last_gate_raw = None
+            self.last_gate_act = None
+            self.last_dot_raw = None
+            self.register_buffer("sl_idx", sl_idx)
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            x = xc0h_stem_forward(self, x_in, D, XC0H_K)
+            for blk in self.convs:
+                x = blk(x)
+            board = x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)
+            x = board + self.pos_scale * self.pos.unsqueeze(0)
+            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.trunk(x)
+            wdl = self.wdl_w2(self.wdl_norm(F.gelu(self.wdl_w1(x[:, 64, :]))))
+
+            from_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:71, :]], dim=1)
+            to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 71:72, :]], dim=1)
+            f_proj = from_set + F.gelu(self.from_proj(from_set))
+            fn     = self.from_norm(f_proj)
+            f_base = f_proj[:, :64, :] + self.from_mha(fn[:, :64, :], fn)
+            fv     = f_base + self.from_out(f_base)
+            t_proj = to_set + F.gelu(self.to_proj(to_set))
+            tn     = self.to_norm(t_proj)
+            t_base = t_proj[:, :64, :] + self.to_mha(tn[:, :64, :], tn)
+            tv     = t_base + self.to_out(t_base)
+            dots_raw = torch.bmm(self.from_dot_norm(fv), self.to_dot_norm(tv).transpose(1, 2))
+            dots_raw = dots_raw.clamp(-FP16_CLIP, FP16_CLIP)
+            self.last_dot_raw = dots_raw
+            dots_full = dots_raw * (PDH ** -0.5)
+            dots      = dots_full.reshape(B, 64 * 64)
+            dots_sub  = dots_full[:, 48:56, 56:64]
+            pf = self.promo_from(fv[:, 48:56, :])
+            pt = self.promo_to(tv[:, 56:64, :])
+            promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+                     ).permute(0, 3, 2, 1).reshape(B, 192)
+            policy = torch.cat([dots, promo], dim=-1)[:, self.sl_idx]
+
+            gi   = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)
+            h    = soft_clamp(F.gelu(self.gate_ff1(gi)))
+            down = soft_clamp(self.gate_ff2(h))
+            g    = self.gate_norm((gi + down).clamp(-250.0, 250.0))
+            gate_raw = self.gate_out(g)
+            self.last_gate_raw = gate_raw
+            gate_act = F.logsigmoid(gate_raw.clamp(-250.0, 250.0))
+            self.last_gate_act = gate_act
+            return policy + gate_act, wdl
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
 PT_BUILDERS: dict[str, object] = {
     "16m-transformer":           build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
@@ -2262,4 +2531,5 @@ PT_BUILDERS: dict[str, object] = {
     "conv-pure":                            build_pt_conv_pure,
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
+    "m13-7-8c8t-d256":                      build_pt_expandy_swiglu,
 }

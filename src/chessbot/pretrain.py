@@ -55,13 +55,18 @@ LR_STEP_SIZE     = 50
 
 
 def lr_for_epoch(ep: int, max_epoch: int = DEFAULT_MAX_EPOCH, scale: float = 1.0,
-                 lr_min: float = LR_MIN, lr_max: float = LR_MAX) -> float:
+                 lr_min: float = LR_MIN, lr_max: float = LR_MAX,
+                 hold_epochs: int = 0) -> float:
+    """hold_epochs keeps lr flat at lr_max after warmup; cosine runs from there
+    to decay_end."""
     decay_end   = max_epoch - LR_DECAY_EPOCHS
-    total_steps = decay_end // LR_STEP_SIZE
+    total_steps = (decay_end - hold_epochs) // LR_STEP_SIZE
     if ep >= decay_end:
         lr = lr_min
+    elif ep < hold_epochs:
+        lr = lr_max
     else:
-        step = ep // LR_STEP_SIZE
+        step = (ep - hold_epochs) // LR_STEP_SIZE
         t    = (step + 1) / total_steps
         lr   = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t))
     if ep < LR_WARMUP_EPOCHS:

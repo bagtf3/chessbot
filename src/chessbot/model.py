@@ -2273,13 +2273,18 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     xc0h stem (L1) -> n_plain ConvBlock -> n_expandy ExpandyConvBlock -> n_gated
     GatedExpandyConvBlock -> tokens + pos_scale * pos -> 8 global accumulators
     -> n_ff gelu-FF TxBlocks then n_swiglu SwiGLU TxBlocks -> trunk L1
-    -> WDL(acc0) + SmartGate(acc3 cat acc4, GELU MLP-1024, soft-clamped)
-    + from/to MHA policy with L1-normed dot product.
+    -> wdl3 W/D/L(acc0/acc1/acc2, independent gelu heads)
+    + SmartGate(acc3 cat acc4, GELU MLP-1024, soft-clamped)
+    + from/to MHA policy(acc4-acc7) with L1-normed dot product -- same
+    accumulator routing as 20m_wdl3 (build_pt_precond_addpos, wdl_split=True).
 
     Expandy = grouped 3x3 expand D->2D, leaky, 1x1 contract, twice.  Gated
-    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  Forward stashes
-    last_gate_raw / last_gate_act / last_dot_raw for the trainer's fp16 range
-    penalties.
+    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  gate_act, dot_raw,
+    and each SwiGLU block's down-proj output run through a RangeBanger (see
+    class docstring) feeding m.range_penalty(); gate_act and dot_raw are
+    scan-gated via range_scan_active, down-proj runs every step. Each SwiGLU
+    block's gate*up product runs a track_only RangeBanger: stats only, no
+    penalty.
     """
     import torch
     import torch.nn as nn
@@ -2301,6 +2306,11 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     SOFTCLAMP_M, SOFTCLAMP_C = 100.0, 80.0
     FP16_CLIP = 60000.0
     GATE_EMA_BETA = 1.0 - 1.0 / 500.0
+    GACT_CEIL = 16.0          # range banger: logsigmoid suppression term
+    DOT_CEIL = 1024.0         # range banger: policy dot product (pre PDH**-0.5)
+    SWIGLU_PROD_CEIL = 96.0   # range banger: SwiGLU gate*up product
+    SWIGLU_DOWN_CEIL = 72.0   # range banger: SwiGLU down-proj output (residual increment); initial guess, tune once avg/weight is seen
+    RANGE_GAMMA = 1.2   # range banger: excess**GAMMA tilts the flat-L1 gradient to favor worse violators
 
     sl_idx = torch.from_numpy(
         pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
@@ -2312,17 +2322,6 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
 
     def norm_nchw(norm, x):
         return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-    class RMSNorm(nn.Module):
-        """nn.RMSNorm in exportable ops, no dtype cast."""
-
-        def __init__(self, d, eps=1e-6):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(d))
-            self.eps = eps
-
-        def forward(self, x):
-            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
     class Attention(nn.Module):
         def __init__(self, dim, heads):
@@ -2403,10 +2402,63 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.ff1 = nn.Linear(D, ff_dim)
             self.ff2 = nn.Linear(ff_dim, D, bias=False)
 
-        def forward(self, x):
+        def forward(self, x, range_scan_active=True):
             n = self.n1(x)
             x = x + self.attn(n, n)
             return x + self.ff2(F.gelu(self.ff1(self.n2(x))))
+
+    class RangeBanger(nn.Module):
+        """Penalizes `excess = relu(|raw| - ceil)` as `excess**RANGE_GAMMA`.
+        Buffers (site-steps, n-elements-over, raw excess sum) update in-place
+        with no host sync; `read_reset()` is the one sync point, for print
+        time only. Buffers are non-persistent, so they're not part of the
+        checkpoint. `active=False` skips the site: no penalty, no tracking.
+        `track_only=True` still updates the buffers but returns 0.0 always --
+        no penalty, no gradient, computed fully inside no_grad. `last_violated`
+        is a device-resident bool for the caller to check (one sync) whether
+        to re-arm scanning."""
+
+        def __init__(self, ceil, track_only=False):
+            super().__init__()
+            self.ceil = ceil
+            self.track_only = track_only
+            self.register_buffer("steps", torch.zeros(()), persistent=False)
+            self.register_buffer("elems", torch.zeros(()), persistent=False)
+            self.register_buffer("pensum", torch.zeros(()), persistent=False)
+            self.register_buffer("maxexc", torch.zeros(()), persistent=False)
+            self.register_buffer(
+                "last_violated", torch.zeros((), dtype=torch.bool), persistent=False)
+
+        def _track(self, excess):
+            mask = excess > 0
+            n_elem = mask.sum().float()
+            self.last_violated = mask.any()
+            self.steps.add_((n_elem > 0).float())
+            self.elems.add_(n_elem)
+            self.pensum.add_(excess.sum())
+            self.maxexc.copy_(torch.maximum(self.maxexc, excess.max()))
+
+        def forward(self, raw, active=True):
+            if not active:
+                return 0.0
+            if self.track_only:
+                with torch.no_grad():
+                    self._track(F.relu(raw.abs() - self.ceil))
+                return 0.0
+            excess = F.relu(raw.abs() - self.ceil)
+            if self.training and torch.is_grad_enabled():
+                with torch.no_grad():
+                    self._track(excess.detach())
+            return excess.pow(RANGE_GAMMA).sum()
+
+        def read_reset(self):
+            steps, elems = self.steps.item(), self.elems.item()
+            pensum, maxexc = self.pensum.item(), self.maxexc.item()
+            self.steps.zero_()
+            self.elems.zero_()
+            self.pensum.zero_()
+            self.maxexc.zero_()
+            return int(steps), int(elems), pensum, maxexc
 
     class TxBlockSwiGLU(nn.Module):
         def __init__(self):
@@ -2417,12 +2469,20 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.gate = nn.Linear(D, 4 * D)
             self.up = nn.Linear(D, 4 * D)
             self.down = nn.Linear(4 * D, D, bias=False)
+            self.range_banger = RangeBanger(SWIGLU_PROD_CEIL, track_only=True)
+            self.down_banger = RangeBanger(SWIGLU_DOWN_CEIL)
+            self.last_range_pen = 0.0
+            self.last_down_pen = 0.0
 
-        def forward(self, x):
+        def forward(self, x, range_scan_active=True):
             n = self.n1(x)
             x = x + self.attn(n, n)
             n = self.n2(x)
-            return x + self.down(F.silu(self.gate(n)) * self.up(n))
+            product = F.silu(self.gate(n)) * self.up(n)
+            self.last_range_pen = self.range_banger(product)
+            down_out = self.down(product)
+            self.last_down_pen = self.down_banger(down_out)   # internalized: always checked
+            return x + down_out
 
     class M(nn.Module):
         def __init__(self):
@@ -2441,9 +2501,14 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
                 + [TxBlockSwiGLU() for _ in range(n_swiglu)])
             self.trunk = make_l1norm(D)
 
-            self.wdl_w1 = nn.Linear(D, D)
-            self.wdl_norm = RMSNorm(D)
-            self.wdl_w2 = nn.Linear(D, 3)
+            # wdl3: acc0/acc1/acc2 each feed an independent W/D/L head
+            vh = 64   # per-head readout width; gives each W/D/L head real capacity
+            self.wdl_hw = nn.Linear(D, vh, bias=True)
+            self.wdl_hd = nn.Linear(D, vh, bias=True)
+            self.wdl_hl = nn.Linear(D, vh, bias=True)
+            self.wdl_ow = nn.Linear(vh, 1, bias=False)
+            self.wdl_od = nn.Linear(vh, 1, bias=False)
+            self.wdl_ol = nn.Linear(vh, 1, bias=False)
 
             self.from_proj = nn.Linear(D, PDH)
             self.from_norm = make_l1norm(PDH)
@@ -2466,12 +2531,13 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
                 self.gate_ff2.weight.normal_(std=10 ** -1.5)
                 self.gate_out.weight.normal_(std=10 ** -1.5)
                 self.gate_out.bias.fill_(4.0)
-            self.last_gate_raw = None
-            self.last_gate_act = None
-            self.last_dot_raw = None
+            self.gate_act_banger = RangeBanger(GACT_CEIL)
+            self.dot_raw_banger = RangeBanger(DOT_CEIL)
+            self.last_gate_act_pen = 0.0
+            self.last_dot_raw_pen = 0.0
             self.register_buffer("sl_idx", sl_idx)
 
-        def forward(self, x_in):
+        def forward(self, x_in, range_scan_active=True):
             B = x_in.shape[0]
             x = xc0h_stem_forward(self, x_in, D, XC0H_K)
             for blk in self.convs:
@@ -2480,9 +2546,12 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             x = board + self.pos_scale * self.pos.unsqueeze(0)
             x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
             for blk in self.blocks:
-                x = blk(x)
+                x = blk(x, range_scan_active)
             x = self.trunk(x)
-            wdl = self.wdl_w2(self.wdl_norm(F.gelu(self.wdl_w1(x[:, 64, :]))))
+            w = self.wdl_ow(F.gelu(self.wdl_hw(x[:, 64, :])))   # acc0
+            d = self.wdl_od(F.gelu(self.wdl_hd(x[:, 65, :])))   # acc1
+            l = self.wdl_ol(F.gelu(self.wdl_hl(x[:, 66, :])))   # acc2
+            wdl = torch.cat([w, d, l], dim=-1)
 
             from_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:71, :]], dim=1)
             to_set   = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 71:72, :]], dim=1)
@@ -2496,7 +2565,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             tv     = t_base + self.to_out(t_base)
             dots_raw = torch.bmm(self.from_dot_norm(fv), self.to_dot_norm(tv).transpose(1, 2))
             dots_raw = dots_raw.clamp(-FP16_CLIP, FP16_CLIP)
-            self.last_dot_raw = dots_raw
+            self.last_dot_raw_pen = self.dot_raw_banger(dots_raw, range_scan_active)
             dots_full = dots_raw * (PDH ** -0.5)
             dots      = dots_full.reshape(B, 64 * 64)
             dots_sub  = dots_full[:, 48:56, 56:64]
@@ -2511,10 +2580,50 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             down = soft_clamp(self.gate_ff2(h))
             g    = self.gate_norm((gi + down).clamp(-250.0, 250.0))
             gate_raw = self.gate_out(g)
-            self.last_gate_raw = gate_raw
             gate_act = F.logsigmoid(gate_raw.clamp(-250.0, 250.0))
-            self.last_gate_act = gate_act
+            self.last_gate_act_pen = self.gate_act_banger(gate_act, range_scan_active)
             return policy + gate_act, wdl
+
+        def range_penalty(self):
+            """Sum of this forward's RangeBanger penalties. No host sync."""
+            total = self.last_gate_act_pen + self.last_dot_raw_pen
+            for block in self.blocks:
+                total = total + getattr(block, "last_range_pen", 0.0)
+                total = total + getattr(block, "last_down_pen", 0.0)
+            return total
+
+        def range_stats(self):
+            """Reads and resets every RangeBanger's counters (host sync --
+            call at print cadence, not every step). Returns name ->
+            (site_steps, n_elements_over, penalty_sum, max_excess)."""
+            stats = {
+                "gate_act": self.gate_act_banger.read_reset(),
+                "dot_raw": self.dot_raw_banger.read_reset(),
+            }
+            prod_steps = prod_elems = down_steps = down_elems = 0
+            prod_psum = down_psum = prod_max = down_max = 0.0
+            for block in self.blocks:
+                if hasattr(block, "range_banger"):
+                    s, e, p, mx = block.range_banger.read_reset()
+                    prod_steps += s
+                    prod_elems += e
+                    prod_psum += p
+                    prod_max = max(prod_max, mx)
+                if hasattr(block, "down_banger"):
+                    s, e, p, mx = block.down_banger.read_reset()
+                    down_steps += s
+                    down_elems += e
+                    down_psum += p
+                    down_max = max(down_max, mx)
+            stats["swiglu_product"] = (prod_steps, prod_elems, prod_psum, prod_max)
+            stats["swiglu_down"] = (down_steps, down_elems, down_psum, down_max)
+            return stats
+
+        def range_scan_violated(self):
+            """One sync: whether the last checked forward found a violation
+            on gate_act or dot_raw."""
+            v = self.gate_act_banger.last_violated | self.dot_raw_banger.last_violated
+            return bool(v.item())
 
     m = M()
     if log_params:

@@ -51,6 +51,7 @@ LR_MAX = 8e-4
 LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
 
 CHECKPOINT_EVERY = 200
+HARD_SAVE_EVERY = 2000   # persistent checkpoint, never overwritten/deleted; manual cleanup only
 SAVE_PLOTS = False   # progress png is slow to render; csv has everything
 SWA_WINDOW = 100
 SWA_EVERY  = 20
@@ -79,6 +80,15 @@ CLIP_CALM_MAX    = 2
 CLIP_REARM_CLIPS = 10
 FP16_MIN = 5.960464477539063e-8
 FP16_MAX = 65504.0
+RANGE_PENALTY_WEIGHT = 1e-6   # weight on model.range_penalty()
+# weighted penalty is tanh-capped at this fraction of (p_loss + v_loss)
+RANGE_PEN_LOSS_CAP_FRAC = 0.2
+RANGE_BANGER_PRINT_EVERY = 5   # passes between range banger sum printouts
+# gate_act/dot_raw range-scan: arms off after RANGE_SCAN_CALM_STEPS
+# consecutive violation-free checked steps, then checks every
+# RANGE_SCAN_CHECK_EVERY steps until a violation re-arms it
+RANGE_SCAN_CALM_STEPS  = 1000
+RANGE_SCAN_CHECK_EVERY = 10
 
 UNIFIED_COLS = [
     "model_epoch", "value_mse", "value_corr", "value_ce", "policy_ce",
@@ -99,6 +109,10 @@ EVAL_DTYPES = {c: "float64" for c in UNIFIED_COLS if c not in ("model_epoch", "n
 
 def ckpt_path(run_dir, name, epoch):
     return os.path.join(run_dir, f"{name}_pt_ckpt{epoch:04d}.pt")
+
+
+def hard_ckpt_path(run_dir, name, epoch):
+    return os.path.join(run_dir, f"{name}_pt_hard{epoch:04d}.pt")
 
 
 def swa_ckpt_path(run_dir, name, epoch):
@@ -525,7 +539,41 @@ def update_clip_state(state, clipped, report):
     return None
 
 
-def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state, report=False):
+def new_range_scan_state():
+    return {"on": True, "calm_steps": 0, "step": 0}
+
+
+def range_scan_should_check(state):
+    if state["on"]:
+        return True
+    return state["step"] % RANGE_SCAN_CHECK_EVERY == 0
+
+
+def update_range_scan_state(state, checked, violated):
+    """Advance the range-scan arm/disarm window by one step. `violated` is
+    meaningless when `checked` is False. Returns a log line on flip, else None."""
+    state["step"] += 1
+    if not checked:
+        return None
+    if state["on"]:
+        if violated:
+            state["calm_steps"] = 0
+        else:
+            state["calm_steps"] += 1
+            if state["calm_steps"] >= RANGE_SCAN_CALM_STEPS:
+                state["on"] = False
+                state["calm_steps"] = 0
+                return (f"[range scan] off: {RANGE_SCAN_CALM_STEPS} calm checked steps; "
+                        f"checking every {RANGE_SCAN_CHECK_EVERY} steps")
+    elif violated:
+        state["on"] = True
+        state["calm_steps"] = 0
+        return "[range scan] on: violation found on a spot-check"
+    return None
+
+
+def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
+              range_scan_state, report=False):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -543,21 +591,37 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state, report=F
     n_batches  = 0
     grad_rep   = None
     scan = clip_state["on"] or report
+    has_range = hasattr(model, "range_penalty")
+    range_scan_msgs = []
 
     for start in range(0, n, PT_BATCH_SIZE):
         idx = perm[start:start + PT_BATCH_SIZE]
         opt.zero_grad(set_to_none=True)
+        do_check = has_range and range_scan_should_check(range_scan_state)
         with autocast("cuda"):
-            pol, val = model(enc[idx])
+            if has_range:
+                pol, val = model(enc[idx], range_scan_active=do_check)
+            else:
+                pol, val = model(enc[idx])
             p_loss = (F.cross_entropy(pol, policy_t[idx], reduction="none") * w[idx]).mean()
             v_loss = (F.cross_entropy(val, value_t[idx], reduction="none") * w[idx]).mean()
             loss = p_loss + v_loss
+            if has_range:
+                cap = RANGE_PEN_LOSS_CAP_FRAC * (p_loss + v_loss).detach()
+                loss_pen = RANGE_PENALTY_WEIGHT * model.range_penalty()
+                loss_pen = cap * torch.tanh(loss_pen / cap)
+                loss = loss + loss_pen
+        if has_range:
+            violated = model.range_scan_violated() if do_check else False
+            msg = update_range_scan_state(range_scan_state, do_check, violated)
+            if msg:
+                range_scan_msgs.append(msg)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)   # records found_inf here, so the scrub below can't mask it
+        for p in model.parameters():   # always on, never gated by clip_state
+            if p.grad is not None:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
         if scan:
-            for p in model.parameters():
-                if p.grad is not None:
-                    torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
             if report and start + PT_BATCH_SIZE >= n:
                 grad_rep = grad_report(model, scaler.get_scale())
             grad_norms.append(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
@@ -578,6 +642,7 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state, report=F
         "gn_mean": gn.mean(), "gn_median": np.median(gn), "gn_min": gn.min(),
         "gn_max": gn.max(), "gn_clips": int(clipped.sum()),
         "gn_steps": n_batches, "scanned": scan, "report": grad_rep, "flip": flip,
+        "range_scan_msgs": range_scan_msgs,
     }
     return total_p, total_v, total_p + total_v, grad_stats
 
@@ -702,6 +767,7 @@ def worker_main(wargs):
 
     current_lr = None
     clip_state = new_clip_state()
+    range_scan_state = new_range_scan_state()
     begin = time.time()
     epoch_times = []
     t_fetch = t_fit = t_eval = 0.0
@@ -743,7 +809,7 @@ def worker_main(wargs):
         max_norm = pt_clipnorm_for_epoch(ep)
         p_loss, v_loss, t_loss, gns = fit_epoch(
             model, opt, scaler, bundle, max_norm, device, clip_state,
-            report=(ep % GRAD_REPORT_EVERY == 0))
+            range_scan_state, report=(ep % GRAD_REPORT_EVERY == 0))
         t_fit += time.time() - t0
 
         n_this = int(bundle["enc_in"].shape[0])
@@ -769,6 +835,18 @@ def worker_main(wargs):
                   f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
         if gns["flip"]:
             print(gns["flip"], flush=True)
+        for msg in gns["range_scan_msgs"]:
+            print(msg, flush=True)
+        if ep % RANGE_BANGER_PRINT_EVERY == 0 and hasattr(model, "range_stats"):
+            stats = model.range_stats()
+            pen_sum = sum(psum for _, _, psum, _ in stats.values())
+            print(f"[range banger sum] {pen_sum:.2f} over last "
+                  f"{RANGE_BANGER_PRINT_EVERY} passes  (weight={RANGE_PENALTY_WEIGHT:.2e}  "
+                  f"cap_frac={RANGE_PEN_LOSS_CAP_FRAC})")
+            for gname, (steps, elems, psum, maxexc) in sorted(stats.items()):
+                avg = psum / elems if elems else 0.0
+                print(f"    {gname:16s} site-steps: {steps:5d}  sum: {psum:10.2f}  "
+                      f"avg/weight: {avg:.4f}  max: {maxexc:.4f}")
         if gns["report"] is not None:
             print_grad_report(gns["report"])
             print(f"  grad scale      {scaler.get_scale():.0f}", flush=True)
@@ -778,6 +856,10 @@ def worker_main(wargs):
             save_pt_ckpt(model, opt, scaler, ep, name, ckpt_path(run_dir, name, ep))
             delete_old_checkpoints(run_dir, name, keep_epoch=ep)
             save_plot_safe(eval_df, f"{name}  [PT]", ep, plot_file, last_tgt_q, last_val_q)
+
+        if ep % HARD_SAVE_EVERY == 0 and ep > 0:
+            save_pt_ckpt(model, opt, scaler, ep, name, hard_ckpt_path(run_dir, name, ep))
+            print(f"[ckpt] hard save at epoch {ep} (persistent, not auto-deleted)")
 
         if ep in swa_set:
             sp = swa_ckpt_path(run_dir, name, ep)

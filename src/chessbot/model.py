@@ -1,22 +1,5 @@
-"""model.py — PyTorch model definitions for Xerces chess engine.
-
-Exports:
-    VOCAB_SIZE, SEQ_LEN
-    VARIANTS     — shared cfg dict used by speed test and bootstrap
-    PT_BUILDERS  — {name: fn(cfg) -> PT nn.Module}
-    make_pt_relational_policy_head, make_pt_attn_pool_value_head, make_ln2d
-
-Optimizer note for future models: the current Adam setup (make_adam in the
-bootstrap/train scripts) applies weight_decay to every parameter through a
-single flat param_group, including 1-D LayerNorm gains/biases, conv/linear
-biases, and free learnable scalars (e.g. the xc0h_*_scale terms). Best
-practice is to exclude 1-D/bias/norm params from weight decay entirely
-(they should decay to their own equilibrium, not toward zero) rather than
-rely on weight_decay being small enough not to matter. Measured negligible
-here at weight_decay=1e-6 (decay/step ratio <2% in every param group), but
-worth building the param-group split properly if a future model raises
-weight_decay or adds larger 1-D/bias terms that actually need protecting.
-"""
+"""PyTorch models for Xerces. VARIANTS holds each model's cfg, PT_BUILDERS maps
+the same names to fn(cfg) -> nn.Module."""
 from __future__ import annotations
 
 VOCAB_SIZE = 21
@@ -132,11 +115,7 @@ def make_ln2d(ch: int):
 
 
 def make_rms2d(ch: int, eps: float = 1e-6):
-    """Channel-wise RMSNorm for (B, C, H, W) tensors.
-
-    Normalizes over the channel dim independently at each board square, so the
-    64 squares never mix. Learned scale, no additive bias.
-    """
+    """Channel-wise RMSNorm for (B, C, H, W): per square over C, scale only."""
     import torch
     import torch.nn as nn
 
@@ -195,11 +174,8 @@ def make_l1norm(d: int, eps: float = 1e-6):
 
 
 def make_l1p5norm(d: int, eps: float = 1e-6):
-    """x / mean(|x|^1.5)^(2/3) over the last dim, learned per-channel scale and
-    bias. eps sits inside both roots so grads stay finite at 0, as in RMSNorm.
-    Runs fully in the input dtype; the pow is kept out of autocast's fp32 list.
-    With grad on, a custom Function (norm + scale + bias in one node) saves only
-    x, scale and per-token stats and recomputes the rest in backward."""
+    """x / mean(|x|^1.5)^(2/3) over the last dim, per-channel scale + bias, in
+    the input dtype. The custom Function saves only x and per-token stats."""
     import torch
     import torch.nn as nn
 
@@ -244,14 +220,8 @@ def make_l1p5norm(d: int, eps: float = 1e-6):
 
 
 def make_rms_conv_block(D: int):
-    """conv-pure's residual block with RMSNorm in place of LayerNorm.
-
-    residual -> rms -> conv3x3 -> leaky_relu -> conv3x3 -> leaky_relu -> add.
-    Exactly one norm per block, and unlike the LayerNorm version every block
-    normalizes -- the first is no longer skipped. c1 takes a bias since RMSNorm
-    has no bias of its own to absorb the offset; c2 reads a leaky_relu and does
-    not.
-    """
+    """conv-pure residual block: rms -> conv3x3 -> leaky -> conv3x3 -> leaky -> add.
+    c1 has a bias (RMSNorm has none to absorb the offset), c2 does not."""
     import torch.nn as nn
     import torch.nn.functional as F
 
@@ -272,22 +242,9 @@ def make_rms_conv_block(D: int):
 
 
 def make_globalizer_block(D: int = 256, local_ch: int = None, glob_ch: int = 16):
-    """Split local/global residual block.
-
-    One full-width 3x3 conv, then its output is split: the first local_ch
-    channels stay spatial, the last glob_ch are flattened to [B, glob_ch * 64],
-    pushed through a SwiGLU bottleneck (halve then restore), reshaped back to
-    [B, glob_ch, 8, 8] and concatenated back on. Every square therefore sees
-    whole-board state without attention.
-
-    The global channels come off the same 3x3 as the local ones rather than a
-    separate 1x1, so the board summary is built from local patterns instead of
-    isolated per-square probes. It also keeps every conv at D -> D, which tiles
-    cleanly, and drops a kernel launch per block -- this family runs
-    launch-bound well past batch 64.
-
-    One RMSNorm, one outer residual, no LayerScale or residual scaling.
-    """
+    """Split local/global residual block: one 3x3 conv, its last glob_ch channels
+    flattened through a SwiGLU bottleneck and concatenated back, so every square
+    sees whole-board state without attention. One RMSNorm."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -349,10 +306,8 @@ def make_pt_attn_pool_value_head(C: int, n_heads: int = 4):
 
 
 def make_pt_mha_policy_head(C: int, n_heads: int = 4):
-    """MHA-refined bilinear policy head. Accepts (B, C, 8, 8).
-    Each from/to branch gets LN -> proj(256) -> GELU -> MHA -> dense(256),
-    then BMM dot product scaled by 1/sqrt(256) for move logits.
-    Returns (B, 4288): 4096 normal + 192 underpromotion logits."""
+    """MHA-refined bilinear from/to policy head on (B, C, 8, 8); returns
+    (B, 4288) = 4096 from/to + 192 underpromotion logits."""
     import math
     import torch
     import torch.nn as nn
@@ -599,10 +554,8 @@ def build_pt_conformer_interweaved(cfg: dict, log_params: bool = False):
 
 
 def build_pt_precond_conformer(cfg: dict, log_params: bool = False):
-    """
-    4x Conv(256) preconditioner -> concat pos(256) -> 512 ->
-    4x [prenorm-MHA -> FF(512->512->512)] -> heads.
-    """
+    """4x Conv(256) preconditioner -> concat pos(256) -> 512 -> 4x prenorm
+    MHA/FF blocks -> heads."""
     
     import torch
     import torch.nn as nn
@@ -686,24 +639,9 @@ def build_pt_precond_conformer(cfg: dict, log_params: bool = False):
 
 
 def build_pt_precond_smartgate(cfg: dict, log_params: bool = False):
-    """4x Conv(256) preconditioner -> concat pos(256) -> 512-d
-    -> append 8 specialized global accumulators -> 4x transformer blocks
-    -> shared trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
-    Gate is suppress-only (logsigmoid <= 0); bias init=4.0 -> near no-op at init.
-
-    If cfg["lc0_input"] is set, the token embedding stem is replaced by a 1x1
-    conv over (B, 112, 8, 8) lc0 planes; everything downstream is identical.
-    Used for the lc0-vs-xc0 encoding bake-off.
-
-    If cfg["xc0h_K"] is set (xc0h = xc0 with history), the stem instead consumes
-    the flat compact history-token encoding from pyfastchess's
-    board.history_tokens(K) / MCTSForest.get_all_history_tokens(K), K = cfg["xc0h_K"]:
-    K frames of 64 slim tokens + K repetition flags + castling/stm/hmc, flattened
-    to (B, K*64+K+3). A shared per-square token embedding (+ learned per-frame-age
-    bias) plus a learned castling plane and scaled stm/hmc/rep channels are
-    concatenated per square and projected to CF; everything downstream is
-    identical to the xc0/lc0 stems. See PLANS.md section 4.
-    """
+    """4x Conv preconditioner -> concat pos -> 8 global accumulators -> 4x tx ->
+    WDL(acc0) + suppress-only SmartGate(acc1) + from/to MHA policy(acc2-7).
+    Stem: token embed, or cfg lc0_input (112 lc0 planes), or cfg xc0h_K (history)."""
     import math
     import torch
     import torch.nn as nn
@@ -884,33 +822,9 @@ def build_pt_precond_smartgate(cfg: dict, log_params: bool = False):
 
 
 def build_pt_precond_signed(cfg: dict, log_params: bool = False):
-    """Precond skeleton with a swappable attention sublayer.
-
-    pre_blocks x preconditioner (globalizer or conv) at CF -> LN -> concat
-    learned pos(pos_dim) -> D = CF + pos_dim -> append 8 global accumulators
-    (72 tokens) -> tx_blocks x TxBlock -> trunk_ln
-    -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
-
-    cfg["attn"] picks the sublayer, everything else held constant:
-      "signed" (default)  one full-rank bilinear form over all 72 tokens,
-                          tanh-bounded and L1-capped, no softmax and no heads
-      "mha"               plain nn.MultiheadAttention at cfg["num_heads"],
-                          the same sublayer 18m-precond-smartgate-xc0h-6c4t
-                          runs, so the two differ only in the attention
-
-    Deliberately a separate builder rather than another flag on
-    build_pt_precond_smartgate: that one carries the in-production
-    18m-precond-smartgate-xc0h-6c4t arch and is already overloaded with
-    lc0/xc0h/interleave branches. The name still says signed because renaming
-    would break every checkpoint that keys off PT_BUILDERS.
-
-    Differences from build_pt_precond_smartgate, all intentional and shared by
-    both attention modes:
-      - RMSNorm throughout, so the heads that read trunk_ln carry biases
-      - FFN is flat ff_dim wide instead of the 768/1024/1024/768 taper
-      - pos concat width is free (pos_dim), not locked to CF
-      - preconditioner can be globalizer blocks (cfg["pre_block"])
-    """
+    """Precond skeleton with a swappable attention sublayer: cfg attn "signed"
+    (tanh-bounded bilinear over 72 tokens, no softmax) or "mha". RMSNorm, flat
+    FFN, free pos_dim. Name kept for checkpoint compat."""
     import math
     import torch
     import torch.nn as nn
@@ -1117,30 +1031,9 @@ def build_pt_precond_signed(cfg: dict, log_params: bool = False):
 
 
 def build_pt_precond_mixer(cfg: dict, log_params: bool = False):
-    """MLP-Mixer preconditioner feeding the production MHA trunk.
-
-    xc0h stem -> mixer_blocks x MLP-Mixer block at CF (token-mix over the 64
-    squares, then channel-mix over CF, expansion 4x both by default) -> RMS
-    -> concat learned pos(pos_dim) -> D = CF + pos_dim -> append 8 global
-    accumulators (72 tokens) -> tx_blocks x MHA TxBlock at D with the same
-    768/1024/.../1024/768 FFN taper 18m-precond-smartgate-xc0h-6c4t uses ->
-    trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7).
-    Same accumulator layout and head formulas as 6c4t, RMSNorm throughout
-    instead of LayerNorm -- so the tx-block half is matched apples-to-apples
-    and only the preconditioner stage (mixer vs conv) differs.
-
-    The token-mixing sublayer is a fixed learned N=64 map, not attention --
-    it can encode static board geometry (files/ranks/diagonals) for free but,
-    unlike the transformer blocks that follow it, cannot reweight itself
-    based on what is actually on the board. That's deliberate: cheap global
-    mixing up front, real content-dependent attention only where it earns
-    its keep.
-
-    Bias convention: every linear whose input comes directly off an RMSNorm
-    (nothing nonlinear in between) carries a bias, since RMS rescales
-    without re-centering. Everything else (post-GELU/SiLU/residual) does
-    not.
-    """
+    """MLP-Mixer preconditioner (fixed learned token-mix over the 64 squares) ->
+    concat pos -> 6c4t-style MHA trunk and heads, RMSNorm throughout. Linears
+    reading straight off an RMSNorm carry a bias; the rest do not."""
     import math
     import torch
     import torch.nn as nn
@@ -1167,12 +1060,8 @@ def build_pt_precond_mixer(cfg: dict, log_params: bool = False):
         pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
 
     class MixerBlock(nn.Module):
-        """One shared RMSNorm feeding both sublayers in parallel -- token-mix
-        and channel-mix each read the same normalized input and add their
-        result back onto the residual independently, rather than the usual
-        sequential pre-norm-each-sublayer arrangement. Halves the norm count
-        per block; same shape family as GPT-J/PaLM's parallel attn+FFN block.
-        """
+        """One shared RMSNorm feeding token-mix and channel-mix in parallel,
+        each added back to the residual (GPT-J-style parallel block)."""
         def __init__(self):
             super().__init__()
             self.norm      = make_rms1d(CF)
@@ -1320,26 +1209,9 @@ def build_pt_precond_mixer(cfg: dict, log_params: bool = False):
 
 
 def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
-    """Precond skeleton that never widens: D stays at conv_filters the whole
-    way through, no pos-concat step.
-
-    xc0h stem -> pre_blocks x conv preconditioner block at D -> flatten to
-    tokens -> x = x + pos_scale * pos(D) (additive, no RMS on this step --
-    the single learnable pos_scale takes over norm's job of setting relative
-    magnitude, so the raw preconditioner output goes in unnormalized) ->
-    append 8 global accumulators (72 tokens) -> tx_blocks x MHA TxBlock at D
-    -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1 concat acc 6) + from/to MHA
-    policy(acc 2-7). RMSNorm throughout.
-
-    SmartGate reads a concatenation of its own accumulator (slot 1) and one
-    of the two accumulators shared between from/to (slot 6), so its internal
-    width is 2*D regardless of how narrow the trunk itself runs -- the same
-    512-wide gate 18m-precond-smartgate-xc0h-6c4t uses, fed by two narrow
-    reads instead of one wide one.
-
-    Bias convention: every linear whose input comes directly off an RMSNorm
-    (nothing nonlinear in between) carries a bias; everything else does not.
-    """
+    """Precond that never widens: D = conv_filters, pos added via a learned
+    pos_scale (no norm), 8 accumulators, MHA trunk, RMSNorm. SmartGate reads
+    acc1 cat acc6 so it stays 2*D wide."""
     import math
     import torch
     import torch.nn as nn
@@ -1570,11 +1442,8 @@ def build_pt_precond_addpos(cfg: dict, log_params: bool = False):
 
 
 def build_pt_conv_shallow_mha(cfg: dict, log_params: bool = False):
-    """2x Conv(128) -> LN(x) -> concat(x, x, pos(128)) -> 384-d
-    -> append 8 global accumulators -> 8x TxBlock(d=384, ff_dim=1024)
-    -> trunk_ln -> WDL(acc 0) + SmartGate(acc 1) + from/to MHA policy(acc 2-7) at 384-d.
-    SmartGate intermediate dim stays at 768 (same as 16m-precond-smartgate).
-    """
+    """2x Conv(128) -> concat(x, x, pos) -> 384-d, 8 accumulators, 8x tx ->
+    WDL / SmartGate / from-to heads at 384-d (gate hidden 768)."""
     import math
     import torch
     import torch.nn as nn
@@ -1723,18 +1592,9 @@ XC0H_DEMB  = 18
 
 
 def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
-    """Attach the xc0h history-token stem onto `m`.
-
-    Consumes the flat (B, K*64+K+3) encoding from board.history_tokens(K):
-    K frames of 64 slim tokens + K repetition flags + castling/stm/hmc. Assigns
-    with the same flat xc0h_* attribute names the inline version used, so state
-    dicts stay key-compatible. Pair with xc0h_stem_forward.
-
-    norm_type is "layernorm", "rms", "l1" or "l1p5". It defaults to layernorm because
-    the in-production precond models were trained with one there -- switching
-    them would change xc0h_proj_ln's state dict keys (weight+bias -> scale) and
-    break every existing checkpoint.
-    """
+    """Attach the xc0h history-token stem (input (B, K*64+K+3)) onto `m`; pair
+    with xc0h_stem_forward. norm_type ("layernorm", "rms", "l1", "l1p5")
+    changes xc0h_proj_ln's state dict keys."""
     import torch
     import torch.nn as nn
 
@@ -1839,31 +1699,9 @@ def xc0h_stem_forward(m, x_in, CF, K):
 
 
 def attach_value_branch(m, D, block_fn, vd=256, heads=8, ff_mult=2):
-    """Dedicated value branch, tapped off the trunk before its last blocks.
-
-    Gets one block of the trunk's own type (block_fn), so a signed-attn model
-    gets a signed-attn value block and a globalizer model gets a globalizer
-    one -- the branch does its own spatial reasoning on features the remaining
-    trunk blocks never see.
-
-    The readout is an accumulator token: a learned vector appended to the 64
-    squares, run through one attention block so it can gather from them and
-    they can react to it, then pulled back out and used as the query for a
-    second cross-attention over the 64 squares alone. That second attention
-    returns a weighted sum of square values only -- the query contributes
-    nothing but routing -- so its output is added back onto the accumulator.
-    Without that residual everything the accumulator learned in the first
-    attention is discarded, and it also gives the value loss a short path back
-    to the trunk tap.
-
-    vp_proj pins the branch to vd regardless of trunk width, but it is skipped
-    outright when the trunk is already vd wide: nothing nonlinear separates it
-    from vp_mha's in_proj, so the two collapse into one map and the layer buys
-    nothing but a kernel launch.
-
-    Every layer after an RMSNorm carries a bias; RMS rescales without
-    re-centering, so there is nothing upstream to position them against zero.
-    """
+    """Value branch tapped before the trunk's last blocks: one block_fn block,
+    then an accumulator token reads the squares via self- then cross-attn (with
+    a residual so the first read survives). vp_proj is skipped when D == vd."""
     import torch
     import torch.nn as nn
 
@@ -1916,13 +1754,8 @@ def value_branch_forward(m, x, B):
 
 
 def attach_conv_pure_heads(m, D, PDH, GATE_D, GATE_H, dr, sl_idx):
-    """Attach conv-pure's SmartGate + from-to policy heads onto `m`.
-
-    Assigns with the same flat attribute names the inline implementation used,
-    so the head half of a state dict stays key-compatible across the conv-*
-    family. Shared by conv-pure and conv-globalizer. The WDL head is not here
-    -- it lives on its own earlier tap, see attach_value_branch.
-    """
+    """Attach the conv-* family's SmartGate + from/to policy heads onto `m`.
+    WDL lives on its own tap (attach_value_branch)."""
     import math
     import torch.nn as nn
 
@@ -1964,11 +1797,8 @@ def attach_conv_pure_heads(m, D, PDH, GATE_D, GATE_H, dr, sl_idx):
 
 
 def conv_pure_heads_forward(m, trunk, B, D):
-    """Run the heads attached by attach_conv_pure_heads.
-
-    `trunk` is post-trunk-norm [B, D, 8, 8]. Returns policy_1858 only -- WDL
-    comes off the earlier tap via value_branch_forward.
-    """
+    """attach_conv_pure_heads heads on post-norm [B, D, 8, 8]; returns
+    policy_1858 only (WDL comes from value_branch_forward)."""
     import torch
     import torch.nn.functional as F
 
@@ -2007,23 +1837,9 @@ def conv_pure_heads_forward(m, trunk, B, D):
 
 def build_conv_rms_backbone(cfg: dict, block_fn, n_blocks, log_params=False,
                             name=""):
-    """Shared skeleton for the RMSNorm conv family.
-
-    stem -> n_stem standard RMS conv blocks at CF -> optional widen to
-    CF + pos_dim by concatenating a learned per-square positional embedding
-    -> n_blocks x block_fn() at D -> final RMSNorm -> the exact conv-pure heads.
-    `block_fn` is a zero-arg factory so the caller picks globalizer vs
-    signed-attn without duplicating the stem or heads.
-
-    cfg["xc0h_K"] selects the xc0h history-token stem (same one the precond
-    models use); without it the plain 64-token embedding.
-
-    cfg["pos_dim"] mirrors what the precond models do at the conv->transformer
-    boundary: normalize the conv output, then concatenate a learned position
-    channel block rather than adding it, so position survives as its own
-    subspace instead of competing with content. Omit it and the trunk stays at
-    CF the whole way (conv-pure).
-    """
+    """RMSNorm conv family skeleton: stem -> n_stem RMS conv blocks -> optional
+    pos-concat widen (cfg pos_dim) -> n_blocks x block_fn() -> conv-pure heads.
+    cfg xc0h_K picks the history stem."""
     import torch
     import torch.nn as nn
     import pyfastchess
@@ -2096,13 +1912,8 @@ def build_conv_rms_backbone(cfg: dict, block_fn, n_blocks, log_params=False,
 
 
 def build_pt_conv_globalizer(cfg: dict, log_params: bool = False):
-    """conv-globalizer: stem_blocks RMS conv blocks at conv_filters, optional
-    pos-concat widen, then N globalizer blocks at D = conv_filters + pos_dim.
-
-    Global mixing via a 16-channel 1x1 branch flattened to 1024 and pushed
-    through a SwiGLU bottleneck, then concatenated back. No attention.
-    ~2.72M params per globalizer block at D=256.
-    """
+    """conv-globalizer: RMS conv stem, optional pos widen, then globalizer blocks
+    (SwiGLU global branch, no attention)."""
     D  = cfg["conv_filters"] + cfg.get("pos_dim", 0)
     nb = cfg.get("num_blocks", 8)
     ns = cfg.get("stem_blocks", 2)
@@ -2116,13 +1927,8 @@ def build_pt_conv_globalizer(cfg: dict, log_params: bool = False):
 
 
 def build_pt_conv_pure(cfg: dict, log_params: bool = False):
-    """N x RMS conv block (conv_filters) channels-first (NCHW) -> trunk RMSNorm,
-    N = cfg["num_blocks"] (16 in model_variant_speed_test_pt.py's CONV_PURE_CFG).
-
-    Converted from LayerNorm to RMSNorm: one RMSNorm per block, every block
-    normalized (the first is no longer skipped), conv bias=True. Heads are the
-    shared conv-pure WDL / SmartGate / from-to policy stack, unchanged.
-    """
+    """cfg num_blocks x RMS conv blocks (NCHW) -> trunk RMSNorm -> conv-pure
+    WDL / SmartGate / from-to heads."""
     import torch
     import torch.nn as nn
     import pyfastchess
@@ -2178,11 +1984,8 @@ def build_pt_conv_pure(cfg: dict, log_params: bool = False):
 
 
 def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
-    """No conv. Embedding(256) + pos(128) -> cat -> 384-d [B,64,384]
-    -> append 8 global accum tokens -> 7x TxBlock(d=384) -> Linear(384->512) expander
-    -> 1x TxBlock(d=512) -> trunk_ln(512)
-    -> same WDL/SmartGate/from-to-policy heads as 16m-precond-smartgate at 512-d.
-    """
+    """No conv: embed + pos -> 384-d, 8 accumulators, 7x tx, widen to 512, 1x tx
+    -> 16m-precond-smartgate heads at 512-d."""
     import math
     import torch
     import torch.nn as nn
@@ -2317,23 +2120,9 @@ def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
 
 
 def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
-    """Bake-off m13-7 lineage: L1point5Norm throughout, no clamps, d stays at
-    conv_filters end to end. Residual dropout on each TxBlock's attn and FF out.
-
-    xc0h stem (L1.5) -> n_plain ConvBlock -> n_expandy ExpandyConvBlock -> n_gated
-    GatedExpandyConvBlock -> tokens + pos_scale * pos -> 8 global accumulators
-    -> n_ff gelu-FF TxBlocks then n_swiglu SwiGLU TxBlocks -> trunk L1.5
-    -> wdl3 W/D/L(acc0/acc1/acc2, independent gelu heads)
-    + SmartGate(acc3 cat acc4, GELU MLP-1024, policy - scale * sigmoid(gate_raw);
-      gate_raw is a shut-logit trained on illegality via m.gate_raw)
-    + from/to MHA policy(acc4-acc7) with L1.5-normed dot product -- same
-    accumulator routing as 20m_wdl3 (build_pt_precond_addpos, wdl_split=True).
-
-    Expandy = grouped 3x3 expand D->2D, leaky, 1x1 contract, twice.  Gated
-    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  gate_act, dot_raw
-    and each SwiGLU block's down-proj output feed a MaxMonitor (training only,
-    no penalty), read via m.hotspot_maxes().
-    """
+    """m13-7: xc0h stem -> plain/expandy/gated-expandy convs -> FF then SwiGLU tx
+    (8 accumulators) -> wdl3 + dot policy, minus scale * sigmoid(gate_raw)
+    (shut-logit, trained by the legality BCE). cfg norm: layernorm | l1p5."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -2351,6 +2140,11 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     n_swiglu  = cfg.get("n_swiglu", 0)
     groups    = cfg.get("expandy_groups", 4)
     dr        = cfg.get("dropout", 0.05)
+    norm      = cfg.get("norm", "layernorm")
+    norms     = {"layernorm": nn.LayerNorm, "l1p5": make_l1p5norm}
+    if norm not in norms:
+        raise ValueError(f"norm must be one of {sorted(norms)}, got {norm!r}")
+    make_norm = norms[norm]
     XC0H_K    = cfg["xc0h_K"]
     PDH, POLICY_HEADS = 256, 4
     GATE_D, SMARTGATE_H = 2 * D, 1024
@@ -2374,10 +2168,8 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
         return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
     class GateOut(nn.Module):
-        """Shut-logits for the 1858 moves, per-logit bias, plus the learned
-        suppression scale. project() holds bias and scale in range. A checkpoint
-        without `shut_logit` stored open-logits with a scalar bias: W and b are
-        negated on load, b broadcast, and `converted` is set."""
+        """1858 shut-logits (per-logit bias) + learned scale; project() clamps
+        both. A checkpoint without `shut_logit` is open-logit: negated on load."""
 
         def __init__(self):
             super().__init__()
@@ -2427,7 +2219,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class ConvBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.norm = make_l1p5norm(D)
+            self.norm = make_norm(D)
             self.c1 = nn.Conv2d(D, D, 3, padding=1)
             self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
 
@@ -2438,7 +2230,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class ExpandyConvBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.n1 = make_l1p5norm(D)
+            self.n1 = make_norm(D)
             self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
             self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
             self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
@@ -2454,7 +2246,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
 
         def __init__(self):
             super().__init__()
-            self.n1 = make_l1p5norm(D)
+            self.n1 = make_norm(D)
             self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
             self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
             self.c_gate = nn.Conv2d(D, D, 1)
@@ -2476,11 +2268,8 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             return x + gate * self.p2(F.leaky_relu(self.c2(h), 0.03))
 
     class MaxMonitor(nn.Module):
-        """Hotspot stats on device buffers, training steps only, only while
-        `active`, no penalty. One instance may be shared by a group of blocks:
-        cur holds the group's max |x| for the current step until end_step()
-        folds it into peak and the per-step-max sum. read_reset() is the one
-        host sync. Buffers are non-persistent."""
+        """Training-only hotspot stats (max |x|, per-step max, mean) in device
+        buffers while `active`; read_reset() is the one host sync."""
 
         def __init__(self):
             super().__init__()
@@ -2516,9 +2305,9 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class TxBlockFF(nn.Module):
         def __init__(self, down_mon):
             super().__init__()
-            self.n1 = make_l1p5norm(D)
+            self.n1 = make_norm(D)
             self.attn = Attention(D, nh)
-            self.n2 = make_l1p5norm(D)
+            self.n2 = make_norm(D)
             self.ff1 = nn.Linear(D, ff_dim)
             self.ff2 = nn.Linear(ff_dim, D, bias=False)
             self.down_mon = down_mon
@@ -2535,9 +2324,9 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class TxBlockSwiGLU(nn.Module):
         def __init__(self, down_mon):
             super().__init__()
-            self.n1 = make_l1p5norm(D)
+            self.n1 = make_norm(D)
             self.attn = Attention(D, nh)
-            self.n2 = make_l1p5norm(D)
+            self.n2 = make_norm(D)
             self.gate = nn.Linear(D, 4 * D)
             self.up = nn.Linear(D, 4 * D)
             self.down = nn.Linear(4 * D, D, bias=False)
@@ -2556,7 +2345,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            attach_xc0h_stem(self, D, XC0H_K, norm_type="l1p5")
+            attach_xc0h_stem(self, D, XC0H_K, norm_type=norm)
             self.convs = nn.ModuleList(
                 [ConvBlock() for _ in range(n_plain)]
                 + [ExpandyConvBlock() for _ in range(n_expandy)]
@@ -2570,7 +2359,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.blocks = nn.ModuleList(
                 [TxBlockFF(self.ff_down_mon) for _ in range(n_ff)]
                 + [TxBlockSwiGLU(self.swiglu_down_mon) for _ in range(n_swiglu)])
-            self.trunk = make_l1p5norm(D)
+            self.trunk = make_norm(D)
 
             # wdl3: acc0/acc1/acc2 each feed an independent W/D/L head
             vh = 64   # per-head readout width; gives each W/D/L head real capacity
@@ -2582,21 +2371,21 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.wdl_ol = nn.Linear(vh, 1, bias=False)
 
             self.from_proj = nn.Linear(D, PDH)
-            self.from_norm = make_l1p5norm(PDH)
+            self.from_norm = make_norm(PDH)
             self.from_mha = Attention(PDH, POLICY_HEADS)
             self.from_out = nn.Linear(PDH, PDH, bias=False)
             self.to_proj = nn.Linear(D, PDH)
-            self.to_norm = make_l1p5norm(PDH)
+            self.to_norm = make_norm(PDH)
             self.to_mha = Attention(PDH, POLICY_HEADS)
             self.to_out = nn.Linear(PDH, PDH, bias=False)
-            self.from_dot_norm = make_l1p5norm(PDH)
-            self.to_dot_norm = make_l1p5norm(PDH)
+            self.from_dot_norm = make_norm(PDH)
+            self.to_dot_norm = make_norm(PDH)
             self.promo_from = nn.Linear(PDH, 3, bias=False)
             self.promo_to = nn.Linear(PDH, 3, bias=False)
 
             self.gate_ff1 = nn.Linear(GATE_D, SMARTGATE_H)
             self.gate_ff2 = nn.Linear(SMARTGATE_H, GATE_D, bias=False)
-            self.gate_norm = make_l1p5norm(GATE_D)
+            self.gate_norm = make_norm(GATE_D)
             self.gate_out = GateOut()
             with torch.no_grad():
                 self.gate_ff2.weight.normal_(std=10 ** -1.5)

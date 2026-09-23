@@ -7,7 +7,7 @@ harness in bakeoff_speedtest.py.
 
 Layers match bakeoff_4c2t_d256 (plain ConvBlock, ExpandyConvBlock, gated
 expandy, FF 4x, SwiGLU 4x); gated-expandy and SwiGLU use lean copies without
-the training-only EMA buffers / product hooks.
+the training-only EMA buffers / product hooks. Attention runs on SDPA as in prod.
 
     m1     10 plain conv                    6x MHA + FF 4x
     m7     10 plain conv                    6x MHA + SwiGLU 4x
@@ -20,6 +20,8 @@ the training-only EMA buffers / product hooks.
     m13-1-7-6c12t-d256   6 gated-expandy    8x FF 4x, then 4x SwiGLU 4x
     m1-13-1-7-8c8t-d256  4 plain + 4 gated  4x FF 4x, then 4x SwiGLU 4x
     m13-7-8c8t           model.py m13-7-8c8t-d256 (L1.5 norm, wdl3, GELU-MLP smartgate)
+    m13-7-8c8t-ln        m13-7-8c8t with nn.LayerNorm in place of L1.5
+    m13-7-blowup         m13-7-8c8t-ln with +1000 shift / +-300 spread fed into the trunk norm
     m11-1-8c10t          8 expandy          10x FF 4x
     m11-1-7-8c8t         8 expandy          4x FF 4x, then 4x SwiGLU 4x
     m11-13-1-7-6c10t-d256  2 expandy + 4 gated  6x FF 4x, then 4x SwiGLU 4x  (2x m11-13-1-7-3c5t)
@@ -49,6 +51,7 @@ from bakeoff_speedtest import (
     export_to_onnx, make_trt_infer, compare_pt_vs_export, speed_test,
     print_summary_table,
 )
+import bakeoff_4c2t_d256
 from bakeoff_4c2t_d256 import (
     BakeoffModel, L1Norm, Attention, ConvBlock, ExpandyConvBlock, TxBlockFF,
     D, HEADS,
@@ -73,6 +76,24 @@ YES_WORDS = {"y", "yes", "ye", "yeah", "yep", "yup", "sure", "ok", "okay", "do i
 PARAMS_FALLBACK = {
     "m1": 19980155, "m7": 21559163, "m11": 16716155, "m11-7": 19600763,
 }
+
+
+class AttentionSDPA(Attention):
+    """bakeoff Attention with prod's F.scaled_dot_product_attention core; same
+    q/k/v/o params."""
+
+    def forward(self, xq, xkv):
+        bq, nq, _ = xq.shape
+        nk = xkv.shape[1]
+        q = self.q(xq).view(bq, nq, self.heads, self.head_dim).transpose(1, 2)
+        k = self.k(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
+        v = self.v(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
+        h = F.scaled_dot_product_attention(q, k, v)
+        return self.o(h.transpose(1, 2).reshape(bq, nq, self.dim))
+
+
+# every bakeoff block and head builds its attention through this module global
+bakeoff_4c2t_d256.Attention = AttentionSDPA
 
 
 class RMSNormExport(nn.Module):
@@ -116,7 +137,7 @@ class TxBlockSwiGLULean(nn.Module):
     def __init__(self, hidden=SWIGLU_H):
         super().__init__()
         self.n1 = L1Norm(D)
-        self.attn = Attention(D, HEADS)
+        self.attn = AttentionSDPA(D, HEADS)
         self.n2 = L1Norm(D)
         self.gate = nn.Linear(D, hidden)
         self.up = nn.Linear(D, hidden)
@@ -163,6 +184,12 @@ MODEL_SPECS = {
     ),
     "m13-7-8c8t": dict(
         name="m13-7-8c8t-d256_modelpy", build="m137"
+    ),
+    "m13-7-8c8t-ln": dict(
+        name="m13-7-8c8t-d256_modelpy_ln", build="m137_ln"
+    ),
+    "m13-7-blowup": dict(
+        name="m13-7-8c8t-d256_modelpy_ln_blowup", build="m137_blowup"
     ),
     "m11-1-8c10t": dict(
         name="m11-1-8c10t_conv-8expandy_tx-10ff4x",
@@ -234,10 +261,41 @@ M137_CFG = VARIANTS["m13-7-8c8t-d256"]
 
 
 def build_m137():
-    return build_pt_expandy_swiglu(M137_CFG)
+    return build_pt_expandy_swiglu({**M137_CFG, "norm": "l1p5"})
 
 
-MODEL_BUILDERS = {"m137": build_m137}
+def build_m137_ln():
+    return build_pt_expandy_swiglu({**M137_CFG, "norm": "layernorm"})
+
+
+BLOWUP_SHIFT = 1000.0
+BLOWUP_SPREAD = 300.0
+
+
+class BlowupNorm(nn.Module):
+    """fp16 LayerNorm stress: adds BLOWUP_SHIFT plus a fixed +-BLOWUP_SPREAD
+    per-channel pattern ahead of the wrapped norm. The shift pushes the mean
+    reduction past fp16 max (256 * 1000), the spread pushes (x - mean)^2 past it."""
+
+    def __init__(self, norm, d):
+        super().__init__()
+        self.norm = norm
+        g = torch.Generator().manual_seed(0)
+        pattern = torch.randint(0, 2, (d,), generator=g).float() * 2 - 1
+        self.register_buffer("offset", BLOWUP_SHIFT + BLOWUP_SPREAD * pattern)
+
+    def forward(self, x):
+        return self.norm(x + self.offset.to(x.dtype))
+
+
+def build_m137_blowup():
+    m = build_m137_ln()
+    m.trunk = BlowupNorm(m.trunk, M137_CFG["conv_filters"])
+    return m
+
+
+MODEL_BUILDERS = {"m137": build_m137, "m137_ln": build_m137_ln,
+                  "m137_blowup": build_m137_blowup}
 
 
 def parse_args():

@@ -263,6 +263,37 @@ def remap_opt_state(model, opt, saved, old_keys):
     return {"state": state, "param_groups": groups}
 
 
+def load_matching(model, sd):
+    """Load sd by name. A tensor whose shape changed, or that sd lacks, keeps its
+    fresh init; sd entries the model lacks are dropped. The shape check runs as
+    a per-module pre-hook, so it sees keys after any module's own load
+    conversion. Returns (reshaped, missing, unexpected) key lists."""
+    reshaped = []
+
+    def drop_reshaped(module, state_dict, prefix, *args):
+        own = list(module.named_parameters(recurse=False))
+        own += list(module.named_buffers(recurse=False))
+        for local, t in own:
+            key = prefix + local
+            if key in state_dict and state_dict[key].shape != t.shape:
+                reshaped.append(key)
+                del state_dict[key]
+
+    handles = [m.register_load_state_dict_pre_hook(drop_reshaped)
+               for m in model.modules()]
+    res = model.load_state_dict(sd, strict=False)
+    for h in handles:
+        h.remove()
+    missing = [k for k in res.missing_keys if k not in reshaped]
+    return reshaped, missing, list(res.unexpected_keys)
+
+
+def print_key_list(label, keys, limit=12):
+    if keys:
+        shown = ", ".join(keys[:limit]) + (" ..." if len(keys) > limit else "")
+        print(f"[worker] {label} ({len(keys)}): {shown}", flush=True)
+
+
 def load_pt_model(path, name, device, lr):
     import torch
     from torch.amp import GradScaler
@@ -272,10 +303,16 @@ def load_pt_model(path, name, device, lr):
     scaler = GradScaler("cuda", init_scale=2 ** 15)
     # cpu load keeps Adam's step on cpu; a cuda step forces .item() syncs every step
     ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model"])
+    reshaped, missing, unexpected = load_matching(model, ckpt["model"])
+    print_key_list("re-init, shape changed", reshaped)
+    print_key_list("re-init, new in model", missing)
+    print_key_list("dropped, not in model", unexpected)
     if "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
-    if "optimizer" in ckpt:
+    if unexpected:
+        # saved Adam state can't be realigned once old params are gone
+        print("[worker] params removed since the save: fresh Adam state", flush=True)
+    elif "optimizer" in ckpt:
         wds = [pg["weight_decay"] for pg in opt.param_groups]
         saved = ckpt["optimizer"]
         sizes = [len(pg["params"]) for pg in opt.param_groups]
@@ -597,6 +634,14 @@ def update_weight_decay(opt, swiglu_avg_max):
             f"(swiglu_down avg max {swiglu_avg_max:.2f})")
 
 
+def print_profile(prof):
+    """on_trace_ready for the one-shot TRAIN_PROFILE window."""
+    PROFILE_STATE["done"] = True
+    ka = prof.key_averages()
+    print(ka.table(sort_by="cuda_time_total", row_limit=30), flush=True)
+    print(ka.table(sort_by="self_cpu_time_total", row_limit=20), flush=True)
+
+
 def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
               report=False):
     import torch
@@ -621,14 +666,15 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
     has_gate = hasattr(model, "gate_raw")
     has_proj = hasattr(model, "project_params")
     g_losses = []
-    prof = None
-    if PROFILE_STATE["on"] and not PROFILE_STATE["done"]:
+    if PROFILE_STATE["on"] and not PROFILE_STATE["done"] and "prof" not in PROFILE_STATE:
         from torch.profiler import profile, schedule, ProfilerActivity
-        prof = profile(
+        PROFILE_STATE["prof"] = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=2, warmup=2, active=5, repeat=1),
+            schedule=schedule(wait=0, warmup=21, active=10, repeat=1),
+            on_trace_ready=print_profile,
         )
-        prof.__enter__()
+        PROFILE_STATE["prof"].__enter__()
+    prof = PROFILE_STATE.get("prof")
 
     for start in range(0, n, PT_BATCH_SIZE):
         if prof is not None:
@@ -673,12 +719,9 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
         losses.append((p_loss.detach(), v_loss.detach()))
         n_batches += 1
 
-    if prof is not None:
+    if prof is not None and PROFILE_STATE["done"]:
         prof.__exit__(None, None, None)
-        PROFILE_STATE["done"] = True
-        ka = prof.key_averages()
-        print(ka.table(sort_by="cuda_time_total", row_limit=30), flush=True)
-        print(ka.table(sort_by="self_cpu_time_total", row_limit=20), flush=True)
+        del PROFILE_STATE["prof"]
 
     pv = torch.tensor(losses, device=device).float().cpu().numpy()
     total_p, total_v = pv[:, 0].mean(), pv[:, 1].mean()

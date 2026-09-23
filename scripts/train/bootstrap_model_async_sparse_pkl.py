@@ -36,22 +36,34 @@ from chessbot.pretrain import (
 from chessbot.model import VARIANTS, PT_BUILDERS
 from chessbot.replay_buffer import POLICY_DIM
 
-PT_BATCH_SIZE      = 320
-PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 32
+PT_BATCH_SIZE      = 512
+PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
 PT_ADAM_BETA2      = 0.95
+PROFILE_STATE      = {"on": os.environ.get("TRAIN_PROFILE") == "1", "done": False}
+DROPOUT_DUTY       = 0.25   # per-site per-step chance dropout runs, for models with set_dropout
+# smartgate illegality BCE on m.gate_raw (target = policy_t == 0): a legal elem
+# weighs GATE_LEGAL_POS_W x an illegal one, weights rescaled per row to sum to
+# 1858; the term is pinned to GATE_SHARE * (policy + value)
+GATE_LEGAL_POS_W   = 5.0
+GATE_SHARE         = 0.01
 PT_WEIGHT_DECAY    = 0.008   # AdamW decoupled; applied to 2D+ weights only
+# hotspot-driven decay: swiglu_down avg max above WD_RAISE_AT raises decay to
+# WD_HIGH; below WD_DROP_AT drops it back to PT_WEIGHT_DECAY
+WD_HIGH     = 0.03
+WD_RAISE_AT = 500.0
+WD_DROP_AT  = 400.0
 
 BUFFER_CAP     = 256_000       # shuffle pool high-water mark
 REFILL_BAND    = 56_000        # refill once the pool drains below high - band (-> 200k)
 VAL_BUFFER_CAP = 96_000
 
-# cosine LR floor and ceiling; ceiling matches the bakeoff start lr
+# cosine LR floor and ceiling
 LR_MIN = 1e-4
-LR_MAX = 8e-4
+LR_MAX = 1e-3
 LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
 
 CHECKPOINT_EVERY = 200
-HARD_SAVE_EVERY = 2000   # persistent checkpoint, never overwritten/deleted; manual cleanup only
+HARD_SAVE_EVERY = 1000   # persistent checkpoint, never overwritten/deleted; manual cleanup only
 SAVE_PLOTS = False   # progress png is slow to render; csv has everything
 SWA_WINDOW = 100
 SWA_EVERY  = 20
@@ -80,15 +92,7 @@ CLIP_CALM_MAX    = 2
 CLIP_REARM_CLIPS = 10
 FP16_MIN = 5.960464477539063e-8
 FP16_MAX = 65504.0
-RANGE_PENALTY_WEIGHT = 1e-6   # weight on model.range_penalty()
-# weighted penalty is tanh-capped at this fraction of (p_loss + v_loss)
-RANGE_PEN_LOSS_CAP_FRAC = 0.2
-RANGE_BANGER_PRINT_EVERY = 5   # passes between range banger sum printouts
-# gate_act/dot_raw range-scan: arms off after RANGE_SCAN_CALM_STEPS
-# consecutive violation-free checked steps, then checks every
-# RANGE_SCAN_CHECK_EVERY steps until a violation re-arms it
-RANGE_SCAN_CALM_STEPS  = 1000
-RANGE_SCAN_CHECK_EVERY = 10
+HOTSPOT_SCAN_EVERY = 10   # hotspot stats are tracked and printed on these epochs only
 
 UNIFIED_COLS = [
     "model_epoch", "value_mse", "value_corr", "value_ce", "policy_ce",
@@ -238,6 +242,27 @@ def make_adam(model, lr):
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, PT_ADAM_BETA2))
 
 
+def remap_opt_state(model, opt, saved, old_keys):
+    """Saved optimizer state from a model lacking some of today's params:
+    realign it by param name. Params absent from old_keys start fresh."""
+    name_of = {id(p): n for n, p in model.named_parameters()}
+    state, groups, nid = {}, [], 0
+    for pg, spg in zip(opt.param_groups, saved["param_groups"]):
+        names = [name_of[id(p)] for p in pg["params"]]
+        old_names = [n for n in names if n in old_keys]
+        if len(old_names) != len(spg["params"]):
+            raise RuntimeError("optimizer group mismatch not explained by new params")
+        old_id = dict(zip(old_names, spg["params"]))
+        ids = []
+        for n in names:
+            if n in old_id and old_id[n] in saved["state"]:
+                state[nid] = saved["state"][old_id[n]]
+            ids.append(nid)
+            nid += 1
+        groups.append({**spg, "params": ids})
+    return {"state": state, "param_groups": groups}
+
+
 def load_pt_model(path, name, device, lr):
     import torch
     from torch.amp import GradScaler
@@ -245,14 +270,31 @@ def load_pt_model(path, name, device, lr):
     model  = PT_BUILDERS[name](cfg).to(device)
     opt    = make_adam(model, lr)
     scaler = GradScaler("cuda", init_scale=2 ** 15)
-    ckpt = torch.load(path, map_location=device)
+    # cpu load keeps Adam's step on cpu; a cuda step forces .item() syncs every step
+    ckpt = torch.load(path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     if "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
     if "optimizer" in ckpt:
-        opt.load_state_dict(ckpt["optimizer"])
-        for pg in opt.param_groups:
+        wds = [pg["weight_decay"] for pg in opt.param_groups]
+        saved = ckpt["optimizer"]
+        sizes = [len(pg["params"]) for pg in opt.param_groups]
+        if sizes != [len(pg["params"]) for pg in saved["param_groups"]]:
+            saved = remap_opt_state(model, opt, saved, set(ckpt["model"]))
+            print("[worker] optimizer state remapped by name for new params")
+        opt.load_state_dict(saved)
+        for mod in model.modules():   # sign-converted on load: stale momentum
+            if getattr(mod, "converted", False):
+                for p in mod.parameters():
+                    opt.state.pop(p, None)
+                print(f"[worker] reset Adam state for converted {type(mod).__name__}")
+        for pg, wd in zip(opt.param_groups, wds):
             pg["lr"] = lr
+            pg["weight_decay"] = wd
+            for p in pg["params"]:   # param reshaped since the save: fresh Adam state
+                if p in opt.state and opt.state[p]["exp_avg"].shape != p.shape:
+                    del opt.state[p]
+                    print(f"[worker] reset Adam state for reshaped param {tuple(p.shape)}")
     return model, opt, scaler
 
 
@@ -539,41 +581,24 @@ def update_clip_state(state, clipped, report):
     return None
 
 
-def new_range_scan_state():
-    return {"on": True, "calm_steps": 0, "step": 0}
-
-
-def range_scan_should_check(state):
-    if state["on"]:
-        return True
-    return state["step"] % RANGE_SCAN_CHECK_EVERY == 0
-
-
-def update_range_scan_state(state, checked, violated):
-    """Advance the range-scan arm/disarm window by one step. `violated` is
-    meaningless when `checked` is False. Returns a log line on flip, else None."""
-    state["step"] += 1
-    if not checked:
+def update_weight_decay(opt, swiglu_avg_max):
+    """Hysteresis on swiglu_down avg max. param_groups[0] is make_adam's decay
+    group. Returns a log line when the decay changes, else None."""
+    group = opt.param_groups[0]
+    wd = group["weight_decay"]
+    if wd < WD_HIGH and swiglu_avg_max > WD_RAISE_AT:
+        new = WD_HIGH
+    elif wd > PT_WEIGHT_DECAY and swiglu_avg_max < WD_DROP_AT:
+        new = PT_WEIGHT_DECAY
+    else:
         return None
-    if state["on"]:
-        if violated:
-            state["calm_steps"] = 0
-        else:
-            state["calm_steps"] += 1
-            if state["calm_steps"] >= RANGE_SCAN_CALM_STEPS:
-                state["on"] = False
-                state["calm_steps"] = 0
-                return (f"[range scan] off: {RANGE_SCAN_CALM_STEPS} calm checked steps; "
-                        f"checking every {RANGE_SCAN_CHECK_EVERY} steps")
-    elif violated:
-        state["on"] = True
-        state["calm_steps"] = 0
-        return "[range scan] on: violation found on a spot-check"
-    return None
+    group["weight_decay"] = new
+    return (f"[weight decay] {wd:g} -> {new:g}  "
+            f"(swiglu_down avg max {swiglu_avg_max:.2f})")
 
 
 def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
-              range_scan_state, report=False):
+              report=False):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -591,31 +616,47 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
     n_batches  = 0
     grad_rep   = None
     scan = clip_state["on"] or report
-    has_range = hasattr(model, "range_penalty")
-    range_scan_msgs = []
+    has_hot = hasattr(model, "hotspot_end_step")
+    has_drop = hasattr(model, "set_dropout")
+    has_gate = hasattr(model, "gate_raw")
+    has_proj = hasattr(model, "project_params")
+    g_losses = []
+    prof = None
+    if PROFILE_STATE["on"] and not PROFILE_STATE["done"]:
+        from torch.profiler import profile, schedule, ProfilerActivity
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=2, warmup=2, active=5, repeat=1),
+        )
+        prof.__enter__()
 
     for start in range(0, n, PT_BATCH_SIZE):
+        if prof is not None:
+            prof.step()
         idx = perm[start:start + PT_BATCH_SIZE]
+        if has_drop:
+            model.set_dropout(DROPOUT_DUTY)
         opt.zero_grad(set_to_none=True)
-        do_check = has_range and range_scan_should_check(range_scan_state)
         with autocast("cuda"):
-            if has_range:
-                pol, val = model(enc[idx], range_scan_active=do_check)
-            else:
-                pol, val = model(enc[idx])
+            pol, val = model(enc[idx])
             p_loss = (F.cross_entropy(pol, policy_t[idx], reduction="none") * w[idx]).mean()
             v_loss = (F.cross_entropy(val, value_t[idx], reduction="none") * w[idx]).mean()
             loss = p_loss + v_loss
-            if has_range:
-                cap = RANGE_PEN_LOSS_CAP_FRAC * (p_loss + v_loss).detach()
-                loss_pen = RANGE_PENALTY_WEIGHT * model.range_penalty()
-                loss_pen = cap * torch.tanh(loss_pen / cap)
-                loss = loss + loss_pen
-        if has_range:
-            violated = model.range_scan_violated() if do_check else False
-            msg = update_range_scan_state(range_scan_state, do_check, violated)
-            if msg:
-                range_scan_msgs.append(msg)
+            if has_gate:
+                legal = policy_t[idx] > 0
+                g_elem_w = torch.where(legal, GATE_LEGAL_POS_W, 1.0)
+                g_elem_w = g_elem_w * (g_elem_w.shape[-1] / g_elem_w.sum(-1, keepdim=True))
+                g_loss = F.binary_cross_entropy_with_logits(
+                    model.gate_raw.float(),
+                    (~legal).float(),
+                    weight=g_elem_w,
+                    reduction="none",
+                ).sum(-1).mean()
+                gate_w = GATE_SHARE * loss.detach() / g_loss.detach()
+                loss = loss + gate_w * g_loss
+                g_losses.append(g_loss.detach())
+        if has_hot:
+            model.hotspot_end_step()
         scaler.scale(loss).backward()
         scaler.unscale_(opt)   # records found_inf here, so the scrub below can't mask it
         for p in model.parameters():   # always on, never gated by clip_state
@@ -627,8 +668,17 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
             grad_norms.append(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
         scaler.step(opt)
         scaler.update()
+        if has_proj:
+            model.project_params()
         losses.append((p_loss.detach(), v_loss.detach()))
         n_batches += 1
+
+    if prof is not None:
+        prof.__exit__(None, None, None)
+        PROFILE_STATE["done"] = True
+        ka = prof.key_averages()
+        print(ka.table(sort_by="cuda_time_total", row_limit=30), flush=True)
+        print(ka.table(sort_by="self_cpu_time_total", row_limit=20), flush=True)
 
     pv = torch.tensor(losses, device=device).float().cpu().numpy()
     total_p, total_v = pv[:, 0].mean(), pv[:, 1].mean()
@@ -642,7 +692,7 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
         "gn_mean": gn.mean(), "gn_median": np.median(gn), "gn_min": gn.min(),
         "gn_max": gn.max(), "gn_clips": int(clipped.sum()),
         "gn_steps": n_batches, "scanned": scan, "report": grad_rep, "flip": flip,
-        "range_scan_msgs": range_scan_msgs,
+        "g_loss": torch.stack(g_losses).float().mean().item() if g_losses else None,
     }
     return total_p, total_v, total_p + total_v, grad_stats
 
@@ -767,7 +817,6 @@ def worker_main(wargs):
 
     current_lr = None
     clip_state = new_clip_state()
-    range_scan_state = new_range_scan_state()
     begin = time.time()
     epoch_times = []
     t_fetch = t_fit = t_eval = 0.0
@@ -807,9 +856,12 @@ def worker_main(wargs):
 
         t0 = time.time()
         max_norm = pt_clipnorm_for_epoch(ep)
+        hot_scan = ep % HOTSPOT_SCAN_EVERY == 0 and hasattr(model, "set_hotspot_scan")
+        if hot_scan:
+            model.set_hotspot_scan(True)
         p_loss, v_loss, t_loss, gns = fit_epoch(
             model, opt, scaler, bundle, max_norm, device, clip_state,
-            range_scan_state, report=(ep % GRAD_REPORT_EVERY == 0))
+            report=(ep % GRAD_REPORT_EVERY == 0))
         t_fit += time.time() - t0
 
         n_this = int(bundle["enc_in"].shape[0])
@@ -826,27 +878,29 @@ def worker_main(wargs):
             eval_df.loc[eval_df.index[-1], "gn_mean"]   = gns["gn_mean"]
             save_progress_csv(eval_df, progress_file)
 
-        print(f"[epoch {ep:4d}] [{name}] policy_loss: {p_loss:.2f}  "
-              f"value_loss: {v_loss:.2f}  total: {t_loss:.2f}  "
-              f"samples: {total_samples:,}")
+        g_str = f"gate_loss: {gns['g_loss']:.2f}  " if gns["g_loss"] is not None else ""
+        print(f"[epoch {ep:4d}] policy_loss: {p_loss:.2f}  "
+              f"value_loss: {v_loss:.2f}  {g_str}total: {t_loss:.2f}  "
+              f"samples: {total_samples:,}", flush=True)
         if gns["scanned"]:
             print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
                   f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
                   f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
         if gns["flip"]:
             print(gns["flip"], flush=True)
-        for msg in gns["range_scan_msgs"]:
-            print(msg, flush=True)
-        if ep % RANGE_BANGER_PRINT_EVERY == 0 and hasattr(model, "range_stats"):
-            stats = model.range_stats()
-            pen_sum = sum(psum for _, _, psum, _ in stats.values())
-            print(f"[range banger sum] {pen_sum:.2f} over last "
-                  f"{RANGE_BANGER_PRINT_EVERY} passes  (weight={RANGE_PENALTY_WEIGHT:.2e}  "
-                  f"cap_frac={RANGE_PEN_LOSS_CAP_FRAC})")
-            for gname, (steps, elems, psum, maxexc) in sorted(stats.items()):
-                avg = psum / elems if elems else 0.0
-                print(f"    {gname:16s} site-steps: {steps:5d}  sum: {psum:10.2f}  "
-                      f"avg/weight: {avg:.4f}  max: {maxexc:.4f}")
+        if hot_scan:
+            model.set_hotspot_scan(False)
+            stats = model.hotspot_stats()
+            for label, i in (("abs max", 0), ("avg max", 1), ("act avg", 2)):
+                row = "  ".join(f"{k}: {v[i]:8.2f}" for k, v in stats.items())
+                print(f"[hotspot {label}] {row}", flush=True)
+            if hasattr(model, "gate_param_stats"):
+                b_min, b_mean, b_max, g_scale = model.gate_param_stats()
+                print(f"[gate params] bias min: {b_min:.3f}  mean: {b_mean:.3f}  "
+                      f"max: {b_max:.3f}  scale: {g_scale:.3f}", flush=True)
+            wd_msg = update_weight_decay(opt, stats["swiglu_down"][1])
+            if wd_msg:
+                print(wd_msg, flush=True)
         if gns["report"] is not None:
             print_grad_report(gns["report"])
             print(f"  grad scale      {scaler.get_scale():.0f}", flush=True)

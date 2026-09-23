@@ -19,8 +19,7 @@ the training-only EMA buffers / product hooks.
     m11-1-6c12t-d256     6 expandy          12x FF 4x
     m13-1-7-6c12t-d256   6 gated-expandy    8x FF 4x, then 4x SwiGLU 4x
     m1-13-1-7-8c8t-d256  4 plain + 4 gated  4x FF 4x, then 4x SwiGLU 4x
-    m13-7-8c8t           model.py m13-7-8c8t-d256 (wdl3, GELU-MLP smartgate)
-    m13-7-8c8t-L1point5  m13-7-8c8t, L1point5Norm everywhere, unclamped smartgate
+    m13-7-8c8t           model.py m13-7-8c8t-d256 (L1.5 norm, wdl3, GELU-MLP smartgate)
     m11-1-8c10t          8 expandy          10x FF 4x
     m11-1-7-8c8t         8 expandy          4x FF 4x, then 4x SwiGLU 4x
     m11-13-1-7-6c10t-d256  2 expandy + 4 gated  6x FF 4x, then 4x SwiGLU 4x  (2x m11-13-1-7-3c5t)
@@ -52,10 +51,10 @@ from bakeoff_speedtest import (
 )
 from bakeoff_4c2t_d256 import (
     BakeoffModel, L1Norm, Attention, ConvBlock, ExpandyConvBlock, TxBlockFF,
-    D, HEADS, EPS, TOKENS, PDH, FP16_CLIP,
+    D, HEADS,
 )
 
-from chessbot.model import VARIANTS, build_pt_expandy_swiglu, xc0h_stem_forward
+from chessbot.model import VARIANTS, build_pt_expandy_swiglu
 
 N_PLAIN = 4
 N_VARIANT = 6
@@ -89,25 +88,6 @@ class RMSNormExport(nn.Module):
         xf = x.float()
         y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
         return (y * self.weight).to(x.dtype)
-
-
-class L1point5Norm(L1Norm):
-    """x / mean(|x|^1.5)^(2/3); same clamp, scale and bias as L1Norm."""
-
-    def forward(self, x):
-        x = x.clamp(-250.0, 250.0)
-        a = x.abs()
-        y = x / ((a * a.sqrt()).mean(-1, keepdim=True).pow(2.0 / 3.0) + EPS)
-        return y * self.scale.to(x.dtype) + self.b.to(x.dtype)
-
-
-def swap_l1_norms(module):
-    """Replace every L1Norm under module with an L1point5Norm of the same dim."""
-    for name, child in module.named_children():
-        if type(child).__name__ == "L1Norm":
-            setattr(module, name, L1point5Norm(child.scale.numel()))
-        else:
-            swap_l1_norms(child)
 
 
 class GatedExpandyConvBlockLean(nn.Module):
@@ -184,9 +164,6 @@ MODEL_SPECS = {
     "m13-7-8c8t": dict(
         name="m13-7-8c8t-d256_modelpy", build="m137"
     ),
-    "m13-7-8c8t-L1point5": dict(
-        name="m13-7-8c8t-L1point5_modelpy", build="m137_l1p5"
-    ),
     "m11-1-8c10t": dict(
         name="m11-1-8c10t_conv-8expandy_tx-10ff4x",
         conv="expandy_8", tx="vanilla_10"
@@ -260,64 +237,7 @@ def build_m137():
     return build_pt_expandy_swiglu(M137_CFG)
 
 
-def build_m137_l1p5():
-    """model.py m13-7-8c8t-d256 with L1point5Norm everywhere and the smartgate
-    soft clamps and +/-250 clips removed."""
-    cf, k = M137_CFG["conv_filters"], M137_CFG["xc0h_K"]
-
-    class M137L1p5(type(build_m137())):
-        def forward(self, x_in, range_scan_active=True):
-            B = x_in.shape[0]
-            x = xc0h_stem_forward(self, x_in, cf, k)
-            for blk in self.convs:
-                x = blk(x)
-            board = x.permute(0, 2, 3, 1).reshape(B, TOKENS, cf)
-            x = board + self.pos_scale * self.pos.unsqueeze(0)
-            x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
-            for blk in self.blocks:
-                x = blk(x, range_scan_active)
-            x = self.trunk(x)
-            w = self.wdl_ow(F.gelu(self.wdl_hw(x[:, 64, :])))
-            d = self.wdl_od(F.gelu(self.wdl_hd(x[:, 65, :])))
-            l = self.wdl_ol(F.gelu(self.wdl_hl(x[:, 66, :])))
-            wdl = torch.cat([w, d, l], dim=-1)
-
-            from_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 70:71, :]], dim=1)
-            to_set = torch.cat([x[:, :64, :], x[:, 68:70, :], x[:, 71:72, :]], dim=1)
-            f_proj = from_set + F.gelu(self.from_proj(from_set))
-            fn = self.from_norm(f_proj)
-            f_base = f_proj[:, :64, :] + self.from_mha(fn[:, :64, :], fn)
-            fv = f_base + self.from_out(f_base)
-            t_proj = to_set + F.gelu(self.to_proj(to_set))
-            tn = self.to_norm(t_proj)
-            t_base = t_proj[:, :64, :] + self.to_mha(tn[:, :64, :], tn)
-            tv = t_base + self.to_out(t_base)
-            dots_raw = torch.bmm(
-                self.from_dot_norm(fv), self.to_dot_norm(tv).transpose(1, 2))
-            dots_raw = dots_raw.clamp(-FP16_CLIP, FP16_CLIP)
-            self.last_dot_raw_pen = self.dot_raw_banger(dots_raw, range_scan_active)
-            dots_full = dots_raw * (PDH ** -0.5)
-            dots = dots_full.reshape(B, 64 * 64)
-            dots_sub = dots_full[:, 48:56, 56:64]
-            pf = self.promo_from(fv[:, 48:56, :])
-            pt = self.promo_to(tv[:, 56:64, :])
-            promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
-                     ).permute(0, 3, 2, 1).reshape(B, 192)
-            policy = torch.cat([dots, promo], dim=-1)[:, self.sl_idx]
-
-            gi = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)
-            down = self.gate_ff2(F.gelu(self.gate_ff1(gi)))
-            g = self.gate_norm(gi + down)
-            gate_act = F.logsigmoid(self.gate_out(g))
-            self.last_gate_act_pen = self.gate_act_banger(gate_act, range_scan_active)
-            return policy + gate_act, wdl
-
-    m = M137L1p5()
-    swap_l1_norms(m)
-    return m
-
-
-MODEL_BUILDERS = {"m137": build_m137, "m137_l1p5": build_m137_l1p5}
+MODEL_BUILDERS = {"m137": build_m137}
 
 
 def parse_args():

@@ -194,6 +194,55 @@ def make_l1norm(d: int, eps: float = 1e-6):
     return L1Norm()
 
 
+def make_l1p5norm(d: int, eps: float = 1e-6):
+    """x / mean(|x|^1.5)^(2/3) over the last dim, learned per-channel scale and
+    bias. eps sits inside both roots so grads stay finite at 0, as in RMSNorm.
+    Runs fully in the input dtype; the pow is kept out of autocast's fp32 list.
+    With grad on, a custom Function (norm + scale + bias in one node) saves only
+    x, scale and per-token stats and recomputes the rest in backward."""
+    import torch
+    import torch.nn as nn
+
+    def stats(x):
+        a = x.abs()
+        m = (a * (a + eps).sqrt()).mean(-1, keepdim=True) + eps
+        with torch.autocast("cuda", enabled=False):
+            denom = m.pow(2.0 / 3.0)
+        return m, denom
+
+    class L1point5Fn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, scale, b):
+            m, denom = stats(x)
+            ctx.save_for_backward(x, scale, m, denom)
+            return x / denom * scale + b
+
+        @staticmethod
+        def backward(ctx, g):
+            x, scale, m, denom = ctx.saved_tensors
+            y = x / denom
+            gs = g * scale
+            c = (gs * y).sum(-1, keepdim=True) * (2.0 / (3.0 * x.shape[-1])) / m
+            s = (x.abs() + eps).sqrt()
+            dx = gs / denom - c * (x.sign() * s + x / (2.0 * s))
+            dims = tuple(range(g.dim() - 1))
+            return dx, (g * y).sum(dims), g.sum(dims)
+
+    class L1point5Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.ones(d))
+            self.b = nn.Parameter(torch.zeros(d))
+
+        def forward(self, x):
+            scale, b = self.scale.to(x.dtype), self.b.to(x.dtype)
+            if torch.is_grad_enabled() and x.requires_grad:
+                return L1point5Fn.apply(x, scale, b)
+            return x / stats(x)[1] * scale + b
+
+    return L1point5Norm()
+
+
 def make_rms_conv_block(D: int):
     """conv-pure's residual block with RMSNorm in place of LayerNorm.
 
@@ -1681,7 +1730,7 @@ def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
     with the same flat xc0h_* attribute names the inline version used, so state
     dicts stay key-compatible. Pair with xc0h_stem_forward.
 
-    norm_type is "layernorm", "rms" or "l1". It defaults to layernorm because
+    norm_type is "layernorm", "rms", "l1" or "l1p5". It defaults to layernorm because
     the in-production precond models were trained with one there -- switching
     them would change xc0h_proj_ln's state dict keys (weight+bias -> scale) and
     break every existing checkpoint.
@@ -1689,7 +1738,8 @@ def attach_xc0h_stem(m, CF, K, norm_type="layernorm"):
     import torch
     import torch.nn as nn
 
-    norms = {"layernorm": nn.LayerNorm, "rms": make_rms1d, "l1": make_l1norm}
+    norms = {"layernorm": nn.LayerNorm, "rms": make_rms1d, "l1": make_l1norm,
+             "l1p5": make_l1p5norm}
     if norm_type not in norms:
         raise ValueError(f"norm_type must be one of {sorted(norms)}, got {norm_type!r}")
 
@@ -2267,29 +2317,29 @@ def build_pt_full_mha_smartgate(cfg: dict, log_params: bool = False):
 
 
 def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
-    """Bake-off m13-7 lineage: L1Norm throughout, no dropout, d stays at
-    conv_filters end to end.
+    """Bake-off m13-7 lineage: L1point5Norm throughout, no clamps, d stays at
+    conv_filters end to end. Residual dropout on each TxBlock's attn and FF out.
 
-    xc0h stem (L1) -> n_plain ConvBlock -> n_expandy ExpandyConvBlock -> n_gated
+    xc0h stem (L1.5) -> n_plain ConvBlock -> n_expandy ExpandyConvBlock -> n_gated
     GatedExpandyConvBlock -> tokens + pos_scale * pos -> 8 global accumulators
-    -> n_ff gelu-FF TxBlocks then n_swiglu SwiGLU TxBlocks -> trunk L1
+    -> n_ff gelu-FF TxBlocks then n_swiglu SwiGLU TxBlocks -> trunk L1.5
     -> wdl3 W/D/L(acc0/acc1/acc2, independent gelu heads)
-    + SmartGate(acc3 cat acc4, GELU MLP-1024, soft-clamped)
-    + from/to MHA policy(acc4-acc7) with L1-normed dot product -- same
+    + SmartGate(acc3 cat acc4, GELU MLP-1024, policy - scale * sigmoid(gate_raw);
+      gate_raw is a shut-logit trained on illegality via m.gate_raw)
+    + from/to MHA policy(acc4-acc7) with L1.5-normed dot product -- same
     accumulator routing as 20m_wdl3 (build_pt_precond_addpos, wdl_split=True).
 
     Expandy = grouped 3x3 expand D->2D, leaky, 1x1 contract, twice.  Gated
-    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  gate_act, dot_raw,
-    and each SwiGLU block's down-proj output run through a RangeBanger (see
-    class docstring) feeding m.range_penalty(); gate_act and dot_raw are
-    scan-gated via range_scan_active, down-proj runs every step. Each SwiGLU
-    block's gate*up product runs a track_only RangeBanger: stats only, no
-    penalty.
+    expandy adds a 1x1 sigmoid off stage 1 gating stage 2.  gate_act, dot_raw
+    and each SwiGLU block's down-proj output feed a MaxMonitor (training only,
+    no penalty), read via m.hotspot_maxes().
     """
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     import pyfastchess
+
+    import random
 
     D         = cfg["conv_filters"]
     nh        = cfg.get("num_heads", 8)
@@ -2300,28 +2350,60 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     n_ff      = cfg.get("n_ff", 0)
     n_swiglu  = cfg.get("n_swiglu", 0)
     groups    = cfg.get("expandy_groups", 4)
+    dr        = cfg.get("dropout", 0.05)
     XC0H_K    = cfg["xc0h_K"]
     PDH, POLICY_HEADS = 256, 4
     GATE_D, SMARTGATE_H = 2 * D, 1024
-    SOFTCLAMP_M, SOFTCLAMP_C = 100.0, 80.0
-    FP16_CLIP = 60000.0
+    GATE_MAX = 12.0          # gate_scale held in [0, GATE_MAX]
+    GATE_SCALE_INIT = 6.0
+    GATE_BIAS_MAX = 5.0      # per-logit shut bias held in [0, GATE_BIAS_MAX]
+    GATE_BIAS_INIT = 1.27    # m13-7-8c8t ep1200's learned scalar bias, sign-flipped
     GATE_EMA_BETA = 1.0 - 1.0 / 500.0
-    GACT_CEIL = 16.0          # range banger: logsigmoid suppression term
-    DOT_CEIL = 1024.0         # range banger: policy dot product (pre PDH**-0.5)
-    SWIGLU_PROD_CEIL = 96.0   # range banger: SwiGLU gate*up product
-    SWIGLU_DOWN_CEIL = 72.0   # range banger: SwiGLU down-proj output (residual increment); initial guess, tune once avg/weight is seen
-    RANGE_GAMMA = 1.2   # range banger: excess**GAMMA tilts the flat-L1 gradient to favor worse violators
 
     sl_idx = torch.from_numpy(
         pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
-
-    def soft_clamp(x, m=SOFTCLAMP_M, c=SOFTCLAMP_C):
-        a = x.abs()
-        mag = a.clamp(max=c) + (m - c) * torch.tanh(F.relu(a - c) / (m - c))
-        return torch.sign(x) * mag
+    n_main = int((sl_idx < 4096).sum())
+    # promo grid is type*64 + to_file*8 + from_file; gather it in pyfastchess's
+    # packed tail order: valid file pairs (from outer, to inner) x type (q, r, b)
+    promo_idx = torch.tensor([
+        t * 64 + tf * 8 + ff
+        for ff in range(8) for tf in range(max(0, ff - 1), min(7, ff + 1) + 1)
+        for t in range(3)])
 
     def norm_nchw(norm, x):
         return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    class GateOut(nn.Module):
+        """Shut-logits for the 1858 moves, per-logit bias, plus the learned
+        suppression scale. project() holds bias and scale in range. A checkpoint
+        without `shut_logit` stored open-logits with a scalar bias: W and b are
+        negated on load, b broadcast, and `converted` is set."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(1858, GATE_D) * 10 ** -1.5)
+            self.bias = nn.Parameter(torch.full((1858,), GATE_BIAS_INIT))
+            self.scale = nn.Parameter(torch.tensor(GATE_SCALE_INIT))
+            self.register_buffer("shut_logit", torch.ones(()))
+            self.converted = False
+
+        def forward(self, g):
+            return F.linear(g, self.weight, self.bias)
+
+        def project(self):
+            with torch.no_grad():
+                self.bias.clamp_(0.0, GATE_BIAS_MAX)
+                self.scale.clamp_(0.0, GATE_MAX)
+
+        def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+            if prefix + "weight" in state_dict and prefix + "shut_logit" not in state_dict:
+                state_dict[prefix + "weight"] = -state_dict[prefix + "weight"]
+                b = -state_dict[prefix + "bias"]
+                state_dict[prefix + "bias"] = b.expand(1858).clone()
+                state_dict[prefix + "scale"] = torch.tensor(GATE_SCALE_INIT)
+                state_dict[prefix + "shut_logit"] = torch.ones(())
+                self.converted = True
+            super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     class Attention(nn.Module):
         def __init__(self, dim, heads):
@@ -2339,32 +2421,32 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             q = self.q(xq).view(bq, nq, self.heads, self.head_dim).transpose(1, 2)
             k = self.k(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
             v = self.v(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
-            a = ((q @ k.transpose(-1, -2)) * (self.head_dim ** -0.5)).softmax(dim=-1)
-            return self.o((a @ v).transpose(1, 2).reshape(bq, nq, dim))
+            a = F.scaled_dot_product_attention(q, k, v)
+            return self.o(a.transpose(1, 2).reshape(bq, nq, dim))
 
     class ConvBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.norm = make_l1norm(D)
+            self.norm = make_l1p5norm(D)
             self.c1 = nn.Conv2d(D, D, 3, padding=1)
             self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
 
         def forward(self, x):
-            h = F.leaky_relu(self.c1(norm_nchw(self.norm, x)), 0.01)
-            return x + F.leaky_relu(self.c2(h), 0.01)
+            h = F.leaky_relu(self.c1(norm_nchw(self.norm, x)), 0.03)
+            return x + F.leaky_relu(self.c2(h), 0.03)
 
     class ExpandyConvBlock(nn.Module):
         def __init__(self):
             super().__init__()
-            self.n1 = make_l1norm(D)
+            self.n1 = make_l1p5norm(D)
             self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
             self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
             self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
             self.p2 = nn.Conv2d(2 * D, D, 1, bias=False)
 
         def forward(self, x):
-            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.05))
-            return x + self.p2(F.leaky_relu(self.c2(h), 0.05))
+            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.03))
+            return x + self.p2(F.leaky_relu(self.c2(h), 0.03))
 
     class GatedExpandyConvBlock(nn.Module):
         """Gate mean/std/range per (channel, square) tracked as 500-step EMAs
@@ -2372,7 +2454,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
 
         def __init__(self):
             super().__init__()
-            self.n1 = make_l1norm(D)
+            self.n1 = make_l1p5norm(D)
             self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
             self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
             self.c_gate = nn.Conv2d(D, D, 1)
@@ -2383,7 +2465,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.register_buffer("gate_range_ema", torch.zeros(D, 8, 8))
 
         def forward(self, x):
-            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.05))
+            h = self.p1(F.leaky_relu(self.c1(norm_nchw(self.n1, x)), 0.03))
             gate = torch.sigmoid(self.c_gate(h))
             if self.training and torch.is_grad_enabled():
                 with torch.no_grad():
@@ -2391,103 +2473,90 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
                     self.gate_mean_ema.lerp_(gf.mean(0), 1 - GATE_EMA_BETA)
                     self.gate_std_ema.lerp_(gf.std(0), 1 - GATE_EMA_BETA)
                     self.gate_range_ema.lerp_(gf.amax(0) - gf.amin(0), 1 - GATE_EMA_BETA)
-            return x + gate * self.p2(F.leaky_relu(self.c2(h), 0.05))
+            return x + gate * self.p2(F.leaky_relu(self.c2(h), 0.03))
 
-    class TxBlockFF(nn.Module):
+    class MaxMonitor(nn.Module):
+        """Hotspot stats on device buffers, training steps only, only while
+        `active`, no penalty. One instance may be shared by a group of blocks:
+        cur holds the group's max |x| for the current step until end_step()
+        folds it into peak and the per-step-max sum. read_reset() is the one
+        host sync. Buffers are non-persistent."""
+
         def __init__(self):
             super().__init__()
-            self.n1 = make_l1norm(D)
-            self.attn = Attention(D, nh)
-            self.n2 = make_l1norm(D)
-            self.ff1 = nn.Linear(D, ff_dim)
-            self.ff2 = nn.Linear(ff_dim, D, bias=False)
+            self.active = False
+            self.steps = 0
+            self.n_act = 0
+            for name in ("cur", "peak", "maxsum", "actsum"):
+                self.register_buffer(name, torch.zeros(()), persistent=False)
 
-        def forward(self, x, range_scan_active=True):
-            n = self.n1(x)
-            x = x + self.attn(n, n)
-            return x + self.ff2(F.gelu(self.ff1(self.n2(x))))
-
-    class RangeBanger(nn.Module):
-        """Penalizes `excess = relu(|raw| - ceil)` as `excess**RANGE_GAMMA`.
-        Buffers (site-steps, n-elements-over, raw excess sum) update in-place
-        with no host sync; `read_reset()` is the one sync point, for print
-        time only. Buffers are non-persistent, so they're not part of the
-        checkpoint. `active=False` skips the site: no penalty, no tracking.
-        `track_only=True` still updates the buffers but returns 0.0 always --
-        no penalty, no gradient, computed fully inside no_grad. `last_violated`
-        is a device-resident bool for the caller to check (one sync) whether
-        to re-arm scanning."""
-
-        def __init__(self, ceil, track_only=False):
-            super().__init__()
-            self.ceil = ceil
-            self.track_only = track_only
-            self.register_buffer("steps", torch.zeros(()), persistent=False)
-            self.register_buffer("elems", torch.zeros(()), persistent=False)
-            self.register_buffer("pensum", torch.zeros(()), persistent=False)
-            self.register_buffer("maxexc", torch.zeros(()), persistent=False)
-            self.register_buffer(
-                "last_violated", torch.zeros((), dtype=torch.bool), persistent=False)
-
-        def _track(self, excess):
-            mask = excess > 0
-            n_elem = mask.sum().float()
-            self.last_violated = mask.any()
-            self.steps.add_((n_elem > 0).float())
-            self.elems.add_(n_elem)
-            self.pensum.add_(excess.sum())
-            self.maxexc.copy_(torch.maximum(self.maxexc, excess.max()))
-
-        def forward(self, raw, active=True):
-            if not active:
-                return 0.0
-            if self.track_only:
+        def forward(self, x):
+            if self.active and self.training and torch.is_grad_enabled():
                 with torch.no_grad():
-                    self._track(F.relu(raw.abs() - self.ceil))
-                return 0.0
-            excess = F.relu(raw.abs() - self.ceil)
-            if self.training and torch.is_grad_enabled():
-                with torch.no_grad():
-                    self._track(excess.detach())
-            return excess.pow(RANGE_GAMMA).sum()
+                    self.cur.copy_(torch.maximum(self.cur, x.abs().max().float()))
+                    self.actsum.add_(x.mean(dtype=torch.float32))
+                    self.n_act += 1
+
+        def end_step(self):
+            if self.active:
+                self.peak.copy_(torch.maximum(self.peak, self.cur))
+                self.maxsum.add_(self.cur)
+                self.cur.zero_()
+                self.steps += 1
 
         def read_reset(self):
-            steps, elems = self.steps.item(), self.elems.item()
-            pensum, maxexc = self.pensum.item(), self.maxexc.item()
-            self.steps.zero_()
-            self.elems.zero_()
-            self.pensum.zero_()
-            self.maxexc.zero_()
-            return int(steps), int(elems), pensum, maxexc
+            peak, maxsum, actsum = torch.stack(
+                [self.peak, self.maxsum, self.actsum]).tolist()
+            out = (peak, maxsum / max(self.steps, 1), actsum / max(self.n_act, 1))
+            for t in (self.cur, self.peak, self.maxsum, self.actsum):
+                t.zero_()
+            self.steps = self.n_act = 0
+            return out
+
+    class TxBlockFF(nn.Module):
+        def __init__(self, down_mon):
+            super().__init__()
+            self.n1 = make_l1p5norm(D)
+            self.attn = Attention(D, nh)
+            self.n2 = make_l1p5norm(D)
+            self.ff1 = nn.Linear(D, ff_dim)
+            self.ff2 = nn.Linear(ff_dim, D, bias=False)
+            self.down_mon = down_mon
+            self.attn_drop = nn.Dropout(dr)
+            self.ff_drop = nn.Dropout(dr)
+
+        def forward(self, x):
+            n = self.n1(x)
+            x = x + self.attn_drop(self.attn(n, n))
+            down_out = self.ff2(F.gelu(self.ff1(self.n2(x))))
+            self.down_mon(down_out)
+            return x + self.ff_drop(down_out)
 
     class TxBlockSwiGLU(nn.Module):
-        def __init__(self):
+        def __init__(self, down_mon):
             super().__init__()
-            self.n1 = make_l1norm(D)
+            self.n1 = make_l1p5norm(D)
             self.attn = Attention(D, nh)
-            self.n2 = make_l1norm(D)
+            self.n2 = make_l1p5norm(D)
             self.gate = nn.Linear(D, 4 * D)
             self.up = nn.Linear(D, 4 * D)
             self.down = nn.Linear(4 * D, D, bias=False)
-            self.range_banger = RangeBanger(SWIGLU_PROD_CEIL, track_only=True)
-            self.down_banger = RangeBanger(SWIGLU_DOWN_CEIL)
-            self.last_range_pen = 0.0
-            self.last_down_pen = 0.0
+            self.down_mon = down_mon
+            self.attn_drop = nn.Dropout(dr)
+            self.ff_drop = nn.Dropout(dr)
 
-        def forward(self, x, range_scan_active=True):
+        def forward(self, x):
             n = self.n1(x)
-            x = x + self.attn(n, n)
+            x = x + self.attn_drop(self.attn(n, n))
             n = self.n2(x)
-            product = F.silu(self.gate(n)) * self.up(n)
-            self.last_range_pen = self.range_banger(product)
-            down_out = self.down(product)
-            self.last_down_pen = self.down_banger(down_out)   # internalized: always checked
-            return x + down_out
+            down_out = self.down(F.silu(self.gate(n)) * self.up(n))
+            self.down_mon(down_out)
+            return x + self.ff_drop(down_out)
 
     class M(nn.Module):
         def __init__(self):
             super().__init__()
-            attach_xc0h_stem(self, D, XC0H_K, norm_type="l1")
+            attach_xc0h_stem(self, D, XC0H_K, norm_type="l1p5")
             self.convs = nn.ModuleList(
                 [ConvBlock() for _ in range(n_plain)]
                 + [ExpandyConvBlock() for _ in range(n_expandy)]
@@ -2496,10 +2565,12 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.pos = nn.Parameter(torch.randn(SEQ_LEN, D) * 0.02)
             self.pos_scale = nn.Parameter(torch.tensor(1.0))
             self.global_tokens = nn.Parameter(torch.randn(1, 8, D) * 0.02)
+            self.ff_down_mon = MaxMonitor()
+            self.swiglu_down_mon = MaxMonitor()
             self.blocks = nn.ModuleList(
-                [TxBlockFF() for _ in range(n_ff)]
-                + [TxBlockSwiGLU() for _ in range(n_swiglu)])
-            self.trunk = make_l1norm(D)
+                [TxBlockFF(self.ff_down_mon) for _ in range(n_ff)]
+                + [TxBlockSwiGLU(self.swiglu_down_mon) for _ in range(n_swiglu)])
+            self.trunk = make_l1p5norm(D)
 
             # wdl3: acc0/acc1/acc2 each feed an independent W/D/L head
             vh = 64   # per-head readout width; gives each W/D/L head real capacity
@@ -2511,33 +2582,31 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.wdl_ol = nn.Linear(vh, 1, bias=False)
 
             self.from_proj = nn.Linear(D, PDH)
-            self.from_norm = make_l1norm(PDH)
+            self.from_norm = make_l1p5norm(PDH)
             self.from_mha = Attention(PDH, POLICY_HEADS)
             self.from_out = nn.Linear(PDH, PDH, bias=False)
             self.to_proj = nn.Linear(D, PDH)
-            self.to_norm = make_l1norm(PDH)
+            self.to_norm = make_l1p5norm(PDH)
             self.to_mha = Attention(PDH, POLICY_HEADS)
             self.to_out = nn.Linear(PDH, PDH, bias=False)
-            self.from_dot_norm = make_l1norm(PDH)
-            self.to_dot_norm = make_l1norm(PDH)
+            self.from_dot_norm = make_l1p5norm(PDH)
+            self.to_dot_norm = make_l1p5norm(PDH)
             self.promo_from = nn.Linear(PDH, 3, bias=False)
             self.promo_to = nn.Linear(PDH, 3, bias=False)
 
             self.gate_ff1 = nn.Linear(GATE_D, SMARTGATE_H)
             self.gate_ff2 = nn.Linear(SMARTGATE_H, GATE_D, bias=False)
-            self.gate_norm = make_l1norm(GATE_D)
-            self.gate_out = nn.Linear(GATE_D, 1858)
+            self.gate_norm = make_l1p5norm(GATE_D)
+            self.gate_out = GateOut()
             with torch.no_grad():
                 self.gate_ff2.weight.normal_(std=10 ** -1.5)
-                self.gate_out.weight.normal_(std=10 ** -1.5)
-                self.gate_out.bias.fill_(4.0)
-            self.gate_act_banger = RangeBanger(GACT_CEIL)
-            self.dot_raw_banger = RangeBanger(DOT_CEIL)
-            self.last_gate_act_pen = 0.0
-            self.last_dot_raw_pen = 0.0
+            self.gate_act_mon = MaxMonitor()
+            self.gate_raw = None
+            self.dot_raw_mon = MaxMonitor()
             self.register_buffer("sl_idx", sl_idx)
+            self.register_buffer("promo_idx", promo_idx, persistent=False)
 
-        def forward(self, x_in, range_scan_active=True):
+        def forward(self, x_in):
             B = x_in.shape[0]
             x = xc0h_stem_forward(self, x_in, D, XC0H_K)
             for blk in self.convs:
@@ -2546,7 +2615,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             x = board + self.pos_scale * self.pos.unsqueeze(0)
             x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
             for blk in self.blocks:
-                x = blk(x, range_scan_active)
+                x = blk(x)
             x = self.trunk(x)
             w = self.wdl_ow(F.gelu(self.wdl_hw(x[:, 64, :])))   # acc0
             d = self.wdl_od(F.gelu(self.wdl_hd(x[:, 65, :])))   # acc1
@@ -2564,8 +2633,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             t_base = t_proj[:, :64, :] + self.to_mha(tn[:, :64, :], tn)
             tv     = t_base + self.to_out(t_base)
             dots_raw = torch.bmm(self.from_dot_norm(fv), self.to_dot_norm(tv).transpose(1, 2))
-            dots_raw = dots_raw.clamp(-FP16_CLIP, FP16_CLIP)
-            self.last_dot_raw_pen = self.dot_raw_banger(dots_raw, range_scan_active)
+            self.dot_raw_mon(dots_raw)
             dots_full = dots_raw * (PDH ** -0.5)
             dots      = dots_full.reshape(B, 64 * 64)
             dots_sub  = dots_full[:, 48:56, 56:64]
@@ -2573,57 +2641,55 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             pt = self.promo_to(tv[:, 56:64, :])
             promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
                      ).permute(0, 3, 2, 1).reshape(B, 192)
-            policy = torch.cat([dots, promo], dim=-1)[:, self.sl_idx]
+            policy = torch.cat(
+                [dots[:, self.sl_idx[:n_main]], promo[:, self.promo_idx]], dim=-1)
 
             gi   = torch.cat([x[:, 67, :], x[:, 68, :]], dim=-1)
-            h    = soft_clamp(F.gelu(self.gate_ff1(gi)))
-            down = soft_clamp(self.gate_ff2(h))
-            g    = self.gate_norm((gi + down).clamp(-250.0, 250.0))
-            gate_raw = self.gate_out(g)
-            gate_act = F.logsigmoid(gate_raw.clamp(-250.0, 250.0))
-            self.last_gate_act_pen = self.gate_act_banger(gate_act, range_scan_active)
-            return policy + gate_act, wdl
+            down = self.gate_ff2(F.gelu(self.gate_ff1(gi)))
+            g    = self.gate_norm(gi + down)
+            self.gate_raw = self.gate_out(g)
+            gate = self.gate_out.scale * torch.sigmoid(self.gate_raw)
+            self.gate_act_mon(gate)
+            return policy - gate, wdl
 
-        def range_penalty(self):
-            """Sum of this forward's RangeBanger penalties. No host sync."""
-            total = self.last_gate_act_pen + self.last_dot_raw_pen
-            for block in self.blocks:
-                total = total + getattr(block, "last_range_pen", 0.0)
-                total = total + getattr(block, "last_down_pen", 0.0)
-            return total
-
-        def range_stats(self):
-            """Reads and resets every RangeBanger's counters (host sync --
-            call at print cadence, not every step). Returns name ->
-            (site_steps, n_elements_over, penalty_sum, max_excess)."""
-            stats = {
-                "gate_act": self.gate_act_banger.read_reset(),
-                "dot_raw": self.dot_raw_banger.read_reset(),
+        def hotspot_monitors(self):
+            return {
+                "gate_act": self.gate_act_mon,
+                "dot_raw": self.dot_raw_mon,
+                "swiglu_down": self.swiglu_down_mon,
+                "ff_down": self.ff_down_mon,
             }
-            prod_steps = prod_elems = down_steps = down_elems = 0
-            prod_psum = down_psum = prod_max = down_max = 0.0
-            for block in self.blocks:
-                if hasattr(block, "range_banger"):
-                    s, e, p, mx = block.range_banger.read_reset()
-                    prod_steps += s
-                    prod_elems += e
-                    prod_psum += p
-                    prod_max = max(prod_max, mx)
-                if hasattr(block, "down_banger"):
-                    s, e, p, mx = block.down_banger.read_reset()
-                    down_steps += s
-                    down_elems += e
-                    down_psum += p
-                    down_max = max(down_max, mx)
-            stats["swiglu_product"] = (prod_steps, prod_elems, prod_psum, prod_max)
-            stats["swiglu_down"] = (down_steps, down_elems, down_psum, down_max)
-            return stats
 
-        def range_scan_violated(self):
-            """One sync: whether the last checked forward found a violation
-            on gate_act or dot_raw."""
-            v = self.gate_act_banger.last_violated | self.dot_raw_banger.last_violated
-            return bool(v.item())
+        def set_dropout(self, duty):
+            """Each TxBlock dropout site runs with chance `duty`, flipped
+            independently; off = eval mode, no kernel launched."""
+            for blk in self.blocks:
+                blk.attn_drop.train(random.random() < duty)
+                blk.ff_drop.train(random.random() < duty)
+
+        def project_params(self):
+            """Clamp constrained params back into range; call after each opt step."""
+            self.gate_out.project()
+
+        def gate_param_stats(self):
+            """(gate bias min, mean, max, gate scale). Host sync, print cadence only."""
+            b = self.gate_out.bias.detach().float()
+            return tuple(torch.stack(
+                [b.min(), b.mean(), b.max(), self.gate_out.scale.detach().float()]).tolist())
+
+        def set_hotspot_scan(self, on):
+            for mon in self.hotspot_monitors().values():
+                mon.active = on
+
+        def hotspot_end_step(self):
+            """Close one training step on every monitor. No host sync."""
+            for mon in self.hotspot_monitors().values():
+                mon.end_step()
+
+        def hotspot_stats(self):
+            """Reads and resets every monitor (host sync, print cadence only).
+            Returns name -> (abs max, avg per-step max, signed act mean)."""
+            return {k: mon.read_reset() for k, mon in self.hotspot_monitors().items()}
 
     m = M()
     if log_params:

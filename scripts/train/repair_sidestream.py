@@ -1,15 +1,6 @@
-"""Side-stream repair: retrain a checkpoint until it matches its run's metrics.
-
-Loads --target_model from --target_dir into a fresh build of its arch (every
-gate_* param re-initialized, anything else whose name or shape no longer matches
-also fresh), then trains in a side dir with the main trainer's fit_epoch at the
-LR the schedule gives --repair_epoch (short linear warmup). Targets are the mean
-of the --repair_epoch row and the 4 rows above it in the target dir's progress
-CSV for policy_ce, value_ce, value_corr and top1_exact. Each check-in passes when
-every metric is within --margin (looser) of its target; 3 passes in a row, or
---max_repair_epochs, ends the repair. The result is saved into --target_dir as
-<arch>_pt_ckpt<repair_epoch>.pt, so the main trainer resumes from it at
-repair_epoch + 1. The gate re-init is local to this script.
+"""Retrain a checkpoint (gate re-init, one-off) in <target_dir>_repair<epoch> until
+it matches the run's last-5-row CSV averages at --repair_epoch, then install it
+as <arch>_pt_ckpt<repair_epoch>.pt in --target_dir. Rolling repair_latest.pt every 50.
 
 Usage:
     python scripts/train/repair_sidestream.py --target_dir DIR
@@ -30,8 +21,9 @@ if TRAIN_DIR not in sys.path:
 
 from bootstrap_model_async_sparse_pkl import (
     AsyncShardPool, BUFFER_CAP, DEFAULT_MAX_EPOCH, DEFAULT_SHARD_DIR, EPOCH_SIZE,
-    LR_HOLD_EPOCHS, LR_MAX, LR_MIN, REFILL_BAND, VAL_BUFFER_CAP, ckpt_path,
-    do_eval, fit_epoch, list_shards, load_matching, make_adam, new_clip_state,
+    GRAD_REPORT_EVERY, HOTSPOT_SCAN_EVERY, LR_HOLD_EPOCHS, LR_MAX, LR_MIN,
+    REFILL_BAND, VAL_BUFFER_CAP, ckpt_path, do_eval, epoch_diagnostics, fit_epoch,
+    list_shards, load_matching, make_adam, new_clip_state, print_gate_ema,
     print_key_list, progress_csv_path, pt_clipnorm_for_epoch, save_pt_ckpt,
     split_train_val_count,
 )
@@ -42,6 +34,7 @@ from chessbot.pretrain import lr_for_epoch, split_train_val as split_train_val_f
 METRICS = {"policy_ce": False, "value_ce": False, "value_corr": True, "top1_exact": True}
 TARGET_ROWS = 5
 PASS_STREAK = 3
+ROLLING_EVERY = 50   # repair epochs between repair_latest.pt saves
 GATE_PREFIX = "gate_"
 
 
@@ -106,7 +99,7 @@ def check(row, bars):
 
 def print_check(i, result, streak):
     cells = "  ".join(
-        f"{m} {v:.4f} ({'ok' if ok else f'short {gap:.4f}'})"
+        f"{m} {v:.4f} ({'ok' if ok else f'{gap:.4f}'})"
         for m, (v, bar, gap, ok) in result.items())
     print(f"[repair check {i:4d}] {cells}  streak {streak}/{PASS_STREAK}", flush=True)
 
@@ -136,13 +129,15 @@ def main():
     side_dir = f"{target_dir.rstrip(os.sep)}_repair{args.repair_epoch}"
     os.makedirs(side_dir, exist_ok=True)
 
-    ckpt = torch.load(src, map_location="cpu")
+    rolling_path = os.path.join(side_dir, "repair_latest.pt")
+    resume = os.path.exists(rolling_path)
+    ckpt = torch.load(rolling_path if resume else src, map_location="cpu")
     name = ckpt.get("arch")
     if name not in PT_BUILDERS:
-        raise RuntimeError(f"{src}: arch {name!r} not in PT_BUILDERS")
+        raise RuntimeError(f"arch {name!r} not in PT_BUILDERS")
     out_path = ckpt_path(target_dir, name, args.repair_epoch)
 
-    print(f"[repair] source   {src}", flush=True)
+    print(f"[repair] source   {rolling_path if resume else src}", flush=True)
     print(f"[repair] arch     {name}", flush=True)
     print(f"[repair] side dir {side_dir}", flush=True)
     print(f"[repair] output   {out_path}", flush=True)
@@ -153,14 +148,29 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
-    model = build_model(name, ckpt["model"], device)
-    del ckpt
     lr_rep = lr_for_epoch(args.repair_epoch, args.max_epoch, lr_min=LR_MIN,
                           lr_max=LR_MAX, hold_epochs=LR_HOLD_EPOCHS)
-    opt = make_adam(model, lr_rep)
     scaler = GradScaler("cuda", init_scale=2 ** 15)
+    side_csv = os.path.join(side_dir, "repair_progress.csv")
+    eval_df, start = None, 0
+    if resume:
+        # repair_latest already carries the repaired gate: full load, no re-init
+        model = PT_BUILDERS[name](VARIANTS[name]).to(device)
+        model.load_state_dict(ckpt["model"])
+        opt = make_adam(model, lr_rep)
+        opt.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start = ckpt["epoch"] + 1
+        if os.path.exists(side_csv):
+            eval_df = pd.read_csv(side_csv)
+        print(f"[repair] resuming at repair epoch {start} (gate kept, Adam kept, "
+              f"pass streak restarts at 0)", flush=True)
+    else:
+        model = build_model(name, ckpt["model"], device)
+        opt = make_adam(model, lr_rep)
+    del ckpt
     print(f"[repair] lr at epoch {args.repair_epoch}: {lr_rep:.4e}  "
-          f"(linear warmup over {args.warmup} epochs, fresh Adam)", flush=True)
+          f"(linear warmup over {args.warmup} epochs)", flush=True)
 
     all_files = list_shards(args.shard_dir)
     if args.val_shards > 0:
@@ -176,38 +186,45 @@ def main():
     train_pool.start()
     val_pool.start()
 
-    side_csv = os.path.join(side_dir, "repair_progress.csv")
     side_plot = os.path.join(side_dir, "repair_plot.png")
     max_norm = pt_clipnorm_for_epoch(args.repair_epoch)
     clip_state = new_clip_state()
-    eval_df, result, streak = None, None, 0
+    result, streak = None, 0
     begin = time.time()
 
-    for i in range(args.max_repair_epochs):
+    for i in range(start, args.max_repair_epochs):
         lr = lr_rep * min(1.0, (i + 1) / max(args.warmup, 1))
         for pg in opt.param_groups:
             pg["lr"] = lr
         t0 = time.time()
+        hot_scan = i % HOTSPOT_SCAN_EVERY == 0 and hasattr(model, "set_hotspot_scan")
+        if hot_scan:
+            model.set_hotspot_scan(True)
         p_loss, v_loss, t_loss, gns = fit_epoch(
-            model, opt, scaler, train_pool.get(), max_norm, device, clip_state)
+            model, opt, scaler, train_pool.get(), max_norm, device, clip_state,
+            report=(i % GRAD_REPORT_EVERY == 0))
         g_str = f"gate_loss: {gns['g_loss']:.2f}  " if gns["g_loss"] is not None else ""
         print(f"[repair {i:4d}] policy_loss: {p_loss:.2f}  value_loss: {v_loss:.2f}  "
               f"{g_str}lr: {lr:.2e}  {time.time() - t0:.1f}s", flush=True)
+        epoch_diagnostics(model, scaler, gns, hot_scan)
 
         last = i == args.max_repair_epochs - 1
         if (i + 1) % args.checkin_every == 0 or last:
             eval_df, _, _ = do_eval(model, name, i, val_pool.get(), eval_df,
                                     side_csv, side_plot, device, train_loss=t_loss)
+            print_gate_ema(model)
             result = check(eval_df.iloc[-1], bars)
             streak = streak + 1 if all(r[3] for r in result.values()) else 0
             print_check(i, result, streak)
             if streak >= PASS_STREAK:
                 break
+        if (i + 1) % ROLLING_EVERY == 0:
+            save_pt_ckpt(model, opt, scaler, i, name, rolling_path)
 
     train_pool.stop()
     val_pool.stop()
     hit = streak >= PASS_STREAK
-    print(f"\n[repair] {i + 1} repair epochs in {(time.time() - begin) / 60:.1f} min",
+    print(f"\n[repair] {i + 1 - start} repair epochs in {(time.time() - begin) / 60:.1f} min",
           flush=True)
     if hit:
         print(f"[repair] TARGET HIT: {PASS_STREAK} passing check-ins in a row", flush=True)

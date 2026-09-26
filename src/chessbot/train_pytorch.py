@@ -35,8 +35,16 @@ VRAM_CHUNK = 5120
 RETRAIN_LW_BASE_POLICY        = 1.0
 RETRAIN_LW_BASE_VALUE         = 1.0
 RETRAIN_LW_TARGET_POLICY_MULT = 1.0
-RETRAIN_LW_TARGET_VALUE_MULT  = 4.0
+RETRAIN_LW_TARGET_VALUE_MULT  = 1.0
 RETRAIN_LW_EMA_SPAN_STEPS     = 400
+
+# Same recipe as the pretrainer. Smartgate illegality BCE on model.gate_raw
+# (legal = policy target > 0; every legal move carries a 1-visit floor), pinned
+# to GATE_SHARE * (weighted policy + value) while above GATE_W_FLOOR.
+GATE_LEGAL_POS_W = 5.0
+GATE_SHARE       = 0.05
+GATE_W_FLOOR     = 5.0
+DROPOUT_DUTY     = 0.25   # per-site per-step chance dropout runs (set_dropout models)
 
 
 def retrain_lw_state_path(model_path: str, run_dir: str) -> str:
@@ -401,6 +409,11 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     # notch below that known-overflow point instead.
     scaler = GradScaler("cuda", init_scale=2**15)
 
+    has_gate = hasattr(model, "gate_raw")
+    has_proj = hasattr(model, "project_params")
+    has_drop = hasattr(model, "set_dropout")
+    g_losses = []
+
     epoch_losses     = []
     epoch_grad_stats = []
     nan_skips        = 0
@@ -438,6 +451,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 vwb = vwht_t[start:end]
                 pwb = pwht_t[start:end]
 
+                if has_drop:
+                    model.set_dropout(DROPOUT_DUTY)
                 opt.zero_grad()
                 with autocast("cuda"):
                     policy_logits, value_out = model(xb)
@@ -449,6 +464,20 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     value_loss = (-(yb * log_wdl).sum(dim=-1) * vwb).mean()
 
                     loss = policy_lw * policy_loss + value_lw * value_loss
+                    if has_gate:
+                        legal = pb > 0
+                        g_w = torch.where(legal, GATE_LEGAL_POS_W, 1.0)
+                        g_w = g_w * (g_w.shape[-1] / g_w.sum(-1, keepdim=True))
+                        g_loss = F.binary_cross_entropy_with_logits(
+                            model.gate_raw.float(),
+                            (~legal).float(),
+                            weight=g_w,
+                            reduction="none",
+                        ).sum(-1).mean()
+                        gate_w = GATE_SHARE * loss.detach() / g_loss.detach().clamp(
+                            min=GATE_W_FLOOR)
+                        loss = loss + gate_w * g_loss
+                        g_losses.append(g_loss.detach())
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -488,6 +517,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     clip_count += 1
                 scaler.step(opt)
                 scaler.update()
+                if has_proj:
+                    model.project_params()
 
                 total        += loss.item()
                 policy_total += policy_loss.item()
@@ -496,6 +527,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
         if nan_skips:
             print(f"{tag} {nan_skips} batch(es) skipped this epoch due to non-finite grad norm")
+        if g_losses:
+            print(f"{tag} gate_loss: {torch.stack(g_losses).mean().item():.3f}")
 
         gn = np.array(grad_norms)
         epoch_losses.append({

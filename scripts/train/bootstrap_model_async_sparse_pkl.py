@@ -43,15 +43,12 @@ PROFILE_STATE      = {"on": os.environ.get("TRAIN_PROFILE") == "1", "done": Fals
 DROPOUT_DUTY       = 0.25   # per-site per-step chance dropout runs, for models with set_dropout
 # smartgate illegality BCE on m.gate_raw (target = policy_t == 0): a legal elem
 # weighs GATE_LEGAL_POS_W x an illegal one, weights rescaled per row to sum to
-# 1858; the term is pinned to GATE_SHARE * (policy + value)
+# 1858; the term is pinned to GATE_SHARE * (policy + value) while gate_loss is
+# above GATE_W_FLOOR, then holds that weight fixed so residual errors aren't amplified
 GATE_LEGAL_POS_W   = 5.0
-GATE_SHARE         = 0.01
+GATE_SHARE         = 0.05
+GATE_W_FLOOR       = 5.0
 PT_WEIGHT_DECAY    = 0.008   # AdamW decoupled; applied to 2D+ weights only
-# hotspot-driven decay: swiglu_down avg max above WD_RAISE_AT raises decay to
-# WD_HIGH; below WD_DROP_AT drops it back to PT_WEIGHT_DECAY
-WD_HIGH     = 0.03
-WD_RAISE_AT = 500.0
-WD_DROP_AT  = 400.0
 
 BUFFER_CAP     = 256_000       # shuffle pool high-water mark
 REFILL_BAND    = 56_000        # refill once the pool drains below high - band (-> 200k)
@@ -242,21 +239,49 @@ def make_adam(model, lr):
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, PT_ADAM_BETA2))
 
 
-def remap_opt_state(model, opt, saved, old_keys):
-    """Saved optimizer state from a model lacking some of today's params:
-    realign it by param name. Params absent from old_keys start fresh."""
+def saved_param_ids(model, saved, old_sd):
+    """{param name: saved optimizer id} for the model that wrote `saved`. Walks
+    old_sd in save order (= named_parameters order, buffers interleaved); groups
+    follow make_adam (decay = ndim >= 2). A key still in today's model is a param
+    iff it is one today; a removed key counts as a param when its shape matches
+    the next saved Adam state in its group."""
+    params = dict(model.named_parameters())
+    buffers = set(model.state_dict()) - set(params)
+    ids = [list(spg["params"]) for spg in saved["param_groups"]]
+    pos = [0] * len(ids)
+    out = {}
+    for k, t in old_sd.items():
+        g = 0 if t.ndim >= 2 else 1
+        if pos[g] >= len(ids[g]):
+            continue
+        sid = ids[g][pos[g]]
+        if k in params:
+            is_param = True
+        elif k in buffers:
+            is_param = False
+        else:
+            st = saved["state"].get(sid)
+            is_param = st is not None and st["exp_avg"].shape == t.shape
+        if is_param:
+            out[k] = sid
+            pos[g] += 1
+    if pos != [len(g) for g in ids]:
+        raise RuntimeError(f"optimizer remap walked {pos} of {[len(g) for g in ids]}")
+    return out
+
+
+def remap_opt_state(model, opt, saved, old_sd):
+    """Realign saved optimizer state by param name across added and removed
+    params. Params new since the save start fresh; removed ones are dropped."""
     name_of = {id(p): n for n, p in model.named_parameters()}
+    old_id = saved_param_ids(model, saved, old_sd)
     state, groups, nid = {}, [], 0
     for pg, spg in zip(opt.param_groups, saved["param_groups"]):
-        names = [name_of[id(p)] for p in pg["params"]]
-        old_names = [n for n in names if n in old_keys]
-        if len(old_names) != len(spg["params"]):
-            raise RuntimeError("optimizer group mismatch not explained by new params")
-        old_id = dict(zip(old_names, spg["params"]))
         ids = []
-        for n in names:
-            if n in old_id and old_id[n] in saved["state"]:
-                state[nid] = saved["state"][old_id[n]]
+        for p in pg["params"]:
+            sid = old_id.get(name_of[id(p)])
+            if sid is not None and sid in saved["state"]:
+                state[nid] = saved["state"][sid]
             ids.append(nid)
             nid += 1
         groups.append({**spg, "params": ids})
@@ -309,16 +334,13 @@ def load_pt_model(path, name, device, lr):
     print_key_list("dropped, not in model", unexpected)
     if "scaler" in ckpt:
         scaler.load_state_dict(ckpt["scaler"])
-    if unexpected:
-        # saved Adam state can't be realigned once old params are gone
-        print("[worker] params removed since the save: fresh Adam state", flush=True)
-    elif "optimizer" in ckpt:
+    if "optimizer" in ckpt:
         wds = [pg["weight_decay"] for pg in opt.param_groups]
         saved = ckpt["optimizer"]
         sizes = [len(pg["params"]) for pg in opt.param_groups]
-        if sizes != [len(pg["params"]) for pg in saved["param_groups"]]:
-            saved = remap_opt_state(model, opt, saved, set(ckpt["model"]))
-            print("[worker] optimizer state remapped by name for new params")
+        if unexpected or sizes != [len(pg["params"]) for pg in saved["param_groups"]]:
+            saved = remap_opt_state(model, opt, saved, ckpt["model"])
+            print("[worker] optimizer state remapped by name for added/removed params")
         opt.load_state_dict(saved)
         for mod in model.modules():   # sign-converted on load: stale momentum
             if getattr(mod, "converted", False):
@@ -370,6 +392,31 @@ def print_gate_ema(model):
         print(f"  GE gate-EMA {label:<5}  x{len(blocks)}  min {s[0]:5.2f}  max {s[1]:5.2f}"
               f"  mean {s[2]:5.2f}  p25 {s[3]:5.2f}  p50 {s[4]:5.2f}  p75 {s[5]:5.2f}",
               flush=True)
+
+
+def print_attn_gate_ema(model):
+    """AG rows: attention-gate EMAs (1 = identity) averaged across gated blocks."""
+    mods = [m for m in model.modules() if hasattr(m, "ag_range_ema")]
+    if not mods:
+        return
+    for label in ("mean", "std", "range"):
+        s = np.mean([ema_summary(getattr(m, f"ag_{label}_ema")) for m in mods], axis=0)
+        print(f"  AG gate-EMA {label:<5}  x{len(mods)}  min {s[0]:5.2f}  max {s[1]:5.2f}"
+              f"  mean {s[2]:5.2f}  p25 {s[3]:5.2f}  p50 {s[4]:5.2f}  p75 {s[5]:5.2f}",
+              flush=True)
+
+
+def print_prelu(model):
+    """PR row: every PReLU slope pooled, plus counts below 0 and at the clamps."""
+    import torch
+    ps = [m for m in model.modules() if isinstance(m, torch.nn.PReLU)]
+    if not ps:
+        return
+    a = torch.cat([m.weight.detach().float() for m in ps])
+    print(f"  PR slope          x{len(ps)}  min {a.min():6.3f}  max {a.max():6.3f}"
+          f"  mean {a.mean():6.3f}  std {a.std():6.3f}  <0 {int((a < 0).sum())}"
+          f"  floor {int((a <= -0.499).sum())}  ceil {int((a >= 0.499).sum())}",
+          flush=True)
 
 
 def gfmt(v):
@@ -618,21 +665,6 @@ def update_clip_state(state, clipped, report):
     return None
 
 
-def update_weight_decay(opt, swiglu_avg_max):
-    """Hysteresis on swiglu_down avg max. param_groups[0] is make_adam's decay
-    group. Returns a log line when the decay changes, else None."""
-    group = opt.param_groups[0]
-    wd = group["weight_decay"]
-    if wd < WD_HIGH and swiglu_avg_max > WD_RAISE_AT:
-        new = WD_HIGH
-    elif wd > PT_WEIGHT_DECAY and swiglu_avg_max < WD_DROP_AT:
-        new = PT_WEIGHT_DECAY
-    else:
-        return None
-    group["weight_decay"] = new
-    return (f"[weight decay] {wd:g} -> {new:g}  "
-            f"(swiglu_down avg max {swiglu_avg_max:.2f})")
-
 
 def print_profile(prof):
     """on_trace_ready for the one-shot TRAIN_PROFILE window."""
@@ -698,7 +730,7 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
                     weight=g_elem_w,
                     reduction="none",
                 ).sum(-1).mean()
-                gate_w = GATE_SHARE * loss.detach() / g_loss.detach()
+                gate_w = GATE_SHARE * loss.detach() / g_loss.detach().clamp(min=GATE_W_FLOOR)
                 loss = loss + gate_w * g_loss
                 g_losses.append(g_loss.detach())
         if has_hot:
@@ -738,6 +770,40 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
         "g_loss": torch.stack(g_losses).float().mean().item() if g_losses else None,
     }
     return total_p, total_v, total_p + total_v, grad_stats
+
+
+def epoch_diagnostics(model, scaler, gns, hot_scan):
+    """Grad-norm, gate-health, hotspot, gate-param and grad-report printouts on
+    hotspot/report epochs."""
+    if gns["scanned"] and (hot_scan or gns["report"] is not None):
+        print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
+              f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
+              f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
+    if gns["flip"]:
+        print(gns["flip"], flush=True)
+    if hot_scan:
+        print(flush=True)
+        print_gate_ema(model)
+        print_attn_gate_ema(model)
+        print_prelu(model)
+        print(flush=True)
+        model.set_hotspot_scan(False)
+        stats = model.hotspot_stats()
+        rows = {k: (f"{v[2]:.2f}", f"{v[1]:.2f}", f"{v[0]:.2f}",
+                    ", ".join(map(str, v[3])))
+                for k, v in stats.items()}
+        nw = max(len(k) for k in rows) + 1
+        w = [max(len(r[i]) for r in rows.values()) for i in range(3)]
+        for k, r in rows.items():
+            print(f"[check {k:<{nw}}] avg act: {r[0]:>{w[0]}}  avg max: {r[1]:>{w[1]}}  "
+                  f"abs max: {r[2]:>{w[2]}}  arg max: {r[3]}", flush=True)
+        if hasattr(model, "gate_param_stats"):
+            b_min, b_mean, b_max, g_scale = model.gate_param_stats()
+            print(f"[gate params] bias min: {b_min:.3f}  mean: {b_mean:.3f}  "
+                  f"max: {b_max:.3f}  scale: {g_scale:.3f}", flush=True)
+    if gns["report"] is not None:
+        print_grad_report(gns["report"])
+        print(f"  grad scale      {scaler.get_scale():.0f}", flush=True)
 
 
 def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, device,
@@ -888,7 +954,6 @@ def worker_main(wargs):
             eval_df, last_tgt_q, last_val_q = do_eval(
                 model, name, ep, val_bundle, eval_df, progress_file, plot_file,
                 device, train_loss=avg_loss, gn_mean=avg_gn)
-            print_gate_ema(model)
             window_loss_sum = window_gn_sum = 0.0
             window_count = window_gn_count = 0
             t_eval += time.time() - t0
@@ -925,28 +990,7 @@ def worker_main(wargs):
         print(f"[epoch {ep:4d}] policy_loss: {p_loss:.2f}  "
               f"value_loss: {v_loss:.2f}  {g_str}total: {t_loss:.2f}  "
               f"samples: {total_samples:,}", flush=True)
-        if gns["scanned"]:
-            print(f"[grad norms ] mean: {gns['gn_mean']:.3f}  "
-                  f"median: {gns['gn_median']:.3f}  min: {gns['gn_min']:.3f}  "
-                  f"max: {gns['gn_max']:.3f}  clips: {gns['gn_clips']}/{gns['gn_steps']}")
-        if gns["flip"]:
-            print(gns["flip"], flush=True)
-        if hot_scan:
-            model.set_hotspot_scan(False)
-            stats = model.hotspot_stats()
-            for label, i in (("abs max", 0), ("avg max", 1), ("act avg", 2)):
-                row = "  ".join(f"{k}: {v[i]:8.2f}" for k, v in stats.items())
-                print(f"[hotspot {label}] {row}", flush=True)
-            if hasattr(model, "gate_param_stats"):
-                b_min, b_mean, b_max, g_scale = model.gate_param_stats()
-                print(f"[gate params] bias min: {b_min:.3f}  mean: {b_mean:.3f}  "
-                      f"max: {b_max:.3f}  scale: {g_scale:.3f}", flush=True)
-            wd_msg = update_weight_decay(opt, stats["swiglu_down"][1])
-            if wd_msg:
-                print(wd_msg, flush=True)
-        if gns["report"] is not None:
-            print_grad_report(gns["report"])
-            print(f"  grad scale      {scaler.get_scale():.0f}", flush=True)
+        epoch_diagnostics(model, scaler, gns, hot_scan)
 
         is_ckpt = (ep % CHECKPOINT_EVERY == 0 and ep > 0) or ep == end_epoch - 1 or ep == max_epoch - 1
         if is_ckpt:

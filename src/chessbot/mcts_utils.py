@@ -388,7 +388,7 @@ class ChessGame(object):
         tree_cfg = self.config
         
         scenario = meta.get('scenario', '')
-        if scenario == 'piece_training' and not self.config.is_validation_run:
+        if scenario == 'UHO' and not self.config.is_validation_run:
             tree_cfg = self.config.copy()
             tree_cfg.move_sample_temp_range = [0.2, 0.2]
         

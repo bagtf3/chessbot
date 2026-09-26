@@ -2268,6 +2268,8 @@ class Rescorer(object):
             for k, col in col_map.items():
                 if k in b:
                     row[col] = round(b[k], 4)
+            if 'policy_ce' in b and 'ce' in b:
+                row['chess_loss'] = round(b['policy_ce'] + 4.0 * b['ce'], 4)
             if train_stats:
                 row.update(train_stats)
 

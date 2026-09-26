@@ -370,6 +370,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
         model.parameters(), lr=lr,
         betas=(0.9, cfg.adam_beta2),
         weight_decay=1e-6,
+        fused=True,
     )
     opt_state_path = pt_opt_state_path(model_path, cfg.run_dir)
     if os.path.exists(opt_state_path):
@@ -380,10 +381,14 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 pg['lr'] = lr
                 pg['betas'] = (0.9, cfg.adam_beta2)
                 pg['weight_decay'] = 1e-6
+                pg['fused'] = True
+                pg['foreach'] = None
             for param_state in opt.state.values():
                 for k, v in param_state.items():
                     if isinstance(v, torch.Tensor):
                         param_state[k] = v.to(device)
+                if 'step' in param_state:   # fused Adam wants step as fp32
+                    param_state['step'] = param_state['step'].float()
             print(f"{tag} restored Adam state")
         except Exception as e:
             print(f"{tag} failed to load Adam state ({e}) - starting fresh")

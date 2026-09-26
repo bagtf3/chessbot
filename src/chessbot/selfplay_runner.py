@@ -1045,15 +1045,13 @@ class SelfPlayRunner:
                           self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
-            # TEMP OFF: historic shards stay in place pending the 10k repump call
-            # if self.cfg.historic_cold_dir:
-            #     cold = rb.cold_store_files(
-            #         self.retrain_worker["historic_files"],
-            #         self.cfg.historic_cold_dir)
-            #     left = len(rb.list_shard_files(self.cfg.historic_dir))
-            #     print(f"[retrain] {len(cold)} historic -> cold storage, "
-            #           f"{left} left", flush=True)
-            print("[retrain] historic cold storage OFF, shards kept", flush=True)
+            if self.cfg.historic_cold_dir:
+                cold = rb.cold_store_files(
+                    self.retrain_worker["historic_files"],
+                    self.cfg.historic_cold_dir)
+                left = len(rb.list_shard_files(self.cfg.historic_dir))
+                print(f"[retrain] {len(cold)} historic -> cold storage, "
+                      f"{left} left", flush=True)
         else:
             print(f"[retrain] failed: {result.get('error')}", flush=True)
 

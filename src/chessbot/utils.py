@@ -530,8 +530,8 @@ def batch_policy_metrics(logits, labels, mask):
 def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     # name_w derived from actual display labels so columns align
     keys = [
-        "value_mse", "value_corr", "value_ce",
-        "policy_ce", "uniform_ce",
+        "value_ce", "policy_ce", "chess_loss",
+        "value_mse", "value_corr", "ce_gain",
         "top1_exact", "avg_top",
         "top1_mass", "top5_mass", "top5_mass (target)",
     ]
@@ -543,11 +543,12 @@ def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     pfx = f"[epoch {epoch:4d}] [validation]"
 
     value_ce = stats.get("value_ce", float("nan"))
+    chess_loss = stats["policy_ce"] + 4.0 * value_ce
+    print(f"{pfx} {pair('value_ce', value_ce)}  "
+          f"{pair('policy_ce', stats['policy_ce'])}  "
+          f"{pair('chess_loss', chess_loss)}")
     print(f"{pfx} {pair('value_mse', stats['value_mse'])}  "
-          f"{pair('value_corr', stats['value_corr'])}  "
-          f"{pair('value_ce', value_ce)}")
-    print(f"{pfx} {pair('policy_ce', stats['policy_ce'])}  "
-          f"{pair('uniform_ce', stats['uniform_ce'])}  {pair('ce_gain', stats['ce_gain'])}")
+          f"{pair('value_corr', stats['value_corr'])}  {pair('ce_gain', stats['ce_gain'])}")
     print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
           f"{pair('avg_top', stats['avg_top_prob'])}")
     print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "

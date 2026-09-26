@@ -29,9 +29,11 @@ import numpy as np
 import pandas as pd
 import scipy.special
 
+import math
+
 from chessbot.pretrain import (
-    EPOCH_SIZE, PLOT_EVERY, VAL_FRACTION, lr_for_epoch,
-    save_plot, split_train_val as split_train_val_frac,
+    EPOCH_SIZE, VAL_FRACTION, LR_DECAY_EPOCHS, LR_STEP_SIZE,
+    lr_for_epoch, save_plot, split_train_val as split_train_val_frac,
 )
 from chessbot.model import VARIANTS, PT_BUILDERS
 from chessbot.replay_buffer import POLICY_DIM
@@ -58,9 +60,14 @@ VAL_BUFFER_CAP = 96_000
 LR_MIN = 1e-4
 LR_MAX = 1e-3
 LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
+# reforge (--reforge-from EPOCH): linear LR_MIN -> lr_mid over REFORGE_RAMP_EPOCHS,
+# no hold, then stepped cosine lr_mid -> LR_MIN, flat at LR_MIN for the last
+# LR_DECAY_EPOCHS
+REFORGE_LR_MID      = 3e-4
+REFORGE_RAMP_EPOCHS = 100
 
 CHECKPOINT_EVERY = 200
-HARD_SAVE_EVERY = 1000   # persistent checkpoint, never overwritten/deleted; manual cleanup only
+HARD_SAVE_EVERY = 2000   # persistent checkpoint, never overwritten/deleted; manual cleanup only
 SAVE_PLOTS = False   # progress png is slow to render; csv has everything
 SWA_WINDOW = 100
 SWA_EVERY  = 20
@@ -89,11 +96,12 @@ CLIP_CALM_MAX    = 2
 CLIP_REARM_CLIPS = 10
 FP16_MIN = 5.960464477539063e-8
 FP16_MAX = 65504.0
-HOTSPOT_SCAN_EVERY = 10   # hotspot stats are tracked and printed on these epochs only
+HOTSPOT_SCAN_EVERY = 20   # hotspot stats + gate EMAs are tracked and printed on these epochs only
+EVAL_EVERY = 20
 
 UNIFIED_COLS = [
     "model_epoch", "value_mse", "value_corr", "value_ce", "policy_ce",
-    "uniform_ce", "ce_gain", "top1_exact", "top1_mass", "top3_mass",
+    "chess_loss", "uniform_ce", "ce_gain", "top1_exact", "top1_mass", "top3_mass",
     "top5_mass", "n_samples", "mass_on_legal", "avg_top_prob",
     "avg_top_prob_target",
     "train_loss", "gn_mean", "exp_prob_model", "exp_prob_uniform",
@@ -142,7 +150,9 @@ def normalize_progress_df(df):
     if "model_epoch" not in df.columns and "training_epoch" in df.columns:
         df = df.rename(columns={"training_epoch": "model_epoch"})
     extra = [c for c in df.columns if c not in UNIFIED_COLS]
-    return df.reindex(columns=UNIFIED_COLS + extra)
+    df = df.reindex(columns=UNIFIED_COLS + extra)
+    df["chess_loss"] = df["chess_loss"].fillna(df["policy_ce"] + 4.0 * df["value_ce"])
+    return df
 
 
 def save_progress_csv(df, path):
@@ -225,6 +235,42 @@ def get_resume_epoch(run_dir, name, progress_file, unified=False):
     return last_ckpt + 1
 
 
+def reforge_lr(ep, start, max_epoch, lr_mid, ramp):
+    k = ep - start
+    if k <= ramp:
+        return LR_MIN + (lr_mid - LR_MIN) * max(k, 0) / ramp
+    decay_end = max_epoch - LR_DECAY_EPOCHS
+    if ep >= decay_end:
+        return LR_MIN
+    total = max(1, (decay_end - start - ramp) // LR_STEP_SIZE)
+    t = ((k - ramp) // LR_STEP_SIZE) / total
+    return LR_MIN + 0.5 * (lr_mid - LR_MIN) * (1.0 + math.cos(math.pi * t))
+
+
+def lr_at(ep, wargs):
+    if wargs.get("reforge_from") is not None:
+        return reforge_lr(ep, wargs["reforge_from"], wargs["max_epoch"],
+                          wargs["lr_mid"], wargs["ramp_epochs"])
+    return lr_for_epoch(ep, wargs["max_epoch"], lr_min=LR_MIN, lr_max=LR_MAX,
+                        hold_epochs=LR_HOLD_EPOCHS)
+
+
+def retrain_opt_state(model, opt_sd):
+    """AdamW decay/no-decay state -> retrain_pt's single-group Adam layout."""
+    import torch
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if p.requires_grad:
+            (decay if p.ndim >= 2 else no_decay).append(p)
+    src = torch.optim.AdamW([{"params": decay}, {"params": no_decay}])
+    src.load_state_dict(opt_sd)
+    dst = torch.optim.Adam(model.parameters())
+    for p in model.parameters():
+        if p in src.state:
+            dst.state[p] = src.state[p]
+    return dst.state_dict()
+
+
 def make_adam(model, lr):
     import torch
     decay, no_decay = [], []
@@ -236,7 +282,7 @@ def make_adam(model, lr):
         {"params": decay,    "weight_decay": PT_WEIGHT_DECAY},
         {"params": no_decay, "weight_decay": 0.0},
     ]
-    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, PT_ADAM_BETA2))
+    return torch.optim.AdamW(groups, lr=lr, betas=(0.9, PT_ADAM_BETA2), fused=True)
 
 
 def saved_param_ids(model, saved, old_sd):
@@ -326,7 +372,6 @@ def load_pt_model(path, name, device, lr):
     model  = PT_BUILDERS[name](cfg).to(device)
     opt    = make_adam(model, lr)
     scaler = GradScaler("cuda", init_scale=2 ** 15)
-    # cpu load keeps Adam's step on cpu; a cuda step forces .item() syncs every step
     ckpt = torch.load(path, map_location="cpu")
     reshaped, missing, unexpected = load_matching(model, ckpt["model"])
     print_key_list("re-init, shape changed", reshaped)
@@ -350,10 +395,15 @@ def load_pt_model(path, name, device, lr):
         for pg, wd in zip(opt.param_groups, wds):
             pg["lr"] = lr
             pg["weight_decay"] = wd
+            pg["fused"] = True
+            pg["foreach"] = None
             for p in pg["params"]:   # param reshaped since the save: fresh Adam state
                 if p in opt.state and opt.state[p]["exp_avg"].shape != p.shape:
                     del opt.state[p]
                     print(f"[worker] reset Adam state for reshaped param {tuple(p.shape)}")
+        for p, st in opt.state.items():   # fused Adam wants step as fp32 on the param device
+            if "step" in st:
+                st["step"] = st["step"].to(device=p.device, dtype=torch.float32)
     return model, opt, scaler
 
 
@@ -841,6 +891,7 @@ def do_eval(model, name, epoch, bundle, eval_df, progress_file, plot_file, devic
         "model_epoch": epoch,
         "value_mse": value_mse, "value_corr": value_corr, "value_ce": value_ce,
         **pol_stats,
+        "chess_loss": pol_stats["policy_ce"] + 4.0 * value_ce,
         "n_samples": int(enc.shape[0]),
         "avg_top_prob_target": float(pstack.max(axis=1).mean()),
         "train_loss": train_loss, "gn_mean": gn_mean,
@@ -888,8 +939,7 @@ def worker_main(wargs):
     print(f"  {name}  epochs {start_epoch}..{end_epoch - 1}  ".center(72, "#"))
     print(f"{'#' * 72}\n")
 
-    lr0 = lr_for_epoch(start_epoch, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX,
-                       hold_epochs=LR_HOLD_EPOCHS)
+    lr0 = lr_at(start_epoch, wargs)
     if start_epoch == 0:
         from torch.amp import GradScaler
         cfg    = VARIANTS[name]
@@ -935,8 +985,7 @@ def worker_main(wargs):
     last_tgt_q = last_val_q = None
 
     for ep in range(start_epoch, end_epoch):
-        target_lr = lr_for_epoch(ep, max_epoch, lr_min=LR_MIN, lr_max=LR_MAX,
-                                 hold_epochs=LR_HOLD_EPOCHS)
+        target_lr = lr_at(ep, wargs)
         if target_lr != current_lr:
             current_lr = target_lr
             for pg in opt.param_groups:
@@ -946,7 +995,7 @@ def worker_main(wargs):
         epoch_start = time.time()
         print("-" * 89)
 
-        if ep % PLOT_EVERY == 0 or ep == end_epoch - 1:
+        if ep % EVAL_EVERY == 0 or ep == end_epoch - 1:
             t0 = time.time()
             val_bundle = val_pool.get()
             avg_loss = window_loss_sum / window_count if window_count > 0 else None
@@ -981,7 +1030,7 @@ def worker_main(wargs):
             window_gn_sum   += gns["gn_mean"]
             window_gn_count += 1
 
-        if ep == start_epoch and ep % PLOT_EVERY == 0 and eval_df is not None:
+        if ep == start_epoch and ep % EVAL_EVERY == 0 and eval_df is not None:
             eval_df.loc[eval_df.index[-1], "train_loss"] = t_loss
             eval_df.loc[eval_df.index[-1], "gn_mean"]   = gns["gn_mean"]
             save_progress_csv(eval_df, progress_file)
@@ -1013,8 +1062,8 @@ def worker_main(wargs):
               f"avg: {format_time(np.mean(epoch_times))}  "
               f"total: {format_time(time.time() - begin)}")
 
-        if ep % PLOT_EVERY == 0 and ep > start_epoch:
-            print(f"[timing/{PLOT_EVERY}ep] fetch: {t_fetch:.2f}s  fit: {t_fit:.2f}s  "
+        if ep % EVAL_EVERY == 0 and ep > start_epoch:
+            print(f"[timing/{EVAL_EVERY}ep] fetch: {t_fetch:.2f}s  fit: {t_fit:.2f}s  "
                   f"eval: {t_eval:.2f}s  samples_window: {window_samples:,}  "
                   f"samples_total: {total_samples:,}")
             t_fetch = t_fit = t_eval = 0.0
@@ -1119,13 +1168,20 @@ def main():
                              f"({VAL_FRACTION:.0%}, seed-matched to pretrain)")
     parser.add_argument("--buffer-cap", type=int, default=BUFFER_CAP)
     parser.add_argument("--swa", action="store_true")
+    parser.add_argument("--reforge-from", type=int, default=None,
+                        help="checkpoint epoch the reforge LR schedule starts at")
+    parser.add_argument("--lr-mid", type=float, default=REFORGE_LR_MID)
+    parser.add_argument("--ramp-epochs", type=int, default=REFORGE_RAMP_EPOCHS)
+    parser.add_argument("--progress-csv", default=None,
+                        help="csv filename inside the run dir (default: eval_progress.csv)")
     args = parser.parse_args()
 
     run_dir = args.run_dir or os.path.join(SP_DIR, args.run_tag)
     os.makedirs(run_dir, exist_ok=True)
     unified = args.run_dir is not None
     name = args.model
-    progress_file = progress_csv_path(run_dir, name, unified)
+    progress_file = (os.path.join(run_dir, args.progress_csv) if args.progress_csv
+                     else progress_csv_path(run_dir, name, unified))
 
     print(f"[train] model={name}")
     print(f"[train] run_dir={run_dir}")
@@ -1134,6 +1190,10 @@ def main():
     print(f"[train] max_epoch={args.max_epoch}  buffer={args.buffer_cap:,}")
     print(f"[train] batch={PT_BATCH_SIZE}  steps/epoch={PT_STEPS_PER_EPOCH}"
           f"  lr_range=[{LR_MIN:.1e}, {LR_MAX:.1e}]")
+    if args.reforge_from is not None:
+        print(f"[train] reforge from epoch {args.reforge_from}: lr {LR_MIN:.1e} -> "
+              f"{args.lr_mid:.1e} over {args.ramp_epochs} epochs, cosine -> "
+              f"{LR_MIN:.1e} by {args.max_epoch - LR_DECAY_EPOCHS}")
 
     all_files = list_shards(args.shard_dir)
     if not all_files:
@@ -1152,6 +1212,8 @@ def main():
         "start_epoch": resume, "end_epoch": args.max_epoch,
         "max_epoch": args.max_epoch, "progress_file": progress_file,
         "unified_csv": unified, "swa": args.swa, "buffer_cap": args.buffer_cap,
+        "reforge_from": args.reforge_from, "lr_mid": args.lr_mid,
+        "ramp_epochs": args.ramp_epochs,
     }
     worker_main(wargs)
     print(f"\n[train] training complete ({args.max_epoch} epochs)")
@@ -1176,7 +1238,7 @@ def main():
             from chessbot.train_pytorch import pt_opt_state_path
             opt_state_path = pt_opt_state_path(pt_path, run_dir)
             os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
-            torch.save(raw["optimizer"], opt_state_path)
+            torch.save(retrain_opt_state(model, raw["optimizer"]), opt_state_path)
             print(f"[train] exported optimizer state -> {opt_state_path}")
 
         if args.swa:

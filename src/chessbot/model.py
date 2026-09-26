@@ -2208,7 +2208,8 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     class Attention(nn.Module):
         """gate=True scales the SDPA output by 1 + tanh(g(xq)); g is zero-init, so
         the gate is exactly 1 at init (identity graft onto an ungated checkpoint).
-        Gate mean/std/range per (token, channel) tracked as 500-step ag_* EMAs."""
+        Gate mean/std/range per (token, channel) tracked as 500-step ag_* EMAs
+        while `ema_on` (set by M.set_hotspot_scan)."""
 
         def __init__(self, dim, heads, gate=False):
             super().__init__()
@@ -2226,6 +2227,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
                 self.register_buffer("ag_range_ema", torch.zeros(n_tok, dim))
             self.heads = heads
             self.head_dim = dim // heads
+            self.ema_on = False
 
         def forward(self, xq, xkv):
             bq, nq, dim = xq.shape
@@ -2236,7 +2238,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(bq, nq, dim)
             if self.g is not None:
                 gate = 1 + torch.tanh(self.g(xq))
-                if self.training and torch.is_grad_enabled():
+                if self.ema_on and self.training and torch.is_grad_enabled():
                     with torch.no_grad():
                         gh = gate.detach().half()
                         w = 1 - GATE_EMA_BETA
@@ -2276,7 +2278,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
 
     class GatedExpandyConvBlock(nn.Module):
         """Gate mean/std/range per (channel, square) tracked as 500-step EMAs
-        during training for the trainer's gate-health readout."""
+        while `ema_on` (set by M.set_hotspot_scan) for the gate-health readout."""
 
         def __init__(self):
             super().__init__()
@@ -2291,11 +2293,12 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.register_buffer("gate_mean_ema", torch.full((D, 8, 8), 0.5))
             self.register_buffer("gate_std_ema", torch.full((D, 8, 8), 0.16))
             self.register_buffer("gate_range_ema", torch.zeros(D, 8, 8))
+            self.ema_on = False
 
         def forward(self, x):
             h = self.p1(self.a1(self.c1(norm_nchw(self.n1, x))))
             gate = torch.sigmoid(self.c_gate(h))
-            if self.training and torch.is_grad_enabled():
+            if self.ema_on and self.training and torch.is_grad_enabled():
                 with torch.no_grad():
                     gh = gate.detach().half()
                     w = 1 - GATE_EMA_BETA
@@ -2515,10 +2518,11 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
         def project_params(self):
             """Clamp constrained params back into range; call after each opt step."""
             self.gate_out.project()
+            if not hasattr(self, "prelu_list"):
+                self.prelu_list = [m for m in self.modules() if isinstance(m, nn.PReLU)]
             with torch.no_grad():
-                for m in self.modules():
-                    if isinstance(m, nn.PReLU):
-                        m.weight.clamp_(PRELU_MIN, PRELU_MAX)
+                for m in self.prelu_list:
+                    m.weight.clamp_(PRELU_MIN, PRELU_MAX)
 
         def gate_param_stats(self):
             """(gate bias min, mean, max, gate scale). Host sync, print cadence only."""
@@ -2529,6 +2533,9 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
         def set_hotspot_scan(self, on):
             for mon in self.hotspot_monitors().values():
                 mon.active = on
+            for m in self.modules():
+                if hasattr(m, "ema_on"):
+                    m.ema_on = on
 
         def hotspot_end_step(self):
             """Close one training step on every monitor. No host sync."""

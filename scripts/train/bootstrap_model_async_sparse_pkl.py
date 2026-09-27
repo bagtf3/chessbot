@@ -43,6 +43,8 @@ PT_STEPS_PER_EPOCH = EPOCH_SIZE // PT_BATCH_SIZE   # 20
 PT_ADAM_BETA2      = 0.95
 PROFILE_STATE      = {"on": os.environ.get("TRAIN_PROFILE") == "1", "done": False}
 DROPOUT_DUTY       = 0.25   # per-site per-step chance dropout runs, for models with set_dropout
+# (from_epoch, duty) steps applied on top of DROPOUT_DUTY; last matching step wins
+DROPOUT_DUTY_STEPS = [(28000, 0.10), (30000, 0.0)]
 # smartgate illegality BCE on m.gate_raw (target = policy_t == 0): a legal elem
 # weighs GATE_LEGAL_POS_W x an illegal one, weights rescaled per row to sum to
 # 1858; the term is pinned to GATE_SHARE * (policy + value) while gate_loss is
@@ -57,7 +59,7 @@ REFILL_BAND    = 56_000        # refill once the pool drains below high - band (
 VAL_BUFFER_CAP = 96_000
 
 # cosine LR floor and ceiling
-LR_MIN = 1e-4
+LR_MIN = 8e-5
 LR_MAX = 1e-3
 LR_HOLD_EPOCHS = 1000   # flat at LR_MAX after warmup until here, then cosine
 # reforge (--reforge-from EPOCH): linear LR_MIN -> lr_mid over REFORGE_RAMP_EPOCHS,
@@ -245,6 +247,14 @@ def reforge_lr(ep, start, max_epoch, lr_mid, ramp):
     total = max(1, (decay_end - start - ramp) // LR_STEP_SIZE)
     t = ((k - ramp) // LR_STEP_SIZE) / total
     return LR_MIN + 0.5 * (lr_mid - LR_MIN) * (1.0 + math.cos(math.pi * t))
+
+
+def dropout_duty_at(ep):
+    duty = DROPOUT_DUTY
+    for start, d in DROPOUT_DUTY_STEPS:
+        if ep >= start:
+            duty = d
+    return duty
 
 
 def lr_at(ep, wargs):
@@ -725,7 +735,7 @@ def print_profile(prof):
 
 
 def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
-              report=False):
+              report=False, duty=DROPOUT_DUTY):
     import torch
     import torch.nn.functional as F
     from torch.amp import autocast
@@ -763,7 +773,7 @@ def fit_epoch(model, opt, scaler, bundle, max_norm, device, clip_state,
             prof.step()
         idx = perm[start:start + PT_BATCH_SIZE]
         if has_drop:
-            model.set_dropout(DROPOUT_DUTY)
+            model.set_dropout(duty)
         opt.zero_grad(set_to_none=True)
         with autocast("cuda"):
             pol, val = model(enc[idx])
@@ -975,6 +985,7 @@ def worker_main(wargs):
 
 
     current_lr = None
+    current_duty = None
     clip_state = new_clip_state()
     begin = time.time()
     epoch_times = []
@@ -1016,9 +1027,13 @@ def worker_main(wargs):
         hot_scan = ep % HOTSPOT_SCAN_EVERY == 0 and hasattr(model, "set_hotspot_scan")
         if hot_scan:
             model.set_hotspot_scan(True)
+        duty = dropout_duty_at(ep)
+        if duty != current_duty:
+            current_duty = duty
+            print(f"[dropout] epoch {ep}: duty={duty:.2f}", flush=True)
         p_loss, v_loss, t_loss, gns = fit_epoch(
             model, opt, scaler, bundle, max_norm, device, clip_state,
-            report=(ep % GRAD_REPORT_EVERY == 0))
+            report=(ep % GRAD_REPORT_EVERY == 0), duty=duty)
         t_fit += time.time() - t0
 
         n_this = int(bundle["enc_in"].shape[0])

@@ -23,6 +23,9 @@ class Config(object):
     # depth roughly twice as fast.
     validate_every_n_retrains = 5
     validation_games_per_batch = 256
+    # epoch 0 only: hold the first validation batch until this many games
+    # are done, so the quick selfplay games show up first
+    validation_warmup_games = 1000
     n_workers = 2
 
     # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
@@ -38,7 +41,6 @@ class Config(object):
     # MCTS
     c_puct = 2.0
 
-    use_smart_pruning = True
     pruning_factor = 1.33
     
     # Simulation schedule
@@ -69,8 +71,6 @@ class Config(object):
     min_game_length = 5
     use_syzygy = False
     use_material_diff = True
-    material_diff_cutoff = 9
-    material_diff_cutoff_span = 20
 
     allow_resignation = False
     resign_threshold = 0.80
@@ -103,21 +103,12 @@ class Config(object):
     # between the clip points. Both replay paths and normal rescoring share it.
     rescore_blend_alpha_min = 0.10
     rescore_blend_alpha_max = 0.85
-    # above this CPL an xc0 replay probe is not trained on at all -- the
-    # position goes to the teacher instead
-    brp_enqueue_max_cpl = 90
-
-    # target replay positions GameGenerator spreads across each round,
-    # metered against real games queued/completions -- not a flood
-    blunder_replay_per_round = 16384
 
     train_on_stockfish = True
 
     kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median
     kl_boost_p80_mult    = 3.0   # pwht multiplier when KL > running EMA 80th pctile
     kl_quantile_lr       = 0.0005 # step size for the online trackers (~1/lr, ~2000)
-
-    inaccuracy_downweight = 0.5  # xc0 policy weight mult for inaccuracy-tier plies
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
@@ -145,10 +136,9 @@ class Config(object):
     move_sample_temp_plies = 20
     
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    retrain_weight_decay = 0.005  # AdamW decoupled, 2D+ weights only
     adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
-    policy_loss_weight = 0.25     # per-sample weight for policy head
-    value_loss_weight = 0.25      # per-sample weight for value head (non-draw)
-    draw_value_scale = 1.0        # multiplies value_loss_weight for drawn games
+    draw_value_scale = 1.0        # per-sample value weight for drawn games (decisive = 1.0)
     vscale = 0.9
     contempt_zero_q  = 0.0
     contempt_full_q  = 0.5
@@ -159,13 +149,6 @@ class Config(object):
     # LC0 distillation enrichment
     lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
     lc0_distill_batch_size = 64   # positions per ORT inference call
-    lc0_enrich_frac   = 0.0   # fraction of non-blunder accepted positions to enrich with lc0 (0=off, 1=all)
-    lc0_enrich_weight = 0.75  # vwht/pwht multiplier applied to lc0-generated training samples
-
-    # retrain-time validation against lc0-sourced samples is expensive and not
-    # useful every retrain; only run it (and print/save the lc0 breakdown) on
-    # every Nth retrain. Other retrains validate xc0 (incl. historic_seeded) only.
-    lc0_validation_every = 10
 
     # Prior temperature scaling in C++ tree (0 = disabled)
     tempscale_entropy_target = 0.0   # normed entropy target; 0 = disabled
@@ -178,7 +161,6 @@ class Config(object):
     inference_backend        = "ort_trt"  # "ort_trt" | "lc0_trt"
     trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
     trt_cache                = ""          # ort_trt: path to TRT engine cache dir
-    ort_trt_engine_cache_dir = ""          # legacy alias for trt_cache
 
     def __init__(self):
         self.init_paths()
@@ -198,7 +180,6 @@ class Config(object):
         self.primary_buffer_dir = os.path.join(self.run_dir, "primary_buffer")
         self.replay_buffer_dir = os.path.join(self.run_dir, "replay_buffer")
         self.historic_dir = os.getenv("BOOTSTRAP_PKL_GZ", "")
-        self.historic_cold_dir = os.getenv("HISTORIC_COLD_DIR", "")
 
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
@@ -216,10 +197,6 @@ class Config(object):
             for d in (self.run_dir, self.game_dir,
                       self.primary_buffer_dir, self.replay_buffer_dir):
                 os.makedirs(d, exist_ok=True)
-
-        # ORT/TRT: fall back to env var if not set explicitly in YAML
-        if self.inference_backend == "ort_trt" and not self.ort_trt_engine_cache_dir:
-            self.ort_trt_engine_cache_dir = os.getenv("TRT_ENGINE_CACHE_DIR", "")
 
         # public flag; keep the old name too for backward compatibility
         self.paths_initialized = True

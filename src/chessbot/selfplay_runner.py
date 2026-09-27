@@ -760,6 +760,9 @@ class SelfPlayRunner:
             return
         if self.last_validated_epoch == self.current_epoch:
             return
+        if (self.current_epoch == 0
+                and self.total_games < self.cfg.validation_warmup_games):
+            return
         if self.val_pending:
             self.close_partial_validation_batch("superseded by next cadence")
 
@@ -876,7 +879,6 @@ class SelfPlayRunner:
 
     def tick_rescorer(self):
         while self.finished_games:
-            # CLAUDE its saying pull_pkl here is not defined
             self.rescorer.submit(pull_pkl(self.finished_games.popleft()))
         while self.finished_brp:
             self.rescorer.submit_blunder_replay(
@@ -996,10 +998,18 @@ class SelfPlayRunner:
     def poll_retrain(self):
         if self.retrain_worker is None:
             return
+        p = self.retrain_worker["p"]
         try:
             result = self.retrain_worker["result_q"].get_nowait()
         except queue.Empty:
-            return
+            if p.is_alive():
+                return
+            # dead with nothing queued: a native crash, fail it so workers unpause
+            try:
+                result = self.retrain_worker["result_q"].get(timeout=2.0)
+            except queue.Empty:
+                result = {"cmd": "retrain_done", "ok": False,
+                          "error": f"worker died, exitcode={p.exitcode}"}
         if result is None:
             return
 
@@ -1014,7 +1024,6 @@ class SelfPlayRunner:
 
         ok = result.get("ok")
         print(f"[retrain] done ok={ok}", flush=True)
-        p = self.retrain_worker["p"]
         p.join(timeout=15.0)
         if p.is_alive():
             p.terminate()
@@ -1045,13 +1054,6 @@ class SelfPlayRunner:
                           self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
-            if self.cfg.historic_cold_dir:
-                cold = rb.cold_store_files(
-                    self.retrain_worker["historic_files"],
-                    self.cfg.historic_cold_dir)
-                left = len(rb.list_shard_files(self.cfg.historic_dir))
-                print(f"[retrain] {len(cold)} historic -> cold storage, "
-                      f"{left} left", flush=True)
         else:
             print(f"[retrain] failed: {result.get('error')}", flush=True)
 
@@ -1195,6 +1197,8 @@ class SelfPlayRunner:
                 self.drain_results()
                 self.tick_rescorer()
                 self.check_retrain()
+                if self.current_epoch == 0 and self.last_validated_epoch != 0:
+                    self.maybe_start_validation()
                 time.sleep(0.05)
             return 0 if not self.controls.stop.is_set() else 1
         finally:

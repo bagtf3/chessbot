@@ -44,7 +44,6 @@ RETRAIN_LW_EMA_SPAN_STEPS     = 400
 GATE_LEGAL_POS_W = 5.0
 GATE_SHARE       = 0.05
 GATE_W_FLOOR     = 5.0
-DROPOUT_DUTY     = 0.25   # per-site per-step chance dropout runs (set_dropout models)
 
 
 def retrain_lw_state_path(model_path: str, run_dir: str) -> str:
@@ -196,6 +195,25 @@ def save_pt_model(model, path, arch=None, opt=None, trace=True):
 def pt_opt_state_path(model_path: str, run_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(model_path))[0]
     return os.path.join(run_dir, "train_ckpts", stem + "_opt_state.pt")
+
+
+def decay_groups(model, wd):
+    """Decoupled WD on 2D+ weights only; biases, norm gains, PReLU slopes exempt."""
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if p.requires_grad:
+            (decay if p.ndim >= 2 else no_decay).append(p)
+    return [{"params": decay, "weight_decay": wd},
+            {"params": no_decay, "weight_decay": 0.0}]
+
+
+def flat_opt_state(model, opt):
+    """Per-param optimizer state in the single-group layout kept on disk."""
+    flat = torch.optim.Adam(model.parameters())
+    for p in model.parameters():
+        if p in opt.state:
+            flat.state[p] = opt.state[p]
+    return flat.state_dict()
 
 
 PLAYER_SPAN = 7
@@ -354,6 +372,9 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
         model, arch = load_pt_model(model_path)
     device = torch.device("cuda")
     model  = model.to(device).train()
+    for m in model.modules():   # selfplay retrains never use dropout
+        if isinstance(m, torch.nn.Dropout):
+            m.eval()
     timings['load_model'] = timings.get('load_model', 0.0) + (time.time() - t0)
 
     n = len(X)
@@ -366,30 +387,25 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     lr = cfg.learning_rate
     clip_norm = cfg.retrain_clip_norm
-    opt = torch.optim.Adam(
-        model.parameters(), lr=lr,
+    opt = torch.optim.AdamW(
+        decay_groups(model, cfg.retrain_weight_decay), lr=lr,
         betas=(0.9, cfg.adam_beta2),
-        weight_decay=1e-6,
         fused=True,
     )
     opt_state_path = pt_opt_state_path(model_path, cfg.run_dir)
     if os.path.exists(opt_state_path):
         try:
-            state = torch.load(opt_state_path, map_location="cpu")
-            opt.load_state_dict(state)
-            for pg in opt.param_groups:
-                pg['lr'] = lr
-                pg['betas'] = (0.9, cfg.adam_beta2)
-                pg['weight_decay'] = 1e-6
-                pg['fused'] = True
-                pg['foreach'] = None
+            flat = torch.optim.Adam(model.parameters())
+            flat.load_state_dict(torch.load(opt_state_path, map_location="cpu"))
+            for p, param_state in flat.state.items():
+                opt.state[p] = param_state
             for param_state in opt.state.values():
                 for k, v in param_state.items():
                     if isinstance(v, torch.Tensor):
                         param_state[k] = v.to(device)
                 if 'step' in param_state:   # fused Adam wants step as fp32
                     param_state['step'] = param_state['step'].float()
-            print(f"{tag} restored Adam state")
+            print(f"{tag} restored AdamW state")
         except Exception as e:
             print(f"{tag} failed to load Adam state ({e}) - starting fresh")
     else:
@@ -416,7 +432,6 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     has_gate = hasattr(model, "gate_raw")
     has_proj = hasattr(model, "project_params")
-    has_drop = hasattr(model, "set_dropout")
     g_losses = []
 
     epoch_losses     = []
@@ -456,8 +471,6 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 vwb = vwht_t[start:end]
                 pwb = pwht_t[start:end]
 
-                if has_drop:
-                    model.set_dropout(DROPOUT_DUTY)
                 opt.zero_grad()
                 with autocast("cuda"):
                     policy_logits, value_out = model(xb)
@@ -554,7 +567,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     print_pt_fit_history(epoch_losses, epoch, label=label)
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
-    torch.save(opt.state_dict(), opt_state_path)
+    torch.save(flat_opt_state(model, opt), opt_state_path)
 
     cycle_steps = epoch_grad_stats[-1]['gn_steps']
     lw_state["policy_ce_hat"] = retrain_lw_ema_update(

@@ -74,10 +74,8 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - VRAM reclaimed via spawn process before retrain
 - Each retrain draws 12 primary + 12 replay + 4 historic shards. After a
   successful retrain: primary → replay buffer, the drawn replay shards are
-  discarded, and the 4 historic shards are **moved off to cold storage**
-  (`HISTORIC_COLD_DIR`, a different drive) — historic is consumable and shrinks
-  by 4 per retrain. Draining it is the signal to re-pretrain; `sample_files`
-  raises once fewer than 4 remain.
+  discarded, and the 4 historic shards stay in place (historic is read-only
+  and can be redrawn; a full copy lives on E:).
 - Historic corpus lives at `BOOTSTRAP_PKL_GZ` (pkl.gz shards, not tfrecords —
   the `BOOTSTRAP_TFREC_DIR` name survives only in legacy tfrec-era scripts)
 

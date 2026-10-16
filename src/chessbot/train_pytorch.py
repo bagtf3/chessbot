@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from chessbot.replay_buffer import stack_policies
+
 
 def enforce_pytorch_gpu_or_die(max_tries=5, sleep_s=1.0):
     import time
@@ -195,6 +197,11 @@ def save_pt_model(model, path, arch=None, opt=None, trace=True):
 def pt_opt_state_path(model_path: str, run_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(model_path))[0]
     return os.path.join(run_dir, "train_ckpts", stem + "_opt_state.pt")
+
+
+def pt_scaler_state_path(model_path: str, run_dir: str) -> str:
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    return os.path.join(run_dir, "train_ckpts", stem + "_scaler_state.pt")
 
 
 def decay_groups(model, wd):
@@ -424,11 +431,21 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     print(f"{tag} dynamic LW: policy={policy_lw:.3f}  value={value_lw:.3f}")
 
     from torch.amp import autocast, GradScaler
-    # Scaler is recreated each retrain (state not persisted), so the default
-    # init_scale=2**16 cold-starts too high for this model's ~O(0.1-2) grads and
-    # burns one overflow-skip early every epoch calibrating down. Start one
-    # notch below that known-overflow point instead.
+    # State is persisted across retrains (same as the AdamW state above), so
+    # only the very first retrain ever cold-starts. init_scale=2**15 is that
+    # cold-start's starting point -- one notch below this model's known
+    # overflow point for its ~O(0.1-2) grads, to skip the first guaranteed
+    # overflow-skip a default 2**16 start would burn calibrating down.
     scaler = GradScaler("cuda", init_scale=2**15)
+    scaler_state_path = pt_scaler_state_path(model_path, cfg.run_dir)
+    if os.path.exists(scaler_state_path):
+        try:
+            scaler.load_state_dict(torch.load(scaler_state_path, map_location="cpu"))
+            print(f"{tag} restored GradScaler state (scale={scaler.get_scale():.0f})")
+        except Exception as e:
+            print(f"{tag} failed to load GradScaler state ({e}) - starting fresh")
+    else:
+        print(f"{tag} no prior GradScaler state - starting fresh")
 
     has_gate = hasattr(model, "gate_raw")
     has_proj = hasattr(model, "project_params")
@@ -458,7 +475,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 X_t[:, 109] /= 99.0
             else:
                 X_t = torch.from_numpy(X[chunk_idx]).long().to(device)
-            P_t    = torch.from_numpy(P[chunk_idx]).float().to(device)
+            P_t    = torch.from_numpy(
+                stack_policies([P[i] for i in chunk_idx], index=None)).to(device)
             Y_t    = torch.from_numpy(Y_wdl[chunk_idx]).float().to(device)
             vwht_t = torch.from_numpy(vwht[chunk_idx]).float().to(device)
             pwht_t = torch.from_numpy(pwht[chunk_idx]).float().to(device)
@@ -568,6 +586,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
     torch.save(flat_opt_state(model, opt), opt_state_path)
+    torch.save(scaler.state_dict(), scaler_state_path)
 
     cycle_steps = epoch_grad_stats[-1]['gn_steps']
     lw_state["policy_ce_hat"] = retrain_lw_ema_update(

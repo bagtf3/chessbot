@@ -25,11 +25,11 @@ from pyfastchess import Board as FastBoard
 from xerces_training.parse_utils import uci_to_xerces_index
 
 PRE_OPENED_PKL = os.getenv('PRE_OPENED_UCI_PATHS', '')
-TRT_CACHE      = r'C:\Users\Bryan\Data\chessbot_data\lc0\trt_cache'
-ONNX_PATH      = r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\t1-512x15x8h-distilled-swa-3395000.onnx'
+TRT_CACHE      = r'D:\Data\chessbot_data\lc0\trt_cache'
+ONNX_PATH      = r'D:\Data\chessbot_data\lc0\onnx\t1-512x15x8h-distilled-swa-3395000.onnx'
 MODEL_NAME     = 't1-big'
 BATCH_SIZE     = 128
-OUT_PKL        = r'C:\Users\Bryan\Data\chessbot_data\t1_large_book_evals.pkl'
+OUT_PKL        = r'D:\Data\chessbot_data\t1_large_book_evals.pkl'
 
 print(f'Source book: {PRE_OPENED_PKL}')
 print(f'Output:      {OUT_PKL}')
@@ -137,7 +137,7 @@ OVERWRITE_LINES = [
 ]
 
 sess_791 = make_lc0_trt_session(
-    r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\791556.onnx', '791556', TRT_CACHE)
+    r'D:\Data\chessbot_data\lc0\onnx\791556.onnx', '791556', TRT_CACHE)
 
 for moves_uci in OVERWRITE_LINES:
     b  = chess.Board()
@@ -203,11 +203,11 @@ show_policy(book, 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1',
 # %% [9] Compare all 5 LC0 models across 4 positions
 
 MODELS_7 = [
-    ('LD2',      r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\LD2.onnx'),
-    ('791556',   r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\791556.onnx'),
-    ('t1-small', r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\t1-256x10-distilled-swa-2432500.onnx'),
-    ('t1-big',   r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\t1-512x15x8h-distilled-swa-3395000.onnx'),
-    ('BT4',      r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\BT4-1024x15x32h-swa-6147500.onnx'),
+    ('LD2',      r'D:\Data\chessbot_data\lc0\onnx\LD2.onnx'),
+    ('791556',   r'D:\Data\chessbot_data\lc0\onnx\791556.onnx'),
+    ('t1-small', r'D:\Data\chessbot_data\lc0\onnx\t1-256x10-distilled-swa-2432500.onnx'),
+    ('t1-big',   r'D:\Data\chessbot_data\lc0\onnx\t1-512x15x8h-distilled-swa-3395000.onnx'),
+    ('BT4',      r'D:\Data\chessbot_data\lc0\onnx\BT4-1024x15x32h-swa-6147500.onnx'),
 ]
 
 POSITIONS_7 = [

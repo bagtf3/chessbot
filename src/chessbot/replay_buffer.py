@@ -110,14 +110,15 @@ def densify_policy(p, dim=POLICY_DIM):
 
 
 def stack_policies(records, index=2, dim=POLICY_DIM):
-    """(N, dim) dense stack from a list of records in either format.
+    """(N, dim) dense stack from a list of records in either format, or of
+    bare policies when index is None.
 
     The single densify point. Scatters straight into one preallocated array
     rather than building N intermediates and stacking them.
     """
     out = np.zeros((len(records), dim), dtype=np.float32)
     for i, r in enumerate(records):
-        p = r[index]
+        p = r if index is None else r[index]
         if is_sparse_policy(p):
             idx, vals = p
             out[i, idx.astype(np.int32)] = vals

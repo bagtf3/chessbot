@@ -1,4 +1,4 @@
-import os, json, gzip, pathlib, time, random
+import os, json, gzip, pathlib, time, random, asyncio, concurrent.futures
 import pickle
 
 # the retained list would otherwise grow for the life of the process; the
@@ -19,7 +19,6 @@ import io
 import chess, chess.svg
 from IPython.display import SVG, display, clear_output
 import chess.engine
-import cairosvg
 from PIL import Image
 
 import pandas as pd
@@ -40,7 +39,7 @@ from chessbot.utils import (
 
 
 ANALYZE_PKL = "analyze_results_combined.pkl"
-VISUALS_DIR = r"C:\Users\Bryan\Data\chessbot_data\visuals"
+VISUALS_DIR = r"D:\Data\chessbot_data\visuals"
 
 # default analysis params
 DEPTH = 12
@@ -330,7 +329,15 @@ class GameViewer:
 
         print(f"Running lc0 ({nodes} nodes)...")
         sf_board = self.board_ch.copy()
-        all_rows = lc0_analyze(sf_board, nodes=nodes)
+        try:
+            all_rows = lc0_analyze(sf_board, nodes=nodes)
+        except (chess.engine.EngineError, asyncio.CancelledError,
+                asyncio.TimeoutError, concurrent.futures.CancelledError) as e:
+            print(f"lc0 analysis failed: {e!r}")
+            print("lc0 process likely crashed on startup (CUDA/driver "
+                  "mismatch or GPU busy) -- run scripts/tools or check "
+                  "lc0 stderr directly to confirm")
+            return
         if not all_rows:
             print("No lc0 data returned.")
             return
@@ -500,6 +507,8 @@ class GameViewer:
             save_to = pathlib.Path(save_to)
         save_to.parent.mkdir(parents=True, exist_ok=True)
 
+        import cairosvg
+
         board = chess.Board(self.start_fen) if self.start_fen else chess.Board()
         frames = []
         lastmove = None
@@ -652,6 +661,16 @@ class GameViewer:
 
         return out
 
+    def fpu_q(self, cands):
+        """STM-POV Q that PUCT assigns an unvisited child: root Q, taken as
+        the visit-weighted mean of child Q, minus fpu_reduction."""
+        n = sum(c.get("visits", 0) for c in cands)
+        if n == 0:
+            return None
+        sign = 1 if self.board.white_to_move() else -1
+        q = sum(c.get("visits", 0) * c.get("Q", 0.0) for c in cands) / n
+        return q * sign - self.log.get("fpu_reduction", 0.1)
+
     def print_header(self, show_rank=False, show_rsc=False):
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
@@ -691,6 +710,7 @@ class GameViewer:
         show_rsc=False,
         rsc_val=None,
         extra_flags=None,
+        fpu_q=None,
     ):
         uci = c.get("uci", "")
         san = self.board.san(uci) if uci else "?"
@@ -699,13 +719,8 @@ class GameViewer:
         visit_share = c.get("visit_share", 0.0)
 
         sign = 1 if self.board.white_to_move() else -1
-        q = c.get("Q", 0.0) * sign
-        qema = c.get("Qema", 0.0) * sign
-        ds = c.get("Qdelta_sign", 0.0)
-
         p = c.get("P", 0.0)
-        u = c.get("U", 0.0) * (1.0 + 0.5 * np.clip(ds, -0.5, 0.5))
-        puct = q + u
+        u = c.get("U", 0.0)
 
         flags = []
         if mark:
@@ -715,15 +730,28 @@ class GameViewer:
         if c.get("is_terminal", False):
             flags.append("T")
 
+        if visits > 0:
+            q = c.get("Q", 0.0) * sign
+            q_txt = f"{q:^+7.3f}"
+            qema_txt = f"{c.get('Qema', 0.0) * sign:^+7.3f}"
+            ds_txt = f"{c.get('Qdelta_sign', 0.0):^+7.3f}"
+            draw_txt = f"{c.get('Q_draw', float('nan')):^6.3f}"
+            puct_txt = f"{q + u:^+8.3f}"
+        else:
+            q_txt = f"{fpu_q:^+7.3f}" if fpu_q is not None else f"{'':7}"
+            qema_txt, ds_txt, draw_txt = f"{'':7}", f"{'':7}", f"{'':6}"
+            puct_txt = (f"{fpu_q + u:^+8.3f}" if fpu_q is not None
+                        else f"{'':8}")
+            flags.append("FPU")
+
         flags_txt = ", ".join([f for f in flags if f])
 
-        q_draw = c.get("Q_draw", float("nan"))
         parts = [
             f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
             "|",
-            f"{q:^+7.3f}", f"{qema:^+7.3f}", f"{ds:^+7.3f}", f"{q_draw:^6.3f}",
+            q_txt, qema_txt, ds_txt, draw_txt,
             "|",
-            f"{p:^7.3f}", f"{u:^+7.3f}", f"{puct:^+8.3f}",
+            f"{p:^7.3f}", f"{u:^+7.3f}", puct_txt,
             "|",
             f"{flags_txt:^9}",
         ]
@@ -905,6 +933,7 @@ class GameViewer:
             need_rank = need_rank or (xc0_idx >= top_n)
 
         self.print_header(show_rank=need_rank, show_rsc=True)
+        fq = self.fpu_q(cands)
         rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
 
         shown_ucis = set()
@@ -947,6 +976,7 @@ class GameViewer:
                 show_rsc=True,
                 rsc_val=rsc_map.get(uci),
                 extra_flags=extra,
+                fpu_q=fq,
             )
             shown_ucis.add(uci)
 
@@ -966,7 +996,8 @@ class GameViewer:
                     rank_val=xc0_idx + 1,
                     show_rsc=True,
                     rsc_val=None,
-                    extra_flags=extra
+                    extra_flags=extra,
+                    fpu_q=fq,
                 )
                 shown_ucis.add(xc0_move)
 
@@ -987,7 +1018,8 @@ class GameViewer:
                     rank_val=sf_best_idx + 1,
                     show_rsc=True,
                     rsc_val=None,
-                    extra_flags=extra
+                    extra_flags=extra,
+                    fpu_q=fq,
                 )
         if is_sf_turn and chosen and (chosen not in shown_ucis):
             if chosen_idx is not None:
@@ -1000,6 +1032,7 @@ class GameViewer:
                     show_rsc=True,
                     rsc_val=None,
                     extra_flags=None,
+                    fpu_q=fq,
                 )
                 shown_ucis.add(chosen)
 
@@ -1122,6 +1155,7 @@ class GameViewer:
 
         print(f"  === Showing visit info for {uci_or_san} ===")
         self.print_header(show_rank=True, show_rsc=False)
+        fq = self.fpu_q(cands)
         self.print_row(
             move,
             mark=mark,
@@ -1129,6 +1163,7 @@ class GameViewer:
             rank_val=rank,
             show_rsc=False,
             extra_flags=extra,
+            fpu_q=fq,
         )
         print(f"   Rank: {rank}\tShare: {100 * move['visits'] / node['sims']:.3f}%")
 

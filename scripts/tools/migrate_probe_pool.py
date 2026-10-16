@@ -47,7 +47,7 @@ from chessbot.blunder_replay import (
     BRP_EQUIV_CPL, evicted_path, save_probe_pool, short_fen,
 )
 
-SELFPLAY_RUNS_GLOB = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/*"
+SELFPLAY_RUNS_GLOB = "D:/Data/chessbot_data/selfplay_runs/*"
 # legacy threshold in effect when this one-time migration ran -- decoupled
 # from blunder_replay.py's current live eviction policy, which no longer
 # has a streak concept

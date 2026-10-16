@@ -46,8 +46,8 @@ from chessbot.opening_counts import absolute_ply
 from chessbot.utils import calc_entropy, scalar_to_wdl as to_wdl
 from chessbot.game_utils import reconcile_game_boards
 
-DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
-DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_071826\staging"
+DEFAULT_LC0_DIR = r"D:\Data\chessbot_data\training_data\lc0"
+DEFAULT_OUT_DIR = r"D:\Data\chessbot_data\training_data\xc0hK6_071826\staging"
 
 # RUN_TAGS = [
 #     "16m_precond_run2", "16m_precond_run1", "16m_precond_run0",

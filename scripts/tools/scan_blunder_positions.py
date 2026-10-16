@@ -57,7 +57,7 @@ from chessbot.blunder_replay import (
 # immediately, same effect as `python -u`.
 sys.stdout.reconfigure(write_through=True)
 
-BASE = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
+BASE = "D:/Data/chessbot_data/selfplay_runs"
 RUN_PATTERNS = ["18m_*", "16m_xc0hK6_*"]
 
 PLY_COLS = [

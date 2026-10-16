@@ -30,7 +30,7 @@ import bootstrap_model_async_sparse_pkl as B
 from chessbot.pretrain import EPOCH_SIZE, PLOT_EVERY, lr_for_epoch, split_train_val
 
 NAME       = "precond-mha-10c6t-d256-wdl3"
-RUN_DIR    = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs\20m_wdl3_gatereg_exp"
+RUN_DIR    = r"D:\Data\chessbot_data\selfplay_runs\20m_wdl3_gatereg_exp"
 START_CKPT = os.path.join(RUN_DIR, f"{NAME}_pt_ckpt28100.pt")
 START_EP   = 28100
 SHARD_DIR  = B.DEFAULT_SHARD_DIR

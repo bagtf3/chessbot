@@ -11,7 +11,7 @@ import torch
 from collections import defaultdict
 
 
-RUN_DIR  = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs\16m_xc0hK6_run3"
+RUN_DIR  = r"D:\Data\chessbot_data\selfplay_runs\16m_xc0hK6_run3"
 DEFAULT_MODEL = RUN_DIR + r"\16m_xc0hK6_run3_model.pt"
 DEFAULT_OPT   = RUN_DIR + r"\train_ckpts\16m_xc0hK6_run3_model_opt_state.pt"
 

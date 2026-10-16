@@ -77,7 +77,7 @@ SWA_EVERY  = 20
 DEFAULT_MODEL     = "m13-7-8c8t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 26001
-DEFAULT_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
+DEFAULT_SHARD_DIR = r"D:\Data\chessbot_data\training_data\pretrain_shards"
 
 # per-draw subsampling (train pool only): drawish positions (soft D past the
 # threshold) are dropped with DRAW_DROP_P, then decided positions (any WDL

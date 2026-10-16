@@ -103,7 +103,8 @@ def lc0_analyze(board, nodes=4000, lc0_loc=None, engine_cfg=None):
     if engine_cfg:
         cfg.update(engine_cfg)
 
-    with chess.engine.SimpleEngine.popen_uci(loc, stderr=subprocess.DEVNULL) as eng:
+    with chess.engine.SimpleEngine.popen_uci(
+            loc, stderr=subprocess.DEVNULL, timeout=60.0) as eng:
         eng.configure(cfg)
         with eng.analysis(board, limit, info=chess.engine.INFO_ALL) as an:
             for info in an:
@@ -120,7 +121,8 @@ class Lc0Session:
 
     def __init__(self, lc0_loc=None, cfg=None):
         loc = lc0_loc or LC0_LOC
-        self.eng = chess.engine.SimpleEngine.popen_uci(loc, stderr=subprocess.DEVNULL)
+        self.eng = chess.engine.SimpleEngine.popen_uci(
+            loc, stderr=subprocess.DEVNULL, timeout=60.0)
         base_cfg = {"VerboseMoveStats": True, "MinibatchSize": 64}
         apply_lc0_weights(base_cfg)
         if cfg:

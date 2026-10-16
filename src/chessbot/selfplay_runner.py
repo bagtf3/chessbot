@@ -51,24 +51,35 @@ import chessbot.replay_buffer as rb
 GAME_QUEUE_MIN = 36
 GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
 WORKER_PAUSE_SETTLE_S = 10.0
+# longest the runner holds a retrain waiting on the fleet to drop its GPU
+# sessions; kept under the retrain worker's own GO_TIMEOUT_S
+RETRAIN_RELEASE_TIMEOUT_S = 90.0
 RESPAWN_COOLDOWN_S = 30.0
 STOP_DRAIN_S = 5.0
 WORKER_KINDS = ("xc0", "lc0")
+# teacher probes are held and released in bundles this size so the lc0 worker
+# runs full batches instead of a trickle of near-empty ones
+LC0_BUNDLE_SIZE = 128
+# a bundle that has not filled after this long is sent as-is
+LC0_BUNDLE_MAX_WAIT_S = 600.0
 
 # xc0 blunder-replay probes are held off the worker queue until this epoch;
 # credits and the blunder pool keep accruing, and lc0 BRP runs unaffected.
 BRP_WORKER_START_EPOCH = 5
 
 
-def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue):
+def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue,
+                 release_ev=None):
     """mp.Process target. One queue now -- selfplay, validation and blunder
     replays all arrive on it and are told apart by spec.meta."""
     with init_selfplay(
-        cfg, recent_games_q, telemetry_q, 
+        cfg, recent_games_q, telemetry_q,
         msg_q, game_q=game_queue
     ) as looper:
-        # lc0 is demand-driven and idles far longer between teacher probes
-        looper.run(stop_ev, wait_time=1200 if cfg.id.startswith("lc0") else 600)
+        looper.release_ev = release_ev
+        # lc0 is demand-driven and idles between bundles; its idle window
+        # must outlast LC0_BUNDLE_MAX_WAIT_S or it exits waiting on one
+        looper.run(stop_ev, wait_time=2400 if cfg.id.startswith("lc0") else 600)
 
 
 def drain_queue(q):
@@ -329,6 +340,8 @@ class SelfPlayRunner:
         self.ctx = mp.get_context()
         self.game_q = None
         self.lc0_q = None
+        self.lc0_hold = []
+        self.lc0_hold_since = None
         self.recent_q = None
         self.telemetry_q = None
         self.procs = []
@@ -484,17 +497,19 @@ class SelfPlayRunner:
         c.id = f"w{self.next_worker_id}"
         self.next_worker_id += 1
         stop_ev = self.ctx.Event()
+        release_ev = self.ctx.Event()
         msg_q = self.ctx.Queue()
         p = self.ctx.Process(
             target=child_looper,
             args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
-                  self.game_q),
+                  self.game_q, release_ev),
             daemon=True,
         )
         p.start()
         self.worker_procs.append(p)
         self.procs.append({
             "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
+            "release_ev": release_ev,
             "kind": "xc0", "stop_sent_at": None, "term_sent_at": None,
             "kill_sent_at": None,
         })
@@ -510,17 +525,19 @@ class SelfPlayRunner:
         c.id = f"lc0w{self.next_worker_id}"
         self.next_worker_id += 1
         stop_ev = self.ctx.Event()
+        release_ev = self.ctx.Event()
         msg_q = self.ctx.Queue()
         p = self.ctx.Process(
             target=child_looper,
             args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
-                  self.lc0_q),
+                  self.lc0_q, release_ev),
             daemon=True,
         )
         p.start()
         self.worker_procs.append(p)
         self.procs.append({
             "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
+            "release_ev": release_ev,
             "kind": "lc0", "stop_sent_at": None, "term_sent_at": None,
             "kill_sent_at": None,
         })
@@ -557,14 +574,29 @@ class SelfPlayRunner:
                   f"({self.lc0_cfg.lc0_distill_model_name})", flush=True)
 
     def drain_lc0_specs(self):
-        """Move staged teacher probes from the rescorer onto the lc0 queue."""
+        """Hold staged teacher probes until LC0_BUNDLE_SIZE, then release the
+        whole bundle onto the lc0 queue. A bundle older than
+        LC0_BUNDLE_MAX_WAIT_S goes out short, and a draining run flushes
+        whatever is held so no probe is stranded."""
         if self.lc0_q is None:
             return 0
         specs = self.rescorer.take_lc0_specs()
-        for spec in specs:
-            self.lc0_q.put(spec)
-        self.recorder.lc0_backlog = self.lc0_q.qsize()
-        return len(specs)
+        if specs and not self.lc0_hold:
+            self.lc0_hold_since = time.monotonic()
+        self.lc0_hold.extend(specs)
+
+        sent = 0
+        if self.lc0_hold and (
+                len(self.lc0_hold) >= LC0_BUNDLE_SIZE
+                or time.monotonic() - self.lc0_hold_since >= LC0_BUNDLE_MAX_WAIT_S
+                or self.stop_signal_sent):
+            for spec in self.lc0_hold:
+                self.lc0_q.put(spec)
+            sent = len(self.lc0_hold)
+            self.lc0_hold = []
+            self.lc0_hold_since = None
+        self.recorder.lc0_backlog = self.lc0_q.qsize() + len(self.lc0_hold)
+        return sent
 
     def fleet_wanted(self):
         """True while the run still wants workers running.
@@ -634,17 +666,21 @@ class SelfPlayRunner:
         print(f"[runner] paused {'+'.join(sorted(todo))} ({why})", flush=True)
         return True
 
-    def unpause_workers(self, why, kinds=None):
+    def unpause_workers(self, why, kinds=None, epoch=None):
         """Release the named fleets, minus anything the operator is holding.
 
         This filter is what stops a finishing retrain from silently undoing an
-        operator pause issued while it was in flight.
+        operator pause issued while it was in flight. The message carries the
+        model epoch, so workers tag games from the runner's count rather than
+        counting pauses themselves.
         """
         kinds = set(kinds) if kinds else set(WORKER_KINDS)
         todo = (kinds & self.paused_kinds) - self.operator_paused
         if not todo:
             return False
-        self.broadcast("unpause", todo)
+        if epoch is None:
+            epoch = self.current_epoch
+        self.broadcast({"cmd": "unpause", "epoch": epoch}, todo)
         self.paused_kinds -= todo
         print(f"[runner] unpaused {'+'.join(sorted(todo))} ({why})", flush=True)
         return True
@@ -989,15 +1025,36 @@ class SelfPlayRunner:
         self.retrain_worker = {
             "p": p, "msg_q": msg_q, "result_q": result_q,
             "replay_files": replay_files, "primary_files": primary_sample,
-            "historic_files": historic_files,
+            "historic_files": historic_files, "go_wait_since": None,
         }
         print(f"[retrain] launched at {len(primary)}/"
               f"{rb.PRIMARY_TRIGGER_SHARDS}", flush=True)
         self.rescorer.reset_writer()
 
+    def maybe_send_retrain_go(self):
+        """Let the paused retrain allocate once every live worker has dropped
+        its GPU sessions, or after RETRAIN_RELEASE_TIMEOUT_S regardless."""
+        rw = self.retrain_worker
+        since = rw["go_wait_since"]
+        if since is None:
+            return
+        held = [w["id"] for w in self.procs
+                if w["p"].is_alive() and not w["release_ev"].is_set()]
+        waited = time.monotonic() - since
+        if held and waited < RETRAIN_RELEASE_TIMEOUT_S:
+            return
+        if held:
+            print(f"[retrain] {', '.join(held)} still holding the GPU after "
+                  f"{waited:.0f}s, training anyway", flush=True)
+        else:
+            print(f"[retrain] fleet released GPU in {waited:.1f}s", flush=True)
+        rw["msg_q"].put({"cmd": "go"})
+        rw["go_wait_since"] = None
+
     def poll_retrain(self):
         if self.retrain_worker is None:
             return
+        self.maybe_send_retrain_go()
         p = self.retrain_worker["p"]
         try:
             result = self.retrain_worker["result_q"].get_nowait()
@@ -1015,8 +1072,9 @@ class SelfPlayRunner:
 
         if result["cmd"] == "retrain_ready":
             # worker-side validation is done and predictions are on disk;
-            # pause so the retrain gets the GPU
+            # pause so the retrain gets the GPU; it trains on "go"
             self.pause_workers("retrain")
+            self.retrain_worker["go_wait_since"] = time.monotonic()
             return
 
         if result["cmd"] != "retrain_done":
@@ -1037,7 +1095,6 @@ class SelfPlayRunner:
         if self.pause_workers("retrain teardown"):
             time.sleep(WORKER_PAUSE_SETTLE_S)
 
-        self.recorder.n_retrains += 1
         self.reload_config()
         for t in self.sf_rescore_threads:
             t.update_config(self.cfg)
@@ -1046,29 +1103,30 @@ class SelfPlayRunner:
         # hard rule: unpause as soon as training is done, the TRT rebuild in
         # reload_config being the one unavoidable prerequisite. A pause the
         # operator issued mid-retrain survives -- unpause_workers filters it
-        # out -- and blocks the next retrain until they clear it.
-        self.unpause_workers("retrain complete")
+        # out -- and blocks the next retrain until they clear it. A failed
+        # retrain leaves the weights, and so the epoch, where they were.
+        self.unpause_workers("retrain complete",
+                             epoch=self.current_epoch + (1 if ok else 0))
 
+        pred_pkl = os.path.join(self.cfg.run_dir, "predictions_latest.pkl")
         if ok:
             rb.move_files(self.retrain_worker["primary_files"],
                           self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
+            self.rescorer.aggregate_metrics(
+                self.current_epoch, self.cfg.progress_csv_path, pred_pkl,
+                train_stats=result.get("train_stats"))
         else:
-            print(f"[retrain] failed: {result.get('error')}", flush=True)
-
-        pred_pkl = os.path.join(self.cfg.run_dir, "predictions_latest.pkl")
-        self.rescorer.aggregate_metrics(
-            self.current_epoch, self.cfg.progress_csv_path, pred_pkl,
-            train_stats=result.get("train_stats"))
-        # aggregation is the only consumer and it has the numbers now
+            print(f"[retrain] failed: {result.get('error')} -- epoch stays "
+                  f"{self.current_epoch}, no csv rows written", flush=True)
+        # aggregation is the only consumer
         if os.path.exists(pred_pkl):
             os.remove(pred_pkl)
 
-        # re-read rather than increment: aggregate_metrics runs even when the
-        # retrain failed, so a local counter can drift from the csv with
-        # nothing to resync it. Disk is the one source of truth.
+        # disk is the one source of truth for the epoch
         self.current_epoch = next_model_epoch(self.cfg.progress_csv_path)
+        self.recorder.n_retrains = self.current_epoch
         self.retrain_worker = None
 
         # fresh weights: probe the new epoch in bulk so most of an analysis

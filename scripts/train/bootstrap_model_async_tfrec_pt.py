@@ -78,7 +78,7 @@ SWA_EVERY  = 20
 DEFAULT_MODEL     = "precond-mha-10c6t-d256"
 DEFAULT_RUN_TAG   = "val_test_multi"
 DEFAULT_MAX_EPOCH = 3501
-DEFAULT_TFREC_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
+DEFAULT_TFREC_DIR = r"D:\Data\chessbot_data\training_data\xc0hK6_combined\shuffled"
 
 # ---------------------------------------------------------------------------
 # LW-twiddle experiment (lw_twiddle branch, pretrain-only)

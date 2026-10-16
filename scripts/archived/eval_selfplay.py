@@ -15,7 +15,7 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from tqdm import tqdm
 
 
-RUN_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_1000_test"
+RUN_DIR = "D:/Data/chessbot_data/selfplay_runs/conv_1000_test"
 N_WORKERS = 6
 
 

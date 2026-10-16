@@ -5,7 +5,7 @@ scripts/review_cli.py  --  Game review with browser-based attention/attribution.
 Usage:
     python scripts/review_cli.py --run-tag precond_run1 [--port 8766]
 
-Data root defaults to C:/Users/Bryan/Data/chessbot_data/selfplay_runs/
+Data root defaults to D:/Data/chessbot_data/selfplay_runs/
 Override with env var XERCES_DATA_DIR.
 
 Browser shortcuts (in review mode): ArrowRight/Space=forward  ArrowLeft=back  A=attn  P=pv
@@ -34,7 +34,7 @@ from chessbot.review import GameViewer
 
 DATA_ROOT = os.environ.get(
     "XERCES_DATA_DIR",
-    r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs"
+    r"D:\Data\chessbot_data\selfplay_runs"
 )
 
 POLICY_COLORS = ["#00c853", "#2196f3", "#ff6d00"]

@@ -36,8 +36,8 @@ POLICY_MAX_CLIP  = 0.6
 DRAW_DROP_RATE   = 0.75
 Z_BLEND          = 0.5
 
-DEFAULT_LC0_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
-DEFAULT_OUT_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\staging"
+DEFAULT_LC0_DIR = r"D:\Data\chessbot_data\training_data\lc0"
+DEFAULT_OUT_DIR = r"D:\Data\chessbot_data\training_data\staging"
 
 OPTIONS  = tf.io.TFRecordOptions(compression_type="GZIP")
 V6_STRUC = struct.Struct(V6_STRUCT_STRING)

@@ -129,9 +129,6 @@ PRECOND_MHA_8C8T_CFG = dict(
 # the same 1858/3 heads, so one loop covers them.
 CONV_MODELS = [
     ("conv-pure",              build_pt_conv_pure,      CONV_PURE_CFG,         "conv_pure"),
-    ("precond-mha-8c4t-d384",  build_pt_precond_signed, PRECOND_MHA_8C4T_CFG,  "precond_mha_8c4t_d384"),
-    ("precond-mha-8c6t-d256",  build_pt_precond_addpos, PRECOND_MHA_8C6T_CFG,  "precond_mha_8c6t_d256"),
-    ("precond-mha-10c6t-d256", build_pt_precond_addpos, PRECOND_MHA_10C6T_CFG, "precond_mha_10c6t_d256"),
     ("precond-mha-8c8t-d256",  build_pt_precond_addpos, PRECOND_MHA_8C8T_CFG,  "precond_mha_8c8t_d256"),
 ]
 

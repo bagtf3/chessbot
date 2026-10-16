@@ -47,12 +47,17 @@ class GameLooper(object):
         self.game_queue = game_queue
         self.sf_queue = sf_queue
         self.unpause_queued = False
+        # model epoch carried by the last unpause; the runner owns the count
+        self.unpause_epoch = None
         self.stop_at_empty = False
         self.games_finished = 0
         self.active_games = []
         self.sf_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         self.sf_teardown_pending = False
+        # set while paused with GPU sessions dropped; the runner waits on it
+        # before letting a retrain allocate
+        self.release_ev = None
         self.forest = MCTSForest()
 
         self.pull_from_queue()
@@ -170,23 +175,28 @@ class GameLooper(object):
 
             if cmd == "unpause":
                 self.unpause_queued = True
+                self.take_unpause_epoch(msg)
                 continue
 
-            if cmd == "drain_and_stop":
-                self.stop_at_empty = True
-                self.active_games = self.active_games[:self.config.games_at_once]
-                continue
+            self.handle_side_cmd(cmd)
 
-            if cmd == "tear_down_sf":
-                # never mid-game: an active vs_stockfish game still needs the
-                # engine, so defer and let the run loop retry
-                if any(g.vs_stockfish for g in self.active_games):
-                    self.sf_teardown_pending = True
-                else:
-                    self.tear_down_sf()
-                continue
+    def take_unpause_epoch(self, msg):
+        if isinstance(msg, dict) and msg.get("epoch") is not None:
+            self.unpause_epoch = int(msg["epoch"])
 
-            continue
+    def handle_side_cmd(self, cmd):
+        """Commands other than pause/unpause, honored paused or not."""
+        if cmd == "drain_and_stop":
+            self.stop_at_empty = True
+            self.active_games = self.active_games[:self.config.games_at_once]
+
+        elif cmd == "tear_down_sf":
+            # never mid-game: an active vs_stockfish game still needs the
+            # engine, so defer and let the run loop retry
+            if any(g.vs_stockfish for g in self.active_games):
+                self.sf_teardown_pending = True
+            else:
+                self.tear_down_sf()
 
     def pause_wait_and_reload(self):
         """
@@ -207,6 +217,9 @@ class GameLooper(object):
 
         priors_cache_clear()
 
+        if self.release_ev is not None:
+            self.release_ev.set()
+
         if self.unpause_queued:
             self.unpause_queued = False
         else:
@@ -215,16 +228,18 @@ class GameLooper(object):
                 cmd = msg.get("cmd") if isinstance(msg, dict) else msg
 
                 if cmd == "unpause":
+                    self.take_unpause_epoch(msg)
                     break
 
-                if cmd == "pause":
-                    continue
+                if cmd != "pause":
+                    self.handle_side_cmd(cmd)
 
-                continue
-
+        if self.release_ev is not None:
+            self.release_ev.clear()
         self.load_reload_model()
 
-        self.n_retrains += 1
+        if self.unpause_epoch is not None:
+            self.n_retrains = self.unpause_epoch
 
     def pull_from_queue(self):
         games_at_once = self.config.games_at_once
@@ -292,6 +307,10 @@ class GameLooper(object):
                 # queue transiently empty -- wait for the parent to refill
                 for _ in range(wait_time):
                     time.sleep(0.5)
+                    # idle still holds the GPU session, so a pause must land
+                    # here too or a retrain trains on top of it
+                    if self.check_for_pause():
+                        self.pause_wait_and_reload()
                     self.pull_from_queue()
                     if self.active_games:
                         break

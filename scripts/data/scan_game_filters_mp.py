@@ -27,7 +27,7 @@ import pyarrow.parquet as pqf
 
 from chessbot import SP_DIR
 
-OUT_DIR_DEFAULT = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_filter_lists"
+OUT_DIR_DEFAULT = r"D:\Data\chessbot_data\training_data\pretrain_filter_lists"
 COLLAR_CP, COLLAR_N, COLLAR_REV = 350, 7, 3
 
 RUN_TAGS = [

@@ -25,8 +25,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import poc_2c2t_wdl3_d256 as poc  # noqa: E402
 
-SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\pretrain_shards"
-OUT_DIR = r"C:\Users\Bryan\Data\chessbot\_data\models\int8_poc_2c2t"
+SHARD_DIR = r"D:\Data\chessbot_data\training_data\pretrain_shards"
+OUT_DIR = r"D:\Data\chessbot\_data\models\int8_poc_2c2t"
 CKPT = os.path.join(OUT_DIR, "poc_2c2t_wdl3_int8dot_qat.pt")
 
 

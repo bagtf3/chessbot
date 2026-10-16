@@ -18,8 +18,8 @@ from chessbot.engines import Lc0Session
 from chessbot.lc0_utils import Lc0Board, softmax, make_lc0_trt_session
 
 PRE_OPENED_PKL = os.getenv('PRE_OPENED_UCI_PATHS', '')
-TRT_CACHE      = r'C:\Users\Bryan\Data\chessbot_data\lc0\trt_cache'
-ONNX_PATH      = r'C:\Users\Bryan\Data\chessbot_data\lc0\onnx\t1-256x10-distilled-swa-2432500.onnx'
+TRT_CACHE      = r'D:\Data\chessbot_data\lc0\trt_cache'
+ONNX_PATH      = r'D:\Data\chessbot_data\lc0\onnx\t1-256x10-distilled-swa-2432500.onnx'
 MODEL_NAME     = 't1-small'
 N_POSITIONS    = 50
 EXTRA_MOVES    = 3

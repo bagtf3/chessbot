@@ -29,8 +29,8 @@ import torch
 from chessbot import SP_DIR
 from chessbot.train_pytorch import load_pt_model
 
-LC0_DIR       = r'C:\Users\Bryan\Data\chessbot_data\training_data\lc0_distilled_positions'
-LC0_BATCH1_DIR = r'C:\Users\Bryan\Data\chessbot_data\training_data\lc0_distilled_positions_batch1'
+LC0_DIR       = r'D:\Data\chessbot_data\training_data\lc0_distilled_positions'
+LC0_BATCH1_DIR = r'D:\Data\chessbot_data\training_data\lc0_distilled_positions_batch1'
 POLICY_DIM    = 1858
 
 

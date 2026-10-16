@@ -5,7 +5,7 @@ Usage:
 
 Example:
     python scripts/convert_pretrain_ckpt.py \
-        C:/Users/Bryan/Data/chessbot_data/selfplay_runs/val_test_multi/16m-precond-smartgate_pt_ckpt2999.pt \
+        D:/Data/chessbot_data/selfplay_runs/val_test_multi/16m-precond-smartgate_pt_ckpt2999.pt \
         16m_precond_run0
 """
 import sys

@@ -25,8 +25,8 @@ import pyfastchess as pf
 from xerces_training.chunkparser import V6_STRUCT_STRING
 from xerces_training.parse_utils import v6_planes_to_xc0h, get_policy_vector
 
-LC0_SRC_ROOT = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0"
-OUT_ROOT     = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0_pkl"
+LC0_SRC_ROOT = r"D:\Data\chessbot_data\training_data\lc0"
+OUT_ROOT     = r"D:\Data\chessbot_data\training_data\lc0_pkl"
 
 SL_IDX  = np.nonzero(pf.build_sometimes_legal_mask().astype(bool))[0]
 V6      = struct.Struct(V6_STRUCT_STRING)

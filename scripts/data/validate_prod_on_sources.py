@@ -24,7 +24,7 @@ from chessbot import SP_DIR
 from chessbot.replay_buffer import POLICY_DIM
 from chessbot.train_pytorch import load_pt_model
 
-TD    = r"C:\Users\Bryan\Data\chessbot_data\training_data"
+TD    = r"D:\Data\chessbot_data\training_data"
 BATCH = 256
 
 RUN_TAGS = [

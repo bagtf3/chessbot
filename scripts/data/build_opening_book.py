@@ -5,9 +5,9 @@ import random
 import chess
 import chess.pgn
 
-UHO_PGN = "C:/Users/Bryan/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
-PRE_OPENED_PKL = "C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_quota_4to8.pkl"
-OUT_PATH = "C:/Users/Bryan/Data/chessbot_data/cutechess/opening_book.pgn"
+UHO_PGN = "D:/Data/chessbot_data/opening_books/UHO_XXL_2022_+100_+129.pgn"
+PRE_OPENED_PKL = "D:/Data/chessbot_data/pre_opened_uci_paths_quota_4to8.pkl"
+OUT_PATH = "D:/Data/chessbot_data/cutechess/opening_book.pgn"
 
 N_UHO = 10000
 N_PRE = 3000

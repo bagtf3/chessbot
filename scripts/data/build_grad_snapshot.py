@@ -17,9 +17,9 @@ import os
 import pickle
 import numpy as np
 
-TFREC_DIR   = r"C:\Users\Bryan\Data\chessbot_data\training_data\wdl"
+TFREC_DIR   = r"D:\Data\chessbot_data\training_data\wdl"
 N_DEFAULT   = 20480
-OUT_DEFAULT = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs\val_test\grad_analysis_snapshot.pkl"
+OUT_DEFAULT = r"D:\Data\chessbot_data\selfplay_runs\val_test\grad_analysis_snapshot.pkl"
 
 UNIFORM_BLEND   = 0.05
 POLICY_MAX_CLIP = 0.6

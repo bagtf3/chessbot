@@ -14,7 +14,7 @@ from chessbot.int8 import freeze_int8
 from chessbot.int8.onnx_qdq import export_frozen_sequential_qdq
 from poc_layer_demo import train_toy
 
-DEFAULT_OUT = r"C:\Users\Bryan\Data\chessbot_data\int8_poc\toy_qdq.onnx"
+DEFAULT_OUT = r"D:\Data\chessbot_data\int8_poc\toy_qdq.onnx"
 
 
 def main():

@@ -16,8 +16,8 @@ import pandas as pd
 
 from chessbot.blunder_replay import short_fen
 
-BACKUP_GLOB = "C:/Users/Bryan/Data/chessbot_data/*.pre_migration.pkl.gz"
-CSV_GLOB = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/*/blunder_probe/probe_e*.csv"
+BACKUP_GLOB = "D:/Data/chessbot_data/*.pre_migration.pkl.gz"
+CSV_GLOB = "D:/Data/chessbot_data/selfplay_runs/*/blunder_probe/probe_e*.csv"
 
 
 def build_pos_id_map():

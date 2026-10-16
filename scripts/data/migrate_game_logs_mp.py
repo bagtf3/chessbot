@@ -28,7 +28,7 @@ import numpy as np
 from chessbot import SP_DIR
 from chessbot.replay_buffer import sparsify_policy, new_shard_path, write_pkl_gz_shard
 
-LC0_SHARD_DIR = r"C:\Users\Bryan\Data\chessbot_data\training_data\lc0_distilled_positions"
+LC0_SHARD_DIR = r"D:\Data\chessbot_data\training_data\lc0_distilled_positions"
 LC0_BATCH_SIZE = 128
 CPL_LC0_THRESHOLD = 30
 

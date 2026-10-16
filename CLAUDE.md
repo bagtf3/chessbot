@@ -12,7 +12,7 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - Engine name: **Xerces**
 - Python package: `chessbot` (src layout: `src/chessbot/`)
 - Entry point: `scripts/run_selfplay.py <run_tag>`
-- Run configs live at: `C:\Users\Bryan\Data\chessbot_data\selfplay_runs\<run_tag>\config.yaml`
+- Run configs live at: `D:\Data\chessbot_data\selfplay_runs\<run_tag>\config.yaml`
 - Active run tag: check the current run dir under `selfplay_dir` — don't assume; this drifts
 
 ## Key Files

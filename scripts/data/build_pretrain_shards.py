@@ -40,7 +40,7 @@ from chessbot.replay_buffer import (
     new_shard_path, write_pkl_gz_shard,
 )
 
-TD          = r"C:\Users\Bryan\Data\chessbot_data\training_data"
+TD          = r"D:\Data\chessbot_data\training_data"
 SHARD_SIZE  = 10240
 BUFFER_CAP  = 40960
 N_BUFFERS   = 16

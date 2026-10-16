@@ -42,7 +42,7 @@ TARGET_TAGS = [
 ]
 
 HISTORY_FILENAME = "validation_history.jsonl"
-DEFAULT_SELFPLAY_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs"
+DEFAULT_SELFPLAY_DIR = "D:/Data/chessbot_data/selfplay_runs"
 
 
 def load_sf_depth_table(repo_root):

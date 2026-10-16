@@ -23,7 +23,7 @@ import pickle
 import numpy as np
 import pandas as pd
 
-BASE = r"C:\Users\Bryan\Data\chessbot_data\selfplay_runs"
+BASE = r"D:\Data\chessbot_data\selfplay_runs"
 ANALYZE_PKL = "analyze_results_combined.pkl"
 META_PKL = "analyze_meta.pkl"
 FRAMES = {"df_all": "df_all.parquet", "df_means": "df_means.parquet"}

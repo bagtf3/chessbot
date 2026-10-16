@@ -11,9 +11,9 @@ from chessbot import CUTECHESS_CLI_LOC, LC0_LOC, SF_LOC, ENDGAME_LOC
 CC_PATH = CUTECHESS_CLI_LOC
 SF_PATH = SF_LOC
 LC0_PATH = LC0_LOC
-OPENING_BOOK = r"C:\Users\Bryan\Data\chessbot_data\cutechess\opening_book.pgn"
+OPENING_BOOK = r"D:\Data\chessbot_data\cutechess\opening_book.pgn"
 
-OUT_DIR = Path(r"C:\Users\Bryan\Data\chessbot_data\ratings_ladder")
+OUT_DIR = Path(r"D:\Data\chessbot_data\ratings_ladder")
 RUNS_DIR = OUT_DIR / "runs"
 ALL_GAMES_PATH = OUT_DIR / "all_games.pgn"
 PAIRINGS_PATH = OUT_DIR / "pairings.jsonl"
@@ -22,7 +22,7 @@ RATINGS_PATH = OUT_DIR / "ratings.txt"
 RATINGS_CANDIDATES_PATH = OUT_DIR / "ratings_candidates.txt"
 RATINGS_LADDERED_PATH = OUT_DIR / "ratings_laddered.txt"
 
-ORDO_PATH = r"C:\Users\Bryan\Data\chessbot_data\cutechess\ordo-1.2.6-win\ordo-win64.exe"
+ORDO_PATH = r"D:\Data\chessbot_data\cutechess\ordo-1.2.6-win\ordo-win64.exe"
 ORDO_ANCHOR = "SF_VLTC"
 ORDO_ANCHOR_RATING = 3776
 

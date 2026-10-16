@@ -44,7 +44,7 @@ b2.unmake()
 check_equal("b2 unmake returns to custom FEN", b2.fen(), custom_fen)
 #%%
 import pickle
-fen_path = "C:/Users/Bryan/Data/chessbot_data/fens2000.pkl"
+fen_path = "D:/Data/chessbot_data/fens2000.pkl"
 with open(fen_path, "rb") as f:
     fen_list = pickle.load(f)
 
@@ -797,7 +797,7 @@ def main(save_path: Optional[str] = None, chess960: bool = False):
     return results
 
 
-res = main(save_path="C:/Users/Bryan/Data/chessbot_data/edge_case_fens.json", chess960=False)
+res = main(save_path="D:/Data/chessbot_data/edge_case_fens.json", chess960=False)
 
 
 import json, random
@@ -883,11 +883,11 @@ def run_edge_case_suite(res_or_path, check_all_legal=False, legal_limit=None):
 
 # --------- run it ---------
 # If you already have `res` in memory:
-res = main(save_path="C:/Users/Bryan/Data/chessbot_data/edge_case_fens.json", chess960=False)
+res = main(save_path="D:/Data/chessbot_data/edge_case_fens.json", chess960=False)
 run_edge_case_suite(res, check_all_legal=True, legal_limit=None)
 
 # Or load from disk:
-# run_edge_case_suite(r"C:/Users/Bryan/Data/chessbot_data/edge_case_fens.json", check_all_legal=True)
+# run_edge_case_suite(r"D:/Data/chessbot_data/edge_case_fens.json", check_all_legal=True)
 
 from pyfastchess import Board as fastboard
 import chess

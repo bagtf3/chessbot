@@ -206,6 +206,40 @@ def run_selfplay_once(tag, args, fh):
     return proc.returncode, "exited"
 
 
+def set_yaml_scalar_inplace(path, key, value, fh=None):
+    """Rewrite `key: <value>` in place, preserving every other line verbatim
+    (comments included) -- same approach as init_new_run's yaml patcher.
+
+    value is formatted via yaml.safe_dump rather than plain str(): Python's
+    str(5e-05) == '5e-05', which PyYAML's safe_load parses back as a STRING
+    (its float regex requires a decimal point in the mantissa), silently
+    handing the trainer a str learning_rate instead of a float. safe_dump
+    always emits the decimal point ('5.0e-05'), so the round-trip is a float.
+    """
+    scalar = yaml.safe_dump(value).splitlines()[0]
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(f"{key}:"):
+            indent = line[:len(line) - len(line.lstrip())]
+            lines[i] = f"{indent}{key}: {scalar}\n"
+            found = True
+            break
+    if not found:
+        lines.append(f"\n{key}: {scalar}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    reloaded = (yaml.safe_load("".join(lines)) or {}).get(key)
+    if not isinstance(reloaded, float):
+        raise RuntimeError(
+            f"set_yaml_scalar_inplace: {key} round-tripped as "
+            f"{type(reloaded).__name__} ({reloaded!r}), not float -- refusing "
+            f"to leave {path} in a state the trainer would choke on")
+    log(f"set {key}={scalar} in {path}", fh)
+
+
 def iterate(tag, fh):
     """--iterate tag -> next tag, exactly once. Returns the new tag or None."""
     new = next_tag(tag)
@@ -290,7 +324,18 @@ def main():
     p.add_argument("--stall-min", type=float, default=90.0,
                    help="kill + relaunch after this many minutes with no new game")
     p.add_argument("--min-free-gb", type=float, default=5.0)
+    p.add_argument("--lr-drop-tag", default=None,
+                   help="exact run_tag to set learning_rate on, e.g. "
+                        "m137_8c8t_selfplay2. Checked by tag name (not a "
+                        "loop counter) so it still fires correctly if this "
+                        "script is restarted partway through")
+    p.add_argument("--lr-drop-to", type=float, default=None,
+                   help="learning_rate value applied at --lr-drop-tag "
+                        "(e.g. 0.00005)")
     args = p.parse_args()
+
+    if (args.lr_drop_tag is None) != (args.lr_drop_to is None):
+        p.error("--lr-drop-tag and --lr-drop-to must be given together")
 
     tag = args.run_tag
     if not os.path.exists(os.path.join(run_dir(tag), "config.yaml")):
@@ -306,6 +351,10 @@ def main():
                     log(f"stop file present ({STOP_FILE}) -- stopping", fh)
                     break
                 log(f"=== run {i}/{args.loops}: {tag} ===", fh)
+                if args.lr_drop_tag is not None and tag == args.lr_drop_tag:
+                    set_yaml_scalar_inplace(
+                        os.path.join(run_dir(tag), "config.yaml"),
+                        "learning_rate", args.lr_drop_to, fh)
                 if not run_to_completion(tag, args, fh):
                     sys.exit(1)
                 if i == args.loops:

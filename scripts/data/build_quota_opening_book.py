@@ -29,10 +29,10 @@ load_dotenv()
 SF_LOC = os.getenv("SF_LOC")
 UPTO2_PATH = os.getenv(
     "PRE_OPENED_UCI_PATHS_MINI",
-    "C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl",
+    "D:/Data/chessbot_data/pre_opened_uci_paths_upto2.pkl",
 )
 OUT_PATH = (
-    "C:/Users/Bryan/Data/chessbot_data/pre_opened_uci_paths_quota_4to8.pkl"
+    "D:/Data/chessbot_data/pre_opened_uci_paths_quota_4to8.pkl"
 )
 
 TOTAL_PATHS = 6000

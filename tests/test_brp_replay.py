@@ -16,7 +16,7 @@ from chessbot.config import Config
 from chessbot.game_utils import reconcile_game_boards, short_fen, GameSpec, STARTPOS_FEN
 from chessbot.mcts_utils import ChessGame
 
-POOL_DIR = r"C:\Users\Bryan\Data\chessbot_data"
+POOL_DIR = r"D:\Data\chessbot_data"
 POOLS = {
     "selfplay": os.path.join(POOL_DIR, "blunder_positions_selfplay.pkl.gz"),
     "raw": os.path.join(POOL_DIR, "blunder_positions_raw.pkl.gz"),

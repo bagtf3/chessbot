@@ -10,6 +10,9 @@ Message protocol (msg_q, main -> worker):
       happens once primary_buffer is full at PRIMARY_TRIGGER_SHARDS. They
       stayed two messages because the worker consumes them in order and the
       split costs nothing.
+  {"cmd": "go"}
+      Every selfplay worker has dropped its GPU sessions (or main gave up
+      waiting). Training allocates only after this, or after GO_TIMEOUT_S.
 
 Message protocol (result_q, worker -> main):
   {"cmd": "retrain_ready"}
@@ -17,8 +20,9 @@ Message protocol (result_q, worker -> main):
       pauses selfplay workers on receipt of this.
 
 predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
-  {"primary":  {"samples": [...], "preds": [...]},
-   "historic": {"samples": [...], "preds": [...]}}
+  {"primary":  {"samples": [...], "wdl": (N, 3), "logits": (N, 1858)},
+   "historic": {...same...}, "lc0": {...same...}}
+  wdl and logits are float32 arrays, row-aligned with samples.
   {"cmd": "retrain_done", "ok": bool, "error": str or None,
    "train_stats": {"train_loss": float, "gn_mean": float}}
       training + save finished (or failed). Main unpauses selfplay workers
@@ -27,9 +31,9 @@ predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
 """
 import os
 import pickle
+import queue
 import random
 import sys
-import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,9 +41,12 @@ import numpy as np
 from chessbot.config import Config
 from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
-    read_shard, sample_records, stack_policies, write_pkl_gz_shard,
+    read_shard, sample_records, write_pkl_gz_shard, POLICY_DIM,
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
 )
+
+# above the runner's RETRAIN_RELEASE_TIMEOUT_S so main's go normally wins
+GO_TIMEOUT_S = 120.0
 
 
 def load_records(paths):
@@ -64,21 +71,23 @@ def shuffle_rewrite_primary(paths, records, shard_size=SHARD_SIZE):
 
 
 def predict_fp16(model, X_list, batch_size):
+    """(wdl (N, 3), policy logits (N, 1858)) float32 arrays."""
     import torch
     import torch.nn.functional as F
     device = torch.device("cuda")
     model = model.to(device).half().eval()
-    results = []
+    n = len(X_list)
+    wdl = np.zeros((n, 3), dtype=np.float32)
+    logits = np.zeros((n, POLICY_DIM), dtype=np.float32)
     with torch.no_grad():
-        for i in range(0, len(X_list), batch_size):
+        for i in range(0, n, batch_size):
             batch = np.stack(X_list[i:i + batch_size], axis=0)
             xb = torch.from_numpy(batch).long().to(device)
             pol_logits, val_out = model(xb)
-            pol_np = pol_logits.float().cpu().numpy()
-            wdl_np = F.softmax(val_out.float(), dim=-1).cpu().numpy()
-            for j in range(len(pol_np)):
-                results.append((wdl_np[j].tolist(), pol_np[j].tolist()))
-    return results
+            j = i + len(batch)
+            logits[i:j] = pol_logits.float().cpu().numpy()
+            wdl[i:j] = F.softmax(val_out.float(), dim=-1).cpu().numpy()
+    return wdl, logits
 
 
 def records_to_arrays(records):
@@ -86,13 +95,23 @@ def records_to_arrays(records):
     # (.long() for token encodings, .float() for lc0 planes), so an int32
     # intermediate here just doubles the array for nothing
     X = np.stack([r[0] for r in records])
-    # primary + replay + historic meet here, so this is where sparse (new)
-    # and dense (old, and historic tfrec) records mix
-    P = stack_policies(records)
+    # policies stay in record form (sparse or dense, mixed); retrain_pt
+    # densifies one VRAM chunk at a time so the full (N, 1858) float32 stack
+    # never exists
+    P = [r[2] for r in records]
     Y = np.array([r[3] for r in records], dtype=np.float32)
     vwht = np.array([r[4] for r in records], dtype=np.float32)
     pwht = np.array([r[5] for r in records], dtype=np.float32)
     return X, P, Y, vwht, pwht
+
+
+def wait_for_go(msg_q):
+    """Block until main reports the fleet off the GPU. The timeout is a
+    backstop only; main sends go after its own shorter one."""
+    try:
+        msg_q.get(timeout=GO_TIMEOUT_S)
+    except queue.Empty:
+        print("[retrain] no go from main, training anyway", flush=True)
 
 
 def run_retrain_worker(run_dir, msg_q, result_q, epoch):
@@ -137,31 +156,35 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     val_lc0 = sample_records(lc0_pool, VAL_LC0_RECORDS)
 
     bs = cfg.retrain_batch_size
-    preds_primary = predict_fp16(model, [r[0] for r in val_primary], batch_size=bs)
-    preds_historic = predict_fp16(model, [r[0] for r in val_historic], batch_size=bs)
-    preds_lc0 = predict_fp16(model, [r[0] for r in val_lc0], batch_size=bs)
+    def stream(samples):
+        wdl, logits = predict_fp16(model, [r[0] for r in samples], batch_size=bs)
+        return {"samples": samples, "wdl": wdl, "logits": logits}
 
     pred_pkl_path = os.path.join(run_dir, "predictions_latest.pkl")
     payload = {
-        "primary": {"samples": val_primary, "preds": preds_primary},
-        "historic": {"samples": val_historic, "preds": preds_historic},
-        "lc0": {"samples": val_lc0, "preds": preds_lc0},
+        "primary": stream(val_primary),
+        "historic": stream(val_historic),
+        "lc0": stream(val_lc0),
     }
     with open(pred_pkl_path + ".tmp", "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(pred_pkl_path + ".tmp", pred_pkl_path)
 
-    del model
+    del model, payload, val_pool, val_primary, val_historic, lc0_pool, val_lc0
     torch.cuda.empty_cache()
 
     primary_records = shuffle_rewrite_primary(primary_paths, primary_records_raw)
+    del primary_records_raw
 
     all_records = primary_records + replay_records + historic_records
+    del primary_records, replay_records, historic_records
     random.shuffle(all_records)
     X, P, Y, vwht, pwht = records_to_arrays(all_records)
+    # X and the arrays are copies; P holds only the policy objects
+    del all_records
 
     result_q.put({"cmd": "retrain_ready"})
-    time.sleep(10)
+    wait_for_go(msg_q)
 
     model, arch = load_pt_model(cfg.model_path)
     args = SimpleNamespace(batch_size=cfg.retrain_batch_size)

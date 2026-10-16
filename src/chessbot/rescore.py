@@ -2162,31 +2162,33 @@ class Rescorer(object):
         eps = 1e-7
 
         def build_group(stream):
-            g = {'wdl_pred': [], 'wdl_true': [], 'pol_pred': [], 'source': []}
             samples = stream["samples"]
-            preds = stream["preds"]
-            if len(samples) != len(preds):
+            wdl, logits = stream["wdl"], stream["logits"]
+            if not len(samples) == len(wdl) == len(logits):
                 raise RuntimeError(
-                    f"sample/pred count mismatch: {len(samples)} vs {len(preds)}")
-            for (pred_wdl, pred_pol), sample in zip(preds, samples):
-                g['wdl_pred'].append(pred_wdl)
-                g['wdl_true'].append(np.array(sample[3], dtype=np.float64))
-                g['pol_pred'].append(pred_pol)
-                g['source'].append(sample[6])
-            # one shot, and it handles sparse and dense records alike
-            g['pol_true'] = stack_policies(samples)
-            return g
+                    f"sample/pred count mismatch: {len(samples)} vs "
+                    f"{len(wdl)}/{len(logits)}")
+            return {
+                'wdl_pred': wdl,
+                'wdl_true': np.array([s[3] for s in samples],
+                                     dtype=np.float64).reshape(-1, 3),
+                'pol_pred': logits,
+                'source': [s[6] for s in samples],
+                # one shot, and it handles sparse and dense records alike
+                'pol_true': stack_policies(samples),
+            }
 
         primary = build_group(payload["primary"])
         historic = build_group(payload["historic"])
-        lc0 = build_group(payload.get("lc0", {"samples": [], "preds": []}))
+        lc0 = build_group(payload["lc0"])
+        del payload
 
-        if not primary['wdl_pred'] and not historic['wdl_pred']:
+        if not len(primary['wdl_pred']) and not len(historic['wdl_pred']):
             print("[metrics] no samples in pred pkl, skipping")
             return
 
         def metrics_block(g):
-            if not g['wdl_pred']:
+            if not len(g['wdl_pred']):
                 return None
             pp = np.array(g['wdl_pred'], dtype=np.float64)
             pt = np.array(g['wdl_true'], dtype=np.float64)
@@ -2200,7 +2202,7 @@ class Rescorer(object):
             mse = np.mean((pred_v - true_v) ** 2)
             corr = np.corrcoef(pred_v, true_v)[0, 1] if len(pred_v) > 1 else 0.0
 
-            logits = np.array(g['pol_pred'], dtype=np.float32)
+            logits = g['pol_pred']
             true_p = g['pol_true']
 
             # Same function pretraining validates with, on the same
@@ -2296,8 +2298,8 @@ class Rescorer(object):
         print(f"{pfx} saved to {os.path.basename(progress_csv_path)} "
               f"+ {PRETRAIN_CONTINUED_CSV}")
 
-        # every value is a list except pol_true, which stack_policies builds as
-        # an (N, 1858) array -- `+` on that would add element-wise, not append
+        # source is a list, everything else an array -- `+` on an array would
+        # add element-wise, not append
         def cat(a, b):
             if isinstance(a, np.ndarray):
                 return np.concatenate([a, b])
@@ -2314,7 +2316,7 @@ class Rescorer(object):
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        if not g['wdl_pred']:
+        if not len(g['wdl_pred']):
             return
 
         sqrt3_2 = np.sqrt(3) / 2
@@ -2333,8 +2335,8 @@ class Rescorer(object):
         mse = np.mean((pred_v - true_v) ** 2)
         corr = np.corrcoef(pred_v, true_v)[0, 1] if len(pred_v) > 1 else 0.0
 
-        logits = np.array(g['pol_pred'], dtype=np.float32)
-        true_p = np.array(g['pol_true'], dtype=np.float32)
+        logits = np.asarray(g['pol_pred'], dtype=np.float32)
+        true_p = np.asarray(g['pol_true'], dtype=np.float32)
         exp_l = np.exp(logits - logits.max(axis=1, keepdims=True))
         pred_probs = exp_l / exp_l.sum(axis=1, keepdims=True)
 

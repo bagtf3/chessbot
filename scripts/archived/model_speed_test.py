@@ -57,11 +57,11 @@ def speed_test_forward(model, compiled_fn,
         
 
 models = [
-    'C:/Users/Bryan/Data/chessbot_data/models/conformer_10x256x5_init.h5',
-    'C:/Users/Bryan/Data/chessbot_data/models/conv_lr_mha_442x256x3_init.h5',
-    'C:/Users/Bryan/Data/chessbot_data/selfplay_runs/conv_9x296_selfplay/conv_9x296_selfplay_model.h5',
-    'C:/Users/Bryan/Data/chessbot_data/models/conv_lr_mha_642x256x3_init.h5',
-    'C:/Users/Bryan/Data/chessbot_data/models/conv_mha_lr_643x256x2_init.h5'
+    'D:/Data/chessbot_data/models/conformer_10x256x5_init.h5',
+    'D:/Data/chessbot_data/models/conv_lr_mha_442x256x3_init.h5',
+    'D:/Data/chessbot_data/selfplay_runs/conv_9x296_selfplay/conv_9x296_selfplay_model.h5',
+    'D:/Data/chessbot_data/models/conv_lr_mha_642x256x3_init.h5',
+    'D:/Data/chessbot_data/models/conv_mha_lr_643x256x2_init.h5'
 ]
 
 for model_file in models:

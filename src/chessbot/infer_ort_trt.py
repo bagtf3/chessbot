@@ -97,37 +97,53 @@ def selfplay_trt_paths(cfg):
     return trt_dir, model_name, onnx_path
 
 
-def prepare_trt(cfg, trt_dir, model_name):
-    """
-    Export current model to ONNX and compile a TRT engine in the calling process.
-    Deletes stale .engine files but preserves .profile and .timing for fast recompile.
-    Patches cfg so workers call make_trt_session and get a cache hit, not a recompile.
-    """
+def build_trt(src_path, onnx_path, trt_dir, model_name, macro_batch,
+              encoding_type):
+    """Export src_path to ONNX and compile its TRT engine. Deletes stale
+    .engine files but preserves .profile and .timing for fast recompile."""
     from chessbot.train_pytorch import export_ts_to_onnx
 
-    os.makedirs(trt_dir, exist_ok=True)
-    onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
-
-    src_path = cfg.model_path
-
     print(f'[trt] exporting {os.path.basename(src_path)} -> '
-          f'{os.path.basename(onnx_path)}')
-    export_ts_to_onnx(src_path, onnx_path, encoding_type=cfg.encoding_type)
+          f'{os.path.basename(onnx_path)}', flush=True)
+    export_ts_to_onnx(src_path, onnx_path, encoding_type=encoding_type)
 
     for f in os.listdir(trt_dir):
         if f.startswith(model_name) and f.endswith('.engine'):
             os.remove(os.path.join(trt_dir, f))
-            print(f'[trt] removed stale engine: {f}')
+            print(f'[trt] removed stale engine: {f}', flush=True)
 
-    print('[trt] compiling TRT engine...')
+    print('[trt] compiling TRT engine...', flush=True)
     t0 = time.time()
-    sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch,
-                            cfg.encoding_type)
-    dummy = enc_dummy(cfg.macro_batch, cfg.encoding_type)
+    sess = make_trt_session(onnx_path, model_name, trt_dir, macro_batch,
+                            encoding_type)
+    dummy = enc_dummy(macro_batch, encoding_type)
     sess.run(['policy_logits', 'value_out'], {'enc_in': dummy})
     del sess
     gc.collect()
-    print(f'[trt] TRT engine ready ({time.time() - t0:.0f}s)')
+    print(f'[trt] TRT engine ready ({time.time() - t0:.0f}s)', flush=True)
+
+
+def prepare_trt(cfg, trt_dir, model_name):
+    """
+    Build the TRT engine for cfg's model in a spawned process, so the caller
+    never initializes CUDA, torch or TRT and holds none of their memory once
+    the build exits. Patches cfg so workers call make_trt_session and get a
+    cache hit, not a recompile.
+    """
+    import multiprocessing as mp
+
+    os.makedirs(trt_dir, exist_ok=True)
+    onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
+
+    p = mp.get_context("spawn").Process(
+        target=build_trt,
+        args=(cfg.model_path, onnx_path, trt_dir, model_name, cfg.macro_batch,
+              cfg.encoding_type),
+    )
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"TRT build process failed, exitcode={p.exitcode}")
 
     cfg.inference_backend = 'ort_trt'
     cfg.model_path = onnx_path

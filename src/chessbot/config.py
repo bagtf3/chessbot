@@ -2,6 +2,9 @@ from chessbot import SP_DIR, MODEL_DIR
 import os
 import yaml, json
 
+# xc0h history frame count; fixed, never modulated.
+XC0H_K = 6
+
 class Config(object):
     """
     Central knobs. Keep simple; override from a dict or flags as needed.
@@ -10,97 +13,154 @@ class Config(object):
     # files
     selfplay_dir = SP_DIR
     run_tag = "dummy"
-    init_model = MODEL_DIR + 'dummy.h5'
+    init_model = MODEL_DIR + 'dummy.ts'
     previous_run_tag = None
 
     # highest level params
     is_validation_run = False
-    validation_every = 5
+    # validation fires every N retrains as a discrete, non-overlapping batch.
+    # The ladder counts runs, not games, so overlapping batches would advance
+    # depth roughly twice as fast.
+    validate_every_n_retrains = 5
+    validation_games_per_batch = 256
+    # epoch 0 only: hold the first validation batch until this many games
+    # are done, so the quick selfplay games show up first
+    validation_warmup_games = 1000
     n_workers = 2
-    n_rounds = 51
 
-    # MCTS (float or list)
-    c_puct = [1.25, 1.5, 1.75, 2.0, 2.25]
+    # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
+    # its own queue and is counted separately from the selfplay workers.
+    n_lc0_workers = 0
+    telemetry_kind = "xc0"
 
-    use_smart_pruning = True
+    # per-game parameter sampling; resolved once per game in the main process.
+    # each entry: param_name: [list of options to pick from].
+    # only 1st-order scalar params are supported (no nested keys).
+    sampleable = {}
+
+    # MCTS
+    c_puct = 2.0
+
     pruning_factor = 1.33
     
     # Simulation schedule
     sf_move_sims = 200
     sims_floor = 400
     sims_ceiling = 800
-    target_delta = 200
 
-    # early stop
-    es_check_every = 50
-    use_sim_decision_model = False
-    sim_decision_model_path = MODEL_DIR + "sim_decision-v1.dll"
+    # per-bin sims scaling; "" disables. effort_alpha is sampled per game.
+    effort_scale_table = ""
+    effort_alpha = 0.0
+
+    # early stop -- tiered rule (C++, pyfastchess mcts.cpp evaluate_early_stop)
+    es_check_every = 100
+    use_robust = True       # fallback selector when a search hits "full" (ceiling)
+
+    es_tier1_consec = 3         # "runaway": consecutive checkins with the same leader
+    es_tier1_jsd_thresh = 0.005
+    es_tier2_consec = 5         # "two-horse race": consecutive checkins, top-2 stable in top-3
+    es_tier2_jsd_thresh = 0.0003
 
     # Game stuff
     n_games = 128
     games_at_once = 128
     micro_batch = 4
-    fwd_batch = 512
+    macro_batch = 256
 
-    sample_adjudicators = True
-    
     max_game_length = 200
     min_game_length = 5
     use_syzygy = False
     use_material_diff = True
-    material_diff_cutoff = 9
-    material_diff_cutoff_span = 20
+
+    allow_resignation = False
+    resign_threshold = 0.80
+    resign_consecutive = 10
+    resign_min_plies = 20
 
     use_eval_draw = True
     eval_draw_min_plies = 50
     eval_draw_thresh = 0.1
     eval_draw_span = 15
 
-    use_eval_collar = True
-    eval_collar_min_plies = 40
-    eval_collar_thresh = 0.75
-    eval_collar_span = 15
-    eval_collar_trigger = 0.3
+    sf_validation_depth = 10
+    sf_config = {"Threads": 1, "Hash": 256, "UCI_ShowWDL": True}
+
+    # rescoring config
+    # SF searches to whichever binds first: this time budget or a hardcoded
+    # depth backstop. Under backlog it drops by a hardcoded 10ms.
+    rescore_movetime_ms = 90
+    rescore_movetime_validation_ms = 160
+    rescore_analyze_batch = 30
     
-    play_vs_sf_prob = 0.5
-    sf_depth = 10
-    sf_config = {"Threads": 1, "Hash": 256}
-    sf_exclude = ["piece_training"]
+    rescore_equiv_min = 10
+    rescore_equiv_max = 60
+    rescore_inaccuracy_cp = 75
+    rescore_blunder_cp_loser = 90
+    rescore_blunder_cp_winner = 200
+    rescore_n_sf_workers = 1
 
-    # overrides for the post hoc worker
-    post_hoc_blunder_cp = 150
-    post_hoc_analyze_batch = 30
-    post_hoc_depth = 12
-    post_hoc_equiv_range = 30
+    # SF weight in the xc0/SF-pointmass blend, ramped across the CPL band
+    # between the clip points. Both replay paths and normal rescoring share it.
+    rescore_blend_alpha_min = 0.10
+    rescore_blend_alpha_max = 0.85
+
     train_on_stockfish = True
-    train_on_validation = False
 
-    KL_boost_threshold = 1.75
-    KL_weight_boost = 1.0
+    kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median
+    kl_boost_p80_mult    = 3.0   # pwht multiplier when KL > running EMA 80th pctile
+    kl_quantile_lr       = 0.0005 # step size for the online trackers (~1/lr, ~2000)
 
     game_probs = {
         "startpos":0.4, "pre_opened_mini": 0.22, "pre_opened": 0.27,
-        "random_init": 0.08,
-        "piece_odds": 0.02, "piece_training": 0.01
+        "random_init": 0.08, "piece_odds": 0.02, "piece_training": 0.01
     }
 
-    # priors
-    prior_clip_max = 0.55
-    prior_clip_min = 0.015
+    # game type mix for validation rounds; same format as game_probs.
+    # all games are paired (one as white, one as black) and must be unique positions.
+    # if a type exhausts unique positions, UHO fills the remainder.
+    validation_game_probs = {"UHO": 1.0}
 
+    # priors
+    uniform_eps = 0.25
+    prior_clip_max = 0.75
+    fpu_reduction = 0.1
+    qema_span = 40
+    qdelta_span = 100
     # randomness
     add_root_noise = True
     dirichlet_eps = 0.3
     dirichlet_alpha = 0.3
+    reuse_tree = True
     sample_moves = True
-    move_sample_temp_range = [0.000001, 1.25]
+    move_sample_temp_range = [0.000001, 2.0]
+    move_sample_temp_plies = 20
     
-    policy_loss_weight = 0.25
-    value_loss_weight = 0.25
+    learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
+    retrain_weight_decay = 0.005  # AdamW decoupled, 2D+ weights only
+    adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
+    draw_value_scale = 1.0        # per-sample value weight for drawn games (decisive = 1.0)
     vscale = 0.9
-    draw_weight = 0.1
+    contempt_zero_q  = 0.0
+    contempt_full_q  = 0.5
+    contempt_fight_c = 0.0
+    retrain_clip_norm = 10.0      # grad norm ceiling per retrain step
     retrain_batch_size = 512
-    training_queue_thresh = 10240
+
+    # LC0 distillation enrichment
+    lc0_distill_model_name = ''   # e.g. 't1-large'; trt cache path via LC0_DISTILL_TRT_CACHE env
+    lc0_distill_batch_size = 64   # positions per ORT inference call
+
+    # Prior temperature scaling in C++ tree (0 = disabled)
+    tempscale_entropy_target = 0.0   # normed entropy target; 0 = disabled
+    tempscale_trigger_q      = -2.0  # STM-POV Q floor; -2 = always; 0.5 = winning only
+
+    # board encoding fed to the model; selfplay and retrain must agree.
+    encoding_type            = "xc0"        # "xc0" | "xc0h" | "lc0"
+
+    # inference backend; retrain is always pt_eager, not a config knob.
+    inference_backend        = "ort_trt"  # "ort_trt" | "lc0_trt"
+    trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
+    trt_cache                = ""          # ort_trt: path to TRT engine cache dir
 
     def __init__(self):
         self.init_paths()
@@ -116,19 +176,26 @@ class Config(object):
         self.run_dir = resolved_run_dir
 
         self.pending_training_dir = os.path.join(self.run_dir, "pending_training")
-        
+
+        self.primary_buffer_dir = os.path.join(self.run_dir, "primary_buffer")
+        self.replay_buffer_dir = os.path.join(self.run_dir, "replay_buffer")
+        self.historic_dir = os.getenv("BOOTSTRAP_PKL_GZ", "")
+
         game_dir = os.path.join(self.run_dir, "game_logs")
         self.game_dir = game_dir
 
         self.game_index_file = os.path.join(self.run_dir, "game_index.json")
+        self.game_index_staging_file = os.path.join(
+            self.run_dir, "game_index_staging.json")
         self.progress_csv_path = os.path.join(self.run_dir, "eval_progress.csv")
         self.progress_plot_path = os.path.join(self.run_dir, "eval_progress.png")
 
-        model_name = f"{self.run_tag}_model.h5"
+        model_name = f"{self.run_tag}_model.ts"
         self.model_path = os.path.join(self.run_dir, model_name)
 
         if 'dummy' not in self.run_dir:
-            for d in (self.run_dir, self.game_dir):
+            for d in (self.run_dir, self.game_dir,
+                      self.primary_buffer_dir, self.replay_buffer_dir):
                 os.makedirs(d, exist_ok=True)
 
         # public flag; keep the old name too for backward compatibility

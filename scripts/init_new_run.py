@@ -3,13 +3,19 @@ init_new_run.py
 
 Usage:
   python init_new_run.py <run_tag> [--clone <existing_run_tag>]
+  python init_new_run.py --iterate <current_run_tag>
 
 Simple: create run_dir, write config.yaml and validation_config.yaml.
 If --clone is given, copy those files from the clone run dir and set
 the new run's init_model to the cloned model (copied into the new run dir).
+
+--iterate is shorthand for the usual next-run case: it increments the
+trailing integer of <current_run_tag> and is equivalent to
+  python init_new_run.py <tag>{N+1} --clone <tag>{N} --do-cleanup
 """
 
 import os
+import re
 import sys
 import argparse
 import yaml
@@ -32,13 +38,12 @@ def load_yaml(path):
 
 
 def find_model_in_dir(d):
-    # prefer exact-named model <tag>_model.h5 handled by caller,
-    # else pick newest .h5
     p = Path(d)
-    h5s = sorted(p.glob("*.h5"), key=lambda x: x.stat().st_mtime, reverse=True)
-    if not h5s:
-        return None
-    return str(h5s[0])
+    for ext in ("*.pt", "*.h5"):
+        matches = sorted(p.glob(ext), key=lambda x: x.stat().st_mtime, reverse=True)
+        if matches:
+            return str(matches[0])
+    return None
 
 
 def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
@@ -70,12 +75,36 @@ def replace_yaml_values_inplace(path, run_tag, init_model, prev_run_tag=None):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("run_tag")
+    p.add_argument("run_tag", nargs="?", default=None)
     p.add_argument("--clone", default=None)
+    p.add_argument("--iterate", default=None, metavar="CURRENT_RUN_TAG",
+                    help="increment the trailing integer of CURRENT_RUN_TAG "
+                         "and clone it with --do-cleanup")
+    p.add_argument("--ignore-eval-progress", action="store_true")
+    p.add_argument("--do-cleanup", action="store_true",
+                    help="delete replay_buffer/primary_buffer from the clone "
+                         "source after copying (live_buffer.pkl is "
+                         "already moved, not copied)")
     args = p.parse_args()
 
-    run_tag = args.run_tag
-    clone_tag = args.clone
+    if args.iterate:
+        if args.run_tag or args.clone:
+            p.error("--iterate derives both tags; do not pass run_tag or --clone")
+        m = re.match(r"^(.*?)(\d+)$", args.iterate)
+        if not m:
+            print(f"[iterate] no trailing integer in '{args.iterate}' -- "
+                  f"iterate isn't possible")
+            sys.exit(1)
+        clone_tag = args.iterate
+        run_tag = f"{m.group(1)}{int(m.group(2)) + 1}"
+        do_cleanup = True
+        print(f"[iterate] {clone_tag} -> {run_tag} (clone + cleanup)")
+    elif args.run_tag:
+        run_tag = args.run_tag
+        clone_tag = args.clone
+        do_cleanup = args.do_cleanup
+    else:
+        p.error("need a run_tag, or --iterate <current_run_tag>")
 
     # set run_tag so Config.init_paths will compute the right paths
     Config.run_tag = run_tag
@@ -83,11 +112,16 @@ def main():
     cfg.init_paths()
 
     dest_dir = cfg.run_dir
+    # --iterate deletes the source buffers, so refuse to re-run onto a run
+    # that already exists rather than clobbering it with stale state
+    if args.iterate and os.path.exists(os.path.join(dest_dir, "config.yaml")):
+        print(f"[iterate] {run_tag} already exists -- refusing to overwrite. "
+              f"Use the explicit --clone form if this is intended.")
+        sys.exit(1)
     os.makedirs(dest_dir, exist_ok=True)
 
     cfg_yaml_dst = os.path.join(dest_dir, "config.yaml")
     val_yaml_dst = os.path.join(dest_dir, "validation_config.yaml")
-    train_yaml_dst = os.path.join(dest_dir, "training_config.yaml")
 
     if clone_tag:
         src_dir = os.path.abspath(os.path.join(cfg.selfplay_dir, clone_tag))
@@ -95,20 +129,76 @@ def main():
             print(f"[clone] source run not found: {src_dir}")
             sys.exit(1)
 
-        # find source model: prefer exact-named <clone_tag>_model.h5 else newest .h5
-        src_model = os.path.join(src_dir, f"{clone_tag}_model.h5")
-        if not os.path.exists(src_model):
+        # find source model: prefer exact-named <clone_tag>_model.{ext} else newest
+        src_model = None
+        for ext in ("pt", "ts", "h5"):
+            candidate = os.path.join(src_dir, f"{clone_tag}_model.{ext}")
+            if os.path.exists(candidate):
+                src_model = candidate
+                break
+        if src_model is None:
             src_model = find_model_in_dir(src_dir)
 
-        # if found, copy into new run_dir as <run_tag>_model.h5 and set cfg.init_model
+        # if found, copy into new run_dir preserving extension and set cfg.init_model
         if src_model and os.path.exists(src_model):
-            dest_model = os.path.join(dest_dir, f"{run_tag}_model.h5")
-            shutil.copy2(src_model, dest_model)
-            cfg.init_model = dest_model
-            print(f"[clone] copied model {src_model} -> {dest_model}")
+            src_ext = Path(src_model).suffix
+            if src_ext == ".pt":
+                # Two lineages, both required. _model.pt is the trainer:
+                # retrain resumes from it and init_model must point at it.
+                # _model_player.pt is the EMA selfplay actually plays --
+                # prepare_trt falls back to the trainer without warning when
+                # it is absent, so a missed copy silently un-averages a
+                # round. Named explicitly rather than globbed so *_backup.*
+                # can never collide on the destination name. The .ts is not
+                # copied: nothing reads it, and a stale trace is a trap.
+                copies = [
+                    (f"{clone_tag}_model.pt", f"{run_tag}_model.pt"),
+                    (f"{clone_tag}_model_player.pt",
+                     f"{run_tag}_model_player.pt"),
+                ]
+                cfg.init_model = os.path.join(dest_dir, f"{run_tag}_model.pt")
+                for src_name, dst_name in copies:
+                    src_pt = os.path.join(src_dir, src_name)
+                    if not os.path.exists(src_pt):
+                        print(f"[clone] WARNING: {src_name} not in source, "
+                              f"not copied")
+                        continue
+                    shutil.copy2(src_pt, os.path.join(dest_dir, dst_name))
+                    print(f"[clone] copied {src_name} -> {dst_name}")
+
+                if not os.path.exists(cfg.init_model):
+                    print(f"[clone] WARNING: init_model points at "
+                          f"{os.path.basename(cfg.init_model)}, which does "
+                          f"not exist -- the run will not start")
+            else:
+                dest_model = os.path.join(dest_dir, f"{run_tag}_model{src_ext}")
+                shutil.copy2(src_model, dest_model)
+                cfg.init_model = dest_model
+                print(f"[clone] copied model {src_model} -> {dest_model}")
         else:
             # no source model found; leave cfg.init_model as default (may be configured)
             print("[clone] no model found in source; using default init_model in config")
+
+        # copy train_ckpts (retrain optimizer state) if present, renaming the
+        # file(s) so the stem matches the new run's model name
+        src_ckpts_dir = os.path.join(src_dir, "train_ckpts")
+        if os.path.isdir(src_ckpts_dir):
+            dst_ckpts_dir = os.path.join(dest_dir, "train_ckpts")
+            os.makedirs(dst_ckpts_dir, exist_ok=True)
+            old_stem = f"{clone_tag}_model"
+            new_stem = f"{run_tag}_model"
+            copied_any = False
+            for f in Path(src_ckpts_dir).iterdir():
+                if not f.is_file():
+                    continue
+                name = f.name
+                if name.startswith(old_stem):
+                    name = new_stem + name[len(old_stem):]
+                dst = os.path.join(dst_ckpts_dir, name)
+                shutil.copy2(f, dst)
+                copied_any = True
+            if copied_any:
+                print(f"[clone] copied train_ckpts from {clone_tag}, renamed to match {new_stem}")
 
         # copy config.yaml if present; update run_tag and init_model in the copy
         src_cfg = os.path.join(src_dir, "config.yaml")
@@ -138,11 +228,72 @@ def main():
             write_yaml(val_yaml_dst, {"is_validation":True})
             print("[init] wrote minimal validation_config.yaml (no src found)")
 
-        # copy training_config.yaml if present (no modification)
-        src_val = os.path.join(src_dir, "training_config.yaml")
-        if os.path.exists(src_val):
-            shutil.copy2(src_val, train_yaml_dst)
-            print(f"[clone] copied training_config.yaml from {clone_tag}")
+        # copy replay_buffer/ and primary_buffer/ dirs if present
+        for buf_name in ("replay_buffer", "primary_buffer"):
+            src_buf = os.path.join(src_dir, buf_name)
+            if os.path.isdir(src_buf):
+                dst_buf = os.path.join(dest_dir, buf_name)
+                shutil.copytree(src_buf, dst_buf, dirs_exist_ok=True)
+                print(f"[clone] copied {buf_name}/ from {clone_tag}")
+                if do_cleanup:
+                    shutil.rmtree(src_buf)
+                    print(f"[clone] deleted {buf_name}/ from {clone_tag} (--do-cleanup)")
+
+        # copy TRT builder cache files (trt_cache/ for selfplay, val_trt/ for
+        # validation). Only .profile and .timing -- .engine/.onnx are keyed to
+        # the old model_name + weight-content-hash and would just be dead
+        # weight under the new run_tag. .timing in particular is a
+        # GPU-architecture-keyed builder tactic cache (not model-specific),
+        # so reusing it avoids re-profiling tactics from scratch on a fresh
+        # run_tag; .profile only pays off if trt_model_name ends up matching.
+        for trt_name in ("trt_cache", "val_trt"):
+            src_trt = os.path.join(src_dir, trt_name)
+            if os.path.isdir(src_trt):
+                dst_trt = os.path.join(dest_dir, trt_name)
+                os.makedirs(dst_trt, exist_ok=True)
+                copied = 0
+                for f in os.listdir(src_trt):
+                    if f.endswith(".profile") or f.endswith(".timing"):
+                        shutil.copy2(os.path.join(src_trt, f), os.path.join(dst_trt, f))
+                        copied += 1
+                if copied:
+                    print(f"[clone] copied {copied} TRT profile/timing cache "
+                          f"file(s) from {clone_tag}/{trt_name}")
+
+        # move the untrained carryover if present, gz or the older plain pkl
+        import chessbot.replay_buffer as rb
+        src_remaining = rb.find_live_buffer(src_dir)
+        if src_remaining:
+            name = os.path.basename(src_remaining)
+            shutil.move(src_remaining, os.path.join(dest_dir, name))
+            print(f"[clone] moved {name} from {clone_tag}")
+
+        # move sf_cache.pkl.gz if present
+        src_sf_cache = os.path.join(src_dir, "sf_cache.pkl.gz")
+        if os.path.exists(src_sf_cache):
+            dst_sf_cache = os.path.join(dest_dir, "sf_cache.pkl.gz")
+            shutil.move(src_sf_cache, dst_sf_cache)
+            print(f"[clone] moved sf_cache.pkl.gz from {clone_tag}")
+
+        # move opening_counts.npz if present
+        src_opening_counts = os.path.join(src_dir, "opening_counts.npz")
+        if os.path.exists(src_opening_counts):
+            dst_opening_counts = os.path.join(dest_dir, "opening_counts.npz")
+            shutil.move(src_opening_counts, dst_opening_counts)
+            print(f"[clone] moved opening_counts.npz from {clone_tag}")
+
+        # copy the progress csvs unless suppressed. Both must travel together:
+        # Rescorer.migrate_pretrain_progress treats "continued file missing"
+        # as "eval_progress.csv still holds pretraining rows" and moves the
+        # whole file across, so cloning only the first one would relabel this
+        # run's selfplay rows as pretraining on the new tag's first startup.
+        if not args.ignore_eval_progress:
+            for fname in ("eval_progress.csv",
+                          "eval_progress_pretrain_continued.csv"):
+                src_eval = os.path.join(src_dir, fname)
+                if os.path.exists(src_eval):
+                    shutil.copy2(src_eval, os.path.join(dest_dir, fname))
+                    print(f"[clone] copied {fname} from {clone_tag}")
     else:
         # not cloning: write minimal files
         write_yaml(cfg_yaml_dst, {

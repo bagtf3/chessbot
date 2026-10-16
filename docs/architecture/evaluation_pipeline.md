@@ -1,0 +1,57 @@
+# Rescoring & Retraining
+
+## Rescoring Overview
+
+After a game finishes, it isn't used for training directly. The raw selfplay data contains noisy outcome labels and visit distributions that reflect the current (imperfect) model. The `Rescorer` processes each finished game asynchronously, runs Stockfish analysis on every position, and builds cleaner training targets before anything reaches the training queue.
+
+## SF Analysis Pipeline
+
+Each game pickle contains the full move history and per-ply NN outputs. `Rescorer.start_game()` iterates through the plies and submits positions to the Stockfish queue for analysis. Results come back asynchronously via `handle_sf_result()`, which stores the best move, centipawn evaluation, and WDL triple for each ply. Every position gets full analysis — an earlier position-keyed cache (`SFCache`) that skipped re-analysis of repeated positions was tried and removed; it wasn't paying off.
+
+## Training Targets
+
+The value target for each ply is a blended 3-component WDL:
+
+```
+Y = 0.5 * z_wdl + 0.5 * sf_wdl
+```
+
+where `z_wdl` is the game result converted to WDL and `sf_wdl` is Stockfish's WDL at that ply. When SF analysis is unavailable, the target falls back to `z_wdl` alone. Blending the outcome with Stockfish's read keeps the target grounded in what actually happened while pulling it toward a stronger positional signal — an earlier variant also mixed in the MCTS search WDL, but that component was dropped.
+
+## Blunder Detection and Visit Redistribution
+
+After SF analysis is complete, `finalize_game()` scans each ply for blunders — positions where Stockfish rates the played move significantly worse than its best move. When a blunder is detected, the visit distribution used as the policy target is redistributed: visits are shifted toward the moves SF considers good, reducing the weight on the blundered line. This prevents the model from learning to confidently play moves that Stockfish rates as mistakes.
+
+An earlier version of this pipeline handled blunders by spawning dedicated replay games starting from the blundered position, to put more data on the positions the model was currently weakest on. That mechanism has been replaced: blunder positions are now routed to LC0 distillation instead (see LC0 Distillation below), so the corrected signal for a blundered position comes from a strong engine's continuation rather than a fresh selfplay game. `blunder_replay` only survives as a scenario tag some data-loading scripts still know to skip in older game logs.
+
+## Collar Rescoring
+
+The eval collar tracks consecutive plies where one side's evaluation stays above a threshold. When the collar fires, it retroactively adjusts the game result label for the affected stretch of plies, overriding the final game outcome with the collar evaluation. This corrects for cases where a clearly winning position was eventually drawn or lost due to adjudication noise or model error, keeping the value targets honest about who was winning at each point in the game.
+
+## Sample Acceptance
+
+Not all positions from a game are included in training. A ply is dropped (`skip_xc0`) when it's a true blunder (CPL above `rescore_blunder_cp_loser`/`rescore_blunder_cp_winner`) that didn't still end in a won position for the mover — those go to the LC0 waypoint path instead of the xc0 policy target. Everything else is accepted.
+
+Separately, KL divergence between the NN's prior and the final visit distribution is used to boost the policy loss weight (`pwht`) on positions where the search significantly disagreed with the network's first guess, via `KL_boost_threshold`/`KL_weight_boost` — this reweights informative positions rather than filtering them. An earlier design also had a value-CE-based soft-sampling scheme (`rescore_kl_threshold`/`rescore_ce_threshold`/`rescore_sample_floor`/`rescore_target_acceptance`); it was tried, found not to help, and removed.
+
+## LC0 Distillation
+
+When an LC0 distillation model is configured (`lc0_distill_model_name` plus the `LC0_DISTILL_*` environment paths), the rescorer runs a distilled Leela network as a policy teacher alongside Stockfish. An `Lc0Thread` batches positions through the same ORT+TensorRT machinery the selfplay backend uses, evaluates them in LC0's native feature/policy layout, and maps the resulting logits back into the 1858 move domain with `lc0_logits_to_xc0_batch`. The LC0 policy becomes an additional soft target for those positions, transferring Leela's opening and positional knowledge without paying its full search cost during selfplay.
+
+Distillation is targeted rather than blanket. A pre-built **enrichment book** covers common book positions: for a position in the book, `maybe_enrich()` has a 50% chance of replacing the ply's policy and value targets with the book's stronger data. Blunder positions are enriched with Leela's principal variation, so the corrected policy target reflects a strong engine's continuation rather than only Stockfish's single best move. LC0 evaluation is entirely optional — with no distill model configured, the `Lc0Thread` is never created and rescoring proceeds on Stockfish alone.
+
+## Retraining
+
+![Retrain loop](../images/retrain_loop.JPG)
+
+Retraining runs as a subprocess (`retrain_worker.py`) rather than inline. The reason is straightforward: on an 8GB GPU, selfplay inference and model training can't share VRAM comfortably. Running training in a subprocess means its GPU memory is fully released when the process exits, and the workers can resume with a clean VRAM state.
+
+The flow: the orchestrator pauses all workers, signals the retrain subprocess, and waits. The subprocess loads the accumulated training shards from `pending_training/`, trains for one epoch with the configured batch size, saves the updated model, and exits. The orchestrator then broadcasts the new model path, workers reload and recompile their inference function, and selfplay resumes.
+
+The retrain view shows per-epoch metrics:
+
+- **value CE** — cross-entropy of the model's WDL predictions against the blended training targets.
+- **value correlation** — Pearson correlation between predicted and target scalar values (`win - loss`). Tracks whether the model's ordinal ranking of positions improves even when absolute calibration is noisy.
+- **policy CE** — cross-entropy of policy logits against the rescored visit distribution targets.
+- **top-1 accuracy** — fraction of positions where the model's top policy move matches the training target's top move.
+- **CE gain vs uniform** — policy CE improvement over a uniform distribution baseline, measuring how much the model has learned to concentrate probability on good moves.

@@ -1,0 +1,196 @@
+"""Retrain worker process. Spawned fresh (ctx.Process) for each retrain
+cycle and torn down after -- a deliberate VRAM-reclaim policy, not an
+artifact of the old subprocess-script approach it replaces. See
+replay_buffer_redesign.md for the full design and message protocol.
+
+Message protocol (msg_q, main -> worker):
+  {"cmd": "preload", "replay": [paths], "historic": [paths]}
+  {"cmd": "start", "primary": [paths]}
+      Both sent back to back the moment the worker is spawned, which only
+      happens once primary_buffer is full at PRIMARY_TRIGGER_SHARDS. They
+      stayed two messages because the worker consumes them in order and the
+      split costs nothing.
+  {"cmd": "go"}
+      Every selfplay worker has dropped its GPU sessions (or main gave up
+      waiting). Training allocates only after this, or after GO_TIMEOUT_S.
+
+Message protocol (result_q, worker -> main):
+  {"cmd": "retrain_ready"}
+      validation predictions written, dataset built, about to train. Main
+      pauses selfplay workers on receipt of this.
+
+predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
+  {"primary":  {"samples": [...], "wdl": (N, 3), "logits": (N, 1858)},
+   "historic": {...same...}, "lc0": {...same...}}
+  wdl and logits are float32 arrays, row-aligned with samples.
+  {"cmd": "retrain_done", "ok": bool, "error": str or None,
+   "train_stats": {"train_loss": float, "gn_mean": float}}
+      training + save finished (or failed). Main unpauses selfplay workers
+      immediately on receipt of this, before running aggregate_metrics, which
+      folds train_stats into the validation rows.
+"""
+import os
+import pickle
+import queue
+import random
+import sys
+from types import SimpleNamespace
+
+import numpy as np
+
+from chessbot.config import Config
+from chessbot.opening_counts import apply_historic_dup_weights
+from chessbot.replay_buffer import (
+    read_shard, sample_records, write_pkl_gz_shard, POLICY_DIM,
+    SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
+)
+
+# above the runner's RETRAIN_RELEASE_TIMEOUT_S so main's go normally wins
+GO_TIMEOUT_S = 120.0
+
+
+def load_records(paths):
+    records = []
+    for path in paths:
+        records.extend(read_shard(path))
+    return records
+
+
+def shuffle_rewrite_primary(paths, records, shard_size=SHARD_SIZE):
+    """Shuffle already-loaded primary records across file boundaries and
+    rewrite shard_size-sized chunks back into the same filenames. Takes the
+    records the caller already read (for validation) rather than re-reading
+    from disk. Returns the shuffled record list -- already the exact primary
+    portion of the retrain set."""
+    all_records = list(records)
+    random.shuffle(all_records)
+    for i, p in enumerate(paths):
+        chunk = all_records[i * shard_size:(i + 1) * shard_size]
+        write_pkl_gz_shard(chunk, p)
+    return all_records
+
+
+def predict_fp16(model, X_list, batch_size):
+    """(wdl (N, 3), policy logits (N, 1858)) float32 arrays."""
+    import torch
+    import torch.nn.functional as F
+    device = torch.device("cuda")
+    model = model.to(device).half().eval()
+    n = len(X_list)
+    wdl = np.zeros((n, 3), dtype=np.float32)
+    logits = np.zeros((n, POLICY_DIM), dtype=np.float32)
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            batch = np.stack(X_list[i:i + batch_size], axis=0)
+            xb = torch.from_numpy(batch).long().to(device)
+            pol_logits, val_out = model(xb)
+            j = i + len(batch)
+            logits[i:j] = pol_logits.float().cpu().numpy()
+            wdl[i:j] = F.softmax(val_out.float(), dim=-1).cpu().numpy()
+    return wdl, logits
+
+
+def records_to_arrays(records):
+    # x is int16 on every path and torch recasts on the way to the GPU
+    # (.long() for token encodings, .float() for lc0 planes), so an int32
+    # intermediate here just doubles the array for nothing
+    X = np.stack([r[0] for r in records])
+    # policies stay in record form (sparse or dense, mixed); retrain_pt
+    # densifies one VRAM chunk at a time so the full (N, 1858) float32 stack
+    # never exists
+    P = [r[2] for r in records]
+    Y = np.array([r[3] for r in records], dtype=np.float32)
+    vwht = np.array([r[4] for r in records], dtype=np.float32)
+    pwht = np.array([r[5] for r in records], dtype=np.float32)
+    return X, P, Y, vwht, pwht
+
+
+def wait_for_go(msg_q):
+    """Block until main reports the fleet off the GPU. The timeout is a
+    backstop only; main sends go after its own shorter one."""
+    try:
+        msg_q.get(timeout=GO_TIMEOUT_S)
+    except queue.Empty:
+        print("[retrain] no go from main, training anyway", flush=True)
+
+
+def run_retrain_worker(run_dir, msg_q, result_q, epoch):
+    try:
+        retrain_worker_body(run_dir, msg_q, result_q, epoch)
+    except Exception as e:
+        result_q.put({"cmd": "retrain_done", "ok": False, "error": str(e)})
+    # os._exit skips the queue's feeder thread; flush it or retrain_done is lost
+    result_q.close()
+    result_q.join_thread()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # TF (used for historic tfrec.gz reads) hangs on normal interpreter exit
+    # -- hard-exit instead, matching shuffle_xc0.py / bootstrap_model_async.
+    os._exit(0)
+
+
+def retrain_worker_body(run_dir, msg_q, result_q, epoch):
+    import torch
+    from chessbot.train_pytorch import load_pt_model, retrain_pt
+
+    cfg = Config.from_yaml(os.path.join(run_dir, "config.yaml"))
+
+    preload_msg = msg_q.get()
+    replay_records = load_records(preload_msg["replay"])
+    historic_records = apply_historic_dup_weights(
+        load_records(preload_msg["historic"]))
+
+    start_msg = msg_q.get()
+    primary_paths = start_msg["primary"]
+
+    model, arch = load_pt_model(cfg.model_path)
+    primary_records_raw = load_records(primary_paths)
+
+    # primary validation is pure xc0 only; replay, lc0, and blend records
+    # still train via all_records below, just aren't validated on
+    val_pool = [r for r in primary_records_raw if r[6] == 'xc0']
+    val_primary = sample_records(val_pool, VAL_PRIMARY_RECORDS)
+    val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
+    # plot-only slice, never validated against in the csv-logged metrics
+    lc0_pool = [r for r in primary_records_raw if r[6].startswith('lc0')]
+    val_lc0 = sample_records(lc0_pool, VAL_LC0_RECORDS)
+
+    bs = cfg.retrain_batch_size
+    def stream(samples):
+        wdl, logits = predict_fp16(model, [r[0] for r in samples], batch_size=bs)
+        return {"samples": samples, "wdl": wdl, "logits": logits}
+
+    pred_pkl_path = os.path.join(run_dir, "predictions_latest.pkl")
+    payload = {
+        "primary": stream(val_primary),
+        "historic": stream(val_historic),
+        "lc0": stream(val_lc0),
+    }
+    with open(pred_pkl_path + ".tmp", "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(pred_pkl_path + ".tmp", pred_pkl_path)
+
+    del model, payload, val_pool, val_primary, val_historic, lc0_pool, val_lc0
+    torch.cuda.empty_cache()
+
+    primary_records = shuffle_rewrite_primary(primary_paths, primary_records_raw)
+    del primary_records_raw
+
+    all_records = primary_records + replay_records + historic_records
+    del primary_records, replay_records, historic_records
+    random.shuffle(all_records)
+    X, P, Y, vwht, pwht = records_to_arrays(all_records)
+    # X and the arrays are copies; P holds only the policy objects
+    del all_records
+
+    result_q.put({"cmd": "retrain_ready"})
+    wait_for_go(msg_q)
+
+    model, arch = load_pt_model(cfg.model_path)
+    args = SimpleNamespace(batch_size=cfg.retrain_batch_size)
+
+    train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
+                             model=model, arch=arch)
+
+    result_q.put({"cmd": "retrain_done", "ok": True, "error": None,
+                  "train_stats": train_stats})

@@ -428,6 +428,7 @@ class GameLooper(object):
         pr = res.total_pruned
         pen = res.total_penalty
         dp = res.total_depth
+        sh = res.total_sharp
 
         n_leafs = nn + nc + nt
         self.lps.tick(n_leafs)
@@ -439,7 +440,7 @@ class GameLooper(object):
 
         counts.append([
             nn, fastpaths, nt, nc, f_stop, c_stop,
-            bl, pu, mv, sk, pr, pen, dp
+            bl, pu, mv, sk, pr, pen, dp, sh
         ])
 
         return nn, n_leafs
@@ -566,15 +567,15 @@ class GameLooper(object):
         lpb = pred_fill
         target = self.config.macro_batch
 
-        # every column of counts is a plain sum; one pass instead of 13
+        # every column of counts is a plain sum; one pass over all of them
         if counts:
             col = np.array(counts, dtype=np.int64).sum(axis=0)
         else:
-            col = np.zeros(13, dtype=np.int64)
+            col = np.zeros(14, dtype=np.int64)
 
         (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
          s_collect_stops, s_blocked, s_puct, s_must_visit, s_skipped,
-         s_pruned, s_penalty, s_depth) = (int(v) for v in col)
+         s_pruned, s_penalty, s_depth, s_sharp) = (int(v) for v in col)
 
         # rate() is destructive, so each meter is read exactly once here
         raw_mps = self.mps.rate()
@@ -616,6 +617,7 @@ class GameLooper(object):
             "s_pruned": s_pruned,
             "s_penalty": s_penalty,
             "s_depth": s_depth,
+            "s_sharp": s_sharp,
         }
         tm = telemetry
 

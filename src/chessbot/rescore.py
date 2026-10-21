@@ -38,6 +38,7 @@ from chessbot.blunder_replay import (
     BRP_MIN_CACHE_DEPTH, BRP_MAX_FAILS, ratchet_store, cached_deep_score,
     BRP_START_MS, BRP_MS_STEP, BRP_MS_MAX_MULT,
     BRP_REVIEW_MIN_FAILS, BRP_REVIEWABLES_FILENAME, probe_fails,
+    BRP_LC0_REQUEUE_FAILS, retire_failed_positions,
 )
 
 from chessbot.lc0_replay import (
@@ -55,10 +56,10 @@ LC0_BRP_SHARD_DIR = os.environ.get("LC0_BRP_SHARD_PATH", "")
 # lc0 audit smoothing, counted in scored positions
 AUDIT_EMA_SPAN = 2000
 BRP_MERGE_EVERY = 512
-# blunder-replay analysis fires purely on collected-row count, not a retrain
-# cadence -- this is how many rows accumulate in blunder_replay_probe.jsonl
-# before a summary is computed and the file resets to a fresh window
-BRP_ANALYSIS_EVERY = 4096
+# a bulk round is analysed once every probe is back, or once this share is
+# back and the stragglers have had BRP_ROUND_WAIT_S to arrive
+BRP_ROUND_DONE_FRAC = 0.999
+BRP_ROUND_WAIT_S = 180
 BRP_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
     "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
@@ -346,8 +347,8 @@ class Rescorer(object):
             blunder_replay_dir(cfg), BRP_REVIEWABLES_FILENAME)
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
-        # 1:1 replay trickle meter -- drained by top_up_queues
-        self.brp_credits = 0
+        self.brp_expected = 0
+        self.brp_wait_start = None
 
         # teacher probes staged here; the runner drains them onto lc0_q.
         # lc0_cfg stays None when the run has no lc0 fleet, which turns
@@ -396,9 +397,6 @@ class Rescorer(object):
 
         fen = board.fen()
         key = short_fen(fen)
-        # meter counts every eligible blunder, including the ones that end up
-        # as a dedup bump or get dropped against a full pool
-        self.brp_credits += 1
 
         if key in pool:
             pool[key]["times_seen"] = pool[key].get("times_seen", 1) + 1
@@ -461,12 +459,24 @@ class Rescorer(object):
         self.n_pool_changes = 0
         print(f"{RS} blunder pool saved: {len(pool)} live")
 
+    def retire_failed(self, pool, epoch):
+        if pool is None:
+            return 0
+        n = retire_failed_positions(
+            pool, epoch, evicted_path(self.blunder_pool_path))
+        if n:
+            save_probe_pool(pool, self.blunder_pool_path)
+            self.n_pool_changes = 0
+        return n
+
     def close(self, pool=None):
         """Idempotent -- the runner closes on the normal path and again in
         cleanup, and the counts are unchanged between the two."""
         if self.closed:
             return
         self.closed = True
+        if self.n_replay_rows:
+            self.analyse_brp_file()
         if pool is not None and self.n_pool_changes > 0:
             save_probe_pool(pool, self.blunder_pool_path)
             self.n_pool_changes = 0
@@ -491,12 +501,6 @@ class Rescorer(object):
     def submit_blunder_replay(self, brp_data):
         self.blunder_replay_intake.append(brp_data)
 
-    def take_brp_credits(self):
-        """Read-and-clear the eligible-blunder count since the last call."""
-        n = self.brp_credits
-        self.brp_credits = 0
-        return n
-
     def tick(self, pool=None):
         # drain completed game batches from SF threads
         while True:
@@ -507,6 +511,7 @@ class Rescorer(object):
             if gid == '__error__':
                 raise results
             self.handle_game_results(gid, results, pool)
+        self.maybe_analyse_brp_round()
 
         flushed = self.live_buffer.flush_all_ready()
         if flushed:
@@ -886,6 +891,8 @@ class Rescorer(object):
         # bank a training example like any other outcome.
         if pool is not None and short_fen_key in pool:
             src = pool[short_fen_key]
+            states = game_state['ply_states']
+            tr0 = (states[0].get('tr') or {}) if states else {}
             # lc0's move was SF-confirmed at entry, so playing it completes
             # the challenge outright -- no depth to compare, nothing to score
             if xerces_uci and xerces_uci == src.get('lc0_move'):
@@ -898,7 +905,7 @@ class Rescorer(object):
                     best_uci=xerces_uci,
                     best_cp=cp, played_cp=cp,
                     best_depth=None, played_depth=None,
-                    sims=None, stop_reason=None,
+                    sims=tr0.get('sims'), stop_reason=tr0.get('stop_reason'),
                     from_cache=True,
                     ply=ply_states[0] if ply_states else None,
                 )
@@ -915,7 +922,7 @@ class Rescorer(object):
                     played_cp=hit['deep_played_cp'],
                     best_depth=hit['deep_best_depth'],
                     played_depth=hit['deep_depth'],
-                    sims=None, stop_reason=None,
+                    sims=tr0.get('sims'), stop_reason=tr0.get('stop_reason'),
                     from_cache=True,
                     ply=ply_states[0] if ply_states else None,
                 )
@@ -1039,7 +1046,7 @@ class Rescorer(object):
         found_best = probe_move == best_uci
         found_equiv = probe_cpl <= BRP_EQUIV_CPL
         same_move = probe_move == orig_move
-        added_to_buffer = False
+        evicted = found_equiv
         added_epoch = None
 
         if short_fen_key and pool is not None and short_fen_key in pool:
@@ -1067,13 +1074,18 @@ class Rescorer(object):
                     )
 
             if found_equiv:
-                added_to_buffer = self.add_equiv_replay_training_example(ply)
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
             # not equiv -- found_equiv took everything at or under
             # BRP_EQUIV_CPL, so anything reaching here is still wrong
             elif ply is not None:
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
+                if src['n_fails'] == BRP_LC0_REQUEUE_FAILS:
+                    self.queue_brp_lc0_replay(src, short_fen_key, probe_cpl)
+                if src['n_fails'] > BRP_MAX_FAILS:
+                    evict_position(pool, short_fen_key, "max_fails", epoch,
+                                   evicted_path(self.blunder_pool_path))
+                    evicted = True
 
             self.n_pool_changes += 1
             self.maybe_save_pool(pool)
@@ -1089,25 +1101,45 @@ class Rescorer(object):
             "probe_cpl": probe_cpl,
             "deep_best": best_uci,
             "best_depth": best_depth,
-            # floats, not bools: the cache-hit paths carry plain python ints
-            # and the SF path numpy scalars, and a mixed column reads back as
-            # object and breaks every downstream .mean()
-            "same_move": float(same_move),
-            "found_best": float(found_best),
-            "found_equiv": float(found_equiv),
-            "evicted": float(found_equiv),
-            "added_to_buffer": float(added_to_buffer),
+            "same_move": same_move,
+            "found_best": found_best,
+            "found_equiv": found_equiv,
+            "evicted": evicted,
             "sims": sims,
             "stop_reason": stop_reason,
             "from_cache": from_cache,
         }
+        # .item() writes numpy scalars as their python value, so a numpy
+        # bool lands as true like a plain one instead of 1.0
         with open(self.blunder_replay_jsonl, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=float) + "\n")
+            f.write(json.dumps(row, default=lambda o: o.item()) + "\n")
 
         self.n_replay_rows += 1
         self.n_replay_finalized += 1
-        if self.n_replay_rows >= BRP_ANALYSIS_EVERY:
+
+    def start_brp_round(self, n):
+        """Rows left from an unfinished earlier round are analysed first so
+        each round's summary covers only its own probes."""
+        if self.n_replay_rows:
             self.analyse_brp_file()
+        self.brp_expected = n
+        self.brp_wait_start = None
+
+    def maybe_analyse_brp_round(self):
+        if not self.brp_expected:
+            return
+        n = self.n_replay_rows
+        if n < self.brp_expected:
+            if n < BRP_ROUND_DONE_FRAC * self.brp_expected:
+                return
+            now = time.time()
+            if self.brp_wait_start is None:
+                self.brp_wait_start = now
+            if now - self.brp_wait_start < BRP_ROUND_WAIT_S:
+                return
+        self.analyse_brp_file()
+        self.brp_expected = 0
+        self.brp_wait_start = None
 
     def write_brp_reviewable(self, brp_data, src, ply, best_uci, best_cp,
                              played_cp, probe_cpl, best_depth):
@@ -1413,67 +1445,6 @@ class Rescorer(object):
         self.live_buffer.append(record, REWEIGHT_INELIGIBLE)
         return record
 
-    def add_equiv_replay_training_example(self, ply):
-        """
-        Bank an equiv-or-better probe before the position is evicted: own
-        visits, own WDL, no SF blend. Weighted like a selfplay sample so
-        the KL boost applies -- always eligible, since found_equiv is well
-        inside the equiv band.
-        """
-        if ply is None:
-            return False
-
-        cfg = self.config
-        board = ply['board']
-        tr = ply.get('tr') or {}
-
-        cm = tr.get('candidate_moves', [])
-        wdl = tr.get('best_wdl')
-        if not cm or wdl is None:
-            return False
-
-        vmap = {c['uci']: max(1, c['visits']) for c in cm}
-        for u in board.legal_moves():
-            vmap.setdefault(u, 1)
-        visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
-
-        mvs = [v[0] for v in visits]
-        vis = [v[1] for v in visits]
-
-        priors_map = {c['uci']: c['P'] for c in cm}
-        priors = [priors_map.get(u, 0.0) for u in mvs]
-
-        kl = kl_divergence(priors, vis)
-        self.kl_q50 = update_ema_quantile(
-            self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
-        self.kl_q80 = update_ema_quantile(
-            self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
-
-        pwht = 1.0
-        if kl >= self.kl_q80:
-            pwht *= cfg.kl_boost_p80_mult
-        elif kl >= self.kl_q50:
-            pwht *= cfg.kl_boost_median_mult
-
-        policy = np.zeros(1858, dtype=np.float32)
-        pi = np.array(vis, dtype=np.float32)
-        pi = pi / pi.sum()
-        pi = blend_to_uniform(pi, 1e-6, 0.95)   # train-target clip
-        for idx, p in zip(board.moves_to_indices(mvs), pi):
-            policy[idx] += p
-
-        Y = np.array(wdl, dtype=np.float32)
-
-        x = self.encode_board(board)
-        okey = self.opening_counts.key(board, x)
-        self.opening_counts.bump(okey)
-        self.sample_counts['accepted'] += 1
-        self.sample_counts_window['accepted'] += 1
-        self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, 1.0, pwht, 'xc0'),
-            okey)
-        return True
-
     def add_blunder_replay_training_example(self, ply, epoch, best_uci,
                                              best_cp, probe_cpl):
         """
@@ -1545,9 +1516,8 @@ class Rescorer(object):
         Replaces the old analyse_probe_file: no SF pass here, that already
         happened per-replay in finalize_blunder_replay, which also evicts
         immediately on found_equiv. This just summarizes the collected jsonl
-        into a CSV + history line, as if one full probe run just finished,
-        stamped with whatever epoch is current -- not necessarily on any
-        retrain cadence. Fires purely on row count.
+        into a CSV + history line, stamped with the newest epoch among the
+        rows. Fires once per bulk round, see maybe_analyse_brp_round.
         """
         rows = []
         with open(self.blunder_replay_jsonl, "r", encoding="utf-8") as f:
@@ -1568,9 +1538,8 @@ class Rescorer(object):
         # window's own rows.
         epoch = max([r.get("model_epoch") for r in rows])
 
-        # two 2048-row windows can land on the same epoch if replay
-        # throughput outpaces the retrain cadence -- append onto that
-        # epoch's existing CSV instead of splitting across multiple files.
+        # a round split by a restart lands twice on the same epoch -- append
+        # onto that epoch's existing CSV instead of splitting across files.
         # probe_e*.csv naming matches the old convention -- probe_table.py,
         # pairwise.py, and backfill_probe_csv_keys.py all glob for it.
         existing = glob.glob(os.path.join(
@@ -1604,7 +1573,6 @@ class Rescorer(object):
             "found_best": df["found_best"].mean(),
             "found_equiv": df["found_equiv"].mean(),
             "n_evicted": int(df["evicted"].sum()),
-            "n_added_to_buffer": int(df["added_to_buffer"].sum()),
             "cache_hit": df["from_cache"].mean(),
             "file": os.path.basename(csv_path),
         }
@@ -1622,8 +1590,7 @@ class Rescorer(object):
               f"({summary['improved_cpl']:+.1f} CPL)  "
               f"worsened {summary['worsened']:.1%} "
               f"({summary['worsened_cpl']:+.1f} CPL)  "
-              f"evicted {summary['n_evicted']}  "
-              f"added_to_buffer {summary['n_added_to_buffer']}", flush=True)
+              f"evicted {summary['n_evicted']}", flush=True)
 
         open(self.blunder_replay_jsonl, "w", encoding="utf-8").close()
         self.n_replay_rows = 0
@@ -1950,7 +1917,8 @@ class Rescorer(object):
 
             if reviewable:
                 for k in ('sims', 'time', 'avg_depth', 'max_depth',
-                          'children_visited', 'total_children', 'pv'):
+                          'children_visited', 'total_children', 'pv',
+                          'sharp_by_depth'):
                     if k in node:
                         entry[k] = node[k]
                 entry['candidate_moves'] = node.get('candidate_moves', [])

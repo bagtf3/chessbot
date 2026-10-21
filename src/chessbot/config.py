@@ -124,6 +124,11 @@ class Config(object):
     uniform_eps = 0.25
     prior_clip_max = 0.75
     fpu_reduction = 0.1
+    # sharp boost: per node, while its visits are inside sharp_window, captures
+    # and checks get prior bonus sharp_boost * (capture + check) * (1 - N/sharp_M)
+    sharp_window = [100, 250]
+    sharp_M = 10
+    sharp_boost = 0.0
     qema_span = 40
     qdelta_span = 100
     # randomness

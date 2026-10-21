@@ -91,6 +91,8 @@ class MCTSTree(fasttree):
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
         self.set_fpu_reduction(float(cfg.fpu_reduction))
+        lo, hi = cfg.sharp_window
+        self.set_sharp_boost(int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost))
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
         self.set_contempt(
@@ -537,8 +539,9 @@ class ChessGame(object):
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn))
 
+        # boost-decided visits are left out of the policy target
         ucis = [cd.uci for cd in details]
-        visits = [cd.N for cd in details]
+        visits = [cd.N - cd.boosted_N for cd in details]
 
         data = {
             "abs_ply": self.board.history_size(),
@@ -556,6 +559,7 @@ class ChessGame(object):
             "xc0h": np.asarray(self.board.history_tokens(XC0H_K), dtype=np.int16),
             "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
+            "sharp_by_depth": list(self.tree.sharp_by_depth()),
             "children_visited": visited_children,
             "total_children": total_children,
         }
@@ -571,6 +575,7 @@ class ChessGame(object):
                 "visit_share": cd.visit_share, "last_visit": cd.last_visit,
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
+                "boosted": cd.boosted_N,
                 "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),
                 "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }

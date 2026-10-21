@@ -23,10 +23,7 @@ import time
 from collections import deque
 
 from chessbot import SP_DIR
-from chessbot.blunder_replay import (
-    BRP_HISTORY_FILENAME, load_probe_pool,
-    last_epoch_in_blunder_replay_history,
-)
+from chessbot.blunder_replay import load_probe_pool
 from chessbot.config import Config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator
@@ -35,7 +32,7 @@ from chessbot.looper import init_selfplay
 from chessbot.lc0_replay import LC0_BRP_SCENARIO, create_lc0_replay_config
 
 from chessbot.rescore import (
-    BRP_ANALYSIS_EVERY, Rescorer, SFRescoreThread, migrate_pretrain_progress,
+    Rescorer, SFRescoreThread, migrate_pretrain_progress,
 )
 from chessbot.retrain_worker import run_retrain_worker
 from chessbot.review import RecordKeeper
@@ -66,6 +63,11 @@ LC0_BUNDLE_MAX_WAIT_S = 600.0
 # xc0 blunder-replay probes are held off the worker queue until this epoch;
 # credits and the blunder pool keep accruing, and lc0 BRP runs unaffected.
 BRP_WORKER_START_EPOCH = 5
+# probes go out in one bulk round on epochs 5, 15, 25, ..., up to this share
+# of the pool drawn from the positions that are due
+BRP_BULK_EVERY = 10
+BRP_BULK_OFFSET = 5
+BRP_BULK_FRAC = 0.25
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue,
@@ -748,9 +750,6 @@ class SelfPlayRunner:
             added += 1
 
         self.total_queued += added
-        # blunder replays ride the same queue and do not count against the
-        # games budget -- they are probes, not selfplay
-        self.drain_brp_credits()
 
         if self.total_queued >= self.cfg.n_games:
             print(f"[runner] games budget {self.cfg.n_games} queued, draining",
@@ -759,20 +758,29 @@ class SelfPlayRunner:
             self.stop_signal_sent = True
         return added
 
-    def drain_brp_credits(self):
-        """1:1 trickle: one replay per eligible blunder the rescorer found
-        since the last pass. Credits accrue while the queue is full."""
-        if self.blunder_pool is None:
+    def maybe_bulk_blunder_replays(self):
+        """On a bulk epoch, queue up to BRP_BULK_FRAC of the pool. Positions
+        already probed this epoch count against the quota, so a restart
+        mid-round tops it up instead of sending a second round."""
+        epoch = self.current_epoch
+        if not self.blunder_pool or epoch % BRP_BULK_EVERY != BRP_BULK_OFFSET:
             return 0
-        if self.current_epoch < BRP_WORKER_START_EPOCH:
-            return 0
-        n = self.rescorer.take_brp_credits()
-        if n <= 0:
-            return 0
-        return self.enqueue_blunder_replays(n)
+        n_retired = self.rescorer.retire_failed(self.blunder_pool, epoch)
+        if n_retired:
+            print(f"[runner] BRP retired {n_retired} positions past max fails, "
+                  f"{len(self.blunder_pool)} live", flush=True)
+        quota = int(len(self.blunder_pool) * BRP_BULK_FRAC)
+        done = sum(1 for r in self.blunder_pool.values()
+                   if r.get('last_seen') == epoch)
+        n = self.enqueue_blunder_replays(quota - done)
+        self.rescorer.start_brp_round(n)
+        print(f"[runner] BRP bulk epoch {epoch}: queued {n} probes "
+              f"(quota {quota}, already probed {done})", flush=True)
+        return n
 
     def enqueue_blunder_replays(self, n):
-        """Queue n replay probes, from either the trickle or a bulk dump.
+        """Queue n replay probes, drawn from the positions that are due.
+        They ride the game queue but do not count against the games budget.
         Progress shows up in the rescore table's replays column."""
         if self.blunder_pool is None or n <= 0:
             return 0
@@ -1129,10 +1137,8 @@ class SelfPlayRunner:
         self.recorder.n_retrains = self.current_epoch
         self.retrain_worker = None
 
-        # fresh weights: probe the new epoch in bulk so most of an analysis
-        # window lands on one model instead of smearing across epochs
         if not self.stop_signal_sent:
-            self.enqueue_blunder_replays(BRP_ANALYSIS_EVERY // 2)
+            self.maybe_bulk_blunder_replays()
 
         rb.sync_live_buffer(self.base_cfg.run_dir,
                             self.rescorer.live_buffer.records)
@@ -1277,14 +1283,7 @@ class SelfPlayRunner:
         is empty right now, so the shallow target would take several loop
         passes to bring the fleet up to capacity.
         """
-        if self.blunder_pool:
-            last = last_epoch_in_blunder_replay_history(
-                os.path.join(self.cfg.run_dir, BRP_HISTORY_FILENAME)
-            )
-
-            if last is None or self.current_epoch > last:
-                self.enqueue_blunder_replays(BRP_ANALYSIS_EVERY // 2)
-
+        self.maybe_bulk_blunder_replays()
         self.maybe_start_validation()
         self.top_up_queue(
             target=self.cfg.n_workers * self.cfg.games_at_once

@@ -520,29 +520,10 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 raw_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm).item()
 
                 if not np.isfinite(raw_norm):
+                    # GradScaler overflow probing; scaler.step skips the update
                     nan_skips += 1
-                    dump_path = os.path.join(
-                        os.path.dirname(model_path),
-                        f"nan_batch_{label or 'retrain'}_ep{epoch}_{int(time.time())}.pkl")
-                    try:
-                        import pickle
-                        with open(dump_path, "wb") as f:
-                            pickle.dump({
-                                'batch_idx': chunk_idx[start:end],
-                                'X':    xb.detach().cpu().numpy(),
-                                'P':    pb.detach().cpu().numpy(),
-                                'Y':    yb.detach().cpu().numpy(),
-                                'vwht': vwb.detach().cpu().numpy(),
-                                'pwht': pwb.detach().cpu().numpy(),
-                                'loss': loss.item() if torch.isfinite(loss) else float('nan'),
-                                'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else float('nan'),
-                                'value_loss':  value_loss.item() if torch.isfinite(value_loss) else float('nan'),
-                            }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}) at step {steps}, "
-                              f"epoch {epoch} -- skipping this batch's update, dumped -> {dump_path}")
-                    except Exception as e:
-                        print(f"{tag} WARNING: non-finite grad norm ({raw_norm}), "
-                              f"failed to dump offending batch: {e}")
+                    print(f"{tag} non-finite grad norm ({raw_norm}) at step {steps}, "
+                          f"epoch {epoch} -- update skipped")
                     scaler.step(opt)
                     scaler.update()
                     opt.zero_grad()

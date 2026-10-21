@@ -59,9 +59,10 @@ def probe_fails(src):
 # probes are drawn on recency of the last probe, not of discovery, so a
 # position gets a rest between challenges instead of being hammered
 BRP_LAST_SEEN_MIN = 7
-# a position this many failed probes deep is treated as uncorrectable and
-# aged out rather than probed forever
-BRP_MAX_FAILS = 9999
+# a position at this many fails gets one last probe; a fail past it evicts
+BRP_MAX_FAILS = 5
+# the fail that hands the position to the lc0 teacher for training samples
+BRP_LC0_REQUEUE_FAILS = 3
 # per-position SF budget: starts here, escalates by MS_STEP each probe that
 # neither found_equiv nor locked a cached best move at MIN_CACHE_DEPTH+,
 # capped at START_MS * MS_MAX_MULT
@@ -196,6 +197,15 @@ def evict_position(pool, key, reason, n_retrains, evicted_file):
     }
     with open(evicted_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, default=float) + "\n")
+
+
+def retire_failed_positions(pool, n_retrains, evicted_file):
+    """Evict every position past BRP_MAX_FAILS."""
+    keys = [k for k, r in pool.items()
+            if (r.get("n_fails") or 0) > BRP_MAX_FAILS]
+    for k in keys:
+        evict_position(pool, k, "max_fails", n_retrains, evicted_file)
+    return len(keys)
 
 
 def ratchet_store(src, move_uci, cp, depth):

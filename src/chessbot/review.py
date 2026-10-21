@@ -10,7 +10,7 @@ RECENT_GAMES_CAP = 20000
 COUNTER_KEYS = (
     "n_groups", "s_collected", "s_fast", "s_terminals", "s_cached",
     "s_fast_stops", "s_collect_stops", "s_blocked", "s_puct", "s_must_visit",
-    "s_skipped", "s_pruned", "s_penalty", "s_depth",
+    "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp",
 )
 from collections import defaultdict, deque
 
@@ -2222,7 +2222,7 @@ class RecordKeeper(object):
             "s_blocked", "s_puct", "preds_per_second",
 
             "s_must_visit",
-            "s_skipped", "s_pruned", "s_penalty", "s_depth",
+            "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp",
 
             # priors cache (per-worker) telemetry, aggregate across workers
             "cache_size", "cache_capacity", "cache_queries", "cache_hits"
@@ -2361,6 +2361,7 @@ class RecordKeeper(object):
         s_depth = summed.get("s_depth", 0)
 
         s_must_visit = summed.get("s_must_visit", 0)
+        s_sharp = summed.get("s_sharp", 0)
 
         s_skipped = summed.get("s_skipped", 0)
         s_pruned = summed.get("s_pruned", 0)
@@ -2414,7 +2415,9 @@ class RecordKeeper(object):
         skip_to_prune = s_skipped / s_pruned if s_pruned else 0.0
         avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
         left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.1f}"
-        right5 = f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
+        sharp_pct = 100.0 * s_sharp / total_overall if total_overall else 0.0
+        right5 = (f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
+                  f"  sharp={compact_count(s_sharp)} ({sharp_pct:.2f}%)")
 
         left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
         right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"

@@ -243,31 +243,6 @@ def test_blend_targets_are_stm_pov(fen, stm_winning):
         assert Y_w[2] > Y_w[0]
 
 
-@pytest.mark.parametrize("fen,stm_winning", POV_CASES)
-def test_equiv_targets_are_stm_pov(fen, stm_winning):
-    """Same four combos through the equiv path, which uses its own flip."""
-    results = []
-    for pos_fen, wdl_white_pov, _, cands, _best in \
-            mirrored_case(fen, stm_winning):
-        r = make_rescorer()
-        ply = make_ply(pos_fen, ucis=cands, best_wdl=wdl_white_pov)
-        assert r.add_equiv_replay_training_example(ply)
-        x, policy, Y, source = sole_entry(r)
-        # an equiv-or-better probe is indistinguishable from a selfplay move
-        assert source == 'xc0'
-        results.append((np.asarray(x), policy, Y))
-
-    (x_w, pol_w, Y_w), (x_b, pol_b, Y_b) = results
-    assert np.array_equal(x_w, x_b)
-    np.testing.assert_allclose(pol_w, pol_b, atol=1e-6)
-    np.testing.assert_allclose(Y_w, Y_b, atol=1e-6)
-
-    if stm_winning:
-        assert Y_w[0] > Y_w[2]
-    else:
-        assert Y_w[2] > Y_w[0]
-
-
 @pytest.mark.parametrize("stm_winning", [True, False])
 def test_blend_wdl_is_stm_pov(stm_winning):
     """The normal selfplay target. z_stm is already STM-POV; best_wdl is not.

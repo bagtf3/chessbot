@@ -2,15 +2,20 @@
 
 ## Orchestration
 
-`scripts/run_selfplay.py` is the entry point for a training run. It spawns N worker processes and runs a persistent outer loop that manages rescoring, retraining, and validation. Each worker runs `child_looper()`, which initializes a `GameLooper` and calls `run()`.
+`scripts/run_selfplay.py <run_tag>` starts a run. All of the run's long-lived state lives in one object, `SelfPlayRunner` (`src/chessbot/selfplay_runner.py`), whose main loop does everything on one thread, in order: reap and respawn dead workers, keep the game queue topped up, drain finished games into the rescorer, tick rescoring, and launch or poll a retrain.
 
-Workers communicate with the main process through several multiprocessing queues:
+**Processes.** The runner manages a small fleet:
 
-- `recent_q` — game results and per-game metadata (W/D/L, sims used, CPL after rescoring)
-- `telemetry_q` — per-worker performance metrics (MPS, LPS, batch fill rate, cache hit rate)
-- `pause_q` / `unpause_q` — synchronization signals sent during model reload between retrain epochs
+- **xc0 workers**: each runs `child_looper()` → `GameLooper`, playing many games concurrently with batched GPU inference.
+- **lc0 worker**: runs the LC0 teacher probes on its own queue (see [Rescoring & Retraining](evaluation_pipeline.md)).
+- **Stockfish rescore threads**: analyze finished games. One extra thread is added automatically while the rescore backlog is deep and retired once it clears.
+- **Retrain worker**: spawned fresh for each retrain and torn down afterwards.
 
-The main process also maintains the retrain trigger: when the `Rescorer` has accumulated enough training examples (`retrain_size`), it pauses all workers, launches the retrain subprocess, waits for completion, broadcasts the new model path, then unpauses workers.
+**One game queue.** Selfplay games, validation games and blunder-replay probes all ride a single FIFO queue that every xc0 worker pulls from. At startup it is seeded in priority order: probes first (they're single-move, so Stockfish has work within seconds), then validation, then selfplay, filled deep enough to bring every worker slot up at once. Workers report finished games and telemetry back on their own queues, and receive pause, unpause and reload commands on a per-worker message queue.
+
+**Retrain boundary.** When the primary buffer fills, the runner spawns the retrain worker, pauses selfplay once the worker is ready, and lets it train only after every worker has released the GPU. When training finishes, the runner re-reads the run's config (so edits take effect at each retrain boundary without a restart), rebuilds the TRT engine, and unpauses the fleet on the new weights. Validation batches and bulk BRP rounds are scheduled off the same retrain counter.
+
+**Unattended runs.** `scripts/run_selfplay_loop.py` wraps the runner for long campaigns. It runs a tag to its game budget, iterates into the next tag (cloning its config), and relaunches on crashes, silent hangs or stalls, killing orphaned workers and engines first. It halts safely on repeated failures or low disk. An operator console on stdin (`stop`, pause/resume, worker and Stockfish scaling) stays available throughout.
 
 ![Selfplay telemetry](../images/selfplay_telemetry.JPG)
 
@@ -41,18 +46,17 @@ Games submit a (game_id, board_fen) pair via `submit()`. The thread drains its i
 
 ## Game Curriculum
 
-`GameGenerator` selects starting positions according to a weighted scenario mix configured per run. The active `16m_precond` curriculum is:
+`GameGenerator` selects starting positions according to a weighted scenario mix configured per run. The mix leans heavily on real openings: half of all games start from the initial position and most of the rest come from opening books and UHO, while the synthetic scenarios are a small minority. The active m137_8c8t curriculum is:
 
 | Scenario | Weight | Description |
 |---|---|---|
-| `startpos` | 13% | Standard starting position |
-| `pre_opened_mini` | 17.5% | Short opening lines (<= 2 moves) |
-| `UHO` | 20% | Unbalanced Human Openings, white to move at ply 16 |
-| `pre_opened` | 18% | Longer opening lines (> 2 moves) |
-| `random_init` | 17% | Random legal position from the opening phase |
-| `random_middle_game` | 11.5% | Random init advanced to ply 20-31 |
+| `startpos` | 50% | Standard starting position |
+| `UHO` | 24% | Unbalanced Human Openings, white to move at ply 16 |
+| `pre_opened` | 10% | Longer opening lines (> 2 moves) |
+| `pre_opened_mini` | 9% | Short opening lines (<= 2 moves) |
+| `random_init` | 3% | Random legal position from the opening phase |
 | `piece_odds` | 2% | Material-unbalanced positions |
-| `piece_training` | 1% | Focused endgame piece training positions |
+| `piece_training` | 2% | Focused endgame piece training positions |
 
 UHO positions come from `UHO_XXL_2022_+100_+129.pgn`, a corpus of unbalanced human games. All UHO positions are white-to-move at ply 16, ensuring the engine sees non-trivial positions with varied pawn structures early in training.
 

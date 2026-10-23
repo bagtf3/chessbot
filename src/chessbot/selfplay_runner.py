@@ -410,7 +410,7 @@ class SelfPlayRunner:
 
         self.current_epoch = next_model_epoch(cfg.progress_csv_path)
         self.recorder = RecordKeeper(self.current_epoch, every_sec=60.0)
-        self.recorder.training_queue = len(self.rescorer.live_buffer)
+        self.recorder.training_queue = self.rescorer.training_data_size
         self.recorder.primary_buffer_dir = cfg.primary_buffer_dir
         self.recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
 
@@ -455,13 +455,14 @@ class SelfPlayRunner:
         if not path:
             return
 
-        self.rescorer.live_buffer.load_records(rb.read_live_buffer(path))
-        print(f"[runner] loaded {len(self.rescorer.live_buffer)} samples "
-              f"from {os.path.basename(path)}", flush=True)
-        self.rescorer.live_buffer.flush_all_ready()
+        rs = self.rescorer
+        flushed = rs.load_buffered_records(rb.read_live_buffer(path))
+        print(f"[runner] loaded from {os.path.basename(path)}: "
+              f"{len(rs.live_buffer)} xc0, {len(rs.lc0_buffer)} lc0 samples "
+              f"after flushing {len(flushed)} shards", flush=True)
         # re-sync to canonical names immediately, so there is never a window
         # with no valid on-disk copy
-        rb.sync_live_buffer(cfg.run_dir, self.rescorer.live_buffer.records)
+        rb.sync_live_buffer(cfg.run_dir, rs.buffered_records())
         canonical = os.path.join(cfg.run_dir, rb.LIVE_BUFFER_PKL)
         if os.path.abspath(path) != os.path.abspath(canonical):
             os.remove(path)
@@ -579,7 +580,8 @@ class SelfPlayRunner:
         """Hold staged teacher probes until LC0_BUNDLE_SIZE, then release the
         whole bundle onto the lc0 queue. A bundle older than
         LC0_BUNDLE_MAX_WAIT_S goes out short, and a draining run flushes
-        whatever is held so no probe is stranded."""
+        whatever is held so no probe is stranded. Nothing is released while
+        a validation batch is out."""
         if self.lc0_q is None:
             return 0
         specs = self.rescorer.take_lc0_specs()
@@ -588,7 +590,8 @@ class SelfPlayRunner:
         self.lc0_hold.extend(specs)
 
         sent = 0
-        if self.lc0_hold and (
+        held_for_val = self.val_pending and not self.stop_signal_sent
+        if self.lc0_hold and not held_for_val and (
                 len(self.lc0_hold) >= LC0_BUNDLE_SIZE
                 or time.monotonic() - self.lc0_hold_since >= LC0_BUNDLE_MAX_WAIT_S
                 or self.stop_signal_sent):
@@ -1008,6 +1011,9 @@ class SelfPlayRunner:
         # bulk BRP enqueue, both of which hang off poll_retrain
         if self.operator_paused:
             return
+        # the validation batch finishes on the model it started on
+        if self.val_pending:
+            return
         primary = rb.list_shard_files(self.cfg.primary_buffer_dir)
         if len(primary) < rb.PRIMARY_TRIGGER_SHARDS:
             return
@@ -1016,7 +1022,8 @@ class SelfPlayRunner:
             self.cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
         historic_files = rb.sample_files(
             self.cfg.historic_dir, rb.RETRAIN_HISTORIC_SHARDS)
-        primary_sample = random.sample(primary, rb.RETRAIN_PRIMARY_SHARDS)
+        primary_sample = rb.sample_retrain_primary(
+            primary, rb.RETRAIN_PRIMARY_SHARDS)
 
         msg_q = self.ctx.Queue()
         result_q = self.ctx.Queue()
@@ -1118,8 +1125,8 @@ class SelfPlayRunner:
 
         pred_pkl = os.path.join(self.cfg.run_dir, "predictions_latest.pkl")
         if ok:
-            rb.move_files(self.retrain_worker["primary_files"],
-                          self.cfg.replay_buffer_dir)
+            rb.rotate_to_replay(self.retrain_worker["primary_files"],
+                                self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
             self.rescorer.aggregate_metrics(
@@ -1141,7 +1148,7 @@ class SelfPlayRunner:
             self.maybe_bulk_blunder_replays()
 
         rb.sync_live_buffer(self.base_cfg.run_dir,
-                            self.rescorer.live_buffer.records)
+                            self.rescorer.buffered_records())
         self.maybe_start_validation()
 
     def handle_commands(self):
@@ -1222,7 +1229,7 @@ class SelfPlayRunner:
             self.add_sf_thread("full clear")
 
     def save_training_snapshot(self):
-        data = self.rescorer.live_buffer.records
+        data = self.rescorer.buffered_records()
         n = self.controls.save_training_data_n
         if n and n < len(data):
             data = random.sample(data, n)
@@ -1345,10 +1352,10 @@ class SelfPlayRunner:
         for t in self.sf_rescore_threads + self.sf_retiring:
             t.close()
         self.sf_retiring = []
-        if self.rescorer.live_buffer.records:
-            path = rb.sync_live_buffer(
-                self.base_cfg.run_dir, self.rescorer.live_buffer.records)
-            print(f"[runner] saved {len(self.rescorer.live_buffer.records)} "
+        records = self.rescorer.buffered_records()
+        if records:
+            path = rb.sync_live_buffer(self.base_cfg.run_dir, records)
+            print(f"[runner] saved {len(records)} "
                   f"samples to {os.path.basename(path)}", flush=True)
         self.rescorer.close(self.blunder_pool)
         self.stop_workers()

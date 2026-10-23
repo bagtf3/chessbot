@@ -21,19 +21,13 @@ things work is to build it myself. It's also fun to be able to experiment with n
 
 ## How strong is it?
 
-I estimate around 3050 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs 8-10 centipawn loss on average.
+I estimate around 3300 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs 5-6 centipawn loss on average.
 
 ---
 
-## Has it ever beaten Stockfish?
+## How does it do against Stockfish?
 
-Yes, once.
-
----
-
-## Leela?
-
-Not even close.
+Xerces is validated against Stockfish every 10 model retrains, in paired games from UHO openings (each position played as both colors). It is currently scoring ~0.4/1.0 against Stockfish 17.1 at depth 15.
 
 ---
 
@@ -61,7 +55,7 @@ Rather than binary piece-plane stacks, Xerces's base encoding represents a posit
 
 ## How fast does it run?
 
-On the RTX 2080, the ~15.8M parameter precond-smartgate network is served in fp16 through ONNX Runtime + TensorRT. With the `MCTSForest` batching leaf encoding across all active games, selfplay sustains around 40,000 leaves per second, of which roughly 21,000 per second actually reach the network. The gap is absorbed before inference: the C++ priors cache resolves repeated positions, terminal nodes need no evaluation, and matelock's must-visit leaves are forced without a fresh prediction. That works out to roughly 750 games per hour of training; validation vs Stockfish is about 100 games per hour.
+On the RTX 2080, the ~18.4M parameter m137_8c8t network is served in fp16 through ONNX Runtime + TensorRT. With the `MCTSForest` batching leaf encoding across all active games, selfplay sustains around 40,000 leaves per second, of which roughly 21,000 per second actually reach the network. The gap is absorbed before inference: the C++ priors cache resolves repeated positions, terminal nodes need no evaluation, and matelock's must-visit leaves are forced without a fresh prediction. That works out to roughly 750 games per hour of training; validation vs Stockfish is about 100 games per hour.
 
 ---
 
@@ -76,7 +70,7 @@ Mostly because I think its cool!
 ---
 
 ## What's next for the project?
-More selfplay. I think the `better data -> better search -> better model -> better data` loop is still progressing (slowly). Beyond that, the iterative deepening MCTS experiment is in progress, and the rescoring pipeline continues to be tuned as the model improves.
+More selfplay. I think the `better data -> better search -> better model -> better data` loop is still progressing (slowly). Beyond that, the rescoring pipeline continues to be tuned as the model improves.
 
 ---
 

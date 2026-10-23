@@ -3,7 +3,7 @@
 Xerces is an open-source, neural-network powered chess engine, trained on multiple data sources: published Lc0 game data, curated Xerces self-play data, and ongoing self-play with Stockfish rescoring.
 
 - Monte Carlo Tree Search with PUCT selection
-- Neural network evaluation (a preconditioner + transformer "precond-smartgate" model, ~15.8M params)
+- Neural network evaluation (an 8-conv + 8-transformer "m137_8c8t" model, ~18.4M params)
 - Stockfish post-hoc rescoring for blunder detection and visit redistribution
 - Async retrain loop running between self-play rounds
 

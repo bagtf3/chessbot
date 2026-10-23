@@ -43,6 +43,8 @@ from chessbot.opening_counts import apply_repeat_weights
 
 LIVE_BUFFER_SIZE = 204_800
 SHARD_SIZE = 10_240
+# lc0 shards are named apart so a retrain can draw one ahead of the rest
+LC0_SHARD_PREFIX = "lc0-"
 PRIMARY_TRIGGER_SHARDS = 144
 RETRAIN_PRIMARY_SHARDS = 12
 RETRAIN_REPLAY_SHARDS = 12
@@ -69,9 +71,17 @@ GZIP_LEVEL = 6
 POLICY_DIM = 1858
 
 
-def new_shard_path(out_dir, suffix=".pkl.gz"):
-    name = f"{int(time.time())}-{uuid.uuid4().hex}{suffix}"
+def new_shard_path(out_dir, suffix=".pkl.gz", prefix=""):
+    name = f"{prefix}{int(time.time())}-{uuid.uuid4().hex}{suffix}"
     return os.path.join(out_dir, name)
+
+
+def is_lc0_shard(path):
+    return os.path.basename(path).startswith(LC0_SHARD_PREFIX)
+
+
+def is_lc0_record(record):
+    return (record[6] or "").startswith("lc0")
 
 
 def write_pkl_gz_shard(records, path):
@@ -253,6 +263,26 @@ def sample_records(records, n):
     return random.sample(records, n)
 
 
+def sample_retrain_primary(primary, n):
+    """Two random lc0 shards when 3+ are waiting, one when 1-2 are, the rest
+    from the other shards. Further lc0 shards wait for a later retrain."""
+    lc0 = [p for p in primary if is_lc0_shard(p)]
+    rest = [p for p in primary if not is_lc0_shard(p)]
+    k = 2 if len(lc0) >= 3 else min(1, len(lc0))
+    return random.sample(lc0, k) + random.sample(rest, n - k)
+
+
+def rotate_to_replay(paths, replay_dir):
+    """Move trained primary shards into replay. The lc0 prefix is dropped:
+    the retrain already shuffled its records in with the others."""
+    os.makedirs(replay_dir, exist_ok=True)
+    for p in paths:
+        name = os.path.basename(p)
+        if name.startswith(LC0_SHARD_PREFIX):
+            name = name[len(LC0_SHARD_PREFIX):]
+        os.replace(p, os.path.join(replay_dir, name))
+
+
 def move_files(paths, dest_dir):
     os.makedirs(dest_dir, exist_ok=True)
     moved = []
@@ -325,40 +355,44 @@ class LiveBuffer:
         self.records.extend(records)
         self.keys.extend(keys if keys is not None else [None] * len(records))
 
-    def load_records(self, records):
+    def load_records(self, records, key=None):
         """Replace the pool wholesale. Used by the state-reload and
         remaining_untrained paths, whose records outlive the key list; None
         keys make maybe_flush re-derive each slot from the record's own x, so a
         restart weights its carryover identically to records that never left
         memory."""
         self.records = list(records)
-        self.keys = [None] * len(self.records)
+        self.keys = [key] * len(self.records)
 
-    def maybe_flush(self):
-        """Write one shard if at capacity. Returns the written path, or
-        None if not yet full. Call in a loop if bulk-loading (e.g. from
-        remaining_untrained.pkl) could fill more than one shard at once.
-
-        This is the only place opening reweighting happens. It must not move
-        into write_pkl_gz_shard -- shuffle_rewrite_primary calls that too, and
-        would compound the weighting every retrain cycle."""
-        if len(self.records) < self.capacity:
-            return None
-
-        idx = set(random.sample(range(len(self.records)), self.shard_size))
+    def take(self, n):
+        """Remove n records at random, returned with their keys."""
+        idx = set(random.sample(range(len(self.records)), n))
         chunk = [r for i, r in enumerate(self.records) if i in idx]
         chunk_keys = [k for i, k in enumerate(self.keys) if i in idx]
         self.records = [r for i, r in enumerate(self.records) if i not in idx]
         self.keys = [k for i, k in enumerate(self.keys) if i not in idx]
+        return chunk, chunk_keys
 
+    def write_shard(self, chunk, chunk_keys, prefix=""):
+        """This is the only place opening reweighting happens. It must not
+        move into write_pkl_gz_shard -- shuffle_rewrite_primary calls that
+        too, and would compound the weighting every retrain cycle."""
         if self.counts is not None:
             chunk = apply_repeat_weights(chunk, chunk_keys, self.counts)
             self.counts.decay()
 
         os.makedirs(self.primary_dir, exist_ok=True)
-        path = new_shard_path(self.primary_dir)
+        path = new_shard_path(self.primary_dir, prefix=prefix)
         write_pkl_gz_shard(chunk, path)
         return path
+
+    def maybe_flush(self):
+        """Write one shard if at capacity. Returns the written path, or
+        None if not yet full. Call in a loop if bulk-loading (e.g. from
+        remaining_untrained.pkl) could fill more than one shard at once."""
+        if len(self.records) < self.capacity:
+            return None
+        return self.write_shard(*self.take(self.shard_size))
 
     def flush_all_ready(self):
         """Drain every full shard currently available. Returns list of
@@ -370,3 +404,13 @@ class LiveBuffer:
                 break
             written.append(path)
         return written
+
+
+def flush_lc0_shards(lc0_buffer, n=SHARD_SIZE):
+    """Every n lc0 records go out as one pure lc0 shard. Returns written
+    paths."""
+    written = []
+    while len(lc0_buffer) >= n:
+        written.append(lc0_buffer.write_shard(
+            *lc0_buffer.take(n), prefix=LC0_SHARD_PREFIX))
+    return written

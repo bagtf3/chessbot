@@ -49,12 +49,14 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - vocab_size=21 in all models
 
 ## Active Model Architecture
-`build_pt_precond_smartgate` (`16m-precond-smartgate`) with:
-- conv_filters=256, num_heads=8, dropout=0.03, pre_blocks=4
-- 4x Conv(256) preconditioner → concat pos(256) → 512-d → 4x transformer blocks
-- 8 specialized global accumulators: WDL(0), SmartGate(1), from/to policy(2-7)
-- SmartGate: quality_logits + logsigmoid(gate) → suppress-only, bias init=4.0
-- ~15.8M parameters, PyTorch float16
+m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`) with:
+- D=256, num_heads=8, ff_dim=1024, xc0h_K=6, LayerNorm throughout
+- xc0h stem -> 2 plain + 6 gated expandy convs -> add pos -> 4 FF + 4 SwiGLU tx blocks
+- Gated expandy: grouped 3x3 (4 groups, D->2D) + 1x1 pointwise, sigmoid gate per square/channel
+- Per-channel PReLU (init 0.03, clamped [-0.5, 0.5]); tanh-gated attention on SwiGLU blocks
+- 8 global accumulators: W/D/L (64-66), SmartGate (67, 68), from/to policy (68-71)
+- SmartGate: policy - scale * sigmoid(gate_raw), suppress-only, legality BCE gate loss
+- ~18.4M parameters, PyTorch fp16 autocast
 - Policy: 1858 legal logits scattered to 4288 flat
 - Value: WDL 3-class softmax, STM-POV
 - Inference: ORT+TRT fp16 via `infer_ort_trt.py` / `prepare_trt`
@@ -79,9 +81,9 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - Historic corpus lives at `BOOTSTRAP_PKL_GZ` (pkl.gz shards, not tfrecords —
   the `BOOTSTRAP_TFREC_DIR` name survives only in legacy tfrec-era scripts)
 
-## Game Curriculum (16m_precond family)
-- startpos 13%, pre_opened_mini 17.5%, UHO 20%, pre_opened 18%
-- random_init 17%, random_middle_game 11.5%, piece_odds 2%, piece_training 1%
+## Game Curriculum (m137_8c8t)
+- startpos 50%, UHO 24%, pre_opened 10%, pre_opened_mini 9%
+- random_init 3%, piece_odds 2%, piece_training 2%
 - UHO = Unbalanced Human Openings (UHO_XXL_2022_+100_+129.pgn), white-to-move at ply 16
 - Bootstrapped from ~6M LC0 positions
 

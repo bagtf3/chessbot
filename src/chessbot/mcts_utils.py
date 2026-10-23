@@ -15,7 +15,6 @@ from chessbot.config import XC0H_K
 from chessbot.utils import rnd
 
 POLICY_DIM = 1858
-
 TABLEBASE = None
 
 
@@ -92,7 +91,10 @@ class MCTSTree(fasttree):
         self.set_vscale(float(cfg.vscale))
         self.set_fpu_reduction(float(cfg.fpu_reduction))
         lo, hi = cfg.sharp_window
-        self.set_sharp_boost(int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost))
+        self.set_sharp_boost(
+            int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)
+        )
+
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
         self.set_contempt(
@@ -157,7 +159,7 @@ class MCTSTree(fasttree):
         xerces_move, xerces_method = self.select_xerces_top_move()
 
         # determine if we need to sample or not
-        if self.config.sample_moves == False:
+        if self.config.sample_moves:
             sample = False
 
         elif self.board.piece_count() <= 20:
@@ -532,12 +534,15 @@ class ChessGame(object):
         best_q = rnd(best_d.Q, 4)
         Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
+        # resignation reads the unscaled search WDL, not the vscaled Q
+        resign_q = best_wdl[0] - best_wdl[2]
         if self.is_stockfish_turn():
             Q_stm = self.sf_eval
             Q_white = Q_stm if turn else -Q_stm
+            resign_q = Q_stm
 
         # keep a small list of items for gameplay checking
-        self.recents.append((mv, Q_stm, Q_white, best_q, turn))
+        self.recents.append((mv, Q_stm, Q_white, best_q, turn, resign_q))
 
         # boost-decided visits are left out of the policy target
         ucis = [cd.uci for cd in details]
@@ -639,7 +644,7 @@ class ChessGame(object):
         violated = False
         violating_index = None
         for i, r in enumerate(reversed(self.recents[-n_last:])):
-            # r is a tuple: (mv, Q_stm, Q_white, best_q, turn)
+            # r is a tuple: (mv, Q_stm, Q_white, best_q, turn, resign_q)
             if abs(r[1]) > thresh_d:
                 violated = True
                 violating_index = i
@@ -668,28 +673,30 @@ class ChessGame(object):
             self.end_reason = reason
             return True
 
-        # resignation
-        if cfg.allow_resignation and self.plies >= cfg.resign_min_plies and self.recents:
-            _, q_stm, _, _, turn = self.recents[-1]
+        # resignation: hits count from the first ply, so a resignation can
+        # land on resign_min_plies itself
+        if cfg.allow_resignation and self.recents:
+            _, _, _, _, turn, resign_q = self.recents[-1]
             if turn:
-                if q_stm < -cfg.resign_threshold:
+                if resign_q < -cfg.resign_threshold:
                     self.resign_counter_white += 1
                 else:
                     self.resign_counter_white = 0
             else:
-                if q_stm < -cfg.resign_threshold:
+                if resign_q < -cfg.resign_threshold:
                     self.resign_counter_black += 1
                 else:
                     self.resign_counter_black = 0
 
-            if self.resign_counter_white >= cfg.resign_consecutive:
-                self.outcome = -1.0
-                self.end_reason = "resign"
-                return True
-            if self.resign_counter_black >= cfg.resign_consecutive:
-                self.outcome = 1.0
-                self.end_reason = "resign"
-                return True
+            if self.plies >= cfg.resign_min_plies:
+                if self.resign_counter_white >= cfg.resign_consecutive:
+                    self.outcome = -1.0
+                    self.end_reason = "resign"
+                    return True
+                if self.resign_counter_black >= cfg.resign_consecutive:
+                    self.outcome = 1.0
+                    self.end_reason = "resign"
+                    return True
 
         # Syzygy probe if few pieces
         # flip syzygy on if about to end due to length

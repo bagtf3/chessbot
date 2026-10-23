@@ -34,6 +34,7 @@ import pickle
 import queue
 import random
 import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -185,12 +186,19 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     result_q.put({"cmd": "retrain_ready"})
     wait_for_go(msg_q)
+    t0 = time.monotonic()
 
     model, arch = load_pt_model(cfg.model_path)
     args = SimpleNamespace(batch_size=cfg.retrain_batch_size)
 
     train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
                              model=model, arch=arch)
+
+    dt = time.monotonic() - t0
+    n = len(X)
+    print(f"[retrain] timing for epoch {epoch}: {dt:.1f}s  "
+          f"{n / dt:.0f} samples/s  {dt * SHARD_SIZE / n:.2f}s per {SHARD_SIZE}",
+          flush=True)
 
     result_q.put({"cmd": "retrain_done", "ok": True, "error": None,
                   "train_stats": train_stats})

@@ -24,7 +24,7 @@ from chessbot.utils import (
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
-    new_shard_path, write_pkl_gz_shard,
+    new_shard_path, write_pkl_gz_shard, flush_lc0_shards, is_lc0_record,
 )
 from chessbot.opening_counts import (
     COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts,
@@ -60,10 +60,33 @@ BRP_MERGE_EVERY = 512
 # back and the stragglers have had BRP_ROUND_WAIT_S to arrive
 BRP_ROUND_DONE_FRAC = 0.999
 BRP_ROUND_WAIT_S = 180
+# teacher stream: plies neither pool confirmation nor the true-blunder path
+# took, sent to lc0 when the loss is this big and xc0's search disagrees with
+# SF's move (see policy_value_miss). The xc0 sample still trains, at
+# LC0_SENT_XC0_WEIGHT.
+LC0_TEACHER_MIN_CPL = 30
+# weight multiplier on an xc0 sample whose position also went to lc0
+LC0_SENT_XC0_WEIGHT = 0.5
+LC0_TEACHER_TOP_K = 5
+LC0_TEACHER_PV_K = 2
 BRP_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
     "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
 )
+
+
+def policy_value_miss(cm, sf_uci):
+    """SF's move outside xc0's top K by visits or by prior, or top PV_K by
+    prior yet outside the top PV_K by visits -- policy and value disagree."""
+    by_visits = [c['uci'] for c in
+                 sorted(cm, key=lambda c: c['visits'], reverse=True)]
+    by_prior = [c['uci'] for c in sorted(cm, key=lambda c: c['P'], reverse=True)]
+    k, pv_k = LC0_TEACHER_TOP_K, LC0_TEACHER_PV_K
+    return (sf_uci not in by_visits[:k]
+            or sf_uci not in by_prior[:k]
+            or (sf_uci in by_prior[:pv_k] and sf_uci not in by_visits[:pv_k]))
+
+
 PRETRAIN_CONTINUED_CSV = "eval_progress_pretrain_continued.csv"
 # pretraining validated every 20 epochs; the continued file keeps that step
 PRETRAIN_EPOCH_STEP = 20
@@ -254,6 +277,8 @@ class Rescorer(object):
               f"{n} slots occupied")
 
         self.live_buffer = LiveBuffer(cfg.primary_buffer_dir, counts=self.opening_counts)
+        # never flushed on its own; flush_lc0_shards drains it
+        self.lc0_buffer = LiveBuffer(cfg.primary_buffer_dir)
         self.analyzed_results = []
         self.closed = False
 
@@ -493,7 +518,24 @@ class Rescorer(object):
 
     @property
     def training_data_size(self):
-        return len(self.live_buffer)
+        return len(self.live_buffer) + len(self.lc0_buffer)
+
+    def buffered_records(self):
+        """Both buffers as one list, the on-disk live_buffer.pkl form."""
+        return self.live_buffer.records + self.lc0_buffer.records
+
+    def load_buffered_records(self, records):
+        """Split a saved live_buffer.pkl back into the two buffers and write
+        any shards it already fills."""
+        lc0 = [r for r in records if is_lc0_record(r)]
+        xc0 = [r for r in records if not is_lc0_record(r)]
+        self.live_buffer.load_records(xc0)
+        self.lc0_buffer.load_records(lc0, REWEIGHT_INELIGIBLE)
+        return self.flush_buffers()
+
+    def flush_buffers(self):
+        return (self.live_buffer.flush_all_ready()
+                + flush_lc0_shards(self.lc0_buffer))
 
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
@@ -513,7 +555,7 @@ class Rescorer(object):
             self.handle_game_results(gid, results, pool)
         self.maybe_analyse_brp_round()
 
-        flushed = self.live_buffer.flush_all_ready()
+        flushed = self.flush_buffers()
         if flushed:
             n = len(flushed) * self.live_buffer.shard_size
             self.written_this_round += n
@@ -1285,7 +1327,7 @@ class Rescorer(object):
         return out
 
     def ingest_lc0_replay(self, meta):
-        """Turn a returned teacher probe into live_buffer samples.
+        """Turn a returned teacher probe into lc0_buffer samples.
 
         One per ply actually played -- syzygy or a terminal can end the probe
         short of LC0_BRP_PLIES. Straight visits and WDL, weight 1.0, no
@@ -1442,7 +1484,7 @@ class Rescorer(object):
         Y = np.array(wdl, dtype=np.float32)
         record = (self.encode_board(board), None, sparsify_policy(policy),
                   Y, 1.0, 1.0, 'lc0')
-        self.live_buffer.append(record, REWEIGHT_INELIGIBLE)
+        self.lc0_buffer.append(record, REWEIGHT_INELIGIBLE)
         return record
 
     def add_blunder_replay_training_example(self, ply, epoch, best_uci,
@@ -1715,6 +1757,11 @@ class Rescorer(object):
             else:
                 blend_cpl = None
 
+            to_teacher = (not to_lc0 and not sent_to_lc0 and not missed_mate
+                          and loss_this >= LC0_TEACHER_MIN_CPL
+                          and castling_rights_clear(ply['sfen'])
+                          and policy_value_miss(cm, best_uci))
+
             # just FYI if we do any adjustments we need to re-sort.
 
             mvs = [v[0] for v in visits]
@@ -1763,6 +1810,8 @@ class Rescorer(object):
                 # the candidate path already sent this one, with the pending
                 # record attached -- queueing again would duplicate the probe
                 'sent_to_lc0':     bool(sent_to_lc0),
+                'to_teacher':      to_teacher,
+                'loss':            loss_this,
                 'blend_cpl':       blend_cpl,
                 'blunder_cp':      blunder_cp,
                 'equiv':           EQUIV,
@@ -1815,6 +1864,19 @@ class Rescorer(object):
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
                     continue
+
+            sent = aux['sent_to_lc0']
+            if aux['to_teacher']:
+                spec = self.queue_lc0_replay(
+                    game_data, aux, {'xc0_cpl': aux['loss'], 'stream': 'teacher'})
+                if spec is not None:
+                    sc['lc0_queued'] += 1
+                    scw['lc0_queued'] += 1
+                    sent = True
+            # the teacher's samples for this position train at full weight
+            if sent:
+                vwht *= LC0_SENT_XC0_WEIGHT
+                pwht *= LC0_SENT_XC0_WEIGHT
 
             blend_cpl = aux['blend_cpl']
             # z==1 means the mover won despite SF's objection -- trust the

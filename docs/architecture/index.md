@@ -23,7 +23,7 @@ Pages in this section:
 
 - **[Stack Overview](system_overview.md)** — how Python and C++ are layered; the chess-library backend stub
 - **[Search](search.md)** — MCTS in C++: node structure, PUCT selection, caches
-- **[Neural Network](neural_network.md)** — precond-smartgate model, ONNX Runtime + TensorRT inference
-- **[Selfplay Suite](training_pipeline.md)** — GameLooper, StockfishThread, game curriculum
+- **[Neural Network](neural_network.md)** — m137_8c8t model, ONNX Runtime + TensorRT inference
+- **[Selfplay Suite](training_pipeline.md)** — SelfPlayRunner, GameLooper, StockfishThread, game curriculum
 - **[Rescoring & Retraining](evaluation_pipeline.md)** — SF analysis pipeline, training data prep, retrain subprocess
 - **[Review Tools](runtime_and_inference.md)** — GameViewer, RecordKeeper

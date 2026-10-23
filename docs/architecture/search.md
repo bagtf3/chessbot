@@ -29,6 +29,23 @@ score = Q_eff + U
 
 Selection is pruned based on the remaining simulation budget: the tree skips children whose prior falls below a threshold determined by `pruning_factor`, concentrating visits on the most promising moves.
 
+### Sharp Move Boost
+
+Captures and checks are where a policy net most often under-rates a move. The sharp boost guarantees them a look without touching the priors. While a node's visit count is inside `sharp_window` (`[100, 250]`), each **sharp** child (one that is a capture, a check, or both) gets an extra exploration term:
+
+```
+U += u_scale * sharp_boost * sharp * max(0, 1 - N/sharp_M) / (1 + N)
+```
+
+`sharp` is `capture + check` (0–2), so a capturing check gets double. The bonus decays linearly to zero by `sharp_M` visits (10), so it only lifts moves the search has barely explored and then gets out of the way. Live settings are `sharp_boost: 0.05` and `sharp_M: 10.0`.
+
+- **Priors run unencumbered first.** Below 100 visits the node searches on plain PUCT. The boost only checks, once the node is established, that sharp moves got a few visits.
+- **Additive, not multiplicative.** A multiplier on the prior can't be tuned across the prior range (3× of 0.001 is still nothing), so the bonus is added to the prior term.
+- **Applies at any depth**, keyed on each node's own visit count. Sharp flags are tagged lazily, once per node, the first time it enters the window. They are not stored in the cache.
+- **Boosted visits are kept out of training.** Each child counts the visits the boost decided (`boosted_N`), and these are subtracted before the visit distribution becomes a policy target. The net is never trained to imitate the boost itself.
+
+Telemetry reports how often the boost changed a selection (`sharp=` on the PUCT stats line), a per-move `sharp_by_depth` histogram, and per-candidate `boosted` counts in game records. In a live sweep (~1,700 games per arm), `sharp_boost` 0.05 cut selfplay CPL from 7.07 to 6.54 versus no boost. A follow-up sweep over `sharp_M` (5, 10, 20) was flat.
+
 If a forced mate is detected anywhere in the tree, the node sets a `must_visit_uci` flag via an atomic state machine, overriding PUCT to steer all remaining visits toward the mating line.
 
 ## Leaf Collection
@@ -73,6 +90,7 @@ When a move is played, `advance_root(move_uci)` promotes the chosen child to be 
 `MCTSTree` in `mcts_utils.py` extends the C++ `fasttree` with Python-side logic:
 
 - **Simulation scheduling** — sim budget is set per-ply from a dict schedule (e.g., ramp from 1000 at ply 0 to 2800 at ply 45).
+- **Effort scaling** — on top of the ply schedule, each move's sims floor and ceiling are multiplied by a scale from an **effort table**. The table was built offline from ~200k training games by measuring how often an outcome-changing mistake happens in each bin of game phase × |parent Q| × parent draw probability. Bins where Xerces plays worse get more sims; quiet, low-stakes bins get fewer. Scales are clamped to `[0.5×, 2×]`, so the budget moves to where mistakes actually happen rather than growing overall. `effort_alpha` sets how strongly the measured mistake rates are turned into scales (0 = flat).
 - **Early stopping** — checks every `es_check_every` sims using two criteria: robust selection confidence (RSC) and Jensen-Shannon divergence stability of the visit distribution. When either is met, the search stops before the ceiling.
 - **Move sampling** — after search completes, the move to play is sampled from the top-5 candidates using temperature that decays linearly from ply 0 to ply 30.
 - **Dirichlet noise** — added to root priors once per move to encourage exploration.

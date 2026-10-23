@@ -32,7 +32,6 @@ nav:
     - VScale: experimental_features/vscale.md
     - Robust Selection Criteria: experimental_features/rsc.md
     - Prior Temperature Scaling: experimental_features/tempscale.md
-    - Iterative Deepening MCTS: experimental_features/iterative_deepening_mcts.md
   - FAQ: faq.md
   - Setup:
     - setup/index.md

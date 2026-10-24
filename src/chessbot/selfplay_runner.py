@@ -870,6 +870,14 @@ class SelfPlayRunner:
             return
         self.finish_validation_batch()
 
+    def maybe_expire_validation(self):
+        if not self.val_pending or self.val_batch_started_at is None:
+            return
+        elapsed = time.monotonic() - self.val_batch_started_at
+        if elapsed >= self.cfg.validation_max_minutes * 60:
+            self.close_partial_validation_batch(
+                f"timed out after {elapsed / 60:.0f} min")
+
     def drain_results(self):
         """Route finished games. Validation metas are counted here: the
         validation config pins min_game_length to 1, so they cannot vanish
@@ -1266,6 +1274,7 @@ class SelfPlayRunner:
                 self.top_up_queue()
                 self.drain_lc0_specs()
                 self.drain_results()
+                self.maybe_expire_validation()
                 self.tick_rescorer()
                 self.check_retrain()
                 if self.current_epoch == 0 and self.last_validated_epoch != 0:

@@ -159,7 +159,7 @@ class MCTSTree(fasttree):
         xerces_move, xerces_method = self.select_xerces_top_move()
 
         # determine if we need to sample or not
-        if self.config.sample_moves:
+        if not self.config.sample_moves:
             sample = False
 
         elif self.board.piece_count() <= 20:

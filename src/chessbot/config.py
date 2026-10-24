@@ -23,6 +23,9 @@ class Config(object):
     # depth roughly twice as fast.
     validate_every_n_retrains = 5
     validation_games_per_batch = 256
+    # a batch still open after this long is closed and summarised as partial,
+    # so games lost to a dead worker cannot block retraining forever
+    validation_max_minutes = 120
     # epoch 0 only: hold the first validation batch until this many games
     # are done, so the quick selfplay games show up first
     validation_warmup_games = 1000

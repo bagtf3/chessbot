@@ -1012,34 +1012,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../experimental_features/iterative_deepening_mcts/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Iterative Deepening MCTS
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -1354,14 +1326,17 @@
 
 <h1 id="selfplay-suite">Selfplay Suite</h1>
 <h2 id="orchestration">Orchestration</h2>
-<p><code>scripts/run_selfplay.py</code> is the entry point for a training run. It spawns N worker processes and runs a persistent outer loop that manages rescoring, retraining, and validation. Each worker runs <code>child_looper()</code>, which initializes a <code>GameLooper</code> and calls <code>run()</code>.</p>
-<p>Workers communicate with the main process through several multiprocessing queues:</p>
+<p><code>scripts/run_selfplay.py &lt;run_tag&gt;</code> starts a run. All of the run's long-lived state lives in one object, <code>SelfPlayRunner</code> (<code>src/chessbot/selfplay_runner.py</code>), whose main loop does everything on one thread, in order: reap and respawn dead workers, keep the game queue topped up, drain finished games into the rescorer, tick rescoring, and launch or poll a retrain.</p>
+<p><strong>Processes.</strong> The runner manages a small fleet:</p>
 <ul>
-<li><code>recent_q</code> — game results and per-game metadata (W/D/L, sims used, CPL after rescoring)</li>
-<li><code>telemetry_q</code> — per-worker performance metrics (MPS, LPS, batch fill rate, cache hit rate)</li>
-<li><code>pause_q</code> / <code>unpause_q</code> — synchronization signals sent during model reload between retrain epochs</li>
+<li><strong>xc0 workers</strong>: each runs <code>child_looper()</code> → <code>GameLooper</code>, playing many games concurrently with batched GPU inference.</li>
+<li><strong>lc0 worker</strong>: runs the LC0 teacher probes on its own queue (see <a href="../evaluation_pipeline/">Rescoring &amp; Retraining</a>).</li>
+<li><strong>Stockfish rescore threads</strong>: analyze finished games. One extra thread is added automatically while the rescore backlog is deep and retired once it clears.</li>
+<li><strong>Retrain worker</strong>: spawned fresh for each retrain and torn down afterwards.</li>
 </ul>
-<p>The main process also maintains the retrain trigger: when the <code>Rescorer</code> has accumulated enough training examples (<code>retrain_size</code>), it pauses all workers, launches the retrain subprocess, waits for completion, broadcasts the new model path, then unpauses workers.</p>
+<p><strong>One game queue.</strong> Selfplay games, validation games and blunder-replay probes all ride a single FIFO queue that every xc0 worker pulls from. At startup it is seeded in priority order: probes first (they're single-move, so Stockfish has work within seconds), then validation, then selfplay, filled deep enough to bring every worker slot up at once. Workers report finished games and telemetry back on their own queues, and receive pause, unpause and reload commands on a per-worker message queue.</p>
+<p><strong>Retrain boundary.</strong> When the primary buffer fills, the runner spawns the retrain worker, pauses selfplay once the worker is ready, and lets it train only after every worker has released the GPU. When training finishes, the runner re-reads the run's config (so edits take effect at each retrain boundary without a restart), rebuilds the TRT engine, and unpauses the fleet on the new weights. Validation batches and bulk BRP rounds are scheduled off the same retrain counter.</p>
+<p><strong>Unattended runs.</strong> <code>scripts/run_selfplay_loop.py</code> wraps the runner for long campaigns. It runs a tag to its game budget, iterates into the next tag (cloning its config), and relaunches on crashes, silent hangs or stalls, killing orphaned workers and engines first. It halts safely on repeated failures or low disk. An operator console on stdin (<code>stop</code>, pause/resume, worker and Stockfish scaling) stays available throughout.</p>
 <p><img alt="Selfplay telemetry" src="../../images/selfplay_telemetry.JPG" /></p>
 <p>The live telemetry view aggregates across all workers and updates each reporting interval. Key metrics: moves/sec (MPS) and leaf evaluations/sec (LPS) reflect game and NN throughput respectively; games/hour gives the effective data generation rate; cache hit rate shows what fraction of leaf collections were resolved by the C++ priors cache without NN inference; PUCT stats and per-scenario W/D/L breakdowns make it easy to spot if one game type is producing systematically lopsided results.</p>
 <h2 id="gamelooper">GameLooper</h2>
@@ -1381,7 +1356,7 @@
 <p><code>StockfishThread</code> runs a Stockfish engine on a background daemon thread, handling positions that need engine evaluation during selfplay — primarily for games played against Stockfish and for the vs-SF validation rounds.</p>
 <p>Games submit a (game_id, board_fen) pair via <code>submit()</code>. The thread drains its input queue, runs Stockfish to the configured depth, and pushes (game_id, result_tuple) to a response queue. The result tuple contains <code>(eval_cp_stm_pov, best_move_uci, wdl_tuple)</code>. Games poll the response queue at the start of each move.</p>
 <h2 id="game-curriculum">Game Curriculum</h2>
-<p><code>GameGenerator</code> selects starting positions according to a weighted scenario mix configured per run. The active <code>16m_precond</code> curriculum is:</p>
+<p><code>GameGenerator</code> selects starting positions according to a weighted scenario mix configured per run. The mix leans heavily on real openings: half of all games start from the initial position and most of the rest come from opening books and UHO, while the synthetic scenarios are a small minority. The active m137_8c8t curriculum is:</p>
 <table>
 <thead>
 <tr>
@@ -1393,33 +1368,28 @@
 <tbody>
 <tr>
 <td><code>startpos</code></td>
-<td>13%</td>
+<td>50%</td>
 <td>Standard starting position</td>
 </tr>
 <tr>
-<td><code>pre_opened_mini</code></td>
-<td>17.5%</td>
-<td>Short opening lines (&lt;= 2 moves)</td>
-</tr>
-<tr>
 <td><code>UHO</code></td>
-<td>20%</td>
+<td>24%</td>
 <td>Unbalanced Human Openings, white to move at ply 16</td>
 </tr>
 <tr>
 <td><code>pre_opened</code></td>
-<td>18%</td>
+<td>10%</td>
 <td>Longer opening lines (&gt; 2 moves)</td>
 </tr>
 <tr>
-<td><code>random_init</code></td>
-<td>17%</td>
-<td>Random legal position from the opening phase</td>
+<td><code>pre_opened_mini</code></td>
+<td>9%</td>
+<td>Short opening lines (&lt;= 2 moves)</td>
 </tr>
 <tr>
-<td><code>random_middle_game</code></td>
-<td>11.5%</td>
-<td>Random init advanced to ply 20-31</td>
+<td><code>random_init</code></td>
+<td>3%</td>
+<td>Random legal position from the opening phase</td>
 </tr>
 <tr>
 <td><code>piece_odds</code></td>
@@ -1428,7 +1398,7 @@
 </tr>
 <tr>
 <td><code>piece_training</code></td>
-<td>1%</td>
+<td>2%</td>
 <td>Focused endgame piece training positions</td>
 </tr>
 </tbody>

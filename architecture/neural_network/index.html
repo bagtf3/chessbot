@@ -643,10 +643,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#preconditioner-smartgate-architecture" class="md-nav__link">
+  <a href="#m137_8c8t-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Preconditioner-SmartGate Architecture
+        m137_8c8t Architecture
       
     </span>
   </a>
@@ -979,34 +979,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../../experimental_features/iterative_deepening_mcts/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Iterative Deepening MCTS
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -1245,10 +1217,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#preconditioner-smartgate-architecture" class="md-nav__link">
+  <a href="#m137_8c8t-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Preconditioner-SmartGate Architecture
+        m137_8c8t Architecture
       
     </span>
   </a>
@@ -1322,22 +1294,70 @@
 </table>
 <p>Castling rights are folded into the king token in this single-frame encoding — no separate planes are needed. The en passant square gets its own token on the target square, giving the model direct spatial context about which file is eligible. Vocabulary size is 21. This encoding is defined in C++ (pyfastchess) and is fixed across the entire stack.</p>
 <p>The <strong>primary model encoding</strong> (<code>xc0h</code>) stacks 6 of these frames — the current position plus 5 prior positions, oldest padded if the game is younger than that — instead of just the current one. Each frame uses a simplified per-square token (pieces 1-6/7-12 by ownership, no castling folded in, EP token, pad token for missing history), all frozen to the same STM-relative orientation so frames stay spatially aligned across time. The stack is followed by a per-frame repetition flag and 3 metadata scalars (combined castling rights, side to move, halfmove clock), for a flat length of <code>K*64 + K + 3</code> — 393 tokens at <code>history_K=6</code>. This was adopted as the primary architecture after testing showed it outperforming the single-frame, no-history version (see the FAQ: "Do you use history planes?").</p>
-<h2 id="preconditioner-smartgate-architecture">Preconditioner-SmartGate Architecture</h2>
-<p>The active model family is <code>precond-smartgate</code> (<code>build_pt_precond_smartgate</code> in <code>src/chessbot/model.py</code>), currently run against the <code>xc0h</code> history encoding above. It is a PyTorch model trained in float16. The design pairs a convolutional preconditioner with a transformer trunk, and attaches every output head to a dedicated global accumulator token rather than pooling over the board.</p>
-<p><strong>Input and embedding.</strong> The token sequence goes through a token embedding (<code>vocab_size=21 → conv_filters=256</code>) and is reshaped to an 8×8 spatial grid (the history/metadata tail is handled separately from the per-square grid).</p>
-<p><strong>Convolutional preconditioner.</strong> 4 residual conv blocks (<code>pre_blocks=4</code>) run over the 8×8 grid. Each block is <code>LayerNorm → Conv2D(3×3) → LeakyReLU → Conv2D(3×3) → LeakyReLU</code>, added back as a residual (the first block skips the prenorm). This lets local spatial structure resolve before any attention runs.</p>
-<p><strong>Positional concat.</strong> The preconditioned grid is flattened to a (64, 256) sequence and LayerNorm'd, then a learned positional embedding (<code>64 → 256</code>) is <strong>concatenated</strong> (not added), producing a 512-d (<code>D = conv_filters * 2</code>) representation per square. Positional information rides in its own channels instead of being summed into the content.</p>
-<p><strong>Global accumulator tokens.</strong> 8 learned global tokens are appended to the sequence, giving <code>[B, 72, D]</code>. These are the model's read-out registers: after the trunk, each output head reads from its own token instead of pooling the 64 board squares.</p>
-<p><strong>Transformer trunk.</strong> 4 prenorm transformer blocks (<code>num_heads=8</code>) with GELU feed-forwards of width <code>[768, 1024, 1024, 768]</code>. Each block is <code>LayerNorm → MHA → residual</code>, then <code>LayerNorm → Linear → GELU → Linear → residual</code>. A shared <code>trunk_ln</code> LayerNorm closes the trunk. No BatchNorm anywhere — small, variable selfplay batches make it unstable.</p>
-<p><strong>Value head (accumulator 0).</strong> <code>Linear(D → D/2) → GELU → Linear(D/2 → 3)</code> reads token 64, producing raw WDL logits. Trained as a 3-class [win, draw, loss] softmax, STM-POV.</p>
-<p><strong>Policy head — from/to attention (accumulators 2–7).</strong> Two projection towers (<code>Linear(D → 256)</code>) build a 256-d vector per square, each refined by its own 4-head self-attention (<code>from_mha</code>, <code>to_mha</code>) that also attends over policy-specific accumulator tokens. Normal-move logits are the scaled dot products <code>(from · to^T) / sqrt(256)</code> → a (64, 64) matrix flattened to 4096. Underpromotion logits (192, from-file × to-file × piece) come from small <code>promo_from</code>/<code>promo_to</code> projections added to the relevant dot-product sub-block. Concatenated, these give the 4288-slot dense move space.</p>
-<p><strong>SmartGate (accumulator 1) and the 1858 domain.</strong> In parallel, a gated FFN (<code>SiLU</code> gate × up-projection → down-projection residual → RMSNorm → <code>Linear(D → 1858)</code>) reads token 65 and produces one gate logit per <strong>legal-in-some-position</strong> move. The raw 4288 logits are indexed down to the 1858 "sometimes-legal" move slots (<code>build_sometimes_legal_mask</code>), and the gate is applied as <code>logits + logsigmoid(gate)</code>. Because <code>logsigmoid ≤ 0</code>, the gate is <strong>suppress-only</strong> — it can dampen a move but never invent one. Its output bias initializes to 4.0 (<code>logsigmoid(4) ≈ 0</code>), so at init the gate is a near no-op and only learns to veto moves the from/to head over-weights. The model's policy output is these 1858 legal logits; C++ scatters them back into the 4288 flat space.</p>
+<h2 id="m137_8c8t-architecture">m137_8c8t Architecture</h2>
+<p>The active model is <strong>m137_8c8t</strong> (registry key <code>m13-7-8c8t-d256</code>, built by <code>build_pt_expandy_swiglu</code> in <code>src/chessbot/model.py</code>): 8 conv blocks followed by 8 transformer blocks at width <code>D = 256</code>, ~18.4M parameters, reading the <code>xc0h</code> history encoding above. It is a PyTorch model trained under fp16 autocast. LayerNorm is used throughout (an experimental L1.5 norm is available via <code>cfg["norm"]</code>); there is no BatchNorm, since small, variable selfplay batches make it unstable.</p>
+<p><strong>xc0h stem.</strong> Each of the 6 history frames is embedded per square with an 18-d token embedding (15-token vocab). The embedding table is initialized compositionally rather than randomly: every piece row is <code>side + movement primitive</code> (<code>us</code>/<code>them</code> plus <code>pawn</code>, <code>knight</code>, <code>diagonal</code>, <code>orthogonal</code>, <code>king</code>), so a queen starts as <code>diagonal + orthogonal</code>, and the EP token starts as <code>empty + them</code>. The 6 frames are concatenated per square (108 channels) alongside the per-frame repetition flags, a castling-rights embedding (16 states → one learned value per square), side to move and the halfmove clock, each scalar with its own learnable scale. A linear projection + LayerNorm maps this to <code>D - 4 = 252</code> channels, and 4 fixed spatial planes (ones, checkerboard, rank, file) are appended <strong>after</strong> the norm so it cannot flatten their geometry. Each plane has a learnable scale so the convs can mute any that aren't useful. The result is a <code>[B, 256, 8, 8]</code> grid.</p>
+<p><strong>Conv stack (8 blocks).</strong> All conv blocks are prenorm residual blocks over the 8×8 grid, so local spatial structure resolves before any attention runs.</p>
+<ul>
+<li><strong>2 plain blocks</strong>: <code>LN → Conv3×3 → act → Conv3×3 → act</code>, added back to the input.</li>
+<li><strong>6 gated expandy blocks</strong>: each half of the block is a depthwise-separable-style factorization: a <strong>grouped 3×3 conv (4 groups) that expands <code>D → 2D</code></strong>, then a <strong>1×1 pointwise conv back down to <code>D</code></strong>. This buys a wide 512-channel intermediate at a fraction of a dense 3×3's cost. Between the two halves, a 1×1 conv + sigmoid produces a <strong>per-square, per-channel gate</strong> that multiplies the block's output before the residual add, so each block can choose, square by square, how much it writes into the stream.</li>
+</ul>
+<p><strong>Learnable PReLUs.</strong> Every conv activation is a per-channel <code>PReLU</code>. Slopes initialize at 0.03, which makes them exactly the <code>LeakyReLU(0.03)</code> they replaced, so grafting onto an older leaky checkpoint is lossless. They are clamped to <code>[-0.5, 0.5]</code> after every optimizer step (<code>project_params</code>), which keeps any channel from drifting into a linear or sign-flipping regime.</p>
+<p><strong>Positions and global accumulators.</strong> The grid is flattened to 64 square tokens and a learned positional embedding is <strong>added</strong>, scaled by a learnable <code>pos_scale</code>. 8 learned global tokens are then appended, giving a <code>[B, 72, 256]</code> sequence. These are the model's read-out registers: after the trunk, every output head reads from dedicated accumulator tokens instead of pooling the board.</p>
+<table>
+<thead>
+<tr>
+<th>Token</th>
+<th>Read by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>64, 65, 66</td>
+<td>Win, draw and loss heads</td>
+</tr>
+<tr>
+<td>67</td>
+<td>SmartGate</td>
+</tr>
+<tr>
+<td>68</td>
+<td>SmartGate and both policy towers (shared)</td>
+</tr>
+<tr>
+<td>69</td>
+<td>Both policy towers</td>
+</tr>
+<tr>
+<td>70</td>
+<td>From tower only</td>
+</tr>
+<tr>
+<td>71</td>
+<td>To tower only</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Transformer trunk (8 blocks).</strong> All blocks are prenorm: <code>LN → MHA (8 heads) → residual</code>, then <code>LN → FFN → residual</code>. The K projection has no bias, since softmax is shift-invariant per query and a K bias would be dead weight.</p>
+<ul>
+<li><strong>Blocks 1–4 (FF)</strong>: GELU feed-forward, <code>256 → 1024 → 256</code>.</li>
+<li><strong>Blocks 5–8 (SwiGLU)</strong>: <code>down(SiLU(gate(x)) * up(x))</code> with a 1024-wide hidden layer, plus <strong>tanh-gated attention</strong>. The attention output is multiplied by <code>1 + tanh(g(x))</code>, where <code>g</code> is a per-token, per-channel linear map. The gate ranges over <code>(0, 2)</code>, so it can both suppress and <strong>boost</strong> what each token takes from attention. <code>g</code> is zero-initialized, so the gate is exactly 1 at init and the block starts as plain attention.</li>
+</ul>
+<p>Dropout in the trunk is stochastic per site: each attention/FFN dropout site is switched on independently with a set duty probability (<code>set_dropout</code>) rather than always running. A final LayerNorm closes the trunk.</p>
+<p><strong>Value head (tokens 64–66).</strong> Win, draw and loss each get an independent head on their own accumulator: <code>Linear(256 → 64) → GELU → Linear(64 → 1)</code>. The three outputs form the WDL logits, trained as a 3-class softmax, STM-POV.</p>
+<p><strong>Policy head: from/to attention.</strong> Two towers build a 256-d "from" and "to" vector per square. Each tower takes the 64 squares plus its accumulators (68, 69, and 70 or 71), applies a GELU projection residual, then runs a 4-head attention in which the squares query over the squares <strong>and</strong> the accumulators, followed by an output residual. Move logits are the dot products of the normalized from/to vectors, scaled by <code>1/sqrt(256)</code>, giving a 64×64 from-to matrix. Queen, rook and bishop promotions get their own logits: the rank-7 → rank-8 sub-block of that matrix plus small per-piece <code>promo_from</code>/<code>promo_to</code> projections. A knight promotion uses the plain from → to slot. Only the 1858 <strong>sometimes-legal</strong> move slots (<code>build_sometimes_legal_mask</code>) are emitted; C++ scatters them back into the 4288 flat space.</p>
+<p><strong>SmartGate: a learned legality veto.</strong> In parallel, the gate reads tokens 67 and 68 concatenated (512-d) through a GELU FFN (<code>512 → 1024 → 512</code>) with a residual and LayerNorm, then a linear layer to <strong>one shut-logit per move slot</strong> (1858). The policy output is</p>
+<pre><code>policy = move_logits - scale * sigmoid(gate_raw)
+</code></pre>
+<p>Because the subtracted term is always ≥ 0, the gate is <strong>suppress-only</strong>: it can push a move down but never invent one. Both knobs are learnable and clamped after every step. The per-move bias lives in <code>[0, 5]</code> and starts at 4.0 (<code>sigmoid(4) ≈ 0.98</code>, mostly shut). The global <code>scale</code> lives in <code>[0, 12]</code> and starts at 1.0. At init the gate therefore applies a near-uniform shift that softmax ignores, and it earns its scale as it learns legality.</p>
+<p><strong>Gate loss.</strong> The gate has its own supervised objective: a BCE on <code>gate_raw</code> predicting <strong>illegality</strong>, with any move the policy target gives visits to counted as legal (every legal move carries a 1-visit floor). Legal moves are up-weighted 5× and the weights are renormalized per position. The gate loss is held at <strong>5% of the main (policy + value) loss</strong>. Once it falls below 5.0 its share shrinks proportionally, so a well-trained gate stops competing with the main objective.</p>
+<p><strong>Diagnostics.</strong> In training, the model can track hotspot statistics (peak activations and where they occur) at the policy dot products, the FFN and SwiGLU down-projections, and the residual stream. It also keeps 500-step EMAs of gate mean, spread and range for both the conv gates and the attention gates. These feed the gate-health readout in the retrain logs and add no host syncs outside print cadence.</p>
 <p>The value used elsewhere (<code>nn_value</code>) is derived in C++ as <code>win - loss</code>. Policy post-processing — softmax over legal moves, <code>uniform_eps</code> blending, <code>prior_clip_max</code> clamping — is handled in C++ (<code>build_priors</code>) after raw logits are inserted into the raw cache.</p>
 <h2 id="onnx-runtime-tensorrt-inference">ONNX Runtime + TensorRT Inference</h2>
 <p>Inference runs through ONNX Runtime with the TensorRT execution provider (<code>src/chessbot/infer_ort_trt.py</code>), the <code>ort_trt</code> backend. TensorFlow has been removed from the active path (old Keras/TF architectures are quarantined in <code>legacy_models.py</code>).</p>
-<p>After each retrain, <code>prepare_trt()</code> exports the current TorchScript model to ONNX (<code>export_ts_to_onnx</code>, input <code>enc_in: [B, 64]</code> int64) and stages it in the run's TRT cache. Workers then call <code>make_ort_trt_infer()</code>, which builds an ORT <code>InferenceSession</code> with:</p>
+<p>After each retrain, <code>prepare_trt()</code> exports the current TorchScript model to ONNX (<code>export_ts_to_onnx</code>, input <code>enc_in: [B, 393]</code> int64 for xc0h) and stages it in the run's TRT cache. Workers then call <code>make_ort_trt_infer()</code>, which builds an ORT <code>InferenceSession</code> with:</p>
 <ul>
-<li><code>TensorrtExecutionProvider</code> — fp16 enabled, 4 GB workspace, fixed shape profile (<code>enc_in:1x64</code> min, <code>{max_bs}x64</code> opt/max). Compiled engines are cached to disk keyed by the sha256[:12] of the ONNX bytes, so subsequent sessions load the engine instead of paying the multi-minute compile. TRT is required, not a fallback — the session raises if it doesn't come up on TRT.</li>
+<li><code>TensorrtExecutionProvider</code> — fp16 enabled, 4 GB workspace, fixed shape profile (<code>enc_in:1x393</code> min, <code>{max_bs}x393</code> opt/max). Compiled engines are cached to disk keyed by the sha256[:12] of the ONNX bytes, so subsequent sessions load the engine instead of paying the multi-minute compile. TRT is required, not a fallback — the session raises if it doesn't come up on TRT.</li>
 </ul>
 <p><code>infer(pair)</code> casts the board batch to int64, runs the session for <code>policy_logits</code> and <code>value_out</code>, and softmaxes the WDL logits on the CPU, returning <code>(logits [B, 1858], wdl [B, 3])</code>. <code>pt_eager</code> (raw PyTorch) remains available for debugging and as the retrain backend; both expose the same <code>(logits, wdl)</code> interface, so the selfplay loop is inference-backend-agnostic.</p>
 <p>A third backend, <code>lc0_trt</code>, swaps in a distilled Leela network over the same TRT machinery — see the <a href="../evaluation_pipeline/">rescoring pipeline</a> for how LC0 is used as a distillation teacher.</p>

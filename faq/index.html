@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://bagtf3.github.io/chessbot/faq/">
       
       
-        <link rel="prev" href="../experimental_features/iterative_deepening_mcts/">
+        <link rel="prev" href="../experimental_features/tempscale/">
       
       
         <link rel="next" href="../setup/">
@@ -897,34 +897,6 @@
 
               
             
-              
-                
-  
-  
-  
-  
-    <li class="md-nav__item">
-      <a href="../experimental_features/iterative_deepening_mcts/" class="md-nav__link">
-        
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Iterative Deepening MCTS
-  
-
-    
-  </span>
-  
-  
-
-      </a>
-    </li>
-  
-
-              
-            
           </ul>
         </nav>
       
@@ -1043,21 +1015,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#has-it-ever-beaten-stockfish" class="md-nav__link">
+  <a href="#how-does-it-do-against-stockfish" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Has it ever beaten Stockfish?
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#leela" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Leela?
+        How does it do against Stockfish?
       
     </span>
   </a>
@@ -1397,21 +1358,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#has-it-ever-beaten-stockfish" class="md-nav__link">
+  <a href="#how-does-it-do-against-stockfish" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Has it ever beaten Stockfish?
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#leela" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Leela?
+        How does it do against Stockfish?
       
     </span>
   </a>
@@ -1538,13 +1488,10 @@
 things work is to build it myself. It's also fun to be able to experiment with new ideas on my own project.</p>
 <hr />
 <h2 id="how-strong-is-it">How strong is it?</h2>
-<p>I estimate around 3050 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs 8-10 centipawn loss on average.</p>
+<p>I estimate around 3300 Elo (human scale) based on validation runs against Stockfish at fixed depth (12, 15, 20 plies, etc). In competition mode it runs 5-6 centipawn loss on average.</p>
 <hr />
-<h2 id="has-it-ever-beaten-stockfish">Has it ever beaten Stockfish?</h2>
-<p>Yes, once.</p>
-<hr />
-<h2 id="leela">Leela?</h2>
-<p>Not even close.</p>
+<h2 id="how-does-it-do-against-stockfish">How does it do against Stockfish?</h2>
+<p>Xerces is validated against Stockfish every 10 model retrains, in paired games from UHO openings (each position played as both colors). It is currently scoring ~0.4/1.0 against Stockfish 17.1 at depth 15.</p>
 <hr />
 <h2 id="why-train-on-a-single-gpu-instead-of-cloud-compute">Why train on a single GPU instead of cloud compute?</h2>
 <p>That's intentional. Part of the appeal of the project is the constraint — figuring out how much strength you can get out of a limited hardware budget is more interesting than throwing resources at the problem. The design decisions throughout the stack (efficient board encoding, aggressive caching, adaptive early stopping, prior fudging) all exist because compute is tight.</p>
@@ -1561,7 +1508,7 @@ things work is to build it myself. It's also fun to be able to experiment with n
 </ul>
 <hr />
 <h2 id="how-fast-does-it-run">How fast does it run?</h2>
-<p>On the RTX 2080, the ~15.8M parameter precond-smartgate network is served in fp16 through ONNX Runtime + TensorRT. With the <code>MCTSForest</code> batching leaf encoding across all active games, selfplay sustains around 40,000 leaves per second, of which roughly 21,000 per second actually reach the network. The gap is absorbed before inference: the C++ priors cache resolves repeated positions, terminal nodes need no evaluation, and matelock's must-visit leaves are forced without a fresh prediction. That works out to roughly 750 games per hour of training; validation vs Stockfish is about 100 games per hour.</p>
+<p>On the RTX 2080, the ~18.4M parameter m137_8c8t network is served in fp16 through ONNX Runtime + TensorRT. With the <code>MCTSForest</code> batching leaf encoding across all active games, selfplay sustains around 40,000 leaves per second, of which roughly 21,000 per second actually reach the network. The gap is absorbed before inference: the C++ priors cache resolves repeated positions, terminal nodes need no evaluation, and matelock's must-visit leaves are forced without a fresh prediction. That works out to roughly 750 games per hour of training; validation vs Stockfish is about 100 games per hour.</p>
 <hr />
 <h2 id="can-i-play-against-xerces">Can I play against Xerces?</h2>
 <hr />
@@ -1569,7 +1516,7 @@ things work is to build it myself. It's also fun to be able to experiment with n
 <p>Mostly because I think its cool!</p>
 <hr />
 <h2 id="whats-next-for-the-project">What's next for the project?</h2>
-<p>More selfplay. I think the <code>better data -&gt; better search -&gt; better model -&gt; better data</code> loop is still progressing (slowly). Beyond that, the iterative deepening MCTS experiment is in progress, and the rescoring pipeline continues to be tuned as the model improves.</p>
+<p>More selfplay. I think the <code>better data -&gt; better search -&gt; better model -&gt; better data</code> loop is still progressing (slowly). Beyond that, the rescoring pipeline continues to be tuned as the model improves.</p>
 <hr />
 <h2 id="whats-the-biggest-thing-youve-learned-building-this">What's the biggest thing you've learned building this?</h2>
 <ol>

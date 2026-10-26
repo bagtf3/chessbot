@@ -1,0 +1,167 @@
+"""
+Epoch x all uplift, split by move-changed and by improved/not-improved.
+
+Sourced from the per-epoch probe_e*.csv files on disk, not the live pool:
+the pool's own probes[] only survives for positions that haven't been
+evicted, so it silently loses history the moment a position is solved.
+The CSVs are the permanent record -- every probe that ever ran, regardless
+of what later happened to that position in the pool.
+
+Scoped to --run_tags like probe_table.py: epoch is only meaningful within
+one model lineage's continuous retrain counter, so globbing every run dir
+on disk would silently mix epochs from unrelated model families.
+
+  python pairwise.py --run_tags 18m_10c6t_SWA_selfplay1
+  python pairwise.py --run_tags 18m_10c6t_SWA_selfplay0 18m_10c6t_SWA_selfplay1
+"""
+import argparse
+import glob
+import itertools
+import json
+import os
+import re
+
+import numpy as np
+import pandas as pd
+
+from chessbot import SP_DIR
+from chessbot.blunder_replay import BRP_EQUIV_CPL, BRP_LAST_SEEN_MIN
+
+from probe_table import trim_rows
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--run_tags", nargs="+", required=True)
+args = ap.parse_args()
+
+seen = {}
+epoch_fens = {}
+for tag in args.run_tags:
+    pattern = os.path.join(SP_DIR, tag, "blunder_probe", "probe_e*.csv")
+    for path in sorted(glob.glob(pattern)):
+        epoch = int(re.search(r"_e(\d+)_", path).group(1))
+        df = pd.read_csv(path)
+        epoch_fens.setdefault(epoch, []).extend(df['short_fen'])
+        for row in df.itertuples(index=False):
+            seen.setdefault(row.short_fen, {})[epoch] = {
+                'move': row.probe_move, 'cpl': row.probe_cpl,
+            }
+
+CLEARED_REASONS = {'found_equiv', 'found_equiv_retroactive', 'same_equiv'}
+cleared_fens = set()
+_data_dir = os.path.dirname(os.path.normpath(SP_DIR))
+for _ev in glob.glob(os.path.join(_data_dir, '*_evicted.jsonl')):
+    with open(_ev, encoding='utf-8') as _f:
+        for _line in _f:
+            _rec = json.loads(_line)
+            if _rec.get('reason') in CLEARED_REASONS:
+                cleared_fens.add(_rec['short_fen'])
+
+epochs = sorted({e for v in seen.values() for e in v})
+print(f'positions with any probe : {len(seen)}')
+print(f'epochs                   : {epochs}')
+print(f'probed 2+ times          : {sum(1 for v in seen.values() if len(v) > 1)}')
+print(f'cleared (equiv) loaded   : {len(cleared_fens)}\n')
+
+
+def pairs_for(a, b):
+    return [(v[a], v[b]) for v in seen.values() if a in v and b in v]
+
+
+def ci95(x):
+    n = len(x)
+    if n < 2:
+        return float('nan')
+    return 1.96 * np.std(x, ddof=1) / np.sqrt(n)
+
+
+def arrow(before, after):
+    return f'{before.mean():.1f} -> {after.mean():.1f}'
+
+
+def delta_ci(before, after):
+    d = after - before
+    return f'{d.mean():+.1f} +/- {ci95(d):.1f}'
+
+
+def pct_plain(mask):
+    return f'{100 * mask.mean():.1f}%'
+
+
+def pct_ci(mask):
+    return f'{100 * mask.mean():.1f}% +/- {100 * ci95(mask.astype(float)):.1f}%'
+
+
+def row(label, pairs, summary=False):
+    n = len(pairs)
+    before = np.array([x['cpl'] for x, y in pairs], dtype=float)
+    after = np.array([y['cpl'] for x, y in pairs], dtype=float)
+    diff_mv = np.array([x['move'] != y['move'] for x, y in pairs])
+    improved = after < before
+    equiv = after <= BRP_EQUIV_CPL
+
+    equiv_cell = pct_plain(equiv)
+
+    if summary:
+        cpl_cell = delta_ci(before, after)
+        cpl_diff_cell = (delta_ci(before[diff_mv], after[diff_mv])
+                         if diff_mv.any() else '')
+        diff_cell = pct_plain(diff_mv)
+        improved_cell = pct_plain(improved)
+        cpl_imp_cell = (delta_ci(before[improved], after[improved])
+                        if improved.any() else '')
+        cpl_not_imp_cell = (delta_ci(before[~improved], after[~improved])
+                            if (~improved).any() else '')
+    else:
+        cpl_cell = arrow(before, after)
+        cpl_diff_cell = arrow(before[diff_mv], after[diff_mv]) if diff_mv.any() else ''
+        diff_cell = pct_plain(diff_mv)
+        improved_cell = pct_plain(improved)
+        cpl_imp_cell = arrow(before[improved], after[improved]) if improved.any() else ''
+        cpl_not_imp_cell = (arrow(before[~improved], after[~improved])
+                            if (~improved).any() else '')
+
+    return {
+        'split': label, 'n': str(n), 'cpl': cpl_cell, 'diff': diff_cell,
+        'cpl (diff)': cpl_diff_cell, 'improved': improved_cell,
+        'equiv': equiv_cell,
+        'cpl (improved)': cpl_imp_cell, 'cpl (!improved)': cpl_not_imp_cell,
+    }
+
+
+current_epoch = max(epochs)
+
+# same cooldown gate as BRP's own probe_is_due: an epoch that hasn't rested
+# BRP_LAST_SEEN_MIN retrains yet hasn't had a chance to be re-probed, so its
+# "x all" row would be near-empty and misleading -- skip it, don't even pool.
+rows = []
+for a in epochs[:-1]:
+    if current_epoch - a <= BRP_LAST_SEEN_MIN:
+        continue
+    pooled = [p for b in epochs if b > a for p in pairs_for(a, b)]
+    if pooled:
+        r = row(f'{a} x all', pooled)
+        fens_a = epoch_fens.get(a, [])
+        n_ret = sum(1 for f in fens_a if f in cleared_fens)
+        r["ret'd"] = f'{n_ret} ({100*n_ret/len(fens_a):.0f}%)' if fens_a else '-'
+        rows.append(r)
+
+# collapse the middle of the per-epoch block before the summaries are
+# appended -- those span every pair, so nothing trimmed here is lost
+rows = trim_rows(pd.DataFrame(rows)).to_dict('records')
+
+everything = [p for a, b in itertools.combinations(epochs, 2)
+              for p in pairs_for(a, b)
+              if current_epoch - a > BRP_LAST_SEEN_MIN]
+r_all = row('all x all', everything)
+r_all["ret'd"] = ''
+rows.append(r_all)
+r_sum = row('mean +/- CI', everything, summary=True)
+r_sum["ret'd"] = ''
+rows.append(r_sum)
+
+cols = ['split', 'n', 'cpl', 'diff', 'cpl (diff)', 'improved',
+       'equiv', "ret'd", 'cpl (improved)', 'cpl (!improved)']
+widths = {c: max(len(c), max(len(r[c]) for r in rows)) for c in cols}
+print(' | '.join(c.center(widths[c]) for c in cols))
+for r in rows:
+    print(' | '.join(r[c].center(widths[c]) for c in cols))

@@ -1,26 +1,32 @@
-# try to get ahead of TF GPU mem management
 import os
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["XLA_FLAGS"] = '--xla_gpu_cuda_data_dir="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8"'
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"
+from pathlib import Path
+from dotenv import load_dotenv
 
-# global mixed precision policy
-from tensorflow.keras import mixed_precision
-mixed_precision.set_global_policy('mixed_float16')
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
+# ORT TRT needs CUDA 12 DLLs (cublas64_12, cublasLt64_12, cudart64_12) — lc0 ships them.
+# Torch lib provides cudnn64_9. Both dirs must be on PATH before any ORT session is created.
+lc0_loc = os.getenv("LC0_LOC", "")
+if lc0_loc:
+    lc0_dir = str(Path(lc0_loc).parent)
+    if lc0_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = lc0_dir + os.pathsep + os.environ.get("PATH", "")
 
 try:
-    import tensorflow as tf
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        for g in gpus:
-            tf.config.experimental.set_memory_growth(g, True)
-except Exception as e:
-    print(f"Error setting TF GPU mem: {e}")
-    
-SF_LOC = "C://Users/Bryan/stockfish-windows-x86-64-avx2/stockfish/stockfish-windows-x86-64-avx2.exe"
-ENDGAME_LOC = "C:/Users/Bryan/Data/chessbot_data/endgame_tables"
-SP_DIR = "C:/Users/Bryan/Data/chessbot_data/selfplay_runs/"
-MODEL_DIR = "C:/Users/Bryan/Data/chessbot_data/models/"
+    import torch
+    torch_lib = str(Path(torch.__file__).parent / "lib")
+    if torch_lib not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass
+
+SF_LOC      = os.getenv("SF_LOC", "")
+LC0_LOC     = os.getenv("LC0_LOC", "")
+LC0_WEIGHTS = os.getenv("LC0_WEIGHTS", "")
+ENDGAME_LOC = os.getenv("ENDGAME_LOC", "")
+SP_DIR = os.getenv("SP_DIR", "")
+MODEL_DIR = os.getenv("MODEL_DIR", "")
+CUTECHESS_CLI_LOC = os.getenv("CUTECHESS_CLI_LOC", "")
 
 import chess
 WHITE_WINNING_WHITE_MOVE = chess.Board("rn5N/p2p3p/b2k3n/5p2/1p2P3/8/PPPP1PPP/RNBQKB1R w KQ - 1 12")

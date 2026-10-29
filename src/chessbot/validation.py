@@ -63,7 +63,15 @@ def create_validation_config(cfg, yaml_file=None, verbose=True):
         previous_run_tag=vcfg.previous_run_tag
     )
 
-    if prev_last is not None:
+    if vcfg.validation_freeze_depth is not None:
+        vcfg.sf_index = next(
+            (i for i, row in enumerate(vcfg.sf_table)
+             if row["depth"] >= vcfg.validation_freeze_depth),
+            len(vcfg.sf_table) - 1,
+        )
+        vcfg.sf_validation_depth = vcfg.sf_table[vcfg.sf_index]['depth']
+        vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
+    elif prev_last is not None:
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
 
     if verbose:
@@ -121,6 +129,15 @@ def find_last_history_entry_for_run(run_dir, selfplay_dir=None, previous_run_tag
 
     print(f"{V} no validation history found.")
     return None
+
+
+def count_history_batches(run_dir):
+    """Validation batches recorded in this run's own history file."""
+    path = os.path.join(run_dir, HISTORY_FILENAME)
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as fh:
+        return sum(1 for line in fh if line.strip())
 
 
 def continue_depth_from_previous_cfg(cfg, last_entry):
@@ -241,7 +258,9 @@ def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
 
     dominant = (n >= min_games) and (score > 0.72)
 
-    if dominant or consec >= 2:
+    if cfg_dict.get("validation_freeze_depth") is not None:
+        action = "frozen"
+    elif dominant or consec >= 2:
         if index < (len(table) - 1):
             bumped = True
             action = "bumped_depth_dominant" if dominant else "bumped_depth"

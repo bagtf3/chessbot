@@ -372,6 +372,10 @@ class Rescorer(object):
             blunder_replay_dir(cfg), BRP_REVIEWABLES_FILENAME)
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
+        self.qmm_probe_jsonl = os.path.join(cfg.run_dir, QMM_PROBE_FILENAME)
+        self.n_qmm_probe = count_jsonl_lines(self.qmm_probe_jsonl)
+        self.qmm_probe_val_jsonl = os.path.join(cfg.run_dir, QMM_PROBE_VAL_FILENAME)
+        self.n_qmm_probe_val = count_jsonl_lines(self.qmm_probe_val_jsonl)
         self.brp_expected = 0
         self.brp_wait_start = None
 
@@ -1938,6 +1942,7 @@ class Rescorer(object):
         self.analyzed_results.append(out)
         self.games_processed += 1
         self.write_lean_record(game_state, cpl_by_ply)
+        self.write_qmm_probe(game_state, out_df)
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
         if self.games_processed % STATS_WINDOW_GAMES == 0:
@@ -1951,6 +1956,57 @@ class Rescorer(object):
         """Keep the fat record for review. Later this may fold in KL/CPL/RMS(Q)
         signal; for now paired validation plus a flat sample rate."""
         return (scenario == 'paired_validation') or (random.random() < REVIEW_RATE)
+
+    def write_qmm_probe(self, game_state, out_df):
+        """Qmm study data: every root child at every ply, joined to the SF
+        verdict, plus the game's qmm_params arm and result. One jsonl row per
+        game; paired validation games go to their own file. One cap covers
+        both files."""
+        if self.n_qmm_probe + self.n_qmm_probe_val >= QMM_PROBE_GAMES:
+            return
+        header = game_state['header']
+        is_val = header.get('scenario') == 'paired_validation'
+        path = self.qmm_probe_val_jsonl if is_val else self.qmm_probe_jsonl
+
+        sf = {int(r.move_num): r for r in out_df.itertuples()}
+        plies = []
+        for i, node in enumerate(game_state['plies']):
+            cands = node.get('candidate_moves') or []
+            if not cands or 'Qmm' not in cands[0]:
+                continue
+            r = sf.get(i)
+            plies.append({
+                'ply': i, 'abs_ply': node.get('abs_ply'), 'stm': node.get('stm'),
+                'move_played': node.get('move_played'),
+                'xc0_move': node.get('xc0_move'),
+                'sel_method': node.get('sel_method'),
+                'sims': node.get('sims'), 'stop_reason': node.get('stop_reason'),
+                'sf_best': r.best_move if r is not None else None,
+                'sf_best_cp': r.best_cp if r is not None else None,
+                'cpl': r.delta if r is not None else None,
+                'qmm_stats': node.get('qmm_stats'),
+                'played_pv_len': node.get('played_pv_len'),
+                'children': [
+                    [c['uci'], c['visits'], c['Q'], c['Qmm'], c['Qmm_N'], c['P'],
+                     c.get('qmm_new_bests'), c.get('qmm_gap12'), c.get('qmm_depth'),
+                     c.get('forced'), c.get('boosted')]
+                    for c in cands],
+            })
+        if not plies:
+            return
+
+        row = {'game_id': header['game_id'], 'scenario': header.get('scenario'),
+               'ts': time.time(), 'qmm_params': header.get('qmm_params'),
+               'result': header.get('result'),
+               'vs_stockfish': header.get('vs_stockfish'),
+               'stockfish_color': header.get('stockfish_color'),
+               'plies': plies}
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row, default=float) + '\n')
+        if is_val:
+            self.n_qmm_probe_val += 1
+        else:
+            self.n_qmm_probe += 1
 
     def write_lean_record(self, game_state, cpl_by_ply):
         """Transform the fat {header, plies} into the on-disk retrain-ready
@@ -2661,6 +2717,9 @@ def blend_wdl(z_stm, best_wdl_white_pov, is_white):
 
 
 REVIEW_RATE = 0.005
+QMM_PROBE_GAMES = 30000
+QMM_PROBE_FILENAME = "qmm_probe.jsonl"
+QMM_PROBE_VAL_FILENAME = "qmm_probe_val.jsonl"
 
 
 def policy_from_raw_visits(raw_visits, prior_clip_max):

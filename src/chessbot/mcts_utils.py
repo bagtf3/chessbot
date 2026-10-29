@@ -16,6 +16,7 @@ from chessbot.utils import rnd
 
 POLICY_DIM = 1858
 TABLEBASE = None
+PLAYED_PV_MAX = 64
 
 
 def build_raw_visits_sparse(board, ucis, visits):
@@ -94,6 +95,9 @@ class MCTSTree(fasttree):
         self.set_sharp_boost(
             int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)
         )
+
+        blend, force, gate = cfg.qmm_params
+        self.set_qmm_params(float(blend), bool(force), bool(gate))
 
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
@@ -544,9 +548,10 @@ class ChessGame(object):
         # keep a small list of items for gameplay checking
         self.recents.append((mv, Q_stm, Q_white, best_q, turn, resign_q))
 
-        # boost-decided visits are left out of the policy target
+        # boost- and Qmm-force-decided visits are left out of the policy target
         ucis = [cd.uci for cd in details]
-        visits = [cd.N - cd.boosted_N for cd in details]
+        visits = [cd.N - cd.boosted_N - cd.forced_N for cd in details]
+        qs = self.tree.qmm_stats()
 
         data = {
             "abs_ply": self.board.history_size(),
@@ -565,6 +570,17 @@ class ChessGame(object):
             "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "sharp_by_depth": list(self.tree.sharp_by_depth()),
+            "qmm_stats": {
+                "root_new_bests": qs.root_new_bests,
+                "root_last_new_best": qs.root_last_new_best,
+                "leader_flips": qs.leader_flips,
+                "last_leader_flip": qs.last_leader_flip,
+                "forces_set": qs.forces_set, "forces_fired": qs.forces_fired,
+                "forces_replaced": qs.forces_replaced,
+                "forces_blocked": qs.forces_blocked,
+                "forces_overridden": qs.forces_overridden,
+                "forced_by_depth": list(self.tree.forced_by_depth()),
+            },
             "children_visited": visited_children,
             "total_children": total_children,
         }
@@ -581,6 +597,9 @@ class ChessGame(object):
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
                 "boosted": cd.boosted_N,
+                "Qmm": rnd(cd.Qmm, 4), "Qmm_N": cd.Qmm_N,
+                "qmm_new_bests": cd.qmm_new_bests, "qmm_gap12": rnd(cd.qmm_gap12, 4),
+                "qmm_depth": cd.qmm_depth, "forced": cd.forced_N,
                 "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),
                 "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }
@@ -600,6 +619,10 @@ class ChessGame(object):
         
         # attach PV snapshot (may be empty if no deeper visited chain exists)
         data["pv"] = pv
+        # most-visited chain under the move actually played, root move included
+        data["played_pv_len"] = (
+            0 if method == "stockfish"
+            else len(self.tree.principal_variation(PLAYED_PV_MAX, mv)))
 
         self.tree_data[self.plies] = data
 

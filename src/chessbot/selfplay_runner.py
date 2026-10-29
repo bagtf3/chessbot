@@ -40,7 +40,7 @@ from chessbot.utils import format_time, make_jsonable, next_model_epoch
 
 from chessbot.validation import (
     build_validation_summary_from_rows, create_validation_config,
-    print_validation_info
+    print_validation_info, count_history_batches
 )
 
 import chessbot.replay_buffer as rb
@@ -766,6 +766,8 @@ class SelfPlayRunner:
         already probed this epoch count against the quota, so a restart
         mid-round tops it up instead of sending a second round."""
         epoch = self.current_epoch
+        if not self.cfg.use_blunder_replay:
+            return 0
         if not self.blunder_pool or epoch % BRP_BULK_EVERY != BRP_BULK_OFFSET:
             return 0
         n_retired = self.rescorer.retire_failed(self.blunder_pool, epoch)
@@ -809,6 +811,11 @@ class SelfPlayRunner:
             return
         if (self.current_epoch == 0
                 and self.total_games < self.cfg.validation_warmup_games):
+            return
+        # a capped run never supersedes its open batch
+        cap = self.cfg.validation_max_batches
+        if cap and (self.val_pending
+                    or count_history_batches(self.cfg.run_dir) >= cap):
             return
         if self.val_pending:
             self.close_partial_validation_batch("superseded by next cadence")

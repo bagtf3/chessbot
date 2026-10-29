@@ -675,7 +675,7 @@ class GameViewer:
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
             ("|", 1),
-            ("Q", 7), ("Qe", 7), ("dS", 7), ("D", 6),
+            ("Q", 7), ("Qe", 7), ("dS", 7), ("D", 6), ("Qmm", 7), ("Nmm", 6),
             ("|", 1),
             ("P", 7), ("U", 7), ("PUCT", 8),
             ("|", 1),
@@ -737,9 +737,15 @@ class GameViewer:
             ds_txt = f"{c.get('Qdelta_sign', 0.0):^+7.3f}"
             draw_txt = f"{c.get('Q_draw', float('nan')):^6.3f}"
             puct_txt = f"{q + u:^+8.3f}"
+            if "Qmm" in c:
+                qmm_txt = f"{c['Qmm'] * sign:^+7.3f}"
+                nmm_txt = f"{c.get('Qmm_N', 0):^6}"
+            else:
+                qmm_txt, nmm_txt = f"{'':7}", f"{'':6}"
         else:
             q_txt = f"{fpu_q:^+7.3f}" if fpu_q is not None else f"{'':7}"
             qema_txt, ds_txt, draw_txt = f"{'':7}", f"{'':7}", f"{'':6}"
+            qmm_txt, nmm_txt = f"{'':7}", f"{'':6}"
             puct_txt = (f"{fpu_q + u:^+8.3f}" if fpu_q is not None
                         else f"{'':8}")
             flags.append("FPU")
@@ -749,7 +755,7 @@ class GameViewer:
         parts = [
             f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
             "|",
-            q_txt, qema_txt, ds_txt, draw_txt,
+            q_txt, qema_txt, ds_txt, draw_txt, qmm_txt, nmm_txt,
             "|",
             f"{p:^7.3f}", f"{u:^+7.3f}", puct_txt,
             "|",

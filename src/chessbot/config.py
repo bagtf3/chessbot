@@ -29,12 +29,18 @@ class Config(object):
     # epoch 0 only: hold the first validation batch until this many games
     # are done, so the quick selfplay games show up first
     validation_warmup_games = 1000
+    # 0 = unlimited; otherwise stop after this many validation batches
+    validation_max_batches = 0
+    # pin the SF depth and never bump it (a side-chain test stream); None = ladder
+    validation_freeze_depth = None
     n_workers = 2
 
     # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
     # its own queue and is counted separately from the selfplay workers.
     n_lc0_workers = 0
     telemetry_kind = "xc0"
+    # xc0 blunder replay bulk rounds; False skips them entirely
+    use_blunder_replay = True
 
     # per-game parameter sampling; resolved once per game in the main process.
     # each entry: param_name: [list of options to pick from].
@@ -134,6 +140,9 @@ class Config(object):
     sharp_boost = 0.0
     qema_span = 40
     qdelta_span = 100
+    # [blend, force, gate]: Q_eff = (1-blend)*Q + blend*Qmm; force sends a visit
+    # to each new Qmm leader; gate needs 5 completed backups to join Qmm
+    qmm_params = [0.0, False, False]
     # randomness
     add_root_noise = True
     dirichlet_eps = 0.3

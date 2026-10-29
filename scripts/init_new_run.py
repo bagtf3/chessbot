@@ -2,7 +2,7 @@
 init_new_run.py
 
 Usage:
-  python init_new_run.py <run_tag> [--clone <existing_run_tag>]
+  python init_new_run.py <run_tag> [--clone <existing_run_tag>] [--keep-source]
   python init_new_run.py --iterate <current_run_tag>
 
 Simple: create run_dir, write config.yaml and validation_config.yaml.
@@ -85,7 +85,14 @@ def main():
                     help="delete replay_buffer/primary_buffer from the clone "
                          "source after copying (live_buffer.pkl is "
                          "already moved, not copied)")
+    p.add_argument("--keep-source", action="store_true",
+                    help="copy live buffer, sf_cache and opening_counts instead "
+                         "of moving them, so the clone source stays runnable")
     args = p.parse_args()
+    if args.keep_source and (args.do_cleanup or args.iterate):
+        p.error("--keep-source cannot be combined with --do-cleanup or --iterate")
+    carry = shutil.copy2 if args.keep_source else shutil.move
+    carry_verb = "copied" if args.keep_source else "moved"
 
     if args.iterate:
         if args.run_tag or args.clone:
@@ -260,27 +267,20 @@ def main():
                     print(f"[clone] copied {copied} TRT profile/timing cache "
                           f"file(s) from {clone_tag}/{trt_name}")
 
-        # move the untrained carryover if present, gz or the older plain pkl
+        # move (or with --keep-source copy) the untrained carryover if
+        # present, gz or the older plain pkl
         import chessbot.replay_buffer as rb
         src_remaining = rb.find_live_buffer(src_dir)
         if src_remaining:
             name = os.path.basename(src_remaining)
-            shutil.move(src_remaining, os.path.join(dest_dir, name))
-            print(f"[clone] moved {name} from {clone_tag}")
+            carry(src_remaining, os.path.join(dest_dir, name))
+            print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
-        # move sf_cache.pkl.gz if present
-        src_sf_cache = os.path.join(src_dir, "sf_cache.pkl.gz")
-        if os.path.exists(src_sf_cache):
-            dst_sf_cache = os.path.join(dest_dir, "sf_cache.pkl.gz")
-            shutil.move(src_sf_cache, dst_sf_cache)
-            print(f"[clone] moved sf_cache.pkl.gz from {clone_tag}")
-
-        # move opening_counts.npz if present
-        src_opening_counts = os.path.join(src_dir, "opening_counts.npz")
-        if os.path.exists(src_opening_counts):
-            dst_opening_counts = os.path.join(dest_dir, "opening_counts.npz")
-            shutil.move(src_opening_counts, dst_opening_counts)
-            print(f"[clone] moved opening_counts.npz from {clone_tag}")
+        for name in ("sf_cache.pkl.gz", "opening_counts.npz"):
+            src_path = os.path.join(src_dir, name)
+            if os.path.exists(src_path):
+                carry(src_path, os.path.join(dest_dir, name))
+                print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
         # copy the progress csvs unless suppressed. Both must travel together:
         # Rescorer.migrate_pretrain_progress treats "continued file missing"

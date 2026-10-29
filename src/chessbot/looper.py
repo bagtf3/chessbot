@@ -517,6 +517,11 @@ class GameLooper(object):
             if param == 'move_sample_temp_range' and isinstance(val, list):
                 mem_summary['move_sample_temp_min'] = val[0]
                 mem_summary['move_sample_temp_max'] = val[1]
+            elif param == 'qmm_params':
+                mem_summary[param] = ','.join(str(v) for v in val)
+                mem_summary['qmm_blend'] = float(val[0])
+                mem_summary['qmm_force'] = bool(val[1])
+                mem_summary['qmm_gate'] = bool(val[2])
             elif isinstance(val, list):
                 mem_summary[param] = ','.join(str(v) for v in val)
             else:

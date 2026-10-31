@@ -33,6 +33,10 @@ SPM_EMA_SPAN = 3
 # priors-cache fields that accumulate in C++ rather than reading as a gauge
 CACHE_COUNTERS = ("queries", "hits", "evictions")
 
+# matches try_break in pyfastchess collect_many_leaves: one leaf per descent,
+# so a call that returns this many leaves was cut off by the descent cap
+COLLECT_DESCENT_CAP = 1000
+
 
 class GameLooper(object):
     """
@@ -276,7 +280,6 @@ class GameLooper(object):
         """
 
         cfg = self.config
-        max_fastpath = 1024
         mps = self.mps
 
         # nn macro batch
@@ -340,11 +343,14 @@ class GameLooper(object):
                         g.set_stockfish_result(res_tup)
 
             bonus = 0
+            filled = 0
             finished = []
-            mbs_used = []
             self.forest.resolve_all_inflight()
             for game in self.active_games[:cfg.games_at_once]:
-                g_mbs = game.config.micro_batch
+                base_mbs = game.config.micro_batch
+                g_mbs = base_mbs
+                if game.config.dynamic_mbs:
+                    g_mbs = game.tree.effective_mbs(base_mbs)
                 sf_terminal, mcts_terminal = False, False
 
                 # if its stockfish turn, check if the move is ready
@@ -386,15 +392,27 @@ class GameLooper(object):
 
                 # if bonus available we can bump our microbatch up by at most 2
                 this_mbs = g_mbs + max(0, min(bonus, 2))
-                res = game.tree.collect_many_leaves(this_mbs, max_fastpath)
-                nn, n_leafs = self.process_results(res, counts, this_mbs)
+
+                # trim to the room left in the nn batch; that game closes the pass
+                room = macro - filled
+                last = this_mbs >= room
+                if last:
+                    this_mbs = room
+
+                res = game.tree.collect_many_leaves(this_mbs)
+                nn, n_leafs = self.process_results(
+                    res, counts, this_mbs, g_mbs > base_mbs)
                 mbs_used.append(this_mbs)
+                filled += nn
 
                 # update bonus, could go up or down
                 bonus += g_mbs - nn
 
                 # update sim count
                 game.tree.sims_completed_this_move += n_leafs
+
+                if last:
+                    break
 
             keys_np, enc_np = self.batch_encoder()
             if len(keys_np):
@@ -406,7 +424,7 @@ class GameLooper(object):
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
                 self.infer_gaps.clear()
-                counts.clear(); pred_fill.clear()
+                counts.clear(); pred_fill.clear(); mbs_used.clear()
             
             if finished:
                 finished_ids.update(finished)
@@ -414,7 +432,7 @@ class GameLooper(object):
         self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=True)
         return 0
 
-    def process_results(self, res, counts, mbs):
+    def process_results(self, res, counts, asked, doubled):
         nn = res.count_new
         nt = res.count_terminal
         nc = res.count_cached
@@ -434,13 +452,13 @@ class GameLooper(object):
         self.lps.tick(n_leafs)
 
         fastpaths = nt + nc
-        f_stop, c_stop = 0, 1
-        if nn < mbs:
-            f_stop, c_stop = 1, 0
+        f_stop = int(n_leafs >= COLLECT_DESCENT_CAP)
+        # came back with fewer new leaves than asked: blocked or early stop
+        short = int(not f_stop and nn < asked)
 
         counts.append([
-            nn, fastpaths, nt, nc, f_stop, c_stop,
-            bl, pu, mv, sk, pr, pen, dp, sh
+            nn, fastpaths, nt, nc, f_stop, short,
+            bl, pu, mv, sk, pr, pen, dp, sh, int(doubled)
         ])
 
         return nn, n_leafs
@@ -519,9 +537,9 @@ class GameLooper(object):
                 mem_summary['move_sample_temp_max'] = val[1]
             elif param == 'qmm_params':
                 mem_summary[param] = ','.join(str(v) for v in val)
-                mem_summary['qmm_blend'] = float(val[0])
-                mem_summary['qmm_force'] = bool(val[1])
-                mem_summary['qmm_gate'] = bool(val[2])
+                mem_summary['qmm_force'] = bool(val[0])
+                mem_summary['qmm_gate'] = int(val[1])
+                mem_summary['qmm_gap_block'] = float(val[2])
             elif isinstance(val, list):
                 mem_summary[param] = ','.join(str(v) for v in val)
             else:
@@ -576,11 +594,11 @@ class GameLooper(object):
         if counts:
             col = np.array(counts, dtype=np.int64).sum(axis=0)
         else:
-            col = np.zeros(14, dtype=np.int64)
+            col = np.zeros(15, dtype=np.int64)
 
         (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
-         s_collect_stops, s_blocked, s_puct, s_must_visit, s_skipped,
-         s_pruned, s_penalty, s_depth, s_sharp) = (int(v) for v in col)
+         s_short, s_blocked, s_puct, s_must_visit, s_skipped,
+         s_pruned, s_penalty, s_depth, s_sharp, s_doubled) = (int(v) for v in col)
 
         # rate() is destructive, so each meter is read exactly once here
         raw_mps = self.mps.rate()
@@ -598,6 +616,7 @@ class GameLooper(object):
             "spm": self.spm_ema,
             "mbs": np.mean(mbs_used) if mbs_used else 0.0,
             "apl": np.mean(lpb) if lpb else 0.0,
+            "n_preds": len(lpb),
             "infer_gap": np.mean(self.infer_gaps) if self.infer_gaps else 0.0,
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
@@ -605,13 +624,15 @@ class GameLooper(object):
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
             "n_groups": len(counts),
+            "calls_per_s": len(counts) / window_s if window_s > 0 else 0.0,
 
             "s_collected": s_collected,
             "s_fast": s_fast,
             "s_terminals": s_terminals,
             "s_cached": s_cached,
             "s_fast_stops": s_fast_stops,
-            "s_collect_stops": s_collect_stops,
+            "s_short": s_short,
+            "s_doubled": s_doubled,
 
             "s_blocked": s_blocked,
             "s_puct": s_puct,

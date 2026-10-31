@@ -102,7 +102,7 @@ def sampleable_cols(rd, fname="config.yaml"):
         if param == "move_sample_temp_range":
             cols += ["move_sample_temp_min", "move_sample_temp_max"]
         elif param == "qmm_params":
-            cols += ["qmm_params", "qmm_blend", "qmm_force", "qmm_gate"]
+            cols += ["qmm_params", "qmm_force", "qmm_gate", "qmm_gap_block"]
         else:
             cols.append(param)
     return cols

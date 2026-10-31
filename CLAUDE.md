@@ -21,7 +21,7 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - `src/chessbot/rescore.py` — post-hoc SF analysis, training data prep, rescoring
 - `src/chessbot/review.py` — `GameViewer`, `RecordKeeper`, lc0 review tools
 - `src/chessbot/config.py` — `Config` class (yaml/json/dict loadable)
-- `src/chessbot/model.py` — all model architectures (active: `build_pt_precond_smartgate`)
+- `src/chessbot/model.py` — all model architectures
 - `src/chessbot/utils.py` — `GameGenerator`, scoring utils, SF helpers
 - `scripts/run_selfplay.py` — main orchestrator (multi-process workers, retrain loop)
 - `scripts/retrain_worker.py` — subprocess target for model retraining
@@ -90,8 +90,6 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`) with:
 ## Validation Ladder
 - Paired games from UHO positions (each played as both colors)
 - Score > 0.5 vs Stockfish fixed depth → increment depth
-- 16m_precond family started from pretrained checkpoint at 16 CPL (SF: Threads=1, Hash=256)
-
 ## Coding Conventions
 - All Q values are white-POV in C++; Python flips with `sign = 1 if white_to_move else -1`
 - STM-POV value = `Q_white * sign`
@@ -107,5 +105,19 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`) with:
 - Comments/docstrings describe the current state of the code only — never reference what it used to do, what changed, or "now"/"anymore" framing. A reader with zero history should never hit a comment that only makes sense if they know the prior version. Changelog-type info goes in the commit message or chat, not inline.
 - No Unicode characters outside ASCII in print statements or log output — Windows subprocesses use cp1252 and will crash on characters like arrows or other non-ASCII symbols. Use ASCII equivalents (e.g. `->` not `->`).
 
+## Working Rules
+- Manual mode: no autonomy. Every action (reads, searches, tool calls, edits) goes
+  through the user's approval. Never switch modes (plan mode, worktrees, anything)
+  without explicit permission. A question like "do you want plan mode?" is not
+  permission.
+- Wait for orders: do exactly what is asked. For any concern or scope change, state it
+  with a proposed fix and ask first. Never scout or prep unasked.
+
 ## Chat Response Format
-User is dyslexic. During iterative status-update style responses (reporting what changed, asking something, flagging a concern, saying what's next), structure with visual headers: `=== DONE ===`, `=== OPEN ===`, `=== FLAGGED ===`, `=== NEXT ===`, each with terse bullet points. Omit a section entirely if empty rather than writing "none". Don't force this onto short direct answers or already-tabular output.
+User is dyslexic. During iterative status-update style responses (reporting what changed, asking something, flagging a concern, saying what's next), structure with visual headers, each with terse bullet points:
+- `=== DONE ===`: summary of what was done.
+- `=== FLAGGED ===`: use sparingly, only for real problems: something is wrong or an issue is expected.
+- `=== OPEN ===`: strictly open questions or decisions about items in DONE or FLAGGED. Don't stretch to fill it.
+- `=== NEXT ===`: next steps. Leave it out unless the user asks; they will ask in a follow-up when they want next steps.
+
+Omit a section entirely if empty rather than writing "none". Don't force this onto short direct answers or already-tabular output.

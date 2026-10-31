@@ -131,15 +131,6 @@ def find_last_history_entry_for_run(run_dir, selfplay_dir=None, previous_run_tag
     return None
 
 
-def count_history_batches(run_dir):
-    """Validation batches recorded in this run's own history file."""
-    path = os.path.join(run_dir, HISTORY_FILENAME)
-    if not os.path.exists(path):
-        return 0
-    with open(path, "r", encoding="utf-8") as fh:
-        return sum(1 for line in fh if line.strip())
-
-
 def continue_depth_from_previous_cfg(cfg, last_entry):
     """
     If last_entry contains a depth or depth_index, set cfg.sf_index to

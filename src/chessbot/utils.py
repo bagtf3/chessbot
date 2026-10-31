@@ -1100,6 +1100,9 @@ def order_stat_rows(stats):
     )
 
 
+LOG_WIDTH = 79
+
+
 def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
     """
     Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
@@ -1115,7 +1118,7 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
         f"{'scenario':<20} {'sf':<6} {'N':>6} "
         f"{'W':>6} {'D':>6} {'L':>6}   {'avg_plies':>10}"
     )
-    print("-" * 64)
+    print("-" * LOG_WIDTH)
     for (scenario, bucket), s in rows:
         avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
         print(
@@ -1123,7 +1126,7 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
             f"{s['W']:>6} {s['D']:>6} {s['L']:>6}  "
             f"{avg:>10.1f}"
         )
-    print("-" * 64)
+    print("-" * LOG_WIDTH)
 
     # bot vs Stockfish summary (score: W=1, D=0.5, L=0)
     total = sf_overall["N"]
@@ -1145,7 +1148,7 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
             key=lambda kv: (-kv[1], kv[0]),
         ):
             print(f"  {s:<30} {c}")
-    print("~" * 60)
+    print("~" * LOG_WIDTH)
 
 
 def ema_step(prev, x, span):

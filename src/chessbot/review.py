@@ -9,8 +9,8 @@ RECENT_GAMES_CAP = 20000
 # telemetry dict. Only these get scaled onto the print's span.
 COUNTER_KEYS = (
     "n_groups", "s_collected", "s_fast", "s_terminals", "s_cached",
-    "s_fast_stops", "s_collect_stops", "s_blocked", "s_puct", "s_must_visit",
-    "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp",
+    "s_fast_stops", "s_short", "s_doubled", "s_blocked", "s_puct", "s_must_visit",
+    "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp", "n_preds",
 )
 from collections import defaultdict, deque
 
@@ -29,7 +29,7 @@ from chessbot.engines import lc0_analyze
 from chessbot.game_utils import reconcile_game_boards
 from chessbot.utils import (
     print_summary_from_stats, accumulate_game_stats,
-    format_time, compact_count,
+    compact_count, LOG_WIDTH,
 )
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_clipped, score_to_value_stm_pov,
@@ -675,9 +675,9 @@ class GameViewer:
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
             ("|", 1),
-            ("Q", 7), ("Qe", 7), ("dS", 7), ("D", 6), ("Qmm", 7), ("Nmm", 6),
+            ("Q", 7), ("Qe", 7), ("dS", 7), ("D", 6), ("Qmm", 7),
             ("|", 1),
-            ("P", 7), ("U", 7), ("PUCT", 8),
+            ("P", 7), ("P_raw", 7), ("U", 7), ("PUCT", 8),
             ("|", 1),
             ("flags", 9),
         ]
@@ -720,6 +720,7 @@ class GameViewer:
 
         sign = 1 if self.board.white_to_move() else -1
         p = c.get("P", 0.0)
+        p_raw_txt = f"{c['P_raw']:^7.3f}" if "P_raw" in c else f"{'':7}"
         u = c.get("U", 0.0)
 
         flags = []
@@ -737,15 +738,12 @@ class GameViewer:
             ds_txt = f"{c.get('Qdelta_sign', 0.0):^+7.3f}"
             draw_txt = f"{c.get('Q_draw', float('nan')):^6.3f}"
             puct_txt = f"{q + u:^+8.3f}"
-            if "Qmm" in c:
-                qmm_txt = f"{c['Qmm'] * sign:^+7.3f}"
-                nmm_txt = f"{c.get('Qmm_N', 0):^6}"
-            else:
-                qmm_txt, nmm_txt = f"{'':7}", f"{'':6}"
+            qmm_txt = (f"{c['Qmm'] * sign:^+7.3f}" if "Qmm" in c
+                       else f"{'':7}")
         else:
             q_txt = f"{fpu_q:^+7.3f}" if fpu_q is not None else f"{'':7}"
             qema_txt, ds_txt, draw_txt = f"{'':7}", f"{'':7}", f"{'':6}"
-            qmm_txt, nmm_txt = f"{'':7}", f"{'':6}"
+            qmm_txt = f"{'':7}"
             puct_txt = (f"{fpu_q + u:^+8.3f}" if fpu_q is not None
                         else f"{'':8}")
             flags.append("FPU")
@@ -755,9 +753,9 @@ class GameViewer:
         parts = [
             f"{san:<7}", f"{visits:^6}", f"{visit_share:^7.3f}",
             "|",
-            q_txt, qema_txt, ds_txt, draw_txt, qmm_txt, nmm_txt,
+            q_txt, qema_txt, ds_txt, draw_txt, qmm_txt,
             "|",
-            f"{p:^7.3f}", f"{u:^+7.3f}", puct_txt,
+            f"{p:^7.3f}", p_raw_txt, f"{u:^+7.3f}", puct_txt,
             "|",
             f"{flags_txt:^9}",
         ]
@@ -809,10 +807,11 @@ class GameViewer:
 
         visits_list = [c.get("visits", 0) for c in cands]
         priors_list = [c.get("P", 0.0) for c in cands]
+        raw_list = [c.get("P_raw", c.get("P", 0.0)) for c in cands]
 
         norm_vis, p_vis = self.compute_norm_entropy(visits_list)
         norm_pri, p_pri = self.compute_norm_entropy(priors_list)
-        kl = kl_divergence(visits_list, priors_list)
+        kl = kl_divergence(visits_list, raw_list)
 
         r_sf = self.sf_row_for_ply(self.ply)
         nn_wdl    = node.get('nn_wdl')
@@ -1195,10 +1194,8 @@ class GameViewer:
             if not cands:
                 continue
             visits_list = [c.get("visits", 0) for c in cands]
-            priors_list = [c.get("P", 0.0) for c in cands]
-            _, p_vis = self.compute_norm_entropy(visits_list)
-            _, p_pri = self.compute_norm_entropy(priors_list)
-            kl = kl_divergence(visits_list, priors_list)
+            raw_list = [c.get("P_raw", c.get("P", 0.0)) for c in cands]
+            kl = kl_divergence(visits_list, raw_list)
             if kl >= threshold:
                 self.goto(ply)
                 print(f"Found KL={kl:.3f} at ply {ply + 1}")
@@ -2224,11 +2221,12 @@ class RecordKeeper(object):
 
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
-            "s_terminals", "s_cached", "s_fast_stops", "s_collect_stops",
-            "s_blocked", "s_puct", "preds_per_second",
+            "s_terminals", "s_cached", "s_fast_stops", "s_short", "s_doubled",
+            "s_blocked", "s_puct", "preds_per_second", "calls_per_s",
 
             "s_must_visit",
             "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp",
+            "n_preds",
 
             # priors cache (per-worker) telemetry, aggregate across workers
             "cache_size", "cache_capacity", "cache_queries", "cache_hits"
@@ -2238,7 +2236,7 @@ class RecordKeeper(object):
         sum_seen = set()
 
         to_avg = ["mbs", "batch_target", "apl", "infer_gap", "pred_wait",
-                  "avg_ply", "spm", "cache_hit_ema"]
+                  "avg_ply", "spm", "cache_hit_ema", "n_active"]
         avged = defaultdict(list)
         avg_seen = set()
 
@@ -2281,7 +2279,7 @@ class RecordKeeper(object):
         gph =  3600 * self.games_finished / (now - self._run_start)
         
         print()
-        print(f" Epoch {self.n_retrains} Logging ".center(72, "~"))
+        print(f" Epoch {self.n_retrains} Logging ".center(LOG_WIDTH, "~"))
         
         mps, lps = summed.get("mps", 0), summed.get("lps", 0)
         print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}")
@@ -2289,12 +2287,13 @@ class RecordKeeper(object):
         print(
             f"[game stats]  finished={self.games_finished}  "
             f"W/D/L={self.white_wins}/{self.draws}/{self.black_wins}  "
-            f"avg_len={avg_moves:.1f} moves")
-        print("-" * 72)
+            f"draw={100 * self.draws / max(1, self.games_finished):.2f}%  "
+            f"avg plies={avg_moves:.1f}")
+        print("-" * LOG_WIDTH)
 
         if not self.games_finished:
             print("(no games to break down)")
-            print("~" * 72)
+            print("~" * LOG_WIDTH)
             self.log_lc0_stats()
             self.log_loop_stats(summed, avged)
             return
@@ -2361,7 +2360,8 @@ class RecordKeeper(object):
         s_terminals = summed.get("s_terminals", 0)
         s_cached = summed.get("s_cached", 0)
         s_fast_stops = summed.get("s_fast_stops", 0)
-        s_collect_stops = summed.get("s_collect_stops", 0)
+        s_short = summed.get("s_short", 0)
+        s_doubled = summed.get("s_doubled", 0)
         s_blocked = summed.get("s_blocked", 0)
         s_puct = summed.get("s_puct", 0)
         s_depth = summed.get("s_depth", 0)
@@ -2378,16 +2378,11 @@ class RecordKeeper(object):
         pct_cached_overall = 100.0 * s_cached / max(1, total_overall)
         pct_term_overall = 100.0 * s_terminals / max(1, total_overall)
 
-        f_stops_pct = 100.0 * s_fast_stops / max(1, n_groups)
-        collect_stops_pct = 100.0 * s_collect_stops / max(1, n_groups)
-
-        mbs = avged["mbs"]
-        print("-" * 72)
-        left1 = f"[loop stats] groups={n_groups:.0f}  mbs={mbs:.1f}"
-        right1 = f"new: collected={s_collected:.0f} avg={avg_new:.2f}"
-
-        left2 = f"[stop stats] fastpath_stops={s_fast_stops:.0f} ({f_stops_pct:.2f}%)"
-        right2 = f"collect_stops={s_collect_stops:.0f} ({collect_stops_pct:.2f}%)"
+        fp_pct = 100.0 * s_fast_stops / n_groups
+        short_pct = 100.0 * s_short / n_groups
+        doubled_pct = 100.0 * s_doubled / n_groups
+        n_preds = summed.get("n_preds", 0)
+        games_per_pass = n_groups / n_preds if n_preds else 0.0
 
         apl = avged["apl"]
         infer_gap = avged.get("infer_gap", 0.0)
@@ -2401,57 +2396,63 @@ class RecordKeeper(object):
             duty_cycle = pred_wait / cycle_time
         realized_preds_per_sec = duty_cycle * preds_per_sec
 
-        left3 = f"[pred stats] batch={apl:.1f}  duty={duty_cycle * 100:.1f}%"
-        right3 = f"gap={infer_gap:.3f}s wait={pred_wait:.3f}s"
-
-        left3b = f"[pred stats] actual preds/s={realized_preds_per_sec:.1f}"
-        right3b = f"ideal preds/s={preds_per_sec:.1f}"
-
-        puct_per_leaf = s_puct / total_overall if total_overall else 0.0
-        avg_depth = s_depth / total_overall if total_overall else 0.0
-        blocked_pct = 100.0 * s_blocked / (s_blocked + s_collected) if (s_blocked + s_collected) > 0 else 0.0
-        left4 = f"[puct stats] blocked={s_blocked:.0f} ({blocked_pct:.3f}%)"
-        right4 = (
-            f"evals={compact_count(s_puct)}  evals/leaf={puct_per_leaf:.1f}"
-            f"  avg_depth={avg_depth:.1f}"
-        )
+        per_leaf = 1.0 / total_overall if total_overall else 0.0
+        puct_per_leaf = s_puct * per_leaf
+        avg_depth = s_depth * per_leaf
+        blocked_pct = 100.0 * s_blocked / max(1, s_blocked + s_collected)
+        sharp_pct = 100.0 * s_sharp * per_leaf
+        must_pct = 100.0 * s_must_visit * per_leaf
 
         tot_skip = s_skipped + s_pruned
         avoided_r = tot_skip / s_puct if s_puct else 0.0
         skip_to_prune = s_skipped / s_pruned if s_pruned else 0.0
-        avoid_per_leaf = tot_skip / total_overall if total_overall else 0.0
-        left5 = f"[puct stats] avoidance={avoided_r:.3f}  s/p={skip_to_prune:.1f}"
-        sharp_pct = 100.0 * s_sharp / total_overall if total_overall else 0.0
-        right5 = (f"avoid/leaf={avoid_per_leaf:.1f}  must_visit={s_must_visit:.0f}"
-                  f"  sharp={compact_count(s_sharp)} ({sharp_pct:.2f}%)")
-
-        left6 = f"[cache hits] cached={s_cached:.0f} ({pct_cached_overall:.3f}%)"
-        right6 = f"terminals={s_terminals:.0f} ({pct_term_overall:.3f}%)"
+        avoid_per_leaf = tot_skip * per_leaf
 
         # EMA of the live rate, not the run average: this should move when
         # validation or a hard probe changes what the search is doing
         sims_per_move = avged.get("spm", 0.0)
-
         n_active = summed["n_active"]
         avg_ply = avged["avg_ply"]
-        left7 = f"[game stats] n={n_active:.0f}  avg ply={avg_ply:.2f}"
-        right7 = f"sims per move={sims_per_move:.2f}"
-
-        col_width = 40
-        print(f"{left1:<{col_width}} | {right1}")
-        print(f"{left2:<{col_width}} | {right2}")
-        print(f"{left3:<{col_width}} | {right3}")
-        print(f"{left3b:<{col_width}} | {right3b}")
-        print(f"{left4:<{col_width}} | {right4}")
-        print(f"{left5:<{col_width}} | {right5}")
-        print(f"{left6:<{col_width}} | {right6}")
-        print(f"{left7:<{col_width}} | {right7}")
 
         last50 = list(self.recent_games)[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
-        avg_runtime = None
+        runtime = ""
         if sum(durations) > 0:
-            avg_runtime = format_time(np.mean(durations))
-            if avg_runtime:
-                print(f"[game stats] last 50 runtime: {avg_runtime}")
-        print("-" * 72)
+            m, s = divmod(int(np.mean(durations)), 60)
+            h, m = divmod(m, 60)
+            runtime = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+        def row(tag, left, right=()):
+            # (label, value) pairs; label/value widths per slot, left then right
+            cells = [f"{k:<{kw}}{v:<{vw}}" for (k, v), kw, vw
+                     in zip(left, (8, 12), (8, 8))]
+            cells += [f"{k:<11}{v:<7}" for k, v in right]
+            line = f"[{tag:<5}]  " + "".join(cells[:2]) + "| " + "".join(cells[2:])
+            print(line.rstrip())
+
+        print("-" * LOG_WIDTH)
+        row("total", [("puct", compact_count(s_puct)),
+                      ("leaves", compact_count(total_overall))],
+            [("new leaves", compact_count(s_collected))])
+        row("loop", [("calls/s", f"{summed.get('calls_per_s', 0.0):.0f}"),
+                     ("games/pass", f"{games_per_pass:.1f}")],
+            [("asked/got", f"{avged['mbs']:.2f} / {avg_new:.2f}")])
+        row("stops", [("short", f"{short_pct:.1f}%"), ("fp", f"{fp_pct:.2f}%")],
+            [("2x calls", f"{doubled_pct:.1f}%")])
+        row("cache", [("cached", f"{pct_cached_overall:.1f}%"),
+                      ("terminal", f"{pct_term_overall:.1f}%")])
+        row("pred", [("fill", f"{apl:.1f}"), ("duty", f"{duty_cycle * 100:.1f}%")],
+            [("preds/s",
+              f"{realized_preds_per_sec:.0f} / {preds_per_sec:.0f}")])
+        row("pred", [("gap", f"{infer_gap:.3f}s"), ("wait", f"{pred_wait:.3f}s")])
+        row("skip", [("avoid", f"{avoided_r:.2f}"),
+                     ("skip:prune", f"{skip_to_prune:.0f}")],
+            [("must_visit", f"{must_pct:.1f}%"),
+             ("avoid/leaf", f"{avoid_per_leaf:.0f}")])
+        row("puct", [("depth", f"{avg_depth:.1f}"),
+                     ("evals/leaf", f"{puct_per_leaf:.0f}")],
+            [("blocked", f"{blocked_pct:.1f}%"), ("sharp", f"{sharp_pct:.1f}%")])
+        row("games", [("active", f"{n_active:.0f}"), ("avg_ply", f"{avg_ply:.1f}")],
+            [("sims/move", f"{sims_per_move:.0f}")]
+            + ([("last50", runtime)] if runtime else []))
+        print("-" * LOG_WIDTH)

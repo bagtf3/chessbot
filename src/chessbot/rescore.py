@@ -744,6 +744,9 @@ class Rescorer(object):
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
+        outcomes = deviation_outcomes(
+            plies, board_ch.turn, result, cfg.value_bootstrap_at_sample)
+
         # (ply_idx, board_copy, xerces_uci) queued for SF analysis
         to_sf_positions = []
         # walk each move: route SF moves, build ply state
@@ -754,13 +757,14 @@ class Rescorer(object):
             tr = plies[i]
             tr['stm'] = bool(turn)
             tr['z_wdl'] = z_to_wdl(result if turn else -result)
-            tr['wdl_target'] = blend_wdl_stm(result if turn else -result,
-                                              tr.get('best_wdl'))
+            outcome = outcomes[i] if turn else outcomes[i][::-1].copy()
+            tr['wdl_target'] = blend_wdl_stm(outcome, tr.get('best_wdl'))
             cm = tr.get('candidate_moves', [])
             if cm:
                 tr['policy'] = policy_from_raw_visits(tr['raw_visits'], 0.95)
                 tr['kl'] = float(kl_divergence(
-                    [c['visits'] for c in cm], [c['P'] for c in cm]))
+                    [c['visits'] for c in cm],
+                    [c.get('P_raw', c['P']) for c in cm]))
             else:
                 tr['policy'] = []
                 tr['kl'] = 0.0
@@ -1771,12 +1775,12 @@ class Rescorer(object):
             mvs = [v[0] for v in visits]
             vis = [v[1] for v in visits]
 
-            priors_map = {c['uci']: c['P'] for c in cm}
+            priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
             vwht = value_weight_for_game(cfg, is_draw)
             pwht = value_weight_for_game(cfg, is_draw)
-            kl = kl_divergence(priors, vis)
+            kl = kl_divergence(vis, priors)
             rows[-1][-2] = kl
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
             self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
@@ -1987,7 +1991,7 @@ class Rescorer(object):
                 'qmm_stats': node.get('qmm_stats'),
                 'played_pv_len': node.get('played_pv_len'),
                 'children': [
-                    [c['uci'], c['visits'], c['Q'], c['Qmm'], c['Qmm_N'], c['P'],
+                    [c['uci'], c['visits'], c['Q'], c['Qmm'], c['P'],
                      c.get('qmm_new_bests'), c.get('qmm_gap12'), c.get('qmm_depth'),
                      c.get('forced'), c.get('boosted')]
                     for c in cands],
@@ -2694,12 +2698,30 @@ def z_to_wdl(z_stm):
     return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
-def blend_wdl_stm(z_stm, best_wdl_stm):
-    """Blend the game result and search WDL, both in STM perspective."""
-    z_wdl = z_to_wdl(z_stm)
+def blend_wdl_stm(outcome_wdl_stm, best_wdl_stm):
+    """Blend an outcome WDL and the search WDL, both in STM perspective."""
     if best_wdl_stm is None:
-        return z_wdl
-    return (0.5 * z_wdl + 0.5 * np.asarray(best_wdl_stm, dtype=np.float32))
+        return outcome_wdl_stm
+    return (0.5 * outcome_wdl_stm + 0.5 * np.asarray(best_wdl_stm, dtype=np.float32))
+
+
+def deviation_outcomes(plies, white_first, result, bootstrap):
+    """White-POV outcome WDL per ply. With bootstrap, a sampled move that
+    differed from Xerces's choice ends a segment: that ply and every ply
+    before it, back to the previous such move, take the search WDL from just
+    before the sampled move instead of the game result."""
+    carry = z_to_wdl(result)
+    out = [None] * len(plies)
+    for i in range(len(plies) - 1, -1, -1):
+        p = plies[i] or {}
+        bw = p.get('best_wdl')
+        if (bootstrap and bw is not None and p.get('xc0_move')
+                and p.get('sel_method') == 'sampled'):
+            bw = np.asarray(bw, dtype=np.float32)
+            white = white_first if i % 2 == 0 else not white_first
+            carry = bw if white else bw[::-1].copy()
+        out[i] = carry
+    return out
 
 
 def blend_wdl(z_stm, best_wdl_white_pov, is_white):

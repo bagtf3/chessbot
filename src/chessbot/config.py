@@ -29,8 +29,6 @@ class Config(object):
     # epoch 0 only: hold the first validation batch until this many games
     # are done, so the quick selfplay games show up first
     validation_warmup_games = 1000
-    # 0 = unlimited; otherwise stop after this many validation batches
-    validation_max_batches = 0
     # pin the SF depth and never bump it (a side-chain test stream); None = ladder
     validation_freeze_depth = None
     n_workers = 2
@@ -75,6 +73,7 @@ class Config(object):
     games_at_once = 128
     micro_batch = 4
     macro_batch = 256
+    dynamic_mbs = False  # 2x micro_batch past half the sims ceiling
 
     max_game_length = 200
     min_game_length = 5
@@ -140,9 +139,10 @@ class Config(object):
     sharp_boost = 0.0
     qema_span = 40
     qdelta_span = 100
-    # [blend, force, gate]: Q_eff = (1-blend)*Q + blend*Qmm; force sends a visit
-    # to each new Qmm leader; gate needs 5 completed backups to join Qmm
-    qmm_params = [0.0, False, False]
+    # [force, gate, gap_block]: force sends a visit to each new Qmm leader; gate
+    # is the completed backups a child needs to join Qmm (0 = 1); gap_block
+    # vetoes tier1/tier2 stops while the leader's STM Qmm - Q < -gap_block (0 = off)
+    qmm_params = [False, 0, 0.0]
     # randomness
     add_root_noise = True
     dirichlet_eps = 0.3
@@ -157,6 +157,8 @@ class Config(object):
     adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
     draw_value_scale = 1.0        # per-sample value weight for drawn games (decisive = 1.0)
     vscale = 0.9
+    # value outcome before a sampled deviation = search WDL at that deviation
+    value_bootstrap_at_sample = False
     contempt_zero_q  = 0.0
     contempt_full_q  = 0.5
     contempt_fight_c = 0.0

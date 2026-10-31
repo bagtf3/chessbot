@@ -40,7 +40,7 @@ from chessbot.utils import format_time, make_jsonable, next_model_epoch
 
 from chessbot.validation import (
     build_validation_summary_from_rows, create_validation_config,
-    print_validation_info, count_history_batches
+    find_last_history_entry_for_run, print_validation_info
 )
 
 import chessbot.replay_buffer as rb
@@ -409,6 +409,10 @@ class SelfPlayRunner:
         migrate_pretrain_progress(cfg.run_dir)
 
         self.current_epoch = next_model_epoch(cfg.progress_csv_path)
+        # an epoch already in this run's history is never validated again
+        last_val = find_last_history_entry_for_run(cfg.run_dir)
+        if last_val is not None:
+            self.last_validated_epoch = last_val.get("model_epoch")
         self.recorder = RecordKeeper(self.current_epoch, every_sec=60.0)
         self.recorder.training_queue = self.rescorer.training_data_size
         self.recorder.primary_buffer_dir = cfg.primary_buffer_dir
@@ -811,11 +815,6 @@ class SelfPlayRunner:
             return
         if (self.current_epoch == 0
                 and self.total_games < self.cfg.validation_warmup_games):
-            return
-        # a capped run never supersedes its open batch
-        cap = self.cfg.validation_max_batches
-        if cap and (self.val_pending
-                    or count_history_batches(self.cfg.run_dir) >= cap):
             return
         if self.val_pending:
             self.close_partial_validation_batch("superseded by next cadence")

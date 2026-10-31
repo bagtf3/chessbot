@@ -18,6 +18,10 @@ POLICY_DIM = 1858
 TABLEBASE = None
 PLAYED_PV_MAX = 64
 
+# move sampling: top-k by visits, each within this STM Q of the most-visited child
+SAMPLE_TOP_K = 7
+SAMPLE_MAX_Q_DELTA = 0.2
+
 
 def build_raw_visits_sparse(board, ucis, visits):
     """Every legal move as sparse (int16 idx, int16 count), index-sorted. Legal
@@ -96,8 +100,8 @@ class MCTSTree(fasttree):
             int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)
         )
 
-        blend, force, gate = cfg.qmm_params
-        self.set_qmm_params(float(blend), bool(force), bool(gate))
+        force, gate, gap_block = cfg.qmm_params
+        self.set_qmm_params(bool(force), int(gate), float(gap_block))
 
         self.set_qema_span(float(cfg.qema_span))
         self.set_qdelta_span(float(cfg.qdelta_span))
@@ -180,23 +184,26 @@ class MCTSTree(fasttree):
             return xerces_move, xerces_method, None
 
         # if here we are sampling
-        rows = self.root_child_visits()
-        if not rows:
+        details = self.root_child_details()
+        if not details:
             return xerces_move, xerces_method, None
 
-        ucis = [u for u, _ in rows]
-        visits = np.array([n for _, n in rows], dtype=np.float64)
+        sign = 1.0 if self.board.white_to_move() else -1.0
+        lead = details[0]
+        q_floor = sign * lead.Q - SAMPLE_MAX_Q_DELTA
+        cands = [lead] + [
+            cd for cd in details[1:SAMPLE_TOP_K]
+            if cd.N >= 1 and sign * cd.Q >= q_floor
+        ]
 
         # trivial cases
-        if len(ucis) == 1 or visits.sum() <= 0.0:
-            move = ucis[0]
+        if len(cands) == 1 or lead.N <= 0:
+            move = lead.uci
             other = xerces_move if move != xerces_move else None
             return move, "most_visited", other
 
-        # force sampling only from the top 5 moves
-        top_k = min(5, len(ucis))
-        top_ucis = ucis[:top_k]
-        top_visits = visits[:top_k]
+        top_ucis = [cd.uci for cd in cands]
+        top_visits = np.array([cd.N for cd in cands], dtype=np.float64)
 
         temp_min = self.config.move_sample_temp_range[0]
         temp_max = self.config.move_sample_temp_range[1]
@@ -580,6 +587,11 @@ class ChessGame(object):
                 "forces_blocked": qs.forces_blocked,
                 "forces_overridden": qs.forces_overridden,
                 "forced_by_depth": list(self.tree.forced_by_depth()),
+                "stop_blocks_t1": qs.stop_blocks_t1,
+                "stop_blocks_t2": qs.stop_blocks_t2,
+                "first_block_sims": qs.first_block_sims,
+                "first_block_leader": qs.first_block_leader or None,
+                "last_gap": rnd(qs.last_gap, 4),
             },
             "children_visited": visited_children,
             "total_children": total_children,
@@ -594,10 +606,11 @@ class ChessGame(object):
             cm = {
                 "uci": cd.uci, "visits": cd.N,
                 "visit_share": cd.visit_share, "last_visit": cd.last_visit,
-                "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4), "U": rnd(U, 4),
+                "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4),
+                "P_raw": rnd(cd.raw_prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
                 "boosted": cd.boosted_N,
-                "Qmm": rnd(cd.Qmm, 4), "Qmm_N": cd.Qmm_N,
+                "Qmm": rnd(cd.Qmm, 4),
                 "qmm_new_bests": cd.qmm_new_bests, "qmm_gap12": rnd(cd.qmm_gap12, 4),
                 "qmm_depth": cd.qmm_depth, "forced": cd.forced_N,
                 "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),

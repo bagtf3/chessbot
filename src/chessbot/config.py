@@ -1,4 +1,5 @@
 from chessbot import SP_DIR, MODEL_DIR
+from copy import deepcopy
 import os
 import yaml, json
 
@@ -39,9 +40,13 @@ class Config(object):
     use_blunder_replay = True
 
     # per-game parameter sampling; resolved once per game in the main process.
-    # each entry: param_name: [list of options to pick from].
+    # each entry: param_name: [list of options to pick from]; None = nothing.
     # only 1st-order scalar params are supported (no nested keys).
-    sampleable = {}
+    sampleable = None
+    # set by scenario_cfg on each game's config: the names (not options) of the
+    # params drawn for that game, which the looper records in its summary.
+    # Runtime only, never set from yaml.
+    sampled_params = None
 
     # MCTS
     c_puct = 2.0
@@ -149,6 +154,10 @@ class Config(object):
     sample_moves = True
     move_sample_temp_range = [0.000001, 2.0]
     move_sample_temp_plies = 20
+    # sampling candidates: the most-visited move plus the next ones up to
+    # rank sample_top_k, each within sample_max_q_delta (STM Q) of the leader
+    sample_top_k = 7
+    sample_max_q_delta = 0.4
     
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
     retrain_weight_decay = 0.005  # AdamW decoupled, 2D+ weights only
@@ -215,9 +224,7 @@ class Config(object):
                       self.primary_buffer_dir, self.replay_buffer_dir):
                 os.makedirs(d, exist_ok=True)
 
-        # public flag; keep the old name too for backward compatibility
         self.paths_initialized = True
-        self._paths_initialized = True
 
     @classmethod
     def from_json(cls, path, init=True):
@@ -325,15 +332,13 @@ class Config(object):
 
     def copy(self, init=False):
         """
-        Return a fresh Config instance cloned from this one.
-        By default this does not touch the filesystem; pass init=True
-        to call init_paths() on the new instance.
+        Return a deep, independent clone: every value, class defaults included,
+        is copied onto the new instance, so no dict or list is ever shared
+        between configs. __init__ is skipped, so nothing touches the
+        filesystem; pass init=True to call init_paths() on the clone.
         """
-        # use the existing dict/ctor path so update() validation stays active
-        cfg_dict = self.to_dict()
-        new = self.__class__.from_dict(cfg_dict, init=False, permissive=True)
-
-        # do not eagerly create directories unless requested
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(deepcopy(self.to_dict()))
         if init:
             new.init_paths()
         return new

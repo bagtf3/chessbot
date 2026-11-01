@@ -28,7 +28,9 @@ Record schema (used uniformly regardless of source file format):
   both map to "historic" -- they are pretrain-distribution records, not
   selfplay output. Anything starting with "lc0" maps to "lc0"; the
   lc0_pv/lc0_blunder/lc0_enrich distinction survives only in the
-  print_sample_stats counters.
+  print_sample_stats counters. SF_SOURCE marks Stockfish-played plies from
+  vs_stockfish games: they train with the xc0 records but stay out of the
+  xc0 primary validation slice.
 """
 import gzip
 import os
@@ -54,6 +56,7 @@ REPLAY_SEED_SHARDS = 144
 # last few shards of the first cycle rather than retraining on pure seed
 PRIMARY_SEED_SHARDS = 140
 SEED_SOURCE = "historic_seeded"
+SF_SOURCE = "sf"
 
 # Validation draws, taken in-memory from records the retrain worker has
 # already loaded for training -- no extra shard reads. Primary only; the
@@ -62,6 +65,7 @@ VAL_PRIMARY_RECORDS = 20_480
 VAL_HISTORIC_RECORDS = 10_240
 # plot-only: never written to a progress csv, just the source-split validation figure
 VAL_LC0_RECORDS = 5_120
+VAL_SF_RECORDS = 5_120
 
 # gzip's default is 9, which costs ~4x the write time of 6 for ~4% less disk.
 # Shard writes are on the rescorer's thread and run ~96 times per retrain

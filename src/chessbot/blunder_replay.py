@@ -87,9 +87,12 @@ F_MIN_V = 1200
 F_MAX_P = 1000
 
 # STARTPOS-traceable only -- history_uci gets replayed from a fresh board, so
-# the random_init / piece_odds families can never join this list
+# the random_init / piece_odds families can never join this list. SF's own
+# moves never reach the candidate check: rescore skips SF plies before
+# ply_states, so vs_stockfish and paired_validation only add Xerces blunders.
 BRP_SCENARIOS = (
-    "startpos", "UHO", "pre_opened", "pre_opened_mini", "paired_validation")
+    "startpos", "UHO", "pre_opened", "pre_opened_mini", "vs_stockfish",
+    "paired_validation")
 
 
 def is_blunder_candidate(v, p, cpl, z_stm):
@@ -311,7 +314,7 @@ def create_blunder_replay_config(cfg, yaml_file=None):
     # no randomness, ever
     pcfg.add_root_noise = False
     pcfg.sample_moves = False
-    pcfg.sampleable = {}
+    pcfg.sampleable = None
 
     return pcfg
 

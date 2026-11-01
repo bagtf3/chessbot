@@ -2114,7 +2114,8 @@ class RecordKeeper(object):
         self.recent_games = deque(maxlen=RECENT_GAMES_CAP)
         self.scenario_stats = defaultdict(
             lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
-        self.sf_overall = {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0}
+        self.sf_overall = defaultdict(
+            lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
         self.wins_by_scenario = defaultdict(int)
         self.telemetry = {}
         self.lc0_telemetry = {}

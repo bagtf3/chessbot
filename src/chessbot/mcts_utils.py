@@ -18,10 +18,6 @@ POLICY_DIM = 1858
 TABLEBASE = None
 PV_MAX = 64
 
-# move sampling: top-k by visits, each within this STM Q of the most-visited child
-SAMPLE_TOP_K = 7
-SAMPLE_MAX_Q_DELTA = 0.4
-
 
 def build_raw_visits_sparse(board, ucis, visits):
     """Every legal move as sparse (int16 idx, int16 count), index-sorted. Legal
@@ -50,7 +46,12 @@ class MCTSTree(fasttree):
     def __init__(self, board, cfg):
         self.config = cfg
 
-        self.c_puct = float(cfg.c_puct)
+        # c_puct can also be a dict {start_ply: c_puct} on absolute game ply:
+        # the entry with the largest start ply at or below the current ply
+        # applies, re-checked every move in advance()
+        self.c_puct_schedule = (sorted(cfg.c_puct.items())
+                                if isinstance(cfg.c_puct, dict) else None)
+        self.c_puct = self.scheduled_c_puct(board.history_size())
 
         # set floor and ceiling 
         self.sims_floor = cfg.sims_floor
@@ -190,9 +191,9 @@ class MCTSTree(fasttree):
 
         sign = 1.0 if self.board.white_to_move() else -1.0
         lead = details[0]
-        q_floor = sign * lead.Q - SAMPLE_MAX_Q_DELTA
+        q_floor = sign * lead.Q - self.config.sample_max_q_delta
         cands = [lead] + [
-            cd for cd in details[1:SAMPLE_TOP_K]
+            cd for cd in details[1:self.config.sample_top_k]
             if cd.N >= 1 and sign * cd.Q >= q_floor
         ]
 
@@ -287,6 +288,12 @@ class MCTSTree(fasttree):
 
         self.set_sim_budget(float(self.sims_ceiling))
 
+        if self.c_puct_schedule:
+            c = self.scheduled_c_puct(self.n_plies)
+            if c != self.c_puct:
+                self.c_puct = c
+                self.set_cpuct(c)
+
         if self.sims_ceiling_schedule:
             if self.n_plies in self.sims_ceiling_schedule.keys():
                 self.set_new_sims_ceiling()
@@ -309,6 +316,15 @@ class MCTSTree(fasttree):
             self.set_sim_budget(float(round(self.sims_ceiling * s)))
             self.set_early_stop_params(
                 min_sims=int(round(self.sims_floor * s)), **self.es_params)
+
+    def scheduled_c_puct(self, ply):
+        if not self.c_puct_schedule:
+            return float(self.config.c_puct)
+        c = self.c_puct_schedule[0][1]
+        for start, val in self.c_puct_schedule:
+            if ply >= start:
+                c = val
+        return float(c)
 
     def set_new_sims_ceiling(self, n_plies=None):
         if n_plies is None:
@@ -400,14 +416,9 @@ class ChessGame(object):
         
         self.stockfish_is_white = meta['stockfish_is_white']
         self.sf_search_depth = []
-        tree_cfg = self.config
-        
-        scenario = meta.get('scenario', '')
-        if scenario == 'UHO' and not self.config.is_validation_run:
-            tree_cfg = self.config.copy()
-            tree_cfg.move_sample_temp_range = [0.3, 0.3]
-        
-        self.tree = MCTSTree(self.board, tree_cfg)
+
+        # scenario overrides are already applied to the spec's cfg
+        self.tree = MCTSTree(self.board, self.config)
         self.tree_data = {}
         self.moves_played = []
         self.recents = []
@@ -454,6 +465,8 @@ class ChessGame(object):
             "end_reason": self.end_reason,
             "vs_stockfish": self.vs_stockfish,
             "stockfish_color": self.stockfish_is_white,
+            "sf_depth": self.meta.get("sf_depth"),
+            "start_type": self.meta.get("start_type"),
             "mcts_sims_total": self.mcts_sims_total,
             "mcts_plies": self.mcts_plies,
             "start_fen": self.start_fen,

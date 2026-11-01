@@ -36,7 +36,9 @@ from chessbot.rescore import (
 )
 from chessbot.retrain_worker import run_retrain_worker
 from chessbot.review import RecordKeeper
-from chessbot.utils import format_time, make_jsonable, next_model_epoch
+from chessbot.utils import (
+    format_time, make_jsonable, next_model_epoch, score_ema_start,
+)
 
 from chessbot.validation import (
     build_validation_summary_from_rows, create_validation_config,
@@ -50,9 +52,8 @@ GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
 # vs_stockfish specs waiting for the SF worker. Kept small: that worker drains
 # sf_q before game_q, so this is how far it lags joining a validation batch.
 SF_QUEUE_TARGET = GAME_QUEUE_MIN
-# adaptive vs_stockfish depth: EMA of Xerces's score, mapped to how many plies
-# below the validation depth SF plays
-SF_EMA_SPAN = 200
+# adaptive vs_stockfish depth: the recorder's score EMA (utils.SCORE_EMA_SPAN),
+# mapped to how many plies below the validation depth SF plays
 SF_DEPTH_BANDS = ((0.45, 0), (0.35, 1))
 SF_DEPTH_MAX_DROP = 2
 WORKER_PAUSE_SETTLE_S = 10.0
@@ -351,7 +352,6 @@ class SelfPlayRunner:
         self.ctx = mp.get_context()
         self.game_q = None
         self.sf_q = None
-        self.sf_ema = 0.5
         self.lc0_q = None
         self.lc0_hold = []
         self.lc0_hold_since = None
@@ -513,6 +513,9 @@ class SelfPlayRunner:
         monotonic counter rather than the fleet index: a respawn must not
         reuse the dead worker's name or the crash log stops making sense."""
         c = self.cfg.copy()
+        # workers never resolve or summarise from their own copy; each game
+        # carries its drawn names in cfg.sampled_params
+        c.sampleable = None
         c.id = f"w{self.next_worker_id}"
         self.next_worker_id += 1
         stop_ev = self.ctx.Event()
@@ -549,22 +552,18 @@ class SelfPlayRunner:
                   "respawned worker takes sf_q", flush=True)
 
     def sync_sf_depth(self):
-        """vs_stockfish depth: validation depth minus 0-2 from the score EMA,
-        never above validation depth."""
-        drop = next((d for lo, d in SF_DEPTH_BANDS if self.sf_ema >= lo),
+        """vs_stockfish depth: validation depth minus 0-2 from the score EMA
+        the recorder keeps for the console line, never above validation depth.
+        Called after each finished vs_stockfish game and each ladder rebuild."""
+        ema = self.recorder.sf_overall.get("vs_stockfish", {}).get(
+            "ema", score_ema_start("vs_stockfish"))
+        drop = next((d for lo, d in SF_DEPTH_BANDS if ema >= lo),
                     SF_DEPTH_MAX_DROP)
         depth = max(1, self.val_cfg.sf_validation_depth - drop)
         if depth != self.game_gen.sf_depth:
             print(f"[runner] vs_stockfish depth -> {depth} "
-                  f"(score ema {self.sf_ema:.3f})", flush=True)
+                  f"(score ema {ema:.3f})", flush=True)
         self.game_gen.sf_depth = depth
-
-    def record_vs_stockfish(self, meta):
-        result = meta.get("result", 0)
-        xc0_white = not meta.get("stockfish_color")
-        s = 0.5 if result == 0 else float((result > 0) == xc0_white)
-        self.sf_ema += (s - self.sf_ema) * 2.0 / (SF_EMA_SPAN + 1)
-        self.sync_sf_depth()
 
     def spawn_lc0_worker(self):
         """Start one lc0 teacher probe worker.
@@ -962,7 +961,7 @@ class SelfPlayRunner:
             self.finished_games.append(game)
             self.total_games += 1
             if scenario == "vs_stockfish":
-                self.record_vs_stockfish(meta)
+                self.sync_sf_depth()
 
             # only collect while a batch is actually live, so a straggler
             # arriving after one closed cannot land in the next one's buffer

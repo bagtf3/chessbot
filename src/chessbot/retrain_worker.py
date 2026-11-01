@@ -21,7 +21,7 @@ Message protocol (result_q, worker -> main):
 
 predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
   {"primary":  {"samples": [...], "wdl": (N, 3), "logits": (N, 1858)},
-   "historic": {...same...}, "lc0": {...same...}}
+   "historic": {...same...}, "lc0": {...same...}, "sf": {...same...}}
   wdl and logits are float32 arrays, row-aligned with samples.
   {"cmd": "retrain_done", "ok": bool, "error": str or None,
    "train_stats": {"train_loss": float, "gn_mean": float}}
@@ -44,6 +44,7 @@ from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
     read_shard, sample_records, write_pkl_gz_shard, POLICY_DIM,
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
+    VAL_SF_RECORDS, SF_SOURCE,
 )
 
 # above the runner's RETRAIN_RELEASE_TIMEOUT_S so main's go normally wins
@@ -155,6 +156,9 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     # plot-only slice, never validated against in the csv-logged metrics
     lc0_pool = [r for r in primary_records_raw if r[6].startswith('lc0')]
     val_lc0 = sample_records(lc0_pool, VAL_LC0_RECORDS)
+    # SF-played plies: plot and console only, like lc0; empty slices are skipped
+    sf_pool = [r for r in primary_records_raw if r[6] == SF_SOURCE]
+    val_sf = sample_records(sf_pool, VAL_SF_RECORDS)
 
     bs = cfg.retrain_batch_size
     def stream(samples):
@@ -166,12 +170,14 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
         "primary": stream(val_primary),
         "historic": stream(val_historic),
         "lc0": stream(val_lc0),
+        "sf": stream(val_sf),
     }
     with open(pred_pkl_path + ".tmp", "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(pred_pkl_path + ".tmp", pred_pkl_path)
 
-    del model, payload, val_pool, val_primary, val_historic, lc0_pool, val_lc0
+    del (model, payload, val_pool, val_primary, val_historic, lc0_pool, val_lc0,
+         sf_pool, val_sf)
     torch.cuda.empty_cache()
 
     primary_records = shuffle_rewrite_primary(primary_paths, primary_records_raw)

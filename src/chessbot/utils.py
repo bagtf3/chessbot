@@ -1035,6 +1035,18 @@ class RateMeter(object):
         return rate
 
 
+# games in the per-SF-scenario score EMA; vs_stockfish's also drives the
+# adaptive SF depth in the runner. It starts just inside the runner's lowest
+# depth band, so a fresh run opens at validation depth - 2 and earns its way
+# up; every other SF scenario starts at 0.5.
+SCORE_EMA_SPAN = 200
+SCORE_EMA_START = {"vs_stockfish": 0.34}
+
+
+def score_ema_start(scenario):
+    return SCORE_EMA_START.get(scenario, 0.5)
+
+
 def sf_bucket(vs_sf, sf_flag):
     if not vs_sf:
         return "none"
@@ -1072,20 +1084,24 @@ def accumulate_game_stats(g, stats, sf_overall, wins_by_scenario=None,
     if not g.get("vs_stockfish", False):
         return
 
-    sf_overall["N"] += 1
-    sf_overall["plies_sum"] += plies
-    if r == 0:
-        sf_overall["D"] += 1
-        return
+    # one W/D/L line per SF scenario: validation and vs_stockfish never pool
+    o = sf_overall[scenario]
+    o["N"] += 1
+    o["plies_sum"] += plies
     # result is WHITE-POV: the bot won iff Stockfish lost
     sf_is_white = bool(g.get("stockfish_color"))
-    bot_won = (r < 0) if sf_is_white else (r > 0)
-    if bot_won:
-        sf_overall["W"] += 1
+    bot_won = r != 0 and ((r < 0) if sf_is_white else (r > 0))
+    s = 0.5 if r == 0 else float(bot_won)
+    ema = o.get("ema", score_ema_start(scenario))
+    o["ema"] = ema + (s - ema) * 2.0 / (SCORE_EMA_SPAN + 1)
+    if r == 0:
+        o["D"] += 1
+    elif bot_won:
+        o["W"] += 1
         if wins_by_scenario is not None:
             wins_by_scenario[scenario] += 1
     else:
-        sf_overall["L"] += 1
+        o["L"] += 1
 
 
 def order_stat_rows(stats):
@@ -1105,8 +1121,8 @@ LOG_WIDTH = 79
 
 def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
     """
-    Pretty-print the scenario table and the bot-vs-Stockfish W/D/L line,
-    plus a wins-by-scenario breakdown (SF games only).
+    Pretty-print the scenario table and one bot-vs-Stockfish W/D/L line per
+    SF scenario, plus a wins-by-scenario breakdown (SF games only).
 
     Takes counters rather than a games list, so a caller accumulating them
     incrementally can report on every game ever played without retaining any.
@@ -1128,18 +1144,19 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
         )
     print("-" * LOG_WIDTH)
 
-    # bot vs Stockfish summary (score: W=1, D=0.5, L=0)
-    total = sf_overall["N"]
-    w, d, l = sf_overall["W"], sf_overall["D"], sf_overall["L"]
-    avg = (sf_overall["plies_sum"] / total) if total else 0.0
-
-    score_pts = w + 0.5 * d
-    score = (score_pts / total) if total else 0.0
-
-    print(
-        f"Total SF games: {total:>6}  W/D/L={w}/{d}/{l}  "
-        f"score={score:.3f}  avg_plies={avg:.1f}"
-    )
+    # bot vs Stockfish summary per SF scenario (score: W=1, D=0.5, L=0)
+    for scenario, o in sorted(sf_overall.items()):
+        total = o["N"]
+        w, d, l = o["W"], o["D"], o["L"]
+        avg = (o["plies_sum"] / total) if total else 0.0
+        score = ((w + 0.5 * d) / total) if total else 0.0
+        label = "validation" if scenario == "paired_validation" else scenario
+        print(
+            f"SF games {label:<12}: {total:>6}  W/D/L={w}/{d}/{l}  "
+            f"score={score:.3f} "
+            f"(ema{SCORE_EMA_SPAN}={o.get('ema', score_ema_start(scenario)):.3f})  "
+            f"avg_plies={avg:.1f}"
+        )
 
     if wins_by_scenario:
         print("\nWins by scenario (SF games only):")

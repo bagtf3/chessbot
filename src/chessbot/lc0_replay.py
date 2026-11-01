@@ -68,7 +68,7 @@ def create_lc0_replay_config(cfg, yaml_file=None):
 
     pcfg.add_root_noise = False
     pcfg.sample_moves = False
-    pcfg.sampleable = {}
+    pcfg.sampleable = None
 
     return pcfg
 

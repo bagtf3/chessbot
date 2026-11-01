@@ -23,7 +23,7 @@ from chessbot.utils import (
     ema_step, load_json, save_pickle_atomic, blend_to_uniform,
 )
 from chessbot.replay_buffer import (
-    LiveBuffer, SEED_SOURCE, sparsify_policy, stack_policies,
+    LiveBuffer, SEED_SOURCE, SF_SOURCE, sparsify_policy, stack_policies,
     new_shard_path, write_pkl_gz_shard, flush_lc0_shards, is_lc0_record,
 )
 from chessbot.opening_counts import (
@@ -64,7 +64,7 @@ BRP_ROUND_WAIT_S = 180
 # took, sent to lc0 when the loss is this big and xc0's search disagrees with
 # SF's move (see policy_value_miss). The xc0 sample still trains, at
 # LC0_SENT_XC0_WEIGHT.
-LC0_TEACHER_MIN_CPL = 30
+LC0_TEACHER_MIN_CPL = 60
 # weight multiplier on an xc0 sample whose position also went to lc0
 LC0_SENT_XC0_WEIGHT = 0.5
 LC0_TEACHER_TOP_K = 5
@@ -106,8 +106,9 @@ D = d = np.arctanh(0.5)
 
 # Validation provenance buckets. seaborn "deep" blue/orange/green, keyed by
 # name so a source that is absent this round leaves the others' colors alone.
-SOURCE_COLORS = {'xc0': '#4C72B0', 'lc0': '#DD8452', 'historic': '#55A868'}
-SOURCE_ORDER = ('xc0', 'lc0', 'historic')
+SOURCE_COLORS = {'xc0': '#4C72B0', 'lc0': '#DD8452', 'historic': '#55A868',
+                 'sf': '#C44E52'}
+SOURCE_ORDER = ('xc0', 'lc0', 'sf', 'historic')
 
 
 def count_jsonl_lines(path):
@@ -125,6 +126,8 @@ def plot_source(source):
         return 'historic'
     if source.startswith('lc0'):
         return 'lc0'
+    if source == SF_SOURCE:
+        return 'sf'
     return 'xc0'
 
 
@@ -649,25 +652,25 @@ class Rescorer(object):
         policy = np.zeros(1858, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, 0.0, self.config.prior_clip_max)
-        pi = pi / pi.sum()
+        pi = blend_to_uniform(pi, 1e-6, self.config.prior_clip_max)
         for idx, p in zip(indices, pi):
             policy[idx] += p
         x = self.encode_board(board)
         return x, policy
 
-    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht):
+    def append_flat_policy_example(self, board, ucis, visits, Y, vwht, pwht,
+                                   source='xc0'):
         x, policy = self.make_policy_example(board, ucis, visits)
         okey = self.opening_counts.key(board, x)
         self.opening_counts.bump(okey)
         self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0'), okey)
+            (x, None, sparsify_policy(policy), Y, vwht, pwht, source), okey)
         return policy
 
     def training_data_from_sf(self, board, mv, tr, Y, is_draw, sf_won):
         """One SF ply. Policy: Xerces's search when SF played the search's
-        top move; otherwise SF's move (1 visit on every other legal move)
-        blended with the search, SF weight SF_POLICY_W_WON if SF won the game
+        top move; otherwise sf_move_target on SF's move blended with the
+        search, SF weight SF_POLICY_W_WON if SF won the game
         else SF_POLICY_W_OTHER. The clip is applied after the blend. KL and
         value-KL boosts match a Xerces ply. Returns the dense policy."""
         cfg = self.config
@@ -684,10 +687,8 @@ class Rescorer(object):
 
         pi = xc0 / xc0.sum()
         if mv != max(vmap, key=vmap.get):
-            sf = np.ones(len(ucis))
-            sf[ucis.index(mv)] += max(0.0, xc0.sum() - len(ucis))
             w = SF_POLICY_W_WON if sf_won else SF_POLICY_W_OTHER
-            pi = w * sf / sf.sum() + (1 - w) * pi
+            pi = w * sf_move_target(ucis, mv) + (1 - w) * pi
 
         vwht = value_weight_for_game(cfg, is_draw)
         pwht = value_weight_for_game(cfg, is_draw)
@@ -705,7 +706,7 @@ class Rescorer(object):
                 vwht *= cfg.kl_boost_median_mult
 
         return self.append_flat_policy_example(
-            board, ucis, list(pi), Y, vwht, pwht)
+            board, ucis, list(pi), Y, vwht, pwht, source=SF_SOURCE)
 
     def start_game(self, pkl_file, pool):
         path = str(pkl_file)
@@ -737,14 +738,15 @@ class Rescorer(object):
         is_validation_game = 'validation' in header.get('scenario', '').lower()
         skip_all_training = is_validation_game
 
-        # snapshot config fields so hot-reloads don't affect an in-flight game
+        # snapshot config fields so hot-reloads don't affect an in-flight game.
+        # prior_clip_max and the KL boosts are read live instead: a reload of
+        # those applies to every target built from then on.
         game_cfg_keys = (
             'train_on_stockfish',
-            'kl_boost_median_mult', 'kl_boost_p80_mult', 'kl_quantile_lr',
             'rescore_equiv_min', 'rescore_equiv_max',
             'rescore_blunder_cp_loser',
             'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
-            'uniform_eps', 'prior_clip_max',
+            'uniform_eps',
             'rescore_analyze_batch',
             'draw_value_scale',
             'vscale',
@@ -1253,16 +1255,13 @@ class Rescorer(object):
         return a_lo + t * (a_hi - a_lo)
 
     def sf_pointmass_policy(self, lms, idx_map, best_uci):
-        """1 visit on every legal move, the rest piled on SF's best."""
-        policy = np.zeros(1858, dtype=np.float32)
+        """Dense sf_move_target over the legal moves."""
         if best_uci not in idx_map:
             return None
-
-        share = 1.0 / max(1, len(lms))
-        for u in lms:
-            policy[idx_map[u]] += share
-        policy[idx_map[best_uci]] += float(len(lms))
-        return policy / policy.sum()
+        lms = list(lms)
+        policy = np.zeros(1858, dtype=np.float32)
+        policy[[idx_map[u] for u in lms]] = sf_move_target(lms, best_uci)
+        return policy
 
     def blend_policy(self, pa, pb, alpha):
         """Convex mix of two policy targets; alpha weights pb.
@@ -1503,7 +1502,7 @@ class Rescorer(object):
         ucis = list(vmap)
         counts = np.array([vmap[u] for u in ucis], dtype=np.float32)
         counts /= counts.sum()
-        counts = blend_to_uniform(counts, 1e-6, 0.95)   # train-target clip
+        counts = blend_to_uniform(counts, 1e-6, self.config.prior_clip_max)
         policy = np.zeros(1858, dtype=np.float32)
         for idx, p in zip(board.moves_to_indices(ucis), counts):
             policy[idx] += p
@@ -1520,7 +1519,7 @@ class Rescorer(object):
         Still-live, still-bad replay probes never earn a normal training
         example on their own -- this is the only path that turns one into a
         live_buffer sample. Policy blends the model's own visits with an SF
-        pointmass (1 visit per legal move, the rest on SF's best), alpha
+        target (sf_move_target on SF's best), alpha
         ramping 0.10 at probe_cpl=25 to 0.85 at 150. Value is the search's
         own WDL, unblended.
         """
@@ -1537,12 +1536,9 @@ class Rescorer(object):
             return False
 
         total_visits = sum(v for _, v in xc0_pairs)
-        sf_visits = {u: 1 for u in legal_ucis}
-        sf_visits[best_uci] += max(total_visits - len(legal_ucis), 0)
-
+        legal_ucis = list(legal_ucis)
         xc0_probs = {u: v / total_visits for u, v in xc0_pairs}
-        sf_total = sum(sf_visits.values())
-        sf_probs = {u: v / sf_total for u, v in sf_visits.items()}
+        sf_probs = dict(zip(legal_ucis, sf_move_target(legal_ucis, best_uci)))
 
         alpha = 0.10 + (min(max(probe_cpl, 25), 150) - 25) / 125.0 * 0.75
 
@@ -1552,7 +1548,7 @@ class Rescorer(object):
             for u in ucis
         ], dtype=np.float32)
         blended = blended / blended.sum()
-        blended = blend_to_uniform(blended, 1e-6, 0.95)   # train-target clip
+        blended = blend_to_uniform(blended, 1e-6, self.config.prior_clip_max)
 
         indices = board.moves_to_indices(ucis)
         policy = np.zeros(1858, dtype=np.float32)
@@ -1801,27 +1797,27 @@ class Rescorer(object):
             pwht = value_weight_for_game(cfg, is_draw)
             kl = kl_divergence(vis, priors)
             rows[-1][-2] = kl
-            self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, cfg.kl_quantile_lr)
-            self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, cfg.kl_quantile_lr)
+            self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, self.config.kl_quantile_lr)
+            self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, self.config.kl_quantile_lr)
             klv = tr.get('kl_value')
             if klv is not None:
                 self.kl_value_q50 = update_ema_quantile(
-                    self.kl_value_q50, klv, 0.5, cfg.kl_quantile_lr)
+                    self.kl_value_q50, klv, 0.5, self.config.kl_quantile_lr)
                 self.kl_value_q80 = update_ema_quantile(
-                    self.kl_value_q80, klv, 0.8, cfg.kl_quantile_lr)
+                    self.kl_value_q80, klv, 0.8, self.config.kl_quantile_lr)
             if kl_eligible:
                 if kl >= self.kl_q80:
-                    pwht *= cfg.kl_boost_p80_mult
+                    pwht *= self.config.kl_boost_p80_mult
                 elif kl >= self.kl_q50:
-                    pwht *= cfg.kl_boost_median_mult
+                    pwht *= self.config.kl_boost_median_mult
                 # value-KL boost on the value weight, mirroring the policy boost.
                 # max(0.01, .) floors the quantile so a zeroed tracker doesn't make
                 # every ply eligible.
                 if klv is not None:
                     if klv >= max(0.03, self.kl_value_q80):
-                        vwht *= cfg.kl_boost_p80_mult
+                        vwht *= self.config.kl_boost_p80_mult
                     elif klv >= max(0.01, self.kl_value_q50):
-                        vwht *= cfg.kl_boost_median_mult
+                        vwht *= self.config.kl_boost_median_mult
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']
@@ -1914,6 +1910,10 @@ class Rescorer(object):
                 sf_policy = self.sf_pointmass_policy(
                     aux['lms'], aux['idx_map'], aux['best_uci'])
                 policy = self.blend_policy(policy, sf_policy, alpha)
+                # the clip comes after the blend, over the legal moves
+                legal = [aux['idx_map'][u] for u in aux['lms']]
+                policy[legal] = blend_to_uniform(
+                    policy[legal], 1e-6, self.config.prior_clip_max)
                 sc['blended'] += 1
                 scw['blended'] += 1
 
@@ -2240,6 +2240,7 @@ class Rescorer(object):
         primary = build_group(payload["primary"])
         historic = build_group(payload["historic"])
         lc0 = build_group(payload["lc0"])
+        sf = build_group(payload["sf"])
         del payload
 
         if not len(primary['wdl_pred']) and not len(historic['wdl_pred']):
@@ -2281,6 +2282,7 @@ class Rescorer(object):
         pb = metrics_block(primary)
         hb = metrics_block(historic)
         lb = metrics_block(lc0)
+        sb = metrics_block(sf)
 
         pfx = f"[epoch {epoch:4d}] [metrics]"
         LBL_W = 60
@@ -2300,7 +2302,7 @@ class Rescorer(object):
                 return
             print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
 
-        slices = [(pb, 'primary'), (hb, 'historic'), (lb, 'lc0')]
+        slices = [(pb, 'primary'), (hb, 'historic'), (lb, 'lc0'), (sb, 'sf')]
         for b, label in slices:
             print_slice(b, label, wdl_line)
         for b, label in slices:
@@ -2364,7 +2366,8 @@ class Rescorer(object):
                 return np.concatenate([a, b])
             return a + b
 
-        combined = {k: cat(cat(primary[k], historic[k]), lc0[k]) for k in primary}
+        combined = {k: cat(cat(cat(primary[k], historic[k]), lc0[k]), sf[k])
+                    for k in primary}
         self.save_validation_plots(
             epoch, os.path.join(run_dir, 'validation_latest.png'), combined)
 
@@ -2712,6 +2715,19 @@ REVIEW_RATE = 0.005
 # top move, by game outcome from SF's side
 SF_POLICY_W_WON = 0.8
 SF_POLICY_W_OTHER = 0.5
+# SF's move as a policy target: this share on SF's move, the rest flat
+SF_MOVE_SHARE = 0.8
+
+
+def sf_move_target(ucis, mv):
+    """SF_MOVE_SHARE on mv, the rest spread evenly over the other moves in
+    ucis; 1.0 when mv is the only move. Aligned to ucis."""
+    n = len(ucis)
+    if n == 1:
+        return np.ones(1)
+    p = np.full(n, (1.0 - SF_MOVE_SHARE) / (n - 1))
+    p[ucis.index(mv)] = SF_MOVE_SHARE
+    return p
 
 
 def policy_from_raw_visits(raw_visits, prior_clip_max):
@@ -2925,32 +2941,5 @@ def save_analysis_chunk_simple(run_dir, batch):
     return outp, cpl, bmr, kl, ce, plies, kl_n, ce_n, blunder
 
 
-def make_fake_visits(mv, lms, ratio_best=60):
-    visits = [[mv, int(ratio_best)]]
-    
-    # may only be 1 legal move
-    if len(lms) < 2:
-        return visits
-    
-    sub_optimal = 100 - ratio_best
-    bad_visits = 1 + min(5, int(sub_optimal / len(lms)))
-    visits += [[m, bad_visits] for m in lms if m != mv]
-    return visits
-
-
-def encourage_best_move(visits, played_mv, best_mv, lms):
-    """
-    visits: list of (uci, count) from tree
-    Sets best_mv visits equal to played_mv visits without lowering played_mv.
-    Ensures all legal moves have at least 1 visit.
-    Returns list of [uci, int_visits] sorted desc.
-    """
-    d = {u: max(1, int(v)) for u, v in visits if u}
-    for m in lms:
-        if m not in d:
-            d[m] = 1
-    d[best_mv] = max(d.get(best_mv, 1), d.get(played_mv, 1))
-    items = sorted(d.items(), key=lambda x: x[1], reverse=True)
-    return [[u, int(v)] for u, v in items]
 
 

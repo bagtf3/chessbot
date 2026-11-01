@@ -4,6 +4,7 @@ import pickle
 import random
 import re
 from collections import deque, namedtuple
+from copy import deepcopy
 
 import chess
 import chess.pgn
@@ -491,25 +492,34 @@ def short_fen(fen):
     return " ".join(fen.split(" ")[:4])
 
 
-def resolve_cfg(cfg):
-    """Return a copy of cfg with sampleable params replaced by sampled scalars."""
-    resolved = cfg.copy()
-    resolved.update({param: random.choice(options) for param, options in cfg.sampleable.items()})
-    resolved.sampleable = {}
-    return resolved
-
-
-# vs_stockfish games inherit the selfplay config except for these, which are
-# pinned on and pulled out of sampleable
-VS_SF_FIXED = {"use_syzygy": True, "allow_resignation": True, "use_eval_draw": True}
+# Per-scenario config overrides. Each game's config is its run config with its
+# scenario's entry pinned on top and those keys pulled out of sampleable, then
+# resolved -- so the spec's config is exactly what the game and its tree play
+# with. A scenario with no entry is resolved as is.
+SCENARIO_OVERRIDES = {
+    # imbalanced openings: sample, but near-greedily
+    "UHO": {"move_sample_temp_range": [0.3, 0.3]},
+    # SF punishes a sampled slip at once, so sampling is tighter
+    "vs_stockfish": {
+        "use_syzygy": True, "allow_resignation": True, "use_eval_draw": True,
+        "sample_top_k": 5, "sample_max_q_delta": 0.2,
+        "move_sample_temp_range": [0.2, 2.0],
+    },
+}
 VS_SF_STARTS = {"startpos": 0.5, "pre_opened": 0.25, "pre_opened_mini": 0.25}
 
 
-def vs_stockfish_cfg(cfg):
+def scenario_cfg(cfg, scenario):
+    """Resolved per-game config for scenario, in one copy: overrides pinned,
+    the remaining sampleables drawn, and only the drawn names kept."""
+    fixed = SCENARIO_OVERRIDES.get(scenario, {})
+    sampleable = {k: v for k, v in (cfg.sampleable or {}).items() if k not in fixed}
     c = cfg.copy()
-    c.sampleable = {k: v for k, v in cfg.sampleable.items() if k not in VS_SF_FIXED}
-    c.update(VS_SF_FIXED)
-    return resolve_cfg(c)
+    c.update(deepcopy(fixed))
+    c.update({k: deepcopy(random.choice(v)) for k, v in sampleable.items()})
+    c.sampled_params = list(sampleable)
+    c.sampleable = None
+    return c
 
 
 class GameGenerator:
@@ -627,7 +637,8 @@ class GameGenerator:
         meta["vs_stockfish"] = False
         meta["stockfish_is_white"] = False
         self.games_queued += 1
-        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
+        return GameSpec(fen=fen, moves=moves, meta=meta,
+                        cfg=scenario_cfg(cfg, game_type))
 
     def generate_dedup(self, game_type):
         fen, moves, meta = self.generate(game_type)
@@ -660,7 +671,8 @@ class GameGenerator:
             "sf_depth": self.sf_depth,
         })
         self.games_queued += 1
-        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=vs_stockfish_cfg(cfg))
+        return GameSpec(fen=fen, moves=moves, meta=meta,
+                        cfg=scenario_cfg(cfg, "vs_stockfish"))
 
     def remember_fen(self, key):
         """FIFO-bounded dedup memory."""
@@ -742,7 +754,7 @@ class GameGenerator:
                 continue
             fen, moves, _ = result
             # one draw per pair so both colours play the same sampled arm
-            pair_cfg = resolve_cfg(cfg)
+            pair_cfg = scenario_cfg(cfg, "paired_validation")
             depth = cfg.sf_validation_depth
             specs.append(GameSpec(
                 fen=fen, moves=moves,

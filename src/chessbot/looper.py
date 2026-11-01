@@ -360,9 +360,13 @@ class GameLooper(object):
                 # otherwise do not block and move on
                 if game.is_stockfish_turn():
                     if not game.sf_pending:
-                        # submit move to sf queue here
+                        # submit move to sf queue here. vs_stockfish openings
+                        # sample SF's move; validation and later plies never do
+                        explore = (game.meta.get("scenario") == "vs_stockfish"
+                                   and game.python_chess_board.ply() < SF_EXPLORE_PLIES)
                         self.sf_thread.submit(game.game_id, game.python_chess_board,
-                                              depth=game.meta.get("sf_depth"))
+                                              depth=game.meta.get("sf_depth"),
+                                              explore=explore)
 
                         # stash the game here for easy reference later
                         self.sf_games[game.game_id] = game
@@ -532,15 +536,18 @@ class GameLooper(object):
 
         cfg = game.config
 
-        # index/telemetry row: essentials + this game's sampled params
-        # cfg.sampleable is wiped by resolve_cfg; param names live on self.config
-        for param in self.config.sampleable:
+        # index/telemetry row: essentials + the params drawn for this game
+        for param in cfg.sampled_params or ():
             val = getattr(cfg, param)
             if param == 'move_sample_temp_range' and isinstance(val, list):
                 mem_summary['move_sample_temp_min'] = val[0]
                 mem_summary['move_sample_temp_max'] = val[1]
             elif isinstance(val, list):
                 mem_summary[param] = ','.join(str(v) for v in val)
+            elif isinstance(val, dict):
+                # ply schedules, e.g. c_puct -> "0:2.5,13:2.0,31:1.5"
+                mem_summary[param] = ','.join(
+                    f"{k}:{v}" for k, v in sorted(val.items()))
             else:
                 mem_summary[param] = val
 
@@ -722,6 +729,17 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_q=None, sf_q=
     return looper
 
 
+# SF opening explorer (vs_stockfish only): on game plies 1-12, SF samples its
+# move from softmax(cp / SF_EXPLORE_TEMP_CP) over its top SF_EXPLORE_MULTIPV
+# lines within SF_EXPLORE_MAX_DELTA_CP of the best. Positions with this many
+# legal moves or fewer, and any mate score, play the best move straight.
+SF_EXPLORE_PLIES = 12
+SF_EXPLORE_MULTIPV = 3
+SF_EXPLORE_MAX_DELTA_CP = 30
+SF_EXPLORE_TEMP_CP = 20.0
+SF_EXPLORE_MIN_LEGAL = 3
+
+
 class StockfishThread(object):
     def __init__(self, sf_config, depth):
         self.sf_loc = SF_LOC
@@ -755,9 +773,9 @@ class StockfishThread(object):
         if self.err is not None:
             raise self.err
 
-    def submit(self, game_id, board, depth=None):
+    def submit(self, game_id, board, depth=None, explore=False):
         b = board.copy(stack=True)
-        self.req_q.put((game_id, b, depth))
+        self.req_q.put((game_id, b, depth, explore))
 
     def clear_hash(self):
         """Clear the TT before the next request; nothing is rebuilt."""
@@ -781,15 +799,19 @@ class StockfishThread(object):
                 self.clear_ev.clear()
                 self.eng.configure({"Clear Hash": None})
             try:
-                game_id, board, depth = self.req_q.get(timeout=0.01)
+                game_id, board, depth, explore = self.req_q.get(timeout=0.01)
             except Empty:
                 continue
 
             try:
-                res_tup = sf_eval(
-                    board, score_fn=lambda s: score_to_value_stm_pov_tanh(s, mid_cp=150.0),
-                    depth=depth or self.depth, engine=self.eng
-                )
+                res_tup = None
+                if explore:
+                    res_tup = self.explore_eval(board, depth or self.depth)
+                if res_tup is None:
+                    res_tup = sf_eval(
+                        board, score_fn=lambda s: score_to_value_stm_pov_tanh(s, mid_cp=150.0),
+                        depth=depth or self.depth, engine=self.eng
+                    )
 
                 self.res_q.put((game_id, res_tup))
             except Exception as e:
@@ -797,3 +819,45 @@ class StockfishThread(object):
                 self.res_q.put(("__error__", e))
                 self.stop_ev.set()
                 return
+
+    def explore_eval(self, board, depth):
+        """Opening exploration: sample SF's move from its top MultiPV lines.
+        Returns the same (value, move, wdl) as sf_eval, with value and wdl
+        taken from the best line, or None to fall back to the plain search:
+        few legal moves, any mate score, fewer than two usable lines, or any
+        error here."""
+        try:
+            if board.legal_moves.count() <= SF_EXPLORE_MIN_LEGAL:
+                return None
+            infos = self.eng.analyse(
+                board, chess.engine.Limit(depth=depth),
+                multipv=SF_EXPLORE_MULTIPV, info=chess.engine.INFO_ALL)
+            lines = []
+            for info in infos:
+                score, pv = info.get("score"), info.get("pv")
+                if score is None or not pv:
+                    continue
+                cp = score.relative.score()
+                if cp is None:
+                    return None  # mate in sight: play it straight
+                lines.append((cp, pv[0], info))
+            if len(lines) < 2:
+                return None
+
+            lines.sort(key=lambda t: -t[0])
+            best_cp, _, best_info = lines[0]
+            keep = [t for t in lines if best_cp - t[0] <= SF_EXPLORE_MAX_DELTA_CP]
+            w = np.exp((np.array([t[0] for t in keep], dtype=np.float64) - best_cp)
+                       / SF_EXPLORE_TEMP_CP)
+            move = keep[int(np.random.choice(len(keep), p=w / w.sum()))][1]
+
+            val = score_to_value_stm_pov_tanh(best_info["score"], mid_cp=150.0)
+            wdl_info = best_info.get("wdl")
+            wdl = ((wdl_info.relative.wins / 1000.0,
+                    wdl_info.relative.draws / 1000.0,
+                    wdl_info.relative.losses / 1000.0)
+                   if wdl_info is not None else None)
+            return val, str(move), wdl
+        except Exception as e:
+            print(f"[sf explore] falling back to plain search: {e!r}", flush=True)
+            return None

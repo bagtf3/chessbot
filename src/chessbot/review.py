@@ -33,7 +33,7 @@ from chessbot.utils import (
 )
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_clipped, score_to_value_stm_pov,
-    score_to_value_stm_pov_tanh, rnd,
+    score_to_value_stm_pov_tanh, rnd, scalar_to_wdl,
     calc_entropy, kl_divergence, load_json, save_pickle_atomic,
 )
 
@@ -91,6 +91,8 @@ class GameViewer:
                 'total_children':    p.get('total_children'),
                 'candidate_moves':   p.get('candidate_moves', []),
                 'pv':                p.get('pv', []),
+                'pv_played':         p.get('pv_played'),
+                'sf_value':          p.get('sf_value'),
             }
             for i, p in enumerate(plies)
         }
@@ -553,7 +555,8 @@ class GameViewer:
 
     def show_pv(self, min_vis=1):
         """
-        Print principal variation recorded in the tree data for the current ply.
+        Print principal variation recorded in the tree data for the current ply,
+        then the played line when the played move differs from Xerces's choice.
         Print all PV moves (subject to min_vis), marking with ' *' those moves
         that were actually played in the game at the corresponding ply.
         """
@@ -572,6 +575,13 @@ class GameViewer:
             print("No PV recorded.")
             return
 
+        self.print_pv_block(pv, min_vis)
+        pv_played = node.get("pv_played")
+        if pv_played:
+            print("\nplayed line:")
+            self.print_pv_block(pv_played, min_vis)
+
+    def print_pv_block(self, pv, min_vis):
         board_tmp = chess.Board(self.board.fen())
         rows = []
         for i, step in enumerate(pv):
@@ -817,7 +827,7 @@ class GameViewer:
         nn_wdl    = node.get('nn_wdl')
         nn_value  = node.get('nn_value')
         best_wdl  = node.get('best_wdl')
-        sf_wdl_tr = node.get('sf_wdl')
+        sf_value  = node.get('sf_value')
         is_white  = self.turn()
         sign      = 1 if is_white else -1
 
@@ -829,7 +839,7 @@ class GameViewer:
             nn_wdl_stm = nw / nw.sum() if nw.sum() > 0 else nw
 
         # reconstruct Y matching rescore.py formulas exactly:
-        #   SF move:     0.5*z + 0.5*sf_wdl_tr  (fallback: pure z)
+        #   SF move:     0.5*z + 0.5*scalar_to_wdl(sf_value)  (fallback: pure z)
         #   Xerces move: 0.5*z + 0.5*best_wdl   (fallback: pure z)
         Y = None
         if nn_value is not None:
@@ -842,8 +852,8 @@ class GameViewer:
                 z_wdl = np.array([0.0, 1.0, 0.0])
 
             if is_sf_turn:
-                if sf_wdl_tr is not None and len(sf_wdl_tr) == 3:
-                    Y = 0.5 * z_wdl + 0.5 * np.array(sf_wdl_tr, dtype=np.float64)
+                if sf_value is not None:
+                    Y = 0.5 * z_wdl + 0.5 * scalar_to_wdl(sf_value)
                 else:
                     Y = z_wdl.copy()
             else:
@@ -927,52 +937,35 @@ class GameViewer:
                 chosen_idx = i
                 break
 
-        need_rank = False
-        if is_sf_turn and chosen_idx is not None:
-            need_rank = (chosen_idx >= top_n)
+        if is_sf_turn:
+            flagged = {chosen_idx}
+        else:
+            flagged = {xc0_idx, sf_best_idx, chosen_idx if sampled else None}
+        overflow = sorted(i for i in flagged if i is not None and i >= top_n)
+        need_rank = bool(overflow)
 
-        if (not is_sf_turn) and sf_best_idx is not None:
-            need_rank = need_rank or (sf_best_idx >= top_n)
-
-        if (not is_sf_turn) and xc0_idx is not None:
-            need_rank = need_rank or (xc0_idx >= top_n)
+        def flags_for(uci):
+            if is_sf_turn:
+                return [], uci == chosen
+            extra = []
+            if xc0_move and uci == xc0_move:
+                extra.append("<-Xc0, SF" if sf_best_uci and uci == sf_best_uci
+                             else "<-Xc0")
+            is_samp = sampled and uci == chosen and chosen != xc0_move
+            if is_samp:
+                extra.append("<-SF,samp" if sf_best_uci and uci == sf_best_uci
+                             else "<-sampled")
+            mark = bool(sf_best_uci and uci == sf_best_uci
+                        and uci != xc0_move and not is_samp)
+            return extra, mark
 
         self.print_header(show_rank=need_rank, show_rsc=True)
         fq = self.fpu_q(cands)
         rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
 
-        shown_ucis = set()
-
         for i, c in enumerate(cands_sorted[:top_n]):
             uci = c.get("uci")
-            extra = []
-
-            if not is_sf_turn:
-                if xc0_move and (uci == xc0_move):
-                    if sf_best_uci and (uci == sf_best_uci):
-                        extra.append("<-Xc0, SF")
-                    else:
-                        extra.append("<-Xc0")
-
-                if sampled and (uci == chosen) and (chosen != xc0_move):
-                    if sf_best_uci and (chosen == sf_best_uci):
-                        extra.append("<-SF,samp")
-                    else:
-                        extra.append("<-sampled")
-
-            mark = False
-            if is_sf_turn:
-                mark = (uci == chosen)
-            else:
-                if sf_best_uci and (uci == sf_best_uci):
-                    is_xc0_sf = bool(xc0_move and (uci == xc0_move))
-                    is_samp_sf = bool(
-                        sampled and (chosen == sf_best_uci) and (uci == chosen)
-                        and (chosen != xc0_move)
-                    )
-                    if (not is_xc0_sf) and (not is_samp_sf):
-                        mark = True
-
+            extra, mark = flags_for(uci)
             self.print_row(
                 c,
                 mark=mark,
@@ -983,63 +976,23 @@ class GameViewer:
                 extra_flags=extra,
                 fpu_q=fq,
             )
-            shown_ucis.add(uci)
 
-        if (not is_sf_turn) and xc0_move and (xc0_move not in shown_ucis):
-            if xc0_idx is not None:
+        prev = top_n - 1
+        for i in overflow:
+            if i != prev + 1:
                 print("   ...")
-                extra = []
-                if sf_best_uci and (xc0_move == sf_best_uci):
-                    extra.append("<-Xc0, SF")
-                else:
-                    extra.append("<-Xc0")
-
-                self.print_row(
-                    cands_sorted[xc0_idx],
-                    mark=False,
-                    show_rank=True,
-                    rank_val=xc0_idx + 1,
-                    show_rsc=True,
-                    rsc_val=None,
-                    extra_flags=extra,
-                    fpu_q=fq,
-                )
-                shown_ucis.add(xc0_move)
-
-        if (not is_sf_turn) and sf_best_uci and (sf_best_uci not in shown_ucis):
-            if sf_best_idx is not None:
-                print("   ...")
-                extra = []
-                mark = True
-
-                if sampled and (sf_best_uci == chosen) and (chosen != xc0_move):
-                    extra.append("<-SF,samp")
-                    mark = False
-
-                self.print_row(
-                    cands_sorted[sf_best_idx],
-                    mark=mark,
-                    show_rank=True,
-                    rank_val=sf_best_idx + 1,
-                    show_rsc=True,
-                    rsc_val=None,
-                    extra_flags=extra,
-                    fpu_q=fq,
-                )
-        if is_sf_turn and chosen and (chosen not in shown_ucis):
-            if chosen_idx is not None:
-                print("   ...")
-                self.print_row(
-                    cands_sorted[chosen_idx],
-                    mark=True,
-                    show_rank=True,
-                    rank_val=chosen_idx + 1,
-                    show_rsc=True,
-                    rsc_val=None,
-                    extra_flags=None,
-                    fpu_q=fq,
-                )
-                shown_ucis.add(chosen)
+            prev = i
+            extra, mark = flags_for(cands_sorted[i].get("uci"))
+            self.print_row(
+                cands_sorted[i],
+                mark=mark,
+                show_rank=True,
+                rank_val=i + 1,
+                show_rsc=True,
+                rsc_val=None,
+                extra_flags=extra,
+                fpu_q=fq,
+            )
 
         wdl = node.get("best_wdl")
         this_q = (wdl[0] - wdl[2]) if wdl is not None else None

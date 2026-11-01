@@ -499,6 +499,19 @@ def resolve_cfg(cfg):
     return resolved
 
 
+# vs_stockfish games inherit the selfplay config except for these, which are
+# pinned on and pulled out of sampleable
+VS_SF_FIXED = {"use_syzygy": True, "allow_resignation": True, "use_eval_draw": True}
+VS_SF_STARTS = {"startpos": 0.5, "pre_opened": 0.25, "pre_opened_mini": 0.25}
+
+
+def vs_stockfish_cfg(cfg):
+    c = cfg.copy()
+    c.sampleable = {k: v for k, v in cfg.sampleable.items() if k not in VS_SF_FIXED}
+    c.update(VS_SF_FIXED)
+    return resolve_cfg(c)
+
+
 class GameGenerator:
     def __init__(self, cfg):
         self.config = cfg
@@ -511,6 +524,8 @@ class GameGenerator:
         self.uho_sampler = UhoPgnSampler(PGN_TEXT)
 
         self.games_queued = 0
+        # SF depth for vs_stockfish games, set by the runner; None = engine default
+        self.sf_depth = None
 
     @property
     def game_types(self):
@@ -583,6 +598,9 @@ class GameGenerator:
         if game_type is None:
             types, probs = zip(*self.config.game_probs.items())
             game_type = random.choices(types, weights=probs, k=1)[0]
+        if game_type == "vs_stockfish":
+            types, probs = zip(*VS_SF_STARTS.items())
+            game_type = random.choices(types, weights=probs, k=1)[0]
         fen, moves, meta = self.generate(game_type)
         b = fastboard(fen)
         for mv in moves:
@@ -600,6 +618,18 @@ class GameGenerator:
                 f"Unknown game type {game_type}. Pick one of {self.game_types}"
             )
 
+        if game_type == "vs_stockfish":
+            return self.vs_stockfish_game(cfg)
+
+        fen, moves, meta = self.generate_dedup(game_type)
+
+        # selfplay never plays SF, but ChessGame reads both keys
+        meta["vs_stockfish"] = False
+        meta["stockfish_is_white"] = False
+        self.games_queued += 1
+        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
+
+    def generate_dedup(self, game_type):
         fen, moves, meta = self.generate(game_type)
 
         if game_type in DEDUP_TYPES:
@@ -616,12 +646,21 @@ class GameGenerator:
                 key = short_fen(b.fen())
                 attempts += 1
             self.remember_fen(key)
+        return fen, moves, meta
 
-        # only paired validation plays SF, but ChessGame reads both keys
-        meta["vs_stockfish"] = False
-        meta["stockfish_is_white"] = False
+    def vs_stockfish_game(self, cfg):
+        """A training game against SF from one of VS_SF_STARTS, random colour,
+        at the runner's current adaptive depth."""
+        types, probs = zip(*VS_SF_STARTS.items())
+        start_type = random.choices(types, weights=probs, k=1)[0]
+        fen, moves, meta = self.generate_dedup(start_type)
+        meta.update({
+            "scenario": "vs_stockfish", "start_type": start_type,
+            "vs_stockfish": True, "stockfish_is_white": random.random() < 0.5,
+            "sf_depth": self.sf_depth,
+        })
         self.games_queued += 1
-        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=resolve_cfg(cfg))
+        return GameSpec(fen=fen, moves=moves, meta=meta, cfg=vs_stockfish_cfg(cfg))
 
     def remember_fen(self, key):
         """FIFO-bounded dedup memory."""
@@ -704,16 +743,17 @@ class GameGenerator:
             fen, moves, _ = result
             # one draw per pair so both colours play the same sampled arm
             pair_cfg = resolve_cfg(cfg)
+            depth = cfg.sf_validation_depth
             specs.append(GameSpec(
                 fen=fen, moves=moves,
                 meta={"vs_stockfish": True, "stockfish_is_white": True,
-                      "scenario": "paired_validation"},
+                      "scenario": "paired_validation", "sf_depth": depth},
                 cfg=pair_cfg,
             ))
             specs.append(GameSpec(
                 fen=fen, moves=list(moves),
                 meta={"vs_stockfish": True, "stockfish_is_white": False,
-                      "scenario": "paired_validation"},
+                      "scenario": "paired_validation", "sf_depth": depth},
                 cfg=pair_cfg.copy(),
             ))
         return specs

@@ -90,8 +90,7 @@ def draw_depth_bands(ax, idxs, depths, n_end):
 def sampleable_cols(rd, fname="config.yaml"):
     """Column names the memlog carries for a run's sampleable params.
     looper.py writes the sampled scalar under the param name, except
-    move_sample_temp_range which it splits into _min/_max, and qmm_params
-    which also gets one column per vector element."""
+    move_sample_temp_range which it splits into _min/_max."""
     path = os.path.join(rd, fname)
     if not os.path.exists(path):
         return []
@@ -101,8 +100,6 @@ def sampleable_cols(rd, fname="config.yaml"):
     for param in samp:
         if param == "move_sample_temp_range":
             cols += ["move_sample_temp_min", "move_sample_temp_max"]
-        elif param == "qmm_params":
-            cols += ["qmm_params", "qmm_force", "qmm_gate", "qmm_gap_block"]
         else:
             cols.append(param)
     return cols

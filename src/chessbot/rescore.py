@@ -372,10 +372,6 @@ class Rescorer(object):
             blunder_replay_dir(cfg), BRP_REVIEWABLES_FILENAME)
         self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
         self.n_replay_finalized = 0
-        self.qmm_probe_jsonl = os.path.join(cfg.run_dir, QMM_PROBE_FILENAME)
-        self.n_qmm_probe = count_jsonl_lines(self.qmm_probe_jsonl)
-        self.qmm_probe_val_jsonl = os.path.join(cfg.run_dir, QMM_PROBE_VAL_FILENAME)
-        self.n_qmm_probe_val = count_jsonl_lines(self.qmm_probe_val_jsonl)
         self.brp_expected = 0
         self.brp_wait_start = None
 
@@ -653,7 +649,7 @@ class Rescorer(object):
         policy = np.zeros(1858, dtype=np.float32)
         s = sum(visits)
         pi = np.array([v / s for v in visits], dtype=np.float32)
-        pi = np.clip(pi, 0.0, 0.95)   # train-target clip, decoupled from search-side cfg
+        pi = np.clip(pi, 0.0, self.config.prior_clip_max)
         pi = pi / pi.sum()
         for idx, p in zip(indices, pi):
             policy[idx] += p
@@ -666,28 +662,50 @@ class Rescorer(object):
         self.opening_counts.bump(okey)
         self.live_buffer.append(
             (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0'), okey)
+        return policy
 
-    def training_data_from_sf(self, board, mv, cm, Y, is_draw, policy_weight=1.0):
+    def training_data_from_sf(self, board, mv, tr, Y, is_draw, sf_won):
+        """One SF ply. Policy: Xerces's search when SF played the search's
+        top move; otherwise SF's move (1 visit on every other legal move)
+        blended with the search, SF weight SF_POLICY_W_WON if SF won the game
+        else SF_POLICY_W_OTHER. The clip is applied after the blend. KL and
+        value-KL boosts match a Xerces ply. Returns the dense policy."""
         cfg = self.config
+        cm = tr['candidate_moves']
+        lms = board.legal_moves()
+        idx_uci = dict(zip(board.moves_to_indices(lms), lms))
+        vmap = {u: 1.0 for u in lms}
+        for idx, v in zip(*tr['raw_visits']):
+            u = idx_uci.get(int(idx))
+            if u is not None:
+                vmap[u] = max(1.0, float(v))
+        ucis = list(vmap)
+        xc0 = np.array([vmap[u] for u in ucis], dtype=np.float64)
 
-        rows = [(c["uci"], c["visits"]) for c in cm]
-        total_visits = sum([n for _, n in rows]) if rows else 0
-
-        if rows and total_visits > 10:
-            top_uci = max(rows, key=lambda x: x[1])[0]
-            pairs = encourage_best_move(rows, top_uci, mv, board.legal_moves())
-            ucis = [v[0] for v in pairs]
-            visits = [v[1] for v in pairs]
-        else:
-            raw = make_fake_visits(mv, board.legal_moves(), ratio_best=60)
-            ucis = [x[0] for x in raw]
-            visits = [int(x[1]) for x in raw]
-
-        priors_map = {c["uci"]: c["P"] for c in cm}
-        priors = [priors_map.get(u, 0.0) for u in ucis]
+        pi = xc0 / xc0.sum()
+        if mv != max(vmap, key=vmap.get):
+            sf = np.ones(len(ucis))
+            sf[ucis.index(mv)] += max(0.0, xc0.sum() - len(ucis))
+            w = SF_POLICY_W_WON if sf_won else SF_POLICY_W_OTHER
+            pi = w * sf / sf.sum() + (1 - w) * pi
 
         vwht = value_weight_for_game(cfg, is_draw)
-        self.append_flat_policy_example(board, ucis, visits, Y, vwht, policy_weight)
+        pwht = value_weight_for_game(cfg, is_draw)
+        priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
+        kl = kl_divergence(list(xc0), [priors_map.get(u, 0.0) for u in ucis])
+        if kl >= self.kl_q80:
+            pwht *= cfg.kl_boost_p80_mult
+        elif kl >= self.kl_q50:
+            pwht *= cfg.kl_boost_median_mult
+        klv = tr.get('kl_value')
+        if klv is not None:
+            if klv >= max(0.03, self.kl_value_q80):
+                vwht *= cfg.kl_boost_p80_mult
+            elif klv >= max(0.01, self.kl_value_q50):
+                vwht *= cfg.kl_boost_median_mult
+
+        return self.append_flat_policy_example(
+            board, ucis, list(pi), Y, vwht, pwht)
 
     def start_game(self, pkl_file, pool):
         path = str(pkl_file)
@@ -761,7 +779,8 @@ class Rescorer(object):
             tr['wdl_target'] = blend_wdl_stm(outcome, tr.get('best_wdl'))
             cm = tr.get('candidate_moves', [])
             if cm:
-                tr['policy'] = policy_from_raw_visits(tr['raw_visits'], 0.95)
+                tr['policy'] = policy_from_raw_visits(
+                    tr['raw_visits'], cfg.prior_clip_max)
                 tr['kl'] = float(kl_divergence(
                     [c['visits'] for c in cm],
                     [c.get('P_raw', c['P']) for c in cm]))
@@ -790,17 +809,17 @@ class Rescorer(object):
                 this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
                 Q = this_q
 
-            sf_wdl = tr.get('sf_wdl')
-            if sf_wdl is not None and len(sf_wdl) == 3:
-                Y_init = (0.5*z_to_wdl(Z_stm) + 0.5*np.array(sf_wdl, dtype=np.float32))
-            else:
-                Y_init = z_to_wdl(Z_stm)
-
             if is_sf_move:
-                sf_pwht = 0.0 if is_validation_game else 1.0
-                self.training_data_from_sf(
-                    b_fast, mv, cm, Y_init, is_draw, policy_weight=sf_pwht
-                )
+                # value: cliff-walker-corrected outcome, half SF's own tanh(cp)
+                sf_v = tr.get('sf_value')
+                Y = outcome if sf_v is None else (
+                    0.5 * outcome + 0.5 * scalar_to_wdl(sf_v)).astype(np.float32)
+                tr['wdl_target'] = Y
+                sf_won = result != 0 and (result > 0) == bool(sf_color)
+                policy = self.training_data_from_sf(
+                    b_fast, mv, tr, Y, is_draw, sf_won)
+                tr['policy'] = [(int(i), float(policy[i]))
+                                for i in np.flatnonzero(policy)]
 
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
@@ -1946,7 +1965,6 @@ class Rescorer(object):
         self.analyzed_results.append(out)
         self.games_processed += 1
         self.write_lean_record(game_state, cpl_by_ply)
-        self.write_qmm_probe(game_state, out_df)
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
         if self.games_processed % STATS_WINDOW_GAMES == 0:
@@ -1960,57 +1978,6 @@ class Rescorer(object):
         """Keep the fat record for review. Later this may fold in KL/CPL/RMS(Q)
         signal; for now paired validation plus a flat sample rate."""
         return (scenario == 'paired_validation') or (random.random() < REVIEW_RATE)
-
-    def write_qmm_probe(self, game_state, out_df):
-        """Qmm study data: every root child at every ply, joined to the SF
-        verdict, plus the game's qmm_params arm and result. One jsonl row per
-        game; paired validation games go to their own file. One cap covers
-        both files."""
-        if self.n_qmm_probe + self.n_qmm_probe_val >= QMM_PROBE_GAMES:
-            return
-        header = game_state['header']
-        is_val = header.get('scenario') == 'paired_validation'
-        path = self.qmm_probe_val_jsonl if is_val else self.qmm_probe_jsonl
-
-        sf = {int(r.move_num): r for r in out_df.itertuples()}
-        plies = []
-        for i, node in enumerate(game_state['plies']):
-            cands = node.get('candidate_moves') or []
-            if not cands or 'Qmm' not in cands[0]:
-                continue
-            r = sf.get(i)
-            plies.append({
-                'ply': i, 'abs_ply': node.get('abs_ply'), 'stm': node.get('stm'),
-                'move_played': node.get('move_played'),
-                'xc0_move': node.get('xc0_move'),
-                'sel_method': node.get('sel_method'),
-                'sims': node.get('sims'), 'stop_reason': node.get('stop_reason'),
-                'sf_best': r.best_move if r is not None else None,
-                'sf_best_cp': r.best_cp if r is not None else None,
-                'cpl': r.delta if r is not None else None,
-                'qmm_stats': node.get('qmm_stats'),
-                'played_pv_len': node.get('played_pv_len'),
-                'children': [
-                    [c['uci'], c['visits'], c['Q'], c['Qmm'], c['P'],
-                     c.get('qmm_new_bests'), c.get('qmm_gap12'), c.get('qmm_depth'),
-                     c.get('forced'), c.get('boosted')]
-                    for c in cands],
-            })
-        if not plies:
-            return
-
-        row = {'game_id': header['game_id'], 'scenario': header.get('scenario'),
-               'ts': time.time(), 'qmm_params': header.get('qmm_params'),
-               'result': header.get('result'),
-               'vs_stockfish': header.get('vs_stockfish'),
-               'stockfish_color': header.get('stockfish_color'),
-               'plies': plies}
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(row, default=float) + '\n')
-        if is_val:
-            self.n_qmm_probe_val += 1
-        else:
-            self.n_qmm_probe += 1
 
     def write_lean_record(self, game_state, cpl_by_ply):
         """Transform the fat {header, plies} into the on-disk retrain-ready
@@ -2026,7 +1993,9 @@ class Rescorer(object):
                 'stm', 'move_played', 'z_wdl', 'wdl_target', 'policy',
                 'kl', 'kl_value')}
             for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
-                      'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits'):
+                      'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits',
+                      'gap_block_sims', 'gap_block_leader', 'pv_len',
+                      'pv_played_len', 'sf_value'):
                 entry[k] = node.get(k)
 
             hit = cpl_by_ply.get(i)
@@ -2040,7 +2009,7 @@ class Rescorer(object):
             if reviewable:
                 for k in ('sims', 'time', 'avg_depth', 'max_depth',
                           'children_visited', 'total_children', 'pv',
-                          'sharp_by_depth'):
+                          'pv_played', 'sharp_by_depth'):
                     if k in node:
                         entry[k] = node[k]
                 entry['candidate_moves'] = node.get('candidate_moves', [])
@@ -2739,9 +2708,10 @@ def blend_wdl(z_stm, best_wdl_white_pov, is_white):
 
 
 REVIEW_RATE = 0.005
-QMM_PROBE_GAMES = 30000
-QMM_PROBE_FILENAME = "qmm_probe.jsonl"
-QMM_PROBE_VAL_FILENAME = "qmm_probe_val.jsonl"
+# SF-ply policy: SF's share of the blend when SF's move is not the search's
+# top move, by game outcome from SF's side
+SF_POLICY_W_WON = 0.8
+SF_POLICY_W_OTHER = 0.5
 
 
 def policy_from_raw_visits(raw_visits, prior_clip_max):

@@ -194,6 +194,10 @@ class GameLooper(object):
             self.stop_at_empty = True
             self.active_games = self.active_games[:self.config.games_at_once]
 
+        elif cmd == "clear_sf_hash":
+            if self.sf_thread is not None:
+                self.sf_thread.clear_hash()
+
         elif cmd == "tear_down_sf":
             # never mid-game: an active vs_stockfish game still needs the
             # engine, so defer and let the run loop retry
@@ -262,8 +266,7 @@ class GameLooper(object):
                     break
             
             if spec.meta.get("vs_stockfish") and self.sf_thread is None:
-                # depth is fixed for this engine's life; a moved ladder only
-                # takes effect after a tear_down_sf rebuilds it
+                # default depth only; every request carries the spec's sf_depth
                 self.sf_thread = StockfishThread(
                     spec.cfg.sf_config, spec.cfg.sf_validation_depth
                 )
@@ -358,7 +361,8 @@ class GameLooper(object):
                 if game.is_stockfish_turn():
                     if not game.sf_pending:
                         # submit move to sf queue here
-                        self.sf_thread.submit(game.game_id, game.python_chess_board)
+                        self.sf_thread.submit(game.game_id, game.python_chess_board,
+                                              depth=game.meta.get("sf_depth"))
 
                         # stash the game here for easy reference later
                         self.sf_games[game.game_id] = game
@@ -535,11 +539,6 @@ class GameLooper(object):
             if param == 'move_sample_temp_range' and isinstance(val, list):
                 mem_summary['move_sample_temp_min'] = val[0]
                 mem_summary['move_sample_temp_max'] = val[1]
-            elif param == 'qmm_params':
-                mem_summary[param] = ','.join(str(v) for v in val)
-                mem_summary['qmm_force'] = bool(val[0])
-                mem_summary['qmm_gate'] = int(val[1])
-                mem_summary['qmm_gap_block'] = float(val[2])
             elif isinstance(val, list):
                 mem_summary[param] = ','.join(str(v) for v in val)
             else:
@@ -732,6 +731,7 @@ class StockfishThread(object):
         self.req_q = Queue()
         self.res_q = Queue()
         self.stop_ev = threading.Event()
+        self.clear_ev = threading.Event()
         self.t = None
 
         self.eng = None
@@ -755,9 +755,13 @@ class StockfishThread(object):
         if self.err is not None:
             raise self.err
 
-    def submit(self, game_id, board):
+    def submit(self, game_id, board, depth=None):
         b = board.copy(stack=True)
-        self.req_q.put((game_id, b))
+        self.req_q.put((game_id, b, depth))
+
+    def clear_hash(self):
+        """Clear the TT before the next request; nothing is rebuilt."""
+        self.clear_ev.set()
 
     def drain(self, max_items=9999):
         out = []
@@ -773,15 +777,18 @@ class StockfishThread(object):
         self.eng.configure(self.sf_config)
 
         while not self.stop_ev.is_set():
+            if self.clear_ev.is_set():
+                self.clear_ev.clear()
+                self.eng.configure({"Clear Hash": None})
             try:
-                game_id, board = self.req_q.get(timeout=0.01)
+                game_id, board, depth = self.req_q.get(timeout=0.01)
             except Empty:
                 continue
 
             try:
                 res_tup = sf_eval(
                     board, score_fn=lambda s: score_to_value_stm_pov_tanh(s, mid_cp=150.0),
-                    depth=self.depth, engine=self.eng
+                    depth=depth or self.depth, engine=self.eng
                 )
 
                 self.res_q.put((game_id, res_tup))

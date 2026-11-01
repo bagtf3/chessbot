@@ -29,8 +29,6 @@ class Config(object):
     # epoch 0 only: hold the first validation batch until this many games
     # are done, so the quick selfplay games show up first
     validation_warmup_games = 1000
-    # pin the SF depth and never bump it (a side-chain test stream); None = ladder
-    validation_freeze_depth = None
     n_workers = 2
 
     # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
@@ -51,7 +49,7 @@ class Config(object):
     pruning_factor = 1.33
     
     # Simulation schedule
-    sf_move_sims = 200
+    sf_move_sims = 400
     sims_floor = 400
     sims_ceiling = 800
 

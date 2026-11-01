@@ -63,15 +63,7 @@ def create_validation_config(cfg, yaml_file=None, verbose=True):
         previous_run_tag=vcfg.previous_run_tag
     )
 
-    if vcfg.validation_freeze_depth is not None:
-        vcfg.sf_index = next(
-            (i for i, row in enumerate(vcfg.sf_table)
-             if row["depth"] >= vcfg.validation_freeze_depth),
-            len(vcfg.sf_table) - 1,
-        )
-        vcfg.sf_validation_depth = vcfg.sf_table[vcfg.sf_index]['depth']
-        vcfg.sf_elo = vcfg.sf_table[vcfg.sf_index]['elo']
-    elif prev_last is not None:
+    if prev_last is not None:
         vcfg = continue_depth_from_previous_cfg(vcfg, prev_last)
 
     if verbose:
@@ -203,7 +195,8 @@ def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
     on: a retrain can land mid-batch. Stamped so the cadence can later be
     driven off the history file instead of in-memory state.
     """
-    sf_games = [g for g in recent if g.get("vs_stockfish")]
+    # vs_stockfish training games also play SF but never count toward the ladder
+    sf_games = [g for g in recent if g.get("scenario") == "paired_validation"]
     n = len(sf_games)
     if n == 0:
         raise RuntimeError("no stockfish games in validation batch")
@@ -249,9 +242,7 @@ def build_validation_summary_from_rows(recent, cfg, model_epoch=None):
 
     dominant = (n >= min_games) and (score > 0.72)
 
-    if cfg_dict.get("validation_freeze_depth") is not None:
-        action = "frozen"
-    elif dominant or consec >= 2:
+    if dominant or consec >= 2:
         if index < (len(table) - 1):
             bumped = True
             action = "bumped_depth_dominant" if dominant else "bumped_depth"

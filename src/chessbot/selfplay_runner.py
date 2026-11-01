@@ -47,6 +47,14 @@ import chessbot.replay_buffer as rb
 
 GAME_QUEUE_MIN = 36
 GAME_QUEUE_TARGET = GAME_QUEUE_MIN * 2
+# vs_stockfish specs waiting for the SF worker. Kept small: that worker drains
+# sf_q before game_q, so this is how far it lags joining a validation batch.
+SF_QUEUE_TARGET = GAME_QUEUE_MIN
+# adaptive vs_stockfish depth: EMA of Xerces's score, mapped to how many plies
+# below the validation depth SF plays
+SF_EMA_SPAN = 200
+SF_DEPTH_BANDS = ((0.45, 0), (0.35, 1))
+SF_DEPTH_MAX_DROP = 2
 WORKER_PAUSE_SETTLE_S = 10.0
 # longest the runner holds a retrain waiting on the fleet to drop its GPU
 # sessions; kept under the retrain worker's own GO_TIMEOUT_S
@@ -71,12 +79,13 @@ BRP_BULK_FRAC = 0.25
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue,
-                 release_ev=None):
-    """mp.Process target. One queue now -- selfplay, validation and blunder
-    replays all arrive on it and are told apart by spec.meta."""
+                 release_ev=None, sf_queue=None):
+    """mp.Process target. Selfplay, validation and blunder replays share
+    game_queue and are told apart by spec.meta. Only the SF worker also gets
+    sf_queue, which carries the vs_stockfish games and is drained first."""
     with init_selfplay(
         cfg, recent_games_q, telemetry_q,
-        msg_q, game_q=game_queue
+        msg_q, game_q=game_queue, sf_q=sf_queue
     ) as looper:
         looper.release_ev = release_ev
         # lc0 is demand-driven and idles between bundles; its idle window
@@ -341,6 +350,8 @@ class SelfPlayRunner:
 
         self.ctx = mp.get_context()
         self.game_q = None
+        self.sf_q = None
+        self.sf_ema = 0.5
         self.lc0_q = None
         self.lc0_hold = []
         self.lc0_hold_since = None
@@ -436,6 +447,7 @@ class SelfPlayRunner:
                   flush=True)
 
         self.game_gen = GameGenerator(self.cfg)
+        self.sync_sf_depth()
         self.started_at = time.time()
 
     def games_already_completed(self):
@@ -506,21 +518,53 @@ class SelfPlayRunner:
         stop_ev = self.ctx.Event()
         release_ev = self.ctx.Event()
         msg_q = self.ctx.Queue()
+        # the first worker spawned while nobody holds sf_q becomes the SF worker
+        sf_owner = self.sf_q is not None and self.sf_owner() is None
         p = self.ctx.Process(
             target=child_looper,
             args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
-                  self.game_q, release_ev),
+                  self.game_q, release_ev, self.sf_q if sf_owner else None),
             daemon=True,
         )
         p.start()
         self.worker_procs.append(p)
         self.procs.append({
             "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
-            "release_ev": release_ev,
+            "release_ev": release_ev, "sf_owner": sf_owner,
             "kind": "xc0", "stop_sent_at": None, "term_sent_at": None,
             "kill_sent_at": None,
         })
+        if sf_owner:
+            print(f"[runner] {c.id} is the vs_stockfish worker", flush=True)
         return c.id
+
+    def sf_owner(self):
+        return next((w for w in self.procs_of("xc0") if w.get("sf_owner")), None)
+
+    def check_sf_owner(self):
+        """After each retrain: the SF worker must still be alive. If it is
+        gone, the next respawn picks up sf_q (see spawn_worker)."""
+        if self.sf_q is not None and self.sf_owner() is None:
+            print("[runner] WARNING no live vs_stockfish worker; the next "
+                  "respawned worker takes sf_q", flush=True)
+
+    def sync_sf_depth(self):
+        """vs_stockfish depth: validation depth minus 0-2 from the score EMA,
+        never above validation depth."""
+        drop = next((d for lo, d in SF_DEPTH_BANDS if self.sf_ema >= lo),
+                    SF_DEPTH_MAX_DROP)
+        depth = max(1, self.val_cfg.sf_validation_depth - drop)
+        if depth != self.game_gen.sf_depth:
+            print(f"[runner] vs_stockfish depth -> {depth} "
+                  f"(score ema {self.sf_ema:.3f})", flush=True)
+        self.game_gen.sf_depth = depth
+
+    def record_vs_stockfish(self, meta):
+        result = meta.get("result", 0)
+        xc0_white = not meta.get("stockfish_color")
+        s = 0.5 if result == 0 else float((result > 0) == xc0_white)
+        self.sf_ema += (s - self.sf_ema) * 2.0 / (SF_EMA_SPAN + 1)
+        self.sync_sf_depth()
 
     def spawn_lc0_worker(self):
         """Start one lc0 teacher probe worker.
@@ -564,6 +608,7 @@ class SelfPlayRunner:
         self.recent_q = self.ctx.Queue()
         self.telemetry_q = self.ctx.Queue()
         self.game_q = self.ctx.Queue()
+        self.sf_q = self.ctx.Queue()
 
         for _ in range(max(1, self.cfg.n_workers)):
             self.spawn_worker()
@@ -751,9 +796,13 @@ class SelfPlayRunner:
         added = 0
         while added < budget and self.game_q.qsize() < target:
             spec = self.game_gen.next_game()
+            # vs_stockfish goes to the SF worker; with sf_q full, redraw
+            while spec is not None and spec.meta.get("vs_stockfish") and (
+                    self.sf_q.qsize() >= SF_QUEUE_TARGET):
+                spec = self.game_gen.next_game()
             if spec is None:
                 break
-            self.game_q.put(spec)
+            (self.sf_q if spec.meta.get("vs_stockfish") else self.game_q).put(spec)
             added += 1
 
         self.total_queued += added
@@ -826,6 +875,8 @@ class SelfPlayRunner:
             print("[validation] no specs generated, skipping", flush=True)
             return
 
+        # validation starts on a clean TT; the SF worker keeps its engine
+        self.broadcast("clear_sf_hash", kinds={"xc0"})
         for spec in specs:
             self.game_q.put(spec)
 
@@ -860,6 +911,7 @@ class SelfPlayRunner:
         self.broadcast("tear_down_sf")
         self.val_cfg = create_validation_config(
             self.cfg, self.val_yaml_path, verbose=False)
+        self.sync_sf_depth()
 
     def close_partial_validation_batch(self, why):
         """Summarise whatever came back. The batch is colour-imbalanced, so
@@ -909,6 +961,8 @@ class SelfPlayRunner:
             self.update_game_index(meta)
             self.finished_games.append(game)
             self.total_games += 1
+            if scenario == "vs_stockfish":
+                self.record_vs_stockfish(meta)
 
             # only collect while a batch is actually live, so a straggler
             # arriving after one closed cannot land in the next one's buffer
@@ -1128,6 +1182,7 @@ class SelfPlayRunner:
         for t in self.sf_rescore_threads:
             t.update_config(self.cfg)
         self.rescorer.current_movetime_ms = self.sf_rescore_threads[0].movetime_ms
+        self.check_sf_owner()
 
         # hard rule: unpause as soon as training is done, the TRT rebuild in
         # reload_config being the one unavoidable prerequisite. A pause the
@@ -1422,7 +1477,7 @@ class SelfPlayRunner:
         self.procs = [w for w in self.procs if w["p"].is_alive()]
 
         for q in (self.recent_q, self.telemetry_q, self.game_q,
-                  self.lc0_q):
+                  self.sf_q, self.lc0_q):
             if q is not None:
                 q.cancel_join_thread()
                 q.close()

@@ -16,11 +16,11 @@ from chessbot.utils import rnd
 
 POLICY_DIM = 1858
 TABLEBASE = None
-PLAYED_PV_MAX = 64
+PV_MAX = 64
 
 # move sampling: top-k by visits, each within this STM Q of the most-visited child
 SAMPLE_TOP_K = 7
-SAMPLE_MAX_Q_DELTA = 0.2
+SAMPLE_MAX_Q_DELTA = 0.4
 
 
 def build_raw_visits_sparse(board, ucis, visits):
@@ -558,7 +558,7 @@ class ChessGame(object):
         # boost- and Qmm-force-decided visits are left out of the policy target
         ucis = [cd.uci for cd in details]
         visits = [cd.N - cd.boosted_N - cd.forced_N for cd in details]
-        qs = self.tree.qmm_stats()
+        gb = self.tree.gap_block()
 
         data = {
             "abs_ply": self.board.history_size(),
@@ -577,25 +577,14 @@ class ChessGame(object):
             "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "sharp_by_depth": list(self.tree.sharp_by_depth()),
-            "qmm_stats": {
-                "root_new_bests": qs.root_new_bests,
-                "root_last_new_best": qs.root_last_new_best,
-                "leader_flips": qs.leader_flips,
-                "last_leader_flip": qs.last_leader_flip,
-                "forces_set": qs.forces_set, "forces_fired": qs.forces_fired,
-                "forces_replaced": qs.forces_replaced,
-                "forces_blocked": qs.forces_blocked,
-                "forces_overridden": qs.forces_overridden,
-                "forced_by_depth": list(self.tree.forced_by_depth()),
-                "stop_blocks_t1": qs.stop_blocks_t1,
-                "stop_blocks_t2": qs.stop_blocks_t2,
-                "first_block_sims": qs.first_block_sims,
-                "first_block_leader": qs.first_block_leader or None,
-                "last_gap": rnd(qs.last_gap, 4),
-            },
+            "gap_block_sims": gb.sims,
+            "gap_block_leader": gb.leader or None,
             "children_visited": visited_children,
             "total_children": total_children,
         }
+        if self.is_stockfish_turn():
+            # SF's tanh(cp) value at play time, STM-POV
+            data["sf_value"] = rnd(self.sf_eval, 4)
 
         # sumN for U term
         sumN = max(1, root.N)
@@ -611,8 +600,6 @@ class ChessGame(object):
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
                 "boosted": cd.boosted_N,
                 "Qmm": rnd(cd.Qmm, 4),
-                "qmm_new_bests": cd.qmm_new_bests, "qmm_gap12": rnd(cd.qmm_gap12, 4),
-                "qmm_depth": cd.qmm_depth, "forced": cd.forced_N,
                 "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),
                 "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }
@@ -620,24 +607,25 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # fast PV via C++; for sampled moves trace from xc0 choice, not the sampled move
-        pv_start = "" if method == "stockfish" else (xc0_move or mv)
-        pv = []
-        pv_items = self.tree.principal_variation(24, pv_start)
-        for x in pv_items:
-            pv.append({
-                "uci": x.uci, "visits": int(x.visits),
-                "P": rnd(x.P, 4), "Q": rnd(x.Q, 4)
-            })
-        
-        # attach PV snapshot (may be empty if no deeper visited chain exists)
+        # pv traces Xerces's choice (most-visited on SF turns); pv_played traces
+        # the move actually played when it differs (sampled or SF)
+        if method == "stockfish":
+            pv_start, xerces_pick = "", (details[0].uci if details else None)
+        else:
+            pv_start = xerces_pick = xc0_move or mv
+        pv = self.pv_dicts(pv_start)
+        pv_played = self.pv_dicts(mv) if mv != xerces_pick else None
         data["pv"] = pv
-        # most-visited chain under the move actually played, root move included
-        data["played_pv_len"] = (
-            0 if method == "stockfish"
-            else len(self.tree.principal_variation(PLAYED_PV_MAX, mv)))
+        data["pv_played"] = pv_played
+        data["pv_len"] = len(pv)
+        data["pv_played_len"] = None if pv_played is None else len(pv_played)
 
         self.tree_data[self.plies] = data
+
+    def pv_dicts(self, start):
+        return [{"uci": x.uci, "visits": int(x.visits), "P": rnd(x.P, 4),
+                 "Q": rnd(x.Q, 4)}
+                for x in self.tree.principal_variation(PV_MAX, start)]
 
     def set_stockfish_result(self, res_tup):
         self.sf_res_tup = res_tup

@@ -41,7 +41,7 @@ from chessbot.replay_buffer import (
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
     VAL_SF_RECORDS, SF_SOURCE,
 )
-from chessbot.rescore import report_validation
+from chessbot.eval_metrics import report_validation
 from chessbot.utils import policy_metric_rows
 
 # above the runner's RETRAIN_RELEASE_TIMEOUT_S so main's go normally wins
@@ -94,7 +94,7 @@ def predict_fp16(model, X_list, batch_size):
 
 def validate_slice(model, samples, batch_size):
     """Value predictions and per-row policy metrics for one validation slice,
-    VAL_CHUNK rows at a time. Input to rescore.report_validation."""
+    VAL_CHUNK rows at a time. Input to eval_metrics.report_validation."""
     wdl, policy, top_target = [], defaultdict(list), []
     for i in range(0, len(samples), VAL_CHUNK):
         part = samples[i:i + VAL_CHUNK]

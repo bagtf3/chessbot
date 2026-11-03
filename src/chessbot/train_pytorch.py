@@ -23,17 +23,18 @@ FALLBACK_ARCH = "13m-precond-conformer"
 # Remove once retrain moves to the tfrec + async EpochBuffer streamer.
 VRAM_CHUNK = 5120
 
-# Dynamic LW: mirrors the pretrain LW-twiddle recipe (bootstrap_model_async_
-# tfrec_pt.py). Fixed 1:1 policy:value shape, rescaled every retrain cycle by
-# an EMA of the raw per-cycle CEs so the weighted total matches
-# RETRAIN_LW_TARGET_POLICY_MULT*policy_ce_hat + RETRAIN_LW_TARGET_VALUE_MULT*
-# value_ce_hat. Each retrain cycle already spans a full pass over a large,
-# variable-sized batch of records (not a fixed 20-step epoch like pretrain),
-# so instead of a fixed per-call alpha, the EMA weight is derived from step
-# count: pretrain's span is LW_EMA_SPAN_EPOCHS(20)*PT_STEPS_PER_EPOCH(20) =
-# 400 steps at batch=512 (matches cfg.retrain_batch_size), so a retrain cycle
-# that runs `steps` steps carries alpha = steps / RETRAIN_LW_EMA_SPAN_STEPS,
-# capped at 1 -- same steps-of-memory invariant, regardless of cycle size.
+# Dynamic LW, the pretrain LW-twiddle recipe (bootstrap_model_async_tfrec_pt.py).
+# RETRAIN_LW_BASE_POLICY / RETRAIN_LW_BASE_VALUE set the policy:value RATIO.
+# Both weights are then multiplied by one shared scale so the weighted total
+# matches RETRAIN_LW_TARGET_POLICY_MULT * policy_ce_hat +
+# RETRAIN_LW_TARGET_VALUE_MULT * value_ce_hat: the TARGET mults pin the overall
+# loss LEVEL while the BASE ratio is moved (e.g. annealed toward even).
+# When the TARGET mults equal the BASE values the scale is 1 and this is a
+# plain fixed-weight loss. Under Adam only the ratio changes the update; the
+# shared scale mostly shifts how often clip_norm bites.
+# *_ce_hat are EMAs of the raw per-cycle CEs. Retrain cycles run a variable
+# number of steps, so the EMA alpha is steps / RETRAIN_LW_EMA_SPAN_STEPS,
+# capped at 1, keeping the pretrain span measured in steps.
 RETRAIN_LW_BASE_POLICY        = 1.0
 RETRAIN_LW_BASE_VALUE         = 1.0
 RETRAIN_LW_TARGET_POLICY_MULT = 1.0

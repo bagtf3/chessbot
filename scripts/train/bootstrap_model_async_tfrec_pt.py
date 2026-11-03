@@ -132,7 +132,7 @@ def lw_for_epoch(ep, policy_ce_hat, value_ce_hat, active):
 
 
 # Shared schema for the unified eval_progress.csv. The first 15 are selfplay's
-# existing columns in their existing order -- rescore.report_validation writes
+# existing columns in their existing order -- eval_metrics.report_validation writes
 # exactly these and nothing else. The last 5 only pretraining can produce, so
 # they sit at the end and stay blank once selfplay starts appending.
 UNIFIED_COLS = [

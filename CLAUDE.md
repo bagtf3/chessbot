@@ -49,17 +49,19 @@ Start Claude Code from the parent directory (`C:\Users\Bryan\repos\`) to access 
 - vocab_size=21 in all models
 
 ## Active Model Architecture
-m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`) with:
-- D=256, num_heads=8, ff_dim=1024, xc0h_K=6, LayerNorm throughout
-- xc0h stem -> 2 plain + 6 gated expandy convs -> add pos -> 4 FF + 4 SwiGLU tx blocks
-- Gated expandy: grouped 3x3 (4 groups, D->2D) + 1x1 pointwise, sigmoid gate per square/channel
-- Per-channel PReLU (init 0.03, clamped [-0.5, 0.5]); tanh-gated attention on SwiGLU blocks
-- 8 global accumulators: W/D/L (64-66), SmartGate (67, 68), from/to policy (68-71)
+m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`):
+- xc0h stem -> plain + gated expandy convs -> add pos -> FF + SwiGLU tx blocks,
+  LayerNorm throughout
+- Gated expandy: grouped 3x3 + 1x1 pointwise, sigmoid gate per square/channel
+- Per-channel PReLU; tanh-gated attention on SwiGLU blocks
+- Global accumulator tokens for W/D/L, SmartGate and from/to policy
 - SmartGate: policy - scale * sigmoid(gate_raw), suppress-only, legality BCE gate loss
-- ~18.4M parameters, PyTorch fp16 autocast
+- PyTorch fp16 autocast
 - Policy: 1858 legal logits scattered to 4288 flat
 - Value: WDL 3-class softmax, STM-POV
 - Inference: ORT+TRT fp16 via `infer_ort_trt.py` / `prepare_trt`
+- Dims, block counts and init values live in the builder in `model.py` (a path
+  for when a task needs them, not an instruction to go look)
 
 ## MCTS
 - `MCTSTree` extends C++ `fasttree`, adds Python-side early stopping, noise, sampling
@@ -74,18 +76,23 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`) with:
 - Blunder detection → visit redistribution → flat 4288-dim policy targets
 - `training_queue_buffer` games accumulated → pause workers → retrain subprocess → unpause
 - VRAM reclaimed via spawn process before retrain
-- Each retrain draws 12 primary + 12 replay + 4 historic shards. After a
-  successful retrain: primary → replay buffer, the drawn replay shards are
-  discarded, and the 4 historic shards stay in place (historic is read-only
-  and can be redrawn; a full copy lives on E:).
+- Each retrain draws primary + replay + historic shards; the counts are the
+  `RETRAIN_*_SHARDS` constants in `replay_buffer.py`. Historic can be set to 0
+  (draw, validation slice and its csv row all switch off). After a successful
+  retrain: primary → replay buffer, the drawn replay shards are discarded, and
+  historic shards stay in place (historic is read-only and can be redrawn; a
+  full copy lives on E:).
 - Historic corpus lives at `BOOTSTRAP_PKL_GZ` (pkl.gz shards, not tfrecords —
-  the `BOOTSTRAP_TFREC_DIR` name survives only in legacy tfrec-era scripts)
+  the `BOOTSTRAP_TFREC_DIR` name survives only in legacy tfrec-era scripts).
+  Mostly older xc0 selfplay plus some lc0, mixed within shards.
 
-## Game Curriculum (m137_8c8t)
-- startpos 50%, UHO 24%, pre_opened 10%, pre_opened_mini 9%
-- random_init 3%, piece_odds 2%, piece_training 2%
-- UHO = Unbalanced Human Openings (UHO_XXL_2022_+100_+129.pgn), white-to-move at ply 16
-- Bootstrapped from ~6M LC0 positions
+## Game Curriculum
+- Scenarios: startpos, UHO, pre_opened, pre_opened_mini, vs_stockfish,
+  random_init, piece_odds, piece_training
+- UHO = Unbalanced Human Openings (UHO_XXL_2022_+100_+129.pgn)
+- The mix is `game_probs` in the run's `config.yaml` (a path for when a task
+  needs it, not an instruction to go look)
+- Bootstrapped by pretraining on the historic corpus (older xc0 + lc0)
 
 ## Validation Ladder
 - Paired games from UHO positions (each played as both colors)

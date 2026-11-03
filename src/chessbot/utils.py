@@ -8,7 +8,6 @@ pd.set_option('display.max_columns', None)
 import math, random, time, pickle
 from pathlib import Path
 from time import time as _now
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import chess
@@ -458,38 +457,38 @@ def policy_metric_rows(logits, labels, mask):
     true_best = labels.argmax(axis=1)
     model_best = probs.argmax(axis=1)
 
-    # top-k indices by label (unsorted within the k)
+    # top-3 indices by label (unsorted within the 3)
     top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :3]
-    top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :5]
-
-    others = labels > 0
-    others[rows, true_best] = False
 
     return {
         "policy_ce": -np.sum(labels * np.log(probs + eps), axis=1),
         "uniform_ce": -np.sum(labels * np.log(uniform + eps), axis=1),
-        "exp_prob_model": np.sum(labels * probs, axis=1),
-        "exp_prob_uniform": np.sum(labels * uniform, axis=1),
+        # entropy of the target: the floor policy_ce can't go below
+        "policy_target_ent": -np.sum(labels * np.log(labels + eps), axis=1),
         "top1_exact": (model_best == true_best).astype(np.float32),
         "avg_top_prob": probs[rows, model_best],
-        # mass on label-defined top-1 / top-3 / top-5
+        # mass on label-defined top-1 / top-3
         "top1_mass": probs[rows, true_best],
         "top3_mass": np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1),
-        "top5_mass": np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1),
-        # mass the target puts on its own top-5 -- the ceiling top5_mass can't
+        # mass the target puts on its own top-3 -- the ceiling top3_mass can't
         # meaningfully exceed, since labels are blended with uniform_eps/clipped
-        "top5_mass_target":
-            np.take_along_axis(labels, top5_idx, axis=1).sum(axis=1),
-        "prob_on_others": (probs * others).sum(axis=1),
+        "top3_mass_target":
+            np.take_along_axis(labels, top3_idx, axis=1).sum(axis=1),
         # raw (unmasked) softmax mass on legal moves
         "mass_on_legal": (stable_softmax(logits) * mask).sum(axis=1),
     }
 
 
 def policy_metric_means(rows):
+    """Means of policy_metric_rows plus the derived columns. policy_kl is
+    policy_ce less the target-entropy floor; ce_gain_frac is ce_gain as a
+    share of the most it can be for these targets (0 = uniform, 1 = exact)."""
     m = {k: float(np.mean(v)) for k, v in rows.items()}
-    return {"policy_ce": m["policy_ce"], "uniform_ce": m["uniform_ce"],
-            "ce_gain": m["uniform_ce"] - m["policy_ce"], **m}
+    ent = m["policy_target_ent"]
+    m["ce_gain"] = m["uniform_ce"] - m["policy_ce"]
+    m["policy_kl"] = m["policy_ce"] - ent
+    m["ce_gain_frac"] = m["ce_gain"] / max(m["uniform_ce"] - ent, 1e-9)
+    return m
 
 
 def batch_policy_metrics(logits, labels, mask):
@@ -502,7 +501,7 @@ def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
         "value_ce", "policy_ce", "chess_loss",
         "value_mse", "value_corr", "ce_gain",
         "top1_exact", "avg_top",
-        "top1_mass", "top5_mass", "top5_mass (target)",
+        "top1_mass", "top3_mass", "top3_mass (target)",
     ]
     name_w = max(len(k) for k in keys)
     num_w = 7
@@ -521,8 +520,8 @@ def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):
     print(f"{pfx} {pair('top1_exact', stats['top1_exact'])}  "
           f"{pair('avg_top', stats['avg_top_prob'])}")
     print(f"{pfx} {pair('top1_mass', stats['top1_mass'])}  "
-          f"{pair('top5_mass', stats['top5_mass'])}  "
-          f"{pair('top5_mass (target)', stats['top5_mass_target'])}")
+          f"{pair('top3_mass', stats['top3_mass'])}  "
+          f"{pair('top3_mass (target)', stats['top3_mass_target'])}")
     if mass_on_legal is not None:
         cov_str = f" ({mol_coverage:.0%} coverage)" if mol_coverage is not None else ""
         print(f"{pfx} mass_on_legal (est): {mass_on_legal:.4f}{cov_str}")

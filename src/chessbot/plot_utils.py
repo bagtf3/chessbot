@@ -134,18 +134,17 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
         fig2.suptitle(title, fontsize=12)
     axs = axs2d[0]
 
-    # top1 / top3 / top5
+    # top1 / top3
     ax = axs[0]
     t1 = np.array(col_vals("top1_mass"))
     t3 = np.array(col_vals("top3_mass"))
-    t5 = np.array(col_vals("top5_mass"))
-    any_top = any(a.size for a in (t1, t3, t5))
+    any_top = any(a.size for a in (t1, t3))
     if not any_top:
         ax.text(0.5, 0.5, "no top-k data", ha="center", va="center")
         ax.set_axis_off()
     else:
-        colors = ["tab:blue", "tab:orange", "tab:green"]
-        for arr, label, c in zip((t1, t3, t5), ("top1", "top3", "top5"), colors):
+        colors = ["tab:blue", "tab:orange"]
+        for arr, label, c in zip((t1, t3), ("top1", "top3"), colors):
             if arr.size:
                 ax.plot(xs, arr[start:], alpha=0.25, lw=0.8, color=c)
                 ma = moving_average_pd(arr, window=ma_window)[start:]
@@ -194,7 +193,7 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
             ax.text(0.5, 0.5, "no data", ha="center", va="center")
             ax.set_axis_off()
 
-    # bottom row: train loss (4:1 recompute), CE ratio, grad norm mean
+    # bottom row: train loss (4:1 recompute), KL ratio, grad norm mean
     axs_b = axs2d[1]
     v_ce = np.array(col_vals("value_ce"))
     p_ce = np.array(col_vals("policy_ce"))
@@ -209,13 +208,16 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
                 ha="center", va="center")
         ax.set_axis_off()
 
+    # KL = CE less the target-entropy floor, so the ratio is error vs error
     ax = axs_b[1]
-    if have_ces:
+    v_kl = np.array(col_vals("value_kl"), dtype=float)
+    p_kl = np.array(col_vals("policy_kl"), dtype=float)
+    if v_kl.size and p_kl.size and not np.all(np.isnan(v_kl)):
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = np.where(p_ce != 0, v_ce / p_ce, np.nan)
-        plot_panel(ax, ratio, "value_ce/policy_ce", title="value CE / policy CE")
+            ratio = np.where(p_kl != 0, v_kl / p_kl, np.nan)
+        plot_panel(ax, ratio, "value_kl/policy_kl", title="value KL / policy KL")
     else:
-        ax.text(0.5, 0.5, "missing: value_ce / policy_ce",
+        ax.text(0.5, 0.5, "missing: value_kl / policy_kl",
                 ha="center", va="center")
         ax.set_axis_off()
 

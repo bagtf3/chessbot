@@ -37,6 +37,15 @@ CACHE_COUNTERS = ("queries", "hits", "evictions")
 # so a call that returns this many leaves was cut off by the descent cap
 COLLECT_DESCENT_CAP = 1000
 
+# one paired_validation spec pulls up to this many in a burst, over
+# games_at_once if need be, so a batch starts at once instead of trickling in
+# as selfplay games finish
+VAL_OVERFILL = 64
+
+
+def is_validation(meta):
+    return meta.get("scenario") == "paired_validation"
+
 
 class GameLooper(object):
     """
@@ -192,7 +201,6 @@ class GameLooper(object):
         """Commands other than pause/unpause, honored paused or not."""
         if cmd == "drain_and_stop":
             self.stop_at_empty = True
-            self.active_games = self.active_games[:self.config.games_at_once]
 
         elif cmd == "clear_sf_hash":
             if self.sf_thread is not None:
@@ -272,13 +280,41 @@ class GameLooper(object):
                     spec = self.game_queue.get_nowait()
                 except Exception:
                     break
-            
-            if spec.meta.get("vs_stockfish"):
-                self.ensure_sf_thread(spec.cfg)
 
-            cg = ChessGame(spec=spec)
+            if is_validation(spec.meta):
+                self.validation_burst(spec)
+            else:
+                self.add_game(spec)
+
+    def validation_burst(self, spec):
+        """Pull validation specs until VAL_OVERFILL, an empty queue, or a
+        non-validation spec, which ends the burst and goes to the back.
+        Validation games are parked up front, behind the ones already in
+        progress, so each pass serves them before selfplay."""
+        n = 0
+        while spec is not None and is_validation(spec.meta):
+            n_val = sum(is_validation(g.meta) for g in self.active_games)
+            self.add_game(spec, at=n_val)
+            n += 1
+            spec = None
+            if n < VAL_OVERFILL:
+                try:
+                    spec = self.game_queue.get_nowait()
+                except Exception:
+                    pass
+        if spec is not None:
+            self.add_game(spec)
+
+    def add_game(self, spec, at=None):
+        if spec.meta.get("vs_stockfish"):
+            self.ensure_sf_thread(spec.cfg)
+
+        cg = ChessGame(spec=spec)
+        if at is None:
             self.active_games.append(cg)
-            self.forest.add_tree(cg.tree)
+        else:
+            self.active_games.insert(at, cg)
+        self.forest.add_tree(cg.tree)
 
     def ensure_sf_thread(self, cfg):
         if self.sf_thread is None:
@@ -359,7 +395,7 @@ class GameLooper(object):
             filled = 0
             finished = []
             self.forest.resolve_all_inflight()
-            for game in self.active_games[:cfg.games_at_once]:
+            for game in self.active_games:
                 base_mbs = game.config.micro_batch
                 g_mbs = base_mbs
                 if game.config.dynamic_mbs:

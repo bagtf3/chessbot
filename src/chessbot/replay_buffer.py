@@ -24,7 +24,7 @@ Record schema (used uniformly regardless of source file format):
   tfrec.gz historic booster shards read via read_tfrec_gz_shard, which
   carry no source; SEED_SOURCE for the bootstrap-seeded primary/
   remaining_untrained records (see seed_selfplay_buffers), which do carry
-  one. For validation grouping (Rescorer.plot_source) SEED_SOURCE and None
+  one. For validation grouping (eval_metrics.plot_source) SEED_SOURCE and None
   both map to "historic" -- they are pretrain-distribution records, not
   selfplay output. Anything starting with "lc0" maps to "lc0"; the
   lc0_pv/lc0_blunder/lc0_enrich distinction survives only in the
@@ -48,9 +48,10 @@ SHARD_SIZE = 10_240
 # lc0 shards are named apart so a retrain can draw one ahead of the rest
 LC0_SHARD_PREFIX = "lc0-"
 PRIMARY_TRIGGER_SHARDS = 144
-RETRAIN_PRIMARY_SHARDS = 12
-RETRAIN_REPLAY_SHARDS = 12
-RETRAIN_HISTORIC_SHARDS = 4
+RETRAIN_PRIMARY_SHARDS = 14
+RETRAIN_REPLAY_SHARDS = 14
+# 0 turns the historic draw off; its validation slice is then empty and skipped
+RETRAIN_HISTORIC_SHARDS = 0
 REPLAY_SEED_SHARDS = 144
 # initial primary fill, left short of the trigger so selfplay supplies the
 # last few shards of the first cycle rather than retraining on pure seed

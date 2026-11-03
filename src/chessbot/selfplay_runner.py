@@ -31,9 +31,8 @@ from chessbot.looper import init_selfplay
 
 from chessbot.lc0_replay import LC0_BRP_SCENARIO, create_lc0_replay_config
 
-from chessbot.rescore import (
-    Rescorer, SFRescoreThread, migrate_pretrain_progress,
-)
+from chessbot.eval_metrics import migrate_pretrain_progress
+from chessbot.rescore import Rescorer, SFRescoreThread
 from chessbot.retrain_worker import run_retrain_worker
 from chessbot.review import RecordKeeper
 from chessbot.utils import (

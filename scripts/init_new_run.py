@@ -283,7 +283,7 @@ def main():
                 print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
         # copy the progress csvs unless suppressed. Both must travel together:
-        # Rescorer.migrate_pretrain_progress treats "continued file missing"
+        # eval_metrics.migrate_pretrain_progress treats "continued file missing"
         # as "eval_progress.csv still holds pretraining rows" and moves the
         # whole file across, so cloning only the first one would relabel this
         # run's selfplay rows as pretraining on the new tag's first startup.

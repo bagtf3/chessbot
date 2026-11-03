@@ -24,9 +24,6 @@ from chessbot import SF_LOC
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import re
-import io
-
 
 MATE_CP = 2500
 CLIP_MAX = 1200
@@ -448,83 +445,55 @@ def next_model_epoch(progress_csv_path):
     return int(df['model_epoch'].max()) + 1
 
 
-def batch_policy_metrics(logits, labels, mask):
+def policy_metric_rows(logits, labels, mask):
+    """Per-row policy metrics, each a (B,) array; batch_policy_metrics is
+    their means. mask marks the legal (target-support) moves."""
     eps = 1e-12
-    big_neg = -1e6
+    mask = mask > 0.5
+    rows = np.arange(labels.shape[0])
 
-    # mask logits, compute stable softmax
-    masked_logits = np.where(mask > 0.5, logits, big_neg)
-    probs = stable_softmax(masked_logits)
+    probs = stable_softmax(np.where(mask, logits, -1e6))
+    uniform = mask / (mask.sum(axis=1, keepdims=True).astype(np.float32) + eps)
 
-    # CE vs labels and vs uniform on legal set
-    per_ce = -np.sum(labels * np.log(probs + eps), axis=1)
-    policy_ce = per_ce.mean()
-
-    legal_counts = mask.sum(axis=1, keepdims=True)
-    uniform = mask / (legal_counts + eps)
-    per_ce_uniform = -np.sum(labels * np.log(uniform + eps), axis=1)
-    uniform_ce = per_ce_uniform.mean()
-
-    exp_prob_model = np.sum(labels * probs, axis=1).mean()
-    exp_prob_uniform = np.sum(labels * uniform, axis=1).mean()
-
-    # best indices
     true_best = labels.argmax(axis=1)
     model_best = probs.argmax(axis=1)
 
-    # top1 exact (model picks same argmax as labels)
-    top1_exact = (model_best == true_best).mean()
-
-    # avg prob of model's chosen best (keeps backward compat)
-    top_probs = probs[np.arange(probs.shape[0]), model_best]
-    avg_top_prob = top_probs.mean()
-
-    # mass on label-defined top-1 / top-3 / top-5 (per-sample then batch mean)
-    top1_per = probs[np.arange(probs.shape[0]), true_best]
-
-    # get top-k indices by label (unsorted within the k)
+    # top-k indices by label (unsorted within the k)
     top3_idx = np.argpartition(-labels, 3 - 1, axis=1)[:, :3]
     top5_idx = np.argpartition(-labels, 5 - 1, axis=1)[:, :5]
 
-    top3_per = np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1)
-    top5_per = np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1)
-
-    # same top5_idx, but gathered from the label itself -- how much mass the
-    # target distribution puts on its own top-5 (the ceiling top5_mass can't
-    # meaningfully exceed, since labels are blended with uniform_eps/clipped)
-    top5_target_per = np.take_along_axis(labels, top5_idx, axis=1).sum(axis=1)
-
-    top1_mass = top1_per.mean()
-    top3_mass = top3_per.mean()
-    top5_mass = top5_per.mean()
-    top5_mass_target = top5_target_per.mean()
-
-    # other support / distribution metrics
-    support_mask = labels > 0
-    support_mask[np.arange(support_mask.shape[0]), true_best] = False
-    prob_on_others_per = (probs * support_mask).sum(axis=1)
-    prob_on_others = prob_on_others_per.mean()
-
-    # fraction of raw (unmasked) softmax mass that lie on legal moves
-    raw_probs = stable_softmax(logits)       # do not apply mask here
-    mass_on_legal_per = np.sum(raw_probs * mask, axis=1)
-    mass_on_legal = mass_on_legal_per.mean()
+    others = labels > 0
+    others[rows, true_best] = False
 
     return {
-        "policy_ce": policy_ce,
-        "uniform_ce": uniform_ce,
-        "ce_gain": (uniform_ce - policy_ce),
-        "exp_prob_model": exp_prob_model,
-        "exp_prob_uniform": exp_prob_uniform,
-        "top1_exact": top1_exact,
-        "avg_top_prob": avg_top_prob,
-        "top1_mass": top1_mass,
-        "top3_mass": top3_mass,
-        "top5_mass": top5_mass,
-        "top5_mass_target": top5_mass_target,
-        "prob_on_others": prob_on_others,
-        "mass_on_legal": mass_on_legal
+        "policy_ce": -np.sum(labels * np.log(probs + eps), axis=1),
+        "uniform_ce": -np.sum(labels * np.log(uniform + eps), axis=1),
+        "exp_prob_model": np.sum(labels * probs, axis=1),
+        "exp_prob_uniform": np.sum(labels * uniform, axis=1),
+        "top1_exact": (model_best == true_best).astype(np.float32),
+        "avg_top_prob": probs[rows, model_best],
+        # mass on label-defined top-1 / top-3 / top-5
+        "top1_mass": probs[rows, true_best],
+        "top3_mass": np.take_along_axis(probs, top3_idx, axis=1).sum(axis=1),
+        "top5_mass": np.take_along_axis(probs, top5_idx, axis=1).sum(axis=1),
+        # mass the target puts on its own top-5 -- the ceiling top5_mass can't
+        # meaningfully exceed, since labels are blended with uniform_eps/clipped
+        "top5_mass_target":
+            np.take_along_axis(labels, top5_idx, axis=1).sum(axis=1),
+        "prob_on_others": (probs * others).sum(axis=1),
+        # raw (unmasked) softmax mass on legal moves
+        "mass_on_legal": (stable_softmax(logits) * mask).sum(axis=1),
     }
+
+
+def policy_metric_means(rows):
+    m = {k: float(np.mean(v)) for k, v in rows.items()}
+    return {"policy_ce": m["policy_ce"], "uniform_ce": m["uniform_ce"],
+            "ce_gain": m["uniform_ce"] - m["policy_ce"], **m}
+
+
+def batch_policy_metrics(logits, labels, mask):
+    return policy_metric_means(policy_metric_rows(logits, labels, mask))
 
 
 def print_validation(epoch, stats, mass_on_legal=None, mol_coverage=None):

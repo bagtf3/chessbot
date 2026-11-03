@@ -16,25 +16,20 @@ Message protocol (msg_q, main -> worker):
 
 Message protocol (result_q, worker -> main):
   {"cmd": "retrain_ready"}
-      validation predictions written, dataset built, about to train. Main
-      pauses selfplay workers on receipt of this.
-
-predictions_latest.pkl layout (consumed by Rescorer.aggregate_metrics):
-  {"primary":  {"samples": [...], "wdl": (N, 3), "logits": (N, 1858)},
-   "historic": {...same...}, "lc0": {...same...}, "sf": {...same...}}
-  wdl and logits are float32 arrays, row-aligned with samples.
+      validation predicted, dataset built, about to train. Main pauses
+      selfplay workers on receipt of this.
   {"cmd": "retrain_done", "ok": bool, "error": str or None,
    "train_stats": {"train_loss": float, "gn_mean": float}}
-      training + save finished (or failed). Main unpauses selfplay workers
-      immediately on receipt of this, before running aggregate_metrics, which
-      folds train_stats into the validation rows.
+      training, save, and the validation report (console, csv rows with
+      train_stats folded in, validation_latest.png) finished, or failed.
+      Main rebuilds TRT and unpauses selfplay workers on receipt of this.
 """
 import os
-import pickle
 import queue
 import random
 import sys
 import time
+from collections import defaultdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -42,13 +37,18 @@ import numpy as np
 from chessbot.config import Config
 from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
-    read_shard, sample_records, write_pkl_gz_shard, POLICY_DIM,
+    read_shard, sample_records, stack_policies, write_pkl_gz_shard, POLICY_DIM,
     SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
     VAL_SF_RECORDS, SF_SOURCE,
 )
+from chessbot.rescore import report_validation
+from chessbot.utils import policy_metric_rows
 
 # above the runner's RETRAIN_RELEASE_TIMEOUT_S so main's go normally wins
 GO_TIMEOUT_S = 120.0
+# validation rows predicted and scored per pass; the only dense
+# (rows, POLICY_DIM) arrays ever held are this tall
+VAL_CHUNK = 2048
 
 
 def load_records(paths):
@@ -90,6 +90,28 @@ def predict_fp16(model, X_list, batch_size):
             logits[i:j] = pol_logits.float().cpu().numpy()
             wdl[i:j] = F.softmax(val_out.float(), dim=-1).cpu().numpy()
     return wdl, logits
+
+
+def validate_slice(model, samples, batch_size):
+    """Value predictions and per-row policy metrics for one validation slice,
+    VAL_CHUNK rows at a time. Input to rescore.report_validation."""
+    wdl, policy, top_target = [], defaultdict(list), []
+    for i in range(0, len(samples), VAL_CHUNK):
+        part = samples[i:i + VAL_CHUNK]
+        w, logits = predict_fp16(model, [r[0] for r in part], batch_size)
+        labels = stack_policies(part)
+        for k, v in policy_metric_rows(logits, labels, labels > 0).items():
+            policy[k].append(v)
+        top_target.append(labels.max(axis=1))
+        wdl.append(w)
+    return {
+        "wdl_pred": np.concatenate(wdl) if wdl else np.zeros((0, 3), np.float32),
+        "wdl_true": np.array([r[3] for r in samples],
+                             dtype=np.float64).reshape(-1, 3),
+        "source": [r[6] for r in samples],
+        "policy": {k: np.concatenate(v) for k, v in policy.items()},
+        "top_prob_target": np.concatenate(top_target) if top_target else np.zeros(0),
+    }
 
 
 def records_to_arrays(records):
@@ -161,22 +183,12 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     val_sf = sample_records(sf_pool, VAL_SF_RECORDS)
 
     bs = cfg.retrain_batch_size
-    def stream(samples):
-        wdl, logits = predict_fp16(model, [r[0] for r in samples], batch_size=bs)
-        return {"samples": samples, "wdl": wdl, "logits": logits}
+    val = {name: validate_slice(model, samples, bs)
+           for name, samples in (("primary", val_primary),
+                                 ("historic", val_historic),
+                                 ("lc0", val_lc0), ("sf", val_sf))}
 
-    pred_pkl_path = os.path.join(run_dir, "predictions_latest.pkl")
-    payload = {
-        "primary": stream(val_primary),
-        "historic": stream(val_historic),
-        "lc0": stream(val_lc0),
-        "sf": stream(val_sf),
-    }
-    with open(pred_pkl_path + ".tmp", "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(pred_pkl_path + ".tmp", pred_pkl_path)
-
-    del (model, payload, val_pool, val_primary, val_historic, lc0_pool, val_lc0,
+    del (model, val_pool, val_primary, val_historic, lc0_pool, val_lc0,
          sf_pool, val_sf)
     torch.cuda.empty_cache()
 
@@ -205,6 +217,10 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     print(f"[retrain] timing for epoch {epoch}: {dt:.1f}s  "
           f"{n / dt:.0f} samples/s  {dt * SHARD_SIZE / n:.2f}s per {SHARD_SIZE}",
           flush=True)
+
+    del X, P, Y, vwht, pwht, model
+    report_validation(epoch, cfg.progress_csv_path, val, train_stats)
+    sys.stdout.flush()
 
     result_q.put({"cmd": "retrain_done", "ok": True, "error": None,
                   "train_stats": train_stats})

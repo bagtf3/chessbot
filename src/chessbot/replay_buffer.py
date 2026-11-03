@@ -61,8 +61,8 @@ SF_SOURCE = "sf"
 # Validation draws, taken in-memory from records the retrain worker has
 # already loaded for training -- no extra shard reads. Primary only; the
 # replay buffer has been trained on already and is left alone.
-VAL_PRIMARY_RECORDS = 20_480
-VAL_HISTORIC_RECORDS = 10_240
+VAL_PRIMARY_RECORDS = 5_120
+VAL_HISTORIC_RECORDS = 5_120
 # plot-only: never written to a progress csv, just the source-split validation figure
 VAL_LC0_RECORDS = 5_120
 VAL_SF_RECORDS = 5_120

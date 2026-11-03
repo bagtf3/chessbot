@@ -523,7 +523,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     # GradScaler overflow probing; scaler.step skips the update
                     nan_skips += 1
                     print(f"{tag} non-finite grad norm ({raw_norm}) at step {steps}, "
-                          f"epoch {epoch} -- update skipped")
+                          f"epoch {epoch}, loss {loss.item():.4f}, "
+                          f"scale {scaler.get_scale():.0f} -- update skipped")
                     scaler.step(opt)
                     scaler.update()
                     opt.zero_grad()

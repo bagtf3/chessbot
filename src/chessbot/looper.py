@@ -1,4 +1,4 @@
-import os, pickle, gzip
+import os, pickle
 import pathlib
 import time, gc
 
@@ -219,6 +219,14 @@ class GameLooper(object):
         del self.model
         self.model = None
 
+        # SF engines go too; a request still in flight is resubmitted to the
+        # engine rebuilt on the next SF turn
+        self.tear_down_sf()
+        self.sf_teardown_pending = False
+        for g in self.active_games:
+            if g.sf_pending and not g.sf_ready:
+                g.sf_pending = False
+
         # ort_trt and lc0_trt manage their own device memory, so there is
         # nothing to reclaim here beyond the python side
         gc.collect()
@@ -265,16 +273,18 @@ class GameLooper(object):
                 except Exception:
                     break
             
-            if spec.meta.get("vs_stockfish") and self.sf_thread is None:
-                # default depth only; every request carries the spec's sf_depth
-                self.sf_thread = StockfishThread(
-                    spec.cfg.sf_config, spec.cfg.sf_validation_depth
-                )
-                self.sf_thread.start()
-            
+            if spec.meta.get("vs_stockfish"):
+                self.ensure_sf_thread(spec.cfg)
+
             cg = ChessGame(spec=spec)
             self.active_games.append(cg)
             self.forest.add_tree(cg.tree)
+
+    def ensure_sf_thread(self, cfg):
+        if self.sf_thread is None:
+            # default depth only; every request carries the spec's sf_depth
+            self.sf_thread = StockfishThread(cfg.sf_config, cfg.sf_validation_depth)
+            self.sf_thread.start()
 
     def run(self, stop_event=None, wait_time=600):
         """
@@ -364,6 +374,7 @@ class GameLooper(object):
                         # sample SF's move; validation and later plies never do
                         explore = (game.meta.get("scenario") == "vs_stockfish"
                                    and game.python_chess_board.ply() < SF_EXPLORE_PLIES)
+                        self.ensure_sf_thread(game.config)
                         self.sf_thread.submit(game.game_id, game.python_chess_board,
                                               depth=game.meta.get("sf_depth"),
                                               explore=explore)
@@ -729,12 +740,12 @@ def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_q=None, sf_q=
     return looper
 
 
-# SF opening explorer (vs_stockfish only): on game plies 1-12, SF samples its
-# move from softmax(cp / SF_EXPLORE_TEMP_CP) over its top SF_EXPLORE_MULTIPV
-# lines within SF_EXPLORE_MAX_DELTA_CP of the best. Positions with this many
+# SF opening explorer (vs_stockfish only): below game ply SF_EXPLORE_PLIES, SF
+# samples its move from softmax(cp / SF_EXPLORE_TEMP_CP) over its top
+# SF_EXPLORE_MULTIPV lines within SF_EXPLORE_MAX_DELTA_CP of the best. Positions with this many
 # legal moves or fewer, and any mate score, play the best move straight.
-SF_EXPLORE_PLIES = 12
-SF_EXPLORE_MULTIPV = 3
+SF_EXPLORE_PLIES = 16
+SF_EXPLORE_MULTIPV = 5
 SF_EXPLORE_MAX_DELTA_CP = 30
 SF_EXPLORE_TEMP_CP = 20.0
 SF_EXPLORE_MIN_LEGAL = 3

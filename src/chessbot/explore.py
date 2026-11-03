@@ -124,7 +124,8 @@ SPLIT_ROUNDING = {"sims_per_ply": 0, "sims_done": 0, "plies": 0}
 
 
 def split_report(df, cols, stat_cols, weight_col="plies"):
-    """Weighted split of stat_cols by each sampleable, N per bucket."""
+    """Weighted split of stat_cols by each sampleable, plus plain-mean plies
+    per game and N per bucket."""
     rounding = {c: SPLIT_ROUNDING.get(c, 3) for c in stat_cols}
     for col in cols:
         sub = df[df[col].notna()]
@@ -135,8 +136,10 @@ def split_report(df, cols, stat_cols, weight_col="plies"):
             lambda d: pd.Series(
                 {c: weighted_mean(d, c, weight_col) for c in stat_cols})
         ).round(rounding)
+        stats = stats.join(sub.groupby(col)["plies"].mean().round(1)
+                           .rename("plies/game"))
         stats = stats.join(sub.groupby(col).size().rename("N"))
-        print(stats.sort_values(stat_cols[0]))
+        print(stats.sort_values(stat_cols[0]).to_string())
         print()
 
 

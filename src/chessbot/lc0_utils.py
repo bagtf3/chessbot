@@ -151,12 +151,22 @@ def lc0_logits_to_xc0_batch(logits, lc0_idx_list, xc0_idx_list):
     return result
 
 
+# (castling-right plane, lc0 king-takes-rook slot, xc0 king-destination slot)
+CASTLE_SWAPS = [
+    (105, UCI_TO_IDX[1]['e1g1'], UCI_TO_IDX[0]['e1g1']),
+    (104, UCI_TO_IDX[1]['e1c1'], UCI_TO_IDX[0]['e1c1']),
+]
+assert all(rook != dest for _, rook, dest in CASTLE_SWAPS)
+
+
 def make_lc0_infer(sess):
     """Wrap an LC0 ORT session into an infer(pair) callable.
 
     pair[0]: (B, 112, 8, 8) uint8 features from get_all_lc0_features().
     Returns (policy_logits[B,1858], wdl_probs[B,3]).
-    Policy indices are in LC0 order (castling at rook slots, promos at lc0 promo tail).
+    Policy indices are in xc0 order: castling logits are moved from lc0's
+    king-takes-rook slot to the king-destination slot on rows where STM still
+    holds that right (the king is on e1, so neither slot is any other move).
     """
     input_name   = sess.get_inputs()[0].name
     output_names = [o.name for o in sess.get_outputs()]
@@ -168,6 +178,11 @@ def make_lc0_infer(sess):
         outs   = sess.run(output_names, {input_name: feat_f32})
         logits = outs[0].astype(np.float32)           # (B, 1858)
         wdl    = outs[1].astype(np.float32)           # (B, 3) already softmaxed
+        for plane, rook, dest in CASTLE_SWAPS:
+            rows = feat_u8[:, plane, 0, 0] > 0
+            if rows.any():
+                logits[rows, rook], logits[rows, dest] = (
+                    logits[rows, dest], logits[rows, rook])
         return logits, wdl
 
     return infer

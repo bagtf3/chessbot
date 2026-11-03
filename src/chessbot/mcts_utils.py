@@ -96,6 +96,7 @@ class MCTSTree(fasttree):
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
         self.set_fpu_reduction(float(cfg.fpu_reduction))
+        self.set_rep_penalty(bool(cfg.rep_penalty))
         lo, hi = cfg.sharp_window
         self.set_sharp_boost(
             int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)

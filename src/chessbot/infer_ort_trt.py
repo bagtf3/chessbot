@@ -123,6 +123,28 @@ def build_trt(src_path, onnx_path, trt_dir, model_name, macro_batch,
     print(f'[trt] TRT engine ready ({time.time() - t0:.0f}s)', flush=True)
 
 
+TRT_BUILD_ATTEMPTS = 2
+TRT_RETRY_WAIT_S = 10.0
+
+
+def gpu_mem_used():
+    """'used/total MiB' plus per-process usage where the driver reports it."""
+    import subprocess
+    try:
+        tot = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        procs = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10).stdout.split()
+        used, total = [s.strip() for s in tot.split(",")]
+        return f"{used}/{total} MiB, procs [{' '.join(procs)}]"
+    except Exception as e:
+        return f"unavailable ({e})"
+
+
 def prepare_trt(cfg, trt_dir, model_name):
     """
     Build the TRT engine for cfg's model in a spawned process, so the caller
@@ -135,15 +157,21 @@ def prepare_trt(cfg, trt_dir, model_name):
     os.makedirs(trt_dir, exist_ok=True)
     onnx_path = os.path.join(trt_dir, f'{model_name}.onnx')
 
-    p = mp.get_context("spawn").Process(
-        target=build_trt,
-        args=(cfg.model_path, onnx_path, trt_dir, model_name, cfg.macro_batch,
-              cfg.encoding_type),
-    )
-    p.start()
-    p.join()
-    if p.exitcode != 0:
-        raise RuntimeError(f"TRT build process failed, exitcode={p.exitcode}")
+    for attempt in range(TRT_BUILD_ATTEMPTS):
+        p = mp.get_context("spawn").Process(
+            target=build_trt,
+            args=(cfg.model_path, onnx_path, trt_dir, model_name, cfg.macro_batch,
+                  cfg.encoding_type),
+        )
+        p.start()
+        p.join()
+        if p.exitcode == 0:
+            break
+        print(f"[trt] build failed, exitcode={p.exitcode}, gpu: {gpu_mem_used()}",
+              flush=True)
+        if attempt + 1 == TRT_BUILD_ATTEMPTS:
+            raise RuntimeError(f"TRT build process failed, exitcode={p.exitcode}")
+        time.sleep(TRT_RETRY_WAIT_S)
 
     cfg.inference_backend = 'ort_trt'
     cfg.model_path = onnx_path

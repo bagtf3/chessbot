@@ -140,6 +140,11 @@ class Config(object):
     sharp_window = [100, 250]
     sharp_M = 10
     sharp_boost = 0.0
+    # repetition prior penalty, at any node whose side to move is winning (its
+    # own NN STM Q > 0.05): a move back into a position seen once gets
+    # min(prior, 0.10), a would-be threefold min(prior, 0.05), then the node
+    # renormalizes. Values are fixed in the C++ tree.
+    rep_penalty = False
     qema_span = 40
     qdelta_span = 100
     # [force, gate, gap_block]: force sends a visit to each new Qmm leader; gate

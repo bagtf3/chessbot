@@ -1191,21 +1191,14 @@ class SelfPlayRunner:
         self.unpause_workers("retrain complete",
                              epoch=self.current_epoch + (1 if ok else 0))
 
-        pred_pkl = os.path.join(self.cfg.run_dir, "predictions_latest.pkl")
         if ok:
             rb.rotate_to_replay(self.retrain_worker["primary_files"],
                                 self.cfg.replay_buffer_dir)
             rb.discard_files(self.retrain_worker["replay_files"])
             print("[retrain] primary -> replay rotated", flush=True)
-            self.rescorer.aggregate_metrics(
-                self.current_epoch, self.cfg.progress_csv_path, pred_pkl,
-                train_stats=result.get("train_stats"))
         else:
             print(f"[retrain] failed: {result.get('error')} -- epoch stays "
                   f"{self.current_epoch}, no csv rows written", flush=True)
-        # aggregation is the only consumer
-        if os.path.exists(pred_pkl):
-            os.remove(pred_pkl)
 
         # disk is the one source of truth for the epoch
         self.current_epoch = next_model_epoch(self.cfg.progress_csv_path)

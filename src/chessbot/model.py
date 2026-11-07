@@ -86,6 +86,32 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
         n_plain=2, n_gated=6, n_ff=4, n_swiglu=4, attn_gate=True, prelu=True,
     ),
+    "m137s_8c8t_d256_smolgen": dict(
+        conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ff=4, n_swiglu=4, attn_gate=True, prelu=True,
+        smolgen=True,
+    ),
+    "m137f_8c8t_d256_d512": dict(
+        conv_filters=256, wide_filters=512, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ff=4, n_swiglu=2, n_wide=2, prelu=True,
+    ),
+    "m137f_8c8t_4d256_4d512": dict(
+        conv_filters=256, wide_filters=512, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ff=3, n_swiglu=1, n_wide=4, prelu=True,
+    ),
+    "m137f_8c8t_5d256_3d512": dict(
+        conv_filters=256, wide_filters=512, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ff=4, n_swiglu=1, n_wide=3, prelu=True,
+    ),
+    "m137f_4c8t_4d256_4d512": dict(
+        conv_filters=256, wide_filters=512, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=2, n_ff=4, n_swiglu=0, n_wide=4, prelu=True,
+    ),
+    "m137f_4g_6d256_4d512": dict(
+        conv_filters=256, wide_filters=512, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=0, n_gated=4, end_split=True, n_ff=6, n_swiglu=0, n_wide=4,
+        prelu=True,
+    ),
 }
 
 
@@ -2156,6 +2182,8 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     LEAK = 0.03
     attn_gate = cfg.get("attn_gate", False)   # SwiGLU-block SDPA out * (1 + tanh(g(xq)))
     prelu     = cfg.get("prelu", False)       # conv leaky_relus -> per-channel PReLU
+    smolgen   = cfg.get("smolgen", False)     # lc0 smolgen attention bias on every tx block
+    SMOL_CH, SMOL_H, SMOL_GEN = 32, 256, 256
     PRELU_MIN, PRELU_MAX = -0.5, 0.5
 
     sl_idx = torch.from_numpy(
@@ -2229,13 +2257,15 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.head_dim = dim // heads
             self.ema_on = False
 
-        def forward(self, xq, xkv):
+        def forward(self, xq, xkv, bias=None):
             bq, nq, dim = xq.shape
             nk = xkv.shape[1]
             q = self.q(xq).view(bq, nq, self.heads, self.head_dim).transpose(1, 2)
             k = self.k(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
             v = self.v(xkv).view(bq, nk, self.heads, self.head_dim).transpose(1, 2)
-            a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(bq, nq, dim)
+            mask = None if bias is None else bias.to(q.dtype)
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            a = a.transpose(1, 2).reshape(bq, nq, dim)
             if self.g is not None:
                 gate = 1 + torch.tanh(self.g(xq))
                 if self.ema_on and self.training and torch.is_grad_enabled():
@@ -2247,6 +2277,27 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
                         self.ag_range_ema.lerp_((gh.amax(0) - gh.amin(0)).float(), w)
                 a = a * gate
             return self.o(a)
+
+    class Smolgen(nn.Module):
+        """Per-block half of lc0's smolgen: the 64 squares -> one gen vector per
+        head; `shared` maps each to a 64x64 logit bias, zero-padded so the
+        global tokens' rows and columns get none."""
+
+        def __init__(self):
+            super().__init__()
+            self.compress = nn.Linear(D, SMOL_CH, bias=False)
+            self.hidden = nn.Linear(SMOL_CH * SEQ_LEN, SMOL_H)
+            self.hidden_norm = make_norm(SMOL_H)
+            self.gen = nn.Linear(SMOL_H, nh * SMOL_GEN)
+            self.gen_norm = make_norm(nh * SMOL_GEN)
+
+        def forward(self, n, shared):
+            B, T, _ = n.shape
+            c = self.compress(n[:, :SEQ_LEN]).flatten(1)               # [B, 2048]
+            h = self.hidden_norm(F.silu(self.hidden(c)))
+            g = self.gen_norm(F.silu(self.gen(h))).view(B, nh, SMOL_GEN)
+            b = shared(g).view(B, nh, SEQ_LEN, SEQ_LEN)
+            return F.pad(b, (0, T - SEQ_LEN, 0, T - SEQ_LEN))
 
     class ConvBlock(nn.Module):
         def __init__(self):
@@ -2369,13 +2420,15 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.n2 = make_norm(D)
             self.ff1 = nn.Linear(D, ff_dim)
             self.ff2 = nn.Linear(ff_dim, D, bias=False)
+            self.smol = Smolgen() if smolgen else None
             self.down_mon = down_mon
             self.attn_drop = nn.Dropout(dr)
             self.ff_drop = nn.Dropout(dr)
 
-        def forward(self, x):
+        def forward(self, x, smol_gen=None):
             n = self.n1(x)
-            x = x + self.attn_drop(self.attn(n, n))
+            bias = self.smol(n, smol_gen) if self.smol is not None else None
+            x = x + self.attn_drop(self.attn(n, n, bias))
             down_out = self.ff2(F.gelu(self.ff1(self.n2(x))))
             self.down_mon(down_out)
             return x + self.ff_drop(down_out)
@@ -2389,13 +2442,15 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.gate = nn.Linear(D, 4 * D)
             self.up = nn.Linear(D, 4 * D)
             self.down = nn.Linear(4 * D, D, bias=False)
+            self.smol = Smolgen() if smolgen else None
             self.down_mon = down_mon
             self.attn_drop = nn.Dropout(dr)
             self.ff_drop = nn.Dropout(dr)
 
-        def forward(self, x):
+        def forward(self, x, smol_gen=None):
             n = self.n1(x)
-            x = x + self.attn_drop(self.attn(n, n))
+            bias = self.smol(n, smol_gen) if self.smol is not None else None
+            x = x + self.attn_drop(self.attn(n, n, bias))
             n = self.n2(x)
             down_out = self.down(F.silu(self.gate(n)) * self.up(n))
             self.down_mon(down_out)
@@ -2419,6 +2474,12 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.blocks = nn.ModuleList(
                 [TxBlockFF(self.ff_down_mon) for _ in range(n_ff)]
                 + [TxBlockSwiGLU(self.swiglu_down_mon) for _ in range(n_swiglu)])
+            # one 256 -> 64x64 generator shared by every block; zero-init so the
+            # bias is exactly 0 at init (identity graft onto a no-smolgen checkpoint)
+            self.smol_gen = None
+            if smolgen:
+                self.smol_gen = nn.Linear(SMOL_GEN, SEQ_LEN * SEQ_LEN, bias=False)
+                nn.init.zeros_(self.smol_gen.weight)
             self.trunk = make_norm(D)
 
             # wdl3: acc0/acc1/acc2 each feed an independent W/D/L head
@@ -2463,7 +2524,7 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             x = board + self.pos_scale * self.pos.unsqueeze(0)
             x = torch.cat([x, self.global_tokens.expand(B, -1, -1)], dim=1)
             for blk in self.blocks:
-                x = blk(x)
+                x = blk(x, self.smol_gen)
             self.res_mon(x)
             x = self.trunk(x)
             w = self.wdl_ow(F.gelu(self.wdl_hw(x[:, 64, :])))   # acc0
@@ -2554,6 +2615,292 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     return m
 
 
+def build_pt_m137_franken(cfg: dict, log_params: bool = False):
+    """m137f: xc0h stem -> plain + gated-expandy convs at D (end_split selects
+    the GLU-on-output gated block) -> add pos -> 64
+    tokens only: n_ff FF then n_swiglu SwiGLU blocks at D with smolgen, the
+    last of those widening to D2 through its feed-forward down (residual
+    zero-padded),
+    then n_wide SwiGLU blocks at D2 without smolgen. Every attention output is
+    scaled by sigmoid(g(query)). The trunk has no final norm; each head norms
+    its own input. Heads: policy is one residual MLP over the full D2, split
+    into from / to halves for a bilinear dot; value is a per-square MLP to 3 WDL
+    logits and a sigmoid gate, gated and summed over squares plus a global
+    bias. No global tokens and no smartgate: the 1858 logits are unmasked, so
+    training must mask illegal moves in the loss."""
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import pyfastchess
+
+    import random
+
+    D        = cfg["conv_filters"]
+    D2       = cfg["wide_filters"]
+    nh       = cfg.get("num_heads", 8)
+    ff_dim   = cfg.get("ff_dim", 1024)
+    n_plain  = cfg.get("n_plain", 0)
+    n_gated  = cfg.get("n_gated", 0)
+    n_ff     = cfg.get("n_ff", 0)
+    n_swiglu = cfg.get("n_swiglu", 0)
+    n_wide   = cfg.get("n_wide", 0)
+    groups   = cfg.get("expandy_groups", 4)
+    end_split = cfg.get("end_split", False)
+    dr       = cfg.get("dropout", 0.05)
+    prelu    = cfg.get("prelu", False)
+    XC0H_K   = cfg["xc0h_K"]
+    SMOL_CH, SMOL_H, SMOL_GEN = 32, 256, 256
+    HD = D2 // 2             # from / to half width
+    VH, VH2 = D2 // 2, 64    # value MLP hidden widths
+    LEAK = 0.03
+    PRELU_MIN, PRELU_MAX = -0.5, 0.5
+
+    sl_idx = torch.from_numpy(
+        pyfastchess.build_sometimes_legal_mask()).bool().nonzero(as_tuple=True)[0]
+    n_main = int((sl_idx < 4096).sum())
+    # same promo gather as build_pt_expandy_swiglu: pyfastchess's packed tail
+    # order, valid file pairs (from outer, to inner) x type (q, r, b)
+    promo_idx = torch.tensor([
+        t * 64 + tf * 8 + ff
+        for ff in range(8) for tf in range(max(0, ff - 1), min(7, ff + 1) + 1)
+        for t in range(3)])
+
+    def norm_nchw(norm, x):
+        return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    def make_act(ch):
+        return nn.PReLU(ch, init=LEAK) if prelu else nn.LeakyReLU(LEAK)
+
+    class Attention(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q = nn.Linear(dim, dim)
+            self.k = nn.Linear(dim, dim, bias=False)   # softmax is shift-invariant per query
+            self.v = nn.Linear(dim, dim)
+            self.o = nn.Linear(dim, dim)
+            self.g = nn.Linear(dim, dim)
+            self.head_dim = dim // nh
+
+        def forward(self, x, bias=None):
+            B, T, dim = x.shape
+            q = self.q(x).view(B, T, nh, self.head_dim).transpose(1, 2)
+            k = self.k(x).view(B, T, nh, self.head_dim).transpose(1, 2)
+            v = self.v(x).view(B, T, nh, self.head_dim).transpose(1, 2)
+            mask = None if bias is None else bias.to(q.dtype)
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            a = a.transpose(1, 2).reshape(B, T, dim)
+            return self.o(a * torch.sigmoid(self.g(x)))
+
+    class Smolgen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.compress = nn.Linear(D, SMOL_CH, bias=False)
+            self.hidden = nn.Linear(SMOL_CH * SEQ_LEN, SMOL_H)
+            self.hidden_norm = nn.LayerNorm(SMOL_H)
+            self.gen = nn.Linear(SMOL_H, nh * SMOL_GEN)
+            self.gen_norm = nn.LayerNorm(nh * SMOL_GEN)
+
+        def forward(self, n, shared):
+            B = n.shape[0]
+            h = self.hidden_norm(F.silu(self.hidden(self.compress(n).flatten(1))))
+            g = self.gen_norm(F.silu(self.gen(h))).view(B, nh, SMOL_GEN)
+            return shared(g).view(B, nh, SEQ_LEN, SEQ_LEN)
+
+    class ConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.LayerNorm(D)
+            self.c1 = nn.Conv2d(D, D, 3, padding=1)
+            self.c2 = nn.Conv2d(D, D, 3, padding=1, bias=False)
+            self.a1 = make_act(D)
+            self.a2 = make_act(D)
+
+        def forward(self, x):
+            h = self.a1(self.c1(norm_nchw(self.norm, x)))
+            return x + self.a2(self.c2(h))
+
+    class GatedExpandyConvBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.n1 = nn.LayerNorm(D)
+            self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.c_gate = nn.Conv2d(D, D, 1)
+            self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p2 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.a1 = make_act(2 * D)
+            self.a2 = make_act(2 * D)
+
+        def forward(self, x):
+            h = self.p1(self.a1(self.c1(norm_nchw(self.n1, x))))
+            gate = torch.sigmoid(self.c_gate(h))
+            return x + gate * self.p2(self.a2(self.c2(h)))
+
+    class EndSplitGatedConvBlock(nn.Module):
+        """Gated expandy whose last pointwise writes 2D channels, split into a
+        linear update half and a sigmoid gate half (GLU on the block output)."""
+
+        def __init__(self):
+            super().__init__()
+            self.n1 = nn.LayerNorm(D)
+            self.c1 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p1 = nn.Conv2d(2 * D, D, 1, bias=False)
+            self.c2 = nn.Conv2d(D, 2 * D, 3, padding=1, groups=groups)
+            self.p2 = nn.Conv2d(2 * D, 2 * D, 1)
+            self.a1 = make_act(2 * D)
+            self.a2 = make_act(2 * D)
+
+        def forward(self, x):
+            h = self.p1(self.a1(self.c1(norm_nchw(self.n1, x))))
+            u, g = self.p2(self.a2(self.c2(h))).chunk(2, dim=1)
+            return x + u * torch.sigmoid(g)
+
+    class TxBlock(nn.Module):
+        """FF (gelu) or SwiGLU feed-forward; d_out > d widens the residual by
+        zero-padding it and letting the feed-forward down write all d_out."""
+
+        def __init__(self, d, swiglu, smol, d_out=None):
+            super().__init__()
+            d_out = d_out or d
+            self.n1 = nn.LayerNorm(d)
+            self.attn = Attention(d)
+            self.n2 = nn.LayerNorm(d)
+            self.swiglu = swiglu
+            if swiglu:
+                self.gate = nn.Linear(d, ff_dim)
+                self.up = nn.Linear(d, ff_dim)
+                self.down = nn.Linear(ff_dim, d_out, bias=False)
+            else:
+                self.ff1 = nn.Linear(d, ff_dim)
+                self.ff2 = nn.Linear(ff_dim, d_out, bias=False)
+            self.smol = Smolgen() if smol else None
+            self.pad = d_out - d
+            self.attn_drop = nn.Dropout(dr)
+            self.ff_drop = nn.Dropout(dr)
+
+        def forward(self, x, smol_gen=None):
+            n = self.n1(x)
+            bias = self.smol(n, smol_gen) if self.smol is not None else None
+            x = x + self.attn_drop(self.attn(n, bias))
+            n = self.n2(x)
+            if self.swiglu:
+                h = self.down(F.silu(self.gate(n)) * self.up(n))
+            else:
+                h = self.ff2(F.gelu(self.ff1(n)))
+            if self.pad:
+                x = F.pad(x, (0, self.pad))
+            return x + self.ff_drop(h)
+
+    GatedBlock = EndSplitGatedConvBlock if end_split else GatedExpandyConvBlock
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            attach_xc0h_stem(self, D, XC0H_K)
+            self.convs = nn.ModuleList(
+                [ConvBlock() for _ in range(n_plain)]
+                + [GatedBlock() for _ in range(n_gated)])
+            self.pos = nn.Parameter(torch.randn(SEQ_LEN, D) * 0.02)
+            self.pos_scale = nn.Parameter(torch.tensor(1.0))
+
+            kinds = [False] * n_ff + [True] * n_swiglu
+            last = len(kinds) - 1
+            self.blocks = nn.ModuleList(
+                [TxBlock(D, sw, True, d_out=D2 if i == last else None)
+                 for i, sw in enumerate(kinds)]
+                + [TxBlock(D2, True, False) for _ in range(n_wide)])
+            # one 256 -> 64x64 generator shared by every smolgen block
+            self.smol_gen = nn.Linear(SMOL_GEN, SEQ_LEN * SEQ_LEN, bias=False)
+
+            # per square: 3 WDL logits + 1 gate logit from one shared MLP
+            self.v_norm = nn.LayerNorm(D2)
+            self.v1 = nn.Linear(D2, VH)
+            self.v2 = nn.Linear(VH, VH2)
+            self.v_out = nn.Linear(VH2, 4)
+            self.v_bias = nn.Parameter(torch.zeros(3))
+
+            # one residual MLP over the full width, split into from / to after
+            self.p_norm = nn.LayerNorm(D2)
+            self.p1 = nn.Linear(D2, D2)
+            self.p2 = nn.Linear(D2, D2, bias=False)
+            self.from_dot_norm = nn.LayerNorm(HD)
+            self.to_dot_norm = nn.LayerNorm(HD)
+            self.promo_from = nn.Linear(HD, 3, bias=False)
+            self.promo_to = nn.Linear(HD, 3, bias=False)
+            self.register_buffer("sl_idx", sl_idx)
+            self.register_buffer("promo_idx", promo_idx, persistent=False)
+
+        def trunk_forward(self, x_in):
+            B = x_in.shape[0]
+            x = xc0h_stem_forward(self, x_in, D, XC0H_K)
+            for blk in self.convs:
+                x = blk(x)
+            x = x.permute(0, 2, 3, 1).reshape(B, SEQ_LEN, D)
+            x = x + self.pos_scale * self.pos.unsqueeze(0)
+            for blk in self.blocks:
+                x = blk(x, self.smol_gen)
+            return x                                                    # [B, 64, D2]
+
+        def value_squares(self, x):
+            """Per-square WDL logits [B, 64, 3] and gates [B, 64, 1]."""
+            o = self.v_out(F.gelu(self.v2(F.gelu(self.v1(self.v_norm(x))))))
+            return o[..., :3], torch.sigmoid(o[..., 3:])
+
+        @torch.no_grad()
+        def value_map(self, x_in):
+            """Value attribution, STM-as-white orientation: per-square
+            contributions [B, 3, 8, 8] (W, D, L; gate applied), gates
+            [B, 8, 8], and v_bias. Each square's W/D/L is centered on its own
+            mean, which softmax ignores, so softmax(contributions.sum((2, 3))
+            + v_bias) is the WDL forward returns."""
+            wdl, g = self.value_squares(self.trunk_forward(x_in))
+            B = wdl.shape[0]
+            contrib = (wdl * g).transpose(1, 2).reshape(B, 3, 8, 8)
+            contrib = contrib - contrib.mean(dim=1, keepdim=True)
+            return contrib, g.reshape(B, 8, 8), self.v_bias.detach()
+
+        def forward(self, x_in):
+            B = x_in.shape[0]
+            x = self.trunk_forward(x_in)
+
+            wdl, g = self.value_squares(x)
+            wdl = (wdl * g).sum(dim=1) + self.v_bias
+
+            p = self.p_norm(x)
+            fv, tv = (p + self.p2(F.gelu(self.p1(p)))).split(HD, dim=-1)
+            dots_full = torch.bmm(
+                self.from_dot_norm(fv), self.to_dot_norm(tv).transpose(1, 2)) * (HD ** -0.5)
+            dots     = dots_full.reshape(B, 64 * 64)
+            dots_sub = dots_full[:, 48:56, 56:64]
+            pf = self.promo_from(fv[:, 48:56, :])
+            pt = self.promo_to(tv[:, 56:64, :])
+            promo = (dots_sub[..., None] + pf[:, :, None, :] + pt[:, None, :, :]
+                     ).permute(0, 3, 2, 1).reshape(B, 192)
+            policy = torch.cat(
+                [dots[:, self.sl_idx[:n_main]], promo[:, self.promo_idx]], dim=-1)
+            return policy, wdl
+
+        def set_dropout(self, duty):
+            """Each TxBlock dropout site runs with chance `duty`, flipped
+            independently; off = eval mode, no kernel launched."""
+            for blk in self.blocks:
+                blk.attn_drop.train(random.random() < duty)
+                blk.ff_drop.train(random.random() < duty)
+
+        def project_params(self):
+            """Clamp PReLU slopes back into range; call after each opt step."""
+            if not hasattr(self, "prelu_list"):
+                self.prelu_list = [m for m in self.modules() if isinstance(m, nn.PReLU)]
+            with torch.no_grad():
+                for m in self.prelu_list:
+                    m.weight.clamp_(PRELU_MIN, PRELU_MAX)
+
+    m = M()
+    if log_params:
+        print(f"  PT params: {sum(p.numel() for p in m.parameters()):,}")
+    return m
+
+
 PT_BUILDERS: dict[str, object] = {
     "16m-transformer":           build_pt_transformer_16m,
     "16m-conformer-interweaved": build_pt_conformer_interweaved,
@@ -2575,4 +2922,10 @@ PT_BUILDERS: dict[str, object] = {
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "m13-7-8c8t-d256":                      build_pt_expandy_swiglu,
+    "m137s_8c8t_d256_smolgen":              build_pt_expandy_swiglu,
+    "m137f_8c8t_d256_d512":                 build_pt_m137_franken,
+    "m137f_8c8t_4d256_4d512":               build_pt_m137_franken,
+    "m137f_8c8t_5d256_3d512":               build_pt_m137_franken,
+    "m137f_4c8t_4d256_4d512":               build_pt_m137_franken,
+    "m137f_4g_6d256_4d512":                 build_pt_m137_franken,
 }

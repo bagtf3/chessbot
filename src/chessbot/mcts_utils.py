@@ -15,6 +15,10 @@ from chessbot.config import XC0H_K
 from chessbot.utils import rnd
 
 POLICY_DIM = 1858
+# max_length adjudication, given at least N plies: white-POV mean resign_q over
+# the last N; at or past THRESH the side ahead wins, else a draw
+MAX_LENGTH_ADJ_N = 6
+MAX_LENGTH_ADJ_THRESH = 0.5
 TABLEBASE = None
 PV_MAX = 64
 
@@ -96,7 +100,6 @@ class MCTSTree(fasttree):
         self.set_reuse_tree(bool(cfg.reuse_tree))
         self.set_vscale(float(cfg.vscale))
         self.set_fpu_reduction(float(cfg.fpu_reduction))
-        self.set_rep_penalty(bool(cfg.rep_penalty))
         lo, hi = cfg.sharp_window
         self.set_sharp_boost(
             int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)
@@ -767,6 +770,14 @@ class ChessGame(object):
         if self.plies > cfg.max_game_length:
             self.outcome = 0.0
             self.end_reason = "max_length"
+            if len(self.recents) >= MAX_LENGTH_ADJ_N:
+                last = self.recents[-MAX_LENGTH_ADJ_N:]
+                q = np.mean([r[5] if r[4] else -r[5] for r in last])
+                if abs(q) >= MAX_LENGTH_ADJ_THRESH:
+                    self.outcome = float(np.sign(q))
+                    self.end_reason = "resign (max_length)"
+                else:
+                    self.end_reason = "eval_draw (max_length)"
             return True
         # if we made it here the game is active
         return False

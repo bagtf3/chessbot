@@ -59,14 +59,27 @@ WORKER_PAUSE_SETTLE_S = 10.0
 # longest the runner holds a retrain waiting on the fleet to drop its GPU
 # sessions; kept under the retrain worker's own GO_TIMEOUT_S
 RETRAIN_RELEASE_TIMEOUT_S = 90.0
+# playxerces (the website's engine) shares the GPU. Around a retrain the
+# runner creates PX_PAUSE_FLAG in the run dir; playxerces frees its VRAM and
+# answers with PX_RELEASED_FLAG. A PX_HEARTBEAT older than
+# PX_HEARTBEAT_STALE_S means it is not running and is not waited on.
+PX_PAUSE_FLAG = "playxerces_pause.flag"
+PX_RELEASED_FLAG = "playxerces_released.flag"
+PX_HEARTBEAT = "playxerces_heartbeat"
+PX_HEARTBEAT_STALE_S = 10.0
 RESPAWN_COOLDOWN_S = 30.0
 STOP_DRAIN_S = 5.0
 WORKER_KINDS = ("xc0", "lc0")
+# operator pause targets: the two fleets plus retraining
+PAUSE_KINDS = WORKER_KINDS + ("retrain",)
+PAUSE_ALIASES = {"retraining": "retrain"}
 # teacher probes are held and released in bundles this size so the lc0 worker
 # runs full batches instead of a trickle of near-empty ones
 LC0_BUNDLE_SIZE = 128
 # a bundle that has not filled after this long is sent as-is
 LC0_BUNDLE_MAX_WAIT_S = 600.0
+# unsent teacher probes saved at shutdown, reloaded on the next start
+LC0_BACKLOG_FILE = "lc0_backlog.pkl"
 
 # xc0 blunder-replay probes are held off the worker queue until this epoch;
 # credits and the blunder pool keep accruing, and lc0 BRP runs unaffected.
@@ -173,8 +186,10 @@ HELP_TEXT = """[cmd] commands:
   stop                  finish up, save data, exit
   stop now              hard kill
   no new games          drain what is in flight
-  pause [kind] [secs]   kind is xc0 or lc0; bare pause holds both
-  unpause [kind]        releases the operator hold on that fleet
+  pause [kind] [secs]   kind is xc0, lc0 or retrain; bare pause holds all three
+                        lc0: probes back up in the runner, lc0 workers torn down
+                        retrain: selfplay and rescore run on, shards pile up
+  unpause [kind]        releases the operator hold on that kind
   add sf worker         one more SF rescore thread
   kill sf worker        retire the newest SF thread after its current game
   respawn lc0           pause, tear down and rebuild the lc0 fleet from yaml
@@ -188,19 +203,20 @@ HELP_TEXT = """[cmd] commands:
 def parse_kinds_and_dur(args):
     """(kinds, duration) for a pause/unpause argument list.
 
-    A bare command addresses every fleet. Returns (None, None) on an
-    unrecognised fleet name so the caller can complain rather than silently
+    A bare command addresses every kind. Returns (None, None) on an
+    unrecognised kind so the caller can complain rather than silently
     pausing everything.
     """
     kinds, dur = set(), None
     for a in args:
+        a = PAUSE_ALIASES.get(a, a)
         if a.isdigit():
             dur = int(a)
-        elif a in WORKER_KINDS:
+        elif a in PAUSE_KINDS:
             kinds.add(a)
         else:
             return None, None
-    return (kinds or set(WORKER_KINDS)), dur
+    return (kinds or set(PAUSE_KINDS)), dur
 
 
 def stdin_listener(controls, worker_procs):
@@ -235,7 +251,7 @@ def stdin_listener(controls, worker_procs):
         elif parts[0] == 'pause':
             kinds, dur = parse_kinds_and_dur(parts[1:])
             if kinds is None:
-                print(f"[cmd] unknown fleet: {' '.join(parts[1:])!r}",
+                print(f"[cmd] unknown pause kind: {' '.join(parts[1:])!r}",
                       flush=True)
                 continue
             suffix = f" for {dur}s" if dur else ""
@@ -254,7 +270,7 @@ def stdin_listener(controls, worker_procs):
         elif parts[0] == 'unpause':
             kinds, _ = parse_kinds_and_dur(parts[1:])
             if kinds is None:
-                print(f"[cmd] unknown fleet: {' '.join(parts[1:])!r}",
+                print(f"[cmd] unknown pause kind: {' '.join(parts[1:])!r}",
                       flush=True)
                 continue
             print(f"[cmd] unpausing {'+'.join(sorted(kinds))}", flush=True)
@@ -618,10 +634,38 @@ class SelfPlayRunner:
             # handing the rescorer the config is what switches blunders from
             # the blend path onto the teacher path
             self.rescorer.lc0_cfg = self.lc0_cfg
+            self.load_lc0_backlog()
             for _ in range(self.cfg.n_lc0_workers):
                 self.spawn_lc0_worker()
             print(f"[runner] spawned {self.cfg.n_lc0_workers} lc0 workers "
                   f"({self.lc0_cfg.lc0_distill_model_name})", flush=True)
+
+    def lc0_backlog_path(self):
+        return os.path.join(self.base_cfg.run_dir, LC0_BACKLOG_FILE)
+
+    def load_lc0_backlog(self):
+        path = self.lc0_backlog_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "rb") as f:
+            specs = pickle.load(f)
+        os.remove(path)
+        if specs:
+            self.lc0_hold.extend(specs)
+            self.lc0_hold_since = time.monotonic()
+        print(f"[runner] reloaded {len(specs)} lc0 probes from "
+              f"{LC0_BACKLOG_FILE}", flush=True)
+
+    def save_lc0_backlog(self):
+        """Held and queued teacher probes, after the lc0 worker has exited."""
+        specs = self.lc0_hold + drain_queue(self.lc0_q)
+        if not specs:
+            return
+        with open(self.lc0_backlog_path(), "wb") as f:
+            pickle.dump(specs, f, protocol=pickle.HIGHEST_PROTOCOL)
+        self.lc0_hold = []
+        print(f"[runner] saved {len(specs)} lc0 probes to "
+              f"{LC0_BACKLOG_FILE}", flush=True)
 
     def drain_lc0_specs(self):
         """Hold staged teacher probes until LC0_BUNDLE_SIZE, then release the
@@ -638,7 +682,9 @@ class SelfPlayRunner:
 
         sent = 0
         held_for_val = self.val_pending and not self.stop_signal_sent
-        if self.lc0_hold and not held_for_val and (
+        # an operator lc0 pause holds everything here until unpause
+        held = held_for_val or "lc0" in self.operator_paused
+        if self.lc0_hold and not held and (
                 len(self.lc0_hold) >= LC0_BUNDLE_SIZE
                 or time.monotonic() - self.lc0_hold_since >= LC0_BUNDLE_MAX_WAIT_S
                 or self.stop_signal_sent):
@@ -737,6 +783,19 @@ class SelfPlayRunner:
         print(f"[runner] unpaused {'+'.join(sorted(todo))} ({why})", flush=True)
         return True
 
+    def tear_down_fleet(self, kind):
+        """Terminate a fleet's processes so all of their GPU memory, CUDA
+        context included, goes back. Queued specs stay on the runner's queue;
+        only games in flight are lost. maybe_respawn_workers rebuilds the
+        fleet once the kind is unpaused."""
+        for w in self.procs_of(kind):
+            w["stop_ev"].set()
+            try:
+                w["p"].terminate()
+            except Exception:
+                pass
+        self.procs = [w for w in self.procs if w["kind"] != kind]
+
     def respawn_lc0_workers(self, why="operator"):
         """Pause, tear down and rebuild the lc0 fleet from a fresh read of
         lc0_replay_config.yaml -- the only way spawn-time params like
@@ -746,13 +805,7 @@ class SelfPlayRunner:
             return
         self.pause_workers(why, kinds={"lc0"})
         self.operator_paused.add("lc0")
-        for w in self.procs_of("lc0"):
-            w["stop_ev"].set()
-            try:
-                w["p"].terminate()
-            except Exception:
-                pass
-        self.procs = [w for w in self.procs if w["kind"] != "lc0"]
+        self.tear_down_fleet("lc0")
         self.lc0_cfg = create_lc0_replay_config(self.cfg)
         self.rescorer.lc0_cfg = self.lc0_cfg
         self.paused_kinds.discard("lc0")
@@ -767,13 +820,7 @@ class SelfPlayRunner:
         encoding or the net take effect without a full run restart."""
         self.pause_workers(why, kinds={"xc0"})
         self.operator_paused.add("xc0")
-        for w in self.procs_of("xc0"):
-            w["stop_ev"].set()
-            try:
-                w["p"].terminate()
-            except Exception:
-                pass
-        self.procs = [w for w in self.procs if w["kind"] != "xc0"]
+        self.tear_down_fleet("xc0")
         self.reload_config()
         self.paused_kinds.discard("xc0")
         self.operator_paused.discard("xc0")
@@ -1073,9 +1120,10 @@ class SelfPlayRunner:
     def maybe_launch_retrain(self):
         if self.retrain_worker is not None:
             return
-        # an operator pause blocks retraining, and with it validation and the
-        # bulk BRP enqueue, both of which hang off poll_retrain
-        if self.operator_paused:
+        # an operator retrain or xc0 hold blocks retraining, and with it
+        # validation and the bulk BRP enqueue, both of which hang off
+        # poll_retrain. An lc0 hold does not.
+        if self.operator_paused & {"retrain", "xc0"}:
             return
         # the validation batch finishes on the model it started on
         if self.val_pending:
@@ -1112,15 +1160,39 @@ class SelfPlayRunner:
               f"{rb.PRIMARY_TRIGGER_SHARDS}", flush=True)
         self.rescorer.reset_writer()
 
+    def px_path(self, name):
+        return os.path.join(self.cfg.run_dir, name)
+
+    def pause_playxerces(self):
+        with open(self.px_path(PX_PAUSE_FLAG), "w"):
+            pass
+
+    def unpause_playxerces(self):
+        try:
+            os.remove(self.px_path(PX_PAUSE_FLAG))
+        except FileNotFoundError:
+            pass
+
+    def playxerces_holds_gpu(self):
+        try:
+            age = time.time() - os.path.getmtime(self.px_path(PX_HEARTBEAT))
+        except OSError:
+            return False
+        return (age < PX_HEARTBEAT_STALE_S
+                and not os.path.exists(self.px_path(PX_RELEASED_FLAG)))
+
     def maybe_send_retrain_go(self):
-        """Let the paused retrain allocate once every live worker has dropped
-        its GPU sessions, or after RETRAIN_RELEASE_TIMEOUT_S regardless."""
+        """Let the paused retrain allocate once every live worker and
+        playxerces have dropped their GPU sessions, or after
+        RETRAIN_RELEASE_TIMEOUT_S regardless."""
         rw = self.retrain_worker
         since = rw["go_wait_since"]
         if since is None:
             return
         held = [w["id"] for w in self.procs
                 if w["p"].is_alive() and not w["release_ev"].is_set()]
+        if self.playxerces_holds_gpu():
+            held.append("playxerces")
         waited = time.monotonic() - since
         if held and waited < RETRAIN_RELEASE_TIMEOUT_S:
             return
@@ -1155,6 +1227,7 @@ class SelfPlayRunner:
             # worker-side validation is done and predictions are on disk;
             # pause so the retrain gets the GPU; it trains on "go"
             self.pause_workers("retrain")
+            self.pause_playxerces()
             self.retrain_worker["go_wait_since"] = time.monotonic()
             return
 
@@ -1189,6 +1262,8 @@ class SelfPlayRunner:
         # retrain leaves the weights, and so the epoch, where they were.
         self.unpause_workers("retrain complete",
                              epoch=self.current_epoch + (1 if ok else 0))
+        # after reload_config, so playxerces restarts on the rebuilt engine
+        self.unpause_playxerces()
 
         if ok:
             rb.rotate_to_replay(self.retrain_worker["primary_files"],
@@ -1226,8 +1301,17 @@ class SelfPlayRunner:
             c.pause.clear()
             kinds, c.pause_kinds = c.pause_kinds, set()
             self.operator_paused |= kinds
-            if not self.pause_workers("operator", kinds):
+            fleets = kinds & set(WORKER_KINDS)
+            if fleets and not self.pause_workers("operator", fleets):
                 print("[cmd] pause: already paused, hold recorded", flush=True)
+            if "lc0" in kinds and self.procs_of("lc0"):
+                self.tear_down_fleet("lc0")
+                print("[cmd] lc0 workers torn down, probes held in the runner",
+                      flush=True)
+            if "retrain" in kinds:
+                note = (" (the one in flight finishes)"
+                        if self.retrain_worker is not None else "")
+                print(f"[cmd] retraining held{note}", flush=True)
 
         # cleared whether or not anything was paused: left set it would latch
         # and cancel the next pause on the following pass
@@ -1237,7 +1321,15 @@ class SelfPlayRunner:
             # drop the hold first, or unpause_workers filters out the very
             # kinds the operator is asking for
             self.operator_paused -= kinds
-            if not self.unpause_workers("operator", kinds):
+            fleets = kinds & set(WORKER_KINDS)
+            if "retrain" in kinds:
+                print("[cmd] retraining released", flush=True)
+            if fleets and self.retrain_worker is not None:
+                # releasing now would put workers back on the GPU under the
+                # retrain; its completion path unpauses them
+                print("[cmd] unpause: hold dropped, a retrain is in flight -- "
+                      "workers come back when it finishes", flush=True)
+            elif fleets and not self.unpause_workers("operator", fleets):
                 print("[cmd] unpause: nothing paused there, no-op", flush=True)
 
         if c.respawn_lc0.is_set():
@@ -1388,7 +1480,7 @@ class SelfPlayRunner:
 
         if self.retrain_worker is not None:
             retrain = "in flight"
-        elif self.operator_paused:
+        elif self.operator_paused & {"retrain", "xc0"}:
             retrain = "blocked by operator pause"
         else:
             retrain = "idle"
@@ -1398,6 +1490,8 @@ class SelfPlayRunner:
     def shutdown(self):
         if self.retrain_worker is not None and self.retrain_worker["p"].is_alive():
             self.retrain_worker["p"].terminate()
+        # never leave the website paused behind a run that has exited
+        self.unpause_playxerces()
         if self.val_pending:
             self.close_partial_validation_batch("shutdown")
 
@@ -1467,6 +1561,8 @@ class SelfPlayRunner:
                 close_proc(w["p"], self.worker_procs)
         self.procs = [w for w in self.procs if w["p"].is_alive()]
 
+        if self.lc0_q is not None:
+            self.save_lc0_backlog()
         for q in (self.recent_q, self.telemetry_q, self.game_q,
                   self.sf_q, self.lc0_q):
             if q is not None:

@@ -645,12 +645,13 @@ class Rescorer(object):
             (x, None, sparsify_policy(policy), Y, vwht, pwht, source), okey)
         return policy
 
-    def training_data_from_sf(self, board, mv, tr, Y, is_draw, sf_won):
+    def training_data_from_sf(self, board, mv, tr, is_draw, sf_won):
         """One SF ply. Policy: Xerces's search when SF played the search's
         top move; otherwise sf_move_target on SF's move blended with the
         search, SF weight SF_POLICY_W_WON if SF won the game
         else SF_POLICY_W_OTHER. The clip is applied after the blend. KL and
-        value-KL boosts match a Xerces ply. Returns the dense policy."""
+        value-KL boosts match a Xerces ply. Returns (x, dense policy, okey,
+        vwht, pwht); finalize_game attaches the value target and appends."""
         cfg = self.config
         cm = tr['candidate_moves']
         lms = board.legal_moves()
@@ -683,8 +684,8 @@ class Rescorer(object):
             elif klv >= max(0.01, self.kl_value_q50):
                 vwht *= cfg.kl_boost_median_mult
 
-        return self.append_flat_policy_example(
-            board, ucis, list(pi), Y, vwht, pwht, source=SF_SOURCE)
+        x, policy = self.make_policy_example(board, ucis, list(pi))
+        return x, policy, self.opening_counts.key(board, x), vwht, pwht
 
     def start_game(self, pkl_file, pool):
         path = str(pkl_file)
@@ -739,6 +740,8 @@ class Rescorer(object):
             'pkl_path': path,
             'cfg': SimpleNamespace(**{k: getattr(cfg, k) for k in game_cfg_keys}),
             'ply_states': [],
+            # (ply_i, stm, outcome wdl, example parts) per trained SF ply
+            'sf_examples': [],
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
@@ -790,16 +793,13 @@ class Rescorer(object):
                 Q = this_q
 
             if is_sf_move:
-                # value: cliff-walker-corrected outcome, half SF's own tanh(cp)
-                sf_v = tr.get('sf_value')
-                Y = outcome if sf_v is None else (
-                    0.5 * outcome + 0.5 * scalar_to_wdl(sf_v)).astype(np.float32)
-                tr['wdl_target'] = Y
+                # value target waits for finalize_game, which knows the
+                # blunder cuts
                 sf_won = result != 0 and (result > 0) == bool(sf_color)
-                policy = self.training_data_from_sf(
-                    b_fast, mv, tr, Y, is_draw, sf_won)
-                tr['policy'] = [(int(i), float(policy[i]))
-                                for i in np.flatnonzero(policy)]
+                ex = self.training_data_from_sf(b_fast, mv, tr, is_draw, sf_won)
+                tr['policy'] = [(int(j), float(ex[1][j]))
+                                for j in np.flatnonzero(ex[1])]
+                game_state['sf_examples'].append((i, turn, outcome, ex))
 
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
@@ -1835,6 +1835,21 @@ class Rescorer(object):
         row_by_ply = {r[0]: r for r in rows}
         cut_outcome = blunder_cut_outcomes(
             game_state['plies'], cut_white, self.config.value_bootstrap_at_sample)
+
+        # SF plies: cliff-walker-corrected outcome, half SF's own tanh(cp)
+        for ply_i, stm, outcome, (x, policy, okey, vwht, pwht) in game_state.get(
+                'sf_examples', ()):
+            cut = cut_outcome.get(ply_i)
+            if cut is not None:
+                outcome = scalar_to_wdl(cut if stm else -cut)
+            node = game_state['plies'][ply_i]
+            sf_v = node.get('sf_value')
+            Y = outcome if sf_v is None else (
+                0.5 * outcome + 0.5 * scalar_to_wdl(sf_v)).astype(np.float32)
+            node['wdl_target'] = Y
+            self.opening_counts.bump(okey)
+            self.live_buffer.append(
+                (x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE), okey)
 
         # loop 2: compute WDL targets and add to training
         for tup, aux in zip(pending, pending_aux):

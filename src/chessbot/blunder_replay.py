@@ -58,7 +58,7 @@ def probe_fails(src):
     return max(0, (ms - BRP_START_MS) // BRP_MS_STEP)
 # probes are drawn on recency of the last probe, not of discovery, so a
 # position gets a rest between challenges instead of being hammered
-BRP_LAST_SEEN_MIN = 7
+BRP_LAST_SEEN_MIN = 5
 # a position at this many fails gets one last probe; a fail past it evicts
 BRP_MAX_FAILS = 5
 # the fail that hands the position to the lc0 teacher for training samples

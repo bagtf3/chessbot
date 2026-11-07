@@ -23,6 +23,7 @@ import shutil
 from pathlib import Path
 
 from chessbot.config import Config
+from chessbot.eval_metrics import LC0_PROGRESS_CSV, SF_PROGRESS_CSV
 
 
 def write_yaml(path, obj):
@@ -282,14 +283,16 @@ def main():
                 carry(src_path, os.path.join(dest_dir, name))
                 print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
-        # copy the progress csvs unless suppressed. Both must travel together:
-        # eval_metrics.migrate_pretrain_progress treats "continued file missing"
-        # as "eval_progress.csv still holds pretraining rows" and moves the
-        # whole file across, so cloning only the first one would relabel this
-        # run's selfplay rows as pretraining on the new tag's first startup.
+        # copy the progress csvs unless suppressed. The first two must travel
+        # together: eval_metrics.migrate_pretrain_progress treats "continued
+        # file missing" as "eval_progress.csv still holds pretraining rows" and
+        # moves the whole file across, so cloning only the first one would
+        # relabel this run's selfplay rows as pretraining on the new tag's
+        # first startup. The lc0 and SF slice csvs carry their history along.
         if not args.ignore_eval_progress:
             for fname in ("eval_progress.csv",
-                          "eval_progress_pretrain_continued.csv"):
+                          "eval_progress_pretrain_continued.csv",
+                          LC0_PROGRESS_CSV, SF_PROGRESS_CSV):
                 src_eval = os.path.join(src_dir, fname)
                 if os.path.exists(src_eval):
                     shutil.copy2(src_eval, os.path.join(dest_dir, fname))

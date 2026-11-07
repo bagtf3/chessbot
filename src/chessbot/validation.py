@@ -119,7 +119,6 @@ def find_last_history_entry_for_run(run_dir, selfplay_dir=None, previous_run_tag
             print(f"{V} using last history from: {previous_run_tag}")
             return prev_last
 
-    print(f"{V} no validation history found.")
     return None
 
 

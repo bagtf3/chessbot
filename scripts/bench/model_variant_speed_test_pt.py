@@ -1,56 +1,24 @@
 #!/usr/bin/env python3
 """model_variant_speed_test_pt.py
 
-Conv-backbone speed tests for chess policy+value models.
+PT eager and ORT+TensorRT fp16 speed tests for xc0h policy+value models.
 
-Models:
-  18m-precond-smartgate-xc0h-K6-6c4t -- 6 conv preconditioner blocks, 4 transformer
-                                        blocks, pos concatenated (CF=256 -> D=512).
-                                        Keeps its existing LayerNorm; untouched here.
-  conv-pure                          -- 16x RMS conv block (256) NCHW -> trunk RMSNorm
-                                        -> conv-pure WDL / SmartGate / from-to heads
-  precond-mha-8c4t-d384              -- build_pt_precond_signed at
-                                        pre_block="conv", attn="mha": 8 conv
-                                        preconditioner blocks at 256 -> concat
-                                        pos(128) -> D=384 -> 4 MHA tx blocks,
-                                        flat 1024 FFN. Same xc0h stem, same 8
-                                        global accumulators, same WDL /
-                                        SmartGate / from-to heads as 6c4t
-                                        (dims recomputed off D=384) -- RMSNorm
-                                        throughout instead of 6c4t's LayerNorm,
-                                        same 4 tx blocks but 2 more conv
-                                        preconditioner blocks and a narrower D.
-  precond-mha-8c6t-d256              -- build_pt_precond_addpos: 8 conv
-                                        preconditioner blocks at 256, D=256
-                                        throughout (no pos-concat widening) --
-                                        cutover is x = x + pos_scale * pos,
-                                        additive with one learnable scalar,
-                                        no RMS on that step. 6 MHA tx blocks
-                                        at D=256, flat 1024 FFN. SmartGate
-                                        reads acc(1) concat acc(6) (one of
-                                        the from/to-shared slots), so its
-                                        internal width is 512 like prod's
-                                        gate even though the trunk itself
-                                        never widens past 256.
-  precond-mha-10c6t-d256             -- same build_pt_precond_addpos, 10 conv
-                                        preconditioner blocks instead of 8,
-                                        same 6 MHA tx blocks -- isolates the
-                                        cost/value of a deeper preconditioner
-                                        at fixed tx depth.
-  precond-mha-8c8t-d256              -- same build_pt_precond_addpos, 8 conv
-                                        preconditioner blocks, 8 MHA tx blocks
-                                        instead of 6 -- isolates the cost/
-                                        value of more transformer depth at
-                                        fixed preconditioner depth.
-
-The conv models share the identical conv-pure heads and input stem, and all use
-RMSNorm. 6c4t deliberately keeps LayerNorm.
+Models (CONV_MODELS, built from model.VARIANTS):
+  m13-7-8c8t-d256   -- prod: build_pt_expandy_swiglu
+  m137f_8c8t_d256_d512 -- build_pt_m137_franken: 64 tokens only, 6 smolgen tx
+                       blocks at 256 then 2 at 512, split from / to policy,
+                       gated spatial WDL, no smartgate
+  m137f_8c8t_4d256_4d512 -- same, 4 smolgen tx blocks at 256 then 4 at 512
+  m137f_4c8t_4d256_4d512 -- 2 plain + 2 gated convs, 4 smolgen FF tx blocks at
+                       256 then 4 SwiGLU at 512
+  m137f_4g_6d256_4d512 -- 4 end-split gated convs, 6 smolgen FF tx blocks at
+                       256 then 4 SwiGLU at 512
 
 Flags:
   --dry-run              Build models, print param counts + shape checks, skip speed test
   --skip-trt             Skip ORT+TensorRT
-  --skip-convpure        Skip the conv models
-  --batch-sizes    Space-separated list (default: 1 2 4 8 16 32 64 128 256 512)
+  --skip-convpure        Skip the model list
+  --batch-sizes    Space-separated list (default: 16 32 64 256)
 """
 
 import os
@@ -64,10 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import math
-from chessbot.model import (
-    build_pt_precond_smartgate, build_pt_conv_pure,
-    build_pt_precond_signed, build_pt_precond_addpos,
-)
+from chessbot.model import VARIANTS, build_pt_expandy_swiglu, build_pt_m137_franken
 
 SEQ_LEN    = 64
 ENC_VOCAB  = 21
@@ -79,57 +44,25 @@ N_ITERS  = 100
 TRT_CACHE    = os.path.join(os.path.expanduser("~"), ".cache", "conv_chess_trt", "speed_test_cache")
 CSV_RESULTS  = os.path.join(TRT_CACHE, "speed_results.csv")
 
-DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-
-XC0H_CFG = dict(conv_filters=256, num_heads=8, dropout=0.05, pre_blocks=4, xc0h_K=6)
-
-XC0H_6C4T_CFG = dict(
-    conv_filters=256, num_heads=8, dropout=0.05,
-    pre_blocks=6, tx_blocks=4, xc0h_K=6,
-)
+DEFAULT_BATCH_SIZES = [16, 32, 64, 256]
 
 # flat width of board.history_tokens(K): K*64 slim tokens + K rep flags
 # + castling + stm + hmc. Matches random_xc0h_tokens.
 XC0H_IN_LEN = 6 * 64 + 6 + 3
 
-# the whole conv family takes the xc0h K=6 history-token stem, same as the
-# precond models -- input is the flat (B, 393) board.history_tokens(6) encoding
-# value branches after 12 blocks, leaving 4 for policy to specialize on
-CONV_PURE_CFG = dict(
-    conv_filters=256, num_blocks=16, dropout=0.03, xc0h_K=6, value_tap=4,
-)
-
-# 8 conv preconditioner blocks at 256 -> concat pos(128) -> D=384 -> 4 MHA
-# tx blocks, flat 1024 FFN
-PRECOND_MHA_8C4T_CFG = dict(
-    conv_filters=256, pos_dim=128, dropout=0.03, pre_blocks=8, tx_blocks=4,
-    ff_dim=1024, pre_block="conv", attn="mha", num_heads=8, xc0h_K=6,
-)
-
-# 8 conv preconditioner blocks at 256, D=256 throughout (additive pos, no
-# widening) -> 6 MHA tx blocks, flat 1024 FFN
-PRECOND_MHA_8C6T_CFG = dict(
-    conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=6,
-    ff_dim=1024, num_heads=8, xc0h_K=6,
-)
-
-# same addpos design, 10 conv preconditioner blocks, 6 MHA tx blocks
-PRECOND_MHA_10C6T_CFG = dict(
-    conv_filters=256, dropout=0.03, pre_blocks=10, tx_blocks=6,
-    ff_dim=1024, num_heads=8, xc0h_K=6,
-)
-
-# same addpos design, 8 conv preconditioner blocks, 8 MHA tx blocks
-PRECOND_MHA_8C8T_CFG = dict(
-    conv_filters=256, dropout=0.03, pre_blocks=8, tx_blocks=8,
-    ff_dim=1024, num_heads=8, xc0h_K=6,
-)
-
 # (label, builder, cfg, onnx stem) -- all take the xc0h K=6 input and emit
 # the same 1858/3 heads, so one loop covers them.
 CONV_MODELS = [
-    ("conv-pure",              build_pt_conv_pure,      CONV_PURE_CFG,         "conv_pure"),
-    ("precond-mha-8c8t-d256",  build_pt_precond_addpos, PRECOND_MHA_8C8T_CFG,  "precond_mha_8c8t_d256"),
+    ("m13-7-8c8t-d256",  build_pt_expandy_swiglu, VARIANTS["m13-7-8c8t-d256"],
+     "m137_8c8t_d256"),
+    ("m137f_8c8t_d256_d512", build_pt_m137_franken,
+     VARIANTS["m137f_8c8t_d256_d512"], "m137f_8c8t_d256_d512"),
+    ("m137f_8c8t_4d256_4d512", build_pt_m137_franken,
+     VARIANTS["m137f_8c8t_4d256_4d512"], "m137f_8c8t_4d256_4d512"),
+    ("m137f_4c8t_4d256_4d512", build_pt_m137_franken,
+     VARIANTS["m137f_4c8t_4d256_4d512"], "m137f_4c8t_4d256_4d512"),
+    ("m137f_4g_6d256_4d512", build_pt_m137_franken,
+     VARIANTS["m137f_4g_6d256_4d512"], "m137f_4g_6d256_4d512"),
 ]
 
 # rough targets from the design spec; reported alongside the real count
@@ -478,7 +411,7 @@ def speed_test(label, infer_fn, batch_sizes, input_fn=random_tokens):
 # ---------------------------------------------------------------------------
 
 def print_summary_table(all_results, batch_sizes):
-    TABLE_BS = [b for b in [64, 128, 256, 512] if b in batch_sizes]
+    TABLE_BS = sorted(batch_sizes)
     if not TABLE_BS or not all_results:
         return
     col_w = 12
@@ -539,51 +472,8 @@ def main():
         save_results_csv(lbl, params, result)
         return result
 
-    # 18m-precond-smartgate-xc0h-K6-6c4t
-    print(f"\n{'='*60}")
-    print(f"  18m-precond-smartgate-xc0h-K6-6c4t  (same stem as xc0h-K6;"
-          f" 6 conv preconditioner blocks, 4 transformer blocks (unchanged),"
-          f" pos concatenated so CF=256 -> D=512, same as prod)")
-    model_6c4t  = build_pt_precond_smartgate(XC0H_6C4T_CFG)
-    params_6c4t = sum(p.numel() for p in model_6c4t.parameters())
-    cleanup_stale_artifacts(
-        "18m-precond-smartgate-xc0h-K6-6c4t", "precond_xc0h_k6_6c4t",
-        params_6c4t, csv_data)
-
-    if not args.dry_run:
-        try:
-            print(f"\n  Building 18m-precond-smartgate-xc0h-K6-6c4t PT eager ...")
-            eager_6c4t = make_pt_eager_infer(model_6c4t, device)
-            lbl = "18m-precond-smartgate-xc0h-K6-6c4t  PT eager"
-            all_results[lbl] = run_or_cached(
-                lbl, eager_6c4t, params_6c4t,
-                input_fn=lambda b: random_xc0h_tokens(b, 6))
-            del eager_6c4t; gc.collect(); torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t PT eager: {e}")
-
-        if not args.skip_trt:
-            try:
-                lbl        = "18m-precond-smartgate-xc0h-K6-6c4t  ORT TRT"
-                onnx_6c4t  = os.path.join(TRT_CACHE, f"precond_xc0h_k6_6c4t_{params_6c4t}.onnx")
-                if not os.path.exists(onnx_6c4t):
-                    dummy = torch.zeros(
-                        1, XC0H_IN_LEN, dtype=torch.long, device=device)
-                    export_to_onnx(build_pt_precond_smartgate(XC0H_6C4T_CFG), device, onnx_6c4t, dummy=dummy)
-                else:
-                    print(f"  [TRT] ONNX cached: {onnx_6c4t}")
-                trt_6c4t, trt_sess_6c4t = make_trt_infer(
-                    onnx_6c4t, TRT_CACHE, max_bs=max(bs),
-                    input_shape=str(XC0H_IN_LEN))
-                all_results[lbl] = run_or_cached(
-                    lbl, trt_6c4t, params_6c4t,
-                    input_fn=lambda b: random_xc0h_tokens(b, 6))
-                del trt_sess_6c4t; gc.collect()
-            except Exception as e:
-                print(f"  [ERROR] 18m-precond-smartgate-xc0h-K6-6c4t TRT: {e}")
-
     # everything in CONV_MODELS: same xc0h stem, same 1858/3 output, so one
-    # loop covers the conv family and the signed precond clone alike.
+    # loop covers them all
     if not args.skip_convpure:
         for label, builder, cfg, stem in CONV_MODELS:
             print(f"\n{'='*60}")

@@ -234,6 +234,67 @@ def plot_training_progress(metrics_history, epoch=None, ma_max=50, hide_first=10
     plt.show()
 
 
+COMPARE_COLORS = ["tab:blue", "tab:orange", "tab:green"]
+
+# (panel title, column or (numerator, denominator)), one list per figure
+COMPARE_FIGS = [
+    ((2, 2), [
+        ("value KL", "value_kl"),
+        ("policy KL", "policy_kl"),
+        ("value MSE", "value_mse"),
+        ("value corr", "value_corr"),
+    ]),
+    ((2, 3), [
+        ("top1 mass", "top1_mass"),
+        ("avg max prob", "avg_top_prob"),
+        ("top1 exact", "top1_exact"),
+        ("chess loss (4*value_ce + policy_ce)", "chess_loss"),
+        ("value KL / policy KL", ("value_kl", "policy_kl")),
+        ("CE gain fraction", "ce_gain_frac"),
+    ]),
+]
+
+
+def compare_series(d, col):
+    if isinstance(col, tuple):
+        num, den = col
+        if num not in d or den not in d:
+            return None
+        return (d[num] / d[den].replace(0, np.nan)).to_numpy(dtype=float)
+    return d[col].to_numpy(dtype=float) if col in d else None
+
+
+def plot_source_comparison(sources, title=None):
+    """sources: {label: eval frame}, drawn in order on every panel. Raw as a
+    pale line, MA bold; the MA window scales with the longest source."""
+    import matplotlib.pyplot as plt
+
+    n = max(len(d) for d in sources.values())
+    win = max(3, n // 5) | 1
+
+    for shape, panels in COMPARE_FIGS:
+        fig, axes = plt.subplots(*shape, figsize=(5 * shape[1], 4 * shape[0]),
+                                 sharex=True)
+        if title:
+            fig.suptitle(title, fontsize=12)
+        for ax, (name, col) in zip(axes.flat, panels):
+            for (label, d), color in zip(sources.items(), COMPARE_COLORS):
+                y = compare_series(d, col)
+                if y is None:
+                    continue
+                x = d["model_epoch"].to_numpy()
+                ax.plot(x, y, alpha=0.25, lw=0.8, color=color)
+                ax.plot(x, moving_average_pd(y, win), lw=2, color=color,
+                        label=label)
+            ax.set_title(name)
+            ax.legend(fontsize=8)
+        for ax in axes[-1]:
+            ax.set_xlabel(f"model epoch  (MA{win})")
+        plt.tight_layout()
+
+    plt.show()
+
+
 def plot_validation(
     epoch,
     plot_path,

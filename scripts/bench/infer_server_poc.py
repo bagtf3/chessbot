@@ -166,8 +166,9 @@ def poc_worker(cfg, stop_ev, recent_q, telem_q, msg_q, game_q, sf_q,
         return sess, meter.wrap(infer)
 
     lp.make_ort_trt_infer = patched
-    with lp.init_selfplay(cfg, recent_q, telem_q, msg_q,
-                          game_q=game_q, sf_q=sf_q) as looper:
+    queues = {"recent": recent_q, "telemetry": telem_q, "msg": msg_q,
+              "game": game_q, "sf": sf_q}
+    with lp.init_selfplay(cfg, queues) as looper:
         meter.hook(looper)
         looper.run(stop_ev)
     meter.maybe_push(force=True)

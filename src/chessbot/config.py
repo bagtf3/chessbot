@@ -76,7 +76,9 @@ class Config(object):
     games_at_once = 128
     micro_batch = 4
     macro_batch = 256
-    dynamic_mbs = False  # 2x micro_batch past half the sims ceiling
+    # 2x micro_batch past min(dynamic_mbs_min, half the sims ceiling)
+    dynamic_mbs = False
+    dynamic_mbs_min = None
 
     max_game_length = 200
     min_game_length = 5
@@ -187,6 +189,8 @@ class Config(object):
     inference_backend        = "ort_trt"  # "ort_trt" | "lc0_trt"
     trt_model_name           = ""          # ort_trt: cache prefix (e.g. "xc0_precond")
     trt_cache                = ""          # ort_trt: path to TRT engine cache dir
+    # xc0 sessions in one inference-server process; 0 = each worker its own
+    infer_server_threads     = 0
 
     def __init__(self):
         self.init_paths()

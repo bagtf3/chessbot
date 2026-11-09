@@ -51,7 +51,8 @@ class GameLooper(object):
     """
     Orchestrates N games concurrently, central batching, caches, and training.
     """
-    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None, sf_queue=None):
+    def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None, sf_queue=None,
+                 remote=None):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_q
@@ -71,6 +72,8 @@ class GameLooper(object):
         # set while paused with GPU sessions dropped; the runner waits on it
         # before letting a retrain allocate
         self.release_ev = None
+        # xc0 inference-server slot; set, the worker holds no GPU session
+        self.remote = remote
         self.forest = MCTSForest()
 
         self.pull_from_queue()
@@ -132,7 +135,11 @@ class GameLooper(object):
         else:
             self.batch_encoder = self.forest.get_all_encoded
 
-        if cfg.inference_backend == "ort_trt":
+        if self.remote is not None:
+            from chessbot.infer_server import make_remote_infer
+            self.model, self.infer = None, make_remote_infer(self.remote)
+
+        elif cfg.inference_backend == "ort_trt":
             self.model, self.infer = make_ort_trt_infer(
                 cfg.model_path,
                 cfg.trt_model_name,
@@ -391,7 +398,8 @@ class GameLooper(object):
                         g = self.sf_games[game_id]
                         g.set_stockfish_result(res_tup)
 
-            bonus = 0
+            # every pass fills from the top of the list until the batch is full
+            # or the list runs out, so the oldest games finish first
             filled = 0
             finished = []
             self.forest.resolve_all_inflight()
@@ -399,7 +407,8 @@ class GameLooper(object):
                 base_mbs = game.config.micro_batch
                 g_mbs = base_mbs
                 if game.config.dynamic_mbs:
-                    g_mbs = game.tree.effective_mbs(base_mbs)
+                    g_mbs = game.tree.effective_mbs(
+                        base_mbs, game.config.dynamic_mbs_min or 0)
                 sf_terminal, mcts_terminal = False, False
 
                 # if its stockfish turn, check if the move is ready
@@ -426,7 +435,6 @@ class GameLooper(object):
                             sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
                             mps.tick(1)
                         else:
-                            bonus += g_mbs
                             continue
 
                 # if this game has reached its local sim budget, make the move
@@ -442,31 +450,20 @@ class GameLooper(object):
                     finished.append(game.game_id)
                     if game.game_id in self.sf_games:
                         del self.sf_games[game.game_id]
-                    bonus += g_mbs
                     continue
 
-                # if bonus available we can bump our microbatch up by at most 2
-                this_mbs = g_mbs + max(0, min(bonus, 2))
-
-                # trim to the room left in the nn batch; that game closes the pass
-                room = macro - filled
-                last = this_mbs >= room
-                if last:
-                    this_mbs = room
-
+                # count_new never exceeds the ask, so the batch can't overfill
+                this_mbs = min(g_mbs, macro - filled)
                 res = game.tree.collect_many_leaves(this_mbs)
                 nn, n_leafs = self.process_results(
                     res, counts, this_mbs, g_mbs > base_mbs)
                 mbs_used.append(this_mbs)
                 filled += nn
 
-                # update bonus, could go up or down
-                bonus += g_mbs - nn
-
                 # update sim count
                 game.tree.sims_completed_this_move += n_leafs
 
-                if last:
+                if filled >= macro:
                     break
 
             keys_np, enc_np = self.batch_encoder()
@@ -759,13 +756,25 @@ class GameLooper(object):
         })
 
 
-def init_selfplay(config, recent_games_q, telemetry_q, msg_q, game_q=None, sf_q=None):
+# worker queues by name; "sf" is optional and only the vs_stockfish worker
+# gets it
+LOOPER_QUEUES = ("recent", "telemetry", "msg", "game")
+
+
+def init_selfplay(config, queues, remote=None):
+    """queues: dict with every LOOPER_QUEUES name, plus "sf" for the SF
+    worker. remote: an xc0 inference-server slot, or None for a local
+    session."""
+    missing = [k for k in LOOPER_QUEUES if queues.get(k) is None]
+    if missing:
+        raise ValueError(f"init_selfplay missing queues: {missing}")
     model = None  # loaded per-worker in load_reload_model
-    
+
     looper = GameLooper(
         model=model, cfg=config.copy(),
-        recent_q=recent_games_q, telem_q=telemetry_q,
-        msg_q=msg_q, game_queue=game_q, sf_queue=sf_q
+        recent_q=queues["recent"], telem_q=queues["telemetry"],
+        msg_q=queues["msg"], game_queue=queues["game"],
+        sf_queue=queues.get("sf"), remote=remote
     )
 
     # infer the current epoch from the progress csv. Row count is wrong once the

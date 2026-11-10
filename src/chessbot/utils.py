@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MATE_CP = 2500
 CLIP_MAX = 1200
+# cp at which cp_to_value_tanh gives 0.5
+TANH_MID_CP = 150.0
 EPS = 1e-12
 
 def cp_to_value(cp):
@@ -37,12 +39,19 @@ def cp_to_value(cp):
         return np.clip(cp.score() / 1000, -0.95, 0.95)
 
 
-def cp_to_value_tanh(cp, mid_cp=200.0):
+def cp_to_value_tanh(cp, mid_cp=TANH_MID_CP):
     # scale so tanh(k * mid_cp) == 0.5  ->  k = atanh(0.5) / mid_cp
     k = math.atanh(0.5) / mid_cp
 
     # clip so checkmates still look much better
     return np.clip(math.tanh(k * cp), -0.97, 0.97)
+
+
+def expected_score_loss(best_cp, played_cp):
+    """STM-POV cp pair -> expected game points given up, 0..1. Expected score
+    is (1 + Q) / 2 under any W/D/L split, so this is half the drop in Q."""
+    return 0.5 * max(0.0, float(cp_to_value_tanh(best_cp)
+                                - cp_to_value_tanh(played_cp)))
 
 
 def scalar_to_wdl(z):
@@ -62,7 +71,7 @@ def score_to_value_stm_pov(board_score):
     return cp_to_value(rel_score)
 
 
-def score_to_value_stm_pov_tanh(board_score, mid_cp=100.0):
+def score_to_value_stm_pov_tanh(board_score, mid_cp=TANH_MID_CP):
     # tanh scale: +mid_cp -> 0.5 win probability
     rel_score = board_score.relative
     raw = rel_score.score()

@@ -19,7 +19,7 @@ from chessbot import SF_LOC
 from chessbot.config import XC0H_K
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
-    scalar_to_wdl, cp_to_value_tanh,
+    scalar_to_wdl, cp_to_value_tanh, expected_score_loss,
     ema_step, load_json, save_pickle_atomic, blend_to_uniform,
 )
 from chessbot.replay_buffer import (
@@ -31,7 +31,7 @@ from chessbot.opening_counts import (
 )
 
 from chessbot.blunder_replay import (
-    BRP_POOL_ENV, BRP_SCENARIOS, is_blunder_candidate,
+    BRP_POOL_ENV, BRP_SCENARIOS, is_blunder_candidate, is_esl_candidate,
     save_probe_pool, evicted_path, evict_position,
     BRP_EQUIV_CPL, BRP_HISTORY_FILENAME,
     blunder_replay_dir, BRP_POOL_MAX_SIZE,
@@ -72,7 +72,12 @@ LC0_TEACHER_PV_K = 2
 BRP_STAT_KEYS = (
     "total", "missed_mate", "A", "B", "G3", "F", "U",
     "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
+    "esl_inaccuracy", "esl_blunder", "esl_pool",
 )
+# expected-score-loss thresholds, tracked in the blunder stats alongside the
+# cp rules; nothing trains or admits on them yet
+ESL_INACCURACY = 0.05
+ESL_BLUNDER = 0.10
 
 
 def policy_value_miss(cm, sf_uci):
@@ -1709,7 +1714,7 @@ class Rescorer(object):
                 )
 
             if loss_this >= blunder_cp and not missed_mate:
-                v = cp_to_value_tanh(best_cp, mid_cp=BLUNDER_CUT_MID_CP)
+                v = cp_to_value_tanh(best_cp)
                 cut_white[i] = v if turn else -v
 
             eval_trace.append((i, best_abs))
@@ -1747,6 +1752,7 @@ class Rescorer(object):
             self.accumulate_blunder_stats(
                 missed_mate, is_blunder, true_blunder, is_inaccuracy,
                 best_cp, played_cp, loss_this, Z_stm,
+                expected_score_loss(best_cp, best_cp - loss_this),
             )
 
             # what this ply becomes. A true blunder is handed to the teacher
@@ -2056,7 +2062,8 @@ class Rescorer(object):
             f.flush()
 
     def accumulate_blunder_stats(self, missed_mate, is_blunder, true_blunder,
-                                 is_inaccuracy, best_cp, played_cp, cpl, z_stm):
+                                 is_inaccuracy, best_cp, played_cp, cpl, z_stm,
+                                 esl):
         def bump(key, value):
             for acc in (self.total_blunder, self.window_blunder):
                 acc[key]['n'] += 1
@@ -2084,6 +2091,13 @@ class Rescorer(object):
         if missed_mate or is_blunder:
             bump('all_blunders', cpl)
 
+        if esl >= ESL_BLUNDER:
+            bump('esl_blunder', cpl)
+        elif esl >= ESL_INACCURACY:
+            bump('esl_inaccuracy', cpl)
+        if is_esl_candidate(best_cp, played_cp, esl, z_stm)[0]:
+            bump('esl_pool', cpl)
+
     def print_blunder_stats(self):
         acc = self.window_blunder
         primary = ("A", "B", "G3", "U")
@@ -2105,15 +2119,20 @@ class Rescorer(object):
             row(k, k)
         row("true_blunder", "true_blunder")
         row("all blunders", "all_blunders")
+        row("ESL inaccuracies", "esl_inaccuracy")
+        row("ESL blunders", "esl_blunder")
 
         # same A/B/G3/F rule maybe_add_blunder_candidate uses -- fraction of
         # all trainable plies this window that would qualify for the pool
-        pool_n = sum(acc[k]['n'] for k in pool_eligible)
         total_n = acc['total']['n']
-        if pool_n:
-            pool_pct = pool_n / total_n if total_n else 0.0
-            print(f"{RS}  {'pool-eligible (A/B/G3/F)':<24} "
-                  f"n={pool_n:>6}  of {total_n} moves ({pool_pct:.2%})")
+        for label, pool_n in (
+            ("pool-eligible (A/B/G3/F)", sum(acc[k]['n'] for k in pool_eligible)),
+            ("pool-eligible (ESL/F)", acc['esl_pool']['n']),
+        ):
+            if pool_n:
+                pool_pct = pool_n / total_n if total_n else 0.0
+                print(f"{RS}  {label:<24} "
+                      f"n={pool_n:>6}  of {total_n} moves ({pool_pct:.2%})")
 
         for k in BRP_STAT_KEYS:
             self.window_blunder[k] = {'n': 0, 'cpl': 0.0}
@@ -2432,9 +2451,6 @@ def blend_wdl(z_stm, best_wdl_white_pov, is_white):
 
 
 REVIEW_RATE = 0.005
-# cp_to_value_tanh midpoint for the SF value that replaces the outcome
-# before a blunder
-BLUNDER_CUT_MID_CP = 150.0
 # SF-ply policy: SF's share of the blend when SF's move is not the search's
 # top move, by game outcome from SF's side
 SF_POLICY_W_WON = 0.8

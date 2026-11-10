@@ -85,6 +85,11 @@ G_MIN_V = 250
 G_MAX_P = 150
 F_MIN_V = 1200
 F_MAX_P = 1000
+# ESL candidate rule (tracked alongside A/B/G3/F, not yet admitting): an
+# ESL_LOST_MIN slip in a game the mover lost or drew, an ESL_ANY_MIN slip in
+# any game, or F
+ESL_LOST_MIN = 0.12
+ESL_ANY_MIN = 0.20
 
 # STARTPOS-traceable only -- history_uci gets replayed from a fresh board, so
 # the random_init / piece_odds families can never join this list. SF's own
@@ -127,6 +132,16 @@ def is_blunder_candidate(v, p, cpl, z_stm):
         label = label.item()
 
     return is_candidate, label
+
+
+def is_esl_candidate(v, p, esl, z_stm):
+    """Scalar ESL rule: E for the ESL thresholds, F as in is_blunder_candidate,
+    F first. Returns (is_candidate, label)."""
+    if z_stm <= 0 and v >= F_MIN_V and p < F_MAX_P:
+        return True, "F"
+    if esl >= ESL_ANY_MIN or (z_stm <= 0 and esl >= ESL_LOST_MIN):
+        return True, "E"
+    return False, None
 
 
 def probe_pool_path(pool_path=None):

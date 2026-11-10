@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -12,13 +13,13 @@ if lc0_loc:
     if lc0_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = lc0_dir + os.pathsep + os.environ.get("PATH", "")
 
-try:
-    import torch
-    torch_lib = str(Path(torch.__file__).parent / "lib")
+# located without importing torch, so processes that never build an ORT
+# session don't pay for loading it
+torch_spec = importlib.util.find_spec("torch")
+if torch_spec and torch_spec.submodule_search_locations:
+    torch_lib = str(Path(torch_spec.submodule_search_locations[0]) / "lib")
     if torch_lib not in os.environ.get("PATH", ""):
         os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
-except Exception:
-    pass
 
 SF_LOC      = os.getenv("SF_LOC", "")
 LC0_LOC     = os.getenv("LC0_LOC", "")

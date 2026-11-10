@@ -865,7 +865,7 @@ class StockfishThread(object):
                     res_tup = self.explore_eval(board, depth or self.depth)
                 if res_tup is None:
                     res_tup = sf_eval(
-                        board, score_fn=lambda s: score_to_value_stm_pov_tanh(s, mid_cp=150.0),
+                        board, score_fn=score_to_value_stm_pov_tanh,
                         depth=depth or self.depth, engine=self.eng
                     )
 
@@ -907,7 +907,7 @@ class StockfishThread(object):
                        / SF_EXPLORE_TEMP_CP)
             move = keep[int(np.random.choice(len(keep), p=w / w.sum()))][1]
 
-            val = score_to_value_stm_pov_tanh(best_info["score"], mid_cp=150.0)
+            val = score_to_value_stm_pov_tanh(best_info["score"])
             wdl_info = best_info.get("wdl")
             wdl = ((wdl_info.relative.wins / 1000.0,
                     wdl_info.relative.draws / 1000.0,

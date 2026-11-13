@@ -10,9 +10,16 @@ from pyfastchess import MCTSTree as fasttree
 from pyfastchess import Board as fastboard
 from pyfastchess import terminal_value_white_pov
 
+from pyfastchess import SearchParams
+
 from chessbot import ENDGAME_LOC
 from chessbot.config import XC0H_K
 from chessbot.utils import rnd
+
+# C++ search param names; the trailing-underscore entries are derived flags
+SEARCH_FIELDS = [k for k in SearchParams().to_dict() if not k.endswith("_")]
+# set by MCTSTree.move_params each move rather than read from the config
+MOVE_FIELDS = ("c_puct", "sims_min", "sims_max")
 
 POLICY_DIM = 1858
 # max_length adjudication, given at least N plies: white-POV mean resign_q over
@@ -46,36 +53,25 @@ def get_tablebase():
         TABLEBASE = chess.syzygy.open_tablebase(ENDGAME_LOC)
     return TABLEBASE
 
+def scheduled(schedule, ply, default):
+    """Value of the {start_ply: value} entry with the largest start ply at or
+    below ply (the first entry before that); default with no schedule."""
+    if not schedule:
+        return default
+    items = sorted(schedule.items())
+    val = items[0][1]
+    for start, v in items:
+        if ply >= start:
+            val = v
+    return val
+
+
 class MCTSTree(fasttree):
     def __init__(self, board, cfg):
         self.config = cfg
 
-        # c_puct can also be a dict {start_ply: c_puct} on absolute game ply:
-        # the entry with the largest start ply at or below the current ply
-        # applies, re-checked every move in advance()
-        self.c_puct_schedule = (sorted(cfg.c_puct.items())
-                                if isinstance(cfg.c_puct, dict) else None)
-        self.c_puct = self.scheduled_c_puct(board.history_size())
-
-        # set floor and ceiling 
-        self.sims_floor = cfg.sims_floor
-        self.sims_ceiling_schedule = {}
-
-        # can also be a dict, interpreted as a sims schedule
-        if isinstance(cfg.sims_ceiling, dict):
-            # start with the lowest, update at each interval
-            sc = cfg.sims_ceiling.copy()
-            lowest = min(sc.keys())
-            self.sims_ceiling = sc.pop(lowest)
-            self.sims_ceiling_schedule = sc
-        else:
-            self.sims_ceiling = cfg.sims_ceiling
-
-        self.pruning_factor = cfg.pruning_factor
-        super().__init__(
-            board, self.c_puct, self.sims_ceiling, self.pruning_factor,
-            cfg.uniform_eps, cfg.prior_clip_max
-        )
+        # c_puct can also be a dict {start_ply: c_puct} on absolute game ply
+        self.c_puct_schedule = cfg.c_puct if isinstance(cfg.c_puct, dict) else None
 
         # bookkeeping
         self.board = board
@@ -83,66 +79,29 @@ class MCTSTree(fasttree):
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
-        # make sure we're starting at the correct sim schedule entry
-        if self.sims_ceiling_schedule:
-            for i in range(self.n_plies):
-                if i in self.sims_ceiling_schedule:
-                    self.set_new_sims_ceiling(n_plies=i)
-
         self._move_started_at = _now()
         self.sims_completed_this_move = 0
 
         self.n_moves_played = 0
 
-        # configure C++ tree
-        # explicit casts required — these are passed directly to C++
-        if cfg.add_root_noise:
-            self.set_dirichlet(float(cfg.dirichlet_eps), float(cfg.dirichlet_alpha))
-        self.set_reuse_tree(bool(cfg.reuse_tree))
-        self.set_vscale(float(cfg.vscale))
-        self.set_fpu_reduction(float(cfg.fpu_reduction))
-        lo, hi = cfg.sharp_window
-        self.set_sharp_boost(
-            int(lo), int(hi), float(cfg.sharp_M), float(cfg.sharp_boost)
-        )
-
-        force, gate, gap_block = cfg.qmm_params
-        self.set_qmm_params(bool(force), int(gate), float(gap_block))
-
-        self.set_qema_span(float(cfg.qema_span))
-        self.set_qdelta_span(float(cfg.qdelta_span))
-        self.set_contempt(
-            float(cfg.contempt_zero_q),
-            float(cfg.contempt_full_q),
-            float(cfg.contempt_fight_c),
-        )
-        self.set_tempscale_entropy_target(float(cfg.tempscale_entropy_target))
-        self.set_tempscale_trigger_q(float(cfg.tempscale_trigger_q))
+        # every C++ search param comes from the config field of the same name;
+        # c_puct and sims_min / sims_max are resolved per move
+        params = {k: getattr(cfg, k) for k in SEARCH_FIELDS if k not in MOVE_FIELDS}
+        params.update(self.move_params())
+        super().__init__(board, params)
 
         # sim_stop_reason stays Python-owned: apply_stockfish_result writes
         # "sf" into it directly, which C++ has no way to produce.
         self.sim_stop_reason = ""
 
-        # tiered early-stop rule now lives in C++, evaluated inside
-        # collect_many_leaves's own loop so checkins land on exact sim
-        # counts (see pyfastchess mcts.cpp evaluate_early_stop).
-        self.es_params = dict(
-            es_check_every=int(cfg.es_check_every),
-            tier1_consec=int(cfg.es_tier1_consec),
-            tier1_jsd_thresh=float(cfg.es_tier1_jsd_thresh),
-            tier2_consec=int(cfg.es_tier2_consec),
-            tier2_jsd_thresh=float(cfg.es_tier2_jsd_thresh),
-        )
-        self.set_early_stop_params(min_sims=int(cfg.sims_floor), **self.es_params)
-
         self.effort_lut = {}
         self.effort_q_edges = None
         self.effort_d_edges = None
         self.effort_ply_edges = None
-        if getattr(cfg, "effort_scale_table", ""):
+        if cfg.effort_scale_table:
             from chessbot.effort_scale import Q_EDGES, D_EDGES, PLY_EDGES, bin_key
             lut_data = json.load(open(cfg.effort_scale_table))
-            self.effort_lut = lut_data.get(str(getattr(cfg, "effort_alpha", 0.0)), {})
+            self.effort_lut = lut_data.get(str(cfg.effort_alpha), {})
             edges = lut_data.get("edges", {})
             self.effort_q_edges   = tuple(edges.get("Q",   Q_EDGES))
             self.effort_d_edges   = tuple(edges.get("D",   D_EDGES))
@@ -172,13 +131,11 @@ class MCTSTree(fasttree):
         xerces_move, xerces_method = self.select_xerces_top_move()
 
         # determine if we need to sample or not
-        if not self.config.sample_moves:
+        if self.board.piece_count() <= 20:
             sample = False
 
-        elif self.board.piece_count() <= 20:
-            sample = False
-        
-        # at/after the convergence ply, just use C++/base behavior
+        # at/after the convergence ply, just use C++/base behavior;
+        # move_sample_temp_plies = 0 never samples
         elif (self.n_plies >= self.config.move_sample_temp_plies):
             sample = False
 
@@ -245,7 +202,7 @@ class MCTSTree(fasttree):
         Deterministic robust selector.
         Returns just the uci (so callers can label it however they want).
         """
-        rsc, details = self.robust_selection_criteria(5, 60)
+        rsc, details = self.robust_selection_criteria()
         if (not rsc) or (not details) or (len(details) == 1):
             uci, _ = super().best()
             return uci
@@ -291,56 +248,28 @@ class MCTSTree(fasttree):
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
-        self.set_sim_budget(float(self.sims_ceiling))
-
-        if self.c_puct_schedule:
-            c = self.scheduled_c_puct(self.n_plies)
-            if c != self.c_puct:
-                self.c_puct = c
-                self.set_cpuct(c)
-
-        if self.sims_ceiling_schedule:
-            if self.n_plies in self.sims_ceiling_schedule.keys():
-                self.set_new_sims_ceiling()
-
-        if self.effort_lut:
-            self.set_early_stop_params(
-                min_sims=int(self.sims_floor), **self.es_params)
-            self.apply_effort_scale()
-
+        self.set_params(self.move_params(self.effort_scale()))
         self.reset_early_stop()
 
-    def apply_effort_scale(self):
+    def move_params(self, scale=1.0):
+        """c_puct, sims_min and sims_max for the current ply."""
+        cfg = self.config
+        ceiling = scheduled(cfg.sims_schedule, self.n_plies, cfg.sims_ceiling)
+        return {
+            "c_puct": float(scheduled(self.c_puct_schedule, self.n_plies, cfg.c_puct)),
+            "sims_min": int(round(cfg.sims_floor * scale)),
+            "sims_max": int(round(ceiling * scale)),
+        }
+
+    def effort_scale(self):
+        if not self.effort_lut:
+            return 1.0
         from chessbot.effort_scale import bin_key
         key = bin_key(
             self.n_plies, self.saved_parent_q, self.saved_parent_pdraw,
             self.effort_q_edges, self.effort_d_edges, self.effort_ply_edges,
         )
-        s = self.effort_lut.get(key, 1.0)
-        if s != 1.0:
-            self.set_sim_budget(float(round(self.sims_ceiling * s)))
-            self.set_early_stop_params(
-                min_sims=int(round(self.sims_floor * s)), **self.es_params)
-
-    def scheduled_c_puct(self, ply):
-        if not self.c_puct_schedule:
-            return float(self.config.c_puct)
-        c = self.c_puct_schedule[0][1]
-        for start, val in self.c_puct_schedule:
-            if ply >= start:
-                c = val
-        return float(c)
-
-    def set_new_sims_ceiling(self, n_plies=None):
-        if n_plies is None:
-            n_plies = self.n_plies
-
-        new_ceiling = self.sims_ceiling_schedule.get(n_plies, None)
-        if new_ceiling is None:
-            return
-        
-        self.sims_ceiling = new_ceiling
-        self.set_sim_budget(float(new_ceiling))
+        return self.effort_lut.get(key, 1.0)
 
     def get_sim_decision_probs(self):
         # not implemented right now
@@ -487,9 +416,10 @@ class ChessGame(object):
             "c_puct": cfg.c_puct,
             "sims_floor": cfg.sims_floor,
             "sims_ceiling": cfg.sims_ceiling,
+            "sims_schedule": cfg.sims_schedule,
             "dirichlet_alpha": cfg.dirichlet_alpha,
             "dirichlet_eps": cfg.dirichlet_eps,
-            "uniform_eps": cfg.uniform_eps,
+            "prior_uniform_eps": cfg.prior_uniform_eps,
             "fpu_reduction": cfg.fpu_reduction,
             "move_sample_temp_range": cfg.move_sample_temp_range,
             "move_sample_temp_plies": cfg.move_sample_temp_plies,
@@ -529,8 +459,9 @@ class ChessGame(object):
         if not root.is_expanded:
             return
         
-        c_puct = self.tree.c_puct
-        
+        sp = self.tree.get_params("c_puct", "sims_min", "sims_max")
+        c_puct = sp["c_puct"]
+
         # timing
         start = self.tree._move_started_at
         if start is None:
@@ -540,7 +471,7 @@ class ChessGame(object):
     
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
-        rsc, details = self.tree.robust_selection_criteria(5, 60)
+        rsc, details = self.tree.robust_selection_criteria()
         rsc = {} if not rsc else rsc
         if details is None:
             return
@@ -588,8 +519,8 @@ class ChessGame(object):
             "stop_reason": self.tree.sim_stop_reason,
             "time": rnd(elapsed, 3),
             "sims": sims,
-            "sims_floor": int(self.tree.min_sims()),
-            "sims_ceiling": int(self.tree.sim_budget()),
+            "sims_min": int(sp["sims_min"]),
+            "sims_max": int(sp["sims_max"]),
             "best_wdl": best_wdl,
             "root_wdl_nn": root_wdl_nn,
             "xc0h": np.asarray(self.board.history_tokens(XC0H_K), dtype=np.int16),
@@ -617,6 +548,7 @@ class ChessGame(object):
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4),
                 "P_raw": rnd(cd.raw_prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
+                "Qdema": rnd(cd.Qdema, 4),
                 "boosted": cd.boosted_N,
                 "Qmm": rnd(cd.Qmm, 4),
                 "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),

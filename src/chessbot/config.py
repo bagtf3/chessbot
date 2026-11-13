@@ -53,10 +53,13 @@ class Config(object):
 
     pruning_factor = 1.33
     
-    # Simulation schedule
+    # Simulation schedule. Each move the tree gets sims_min = sims_floor and
+    # sims_max = sims_schedule at the current ply (the entry with the largest
+    # start ply at or below it), else sims_ceiling; both times the effort scale.
     sf_move_sims = 400
     sims_floor = 400
     sims_ceiling = 800
+    sims_schedule = None   # {start_ply: ceiling}
 
     # per-bin sims scaling; "" disables. effort_alpha is sampled per game.
     effort_scale_table = ""
@@ -70,6 +73,14 @@ class Config(object):
     es_tier1_jsd_thresh = 0.005
     es_tier2_consec = 5         # "two-horse race": consecutive checkins, top-2 stable in top-3
     es_tier2_jsd_thresh = 0.0003
+    es_tier1_dq12_floor = -0.25
+    es_tier1_qema_veto = 0.2
+    es_observe_only = False     # experiments: record would-stop, never stop
+    es_record_all = False       # experiments: full check-in rows from the first
+    rsc_top_n = 5
+    rsc_min_visits = 60
+    rsc_visit_share_floor = 0.15
+    rsc_margin = 0.05
 
     # Game stuff
     n_games = 128
@@ -129,26 +140,35 @@ class Config(object):
     validation_game_probs = {"UHO": 1.0}
 
     # priors
-    uniform_eps = 0.25
+    prior_uniform_eps = 0.25
     prior_clip_max = 0.75
     fpu_reduction = 0.1
-    # sharp boost: per node, while its visits are inside sharp_window, captures
-    # and checks get prior bonus sharp_boost * (capture + check) * (1 - N/sharp_M)
-    sharp_window = [100, 250]
+    # sharp boost: per node, while its visits are inside [sharp_lo, sharp_hi],
+    # captures and checks get prior bonus
+    # sharp_boost * (capture + check) * (1 - N/sharp_M)
+    sharp_lo = 100
+    sharp_hi = 250
     sharp_M = 10
     sharp_boost = 0.0
     qema_span = 40
     qdelta_span = 100
-    # [force, gate, gap_block]: force sends a visit to each new Qmm leader; gate
-    # is the completed backups a child needs to join Qmm (0 = 1); gap_block
-    # vetoes tier1/tier2 stops while the leader's STM Qmm - Q < -gap_block (0 = off)
-    qmm_params = [False, 0, 0.0]
-    # randomness
-    add_root_noise = True
+    qdema_span = 100
+    recent_visits_span = 400    # visit_share EMA span
+    # qmm_force sends a visit to each new Qmm leader; qmm_gate is the completed
+    # backups a child needs to join Qmm (0 = 1); qmm_gap_block vetoes
+    # tier1/tier2 stops while the leader's STM Qmm - Q < -qmm_gap_block (0 = off)
+    qmm_force = False
+    qmm_gate = 0
+    qmm_gap_block = 0.0
+    qmm_min_visits = 3
+    # tree mechanics
+    tree_reuse = True
+    tree_descent_cap = 1000     # descents per collect call; 0 = no cap
+    tree_resort_thresholds = [250, 1500, 5000]
+    # randomness. dirichlet_eps = 0 turns root noise off;
+    # move_sample_temp_plies = 0 turns move sampling off
     dirichlet_eps = 0.3
     dirichlet_alpha = 0.3
-    reuse_tree = True
-    sample_moves = True
     move_sample_temp_range = [0.000001, 2.0]
     move_sample_temp_plies = 20
     # sampling candidates: the most-visited move plus the next ones up to
@@ -166,6 +186,7 @@ class Config(object):
     contempt_zero_q  = 0.0
     contempt_full_q  = 0.5
     contempt_fight_c = 0.0
+    contempt_min_completed = 100   # root results before contempt latches
     retrain_clip_norm = 10.0      # grad norm ceiling per retrain step
     retrain_batch_size = 512
 

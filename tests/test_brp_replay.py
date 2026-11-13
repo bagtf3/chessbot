@@ -112,7 +112,7 @@ def test_max_game_length_plays_one_move_too_many(max_game_length):
     """
     cfg = Config()
     cfg.max_game_length = max_game_length
-    cfg.add_root_noise = False
+    cfg.dirichlet_eps = 0.0
     cfg.sims_ceiling = 8
 
     meta = {"vs_stockfish": False, "stockfish_is_white": False}

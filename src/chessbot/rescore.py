@@ -715,14 +715,15 @@ class Rescorer(object):
         # snapshot config fields so hot-reloads don't affect an in-flight game.
         # prior_clip_max and the KL boosts are read live instead: a reload of
         # those applies to every target built from then on.
-        game_cfg_keys = (
-            'train_on_stockfish',
-            'rescore_equiv_min', 'rescore_equiv_max',
-            'rescore_esl_inaccuracy', 'rescore_esl_blunder',
-            'uniform_eps',
-            'rescore_analyze_batch',
-            'draw_value_scale',
-            'vscale',
+        game_cfg = SimpleNamespace(
+            train_on_stockfish=cfg.train_on_stockfish,
+            rescore_equiv_min=cfg.rescore_equiv_min,
+            rescore_equiv_max=cfg.rescore_equiv_max,
+            rescore_esl_inaccuracy=cfg.rescore_esl_inaccuracy,
+            rescore_esl_blunder=cfg.rescore_esl_blunder,
+            rescore_analyze_batch=cfg.rescore_analyze_batch,
+            draw_value_scale=cfg.draw_value_scale,
+            vscale=cfg.vscale,
         )
 
         game_state = {
@@ -732,7 +733,7 @@ class Rescorer(object):
             'plies': plies,
             'result': result,
             'pkl_path': path,
-            'cfg': SimpleNamespace(**{k: getattr(cfg, k) for k in game_cfg_keys}),
+            'cfg': game_cfg,
             'ply_states': [],
             # (ply_i, stm, outcome wdl, example parts) per trained SF ply
             'sf_examples': [],
@@ -1654,9 +1655,8 @@ class Rescorer(object):
             loss_this = ms.loss
             cpl_s += loss_this
             n_plies += 1
-            cpl_by_ply[i] = (int(round(loss_this)), ply.get('best_depth'))
-
             esl = expected_score_loss(best_cp, best_cp - loss_this)
+            cpl_by_ply[i] = (int(round(loss_this)), ply.get('best_depth'), rnd(esl, 4))
             is_blunder = not missed_mate and is_esl_candidate(
                 best_cp, played_cp, esl, Z_stm, cfg.rescore_esl_blunder)[0]
 
@@ -1681,6 +1681,7 @@ class Rescorer(object):
                 turn, loss_this,
                 tr.get('stop_reason', ''), tr.get('sims', 0),
                 ply.get('parentQ_white', np.nan), ply.get('parent_p_draw', np.nan),
+                esl,
                 np.nan, np.nan,  # kl, ce -- filled in below if this ply trains
             ])
 
@@ -1863,6 +1864,7 @@ class Rescorer(object):
             'best_cp', 'delta', 'played_cp',
             'best_absolute', 'played_absolute', 'stm', 'loss', 'stop_reason', 'sims',
             'parentQ_white', 'parent_p_draw',
+            'esl',
             'kl', 'ce',
         ]
 
@@ -1936,11 +1938,12 @@ class Rescorer(object):
 
             hit = cpl_by_ply.get(i)
             if hit is not None:
-                entry['cpl'], entry['cpl_depth'] = hit
+                entry['cpl'], entry['cpl_depth'], entry['esl'] = hit
             elif (node.get('sel_method') == 'stockfish'
                   and node.get('xc0_move') == node.get('move_played')):
                 entry['cpl'] = 0
                 entry['cpl_depth'] = None
+                entry['esl'] = 0.0
 
             if reviewable:
                 for k in ('sims', 'time', 'avg_depth', 'max_depth',
@@ -1957,6 +1960,8 @@ class Rescorer(object):
         header['reviewable'] = reviewable
         header['mean_cpl'] = round(sum(cpl_vals) / n, 4) if n else None
         header['mean_bmr'] = round(sum([1 for c in cpl_vals if c == 0]) / n, 4) if n else None
+        esl_vals = [p['esl'] for p in out_plies if 'esl' in p]
+        header['mean_esl'] = round(sum(esl_vals) / len(esl_vals), 4) if esl_vals else None
 
         record = {'header': header, 'plies': out_plies}
         out_path = os.path.join(self.config.game_dir, header['game_id'] + '.pkl.gz')

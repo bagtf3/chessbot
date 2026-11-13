@@ -53,9 +53,3 @@ behaviour-preserving refactor must reproduce them.
 
 Use `--backend real` to run the actual model instead (ort_trt / pt_eager).
 That measures the full production stack; the stub isolates C++ search.
-
-## Known crasher
-
-`tests/repro_segfault_endgame.py` in the pyfastchess repo segfaults in pure
-pyfastchess (no chessbot code) on an endgame FEN at ~50+ sims. Fixture sets
-drawn from game logs can contain positions that hit it.

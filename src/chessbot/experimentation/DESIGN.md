@@ -1,4 +1,4 @@
-# Search test harness
+# Experimentation
 
 Replays mined positions through xc0 search under configurable arms and records
 the search at every check-in. Workers share the xc0 inference server; each
@@ -18,7 +18,7 @@ worker owns its own NN caches.
    obeys must_visit and penalty) and walks most-visited children to terminal.
 7. Later: dynamic mbs [2, 4, 8, 16], in-cache WDL / prior updates, others.
 
-The harness core (corpus, labels, runner, store) stays fixed across these;
+The core (corpus, labels, runner, store) stays fixed across these;
 an experiment is a set of arms plus a controller plus probes.
 
 ## Run pass option (RPO) controller
@@ -43,24 +43,92 @@ Then:
 A pick with no label (or one under `MIN_LABEL_DEPTH`) goes to the SF pool
 asynchronously; search continues and the stop decision waits on the label.
 
+## SearchParams (pyfastchess)
+
+One flat struct holds every search parameter. It replaces the constructor
+args, the per-param setters and the `EarlyStopParams`, `SharpBoostParams` and
+`QmmParams` sub-structs. Per-move state stays outside it (`GapBlock`, the
+early-stop window and rows, the contempt latch, `noise_added_`).
+
+Python API:
+- `MCTSTree(board, params)`: params is a dict or `SearchParams`; missing
+  fields take the struct defaults.
+- `tree.set_params(params=None, **kw)`: merges into the current params, kw
+  winning. Unknown names raise. Recomputes derived values (EMA alphas, the
+  early-stop collection start).
+- `tree.get_params()`: dict of every field, defaults included, plus the
+  derived flags. `tree.get_params("c_puct", "sims_max")`: just those;
+  unknown names map to None.
+
+Derived flags: `set_params` decides once whether a value turns its feature
+off and stores a read-only flag (trailing underscore; setting one raises):
+
+| flag | on when |
+|---|---|
+| noise_on_ | dirichlet_eps > 0 and dirichlet_alpha > 0 |
+| es_on_ | es_check_every > 0 |
+| sharp_on_ | sharp_boost > 0 |
+| contempt_on_ | contempt_fight_c > 0 |
+| qmm_gap_block_on_ | qmm_gap_block > 0 |
+| pruning_on_ | pruning_factor > 0 |
+| descent_cap_on_ | tree_descent_cap > 0 |
+
+Tempscale keeps its value checks (entropy target 0 = off, trigger_q as is).
+Move sampling is Python-only (`best()`): `move_sample_temp_plies = 0` turns it
+off, replacing `sample_moves`. `add_root_noise` is dropped for
+`dirichlet_eps = 0`.
+
+Python sets params once per move (in `advance` / `reset_for_new_move`), never
+per leaf; the hot path reads `params_` members directly.
+
+Fields, defaults as today:
+
+| group | fields | defaults |
+|---|---|---|
+| core | c_puct, fpu_reduction, pruning_factor, vscale | 1.5, 0.1, 1.2, 1.0 |
+| prior | prior_uniform_eps, prior_clip_max | 0.05, 0.65 |
+| sims | sims_min, sims_max | 400, 800 |
+| dirichlet | dirichlet_eps, dirichlet_alpha | 0, 0.3 |
+| tree | tree_reuse, tree_descent_cap, tree_resort_thresholds | true, 1000, [250, 1500, 5000] |
+| contempt | contempt_zero_q, contempt_full_q, contempt_fight_c, contempt_min_completed | 0, 0.5, 0, 100 |
+| tempscale | tempscale_entropy_target, tempscale_trigger_q | 0, -2 |
+| spans | qema_span, qdelta_span, qdema_span, recent_visits_span | 40, 100, 100, 400 |
+| sharp | sharp_lo, sharp_hi, sharp_M, sharp_boost | 100, 250, 10, 0 |
+| qmm | qmm_force, qmm_gate, qmm_gap_block, qmm_min_visits | false, 0, 0, 3 |
+| es | es_check_every, es_tier1_consec, es_tier1_jsd_thresh, es_tier2_consec, es_tier2_jsd_thresh, es_tier1_dq12_floor, es_tier1_qema_veto | 100, 3, 0.005, 5, 0.0003, -0.25, 0.2 |
+| es (experiment) | es_observe_only, es_record_all | false, false |
+| rsc | rsc_top_n, rsc_min_visits, rsc_visit_share_floor, rsc_margin | 5, 60, 0.15, 0.05 |
+
+`rsc_min_visits` is 60 everywhere, early stop included.
+
+Config side (Python): `sims_floor` and `sims_ceiling` (scalar) plus an optional
+`sims_schedule` (`{ply: ceiling}`). Each move Python evaluates the schedule at
+the current ply, applies the effort scale, and sets `sims_min` / `sims_max`.
+c_puct keeps its scalar-or-dict form.
+
 ## C++ changes (pyfastchess)
 
-All behind harness-only knobs; selfplay behaviour is unchanged with them off.
+Built on `SearchParams`. The experiment knobs are off by default, so
+selfplay behaviour is unchanged.
 
-1. `es_record_all`: check-ins from sim 100 (`es_collect_start_ = 0`) instead of
-   `min_sims - span`.
+1. `es_record_all`: check-ins every `es_check_every` from the first, instead
+   of from `sims_min - span`, each storing a full row.
 2. `es_observe_only`: tier rules are evaluated and the result recorded
-   (`would_stop`, reason) but `es_tripped_` is never set. The budget ("full")
-   stop still applies. Python owns the stop.
-3. `break_on_checkin`: `collect_many_leaves` returns right after a check-in, so
-   Python snapshots at exact sim counts and cache-hit runs can't blow through
-   a check-in.
-4. `EsCheckinRow` gains per-condition pass/fail for tier1 (conds 1-7) and tier2,
-   RSC argmax, gap_block veto, `would_stop` and reason.
-5. `Qdema` per node: EMA of the signed backup delta `(v - Q_pre) * pov`,
+   (`would_stop`, reason) but `es_tripped_` is never set. The "full" stop at
+   `sims_max` still applies. Python owns the stop.
+3. Check-in rows: per-condition pass/fail for tier1 (conds 1-7) and tier2,
+   RSC argmax, gap_block veto, `would_stop` and reason, plus the full root
+   child table (N, Q, Qema, Qmm, Qdelta_sign, Qdema, rcs, prior, raw_prior,
+   visit_share) and the PV.
+   - `gather_stop_stats()`: every row this move; when the search ended off a
+     check-in, a final row at the actual sim count is added first.
+   - `latest_checkin()`: the newest row, read after each collect call, for
+     controllers that stop mid-search (RPO).
+4. `Qdema` per node: EMA of the signed backup delta `(v - Q_pre) * pov`,
    updated next to `Qdelta_sign` (`mcts.cpp` backup at the root) and exposed
    on `ChildDetail`. Qdelta_sign keeps only the sign; Qdema keeps the size,
    reacts fast to a refutation and shrinks as Q catches up.
+5. `tree_descent_cap` = 0 removes the per-call descent cap (roadmap #2).
 6. Per-experiment knobs as they are built: `pv_extender`, MateLock++ scout
    params.
 
@@ -114,7 +182,7 @@ wants. Initial set:
 ## Modules
 
 ```
-test_harness/
+experimentation/
   corpus.py       mine, stratify, weight, save/load
   labels.py       SF label lookup + async on-need SF pool
   arms.py         arm = config overlay + C++ knobs + cache group
@@ -205,4 +273,4 @@ Workflow: mine a corpus, form a hypothesis, test it on a freshly drawn corpus.
 - one pinned model checkpoint, hash recorded
 - TRT fp16 as in selfplay
 - no root noise, no move sampling, c_puct from the arm (no per-game draw)
-- selfplay paused while the harness owns the GPU
+- selfplay paused while experiments own the GPU

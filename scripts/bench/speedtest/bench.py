@@ -102,10 +102,9 @@ def build_real_infer(cfg):
 def bench_config(base=None, reuse_tree=False):
     """Config with everything nondeterministic switched off."""
     cfg = base or Config()
-    cfg.add_root_noise = False
     cfg.dirichlet_eps = 0.0
-    cfg.sample_moves = False
-    cfg.reuse_tree = reuse_tree
+    cfg.move_sample_temp_plies = 0
+    cfg.tree_reuse = reuse_tree
     return cfg
 
 

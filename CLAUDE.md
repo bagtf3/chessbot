@@ -121,10 +121,6 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`):
   with a proposed fix and ask first. Never scout or prep unasked.
 
 ## Chat Response Format
-User is dyslexic. During iterative status-update style responses (reporting what changed, asking something, flagging a concern, saying what's next), structure with visual headers, each with terse bullet points:
-- `=== DONE ===`: summary of what was done.
-- `=== FLAGGED ===`: use sparingly, only for real problems: something is wrong or an issue is expected.
-- `=== OPEN ===`: strictly open questions or decisions about items in DONE or FLAGGED. Don't stretch to fill it.
-- `=== NEXT ===`: next steps. Leave it out unless the user asks; they will ask in a follow-up when they want next steps.
-
-Omit a section entirely if empty rather than writing "none". Don't force this onto short direct answers or already-tabular output.
+User is dyslexic. Keep responses terse and to the point, bulleted where it
+helps. Don't bury the user in a wall of text: break long responses into
+smaller blocks, or across multiple responses.

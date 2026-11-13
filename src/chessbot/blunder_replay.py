@@ -325,8 +325,8 @@ def create_blunder_replay_config(cfg, yaml_file=None):
     pcfg.use_material_diff = False
 
     # no randomness, ever
-    pcfg.add_root_noise = False
-    pcfg.sample_moves = False
+    pcfg.dirichlet_eps = 0.0
+    pcfg.move_sample_temp_plies = 0
     pcfg.sampleable = None
 
     return pcfg

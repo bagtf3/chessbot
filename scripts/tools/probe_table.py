@@ -1,84 +1,60 @@
-"""Per-probe summary table, slimmed and with a same-move vs different-move
-CPL split baked in. Footer row is mean +/- 95% CI across the printed probes
-(not a per-position CI -- each row is already an aggregate over ~2048).
+"""Blunder replay probe summary from the per-round probe_e*.csv files.
 
-Reads <SP_DIR>/<run_tag>/blunder_probe/ for each run_tag given. Epoch numbers
-are the continuous retrain counter, so multiple run_tags from one lineage
-(e.g. a run and the one it continued from) stack into a single table sorted
-by epoch.
+Rows from val_test* source runs and positions more than MAX_AGE epochs past
+their admission are left out, matching what the pool keeps. Attempt numbers
+count every probe on disk for a position, so the oldest round on disk (*)
+also counts positions whose first probe predates the CSVs as first attempts.
 
-  python probe_table.py --run_tags 18m_10c6t_SWA_selfplay1
-  python probe_table.py --run_tags 18m_10c6t_SWA_selfplay0 18m_10c6t_SWA_selfplay1
+Epoch numbers are the continuous retrain counter, so run_tags from one
+lineage stack into one set of tables.
+
+  python probe_table.py --run_tags m137_8c8t_selfplay9
+  python probe_table.py --run_tags m137_8c8t_selfplay8 m137_8c8t_selfplay9
 """
 
 import argparse
 import glob
-import json
 import os
 import re
 
-import numpy as np
 import pandas as pd
 
 from chessbot import SP_DIR
 
+MAX_AGE = 100
+AGE_BINS = [0, 7, 10, 20, 40, MAX_AGE + 1]
+AGE_LABELS = ["<=7", "8-10", "11-20", "21-40", f"41-{MAX_AGE}"]
+MAX_ATTEMPT_ROW = 4
 
-def load_rows(run_tags):
-    rows = []
+
+def load_probes(run_tags):
+    frames = []
     for tag in run_tags:
-        run_dir = os.path.join(SP_DIR, tag)
-        hist_path = os.path.join(run_dir, "blunder_probe_history.jsonl")
-        if not os.path.exists(hist_path):
-            print(f"[skip] {tag}: no blunder_probe_history.jsonl")
-            continue
-
-        history = {}
-        with open(hist_path, encoding="utf-8") as f:
-            for line in f:
-                row = json.loads(line)
-                history[row["n_retrains"]] = row
-
-        pattern = os.path.join(run_dir, "blunder_probe", "probe_e*.csv")
-        for path in sorted(glob.glob(pattern),
-                           key=lambda p: int(re.search(r"_e(\d+)_", p).group(1))):
-            e = int(re.search(r"_e(\d+)_", path).group(1))
-            if e not in history:
-                continue
+        pattern = os.path.join(SP_DIR, tag, "blunder_probe", "probe_e*.csv")
+        for path in glob.glob(pattern):
             d = pd.read_csv(path)
-            dm = d[d.same_move == 0]
-            sm = d[d.same_move == 1]
-            h = history[e]
-
-            rows.append({
-                "epoch": e,
-                "n": len(d),
-                "cpl_a": d.orig_cpl.mean(), "cpl_b": d.probe_cpl.mean(),
-                "dm_a": dm.orig_cpl.mean(), "dm_b": dm.probe_cpl.mean(),
-                "sm_a": sm.orig_cpl.mean(), "sm_b": sm.probe_cpl.mean(),
-                "improved": (d.probe_cpl < d.orig_cpl).mean(),
-                "same": d.same_move.mean(),
-                "best": d.found_best.mean(),
-                "equiv": d.found_equiv.mean(),
-                "same & equiv": ((d.same_move == 1) & (d.found_equiv == 1)).mean(),
-                # older CSVs/history rows predate these columns
-                "depth": d["best_depth"].mean() if "best_depth" in d.columns else float("nan"),
-                "age": (e - d["added_epoch"]).mean() if "added_epoch" in d.columns else float("nan"),
-                "enq": d["added_to_buffer"].mean() if "added_to_buffer" in d.columns else float("nan"),
-                "cache": h.get("cache_hit", float("nan")),
-                "ret": h.get("n_evicted", float("nan")),
-            })
-    return pd.DataFrame(rows).sort_values("epoch").reset_index(drop=True)
+            d["epoch"] = int(re.search(r"_e(\d+)_", path).group(1))
+            frames.append(d)
+    if not frames:
+        return pd.DataFrame()
+    d = pd.concat(frames, ignore_index=True).sort_values("epoch", kind="stable")
+    d["attempt"] = d.groupby("short_fen").cumcount() + 1
+    d["age"] = d.epoch - d.added_epoch
+    keep = ~d.src_run_tag.astype(str).str.startswith("val_test") & (d.age <= MAX_AGE)
+    d = d[keep].copy()
+    d["improved"] = d.probe_cpl < d.orig_cpl
+    return d
 
 
 def pct(x):
-    return f"{100 * x:.1f}%"
+    return f"{100 * x.mean():.1f}%" if len(x) else "-"
 
 
-def ci95(x):
-    n = len(x)
-    if n < 2:
-        return float("nan")
-    return 1.96 * np.std(x, ddof=1) / np.sqrt(n)
+def cpl(x):
+    if not len(x):
+        return "-"
+    a, b = x.orig_cpl.mean(), x.probe_cpl.mean()
+    return f"{a:.1f} -> {b:.1f} ({b - a:+.1f})"
 
 
 def trim_rows(disp, keep_last=19):
@@ -90,66 +66,80 @@ def trim_rows(disp, keep_last=19):
     return pd.concat(kept, ignore_index=True)
 
 
-def build_table(raw):
-    PCT_COLS = ["improved", "enq", "cache"]
-
-    disp = pd.DataFrame({
-        "epoch": raw["epoch"].astype(str),
-        "n": raw["n"].astype(str),
-        "cpl": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
-               for a, b in zip(raw.cpl_a, raw.cpl_b)],
-        "cpl (diff move)": [f"{a:.1f} -> {b:.1f} ({a - b:.1f})"
-                            for a, b in zip(raw.dm_a, raw.dm_b)],
-        "depth": raw["depth"].round(1).astype(str),
-        "age": raw["age"].round(1).astype(str),
-        "ret": raw["ret"].astype(str),
-    })
-    for c in PCT_COLS:
-        disp[c] = raw[c].map(pct)
-
-    # equiv subsumes best (found_best implies found_equiv), so best is
-    # redundant here -- one column of same/equiv/same&equiv instead, each
-    # sub-percentage right-justified to its own max width so the slashes
-    # line up down the column
-    same_pct = raw["same"].map(pct)
-    equiv_pct = raw["equiv"].map(pct)
-    both_pct = raw["same & equiv"].map(pct)
-    w_same = same_pct.str.len().max()
-    w_equiv = equiv_pct.str.len().max()
-    w_both = both_pct.str.len().max()
-    disp["same/equiv/both"] = [
-        f"{s.rjust(w_same)} / {e.rjust(w_equiv)} / {b.rjust(w_both)}"
-        for s, e, b in zip(same_pct, equiv_pct, both_pct)
-    ]
-
-    disp = disp[["epoch", "n", "cpl", "cpl (diff move)",
-                 "improved", "same/equiv/both", "depth", "age", "enq",
-                 "cache", "ret"]]
-
-    footer = {c: "" for c in disp.columns}
-    footer["epoch"] = "mean+/-CI"
-    for a_col, b_col, out_col in (("cpl_a", "cpl_b", "cpl"),
-                                  ("dm_a", "dm_b", "cpl (diff move)")):
-        delta = raw[b_col] - raw[a_col]
-        footer[out_col] = f"{delta.mean():+.1f}+/-{ci95(delta):.1f}"
-
-    # totals/means span every probe, including rows trimmed from the display
-    footer["n"] = f"{raw['n'].sum():.0f}"
-    footer["ret"] = f"{raw['ret'].sum():.0f}"
-    footer["improved"] = pct(raw["improved"].mean())
-
-    disp = trim_rows(disp)
-    disp.loc[len(disp)] = footer
-    return disp
-
-
-def print_centered(disp):
+def print_centered(title, disp):
     cols = list(disp.columns)
-    widths = {c: max(len(c), disp[c].str.len().max()) for c in cols}
-    lines = [" | ".join(c.center(widths[c]) for c in cols)]
+    widths = {c: max(len(c), disp[c].astype(str).str.len().max()) for c in cols}
+    print(title)
+    print(" | ".join(c.center(widths[c]) for c in cols))
     for _, row in disp.iterrows():
-        lines.append(" | ".join(row[c].center(widths[c]) for c in cols))
-    print("\n".join(lines))
+        print(" | ".join(str(row[c]).center(widths[c]) for c in cols))
+    print()
+
+
+def round_table(d):
+    first_epoch = d.epoch.min()
+    rows = []
+    for e, g in d.groupby("epoch"):
+        f, r = g[g.attempt == 1], g[g.attempt > 1]
+        rows.append({
+            "round": f"{e}*" if e == first_epoch else str(e),
+            "n": str(len(g)),
+            "first n": str(len(f)),
+            "first cpl": cpl(f),
+            "first improved": pct(f.improved),
+            "first equiv": pct(f.found_equiv),
+            "re-probe n": str(len(r)),
+            "re-probe cpl": cpl(r),
+            "re-probe equiv": pct(r.found_equiv),
+            "all equiv": pct(g.found_equiv),
+            "cache": pct(g.from_cache),
+        })
+    return trim_rows(pd.DataFrame(rows))
+
+
+def attempt_table(d):
+    key = d.attempt.clip(upper=MAX_ATTEMPT_ROW)
+    rows = []
+    for a, g in d.groupby(key):
+        rows.append({
+            "attempt": f"{a}+" if a == MAX_ATTEMPT_ROW else str(a),
+            "n": str(len(g)),
+            "cpl": cpl(g),
+            "improved": pct(g.improved),
+            "equiv": pct(g.found_equiv),
+        })
+    return pd.DataFrame(rows)
+
+
+def age_table(first):
+    bins = pd.cut(first.age, AGE_BINS, labels=AGE_LABELS)
+    rows = []
+    for b, g in first.groupby(bins, observed=True):
+        rows.append({
+            "age": str(b),
+            "n": str(len(g)),
+            "cpl": cpl(g),
+            "improved": pct(g.improved),
+            "equiv": pct(g.found_equiv),
+        })
+    return pd.DataFrame(rows)
+
+
+def cohort_table(d):
+    rows = []
+    for e, g in d[d.attempt == 1].groupby("epoch"):
+        fens = set(g.short_fen)
+        later = d[d.short_fen.isin(fens) & (d.epoch >= e)]
+        cleared = later[later.found_equiv == 1].short_fen.nunique()
+        reprobed = later[later.epoch > e].short_fen.nunique()
+        rows.append({
+            "round": str(e),
+            "n": str(len(fens)),
+            "fixed first try": pct(g.found_equiv),
+            "fixed ever": f"{100 * cleared / len(fens):.1f}%",
+            "re-probed": str(reprobed),
+        })
+    return trim_rows(pd.DataFrame(rows))
 
 
 def main():
@@ -157,11 +147,17 @@ def main():
     ap.add_argument("--run_tags", nargs="+", required=True)
     args = ap.parse_args()
 
-    raw = load_rows(args.run_tags)
-    if not len(raw):
+    d = load_probes(args.run_tags)
+    if not len(d):
         print("no probes found")
         return
-    print_centered(build_table(raw))
+
+    first = d[(d.attempt == 1) & (d.epoch > d.epoch.min())]
+    print_centered("per round (* oldest round on disk):", round_table(d))
+    print_centered("by attempt:", attempt_table(d))
+    print_centered("first attempts by age at probe (oldest round excluded):",
+                   age_table(first))
+    print_centered("first-attempt cohorts:", cohort_table(d))
 
 
 if __name__ == "__main__":

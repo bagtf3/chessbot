@@ -31,7 +31,7 @@ from chessbot.opening_counts import (
 )
 
 from chessbot.blunder_replay import (
-    BRP_POOL_ENV, BRP_SCENARIOS, is_blunder_candidate, is_esl_candidate,
+    BRP_POOL_ENV, BRP_SCENARIOS, is_esl_candidate, ESL_ANY_MIN,
     save_probe_pool, evicted_path, evict_position,
     BRP_EQUIV_CPL, BRP_HISTORY_FILENAME,
     blunder_replay_dir, BRP_POOL_MAX_SIZE,
@@ -42,7 +42,7 @@ from chessbot.blunder_replay import (
 )
 
 from chessbot.lc0_replay import (
-    castling_rights_clear, lc0_replay_spec,
+    lc0_replay_spec,
 )
 
 from chessbot.game_utils import reconcile_game_boards, short_fen
@@ -60,24 +60,18 @@ BRP_MERGE_EVERY = 512
 # back and the stragglers have had BRP_ROUND_WAIT_S to arrive
 BRP_ROUND_DONE_FRAC = 0.999
 BRP_ROUND_WAIT_S = 180
-# teacher stream: plies neither pool confirmation nor the true-blunder path
-# took, sent to lc0 when the loss is this big and xc0's search disagrees with
-# SF's move (see policy_value_miss). The xc0 sample still trains, at
-# LC0_SENT_XC0_WEIGHT.
-LC0_TEACHER_MIN_CPL = 60
+# teacher stream: plies neither pool confirmation nor the blunder path took,
+# sent to lc0 for one ply when ESL clears rescore_esl_inaccuracy and xc0's
+# search disagrees with SF's move (see policy_value_miss). The xc0 sample
+# still trains, at LC0_SENT_XC0_WEIGHT.
 # weight multiplier on an xc0 sample whose position also went to lc0
 LC0_SENT_XC0_WEIGHT = 0.5
 LC0_TEACHER_TOP_K = 5
 LC0_TEACHER_PV_K = 2
 BRP_STAT_KEYS = (
-    "total", "missed_mate", "A", "B", "G3", "F", "U",
-    "true_blunder", "false_blunder", "inaccuracy", "all_blunders",
-    "esl_inaccuracy", "esl_blunder", "esl_pool",
+    "total", "missed_mate", "inaccuracy", "blunder", "blunder_lost",
+    "blunder_any", "F",
 )
-# expected-score-loss thresholds, tracked in the blunder stats alongside the
-# cp rules; nothing trains or admits on them yet
-ESL_INACCURACY = 0.05
-ESL_BLUNDER = 0.10
 
 
 def policy_value_miss(cm, sf_uci):
@@ -315,7 +309,7 @@ class Rescorer(object):
         self.total_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
         self.window_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
 
-        zero_blunder = lambda: {'n': 0, 'cpl': 0.0}
+        zero_blunder = lambda: {'n': 0, 'cpl': 0.0, 'lc0': 0}
         self.total_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
         self.window_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
 
@@ -363,7 +357,7 @@ class Rescorer(object):
 
         # teacher probes staged here; the runner drains them onto lc0_q.
         # lc0_cfg stays None when the run has no lc0 fleet, which turns
-        # queue_lc0_replay into a no-op and leaves every ply on the blend path.
+        # queue_lc0_replay into a no-op.
         self.lc0_pending = []
         self.lc0_cfg = None
 
@@ -375,12 +369,11 @@ class Rescorer(object):
 
     def maybe_add_blunder_candidate(self, pool, game_data, gid, ply_idx,
                                     played_uci, best_uci, best_cp,
-                                    played_cp, cpl, z_stm,
+                                    played_cp, cpl, z_stm, is_blunder,
                                     best_depth=None, played_depth=None):
         """
-        Same A/B/G3/F rules the old scan_blunder_positions.py scan applied
-        post-hoc, checked live against the values finalize_game already
-        computed for this ply. Mutates pool directly (dedup by short_fen);
+        Admits a ply finalize_game flagged as a blunder. Mutates pool
+        directly (dedup by short_fen);
         maybe_save_pool decides when that hits disk. Only STARTPOS-traceable
         scenarios qualify: piece_odds, piece_training and random_init seed a
         custom FEN directly, so history_uci for those never traces back to
@@ -389,10 +382,7 @@ class Rescorer(object):
         the first replay probe can potentially skip SF entirely.
         """
         scenario = game_data.get('scenario')
-        if scenario not in BRP_SCENARIOS:
-            return
-        is_candidate, label = is_blunder_candidate(best_cp, played_cp, cpl, z_stm)
-        if not is_candidate:
+        if scenario not in BRP_SCENARIOS or not is_blunder:
             return
 
         history = game_data.get('history_uci')
@@ -439,8 +429,8 @@ class Rescorer(object):
             if rec.get("deep_evals", {}).get(best_uci) is not None:
                 rec["deep_best_move"] = best_uci
                 rec["deep_best_cp"] = best_cp
-            # admission waits on the teacher; only positions lc0 cannot be
-            # asked about (castling rights, no lc0 fleet) go straight in
+            # admission waits on the teacher; with no lc0 fleet a position
+            # goes straight in
             if self.queue_candidate_lc0_replay(rec, key) is not None:
                 return True
             rec["last_seen"] = rec["model_epoch"]
@@ -728,8 +718,7 @@ class Rescorer(object):
         game_cfg_keys = (
             'train_on_stockfish',
             'rescore_equiv_min', 'rescore_equiv_max',
-            'rescore_blunder_cp_loser',
-            'rescore_blunder_cp_winner', 'rescore_inaccuracy_cp',
+            'rescore_esl_inaccuracy', 'rescore_esl_blunder',
             'uniform_eps',
             'rescore_analyze_batch',
             'draw_value_scale',
@@ -1228,35 +1217,6 @@ class Rescorer(object):
         with open(self.brp_reviewables_jsonl, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=float) + "\n")
 
-    def blend_alpha(self, cpl, lo, hi):
-        """SF weight, ramped across the band between the two clip points."""
-        cfg = self.config
-        a_lo, a_hi = cfg.rescore_blend_alpha_min, cfg.rescore_blend_alpha_max
-        if hi <= lo:
-            return a_hi
-        t = min(max((cpl - lo) / (hi - lo), 0.0), 1.0)
-        return a_lo + t * (a_hi - a_lo)
-
-    def sf_pointmass_policy(self, lms, idx_map, best_uci):
-        """Dense sf_move_target over the legal moves."""
-        if best_uci not in idx_map:
-            return None
-        lms = list(lms)
-        policy = np.zeros(1858, dtype=np.float32)
-        policy[[idx_map[u] for u in lms]] = sf_move_target(lms, best_uci)
-        return policy
-
-    def blend_policy(self, pa, pb, alpha):
-        """Convex mix of two policy targets; alpha weights pb.
-
-        Value is deliberately not blended: SF's cp scores its own best move,
-        which does not describe the position reached by the played move.
-        """
-        if pb is None:
-            return pa
-        policy = (1.0 - alpha) * pa + alpha * pb
-        return policy / policy.sum()
-
     def queue_lc0_replay(self, game_data, aux, meta_extra=None):
         """Hand one blunder position to the teacher fleet.
 
@@ -1269,11 +1229,15 @@ class Rescorer(object):
 
         meta = {
             'src_game_id': game_data.get('game_id'),
-            'orig_cpl': aux.get('blend_cpl'),
+            'orig_cpl': aux.get('orig_cpl'),
         }
         meta.update(meta_extra or {})
+        cfg = self.lc0_cfg
+        if meta.get('stream') == 'teacher':
+            cfg = cfg.copy()
+            cfg.max_game_length = 0
         spec = lc0_replay_spec(
-            self.lc0_cfg, game_data, aux['ply_i'], aux['sfen'], meta)
+            cfg, game_data, aux['ply_i'], aux['sfen'], meta)
         if spec is not None:
             self.lc0_pending.append(spec)
         return spec
@@ -1284,7 +1248,7 @@ class Rescorer(object):
         Writes nothing back to the pool record on purpose: xc0_BRP tracking
         must stay unaware that lc0_BRP exists.
         """
-        if self.lc0_cfg is None or not castling_rights_clear(src['fen']):
+        if self.lc0_cfg is None:
             return None
 
         # start_fen is where the path lands, not where it starts: uci_path is
@@ -1295,7 +1259,7 @@ class Rescorer(object):
             'history_uci': list(src.get('uci_path') or []),
             'game_id': src.get('game_id'),
         }
-        aux = {'ply_i': 0, 'sfen': sfen, 'blend_cpl': src.get('cpl')}
+        aux = {'ply_i': 0, 'sfen': sfen, 'orig_cpl': src.get('cpl')}
         # the failing probe's own loss, not the pool's orig_cpl: uplift
         # compares the teacher against what xc0 just answered here
         spec = self.queue_lc0_replay(
@@ -1311,7 +1275,7 @@ class Rescorer(object):
         The record rides in the meta and is only inserted if lc0 confirms the
         position is correctable, so an unconfirmed blunder never joins the pool.
         """
-        if self.lc0_cfg is None or not castling_rights_clear(rec['fen']):
+        if self.lc0_cfg is None:
             return None
 
         game_data = {
@@ -1320,7 +1284,7 @@ class Rescorer(object):
             'history_uci': list(rec.get('uci_path') or []),
             'game_id': rec.get('game_id'),
         }
-        aux = {'ply_i': 0, 'sfen': sfen, 'blend_cpl': rec.get('cpl')}
+        aux = {'ply_i': 0, 'sfen': sfen, 'orig_cpl': rec.get('cpl')}
         spec = self.queue_lc0_replay(
             game_data, aux,
             {'pending_rec': rec, 'xc0_cpl': rec.get('cpl')})
@@ -1399,13 +1363,11 @@ class Rescorer(object):
         info = self.lc0_audit.pop(gid, None) or {}
         ucis = info.get('ucis') or {}
         xc0_cpl = info.get('xc0_cpl')
-        blunder_cp = self.config.rescore_blunder_cp_winner
 
         for r in results:
             k = r['ply_idx']
             ms = self.lc0_scorer.score(
-                r['best_uci'], r['best_cp'], ucis.get(k, ''), r['played_cp'],
-                blunder_cp=blunder_cp)
+                r['best_uci'], r['best_cp'], ucis.get(k, ''), r['played_cp'])
 
             # stepped as a pair, so the printed subtraction is one population
             if xc0_cpl is not None:
@@ -1681,18 +1643,8 @@ class Rescorer(object):
             played_abs = ply.get('played_abs', best_abs)
             visits = list(ply['visits'])
 
-            # variable blunder threshold based on outcome -- computed before
-            # scoring so missed_mate can gate on "did this actually clear the
-            # blunder bar", not just "are both scores huge". A small gap
-            # between two huge scores (e.g. best=1500, played=1450) is not a
-            # missed mate.
-            blunder_cp = cfg.rescore_blunder_cp_winner
-            if Z_stm <= 0.0:
-                blunder_cp = cfg.rescore_blunder_cp_loser
-
             ms = self.scorer.score(
-                best_uci_raw, best_cp, xerces_uci, played_cp,
-                blunder_cp=blunder_cp, z_stm=Z_stm)
+                best_uci_raw, best_cp, xerces_uci, played_cp, z_stm=Z_stm)
 
             best_uci, best_cp = ms.best_uci, ms.best_cp
             if ms.swapped:
@@ -1704,16 +1656,20 @@ class Rescorer(object):
             n_plies += 1
             cpl_by_ply[i] = (int(round(loss_this)), ply.get('best_depth'))
 
+            esl = expected_score_loss(best_cp, best_cp - loss_this)
+            is_blunder = not missed_mate and is_esl_candidate(
+                best_cp, played_cp, esl, Z_stm, cfg.rescore_esl_blunder)[0]
+
             # consider adding this position to the blunder replay pool
             sent_to_lc0 = False
-            if pool is not None and not missed_mate:
+            if pool is not None:
                 sent_to_lc0 = self.maybe_add_blunder_candidate(
                     pool, game_data, gid, i, xerces_uci, best_uci, best_cp,
-                    played_cp, loss_this, Z_stm,
+                    played_cp, loss_this, Z_stm, is_blunder,
                     best_depth=ply.get('best_depth'), played_depth=ply.get('depth'),
                 )
 
-            if loss_this >= blunder_cp and not missed_mate:
+            if is_blunder:
                 v = cp_to_value_tanh(best_cp)
                 cut_white[i] = v if turn else -v
 
@@ -1742,35 +1698,15 @@ class Rescorer(object):
 
             kl_eligible = loss_this <= EQUIV
 
-            is_blunder = loss_this >= blunder_cp
-            true_blunder = not (played_cp > 350 and Z_stm > 0) and is_blunder
-            is_inaccuracy = (
-                not missed_mate and not is_blunder
-                and loss_this >= cfg.rescore_inaccuracy_cp
-            )
+            stat_keys = self.accumulate_blunder_stats(
+                missed_mate, best_cp, played_cp, loss_this, Z_stm, esl, cfg)
 
-            self.accumulate_blunder_stats(
-                missed_mate, is_blunder, true_blunder, is_inaccuracy,
-                best_cp, played_cp, loss_this, Z_stm,
-                expected_score_loss(best_cp, best_cp - loss_this),
-            )
-
-            # what this ply becomes. A true blunder is handed to the teacher
-            # instead of trained on directly, or blended hard toward SF if it
-            # can't go to lc0. Everything below blunder_cp trains on its raw
-            # visit policy -- no SF blend across the EQUIV..blunder band.
-            to_lc0 = (not missed_mate and true_blunder
-                      and castling_rights_clear(ply['sfen']))
-            if to_lc0:
-                blend_cpl = loss_this
-            elif loss_this >= blunder_cp and not missed_mate:
-                blend_cpl = blunder_cp
-            else:
-                blend_cpl = None
+            # a blunder is handed to the teacher instead of trained on
+            # directly; everything else trains on its raw visit policy
+            to_lc0 = is_blunder
 
             to_teacher = (not to_lc0 and not sent_to_lc0 and not missed_mate
-                          and loss_this >= LC0_TEACHER_MIN_CPL
-                          and castling_rights_clear(ply['sfen'])
+                          and esl >= cfg.rescore_esl_inaccuracy
                           and policy_value_miss(cm, best_uci))
 
             # just FYI if we do any adjustments we need to re-sort.
@@ -1823,14 +1759,14 @@ class Rescorer(object):
                 'sent_to_lc0':     bool(sent_to_lc0),
                 'to_teacher':      to_teacher,
                 'loss':            loss_this,
-                'blend_cpl':       blend_cpl,
-                'blunder_cp':      blunder_cp,
+                'orig_cpl':        loss_this,
                 'equiv':           EQUIV,
                 'best_uci':        best_uci,
                 'best_cp':         best_cp,
                 'lms':             lms,
                 'idx_map':         idx_map,
                 'is_blunder':      is_blunder,
+                'stat_keys':       stat_keys,
                 'ply_i':           i,
                 'best_wdl':        tr.get('best_wdl'),
             })
@@ -1892,12 +1828,14 @@ class Rescorer(object):
                 # already queued as a pool candidate, counted there, and
                 # carrying the pending record this path could not supply
                 if aux['sent_to_lc0']:
+                    self.count_lc0_send(aux['stat_keys'])
                     continue
                 spec = self.queue_lc0_replay(
-                    game_data, aux, {'xc0_cpl': aux['blend_cpl']})
+                    game_data, aux, {'xc0_cpl': aux['loss']})
                 if spec is not None:
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
+                    self.count_lc0_send(aux['stat_keys'])
                     continue
 
             sent = aux['sent_to_lc0']
@@ -1908,26 +1846,12 @@ class Rescorer(object):
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
                     sent = True
+            if sent:
+                self.count_lc0_send(aux['stat_keys'])
             # the teacher's samples for this position train at full weight
             if sent:
                 vwht *= LC0_SENT_XC0_WEIGHT
                 pwht *= LC0_SENT_XC0_WEIGHT
-
-            blend_cpl = aux['blend_cpl']
-            # z==1 means the mover won despite SF's objection -- trust the
-            # model over SF there instead of blending its edge away
-            if blend_cpl is not None and z < 1:
-                alpha = self.blend_alpha(
-                    blend_cpl, aux['equiv'], aux['blunder_cp'])
-                sf_policy = self.sf_pointmass_policy(
-                    aux['lms'], aux['idx_map'], aux['best_uci'])
-                policy = self.blend_policy(policy, sf_policy, alpha)
-                # the clip comes after the blend, over the legal moves
-                legal = [aux['idx_map'][u] for u in aux['lms']]
-                policy[legal] = blend_to_uniform(
-                    policy[legal], 1e-6, self.config.prior_clip_max)
-                sc['blended'] += 1
-                scw['blended'] += 1
 
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
             self.live_buffer.append(entry, okey)
@@ -2061,81 +1985,72 @@ class Rescorer(object):
             f.write(json.dumps(row, default=str) + '\n')
             f.flush()
 
-    def accumulate_blunder_stats(self, missed_mate, is_blunder, true_blunder,
-                                 is_inaccuracy, best_cp, played_cp, cpl, z_stm,
-                                 esl):
+    def accumulate_blunder_stats(self, missed_mate, best_cp, played_cp, cpl,
+                                 z_stm, esl, cfg):
+        """Bump the blunder-type rows this ply falls in; returns their keys."""
+        keys = []
+
         def bump(key, value):
+            keys.append(key)
             for acc in (self.total_blunder, self.window_blunder):
                 acc[key]['n'] += 1
                 acc[key]['cpl'] += value
 
         bump('total', cpl)
-
         if missed_mate:
             bump('missed_mate', cpl)
-        else:
-            _, label = is_blunder_candidate(best_cp, played_cp, cpl, z_stm)
-            if label is not None:
-                bump(label, cpl)
-            elif is_blunder:
-                bump('U', cpl)
+            return keys
 
-        if true_blunder:
-            bump('true_blunder', cpl)
-        elif is_blunder:
-            bump('false_blunder', cpl)
-
-        if is_inaccuracy:
+        if esl >= cfg.rescore_esl_blunder:
+            bump('blunder', cpl)
+            if z_stm <= 0:
+                bump('blunder_lost', cpl)
+        elif esl >= cfg.rescore_esl_inaccuracy:
             bump('inaccuracy', cpl)
+        if esl >= ESL_ANY_MIN:
+            bump('blunder_any', cpl)
 
-        if missed_mate or is_blunder:
-            bump('all_blunders', cpl)
+        _, label = is_esl_candidate(
+            best_cp, played_cp, esl, z_stm, cfg.rescore_esl_blunder)
+        if label == "F":
+            bump('F', cpl)
+        return keys
 
-        if esl >= ESL_BLUNDER:
-            bump('esl_blunder', cpl)
-        elif esl >= ESL_INACCURACY:
-            bump('esl_inaccuracy', cpl)
-        if is_esl_candidate(best_cp, played_cp, esl, z_stm)[0]:
-            bump('esl_pool', cpl)
+    def count_lc0_send(self, keys):
+        for acc in (self.total_blunder, self.window_blunder):
+            for key in keys:
+                acc[key]['lc0'] += 1
 
     def print_blunder_stats(self):
         acc = self.window_blunder
-        primary = ("A", "B", "G3", "U")
-        pool_eligible = ("A", "B", "G3", "F")
+        cfg = self.config
 
         def avg(k):
             n = acc[k]['n']
             return acc[k]['cpl'] / n if n else float('nan')
 
+        total_n = acc['total']['n']
+
         def row(label, k):
-            if acc[k]['n'] == 0:
+            n = acc[k]['n']
+            if n == 0:
                 return
-            print(f"{RS}  {label:<24} n={acc[k]['n']:>6}  cpl={avg(k):6.2f}")
+            pct = n / total_n if total_n else 0.0
+            lc0 = acc[k]['lc0']
+            print(f"{RS}  {label:<24} n={n:>6}  {pct:>7.2%}  cpl={avg(k):>8.2f}"
+                  f"  lc0={lc0:>5} ({lc0 / n:>6.1%})")
 
         print(f"{RS} blunder types (last {STATS_WINDOW_GAMES}):")
         row("total", "total")
-        row("inaccuracies", "inaccuracy")
-        for k in primary:
-            row(k, k)
-        row("true_blunder", "true_blunder")
-        row("all blunders", "all_blunders")
-        row("ESL inaccuracies", "esl_inaccuracy")
-        row("ESL blunders", "esl_blunder")
-
-        # same A/B/G3/F rule maybe_add_blunder_candidate uses -- fraction of
-        # all trainable plies this window that would qualify for the pool
-        total_n = acc['total']['n']
-        for label, pool_n in (
-            ("pool-eligible (A/B/G3/F)", sum(acc[k]['n'] for k in pool_eligible)),
-            ("pool-eligible (ESL/F)", acc['esl_pool']['n']),
-        ):
-            if pool_n:
-                pool_pct = pool_n / total_n if total_n else 0.0
-                print(f"{RS}  {label:<24} "
-                      f"n={pool_n:>6}  of {total_n} moves ({pool_pct:.2%})")
+        row(f"ESL {cfg.rescore_esl_inaccuracy:.2f}"
+            f"-{cfg.rescore_esl_blunder:.2f}", "inaccuracy")
+        row(f"ESL >= {cfg.rescore_esl_blunder:.2f}", "blunder")
+        row(f"ESL >= {cfg.rescore_esl_blunder:.2f}, not won", "blunder_lost")
+        row(f"ESL >= {ESL_ANY_MIN:.2f}", "blunder_any")
+        row("F", "F")
 
         for k in BRP_STAT_KEYS:
-            self.window_blunder[k] = {'n': 0, 'cpl': 0.0}
+            self.window_blunder[k] = {'n': 0, 'cpl': 0.0, 'lc0': 0}
 
     def accumulate_stop_stats(self, stop_stats):
         for st, s in stop_stats.items():
@@ -2201,29 +2116,19 @@ class Rescorer(object):
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
 
     def print_sample_stats(self):
-        W = 10
-
-        def col(val):
-            return f"  {val:>{W}}  |"
-
         def teacher_row(label, sc):
             # queued and samples do not balance within a batch: a probe is
             # answered a few seconds after it is sent, often after this print
             total_tr = sc['accepted'] + sc['lc0_samples']
             lc0_pct = f"{sc['lc0_samples'] / total_tr * 100:.1f}%" if total_tr else "--"
-            return (f"{RS}  {label:<12} |"
-                    + col(sc['accepted'])
-                    + col(sc['blended'])
-                    + col(sc['lc0_queued'])
-                    + col(sc['lc0_samples'])
-                    + col(lc0_pct))
+            return (label, [sc['accepted'], sc['blended'], sc['lc0_queued'],
+                            sc['lc0_samples'], lc0_pct])
 
-        thdr = (f"{RS}  {'targets':<12} |"
-                + "".join(col(lbl) for lbl in
-                          ("xc0", "blended", "lc0-sent", "lc0-back", "lc0-%")))
-        print(thdr)
-        print(teacher_row("batch", self.sample_counts_window))
-        print(teacher_row("total", self.sample_counts))
+        print_stat_table([
+            ("targets", ["xc0", "blended", "lc0-sent", "lc0-back", "lc0-%"]),
+            teacher_row("batch", self.sample_counts_window),
+            teacher_row("total", self.sample_counts),
+        ])
 
         self.sample_counts_window = {
             'total': 0, 'accepted': 0, 'blended': 0,
@@ -2273,11 +2178,13 @@ class Rescorer(object):
             self.recent_ce_plies = self.recent_ce_plies[-RECENT_WINDOW:]
 
         if report:
+            stats = [("stats", ["CPL", "BMR", "CE", "KL", f"CPL>{BLUNDER_CP}"]),
+                     stats_row("batch", c, b, ce, kl, bl)]
             for n in (10, RECENT_WINDOW):
                 if len(self.recent_cpls) < n:
                     continue
-                print(fmt_rescore_stats(
-                    f"Last {n} avg",
+                stats.append(stats_row(
+                    f"last {n}",
                     window_avg(self.recent_cpls, self.recent_plies, n),
                     window_avg(self.recent_bmrs, self.recent_plies, n),
                     window_avg(self.recent_ces, self.recent_ce_plies, n),
@@ -2292,19 +2199,16 @@ class Rescorer(object):
                            if self.total_kl_valid_plies else float('nan'))
                 ce_mean = (self.total_ce_plies / self.total_ce_valid_plies
                            if self.total_ce_valid_plies else float('nan'))
-                print(fmt_rescore_stats("Overall stats", cpl_mean, bmr_mean,
-                                        ce_mean, kl_mean, blunder_mean))
-
-            W = 10
-
-            def col(val):
-                return f"  {val:>{W}}  |"
+                stats.append(stats_row("overall", cpl_mean, bmr_mean,
+                                       ce_mean, kl_mean, blunder_mean))
+            print()
 
             # true search depth reached under the time budget, averaged over
             # every SF call this window (both passes), not seldepth
             avg_depth = (self.sf_depth_sum / self.sf_depth_count
                          if self.sf_depth_count else 0.0)
 
+            table = []
             n_tot = self.games_processed
             if n_tot > self.config.rescore_analyze_batch and self.start_time is not None:
                 elapsed = time.time() - self.start_time
@@ -2317,12 +2221,8 @@ class Rescorer(object):
                     ("replays",    str(self.n_replay_finalized)),
                     ("depth",      f"{avg_depth:.1f}"),
                 ]
-                tg_hdr = (f"{RS}  {'Total':<12} |"
-                          + "".join(col(h) for h, _ in tg_cols))
-                tg_row = (f"{RS}  {'':<12} |"
-                          + "".join(col(v) for _, v in tg_cols))
-                print(tg_hdr)
-                print(tg_row)
+                table += [("Total", [h for h, _ in tg_cols]),
+                          ("", [v for _, v in tg_cols])]
 
             avg_ms_per_pos = (
                 1000 * self.sf_compute_time / self.sf_call_count
@@ -2348,12 +2248,11 @@ class Rescorer(object):
                 ("1st run %", f"{first_run_pct:.1f}%"),
                 ("backlog",   str(backlog)),
             ]
-            sf_hdr = (f"{RS}  {'SF':<12} |"
-                      + "".join(col(h) for h, _ in sf_cols))
-            sf_row = (f"{RS}  {'':<12} |"
-                      + "".join(col(v) for _, v in sf_cols))
-            print(sf_hdr)
-            print(sf_row)
+            table += [("SF", [h for h, _ in sf_cols]),
+                      ("", [v for _, v in sf_cols])]
+            print_stat_table(table)
+            print()
+            print_stat_table(stats)
             self.sf_compute_time = 0.0
             self.sf_compute_count = 0
             self.sf_call_count = 0
@@ -2580,10 +2479,25 @@ def combine_analysis_staging(run_dir):
     return combined_new
 
 
-def fmt_rescore_stats(label, cpl, bmr, ce, kl, blunder):
-    # CPL swings between 1 and 2+ digits -- fixed width keeps columns aligned
-    return (f"{RS} {label:<14}:  CPL {cpl:>5.2f}  BMR {bmr:>4.2f}  "
-            f"CE {ce:>4.2f}  KL {kl:>4.2f}  CPL>{BLUNDER_CP} {blunder:>5.3f}")
+def stats_row(label, cpl, bmr, ce, kl, blunder):
+    """One game-quality row for print_stat_table."""
+    return (label, [f"{cpl:.2f}", f"{bmr:.2f}", f"{ce:.2f}", f"{kl:.2f}",
+                    f"{blunder:.3f}"])
+
+
+# widest header across the stat tables, so separate tables line up
+STAT_MIN_W = len("positions")
+
+
+def print_stat_table(rows):
+    """Print (label, cells) rows as one table. Every column, the label
+    included, is as wide as the widest entry anywhere in the table, with two
+    spaces of padding inside each bar. Labels sit left, cells right."""
+    rows = [(str(label), [str(c) for c in cells]) for label, cells in rows]
+    w = max(STAT_MIN_W, *(len(s) for label, cells in rows
+                          for s in [label, *cells]))
+    for label, cells in rows:
+        print(f"{RS}  {label:<{w}}  |" + "".join(f"  {s:>{w}}  |" for s in cells))
 
 
 
@@ -2627,7 +2541,6 @@ def save_analysis_chunk_simple(run_dir, batch):
     plies = len(df_all)
 
     print(f"{RS} Saving {len(batch)} analyzed games")
-    print(fmt_rescore_stats("Batch stats", cpl, bmr, ce, kl, blunder))
 
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)

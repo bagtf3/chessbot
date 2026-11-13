@@ -23,13 +23,6 @@ LC0_BRP_CONFIG_ENV = "LC0_REPLAY_CONFIG"
 LC0_BRP_PLIES = 3
 
 
-def castling_rights_clear(fen):
-    """lc0 and xc0 disagree on castling move indices (king-dest vs king-rook),
-    so positions with rights are refused. Rights never regenerate, making a
-    root check sufficient for the whole probe window."""
-    return fen.split()[2] == "-"
-
-
 def create_lc0_replay_config(cfg, yaml_file=None):
     """
     Config for the lc0 replay probe worker.

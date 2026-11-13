@@ -34,8 +34,7 @@ class MoveScorer:
     def __init__(self, rules):
         self.rules = rules
 
-    def score(self, best_uci, best_cp, played_uci, played_cp,
-              blunder_cp=None, z_stm=None):
+    def score(self, best_uci, best_cp, played_uci, played_cp, z_stm=None):
         """Loss for one played move against the engine's own best.
 
         Returns the possibly-swapped best alongside the loss; `swapped` is
@@ -61,11 +60,10 @@ class MoveScorer:
         # tested against the post-swap best and the post-equiv loss, matching
         # the original inline rule
         missed_mate = False
-        if r.mate_cap is not None and blunder_cp is not None:
+        if r.mate_cap is not None:
             z_ok = True if not r.require_positive_z else (
                 z_stm is not None and z_stm > 0)
-            missed_mate = (out_cp >= 1200 and played_cp >= 500 and z_ok
-                           and loss >= blunder_cp)
+            missed_mate = out_cp >= 1200 and played_cp >= 500 and z_ok
             if missed_mate:
                 loss = min(r.mate_cap, loss)
 

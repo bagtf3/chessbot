@@ -173,7 +173,7 @@ def save_pickle_atomic(obj, path, tries=0):
 
 
 def rnd(x, n):
-    return np.round(x, n)
+    return round(x, n)
 
 
 def maybe_random_from_list(item):
@@ -596,6 +596,18 @@ def compact_count(n):
             v = n / scale
             return f"{v:.1f}{suffix}" if abs(v) < 10 else f"{v:.0f}{suffix}"
     return f"{n:.0f}"
+
+
+def compact_span(seconds):
+    """Render a span as its two largest units: 1d13h, 13h04m or 16m24s."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
 
 
 def make_jsonable(obj):
@@ -1030,8 +1042,7 @@ def sf_bucket(vs_sf, sf_flag):
     return "white" if sf_flag else "black"
 
 
-def accumulate_game_stats(g, stats, sf_overall, wins_by_scenario=None,
-                          result_is_bot_pov=True):
+def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
     """Fold one game's meta into running counters.
 
     Every field the summary reports is a counter, so the whole-run view is
@@ -1075,8 +1086,6 @@ def accumulate_game_stats(g, stats, sf_overall, wins_by_scenario=None,
         o["D"] += 1
     elif bot_won:
         o["W"] += 1
-        if wins_by_scenario is not None:
-            wins_by_scenario[scenario] += 1
     else:
         o["L"] += 1
 
@@ -1096,10 +1105,10 @@ def order_stat_rows(stats):
 LOG_WIDTH = 79
 
 
-def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
+def print_summary_from_stats(stats, sf_overall):
     """
     Pretty-print the scenario table and one bot-vs-Stockfish W/D/L line per
-    SF scenario, plus a wins-by-scenario breakdown (SF games only).
+    SF scenario.
 
     Takes counters rather than a games list, so a caller accumulating them
     incrementally can report on every game ever played without retaining any.
@@ -1122,26 +1131,24 @@ def print_summary_from_stats(stats, sf_overall, wins_by_scenario=None):
     print("-" * LOG_WIDTH)
 
     # bot vs Stockfish summary per SF scenario (score: W=1, D=0.5, L=0)
-    for scenario, o in sorted(sf_overall.items()):
+    if sf_overall:
+        print("=== SF Games ===")
+    sf_rows = sorted(sf_overall.items())
+    wdl_w = max((len(f"{o['W']}/{o['D']}/{o['L']}") for _, o in sf_rows),
+                default=0)
+    for scenario, o in sf_rows:
         total = o["N"]
         w, d, l = o["W"], o["D"], o["L"]
         avg = (o["plies_sum"] / total) if total else 0.0
         score = ((w + 0.5 * d) / total) if total else 0.0
         label = "validation" if scenario == "paired_validation" else scenario
+        wdl = f"{w}/{d}/{l}"
         print(
-            f"SF games {label:<12}: {total:>6}  W/D/L={w}/{d}/{l}  "
+            f"{label:<12}: {total:>6}  W/D/L={wdl:<{wdl_w}}  "
             f"score={score:.3f} "
             f"(ema{SCORE_EMA_SPAN}={o.get('ema', score_ema_start(scenario)):.3f})  "
             f"avg_plies={avg:.1f}"
         )
-
-    if wins_by_scenario:
-        print("\nWins by scenario (SF games only):")
-        for s, c in sorted(
-            wins_by_scenario.items(),
-            key=lambda kv: (-kv[1], kv[0]),
-        ):
-            print(f"  {s:<30} {c}")
     print("~" * LOG_WIDTH)
 
 

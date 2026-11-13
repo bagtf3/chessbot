@@ -28,6 +28,8 @@ from chessbot.utils import RateMeter, ema_step, sf_eval, next_model_epoch
 # telemetry smoothing, counted in pushes rather than seconds. sims/move is
 # deliberately faster: it should visibly react to validation and hard probes.
 RATE_EMA_SPAN = 8
+# lc0 runs in short demand-driven bursts, so its rates track a shorter window
+LC0_RATE_EMA_SPAN = 3
 SPM_EMA_SPAN = 3
 
 # priors-cache fields that accumulate in C++ rather than reading as a gauge
@@ -41,6 +43,26 @@ COLLECT_DESCENT_CAP = 1000
 # games_at_once if need be, so a batch starts at once instead of trickling in
 # as selfplay games finish
 VAL_OVERFILL = 64
+
+
+class CallTotals:
+    """Running column sums of the per-call rows from process_results, plus the
+    number of calls, so a telemetry push never has to convert every row."""
+
+    N_COLS = 15
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.cols = [0] * self.N_COLS
+        self.n = 0
+
+    def add(self, row):
+        cols = self.cols
+        for i, v in enumerate(row):
+            cols[i] += v
+        self.n += 1
 
 
 def is_validation(meta):
@@ -213,6 +235,11 @@ class GameLooper(object):
             if self.sf_thread is not None:
                 self.sf_thread.clear_hash()
 
+        elif cmd == "end_validation":
+            for g in self.active_games:
+                if is_validation(g.meta):
+                    g.wrap_up = True
+
         elif cmd == "tear_down_sf":
             # never mid-game: an active vs_stockfish game still needs the
             # engine, so defer and let the run loop retry
@@ -342,7 +369,7 @@ class GameLooper(object):
         macro = cfg.macro_batch
         
         #(batch size, target), counts returned
-        pred_fill, counts, mbs_used = [], [], []
+        pred_fill, counts, mbs_used = [], CallTotals(), []
         finished_ids = set()
         #passes_since_trigger = 0
         while True:
@@ -476,7 +503,7 @@ class GameLooper(object):
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
                 self.infer_gaps.clear()
-                counts.clear(); pred_fill.clear(); mbs_used.clear()
+                counts.reset(); pred_fill.clear(); mbs_used.clear()
             
             if finished:
                 finished_ids.update(finished)
@@ -508,10 +535,10 @@ class GameLooper(object):
         # came back with fewer new leaves than asked: blocked or early stop
         short = int(not f_stop and nn < asked)
 
-        counts.append([
+        counts.add((
             nn, fastpaths, nt, nc, f_stop, short,
             bl, pu, mv, sk, pr, pen, dp, sh, int(doubled)
-        ])
+        ))
 
         return nn, n_leafs
 
@@ -640,11 +667,7 @@ class GameLooper(object):
         lpb = pred_fill
         target = self.config.macro_batch
 
-        # every column of counts is a plain sum; one pass over all of them
-        if counts:
-            col = np.array(counts, dtype=np.int64).sum(axis=0)
-        else:
-            col = np.zeros(15, dtype=np.int64)
+        col = counts.cols
 
         (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
          s_short, s_blocked, s_puct, s_must_visit, s_skipped,
@@ -653,8 +676,10 @@ class GameLooper(object):
         # rate() is destructive, so each meter is read exactly once here
         raw_mps = self.mps.rate()
         raw_lps = self.lps.rate()
-        self.mps_ema = ema_step(self.mps_ema, raw_mps, RATE_EMA_SPAN)
-        self.lps_ema = ema_step(self.lps_ema, raw_lps, RATE_EMA_SPAN)
+        span = (LC0_RATE_EMA_SPAN if self.config.telemetry_kind == "lc0"
+                else RATE_EMA_SPAN)
+        self.mps_ema = ema_step(self.mps_ema, raw_mps, span)
+        self.lps_ema = ema_step(self.lps_ema, raw_lps, span)
         raw_spm = raw_lps / raw_mps if raw_mps else 0.0
         self.spm_ema = ema_step(self.spm_ema, raw_spm, SPM_EMA_SPAN)
 
@@ -673,8 +698,8 @@ class GameLooper(object):
             "batch_target": target,
             "n_active": len(self.active_games),
             "avg_ply": 0.0,
-            "n_groups": len(counts),
-            "calls_per_s": len(counts) / window_s if window_s > 0 else 0.0,
+            "n_groups": counts.n,
+            "calls_per_s": counts.n / window_s if window_s > 0 else 0.0,
 
             "s_collected": s_collected,
             "s_fast": s_fast,

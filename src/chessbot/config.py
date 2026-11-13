@@ -107,15 +107,10 @@ class Config(object):
     
     rescore_equiv_min = 10
     rescore_equiv_max = 60
-    rescore_inaccuracy_cp = 75
-    rescore_blunder_cp_loser = 90
-    rescore_blunder_cp_winner = 200
+    # expected-score-loss bars for an inaccuracy and a blunder
+    rescore_esl_inaccuracy = 0.05
+    rescore_esl_blunder = 0.12
     rescore_n_sf_workers = 1
-
-    # SF weight in the xc0/SF-pointmass blend, ramped across the CPL band
-    # between the clip points. Both replay paths and normal rescoring share it.
-    rescore_blend_alpha_min = 0.10
-    rescore_blend_alpha_max = 0.85
 
     train_on_stockfish = True
 

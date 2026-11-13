@@ -151,27 +151,18 @@ def main():
         if src_model and os.path.exists(src_model):
             src_ext = Path(src_model).suffix
             if src_ext == ".pt":
-                # Two lineages, both required. _model.pt is the trainer:
-                # retrain resumes from it and init_model must point at it.
-                # _model_player.pt is the EMA selfplay actually plays --
-                # prepare_trt falls back to the trainer without warning when
-                # it is absent, so a missed copy silently un-averages a
-                # round. Named explicitly rather than globbed so *_backup.*
-                # can never collide on the destination name. The .ts is not
-                # copied: nothing reads it, and a stale trace is a trap.
-                copies = [
-                    (f"{clone_tag}_model.pt", f"{run_tag}_model.pt"),
-                    (f"{clone_tag}_model_player.pt",
-                     f"{run_tag}_model_player.pt"),
-                ]
-                cfg.init_model = os.path.join(dest_dir, f"{run_tag}_model.pt")
-                for src_name, dst_name in copies:
-                    src_pt = os.path.join(src_dir, src_name)
-                    if not os.path.exists(src_pt):
-                        print(f"[clone] WARNING: {src_name} not in source, "
-                              f"not copied")
-                        continue
-                    shutil.copy2(src_pt, os.path.join(dest_dir, dst_name))
+                # _model.pt is the trainer: retrain resumes from it and
+                # init_model must point at it. The EMA player state travels
+                # in train_ckpts/. Named explicitly rather than globbed so
+                # *_backup.* can never collide on the destination name. The
+                # .ts is not copied: nothing reads it, and a stale trace is
+                # a trap.
+                src_name = f"{clone_tag}_model.pt"
+                dst_name = f"{run_tag}_model.pt"
+                cfg.init_model = os.path.join(dest_dir, dst_name)
+                src_pt = os.path.join(src_dir, src_name)
+                if os.path.exists(src_pt):
+                    shutil.copy2(src_pt, cfg.init_model)
                     print(f"[clone] copied {src_name} -> {dst_name}")
 
                 if not os.path.exists(cfg.init_model):
@@ -277,7 +268,8 @@ def main():
             carry(src_remaining, os.path.join(dest_dir, name))
             print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
-        for name in ("sf_cache.pkl.gz", "opening_counts.npz"):
+        from chessbot.selfplay_runner import LC0_BACKLOG_FILE
+        for name in ("sf_cache.pkl.gz", "opening_counts.npz", LC0_BACKLOG_FILE):
             src_path = os.path.join(src_dir, name)
             if os.path.exists(src_path):
                 carry(src_path, os.path.join(dest_dir, name))

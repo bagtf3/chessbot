@@ -29,7 +29,7 @@ from chessbot.engines import lc0_analyze
 from chessbot.game_utils import reconcile_game_boards
 from chessbot.utils import (
     print_summary_from_stats, accumulate_game_stats,
-    compact_count, LOG_WIDTH,
+    compact_count, compact_span, LOG_WIDTH,
 )
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, score_clipped, score_to_value_stm_pov,
@@ -379,8 +379,8 @@ class GameViewer:
         xc0_ent_vis, xc0_pvis = self.compute_norm_entropy(xc0_vis_vec)
         xc0_ent_pri, xc0_ppri = self.compute_norm_entropy(xc0_pri_vec)
         lc0_kl_vp    = kl_divergence(lc0_vis_vec, lc0_pri_vec)
-        kl_xpri_lpri = kl_divergence(xc0_pri_vec, lc0_pri_vec)
-        kl_xvis_lvis = kl_divergence(xc0_vis_vec, lc0_vis_vec)
+        kl_lpri_xpri = kl_divergence(lc0_pri_vec, xc0_pri_vec)
+        kl_lvis_xvis = kl_divergence(lc0_vis_vec, xc0_vis_vec)
 
         hdr = (
             f"  {'SAN':<7}  {'N':>6}  {'P(lc0)':>7}  {'P(xc0)':>7}"
@@ -421,8 +421,8 @@ class GameViewer:
         )
         print(
             f"  {'cross KL:':<16}"
-            f"  xc0_p||lc0_p={kl_xpri_lpri:.3f}"
-            f"   xc0_v||lc0_v={kl_xvis_lvis:.3f}"
+            f"  lc0_p||xc0_p={kl_lpri_xpri:.3f}"
+            f"   lc0_v||xc0_v={kl_lvis_xvis:.3f}"
         )
 
         if self.ply < len(self.moves_uci):
@@ -2116,7 +2116,6 @@ class RecordKeeper(object):
             lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
         self.sf_overall = defaultdict(
             lambda: {"N": 0, "W": 0, "L": 0, "D": 0, "plies_sum": 0})
-        self.wins_by_scenario = defaultdict(int)
         self.telemetry = {}
         self.lc0_telemetry = {}
         # set by the runner: it owns the queue and sees the replies
@@ -2144,8 +2143,7 @@ class RecordKeeper(object):
             self.draws += 1
         
         self.recent_games.append(meta)
-        accumulate_game_stats(meta, self.scenario_stats, self.sf_overall,
-                              self.wins_by_scenario)
+        accumulate_game_stats(meta, self.scenario_stats, self.sf_overall)
 
     def ingest_telemetry(self, telemetry):
         # store the latest from each only. lc0 is kept apart so its throughput
@@ -2236,7 +2234,8 @@ class RecordKeeper(object):
         print(f" Epoch {self.n_retrains} Logging ".center(LOG_WIDTH, "~"))
         
         mps, lps = summed.get("mps", 0), summed.get("lps", 0)
-        print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}")
+        print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}  "
+              f"uptime={compact_span(now - self._run_start)}")
         
         print(
             f"[game stats]  finished={self.games_finished}  "
@@ -2253,8 +2252,7 @@ class RecordKeeper(object):
             return
 
         # counters cover the whole run, not the last `window` games
-        print_summary_from_stats(self.scenario_stats, self.sf_overall,
-                                 self.wins_by_scenario)
+        print_summary_from_stats(self.scenario_stats, self.sf_overall)
         primary_count = (len(os.listdir(self.primary_buffer_dir))
                          if self.primary_buffer_dir else 0)
         print(
@@ -2370,11 +2368,7 @@ class RecordKeeper(object):
 
         last50 = list(self.recent_games)[-50:]
         durations = [g.get("duration", 0.0) for g in last50]
-        runtime = ""
-        if sum(durations) > 0:
-            m, s = divmod(int(np.mean(durations)), 60)
-            h, m = divmod(m, 60)
-            runtime = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+        runtime = compact_span(np.mean(durations)) if sum(durations) > 0 else ""
 
         def row(tag, left, right=()):
             # (label, value) pairs; label/value widths per slot, left then right

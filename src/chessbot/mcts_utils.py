@@ -79,6 +79,7 @@ class MCTSTree(fasttree):
 
         # bookkeeping
         self.board = board
+        self.only_one_move = len(board.legal_moves()) < 2
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
 
@@ -139,7 +140,6 @@ class MCTSTree(fasttree):
         self.effort_d_edges = None
         self.effort_ply_edges = None
         if getattr(cfg, "effort_scale_table", ""):
-            import json
             from chessbot.effort_scale import Q_EDGES, D_EDGES, PLY_EDGES, bin_key
             lut_data = json.load(open(cfg.effort_scale_table))
             self.effort_lut = lut_data.get(str(getattr(cfg, "effort_alpha", 0.0)), {})
@@ -286,6 +286,7 @@ class MCTSTree(fasttree):
         # Keep external board & counters in sync for your caller's logic
         board.push_uci(move_uci)
         self.board = board
+        self.only_one_move = len(board.legal_moves()) < 2
 
         self.root_board_fen = board.fen()
         self.n_plies = board.history_size()
@@ -350,8 +351,7 @@ class MCTSTree(fasttree):
         if self.sims_completed_this_move < 1:
             return False
 
-        # check for only 1 move
-        if len(self.board.legal_moves()) < 2:
+        if self.only_one_move:
             self.sim_stop_reason = "Only 1 legal move"
             return True
 
@@ -432,6 +432,8 @@ class ChessGame(object):
         self.outcome = None
         self.end_reason = ""
         self.plies = 0
+        # set by the end_validation command: adjudicate as at max_game_length
+        self.wrap_up = False
         self.mcts_sims_total = 0
         self.mcts_plies = 0
         self.sf_eval = None
@@ -767,7 +769,7 @@ class ChessGame(object):
                 return True
 
         # check for overall game_length limit
-        if self.plies > cfg.max_game_length:
+        if self.plies > cfg.max_game_length or self.wrap_up:
             self.outcome = 0.0
             self.end_reason = "max_length"
             if len(self.recents) >= MAX_LENGTH_ADJ_N:

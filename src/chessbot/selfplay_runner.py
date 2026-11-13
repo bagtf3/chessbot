@@ -210,6 +210,8 @@ HELP_TEXT = """[cmd] commands:
   kill sf worker        retire the newest SF thread after its current game
   respawn lc0           pause, tear down and rebuild the lc0 fleet from yaml
   respawn xc0           pause, tear down and rebuild the xc0 fleet from yaml
+  end validation        adjudicate in-flight validation games after their
+                        next move, as at max_game_length
   full clear            drop all pauses, sf back to the config count
   save training data N  snapshot N live-buffer samples
   status                fleets, sf threads, pause state, backlog
@@ -309,6 +311,10 @@ def stdin_listener(controls, worker_procs):
             controls.respawn_xc0.set()
             print("[cmd] respawn xc0 requested", flush=True)
 
+        elif cmd == 'end validation':
+            controls.end_validation.set()
+            print("[cmd] end validation requested", flush=True)
+
         elif cmd == 'full clear':
             print("[cmd] full clear -- dropping pauses, sf back to config",
                   flush=True)
@@ -345,6 +351,7 @@ class Controls:
         self.full_clear = threading.Event()
         self.respawn_lc0 = threading.Event()
         self.respawn_xc0 = threading.Event()
+        self.end_validation = threading.Event()
 
         # kinds accumulate rather than overwrite, so two commands typed inside
         # one loop pass do not lose the first one
@@ -660,8 +667,7 @@ class SelfPlayRunner:
         if self.cfg.n_lc0_workers:
             self.lc0_q = self.ctx.Queue()
             self.lc0_cfg = create_lc0_replay_config(self.cfg)
-            # handing the rescorer the config is what switches blunders from
-            # the blend path onto the teacher path
+            # handing the rescorer the config is what turns on the teacher path
             self.rescorer.lc0_cfg = self.lc0_cfg
             self.load_lc0_backlog()
             for _ in range(self.cfg.n_lc0_workers):
@@ -1594,6 +1600,15 @@ class SelfPlayRunner:
         if c.respawn_xc0.is_set():
             c.respawn_xc0.clear()
             self.respawn_xc0_workers("operator")
+
+        if c.end_validation.is_set():
+            c.end_validation.clear()
+            if self.val_pending:
+                self.broadcast("end_validation", kinds={"xc0"})
+                print(f"[validation] wrapping up {self.val_pending} pending "
+                      f"games", flush=True)
+            else:
+                print("[validation] no batch live", flush=True)
 
         if c.full_clear.is_set():
             c.full_clear.clear()

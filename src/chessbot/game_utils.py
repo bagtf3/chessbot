@@ -505,6 +505,10 @@ SCENARIO_OVERRIDES = {
         "sample_top_k": 5, "sample_max_q_delta": 0.2,
         "move_sample_temp_range": [0.2, 2.0],
     },
+    # odds games are played out to mate, not resigned
+    "piece_odds": {"allow_resignation": False},
+    # odd piece sets: played out rather than called drawn on eval
+    "piece_training": {"use_eval_draw": False},
 }
 VS_SF_STARTS = {"startpos": 0.5, "pre_opened": 0.25, "pre_opened_mini": 0.25}
 

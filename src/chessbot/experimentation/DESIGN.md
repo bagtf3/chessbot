@@ -16,6 +16,8 @@ worker owns its own NN caches.
    search moves off it, which signals justify more budget.
 6. pv_extender: first pluck of each `collect_many_leaves` skips PUCT (still
    obeys must_visit and penalty) and walks most-visited children to terminal.
+   Tested 2026-11-13 (2,500 positions): worse on every measure (own SF-equiv
+   1,947 vs 2,087, own ESL x1000 16.4 vs 11.3, most sims); removed from the code.
 7. Later: dynamic mbs [2, 4, 8, 16], in-cache WDL / prior updates, others.
 
 The core (corpus, labels, runner, store) stays fixed across these;
@@ -92,7 +94,7 @@ Fields, defaults as today:
 | tree | tree_reuse, tree_descent_cap, tree_resort_thresholds | true, 1000, [250, 1500, 5000] |
 | contempt | contempt_zero_q, contempt_full_q, contempt_fight_c, contempt_min_completed | 0, 0.5, 0, 100 |
 | tempscale | tempscale_entropy_target, tempscale_trigger_q | 0, -2 |
-| spans | qema_span, qdelta_span, qdema_span, recent_visits_span | 40, 100, 100, 400 |
+| spans | qema_span, qdelta_span, recent_visits_span | 40, 100, 400 |
 | sharp | sharp_lo, sharp_hi, sharp_M, sharp_boost | 100, 250, 10, 0 |
 | qmm | qmm_force, qmm_gate, qmm_gap_block, qmm_min_visits | false, 0, 0, 3 |
 | es | es_check_every, es_tier1_consec, es_tier1_jsd_thresh, es_tier2_consec, es_tier2_jsd_thresh, es_tier1_dq12_floor, es_tier1_qema_veto | 100, 3, 0.005, 5, 0.0003, -0.25, 0.2 |
@@ -118,19 +120,14 @@ selfplay behaviour is unchanged.
    `sims_max` still applies. Python owns the stop.
 3. Check-in rows: per-condition pass/fail for tier1 (conds 1-7) and tier2,
    RSC argmax, gap_block veto, `would_stop` and reason, plus the full root
-   child table (N, Q, Qema, Qmm, Qdelta_sign, Qdema, rcs, prior, raw_prior,
+   child table (N, Q, Qema, Qmm, Qdelta_sign, rcs, prior, raw_prior,
    visit_share) and the PV.
    - `gather_stop_stats()`: every row this move; when the search ended off a
      check-in, a final row at the actual sim count is added first.
    - `latest_checkin()`: the newest row, read after each collect call, for
      controllers that stop mid-search (RPO).
-4. `Qdema` per node: EMA of the signed backup delta `(v - Q_pre) * pov`,
-   updated next to `Qdelta_sign` (`mcts.cpp` backup at the root) and exposed
-   on `ChildDetail`. Qdelta_sign keeps only the sign; Qdema keeps the size,
-   reacts fast to a refutation and shrinks as Q catches up.
-5. `tree_descent_cap` = 0 removes the per-call descent cap (roadmap #2).
-6. Per-experiment knobs as they are built: `pv_extender`, MateLock++ scout
-   params.
+4. `tree_descent_cap` = 0 removes the per-call descent cap (roadmap #2).
+5. Per-experiment knobs as they are built: MateLock++ scout params.
 
 ## Cache policy
 
@@ -173,8 +170,8 @@ Snapshot functions run at each check-in; an experiment lists the ones it
 wants. Initial set:
 - `checkin`: the C++ `EsCheckinRow` (jsd, delta_12, dQ12, Q1, Qema1, per-cond
   flags, would_stop)
-- `root`: root child table top-k (uci, N, Q, Qema, Qmm, Qdelta_sign, Qdema,
-  rcs, prior, raw_prior, visit_share, boosted_N, forced_N)
+- `root`: root child table top-k (uci, N, Q, Qema, Qmm, Qdelta_sign, rcs,
+  prior, raw_prior, visit_share, boosted_N, forced_N)
 - `pv`: principal variation with per-node N, P, Q
 - `pick`: most-visited, RSC argmax, xc0 pick, label and `good` for each
 - `cache`: cache-hit fraction since the last check-in (`count_cached`)
@@ -239,19 +236,16 @@ Cache group `isolated`. Writes go through `raw_cache_lookup` +
 `raw_cache_bulk_insert` (policy kept, WDL replaced); `priors_cache` entries
 for corrected keys must be invalidated or updated to match.
 
-### Refutation signals and Qdema
+### Refutation signals
 
 End-of-search snapshots of refuted leaders (top raw prior, heavy visits,
 `visit_share` near 0, lost to a lower-prior pick) show Qema and Qdelta_sign
 separating leader from pick; Q and Qmm barely do. The open question is lead
 time: do the signals turn before visits move.
 
-1. Observe: record Q, Qema, Qmm, Qdelta_sign, Qdema, rcs, visit_share per
-   root child at every check-in on a refutation corpus; measure each
-   signal's lead before the switch. Model which signals are needed.
-2. Qdema as a selection term (arm): bonus/penalty `k * Qdema`, capped. The
-   EMA only updates on visits, so a penalty that starves a node would freeze
-   it; Qdema also decays by parent visits since `last_visit`.
+Record Q, Qema, Qmm, Qdelta_sign, rcs, visit_share per root child at every
+check-in on a refutation corpus; measure each signal's lead before the
+switch. Model which signals are needed.
 
 Workflow: mine a corpus, form a hypothesis, test it on a freshly drawn corpus.
 

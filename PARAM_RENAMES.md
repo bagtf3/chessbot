@@ -26,8 +26,7 @@ es_tier2_consec, es_tier2_jsd_thresh.
 
 New config keys (previously hard-coded in C++, or new): es_tier1_dq12_floor,
 es_tier1_qema_veto, es_observe_only, es_record_all, rsc_top_n,
-rsc_min_visits, rsc_visit_share_floor, rsc_margin, qdema_span,
-recent_visits_span, qmm_min_visits, contempt_min_completed, tree_descent_cap,
+rsc_min_visits, rsc_visit_share_floor, rsc_margin, recent_visits_span, qmm_min_visits, contempt_min_completed, tree_descent_cap,
 tree_resort_thresholds.
 
 ## Per-move tree values

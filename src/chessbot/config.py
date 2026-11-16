@@ -90,6 +90,8 @@ class Config(object):
     # 2x micro_batch past min(dynamic_mbs_min, half the sims ceiling)
     dynamic_mbs = False
     dynamic_mbs_min = None
+    # {root_visits: micro_batch}; when set it replaces micro_batch/dynamic_mbs
+    mbs_schedule = None
 
     max_game_length = 200
     min_game_length = 5
@@ -152,7 +154,6 @@ class Config(object):
     sharp_boost = 0.0
     qema_span = 40
     qdelta_span = 100
-    qdema_span = 100
     recent_visits_span = 400    # visit_share EMA span
     # qmm_force sends a visit to each new Qmm leader; qmm_gate is the completed
     # backups a child needs to join Qmm (0 = 1); qmm_gap_block vetoes

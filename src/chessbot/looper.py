@@ -22,7 +22,7 @@ from chessbot.config import XC0H_K
 
 from chessbot.infer_ort_trt import make_ort_trt_infer
 
-from chessbot.mcts_utils import ChessGame
+from chessbot.mcts_utils import ChessGame, micro_batch_for
 from chessbot.utils import RateMeter, ema_step, sf_eval, next_model_epoch
 
 # telemetry smoothing, counted in pushes rather than seconds. sims/move is
@@ -432,10 +432,7 @@ class GameLooper(object):
             self.forest.resolve_all_inflight()
             for game in self.active_games:
                 base_mbs = game.config.micro_batch
-                g_mbs = base_mbs
-                if game.config.dynamic_mbs:
-                    g_mbs = game.tree.effective_mbs(
-                        base_mbs, game.config.dynamic_mbs_min or 0)
+                g_mbs = micro_batch_for(game.tree, game.config)
                 sf_terminal, mcts_terminal = False, False
 
                 # if its stockfish turn, check if the move is ready

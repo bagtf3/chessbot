@@ -12,10 +12,13 @@ header, and (reviewable games only) the full candidate table and PV. Records
 carry init_fen + uci_path (the full line from the game's first position),
 which is what xc0h history needs.
 """
+import argparse
 import gzip
 import json
+import multiprocessing as mp
 import os
 import pickle
+from collections import Counter
 
 import chess
 import numpy as np
@@ -40,6 +43,11 @@ REFUT_MAX_VS = 0.10
 REFUT_MIN_PICK_VS = 0.5
 REFUT_MAX_GAMES = 600
 
+N_WORKERS = 4
+OVERSAMPLE = 1.1
+# drawn evenly from every ply, ahead of and apart from the rule strata
+RANDOM = "random"
+
 MIX = {
     "mate_found": 1000,
     "refutation": 1500,
@@ -48,6 +56,17 @@ MIX = {
     "high_kl": 1000,
     "high_ce": 1000,
     "regular": 3000,
+}
+
+# 75% random; the hard 25% keeps c26k_close's hard proportions plus mates
+MIX_RANDOM_HARD = {
+    RANDOM: 75000,
+    "mate_found": 1500,
+    "refutation": 3550,
+    "high_cpl": 5725,
+    "kl_ce": 4275,
+    "high_kl": 4975,
+    "high_ce": 4975,
 }
 
 PLY_COLS = ["game_id", "move_num", "stm", "played_move", "most_visited_move",
@@ -180,7 +199,8 @@ def refutation_row(p):
     """Refuted leader: the top raw prior drew heavy visits, then its
     visit_share collapsed while a different pick took over."""
     cms = p.get("candidate_moves")
-    if not cms or p.get("sel_method") == "stockfish":
+    # older logs have no raw prior (P carries noise), so they give none
+    if not cms or p.get("sel_method") == "stockfish" or "P_raw" not in cms[0]:
         return None
     sims = sum(c["visits"] for c in cms)
     if sims < REFUT_MIN_SIMS:
@@ -198,21 +218,29 @@ def refutation_row(p):
             "refuted_P": top["P_raw"]}
 
 
-def find_refutations(run_tags, rng):
+def scan_refutations(h):
+    """Refutation rows in one game's log, or None when the log is unreadable."""
+    plies = load_log_plies(h)
+    if plies is None:
+        return None
+    out = []
+    for i, p in enumerate(plies):
+        row = refutation_row(p)
+        if row is not None:
+            out.append({"game_id": h["game_id"], "move_num": i, **row})
+    return out
+
+
+def find_refutations(run_tags, rng, max_games, pool):
     """Scan reviewable logs (non-paired first) for refuted leaders."""
     heads = list(load_headers(run_tags, filt=lambda h: h.get("reviewable")).values())
     rng.shuffle(heads)
     heads.sort(key=lambda h: h["scenario"] == "paired_validation")
     found, scanned = [], 0
-    for h in heads[:REFUT_MAX_GAMES]:
-        plies = load_log_plies(h)
-        if plies is None:
-            continue
-        scanned += 1
-        for i, p in enumerate(plies):
-            row = refutation_row(p)
-            if row is not None:
-                found.append({"game_id": h["game_id"], "move_num": i, **row})
+    for rows in pool.imap_unordered(scan_refutations, heads[:max_games], chunksize=8):
+        if rows is not None:
+            scanned += 1
+            found += rows
     return pd.DataFrame(found), scanned
 
 
@@ -233,58 +261,132 @@ def build_record(r, h, p):
     return rec
 
 
-def build_corpus(name, run_tags, mix=MIX, seed=0):
+def build_game(job):
+    """(records, drop counts) for one game's picked rows."""
+    h, rows = job
+    dropped = Counter()
+    if h is None:
+        dropped["no_header"] += len(rows)
+        return [], dropped
+    plies = load_log_plies(h)
+    if plies is None:
+        dropped["no_log"] += len(rows)
+        return [], dropped
+    recs = []
+    for r in rows:
+        p = plies[r["move_num"]] if r["move_num"] < len(plies) else {}
+        if not p.get("abs_ply") and p.get("abs_ply") != 0:
+            dropped["no_ply"] += 1
+            continue
+        rec = build_record(r, h, p)
+        if rec is None:
+            dropped["bad_path"] += 1
+            continue
+        recs.append(rec)
+    return recs, dropped
+
+
+def build_corpus(name, run_tags, mix=MIX, seed=0, exclude=(), workers=N_WORKERS,
+                 refut_max_games=REFUT_MAX_GAMES):
+    """exclude: corpus names whose plies (game_id, move_num) are dropped before
+    sampling and whose positions (short_fen) are dropped after the build.
+    Each stratum is oversampled by OVERSAMPLE, then trimmed to its mix count
+    after the replay, exclusion and dedup drops."""
     rng = np.random.default_rng(seed)
+    log(f"[corpus] loading plies: {', '.join(run_tags)}")
     df = pd.concat([load_plies(r) for r in run_tags], ignore_index=True)
     df = df[df.stop_reason != "Only 1 legal move"].reset_index(drop=True)
+    skip, skip_plies = set(), set()
+    for c in exclude:
+        prior = pd.read_pickle(os.path.join(CORPUS_DIR, f"{c}.pkl.gz"))
+        skip |= set(prior.short_fen)
+        skip_plies |= set(ply_keys(prior.game_id, prior.move_num))
+    n_plies = len(df)
+    df = df[~ply_keys(df.game_id, df.move_num).isin(skip_plies).values]
+    df = df.reset_index(drop=True)
+    log(f"[corpus] {len(df):,} plies after dropping {n_plies - len(df):,} used plies, "
+        f"{len(skip):,} excluded positions")
 
-    refut, scanned = find_refutations(run_tags, rng)
-    taken = set(ply_keys(refut.game_id, refut.move_num)) if len(refut) else set()
-    df = assign_strata(df, taken)
-    pools = df.stratum.value_counts().to_dict()
-    if len(refut):
-        df = df.merge(refut, on=["game_id", "move_num"], how="left")
+    with mp.get_context("spawn").Pool(workers) as pool:
+        refut, scanned = pd.DataFrame(), 0
+        if "refutation" in mix:
+            refut, scanned = find_refutations(run_tags, rng, refut_max_games, pool)
+            log(f"[corpus] refutations: {len(refut):,} in {scanned:,} games")
+        taken = set(ply_keys(refut.game_id, refut.move_num)) if len(refut) else set()
+        df = assign_strata(df, taken)
+        pools = df.stratum.value_counts().to_dict()
+        if len(refut):
+            df = df.merge(refut, on=["game_id", "move_num"], how="left")
 
-    picks = []
-    for stratum, n in mix.items():
-        pool = df[df.stratum == stratum]
-        rows = sample_capped(pool, n, rng)
-        pop = np.nan if stratum == "refutation" else len(pool)
-        picks.append(rows.assign(stratum_pop=pop,
-                                 weight=pop / max(len(rows), 1)))
-    picks = pd.concat(picks, ignore_index=True)
+        picks = []
+        if RANDOM in mix:
+            rows = sample_capped(df, int(mix[RANDOM] * OVERSAMPLE), rng)
+            picks.append(rows.assign(stratum=RANDOM))
+            pools[RANDOM] = len(df)
+            df = df.drop(rows.index)
+        for stratum, n in mix.items():
+            if stratum != RANDOM:
+                picks.append(sample_capped(df[df.stratum == stratum],
+                                           int(n * OVERSAMPLE), rng))
+        picks = pd.concat(picks, ignore_index=True)
 
-    heads = load_headers(run_tags, game_ids=set(picks.game_id))
-    recs, dropped = [], {"no_header": 0, "no_log": 0, "bad_path": 0}
-    for gid, rows in picks.groupby("game_id"):
-        h = heads.get(gid)
-        if h is None:
-            dropped["no_header"] += len(rows)
-            continue
-        plies = load_log_plies(h)
-        if plies is None:
-            dropped["no_log"] += len(rows)
-            continue
-        for r in rows.to_dict("records"):
-            p = plies[r["move_num"]] if r["move_num"] < len(plies) else {}
-            rec = build_record(r, h, p)
-            if rec is None:
-                dropped["bad_path"] += 1
-                continue
-            recs.append(rec)
+        heads = load_headers(run_tags, game_ids=set(picks.game_id))
+        jobs = [(heads.get(gid), rows.to_dict("records"))
+                for gid, rows in picks.groupby("game_id")]
+        log(f"[corpus] building {len(picks):,} records from {len(jobs):,} games")
+        recs, dropped = [], Counter()
+        for i, (r, d) in enumerate(pool.imap_unordered(build_game, jobs, chunksize=16)):
+            recs += r
+            dropped.update(d)
+            if (i + 1) % 5000 == 0:
+                log(f"[corpus]   {i + 1:,}/{len(jobs):,} games")
 
-    corpus = pd.DataFrame(recs)
+    corpus = pd.DataFrame(recs).sort_values(["game_id", "move_num", "stratum"])
+    corpus = corpus.sample(frac=1.0, random_state=seed)
     corpus["short_fen"] = corpus.fen.str.rsplit(" ", n=2).str[0]
+    n_built = len(corpus)
+    corpus = corpus[~corpus.short_fen.isin(skip)]
+    n_excluded = n_built - len(corpus)
     n_before = len(corpus)
-    corpus = corpus.drop_duplicates("short_fen").reset_index(drop=True)
+    corpus = corpus.drop_duplicates("short_fen")
+    n_dups = n_before - len(corpus)
+    corpus = corpus[corpus.groupby("stratum").cumcount() < corpus.stratum.map(mix)]
+    counts = corpus.stratum.value_counts()
+    pop = {s: (np.nan if s == "refutation" else pools.get(s, 0)) for s in counts.index}
+    corpus["stratum_pop"] = corpus.stratum.map(pop)
+    corpus["weight"] = corpus.stratum_pop / corpus.stratum.map(counts)
+    corpus = corpus.reset_index(drop=True)
 
     os.makedirs(CORPUS_DIR, exist_ok=True)
     corpus.to_pickle(os.path.join(CORPUS_DIR, f"{name}.pkl.gz"))
     meta = {"name": name, "run_tags": run_tags, "seed": seed, "mix": mix,
+            "exclude": list(exclude), "oversample": OVERSAMPLE,
             "pools": pools, "refut_games_scanned": scanned,
-            "refut_found": len(refut), "dropped": dropped,
-            "dup_fens": n_before - len(corpus), "n": len(corpus),
-            "counts": corpus.stratum.value_counts().to_dict()}
+            "refut_found": len(refut), "dropped": dict(dropped),
+            "excluded": n_excluded, "dup_fens": n_dups, "n": len(corpus),
+            "counts": counts.to_dict()}
     with open(os.path.join(CORPUS_DIR, f"{name}.json"), "w") as f:
         json.dump(meta, f, indent=1, default=str)
     return corpus, meta
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("name")
+    ap.add_argument("--runs", nargs="+",
+                    default=[f"m137_8c8t_selfplay{i}" for i in (7, 8, 9, 10)])
+    ap.add_argument("--exclude", nargs="*", default=["c26k_close"])
+    ap.add_argument("--workers", type=int, default=N_WORKERS)
+    ap.add_argument("--refut-games", type=int, default=3000)
+    ap.add_argument("--seed", type=int, default=0)
+    # multiplies every MIX_RANDOM_HARD count
+    ap.add_argument("--scale", type=float, default=1.0)
+    args = ap.parse_args()
+    mix = {s: round(n * args.scale) for s, n in MIX_RANDOM_HARD.items()}
+    _, meta = build_corpus(args.name, args.runs, mix, args.seed,
+                           args.exclude, args.workers, args.refut_games)
+    log(json.dumps(meta, indent=1, default=str))

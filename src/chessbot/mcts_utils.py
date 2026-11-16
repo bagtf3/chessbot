@@ -66,6 +66,16 @@ def scheduled(schedule, ply, default):
     return val
 
 
+def micro_batch_for(tree, cfg):
+    """Leaves to ask for in one collect: mbs_schedule at the tree's root
+    visits when set, else micro_batch, doubled under dynamic_mbs."""
+    if cfg.mbs_schedule:
+        return int(scheduled(cfg.mbs_schedule, int(tree.root().N), cfg.micro_batch))
+    if cfg.dynamic_mbs:
+        return tree.effective_mbs(cfg.micro_batch, cfg.dynamic_mbs_min or 0)
+    return cfg.micro_batch
+
+
 class MCTSTree(fasttree):
     def __init__(self, board, cfg):
         self.config = cfg
@@ -233,9 +243,9 @@ class MCTSTree(fasttree):
         """
         # Capture parent Q/pdraw before the tree resets on advance.
         r = self.root()
-        if r is not None and r.N > 0:
+        if r is not None and r.n_done > 0:
             self.saved_parent_q = r.Q
-            self.saved_parent_pdraw = r.p_draw / r.N
+            self.saved_parent_pdraw = r.p_draw / r.n_done
 
         # Never try to assign self.root in Python; C++ owns the root.
         self.advance_root(move_uci)
@@ -548,10 +558,9 @@ class ChessGame(object):
                 "Q": rnd(cd.Q, 4), "P": rnd(cd.prior, 4),
                 "P_raw": rnd(cd.raw_prior, 4), "U": rnd(U, 4),
                 "Qema": rnd(cd.Qema, 4), "Qdelta_sign": rnd(cd.Qdelta_sign, 4),
-                "Qdema": rnd(cd.Qdema, 4),
                 "boosted": cd.boosted_N,
                 "Qmm": rnd(cd.Qmm, 4),
-                "Q_draw": rnd(cd.draw, 4) if cd.N > 0 else float("nan"),
+                "Q_draw": rnd(cd.draw, 4) if cd.n_done > 0 else float("nan"),
                 "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
             }
             

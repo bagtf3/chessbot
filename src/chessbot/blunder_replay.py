@@ -295,6 +295,10 @@ def create_blunder_replay_config(cfg, yaml_file=None):
     selfplay workers already compiled instead of building its own.
     """
     pcfg = cfg.copy()
+    # a copy in the run dir (val_test forks) wins over the shared one
+    run_yaml = os.path.join(getattr(cfg, "run_dir", "") or "", "blunder_replay_config.yaml")
+    if not yaml_file and os.path.exists(run_yaml):
+        yaml_file = run_yaml
     p_yaml = yaml_file or os.environ.get(BRP_CONFIG_ENV, "")
     if not p_yaml or not os.path.exists(p_yaml):
         raise RuntimeError(f"{P} no frozen probe config at {p_yaml!r}")

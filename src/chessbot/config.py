@@ -82,6 +82,30 @@ class Config(object):
     rsc_visit_share_floor = 0.15
     rsc_margin = 0.05
 
+    # search controller (C++, pyfastchess controller.cpp; the rules are
+    # documented at the ctrl params in mcts.hpp). ctrl_model: an exported
+    # two-head <checkpoint>.ctrl dir, loaded once per worker; ctrl_enable needs
+    # it and es_check_every 0. Off on Stockfish's turns in vs-SF games.
+    ctrl_model = ""
+    # "ctrl" or "old": switches every stop-rule setting together
+    # (game_utils.STOP_RULE_ARMS) so the two can be sampled per game. None
+    # leaves the config's own settings alone.
+    stop_rules = None
+    ctrl_enable = False
+    ctrl_min_stop = 300         # earliest stop; sims_max is held at least this
+    ctrl_s_thresh = 0.95
+    ctrl_q_thresh = 0.98
+    ctrl_agree_consec = 2
+    ctrl_ext_max = 2            # extensions per move; 0 = locks are never extended
+    ctrl_ext_sims = 2000        # sims per extension
+    ctrl_ext_d_max = 0.9
+    ctrl_ext_q0 = 0.7
+    ctrl_ext_absq0 = 0.6
+    ctrl_ext_slope = 0.6666667
+    ctrl_ext_pruning = 0.5      # pruning_factor while extended; restored next move
+    ctrl_record = False         # keep every check-in in the game log (ply["ctrl"])
+    checkin_break = False       # collect_many_leaves returns at each check-in
+
     # Game stuff
     n_games = 128
     games_at_once = 128
@@ -182,6 +206,8 @@ class Config(object):
     adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
     draw_value_scale = 1.0        # per-sample value weight for drawn games (decisive = 1.0)
     vscale = 0.9
+    # vscale applies only while raw |root Q| > vscale_gate_q (0 = always)
+    vscale_gate_q = 0.9
     # value outcome before a sampled deviation = search WDL at that deviation
     value_bootstrap_at_sample = False
     contempt_zero_q  = 0.0

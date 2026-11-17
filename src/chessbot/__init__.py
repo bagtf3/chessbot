@@ -26,6 +26,10 @@ LC0_LOC     = os.getenv("LC0_LOC", "")
 LC0_WEIGHTS = os.getenv("LC0_WEIGHTS", "")
 ENDGAME_LOC = os.getenv("ENDGAME_LOC", "")
 SP_DIR = os.getenv("SP_DIR", "")
+# Play Xerces <-> selfplay pause handshake files: one fixed folder, so it does
+# not depend on which run is playing
+PX_DIR = os.getenv("PX_DIR", os.path.join(os.path.dirname(os.path.normpath(SP_DIR)),
+                                          "playxerces"))
 MODEL_DIR = os.getenv("MODEL_DIR", "")
 CUTECHESS_CLI_LOC = os.getenv("CUTECHESS_CLI_LOC", "")
 

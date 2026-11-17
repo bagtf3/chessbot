@@ -22,7 +22,7 @@ import json
 import time
 from collections import deque
 
-from chessbot import SP_DIR
+from chessbot import PX_DIR, SP_DIR
 from chessbot.blunder_replay import load_probe_pool
 from chessbot.config import Config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
@@ -61,7 +61,7 @@ WORKER_PAUSE_SETTLE_S = 10.0
 # sessions; kept under the retrain worker's own GO_TIMEOUT_S
 RETRAIN_RELEASE_TIMEOUT_S = 90.0
 # playxerces (the website's engine) shares the GPU. Around a retrain the
-# runner creates PX_PAUSE_FLAG in the run dir; playxerces frees its VRAM and
+# runner creates PX_PAUSE_FLAG in PX_DIR; playxerces frees its VRAM and
 # answers with PX_RELEASED_FLAG. A PX_HEARTBEAT older than
 # PX_HEARTBEAT_STALE_S means it is not running and is not waited on.
 PX_PAUSE_FLAG = "playxerces_pause.flag"
@@ -1394,7 +1394,8 @@ class SelfPlayRunner:
         self.rescorer.reset_writer()
 
     def px_path(self, name):
-        return os.path.join(self.cfg.run_dir, name)
+        os.makedirs(PX_DIR, exist_ok=True)
+        return os.path.join(PX_DIR, name)
 
     def pause_playxerces(self):
         with open(self.px_path(PX_PAUSE_FLAG), "w"):

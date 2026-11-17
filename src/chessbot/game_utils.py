@@ -510,6 +510,14 @@ SCENARIO_OVERRIDES = {
     # odd piece sets: played out rather than called drawn on eval
     "piece_training": {"use_eval_draw": False},
 }
+# stop_rules arms. old is the tiered early stop with robust selection, as run
+# before the search controller.
+STOP_RULE_ARMS = {
+    "ctrl": {"ctrl_enable": True, "es_check_every": 0, "use_robust": False,
+             "qmm_gap_block": 0.0},
+    "old": {"ctrl_enable": False, "es_check_every": 100, "use_robust": True,
+            "qmm_gap_block": 0.05},
+}
 VS_SF_STARTS = {"startpos": 0.5, "pre_opened": 0.25, "pre_opened_mini": 0.25}
 
 
@@ -521,6 +529,8 @@ def scenario_cfg(cfg, scenario):
     c = cfg.copy()
     c.update(deepcopy(fixed))
     c.update({k: deepcopy(random.choice(v)) for k, v in sampleable.items()})
+    if c.stop_rules:
+        c.update(STOP_RULE_ARMS[c.stop_rules])
     c.sampled_params = list(sampleable)
     c.sampleable = None
     return c

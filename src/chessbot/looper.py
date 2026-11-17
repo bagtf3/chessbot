@@ -49,7 +49,7 @@ class CallTotals:
     """Running column sums of the per-call rows from process_results, plus the
     number of calls, so a telemetry push never has to convert every row."""
 
-    N_COLS = 15
+    N_COLS = 18
 
     def __init__(self):
         self.reset()
@@ -98,6 +98,16 @@ class GameLooper(object):
         self.remote = remote
         self.forest = MCTSForest()
 
+        # the search controller lives in C++ (one model per process); trees
+        # with ctrl_enable refuse to build without it, so it loads before
+        # the first game
+        if cfg.ctrl_model:
+            import pyfastchess
+            pyfastchess.load_search_controller(cfg.ctrl_model)
+            state = "on" if cfg.ctrl_enable else "loaded, off"
+            print(f"[worker {self.id}] controller {state}: "
+                  f"{os.path.basename(cfg.ctrl_model.rstrip('/'))}", flush=True)
+
         self.pull_from_queue()
 
         self.model = model
@@ -113,6 +123,7 @@ class GameLooper(object):
         self.mps_ema = None
         self.lps_ema = None
         self.spm_ema = None
+        self.rate_pushes = 0
         self.cache_hit_ema = None
         self.cache_prev = {}
         self.last_stats_log = now()
@@ -431,7 +442,6 @@ class GameLooper(object):
             finished = []
             self.forest.resolve_all_inflight()
             for game in self.active_games:
-                base_mbs = game.config.micro_batch
                 g_mbs = micro_batch_for(game.tree, game.config)
                 sf_terminal, mcts_terminal = False, False
 
@@ -480,7 +490,7 @@ class GameLooper(object):
                 this_mbs = min(g_mbs, macro - filled)
                 res = game.tree.collect_many_leaves(this_mbs)
                 nn, n_leafs = self.process_results(
-                    res, counts, this_mbs, g_mbs > base_mbs)
+                    res, counts, this_mbs, g_mbs)
                 mbs_used.append(this_mbs)
                 filled += nn
 
@@ -508,7 +518,7 @@ class GameLooper(object):
         self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=True)
         return 0
 
-    def process_results(self, res, counts, asked, doubled):
+    def process_results(self, res, counts, asked, sched):
         nn = res.count_new
         nt = res.count_terminal
         nc = res.count_cached
@@ -532,9 +542,11 @@ class GameLooper(object):
         # came back with fewer new leaves than asked: blocked or early stop
         short = int(not f_stop and nn < asked)
 
+        # the call's step in mbs_schedule: 2 or less, 4, 8, 16 and up
+        step = [sched <= 2, 2 < sched <= 4, 4 < sched <= 8, sched > 8]
         counts.add((
             nn, fastpaths, nt, nc, f_stop, short,
-            bl, pu, mv, sk, pr, pen, dp, sh, int(doubled)
+            bl, pu, mv, sk, pr, pen, dp, sh, *map(int, step)
         ))
 
         return nn, n_leafs
@@ -668,24 +680,29 @@ class GameLooper(object):
 
         (s_collected, s_fast, s_terminals, s_cached, s_fast_stops,
          s_short, s_blocked, s_puct, s_must_visit, s_skipped,
-         s_pruned, s_penalty, s_depth, s_sharp, s_doubled) = (int(v) for v in col)
+         s_pruned, s_penalty, s_depth, s_sharp,
+         s_mbs2, s_mbs4, s_mbs8, s_mbs16) = (int(v) for v in col)
 
         # rate() is destructive, so each meter is read exactly once here
         raw_mps = self.mps.rate()
         raw_lps = self.lps.rate()
         span = (LC0_RATE_EMA_SPAN if self.config.telemetry_kind == "lc0"
                 else RATE_EMA_SPAN)
-        self.mps_ema = ema_step(self.mps_ema, raw_mps, span)
-        self.lps_ema = ema_step(self.lps_ema, raw_lps, span)
-        raw_spm = raw_lps / raw_mps if raw_mps else 0.0
-        self.spm_ema = ema_step(self.spm_ema, raw_spm, SPM_EMA_SPAN)
+        # the first window is startup (loading, empty trees): the rate EMAs
+        # skip it and seed on the second
+        self.rate_pushes += 1
+        if self.rate_pushes > 1:
+            self.mps_ema = ema_step(self.mps_ema, raw_mps, span)
+            self.lps_ema = ema_step(self.lps_ema, raw_lps, span)
+            raw_spm = raw_lps / raw_mps if raw_mps else 0.0
+            self.spm_ema = ema_step(self.spm_ema, raw_spm, SPM_EMA_SPAN)
 
         telemetry = {
             "ts": ts_now,
             "window_s": window_s,
-            "mps": self.mps_ema,
-            "lps": self.lps_ema,
-            "spm": self.spm_ema,
+            "mps": self.mps_ema or 0.0,
+            "lps": self.lps_ema or 0.0,
+            "spm": self.spm_ema or 0.0,
             "mbs": np.mean(mbs_used) if mbs_used else 0.0,
             "apl": np.mean(lpb) if lpb else 0.0,
             "n_preds": len(lpb),
@@ -704,7 +721,7 @@ class GameLooper(object):
             "s_cached": s_cached,
             "s_fast_stops": s_fast_stops,
             "s_short": s_short,
-            "s_doubled": s_doubled,
+            "s_mbs2": s_mbs2, "s_mbs4": s_mbs4, "s_mbs8": s_mbs8, "s_mbs16": s_mbs16,
 
             "s_blocked": s_blocked,
             "s_puct": s_puct,

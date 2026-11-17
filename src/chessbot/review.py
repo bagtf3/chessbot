@@ -9,7 +9,7 @@ RECENT_GAMES_CAP = 20000
 # telemetry dict. Only these get scaled onto the print's span.
 COUNTER_KEYS = (
     "n_groups", "s_collected", "s_fast", "s_terminals", "s_cached",
-    "s_fast_stops", "s_short", "s_doubled", "s_blocked", "s_puct", "s_must_visit",
+    "s_fast_stops", "s_short", "s_mbs2", "s_mbs4", "s_mbs8", "s_mbs16", "s_blocked", "s_puct", "s_must_visit",
     "s_skipped", "s_pruned", "s_penalty", "s_depth", "s_sharp", "n_preds",
 )
 from collections import defaultdict, deque
@@ -583,6 +583,7 @@ class GameViewer:
 
     def print_pv_block(self, pv, min_vis):
         board_tmp = chess.Board(self.board.fen())
+        sign = 1 if self.board.white_to_move() else -1
         rows = []
         for i, step in enumerate(pv):
             visits = int(step.get("visits", 0))
@@ -597,7 +598,7 @@ class GameViewer:
 
             san = board_tmp.san(chess.Move.from_uci(uci))
             p = step.get("P", 0.0)
-            q = step.get("Q", 0.0)
+            q = step.get("Q", 0.0) * sign
 
             rows.append((i + 1, san, uci, visits, float(p), float(q), played))
             board_tmp.push_uci(uci)
@@ -609,67 +610,13 @@ class GameViewer:
         san_w = max(8, max(len(r[1]) for r in rows))
         uci_w = max(6, max(len(r[2]) for r in rows))
 
+        to_move = "White" if sign > 0 else "Black"
+        print(f"  (Q from {to_move}'s view, the side to move at this ply)")
         for no, san, uci, visits, p, q, played in rows:
             star = " *" if played else ""
             line = (f"{no:3d}. {san:<{san_w}}  uci={uci:<{uci_w}}  "
-                    f"visits={visits:5d}  P={p:0.4f}  Q={q:0.4f}{star}")
+                    f"visits={visits:5d}  P={p:0.4f}  Q={q:+0.4f}{star}")
             print(line)
-
-    def compute_rsc_top5(self, children):
-        if not children:
-            return {}
-
-        items = list(children)
-        items.sort(key=lambda x: x.get("visits", 0), reverse=True)
-
-        k = min(5, len(items))
-        top = items[:k]
-
-        if k == 1:
-            uci = top[0].get("uci", "")
-            return {uci: 1.0}
-
-        flip = 1.0 if self.board.white_to_move() else -1.0
-
-        def minmax(vals):
-            lo = min(vals)
-            hi = max(vals)
-            if hi <= lo:
-                return [0.5 for _ in vals]
-            return [(v - lo) / (hi - lo) for v in vals]
-
-        def to_prob(vals01):
-            s = sum(vals01)
-            if s <= 0.0:
-                kk = len(vals01)
-                return [1.0 / kk for _ in vals01]
-            return [v / s for v in vals01]
-
-        visits = [c.get("visits", 0) for c in top]
-        vs = [c.get("visit_share", 0.0) for c in top]
-        q = [flip * c.get("Q", 0.0) for c in top]
-        qe = [flip * c.get("Qema", 0.0) for c in top]
-        ds = [c.get("Qdelta_sign", 0.0) for c in top]
-
-        p_vis = to_prob(minmax(visits))
-        p_vs = to_prob(minmax(vs))
-        p_q = to_prob(minmax(q))
-        p_qe = to_prob(minmax(qe))
-        p_ds = to_prob(minmax(ds))
-
-        w = 0.2
-        out = {}
-        for i in range(k):
-            score = (
-                w * p_vis[i]
-                + w * p_vs[i]
-                + w * p_q[i]
-                + w * p_qe[i]
-                + w * p_ds[i]
-            )
-            out[top[i].get("uci", "")] = score
-
-        return out
 
     def fpu_q(self, cands):
         """STM-POV Q that PUCT assigns an unvisited child: root Q, taken as
@@ -681,7 +628,7 @@ class GameViewer:
         q = sum(c.get("visits", 0) * c.get("Q", 0.0) for c in cands) / n
         return q * sign - self.log.get("fpu_reduction", 0.1)
 
-    def print_header(self, show_rank=False, show_rsc=False):
+    def print_header(self, show_rank=False):
         cols = [
             ("SAN", 7), ("N", 6), ("vs", 7),
             ("|", 1),
@@ -691,9 +638,6 @@ class GameViewer:
             ("|", 1),
             ("flags", 9),
         ]
-
-        if show_rsc:
-            cols.append(("rsc", 7))
 
         if show_rank:
             cols.append(("rank", 7))
@@ -717,8 +661,6 @@ class GameViewer:
         mark=False,
         show_rank=False,
         rank_val=None,
-        show_rsc=False,
-        rsc_val=None,
         extra_flags=None,
         fpu_q=None,
     ):
@@ -771,10 +713,6 @@ class GameViewer:
             f"{flags_txt:^9}",
         ]
 
-        if show_rsc:
-            rv = "" if rsc_val is None else f"{rsc_val:0.3f}"
-            parts.append(f"{rv:^7}")
-
         if show_rank:
             r = rank_val if rank_val is not None else ""
             parts.append(f"{r!s:<7}")
@@ -815,6 +753,11 @@ class GameViewer:
             f"max_depth={max_d} children visited={cv}/{tc}"
         )
         print(line)
+        if "vscale_gate_q" not in self.log:
+            print("  (log predates raw stats: Q, Qe, Qmm and PV Q are vscaled; "
+                  "Best Q is raw)")
+        print(f"  values are {'White' if self.turn() else 'Black'}'s view "
+              f"(side to move); SF cp too")
 
         visits_list = [c.get("visits", 0) for c in cands]
         priors_list = [c.get("P", 0.0) for c in cands]
@@ -960,9 +903,8 @@ class GameViewer:
                         and uci != xc0_move and not is_samp)
             return extra, mark
 
-        self.print_header(show_rank=need_rank, show_rsc=True)
+        self.print_header(show_rank=need_rank)
         fq = self.fpu_q(cands)
-        rsc_map = self.compute_rsc_top5(cands_sorted[:top_n])
 
         for i, c in enumerate(cands_sorted[:top_n]):
             uci = c.get("uci")
@@ -972,8 +914,6 @@ class GameViewer:
                 mark=mark,
                 show_rank=need_rank,
                 rank_val=(i + 1) if need_rank else None,
-                show_rsc=True,
-                rsc_val=rsc_map.get(uci),
                 extra_flags=extra,
                 fpu_q=fq,
             )
@@ -989,8 +929,6 @@ class GameViewer:
                 mark=mark,
                 show_rank=True,
                 rank_val=i + 1,
-                show_rsc=True,
-                rsc_val=None,
                 extra_flags=extra,
                 fpu_q=fq,
             )
@@ -1113,14 +1051,13 @@ class GameViewer:
                 mark = True
 
         print(f"  === Showing visit info for {uci_or_san} ===")
-        self.print_header(show_rank=True, show_rsc=False)
+        self.print_header(show_rank=True)
         fq = self.fpu_q(cands)
         self.print_row(
             move,
             mark=mark,
             show_rank=True,
             rank_val=rank,
-            show_rsc=False,
             extra_flags=extra,
             fpu_q=fq,
         )
@@ -1183,12 +1120,14 @@ class GameViewer:
                 total -= val * len(board.pieces(pt, chess.BLACK))
             return total
 
-        def sac_q(ply, sign):
+        def sac_q(ply, stm, sac_color):
+            """best_wdl is STM-POV for the position searched at ply; turn it
+            to the sacrificer's POV."""
             node = self.tree_data.get(ply) or self.tree_data.get(str(ply))
             wdl = node.get("best_wdl") if node else None
             if not wdl:
                 return None
-            return (wdl[0] - wdl[2]) * sign
+            return (wdl[0] - wdl[2]) * (1 if stm == sac_color else -1)
 
         def nbrq_count(board, color):
             return sum(
@@ -1238,7 +1177,8 @@ class GameViewer:
             for k in range(i + 1, i + 1 + self.SAC_HOLD_PLIES):
                 probe.push(chess.Move.from_uci(self.moves_uci[k]))
                 mat = material_white(probe) * sign
-                q = sac_q(k + 1, sign)
+                # tree_data[k + 1] searched probe's position
+                q = sac_q(k + 1, probe.turn, sac_color)
                 if mat > -self.SAC_MATERIAL or q is None or q <= self.SAC_Q:
                     ok = False
                     break
@@ -1454,129 +1394,6 @@ class GameViewer:
         
         ent, norm = calc_entropy(p)
         return norm, p
-
-    def generate_training_data(self, min_visits=200, cpl_threshold=60, skip_sf_moves=False, min_ply=0,
-                               emit_lc0=False, policy_clip=0.6, **kwargs):
-        """
-        Walk the game and produce Xerces training examples.
-        - Plies below min_ply are skipped.
-        - If skip_sf_moves, all plies where stockfish moved are skipped.
-        - Plies with fewer than min_visits total MCTS visits are skipped.
-        - If sf_df was passed to __init__ and cpl_threshold is set, plies where
-          the played move's CPL (loss column) exceeds cpl_threshold are skipped.
-          Plies with no matching SF row are also skipped when SF data is present.
-        - policy_clip caps per-move visit prob (renormalized); None disables it.
-        - emit_lc0 also returns per-ply lc0 (112,8,8) features and the ply index,
-          appended as two extra lists (X, M, P, Z, V, WDL, R, L, PLY).
-        """
-        X, M, P, Z, V, WDL, R, L, PLY = [], [], [], [], [], [], [], [], []
-        result = self.result
-        self.reset()
-
-        use_cpl_filter = (self.sf_rows is not None) and (cpl_threshold is not None)
-
-        total_plies = len(self.moves_uci)
-        while self.ply < total_plies:
-            move_played = self.moves_uci[self.ply]
-            mover = self.who_moved().lower()
-            is_white_move = "white" in mover
-            is_sf_move = "stockfish" in mover
-
-            if self.ply < min_ply:
-                self.next()
-                continue
-
-            if skip_sf_moves and is_sf_move:
-                self.next()
-                continue
-
-            if use_cpl_filter:
-                sf_row = self.sf_row_for_ply(self.ply)
-                if sf_row is None or sf_row['loss'] > cpl_threshold:
-                    self.next()
-                    continue
-
-            rb = self.board
-            lms = rb.legal_moves()
-
-            node = self.tree_data.get(self.ply, {})
-            if not node:
-                self.next()
-                continue
-
-            cms = node.get("candidate_moves", {})
-            if not cms:
-                self.next()
-                continue
-
-            visits = [[x['uci'], x['visits']] for x in cms]
-
-            if sum(v[1] for v in visits) < min_visits:
-                self.next()
-                continue
-
-            visited = set(x[0] for x in visits)
-            for move in [l for l in lms if l not in visited]:
-                visited.add(move)
-                visits.append([move, 1])
-
-            visits = sorted(visits, key=lambda x: x[1], reverse=True)
-
-            counts = np.array([x[1] for x in visits], dtype=np.float32)
-            s = counts.sum()
-            if s > 0.0:
-                pi = counts / s
-            else:
-                n_l = len(lms)
-                if n_l == 0:
-                    self.next()
-                    continue
-                pi = np.ones(n_l, dtype=np.float32) / float(n_l)
-            if policy_clip is not None:
-                pi = np.minimum(pi, policy_clip)
-                pi /= pi.sum()
-
-            # map legal moves -> flat xerces indices and build policy
-            
-            visited = [x[0] for x in visits]
-            indices = rb.moves_to_indices(visited)
-            policy = np.zeros(64 * 67, dtype=np.float32)
-            for idx, prob in zip(indices, pi):
-                policy[idx] += prob
-
-            # inputs and mask
-            x = rb.encode_64_tokens()
-            mask = rb.legal_move_mask()
-
-            # value target 0.5*Z + 0.5*best_q (q of most visited child)
-            wdl = node.get("best_wdl")
-            this_q = (wdl[0] - wdl[2]) if wdl is not None else 0.0
-            this_q_stm = this_q if is_white_move else -this_q
-            if result > 0:
-                z = 1 if is_white_move else -1
-            elif result < 0:
-                z = -1 if is_white_move else 1
-            else:
-                z = 0
-            
-            this_wdl = node.get("best_wdl")
-            X.append(x)
-            M.append(mask)
-            P.append(policy)
-            Z.append(z)
-            V.append(this_q_stm)
-            WDL.append(this_wdl)
-            R.append(len(self.moves_uci) - int(self.ply))
-            if emit_lc0:
-                L.append(rb.lc0_features())
-                PLY.append(int(self.ply))
-
-            # advance to next ply using existing helper
-            self.next()
-
-        if emit_lc0:
-            return X, M, P, Z, V, WDL, R, L, PLY
-        return X, M, P, Z, V, WDL, R
 
 
 def load_game_index(path=None):
@@ -2174,7 +1991,7 @@ class RecordKeeper(object):
 
         to_sum = [
             "mps", "lps", "n_active", "n_groups", "s_collected", "s_fast",
-            "s_terminals", "s_cached", "s_fast_stops", "s_short", "s_doubled",
+            "s_terminals", "s_cached", "s_fast_stops", "s_short", "s_mbs2", "s_mbs4", "s_mbs8", "s_mbs16",
             "s_blocked", "s_puct", "preds_per_second", "calls_per_s",
 
             "s_must_visit",
@@ -2314,7 +2131,6 @@ class RecordKeeper(object):
         s_cached = summed.get("s_cached", 0)
         s_fast_stops = summed.get("s_fast_stops", 0)
         s_short = summed.get("s_short", 0)
-        s_doubled = summed.get("s_doubled", 0)
         s_blocked = summed.get("s_blocked", 0)
         s_puct = summed.get("s_puct", 0)
         s_depth = summed.get("s_depth", 0)
@@ -2333,7 +2149,8 @@ class RecordKeeper(object):
 
         fp_pct = 100.0 * s_fast_stops / n_groups
         short_pct = 100.0 * s_short / n_groups
-        doubled_pct = 100.0 * s_doubled / n_groups
+        mbs_pct = [100.0 * summed.get(k, 0) / n_groups
+                   for k in ("s_mbs2", "s_mbs4", "s_mbs8", "s_mbs16")]
         n_preds = summed.get("n_preds", 0)
         games_per_pass = n_groups / n_preds if n_preds else 0.0
 
@@ -2386,8 +2203,9 @@ class RecordKeeper(object):
         row("loop", [("calls/s", f"{summed.get('calls_per_s', 0.0):.0f}"),
                      ("games/pass", f"{games_per_pass:.1f}")],
             [("asked/got", f"{avged['mbs']:.2f} / {avg_new:.2f}")])
+        # % of calls at each mbs_schedule step (leaves asked): 2, 4, 8, 16+
         row("stops", [("short", f"{short_pct:.1f}%"), ("fp", f"{fp_pct:.2f}%")],
-            [("2x calls", f"{doubled_pct:.1f}%")])
+            [("2/4/8/16", "/".join(f"{x:.0f}" for x in mbs_pct))])
         row("cache", [("cached", f"{pct_cached_overall:.1f}%"),
                       ("terminal", f"{pct_term_overall:.1f}%")])
         row("pred", [("fill", f"{apl:.1f}"), ("duty", f"{duty_cycle * 100:.1f}%")],

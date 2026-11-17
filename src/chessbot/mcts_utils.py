@@ -200,7 +200,9 @@ class MCTSTree(fasttree):
         Deterministic Xerces choice (no sampling), returning:
         (uci, method) where method is "robust" or "most_visited".
         """
-        if self.sim_stop_reason == "full" and self.config.use_robust:
+        # the search controller always plays the most visited move
+        ctrl_on = self.get_params("ctrl_enable")["ctrl_enable"]
+        if self.sim_stop_reason == "full" and self.config.use_robust and not ctrl_on:
             uci = self.select_using_robust()
             return uci, "robust"
 
@@ -362,6 +364,7 @@ class ChessGame(object):
 
         # scenario overrides are already applied to the spec's cfg
         self.tree = MCTSTree(self.board, self.config)
+        self.sync_controller()
         self.tree_data = {}
         self.moves_played = []
         self.recents = []
@@ -431,6 +434,8 @@ class ChessGame(object):
             "dirichlet_eps": cfg.dirichlet_eps,
             "prior_uniform_eps": cfg.prior_uniform_eps,
             "fpu_reduction": cfg.fpu_reduction,
+            "vscale": cfg.vscale,
+            "vscale_gate_q": cfg.vscale_gate_q,
             "move_sample_temp_range": cfg.move_sample_temp_range,
             "move_sample_temp_plies": cfg.move_sample_temp_plies,
         }
@@ -444,6 +449,17 @@ class ChessGame(object):
     def is_stockfish_turn(self):
         return self.vs_stockfish and (self.stockfish_is_white == self.turn())
     
+    def sync_controller(self, next_mover=False):
+        """The search controller runs on xc0's own moves only; Stockfish's
+        turns search to sf_move_sims with it off, and record nothing.
+        next_mover: set it for the side about to move, before the tree
+        advances, so the advance (no subtree reuse) and the move's sims
+        budget follow that side's setting."""
+        sf = self.is_stockfish_turn() != (next_mover and self.vs_stockfish)
+        on = self.config.ctrl_enable and not sf
+        if self.tree.get_params("ctrl_enable")["ctrl_enable"] != on:
+            self.tree.set_params(ctrl_enable=on, ctrl_record=on and self.config.ctrl_record)
+
     def push_move(self, mv, method, xc0_move):
         # collect search data then push and update
         self.collect_tree_search_data(mv, method, xc0_move)
@@ -453,6 +469,7 @@ class ChessGame(object):
             self.mcts_plies += 1
 
         # advance tree (pushes move) and reset
+        self.sync_controller(next_mover=True)
         self.tree.advance(self.board, mv)
 
         # keep python chess board sync'd too
@@ -469,7 +486,8 @@ class ChessGame(object):
         if not root.is_expanded:
             return
         
-        sp = self.tree.get_params("c_puct", "sims_min", "sims_max")
+        sp = self.tree.get_params(
+            "c_puct", "sims_min", "sims_max", "ctrl_enable", "ctrl_record")
         c_puct = sp["c_puct"]
 
         # timing
@@ -505,7 +523,7 @@ class ChessGame(object):
         best_q = rnd(best_d.Q, 4)
         Q_white = best_q
         Q_stm = Q_white if turn else -Q_white
-        # resignation reads the unscaled search WDL, not the vscaled Q
+        # resignation reads the search WDL
         resign_q = best_wdl[0] - best_wdl[2]
         if self.is_stockfish_turn():
             Q_stm = self.sf_eval
@@ -545,6 +563,11 @@ class ChessGame(object):
         if self.is_stockfish_turn():
             # SF's tanh(cp) value at play time, STM-POV
             data["sf_value"] = rnd(self.sf_eval, 4)
+        if sp["ctrl_record"]:
+            data["ctrl"] = self.tree.get_ctrl_record()
+        # rescore's controller stats; the lean log keeps the heads and rejections
+        if sp["ctrl_enable"]:
+            data["ctrl_sum"] = self.tree.get_ctrl_summary()
 
         # sumN for U term
         sumN = max(1, root.N)

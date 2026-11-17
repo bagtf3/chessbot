@@ -94,11 +94,39 @@ RECENT_WINDOW = 100
 # stop/blunder stat blocks print every N analyzed games; their window
 # accumulators reset on print, so this is the cadence and the window both
 STATS_WINDOW_GAMES = 200
+CTRL_WINDOW_GAMES = 100
 # SF rescore search caps. cfg.rescore_movetime_ms is the tunable budget; the
 # catch-up trim and the depth backstop stay fixed so there is one knob.
 
 C = 0.9699
 D = d = np.arctanh(0.5)
+
+# Rescore shortcuts. A move that follows an earlier search's PV is not
+# searched: CPL 0, scored at the bookend's eval, once the bookend (the
+# position where the game leaves the PV, searched anyway) confirms the PV's
+# eval within PV_CONFIRM_ES expected score; otherwise every skipped move is
+# searched. Positions with search |Q| or D above DECIDED_QD get
+# DECIDED_TIME_FRAC of the movetime; other positions from BUSY_MIN_PLY on
+# (game ply from startpos, by the FEN's move counters) with more than
+# BUSY_LEGAL legal moves or BUSY_MATERIAL material get BUSY_EXTRA_MS more.
+# An extended controller search that changed its leader has both moves
+# scored in one multipv search at PAIR_TIME_MULT of the movetime.
+PV_CONFIRM_ES = 0.02
+DECIDED_QD = 0.9
+DECIDED_TIME_FRAC = 0.8
+BUSY_MIN_PLY = 10
+BUSY_LEGAL = 30
+BUSY_MATERIAL = 60
+BUSY_EXTRA_MS = 20
+PAIR_TIME_MULT = 2.25
+PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5,
+                chess.QUEEN: 9}
+
+
+def material(board):
+    """Both sides' material in pawns."""
+    return sum(v * len(board.pieces(pt, c))
+               for pt, v in PIECE_VALUES.items() for c in chess.COLORS)
 
 
 def count_jsonl_lines(path):
@@ -106,6 +134,70 @@ def count_jsonl_lines(path):
         return 0
     with open(path, "r", encoding="utf-8") as f:
         return sum([1 for _ in f])
+
+
+class CtrlStats:
+    """Running sums of the search controller's per-move outcomes. Each group
+    is [moves, sims, TSL, CPL, blunders]."""
+    GROUPS = ("ctrl", "lock", "ext ctrl", "ext lock", "other")
+
+    def __init__(self):
+        self.groups = {g: [0, 0.0, 0.0, 0.0, 0] for g in self.GROUPS}
+        self.all = [0, 0.0, 0.0, 0.0, 0]
+        self.old = [0, 0.0, 0.0, 0.0, 0]
+        self.n = 0
+        self.sims = self.sched = 0          # moves the controller ran
+        self.old_sims = self.old_sched = 0
+        self.n_ext = 0
+        self.n_multi = 0                    # moves extended more than once
+        self.ext_extra = self.ext_changed = 0.0
+        # extended moves: [moves, TSL] for a kept leader; [moves, TSL,
+        # rejected TSL] where the leader changed, both from the side-by-side
+        # pair search
+        self.ext_same = [0, 0.0]
+        self.ext_chg = [0, 0.0, 0.0]
+        self.ms = self.checkins = self.stab = self.qual = self.ties = 0.0
+
+    @staticmethod
+    def bump(g, sims, cpl, esl, blunder):
+        g[0] += 1
+        g[1] += sims
+        g[2] += 1000 * esl
+        g[3] += cpl
+        g[4] += esl >= blunder
+
+    def add_ctrl(self, c, reason, sims, cpl, esl, played, blunder, pair_esl=None):
+        group = ("ext " if c['ext'] else "") + reason
+        if group not in self.GROUPS:
+            group = "other"
+        if c['ext']:
+            self.n_ext += 1
+            self.ext_extra += sims - c['sims_max_start']
+            self.ext_changed += played != c['rejected']
+            self.n_multi += c['ext'] >= 2
+            if played == c['rejected']:
+                self.ext_same[0] += 1
+                self.ext_same[1] += 1000 * esl
+            elif pair_esl is not None:
+                self.ext_chg[0] += 1
+                self.ext_chg[1] += 1000 * pair_esl[0]
+                self.ext_chg[2] += 1000 * pair_esl[1]
+        self.bump(self.groups[group], sims, cpl, esl, blunder)
+        self.bump(self.all, sims, cpl, esl, blunder)
+        self.n += 1
+        if c['checkins']:
+            self.sims += sims
+            self.sched += c['sims_max_start']
+        self.ms += c['ms']
+        self.checkins += c['checkins']
+        self.stab += c['stab']
+        self.qual += c['qual']
+        self.ties += c['ties']
+
+    def add_old(self, sims, cpl, esl, sims_max, blunder):
+        self.bump(self.old, sims, cpl, esl, blunder)
+        self.old_sims += sims
+        self.old_sched += sims_max or 0
 
 
 class SFRescoreThread:
@@ -155,6 +247,140 @@ class SFRescoreThread:
             self.eng.quit()
             self.eng = None
 
+    def search(self, ply_idx, board, xerces_uci, limits, rejected=None):
+        """Best move and xc0's move under limits, a (pass1, pass2) pair. When
+        xc0 played something other than the controller's rejected leader, both
+        moves are also scored side by side at PAIR_TIME_MULT of the movetime."""
+        pass1_limit, pass2_limit = limits
+        elapsed = 0.0
+        depths = []
+        t0 = time.time()
+        info = self.eng.analyse(board, pass1_limit, info=chess.engine.INFO_ALL)
+        elapsed += time.time() - t0
+        depth = info.get('depth', 0)
+        pv = [str(m) for m in info.get('pv', [])]
+        best_uci = pv[0]
+        best_cp = score_cp_stm_pov(info['score'])
+        best_abs = score_cp_white_pov(info['score'])
+
+        # pass 2: score xerces's move only if it differs from best
+        rerun = xerces_uci != best_uci
+        if rerun:
+            t0 = time.time()
+            info2 = self.eng.analyse(board, pass2_limit, info=chess.engine.INFO_ALL,
+                                     root_moves=[chess.Move.from_uci(xerces_uci)])
+            elapsed += time.time() - t0
+            depths.append(info2.get('depth', 0))
+            played_cp = score_cp_stm_pov(info2['score'])
+            played_abs = score_cp_white_pov(info2['score'])
+        else:
+            played_cp, played_abs = best_cp, best_abs
+            depths.append(depth)
+
+        pair_cp = None
+        if rejected and rejected != xerces_uci:
+            t0 = time.time()
+            infos = self.eng.analyse(
+                board, chess.engine.Limit(time=self.movetime_ms * PAIR_TIME_MULT / 1000.0,
+                                          depth=self.max_depth),
+                multipv=2,
+                root_moves=[chess.Move.from_uci(m) for m in (xerces_uci, rejected)])
+            elapsed += time.time() - t0
+            cps = {str(i['pv'][0]): score_cp_stm_pov(i['score'])
+                   for i in infos if i.get('pv')}
+            if xerces_uci in cps and rejected in cps:
+                pair_cp = (cps[xerces_uci], cps[rejected])
+
+        return {
+            'pair_cp':    pair_cp,    # (xc0's move, rejected leader)
+            'ply_idx':    ply_idx,
+            'best_uci':   best_uci,
+            'pv_ucis':    pv[:3],
+            'pv':         pv,
+            'best_cp':    best_cp,
+            'best_abs':   best_abs,
+            'played_cp':  played_cp,
+            'played_abs': played_abs,
+            'elapsed':    elapsed,
+            'best_depth': depth,      # pass 1, the free search
+            'depth':      depths[0],  # pass 2, the played move
+            'depths':     depths,
+            'rerun':      rerun,
+        }
+
+    @staticmethod
+    def unsearched(ply_idx, board, xerces_uci, abs_cp, depth, pv, why):
+        """A result scored without a search: xc0's move is the best move, at
+        a white-POV eval taken from elsewhere."""
+        cp = abs_cp if board.turn == chess.WHITE else -abs_cp
+        return {
+            'ply_idx': ply_idx, 'best_uci': xerces_uci, 'pv_ucis': pv[:3], 'pv': pv,
+            'best_cp': cp, 'best_abs': abs_cp, 'played_cp': cp, 'played_abs': abs_cp,
+            'elapsed': 0.0, 'best_depth': depth, 'depth': depth, 'depths': [],
+            'rerun': False, 'skipped': why,
+        }
+
+    def rescore_game(self, positions, moves, tiers):
+        """One game's positions in ply order. Forced moves are not searched.
+        A move on the PV of the last searched position is not searched
+        either. The bookend is the next searched position still on the PV's
+        line (where xc0 left it: SF's best and the move played, as for any
+        position); if its eval matches the PV's, the skipped moves get CPL 0
+        at the bookend's eval, else they are searched. With no such position
+        (the game ends, or a move off the PV came first) the last skipped
+        move is searched as the bookend."""
+        out = {}
+        origin = None   # (ply, result) whose PV the game is following
+        chain = []      # positions on origin's PV, not searched yet
+        last_abs = 0.0
+
+        def on_line(k):
+            # the game reached k along origin's PV
+            o_ply, o_res = origin
+            off = k - o_ply
+            return 0 < off <= len(o_res['pv']) and moves[o_ply:k] == o_res['pv'][:off]
+
+        def on_pv(k, xerces_uci):
+            off = k - origin[0]
+            pv = origin[1]['pv']
+            return on_line(k) and off < len(pv) and xerces_uci == pv[off]
+
+        def settle(k=None, book=None):
+            if not chain:
+                return
+            if book is None or not on_line(k):
+                last = chain.pop()
+                book = self.search(last[0], last[1], last[2], tiers[last[3]])
+                out[last[0]] = book
+            o_res = origin[1]
+            # expected-score gap either way, white POV
+            gap = max(expected_score_loss(o_res['best_abs'], book['best_abs']),
+                      expected_score_loss(book['best_abs'], o_res['best_abs']))
+            for c, board, xerces_uci, tier, _ in chain:
+                off = c - origin[0]
+                out[c] = (self.unsearched(c, board, xerces_uci, book['best_abs'],
+                                          book['best_depth'], o_res['pv'][off:], "pv")
+                          if gap <= PV_CONFIRM_ES
+                          else self.search(c, board, xerces_uci, tiers[tier]))
+            chain.clear()
+
+        for pos in positions:
+            k, board, xerces_uci, tier, rejected = pos
+            if board.legal_moves.count() == 1:
+                out[k] = self.unsearched(k, board, xerces_uci, last_abs, 0, [], "forced")
+                continue
+            # a rejected leader needs its own score, so it is never skipped
+            if origin is not None and not rejected and on_pv(k, xerces_uci):
+                chain.append(pos)
+                continue
+            r = self.search(k, board, xerces_uci, tiers[tier], rejected)
+            settle(k, r)
+            out[k] = r
+            last_abs = r['best_abs']
+            origin = (k, r) if r['pv'] else None
+        settle()
+        return [out[k] for k in sorted(out)]
+
     def run(self):
         self.eng = chess.engine.SimpleEngine.popen_uci(SF_LOC, timeout=180)
         self.eng.configure(self.sf_config)
@@ -169,72 +395,30 @@ class SFRescoreThread:
             gid, positions, info = item
             results = []
 
-            # read both keys before the loop rebinds info to an analyse result
             movetime_ms = info.get("movetime_ms", self.movetime_ms)
             fixed_depth = info.get("depth")
 
+            def timed(ms):
+                # longer search for pass2 because Xc0 move may be better
+                return (chess.engine.Limit(time=ms / 1000.0, depth=self.max_depth),
+                        chess.engine.Limit(time=(ms + 20) / 1000.0, depth=self.max_depth))
+
             if fixed_depth:
                 # replay probes run to a flat depth with no time cap
-                pass1_limit = chess.engine.Limit(depth=fixed_depth)
-                pass2_limit = pass1_limit
+                flat = chess.engine.Limit(depth=fixed_depth)
+                limits = (flat, flat)
             else:
-                pass1_limit = chess.engine.Limit(
-                    time= movetime_ms/ 1000.0, depth=self.max_depth)
+                limits = timed(movetime_ms)
+            tiers = {None: limits,
+                     "decided": timed(movetime_ms * DECIDED_TIME_FRAC),
+                     "busy": timed(movetime_ms + BUSY_EXTRA_MS)}
 
-                # longer search for pass2 because Xc0 move may be better
-                pass2_limit = chess.engine.Limit(
-                    time=(movetime_ms + 20)/ 1000.0, depth=self.max_depth)
-            
             try:
-                for ply_idx, board, xerces_uci in positions:
-                    elapsed = 0.0
-                    depths = []
-
-                    # pass 1: full best-move analysis
-                    t0 = time.time()
-                    info = self.eng.analyse(
-                        board, pass1_limit, info=chess.engine.INFO_ALL)
-                    
-                    elapsed += time.time() - t0
-                    depth = info.get('depth', 0)
-                    best_uci = str(info['pv'][0])
-                    pv_ucis  = [str(m) for m in info.get('pv', [])[:3]]
-                    best_cp  = score_cp_stm_pov(info['score'])
-                    best_abs = score_cp_white_pov(info['score'])
-
-                    # pass 2: score xerces's move only if it differs from best
-                    rerun = xerces_uci != best_uci
-                    if rerun:
-                        t0 = time.time()
-                        info2 = self.eng.analyse(
-                            board, pass2_limit,
-                            root_moves=[chess.Move.from_uci(xerces_uci)],
-                            info=chess.engine.INFO_ALL,
-                        )
-                        elapsed  += time.time() - t0
-                        depths.append(info2.get('depth', 0))
-                        played_cp  = score_cp_stm_pov(info2['score'])
-                        played_abs = score_cp_white_pov(info2['score'])
-                    else:
-                        played_cp  = best_cp
-                        played_abs = best_abs
-                        depths.append(depth)
-
-                    results.append({
-                        'ply_idx':    ply_idx,
-                        'best_uci':   best_uci,
-                        'pv_ucis':    pv_ucis,
-                        'best_cp':    best_cp,
-                        'best_abs':   best_abs,
-                        'played_cp':  played_cp,
-                        'played_abs': played_abs,
-                        'elapsed':    elapsed,
-                        'best_depth': depth,      # pass 1, the free search
-                        'depth':      depths[0],  # pass 2, the played move
-                        'depths':     depths,
-                        'rerun':      rerun,
-                    })
-            
+                if info.get("moves") is None:
+                    results = [self.search(pos[0], pos[1], pos[2], limits)
+                               for pos in positions]
+                else:
+                    results = self.rescore_game(positions, info["moves"], tiers)
             except Exception as e:
                 self.res_q.put(('__error__', e))
                 self.stop_ev.set()
@@ -279,7 +463,7 @@ class Rescorer(object):
         self.written_this_round = 0
         self.n_saved = 0
         self.total_cpl_plies = 0.0
-        self.total_bmr_plies = 0.0
+        self.total_tsl_plies = 0.0
         self.total_blunder_plies = 0.0
         self.total_kl_plies = 0.0
         self.total_ce_plies = 0.0
@@ -292,12 +476,13 @@ class Rescorer(object):
         self.sf_compute_count = 0
         self.sf_call_count = 0
         self.sf_rerun_count = 0
+        self.sf_skipped = 0
         self.n_sf_workers = cfg.rescore_n_sf_workers
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
         self.current_movetime_ms = 0
         self.recent_cpls = []
-        self.recent_bmrs = []
+        self.recent_tsls = []
         self.recent_blunders = []
         self.recent_kls = []
         self.recent_ces = []
@@ -308,6 +493,13 @@ class Rescorer(object):
         zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
         self.total_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
         self.window_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
+
+        # search controller, xc0's own moves only; printed and dropped every
+        # CTRL_WINDOW_GAMES games
+        # running sums since this process started; printed every
+        # CTRL_WINDOW_GAMES games
+        self.ctrl_acc = CtrlStats()
+        self.ctrl_games = 0
 
         zero_blunder = lambda: {'n': 0, 'cpl': 0.0, 'lc0': 0}
         self.total_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
@@ -859,7 +1051,19 @@ class Rescorer(object):
                 'resolved': False,
             }
 
-            to_sf_positions.append((i, board_ch.copy(), xerces_uci))
+            # SF time tier: decided by the search's own WDL (STM), else busy
+            # by legal moves or material
+            sw = tr.get('best_wdl') or (0.0, 0.0, 0.0)
+            if abs(sw[0] - sw[2]) > DECIDED_QD or sw[1] > DECIDED_QD:
+                tier = "decided"
+            elif board_ch.ply() >= BUSY_MIN_PLY and (
+                    board_ch.legal_moves.count() > BUSY_LEGAL
+                    or material(board_ch) > BUSY_MATERIAL):
+                tier = "busy"
+            else:
+                tier = None
+            rejected = (tr.get('ctrl_sum') or {}).get('rejected') or None
+            to_sf_positions.append((i, board_ch.copy(), xerces_uci, tier, rejected))
 
             game_state['ply_states'].append(ply)
             board_ch.push(move_ch)
@@ -874,7 +1078,8 @@ class Rescorer(object):
             # high sims, no training use -- so they buy a deeper SF pass than
             # selfplay. Blunder replays never come through here; they submit
             # a flat depth instead of any movetime.
-            info = {}
+            # the moves let the SF thread follow PVs across plies
+            info = {"moves": list(game_data.get('moves_played', []))}
             if is_validation_game and cfg.rescore_movetime_validation_ms:
                 info["movetime_ms"] = cfg.rescore_movetime_validation_ms
             self.game_q.put((gid, to_sf_positions, info))
@@ -1011,6 +1216,8 @@ class Rescorer(object):
             played_cp  = r['played_cp']
             played_abs = r['played_abs']
 
+            if r.get('skipped'):
+                self.sf_skipped += 1
             self.sf_compute_time  += r['elapsed']
             self.sf_compute_count += 1
             ds = r.get('depths') or []
@@ -1034,6 +1241,7 @@ class Rescorer(object):
             ply['played_abs'] = played_abs
             ply['best_depth'] = r.get('best_depth')
             ply['depth']      = r.get('depth')
+            ply['pair_cp']    = r.get('pair_cp')
             ply['resolved']   = True
 
         game['waiting'] = False
@@ -1674,6 +1882,20 @@ class Rescorer(object):
                 cut_white[i] = v if turn else -v
 
             eval_trace.append((i, best_abs))
+            if 'ctrl_sum' in tr:
+                pair = ply.get('pair_cp')
+                pair_esl = None
+                if pair is not None:
+                    ref = max(best_cp, *pair)
+                    pair_esl = tuple(expected_score_loss(ref, cp) for cp in pair)
+                self.ctrl_acc.add_ctrl(tr['ctrl_sum'], tr.get('stop_reason', ''),
+                                       tr.get('sims', 0), loss_this, esl, xerces_uci,
+                                       self.config.rescore_esl_blunder, pair_esl)
+            elif tr.get('sel_method') != 'stockfish':
+                # xc0 moves searched without the controller (stop_rules old)
+                self.ctrl_acc.add_old(tr.get('sims', 0), loss_this, esl,
+                                      tr.get('sims_max', 0),
+                                      self.config.rescore_esl_blunder)
             rows.append([
                 i, mv, xerces_uci, best_uci,
                 best_cp, loss_this, played_cp,
@@ -1905,6 +2127,11 @@ class Rescorer(object):
         self.write_lean_record(game_state, cpl_by_ply)
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
+        # cfg here is the per-game snapshot; the controller flag is run-wide
+        if self.config.ctrl_enable:
+            self.ctrl_games += 1
+            if self.ctrl_games % CTRL_WINDOW_GAMES == 0:
+                self.print_ctrl_stats()
         if self.games_processed % STATS_WINDOW_GAMES == 0:
             self.print_stop_stats()
             self.print_blunder_stats()
@@ -1935,6 +2162,18 @@ class Rescorer(object):
                       'gap_block_sims', 'gap_block_leader', 'pv_len',
                       'pv_played_len', 'sf_value'):
                 entry[k] = node.get(k)
+            # search-controller check-ins, only on games run with ctrl_record
+            if 'ctrl' in node:
+                entry['ctrl'] = node['ctrl']
+            # the controller's heads at the stop, and per rejected lock
+            # (leader uci, stab, qual, root STM Q, D)
+            cs = node.get('ctrl_sum')
+            if cs:
+                entry['ctrl_stab'] = round(cs['stab'], 4)
+                entry['ctrl_qual'] = round(cs['qual'], 4)
+                entry['ctrl_ext'] = cs['ext']
+                entry['ctrl_rej'] = [(m, *(round(x, 4) for x in v))
+                                     for m, *v in cs.get('rejections', [])]
 
             hit = cpl_by_ply.get(i)
             if hit is not None:
@@ -2069,6 +2308,51 @@ class Rescorer(object):
                 if not np.isnan(s.get('sims', float('nan'))):
                     acc[st]['sims'] += s['sims'] * n
 
+    def print_ctrl_stats(self):
+        """Search controller since this process started: how each search
+        ended and the quality of the move it played."""
+        a = self.ctrl_acc
+        n = a.n
+        if not n:
+            return
+
+        def line(label, g, share):
+            k, sims, tsl, cpl, bl = g
+            if not k:
+                return f"{RS}  {label:<9}{'-':>7}{'-':>7}{'-':>7}{'-':>7}{'-':>8}"
+            return (f"{RS}  {label:<9}{share:7.1%}{sims / k:7.0f}{tsl / k:7.2f}"
+                    f"{cpl / k:7.2f}{bl / k:8.2%}")
+
+        print(f"{RS} controller, all {self.ctrl_games} games since start "
+              f"({n} ctrl / {a.old[0]} old xc0 moves)")
+        print(f"{RS}  {'stop':<9}{'share':>7}{'sims':>7}{'TSL':>7}{'CPL':>7}{'blund':>8}")
+        for g in CtrlStats.GROUPS[:-1]:
+            print(line(g, a.groups[g], a.groups[g][0] / n))
+        print(line("all", a.all, 1.0))
+        # old rules: share is of all xc0 moves
+        print(line("old", a.old, a.old[0] / (n + a.old[0])))
+
+        saved = 1 - a.sims / a.sched if a.sched else float("nan")
+        old_txt = (f"   old {a.old_sims / 1e6:.2f}M/{a.old_sched / 1e6:.2f}M "
+                   f"{1 - a.old_sims / a.old_sched:.1%}" if a.old_sched else "")
+        n_ext = a.n_ext
+        extra = a.ext_extra / n_ext if n_ext else 0.0
+        changed = a.ext_changed / n_ext if n_ext else 0.0
+        print(f"{RS}  sims     {a.sims / 1e6:.2f}M/{a.sched / 1e6:.2f}M "
+              f"saved {saved:.1%}{old_txt}")
+        print(f"{RS}  extend   {n_ext} ({n_ext / n:.1%})   2+ {a.n_multi} "
+              f"({a.n_multi / n:.1%})   {extra:+.0f} sims   changed {changed:.0%}")
+        sk, st = a.ext_same
+        ck, ct, cr = a.ext_chg
+        same = st / sk if sk else 0.0
+        chg = ct / ck if ck else 0.0
+        rej = cr / ck if ck else 0.0
+        print(f"{RS}  ext TSL  same {same:.2f} | changed {chg:.2f} | "
+              f"rejected {rej:.2f} | gain {rej - chg:+.2f} ({ck})")
+        print(f"{RS}  ctrl     {a.ms / n:.1f} ms/mv   {a.checkins / n:.1f} ci/mv"
+              f"   stab {a.stab / n:.3f}   qual {a.qual / n:.3f}"
+              f"   ties {a.ties / max(1, a.checkins):.2%}")
+
     def print_stop_stats(self):
         stops = ("tier1", "tier2", "full")
         W = 12
@@ -2106,6 +2390,10 @@ class Rescorer(object):
 
         wh, ws, wc, wb = rows(f"last {STATS_WINDOW_GAMES}", self.window_stop)
         th, _,  tc, tb = rows("overall",  self.total_stop)
+        if self.config.ctrl_enable:
+            print(f"{RS} KL        q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
+            print(f"{RS} KL_value  q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
+            return
         print(wh)
         print(ws)
         print(wc)
@@ -2146,11 +2434,11 @@ class Rescorer(object):
             return
         
         run_dir = self.config.run_dir
-        outp, c, b, kl, ce, plies, kl_n, ce_n, bl = save_analysis_chunk_simple(
+        outp, c, t, kl, ce, plies, kl_n, ce_n, bl = save_analysis_chunk_simple(
             run_dir, self.analyzed_results)
         self.n_saved += 1
         self.total_cpl_plies += c * plies
-        self.total_bmr_plies += b * plies
+        self.total_tsl_plies += t * plies
         self.total_blunder_plies += bl * plies
         self.total_plies += plies
         # kl/ce are undefined (NaN) for batches with no trainable plies
@@ -2165,8 +2453,8 @@ class Rescorer(object):
 
         self.recent_cpls.append(c)
         self.recent_cpls = self.recent_cpls[-RECENT_WINDOW:]
-        self.recent_bmrs.append(b)
-        self.recent_bmrs = self.recent_bmrs[-RECENT_WINDOW:]
+        self.recent_tsls.append(t)
+        self.recent_tsls = self.recent_tsls[-RECENT_WINDOW:]
         self.recent_blunders.append(bl)
         self.recent_blunders = self.recent_blunders[-RECENT_WINDOW:]
         self.recent_plies.append(plies)
@@ -2183,28 +2471,28 @@ class Rescorer(object):
             self.recent_ce_plies = self.recent_ce_plies[-RECENT_WINDOW:]
 
         if report:
-            stats = [("stats", ["CPL", "BMR", "CE", "KL", f"CPL>{BLUNDER_CP}"]),
-                     stats_row("batch", c, b, ce, kl, bl)]
+            stats = [("stats", ["CPL", "TSL", "CE", "KL", f"CPL>{BLUNDER_CP}"]),
+                     stats_row("batch", c, t, ce, kl, bl)]
             for n in (10, RECENT_WINDOW):
                 if len(self.recent_cpls) < n:
                     continue
                 stats.append(stats_row(
                     f"last {n}",
                     window_avg(self.recent_cpls, self.recent_plies, n),
-                    window_avg(self.recent_bmrs, self.recent_plies, n),
+                    window_avg(self.recent_tsls, self.recent_plies, n),
                     window_avg(self.recent_ces, self.recent_ce_plies, n),
                     window_avg(self.recent_kls, self.recent_kl_plies, n),
                     window_avg(self.recent_blunders, self.recent_plies, n)))
 
             if self.n_saved >= 2:
                 cpl_mean = self.total_cpl_plies / self.total_plies
-                bmr_mean = self.total_bmr_plies / self.total_plies
+                tsl_mean = self.total_tsl_plies / self.total_plies
                 blunder_mean = self.total_blunder_plies / self.total_plies
                 kl_mean = (self.total_kl_plies / self.total_kl_valid_plies
                            if self.total_kl_valid_plies else float('nan'))
                 ce_mean = (self.total_ce_plies / self.total_ce_valid_plies
                            if self.total_ce_valid_plies else float('nan'))
-                stats.append(stats_row("overall", cpl_mean, bmr_mean,
+                stats.append(stats_row("overall", cpl_mean, tsl_mean,
                                        ce_mean, kl_mean, blunder_mean))
             print()
 
@@ -2262,6 +2550,7 @@ class Rescorer(object):
             self.sf_compute_count = 0
             self.sf_call_count = 0
             self.sf_rerun_count = 0
+            self.sf_skipped = 0
             self.sf_depth_sum = 0
             self.sf_depth_count = 0
             print()
@@ -2484,9 +2773,9 @@ def combine_analysis_staging(run_dir):
     return combined_new
 
 
-def stats_row(label, cpl, bmr, ce, kl, blunder):
+def stats_row(label, cpl, tsl, ce, kl, blunder):
     """One game-quality row for print_stat_table."""
-    return (label, [f"{cpl:.2f}", f"{bmr:.2f}", f"{ce:.2f}", f"{kl:.2f}",
+    return (label, [f"{cpl:.2f}", f"{tsl:.2f}", f"{ce:.2f}", f"{kl:.2f}",
                     f"{blunder:.3f}"])
 
 
@@ -2535,7 +2824,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     chunk_obj = {"df_all": df_all}
 
     cpl = df_all.delta.mean()
-    bmr = df_all.played_best_move.mean()
+    tsl = 1000 * df_all.esl.mean()
     # rate of plies dropping more than BLUNDER_CP -- CPL is a mean and a few
     # huge losses move it as much as a broad decline, so track the tail too
     blunder = (df_all.delta > BLUNDER_CP).mean()
@@ -2553,7 +2842,7 @@ def save_analysis_chunk_simple(run_dir, batch):
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, bmr, kl, ce, plies, kl_n, ce_n, blunder
+    return outp, cpl, tsl, kl, ce, plies, kl_n, ce_n, blunder
 
 
 

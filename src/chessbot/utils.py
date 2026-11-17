@@ -20,7 +20,7 @@ from pyfastchess import Board as fastboard
 
 from chessbot import SF_LOC
 
-from collections import deque
+from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -1090,44 +1090,122 @@ def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
         o["L"] += 1
 
 
-def order_stat_rows(stats):
-    """Scenario rows for display. paired_validation sinks to the bottom: it
-    is a measurement, not part of the training mix, and reads better after
-    the selfplay scenarios rather than alphabetised among them."""
-    bucket_order = {"white": 0, "black": 1, "none": 2}
-    return sorted(
-        stats.items(),
-        key=lambda kv: (kv[0][0] == "paired_validation", kv[0][0],
-                        bucket_order.get(kv[0][1], 99)),
-    )
-
-
 LOG_WIDTH = 79
 
 
-def print_summary_from_stats(stats, sf_overall):
+QUALITY = ("cpl", "tsl", "ce", "kl")
+
+
+class ReportRow:
+    """One scenario row: results (W/D/L white-POV) and per-game quality means,
+    each game weighted once."""
+
+    def __init__(self):
+        self.N = self.W = self.D = self.L = 0
+        self.plies = 0
+        self.q = {m: [0.0, 0] for m in QUALITY}
+
+    def add_game(self, result, plies, quality):
+        self.N += 1
+        self.W += result > 0
+        self.D += result == 0
+        self.L += result < 0
+        self.plies += plies
+        self.add_quality(quality)
+
+    def add_quality(self, quality):
+        for m, v in quality.items():
+            if v is not None and np.isfinite(v):
+                self.q[m][0] += v
+                self.q[m][1] += 1
+
+    def merge(self, other):
+        self.N += other.N
+        self.W += other.W
+        self.D += other.D
+        self.L += other.L
+        self.plies += other.plies
+        for m in QUALITY:
+            self.q[m][0] += other.q[m][0]
+            self.q[m][1] += other.q[m][1]
+
+    def mean(self, m):
+        s, n = self.q[m]
+        return s / n if n else None
+
+
+def report_row_name(scenario, stockfish_color):
+    """Paired validation splits by xc0's colour; every other scenario is one
+    row, whichever side Stockfish played."""
+    if scenario == 'paired_validation':
+        return 'val(xc0=blk)' if stockfish_color else 'val(xc0=wht)'
+    return scenario
+
+
+def cell(v, w, spec):
+    """A right-aligned table cell, or '-' where there is no value."""
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return f"{'-':>{w}}"
+    return f"{v:>{w}{spec}}"
+
+
+
+
+def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
     """
     Pretty-print the scenario table and one bot-vs-Stockfish W/D/L line per
     SF scenario.
 
     Takes counters rather than a games list, so a caller accumulating them
     incrementally can report on every game ever played without retaining any.
+    W/D/L are white won / draw / white lost. quality maps a row name to
+    rescore's ReportRow (per-game CPL/TSL/CE/KL means) and brp is its probe
+    row; both lag finished games by the rescore backlog.
     """
-    rows = order_stat_rows(stats)
+    quality = quality or {}
+    counts = defaultdict(lambda: {"N": 0, "W": 0, "D": 0, "L": 0, "plies_sum": 0})
+    for (scenario, bucket), s in stats.items():
+        c = counts[report_row_name(scenario, bucket == "white")]
+        for k in c:
+            c[k] += s[k]
 
-    # scenario table (unchanged formatting)
-    print(
-        f"{'scenario':<20} {'sf':<6} {'N':>6} "
-        f"{'W':>6} {'D':>6} {'L':>6}   {'avg_plies':>10}"
-    )
+    def line(name, c, q):
+        n = c["N"] if c else q.N
+        wdl = [c[k] for k in "WDL"] if c else [None] * 3
+        d_pct = 100 * c["D"] / n if c and n else None
+        plies = c["plies_sum"] / n if c and n else None
+        mean = q.mean if q else (lambda m: None)
+        print(f"{name:<16}{n:>5}" + "".join(cell(v, 5, "d") for v in wdl)
+              + cell(d_pct, 6, ".1f") + cell(mean('cpl'), 8, ".2f")
+              + cell(mean('tsl'), 7, ".2f") + cell(mean('ce'), 7, ".2f")
+              + cell(mean('kl'), 6, ".2f") + cell(plies, 7, ".1f"))
+
+    def section(names):
+        total_c = {"N": 0, "W": 0, "D": 0, "L": 0, "plies_sum": 0}
+        total_q = ReportRow()
+        for name in names:
+            line(name, counts[name], quality.get(name))
+            for k in total_c:
+                total_c[k] += counts[name][k]
+            if name in quality:
+                total_q.merge(quality[name])
+        return total_c, total_q
+
+    print(f"{'scenario':<16}{'N':>5}{'W':>5}{'D':>5}{'L':>5}{'D%':>6}"
+          f"{'CPL':>8}{'TSL':>7}{'CE':>7}{'KL':>6}{'plies':>7}")
     print("-" * LOG_WIDTH)
-    for (scenario, bucket), s in rows:
-        avg = (s["plies_sum"] / s["N"]) if s["N"] else 0.0
-        print(
-            f"{scenario:<20} {bucket:<6} {s['N']:>6} "
-            f"{s['W']:>6} {s['D']:>6} {s['L']:>6}  "
-            f"{avg:>10.1f}"
-        )
+    names = sorted(counts)
+    total_c, total_q = section([n for n in names if not n.startswith("val(")])
+    print("-" * LOG_WIDTH)
+    line("selfplay total", total_c, total_q)
+    vals = sorted((n for n in names if n.startswith("val(")), reverse=True)
+    if vals:
+        print("-" * LOG_WIDTH)
+        total_c, total_q = section(vals)
+        line("validation total", total_c, total_q)
+    if brp is not None and brp.N:
+        print("-" * LOG_WIDTH)
+        line("BRP", None, brp)
     print("-" * LOG_WIDTH)
 
     # bot vs Stockfish summary per SF scenario (score: W=1, D=0.5, L=0)

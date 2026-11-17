@@ -1944,6 +1944,10 @@ class RecordKeeper(object):
         self.lc0_audit_n = 0
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
+        # set by the runner to the rescorer's live per-scenario quality rows
+        # and BRP probe row, so the scenario table can show CPL/TSL/CE/KL
+        self.quality_rows = {}
+        self.brp_row = None
 
     def ingest_recents(self, recent):
         meta = recent['meta']
@@ -2070,7 +2074,8 @@ class RecordKeeper(object):
             return
 
         # counters cover the whole run, not the last `window` games
-        print_summary_from_stats(self.scenario_stats, self.sf_overall)
+        print_summary_from_stats(self.scenario_stats, self.sf_overall,
+                                 self.quality_rows, self.brp_row)
         primary_count = (len(os.listdir(self.primary_buffer_dir))
                          if self.primary_buffer_dir else 0)
         print(

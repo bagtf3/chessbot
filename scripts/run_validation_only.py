@@ -173,7 +173,7 @@ def main(run_tag, model, n_workers, n_selfplay):
         if rescore_outstanding(rescorer):
             print(f"[val-only] rescore drain timed out, "
                   f"{rescore_outstanding(rescorer)} games unfinished", flush=True)
-        rescorer.push_analyzed(report=True)
+        rescorer.push_analyzed()
         for t in sf_threads:
             t.close()
         rescorer.close()

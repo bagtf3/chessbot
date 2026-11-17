@@ -64,11 +64,15 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`):
   for when a task needs them, not an instruction to go look)
 
 ## MCTS
-- `MCTSTree` extends C++ `fasttree`, adds Python-side early stopping, noise, sampling
+- `MCTSTree` extends C++ `fasttree`, adds Python-side noise, sampling and per-move params
 - `best()` returns 3-tuple: `(move_uci, method, xerces_top_if_sampled_diff)`
-- Early stopping: floor→ceiling sims budget, `robust_selection_criteria`, extensions
-- Sims schedule: dict keyed by ply (e.g. ramps up through middlegame, backs off endgame)
-- c_puct sampled from list per game; dirichlet noise per move
+- Stopping: the search controller (C++, two-head ONNX model, check-ins every 100
+  root visits). Stops are `ctrl` (heads agree) or `lock` (visit dominance); a
+  low-quality lock is extended up to `ctrl_ext_max` times. RSC is off with it on.
+  Design: `SEARCH_CONTROLLER.md`. The old tiered early stop is the `stop_rules: old` arm.
+- Sims: `sims_floor` / `sims_ceiling`, `sims_schedule` by ply, scaled per move by
+  the effort table
+- c_puct scalar or `{ply: value}`; dirichlet noise per move
 
 ## Training Loop
 - Workers play N games concurrently, batch NN inference centrally
@@ -93,6 +97,21 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`):
 - The mix is `game_probs` in the run's `config.yaml` (a path for when a task
   needs it, not an instruction to go look)
 - Bootstrapped by pretraining on the historic corpus (older xc0 + lc0)
+
+## Rescore
+- Move quality is TSL (1000 x expected-score loss vs SF's best); CPL is secondary
+- SF searches are time-based, with decided / busy / normal time tiers (constants
+  at the top of `rescore.py`)
+
+## Repo docs
+- `CHANGELOG.md`: brief entries for finished features only. Do NOT update it per
+  turn or while a feature is still being developed or tuned; the user says when.
+- Roadmaps: `ROADMAP_SEARCH.md`, `ROADMAP_MODEL.md`, `ROADMAP_INFRA.md`
+  (workers, rescore, retrain, housekeeping), `ROADMAP_IDEAS.md` (not on the agenda)
+- `docs/` is stale and due to be replaced; don't spend effort on it
+- `.claude/notes/` (git-ignored, agent-only): `PARAM_RENAMES.md` maps old config
+  keys, stop reasons and log fields for analysis of pre-sp10 or older runs. Read it
+  only when working with old data.
 
 ## Validation Ladder
 - Paired games from UHO positions (each played as both colors)

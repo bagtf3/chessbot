@@ -100,13 +100,15 @@ class GameLooper(object):
 
         # the search controller lives in C++ (one model per process); trees
         # with ctrl_enable refuse to build without it, so it loads before
-        # the first game
+        # the first game. load_reload_model reports both loads as one line.
         if cfg.ctrl_model:
             import pyfastchess
-            pyfastchess.load_search_controller(cfg.ctrl_model)
-            state = "on" if cfg.ctrl_enable else "loaded, off"
-            print(f"[worker {self.id}] controller {state}: "
-                  f"{os.path.basename(cfg.ctrl_model.rstrip('/'))}", flush=True)
+            try:
+                pyfastchess.load_search_controller(cfg.ctrl_model)
+            except Exception as e:
+                print(f"{self.load_tag()} load FAILED: controller "
+                      f"{cfg.ctrl_model}: {e}", flush=True)
+                raise
 
         self.pull_from_queue()
 
@@ -154,7 +156,23 @@ class GameLooper(object):
         self.close()
         return False
 
+    def load_tag(self):
+        kind = 'lc0' if self.id.startswith('lc0') else 'xc0'
+        wid = self.id[3:] if kind == 'lc0' else self.id
+        return f'[worker {kind} {wid:<4}]'
+
     def load_reload_model(self):
+        """Load the policy/value model. Prints one line per worker: load OK
+        once it and the controller (loaded in __init__) are both up, or what
+        failed."""
+        try:
+            self.load_policy_value_model()
+        except Exception as e:
+            print(f'{self.load_tag()} load FAILED: model: {e}', flush=True)
+            raise
+        print(f'{self.load_tag()} load: OK', flush=True)
+
+    def load_policy_value_model(self):
         cfg = self.config
         encoding = cfg.encoding_type
         if encoding not in ("xc0", "lc0", "xc0h"):
@@ -201,10 +219,6 @@ class GameLooper(object):
             )
             self.model = sess
             self.infer = make_lc0_infer(sess)
-
-        kind = 'lc0' if self.id.startswith('lc0') else 'xc0'
-        wid = self.id[3:] if kind == 'lc0' else self.id
-        print(f'[worker {kind} {wid:<4}] load: OK', flush=True)
 
 
     def check_for_pause(self):

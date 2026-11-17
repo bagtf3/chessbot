@@ -471,6 +471,8 @@ class SelfPlayRunner:
         self.recorder.training_queue = self.rescorer.training_data_size
         self.recorder.primary_buffer_dir = cfg.primary_buffer_dir
         self.recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
+        self.recorder.quality_rows = self.rescorer.report_rows
+        self.recorder.brp_row = self.rescorer.brp_row
 
         self.reload_config()
         self.val_cfg = create_validation_config(
@@ -1779,7 +1781,7 @@ class SelfPlayRunner:
         if self.controls.stop.is_set():
             self.drain_rescorer(STOP_DRAIN_S)
 
-        self.rescorer.push_analyzed(report=True)
+        self.rescorer.push_analyzed()
         # after the drain, never before: pending only empties as these threads
         # return results
         for t in self.sf_rescore_threads + self.sf_retiring:

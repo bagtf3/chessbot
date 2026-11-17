@@ -4,7 +4,7 @@ from pathlib import Path
 import uuid
 import random
 import threading
-from collections import deque
+from collections import deque, defaultdict
 from queue import Empty
 
 import pickle
@@ -21,6 +21,7 @@ from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
     scalar_to_wdl, cp_to_value_tanh, expected_score_loss,
     ema_step, load_json, save_pickle_atomic, blend_to_uniform,
+    QUALITY, ReportRow, report_row_name, cell,
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SF_SOURCE, sparsify_policy,
@@ -86,11 +87,16 @@ def policy_value_miss(cm, sf_uci):
             or (sf_uci in by_prior[:pv_k] and sf_uci not in by_visits[:pv_k]))
 
 
-# a ply losing more than this many centipawns counts as a blunder for the
-# L<n> rate in the rescore stats line
-BLUNDER_CP = 30
-# rolling stat window, in push_analyzed chunks (30 games each)
-RECENT_WINDOW = 100
+# the rescore report (scenario table, trends, throughput, targets) prints
+# every REPORT_EVERY analyzed games
+REPORT_EVERY = 100
+# game-weighted EMA spans for the trend lines. The shortest is a running
+# mean for its first span of games; each longer one starts at the previous
+# span's game count, seeded with that EMA, and shows once its own span is in.
+TREND_SPANS = (100, 500, 2000)
+# per-ply TSL thresholds for the mistake / blunder rates in the trend lines
+TSL_MISTAKE = 50
+TSL_BLUNDER = 120
 # stop/blunder stat blocks print every N analyzed games; their window
 # accumulators reset on print, so this is the cadence and the window both
 STATS_WINDOW_GAMES = 200
@@ -198,6 +204,32 @@ class CtrlStats:
         self.bump(self.old, sims, cpl, esl, blunder)
         self.old_sims += sims
         self.old_sched += sims_max or 0
+
+
+class Trend:
+    """Game-weighted EMAs of one metric at TREND_SPANS (see there)."""
+
+    def __init__(self):
+        self.n = 0
+        self.vals = [None] * len(TREND_SPANS)
+
+    def add(self, x):
+        self.n += 1
+        for i, span in enumerate(TREND_SPANS):
+            v = self.vals[i]
+            if v is None:
+                if i == 0:
+                    self.vals[0] = x
+                continue
+            a = 1.0 / self.n if i == 0 and self.n <= span else 2.0 / (span + 1)
+            self.vals[i] = v + a * (x - v)
+        for i in range(1, len(TREND_SPANS)):
+            if self.vals[i] is None and self.n == TREND_SPANS[i - 1]:
+                self.vals[i] = self.vals[i - 1]
+
+    def value(self, i):
+        """The i-th span's value once it has seen that many games, else None."""
+        return self.vals[i] if self.n >= TREND_SPANS[i] else None
 
 
 class SFRescoreThread:
@@ -461,15 +493,12 @@ class Rescorer(object):
         self.games_processed = 0
         self.written_total = 0
         self.written_this_round = 0
-        self.n_saved = 0
-        self.total_cpl_plies = 0.0
-        self.total_tsl_plies = 0.0
-        self.total_blunder_plies = 0.0
-        self.total_kl_plies = 0.0
-        self.total_ce_plies = 0.0
         self.total_plies = 0
-        self.total_kl_valid_plies = 0.0
-        self.total_ce_valid_plies = 0.0
+        # since start: rows by scenario, the BRP probe row, and selfplay
+        # quality trends (validation games stay out of the trends)
+        self.report_rows = defaultdict(ReportRow)
+        self.brp_row = ReportRow()
+        self.trends = {m: Trend() for m in (*QUALITY, "tsl_mistake", "tsl_blunder")}
 
         self.n_sf_submitted = 0
         self.sf_compute_time = 0.0
@@ -481,14 +510,6 @@ class Rescorer(object):
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
         self.current_movetime_ms = 0
-        self.recent_cpls = []
-        self.recent_tsls = []
-        self.recent_blunders = []
-        self.recent_kls = []
-        self.recent_ces = []
-        self.recent_plies = []
-        self.recent_kl_plies = []
-        self.recent_ce_plies = []
 
         zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
         self.total_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
@@ -1293,8 +1314,17 @@ class Rescorer(object):
         orig_cpl = brp_data.get('orig_cpl')
         epoch = brp_data.get('model_epoch')
 
-        probe_cpl = self.brp_scorer.score(
-            best_uci, best_cp, probe_move, played_cp).loss
+        ms = self.brp_scorer.score(best_uci, best_cp, probe_move, played_cp)
+        probe_cpl = ms.loss
+        cm = ((ply or {}).get('tr') or {}).get('candidate_moves') or []
+        self.brp_row.N += 1
+        self.brp_row.add_quality({
+            'cpl': probe_cpl,
+            'tsl': 1000 * expected_score_loss(ms.best_cp, ms.best_cp - probe_cpl),
+            'kl': float(kl_divergence([c['visits'] for c in cm],
+                                      [c.get('P_raw', c['P']) for c in cm]))
+                  if cm else None,
+        })
         found_best = probe_move == best_uci
         found_equiv = probe_cpl <= BRP_EQUIV_CPL
         same_move = probe_move == orig_move
@@ -2124,6 +2154,9 @@ class Rescorer(object):
 
         self.analyzed_results.append(out)
         self.games_processed += 1
+        self.total_plies += n_plies
+        self.record_report_game(game_data, len(game_state['plies']), out_df,
+                                game_state['ply_states'])
         self.write_lean_record(game_state, cpl_by_ply)
         self.games_seen.add(gid)
         self.accumulate_stop_stats(stop_stats)
@@ -2136,7 +2169,34 @@ class Rescorer(object):
             self.print_stop_stats()
             self.print_blunder_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
-            self.push_analyzed(report=True)
+            self.push_analyzed()
+        if self.games_processed % REPORT_EVERY == 0:
+            self.print_report()
+
+    def record_report_game(self, game_data, game_plies, out_df, ply_states):
+        """One finished game into its scenario row and, for selfplay, the
+        quality trends. Quality is the game's mean over its scored xc0
+        plies; CE only exists where plies trained, KL is search KL."""
+        n = len(out_df)
+        tsl = 1000 * out_df['esl'] if n else None
+        kls = [p['tr'].get('kl') for p in ply_states if p.get('tr')]
+        kls = [k for k in kls if k is not None]
+        quality = {
+            'cpl': out_df['delta'].mean() if n else None,
+            'tsl': tsl.mean() if n else None,
+            'ce': out_df['ce'].mean() if n else None,
+            'kl': float(np.mean(kls)) if kls else None,
+        }
+        scenario = game_data.get('scenario', 'unknown')
+        name = report_row_name(scenario, game_data.get('stockfish_color'))
+        self.report_rows[name].add_game(game_data['result'], game_plies, quality)
+        if scenario == 'paired_validation' or not n:
+            return
+        quality['tsl_mistake'] = float((tsl > TSL_MISTAKE).mean())
+        quality['tsl_blunder'] = float((tsl > TSL_BLUNDER).mean())
+        for m, v in quality.items():
+            if v is not None and np.isfinite(v):
+                self.trends[m].add(v)
 
 
     def decide_reviewable(self, scenario):
@@ -2408,161 +2468,90 @@ class Rescorer(object):
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
 
-    def print_sample_stats(self):
-        def teacher_row(label, sc):
-            # queued and samples do not balance within a batch: a probe is
+    def push_analyzed(self):
+        """Write the analyzed games out as one staging chunk."""
+        if self.analyzed_results:
+            save_analysis_chunk_simple(self.config.run_dir, self.analyzed_results)
+        self.analyzed_results = []
+
+    def print_report(self):
+        """Every REPORT_EVERY games: selfplay quality trends, throughput, SF
+        and training targets. The SF and recent-target windows reset here.
+        The per-scenario table is the epoch log's (it reads report_rows)."""
+        W = 78
+
+        def out(s=""):
+            print(f"{RS} {s}")
+
+        def cols(label, cells, w=10):
+            return f"{label:<16}" + "".join(f"{c:>{w}}" for c in cells)
+
+        print()
+        out("-" * W)
+        out(f"{'trend (game EMA)':<16}{'CPL':>7}{'TSL':>7}{'CE':>6}{'KL':>6}"
+            f"{f'TSL>{TSL_MISTAKE}':>9}{f'TSL>{TSL_BLUNDER}':>9}")
+        t = self.trends
+        for i, span in enumerate(TREND_SPANS):
+            if t['cpl'].value(i) is None:
+                continue
+            mistake = t['tsl_mistake'].value(i)
+            blunder = t['tsl_blunder'].value(i)
+            out(f"{f'ema {span}':<16}" + cell(t['cpl'].value(i), 7, ".2f")
+                + cell(t['tsl'].value(i), 7, ".2f") + cell(t['ce'].value(i), 6, ".2f")
+                + cell(t['kl'].value(i), 6, ".2f")
+                + cell(None if mistake is None else 100 * mistake, 8, ".1f") + "%"
+                + cell(None if blunder is None else 100 * blunder, 8, ".1f") + "%")
+        out("-" * W)
+
+        if self.start_time is not None:
+            elapsed = time.time() - self.start_time
+            avg_depth = (self.sf_depth_sum / self.sf_depth_count
+                         if self.sf_depth_count else 0.0)
+            out(cols("throughput", ["games", "games/hr", "moves/s", "replays", "depth"]))
+            out(cols("", [self.games_processed,
+                          f"{self.games_processed / elapsed * 3600:.1f}",
+                          f"{self.total_plies / elapsed:.2f}",
+                          self.n_replay_finalized, f"{avg_depth:.1f}"]))
+
+        ms_pos = (1000 * self.sf_compute_time / self.sf_call_count
+                  if self.sf_call_count else 0.0)
+        ms_ply = (1000 * self.sf_compute_time / self.sf_compute_count
+                  if self.sf_compute_count else 0.0)
+        # share of plies where xerces already played SF's best move, so the
+        # second pass was skipped
+        first_run = (100 * (self.sf_compute_count - self.sf_rerun_count)
+                     / self.sf_compute_count if self.sf_compute_count else 0.0)
+        out(cols("SF", ["positions", "ms/pos", "ms/ply", "1st run", "backlog"]))
+        out(cols("", [self.n_sf_submitted, f"{ms_pos:.0f}ms", f"{ms_ply:.0f}ms",
+                      f"{first_run:.1f}%", len(self.intake) + len(self.pending)]))
+
+        def target_cells(sc):
+            # queued and samples do not balance within a window: a probe is
             # answered a few seconds after it is sent, often after this print
-            total_tr = sc['accepted'] + sc['lc0_samples']
-            lc0_pct = f"{sc['lc0_samples'] / total_tr * 100:.1f}%" if total_tr else "--"
-            return (label, [sc['accepted'], sc['blended'], sc['lc0_queued'],
-                            sc['lc0_samples'], lc0_pct])
+            total = sc['accepted'] + sc['lc0_samples']
+            pct = f"{sc['lc0_samples'] / total * 100:.1f}%" if total else "-"
+            return [sc['accepted'], sc['blended'], sc['lc0_queued'],
+                    sc['lc0_samples'], pct]
 
-        print_stat_table([
-            ("targets", ["xc0", "blended", "lc0-sent", "lc0-back", "lc0-%"]),
-            teacher_row("batch", self.sample_counts_window),
-            teacher_row("total", self.sample_counts),
-        ])
+        out(cols("targets", ["xc0", "blended", "lc0-sent", "lc0-back", "lc0-%"]))
+        out(cols(f"last {REPORT_EVERY}", target_cells(self.sample_counts_window)))
+        out(cols("total", target_cells(self.sample_counts)))
+        out("-" * W)
+        out(f"training samples this round: {self.written_this_round} | "
+            f"total: {self.written_total}")
+        print()
 
+        self.sf_compute_time = 0.0
+        self.sf_compute_count = 0
+        self.sf_call_count = 0
+        self.sf_rerun_count = 0
+        self.sf_skipped = 0
+        self.sf_depth_sum = 0
+        self.sf_depth_count = 0
         self.sample_counts_window = {
             'total': 0, 'accepted': 0, 'blended': 0,
             'lc0_queued': 0, 'lc0_samples': 0,
         }
-
-    def push_analyzed(self, report=True):
-        # safeguard here
-        if not len(self.analyzed_results):
-            return
-        
-        run_dir = self.config.run_dir
-        outp, c, t, kl, ce, plies, kl_n, ce_n, bl = save_analysis_chunk_simple(
-            run_dir, self.analyzed_results)
-        self.n_saved += 1
-        self.total_cpl_plies += c * plies
-        self.total_tsl_plies += t * plies
-        self.total_blunder_plies += bl * plies
-        self.total_plies += plies
-        # kl/ce are undefined (NaN) for batches with no trainable plies
-        # (e.g. all-validation rounds) -- weight/accumulate by valid plies
-        # only, so they don't poison the running totals with NaN.
-        if kl_n:
-            self.total_kl_plies += kl * kl_n
-            self.total_kl_valid_plies += kl_n
-        if ce_n:
-            self.total_ce_plies += ce * ce_n
-            self.total_ce_valid_plies += ce_n
-
-        self.recent_cpls.append(c)
-        self.recent_cpls = self.recent_cpls[-RECENT_WINDOW:]
-        self.recent_tsls.append(t)
-        self.recent_tsls = self.recent_tsls[-RECENT_WINDOW:]
-        self.recent_blunders.append(bl)
-        self.recent_blunders = self.recent_blunders[-RECENT_WINDOW:]
-        self.recent_plies.append(plies)
-        self.recent_plies = self.recent_plies[-RECENT_WINDOW:]
-        if kl_n:
-            self.recent_kls.append(kl)
-            self.recent_kls = self.recent_kls[-RECENT_WINDOW:]
-            self.recent_kl_plies.append(kl_n)
-            self.recent_kl_plies = self.recent_kl_plies[-RECENT_WINDOW:]
-        if ce_n:
-            self.recent_ces.append(ce)
-            self.recent_ces = self.recent_ces[-RECENT_WINDOW:]
-            self.recent_ce_plies.append(ce_n)
-            self.recent_ce_plies = self.recent_ce_plies[-RECENT_WINDOW:]
-
-        if report:
-            stats = [("stats", ["CPL", "TSL", "CE", "KL", f"CPL>{BLUNDER_CP}"]),
-                     stats_row("batch", c, t, ce, kl, bl)]
-            for n in (10, RECENT_WINDOW):
-                if len(self.recent_cpls) < n:
-                    continue
-                stats.append(stats_row(
-                    f"last {n}",
-                    window_avg(self.recent_cpls, self.recent_plies, n),
-                    window_avg(self.recent_tsls, self.recent_plies, n),
-                    window_avg(self.recent_ces, self.recent_ce_plies, n),
-                    window_avg(self.recent_kls, self.recent_kl_plies, n),
-                    window_avg(self.recent_blunders, self.recent_plies, n)))
-
-            if self.n_saved >= 2:
-                cpl_mean = self.total_cpl_plies / self.total_plies
-                tsl_mean = self.total_tsl_plies / self.total_plies
-                blunder_mean = self.total_blunder_plies / self.total_plies
-                kl_mean = (self.total_kl_plies / self.total_kl_valid_plies
-                           if self.total_kl_valid_plies else float('nan'))
-                ce_mean = (self.total_ce_plies / self.total_ce_valid_plies
-                           if self.total_ce_valid_plies else float('nan'))
-                stats.append(stats_row("overall", cpl_mean, tsl_mean,
-                                       ce_mean, kl_mean, blunder_mean))
-            print()
-
-            # true search depth reached under the time budget, averaged over
-            # every SF call this window (both passes), not seldepth
-            avg_depth = (self.sf_depth_sum / self.sf_depth_count
-                         if self.sf_depth_count else 0.0)
-
-            table = []
-            n_tot = self.games_processed
-            if n_tot > self.config.rescore_analyze_batch and self.start_time is not None:
-                elapsed = time.time() - self.start_time
-                games_hr = n_tot / elapsed * 3600
-                moves_sec = self.total_plies / elapsed
-                tg_cols = [
-                    ("games",      str(n_tot)),
-                    ("games/hr",   f"{games_hr:.1f}"),
-                    ("moves/sec",  f"{moves_sec:.2f}"),
-                    ("replays",    str(self.n_replay_finalized)),
-                    ("depth",      f"{avg_depth:.1f}"),
-                ]
-                table += [("Total", [h for h, _ in tg_cols]),
-                          ("", [v for _, v in tg_cols])]
-
-            avg_ms_per_pos = (
-                1000 * self.sf_compute_time / self.sf_call_count
-                if self.sf_call_count else 0.0
-            )
-            avg_ms_per_ply = (
-                1000 * self.sf_compute_time / self.sf_compute_count
-                if self.sf_compute_count else 0.0
-            )
-            # share of plies where xerces already played SF's best move, so
-            # the second pass was skipped
-            first_run_pct = (
-                100 * (self.sf_compute_count - self.sf_rerun_count)
-                / self.sf_compute_count
-                if self.sf_compute_count else 0.0
-            )
-            backlog = len(self.intake) + len(self.pending)
-
-            sf_cols = [
-                ("positions", str(self.n_sf_submitted)),
-                ("ms/pos",    f"{avg_ms_per_pos:.0f}ms"),
-                ("ms/ply",    f"{avg_ms_per_ply:.0f}ms"),
-                ("1st run %", f"{first_run_pct:.1f}%"),
-                ("backlog",   str(backlog)),
-            ]
-            table += [("SF", [h for h, _ in sf_cols]),
-                      ("", [v for _, v in sf_cols])]
-            print_stat_table(table)
-            print()
-            print_stat_table(stats)
-            self.sf_compute_time = 0.0
-            self.sf_compute_count = 0
-            self.sf_call_count = 0
-            self.sf_rerun_count = 0
-            self.sf_skipped = 0
-            self.sf_depth_sum = 0
-            self.sf_depth_count = 0
-            print()
-
-            self.print_sample_stats()
-
-            w_this = self.written_this_round
-            wtot = self.written_total
-            print(f"{RS} Training samples this round: {w_this} | total: {wtot}")
-            print()
-
-        self.analyzed_results = []
 
 # helpers
 def value_weight_for_game(cfg, is_draw):
@@ -2773,39 +2762,6 @@ def combine_analysis_staging(run_dir):
     return combined_new
 
 
-def stats_row(label, cpl, tsl, ce, kl, blunder):
-    """One game-quality row for print_stat_table."""
-    return (label, [f"{cpl:.2f}", f"{tsl:.2f}", f"{ce:.2f}", f"{kl:.2f}",
-                    f"{blunder:.3f}"])
-
-
-# widest header across the stat tables, so separate tables line up
-STAT_MIN_W = len("positions")
-
-
-def print_stat_table(rows):
-    """Print (label, cells) rows as one table. Every column, the label
-    included, is as wide as the widest entry anywhere in the table, with two
-    spaces of padding inside each bar. Labels sit left, cells right."""
-    rows = [(str(label), [str(c) for c in cells]) for label, cells in rows]
-    w = max(STAT_MIN_W, *(len(s) for label, cells in rows
-                          for s in [label, *cells]))
-    for label, cells in rows:
-        print(f"{RS}  {label:<{w}}  |" + "".join(f"  {s:>{w}}  |" for s in cells))
-
-
-
-
-def window_avg(vals, wts, n):
-    """Ply-weighted mean over the last n entries. vals and wts are the same
-    window (kl/ce keep their own, since chunks with no trainable plies never
-    append to them)."""
-    w = np.array(wts[-n:], dtype=np.float64)
-    if not len(w) or not w.sum():
-        return float('nan')
-    return np.dot(vals[-n:], w) / w.sum()
-
-
 def save_analysis_chunk_simple(run_dir, batch):
     """
     Build a combined-style object for `batch` (list of analysis_out dicts)
@@ -2823,26 +2779,13 @@ def save_analysis_chunk_simple(run_dir, batch):
 
     chunk_obj = {"df_all": df_all}
 
-    cpl = df_all.delta.mean()
-    tsl = 1000 * df_all.esl.mean()
-    # rate of plies dropping more than BLUNDER_CP -- CPL is a mean and a few
-    # huge losses move it as much as a broad decline, so track the tail too
-    blunder = (df_all.delta > BLUNDER_CP).mean()
-    kl_n = int(df_all.kl.notna().sum())
-    ce_n = int(df_all.ce.notna().sum())
-    kl  = df_all.kl.mean()
-    ce  = df_all.ce.mean()
-    plies = len(df_all)
-
-    print(f"{RS} Saving {len(batch)} analyzed games")
-
     fname = f"{int(time.time())}_{uuid.uuid4().hex}.pkl"
     outp = os.path.join(staging, fname)
 
     with open(outp, "wb") as f:
         pickle.dump(chunk_obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return outp, cpl, tsl, kl, ce, plies, kl_n, ce_n, blunder
+    return outp
 
 
 

@@ -12,7 +12,6 @@ import json
 import os
 import pickle
 import random
-import time
 
 import chess
 import numpy as np
@@ -184,32 +183,20 @@ def save_probe_pool(pool, pool_path=None):
 
 
 def evicted_path(pool_path=None):
-    """Per-pool recovery log: the pkl's own name, suffixed instead of
-    shared, so the two pools' recovery trails never mingle."""
+    """Per-pool eviction log: the pkl's own name, suffixed instead of
+    shared, so the two pools' logs never mingle."""
     return probe_pool_path(pool_path).replace(".pkl.gz", "_evicted.jsonl")
 
 
 def evict_position(pool, key, reason, n_retrains, evicted_file):
-    """
-    Pop a position out of the live pool and leave a flat, self-contained
-    recovery record behind -- enough to rebuild and replay the position
-    later without the pool it came from.
-    """
+    """Pop a position out of the live pool and log which one left and why."""
     src = pool.pop(key)
     record = {
         "short_fen": key,
-        "fen": src.get("fen"),
-        "uci_path": src.get("uci_path"),
         "run_tag": src.get("run_tag"),
-        "game_id": src.get("game_id"),
-        "move_num": src.get("move_num"),
-        "start_ply": src.get("start_ply"),
         "model_epoch": src.get("model_epoch"),
-        "scenario": src.get("scenario"),
         "evicted_epoch": n_retrains,
-        "evicted_ts": int(time.time()),
         "reason": reason,
-        "final_probe": (src.get("probes") or [None])[-1],
     }
     with open(evicted_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, default=float) + "\n")

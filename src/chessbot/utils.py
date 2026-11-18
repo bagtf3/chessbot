@@ -1093,7 +1093,7 @@ def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
 LOG_WIDTH = 79
 
 
-QUALITY = ("cpl", "tsl", "ce", "kl")
+QUALITY = ("cpl", "tsl", "klv", "klp")
 
 
 class ReportRow:
@@ -1159,7 +1159,7 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
     Takes counters rather than a games list, so a caller accumulating them
     incrementally can report on every game ever played without retaining any.
     W/D/L are white won / draw / white lost. quality maps a row name to
-    rescore's ReportRow (per-game CPL/TSL/CE/KL means) and brp is its probe
+    rescore's ReportRow (per-game CPL/TSL/KLv/KLp means) and brp is its probe
     row; both lag finished games by the rescore backlog.
     """
     quality = quality or {}
@@ -1177,8 +1177,8 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
         mean = q.mean if q else (lambda m: None)
         print(f"{name:<16}{n:>5}" + "".join(cell(v, 5, "d") for v in wdl)
               + cell(d_pct, 6, ".1f") + cell(mean('cpl'), 8, ".2f")
-              + cell(mean('tsl'), 7, ".2f") + cell(mean('ce'), 7, ".2f")
-              + cell(mean('kl'), 6, ".2f") + cell(plies, 7, ".1f"))
+              + cell(mean('tsl'), 7, ".2f") + cell(mean('klv'), 7, ".3f")
+              + cell(mean('klp'), 6, ".2f") + cell(plies, 7, ".1f"))
 
     def section(names):
         total_c = {"N": 0, "W": 0, "D": 0, "L": 0, "plies_sum": 0}
@@ -1192,7 +1192,7 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
         return total_c, total_q
 
     print(f"{'scenario':<16}{'N':>5}{'W':>5}{'D':>5}{'L':>5}{'D%':>6}"
-          f"{'CPL':>8}{'TSL':>7}{'CE':>7}{'KL':>6}{'plies':>7}")
+          f"{'CPL':>8}{'TSL':>7}{'KLv':>7}{'KLp':>6}{'plies':>7}")
     print("-" * LOG_WIDTH)
     names = sorted(counts)
     total_c, total_q = section([n for n in names if not n.startswith("val(")])

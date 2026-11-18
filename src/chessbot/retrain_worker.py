@@ -49,6 +49,14 @@ GO_TIMEOUT_S = 120.0
 # validation rows predicted and scored per pass; the only dense
 # (rows, POLICY_DIM) arrays ever held are this tall
 VAL_CHUNK = 2048
+# fit tracking: TRACK_RECORDS trained xc0 records and HOLDOUT_RECORDS xc0
+# records held out (dropped from the round, never trained), each predicted
+# with the starting and the trained weights. The worst row is the top
+# WORST_FRAC of the trained slice by its starting loss.
+TRACK_RECORDS = 2048
+HOLDOUT_RECORDS = 1024
+WORST_FRAC = 0.1
+FIT_CSV = "fit_tracking.csv"
 
 
 def load_records(paths):
@@ -58,17 +66,18 @@ def load_records(paths):
     return records
 
 
-def shuffle_rewrite_primary(paths, records, shard_size=SHARD_SIZE):
+def shuffle_rewrite_primary(paths, records):
     """Shuffle already-loaded primary records across file boundaries and
-    rewrite shard_size-sized chunks back into the same filenames. Takes the
-    records the caller already read (for validation) rather than re-reading
-    from disk. Returns the shuffled record list -- already the exact primary
+    rewrite them, split evenly, back into the same filenames (the held-out
+    records are already gone, so shards run a little under SHARD_SIZE).
+    Takes the records the caller already read rather than re-reading from
+    disk. Returns the shuffled record list -- already the exact primary
     portion of the retrain set."""
     all_records = list(records)
     random.shuffle(all_records)
-    for i, p in enumerate(paths):
-        chunk = all_records[i * shard_size:(i + 1) * shard_size]
-        write_pkl_gz_shard(chunk, p)
+    bounds = np.linspace(0, len(all_records), len(paths) + 1).astype(int)
+    for p, a, b in zip(paths, bounds[:-1], bounds[1:]):
+        write_pkl_gz_shard(all_records[a:b], p)
     return all_records
 
 
@@ -112,6 +121,92 @@ def validate_slice(model, samples, batch_size):
         "policy": {k: np.concatenate(v) for k, v in policy.items()},
         "top_prob_target": np.concatenate(top_target) if top_target else np.zeros(0),
     }
+
+
+def masked_logp(logits, mask):
+    """Log-softmax over the masked (legal) moves; -inf elsewhere."""
+    with np.errstate(invalid="ignore"):
+        z = np.where(mask, logits, -np.inf)
+        z = z - z.max(axis=1, keepdims=True)
+        return z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+
+
+def kl_rows(p, logp, logq):
+    """Per-row KL(p || q), summed only where p > 0."""
+    with np.errstate(invalid="ignore"):
+        return np.where(p > 0, p * (logp - logq), 0.0).sum(axis=1)
+
+
+def safe_log(p):
+    return np.log(np.where(p > 0, p, 1.0))
+
+
+def fit_rows(samples, before, after):
+    """Per-row fit metrics for one slice. KLp / KLv are KL(target || net)
+    for policy / value with the starting (0) and trained (1) weights; move_p
+    / move_v are KL(trained || starting) on the same positions, how far the
+    net moved whatever the targets."""
+    labels = stack_policies(samples)
+    mask = labels > 0
+    y = np.array([r[3] for r in samples], dtype=np.float64).reshape(-1, 3)
+    (w0, l0), (w1, l1) = before, after
+    lq0, lq1 = masked_logp(l0, mask), masked_logp(l1, mask)
+    lt, ly = safe_log(labels), safe_log(y)
+    lw0, lw1 = safe_log(w0.astype(np.float64)), safe_log(w1.astype(np.float64))
+    return {
+        "klp0": kl_rows(labels, lt, lq0), "klp1": kl_rows(labels, lt, lq1),
+        "klv0": kl_rows(y, ly, lw0), "klv1": kl_rows(y, ly, lw1),
+        "move_p": kl_rows(np.exp(lq1), lq1, lq0),
+        "move_v": kl_rows(w1.astype(np.float64), lw1, lw0),
+    }
+
+
+def fit_summary(rows, worst=False):
+    """Slice means. With worst, policy columns cover the top WORST_FRAC by
+    starting KLp and value columns the top WORST_FRAC by starting KLv."""
+    def top(key):
+        n = max(1, int(round(WORST_FRAC * len(rows[key]))))
+        return np.argsort(rows[key])[-n:]
+    ip = top("klp0") if worst else slice(None)
+    iv = top("klv0") if worst else slice(None)
+    out = {k: float(rows[k][ip].mean()) for k in ("klp0", "klp1", "move_p")}
+    out.update({k: float(rows[k][iv].mean()) for k in ("klv0", "klv1", "move_v")})
+    out["n"] = len(rows["klp0"][ip])
+    return out
+
+
+def report_fit_tracking(cfg, epoch, slices, before, after):
+    """Print the fit table and append one row to FIT_CSV in the run dir."""
+    import csv
+    if not slices["trained"] or not slices["held_out"]:
+        print("[retrain] fit tracking skipped: no xc0 records", flush=True)
+        return
+    trained = fit_rows(slices["trained"], before["trained"], after["trained"])
+    summary = {
+        "trained": fit_summary(trained),
+        "worst": fit_summary(trained, worst=True),
+        "held_out": fit_summary(fit_rows(slices["held_out"], before["held_out"],
+                                         after["held_out"])),
+    }
+    print(f"[retrain] {'fit':<10}{'n':>6}{'KLp0':>8}{'KLp1':>8}{'dKLp':>8}"
+          f"{'KLv0':>8}{'KLv1':>8}{'dKLv':>8}{'moveP':>8}{'moveV':>8}")
+    for name, s in summary.items():
+        print(f"[retrain] {name:<10}{s['n']:>6}{s['klp0']:>8.3f}{s['klp1']:>8.3f}"
+              f"{s['klp1'] - s['klp0']:>+8.3f}{s['klv0']:>8.3f}{s['klv1']:>8.3f}"
+              f"{s['klv1'] - s['klv0']:>+8.3f}{s['move_p']:>8.4f}{s['move_v']:>8.4f}")
+
+    row = {"epoch": epoch, "ts": int(time.time()), "lr": cfg.learning_rate}
+    for name, s in summary.items():
+        row[f"{name}_n"] = s["n"]
+        for k in ("klp0", "klp1", "klv0", "klv1", "move_p", "move_v"):
+            row[f"{name}_{k}"] = round(s[k], 6)
+    path = os.path.join(cfg.run_dir, FIT_CSV)
+    new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new:
+            w.writeheader()
+        w.writerow(row)
 
 
 def records_to_arrays(records):
@@ -170,10 +265,18 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     model, arch = load_pt_model(cfg.model_path)
     primary_records_raw = load_records(primary_paths)
 
+    # held out: xc0 records sacrificed from this round, never trained
+    held_out = sample_records([r for r in primary_records_raw if r[6] == 'xc0'],
+                              HOLDOUT_RECORDS)
+    held_ids = {id(r) for r in held_out}
+    primary_records_raw = [r for r in primary_records_raw if id(r) not in held_ids]
+
     # primary validation is pure xc0 only; replay, lc0, and blend records
     # still train via all_records below, just aren't validated on
     val_pool = [r for r in primary_records_raw if r[6] == 'xc0']
     val_primary = sample_records(val_pool, VAL_PRIMARY_RECORDS)
+    tracked = sample_records(val_pool, TRACK_RECORDS)
+    fit_slices = {"trained": tracked, "held_out": held_out}
     val_historic = sample_records(historic_records, VAL_HISTORIC_RECORDS)
     # plot-only slice, never validated against in the csv-logged metrics
     lc0_pool = [r for r in primary_records_raw if r[6].startswith('lc0')]
@@ -187,6 +290,8 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
            for name, samples in (("primary", val_primary),
                                  ("historic", val_historic),
                                  ("lc0", val_lc0), ("sf", val_sf))}
+    fit_before = {name: predict_fp16(model, [r[0] for r in s], bs)
+                  for name, s in fit_slices.items()}
 
     del (model, val_pool, val_primary, val_historic, lc0_pool, val_lc0,
          sf_pool, val_sf)
@@ -219,6 +324,12 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
           flush=True)
 
     del X, P, Y, vwht, pwht, model
+    torch.cuda.empty_cache()
+    model, _ = load_pt_model(cfg.model_path)
+    fit_after = {name: predict_fp16(model, [r[0] for r in s], bs)
+                 for name, s in fit_slices.items()}
+    del model
+    report_fit_tracking(cfg, epoch, fit_slices, fit_before, fit_after)
     report_validation(epoch, cfg.progress_csv_path, val, train_stats)
     sys.stdout.flush()
 

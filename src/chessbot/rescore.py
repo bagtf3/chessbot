@@ -885,6 +885,7 @@ class Rescorer(object):
             pwht *= cfg.kl_boost_p80_mult
         elif kl >= self.kl_q50:
             pwht *= cfg.kl_boost_median_mult
+        # raw search vs net, not the blended target (see the selfplay path)
         klv = tr.get('kl_value')
         if klv is not None:
             if klv >= max(0.03, self.kl_value_q80):
@@ -1321,9 +1322,9 @@ class Rescorer(object):
         self.brp_row.add_quality({
             'cpl': probe_cpl,
             'tsl': 1000 * expected_score_loss(ms.best_cp, ms.best_cp - probe_cpl),
-            'kl': float(kl_divergence([c['visits'] for c in cm],
-                                      [c.get('P_raw', c['P']) for c in cm]))
-                  if cm else None,
+            'klp': float(kl_divergence([c['visits'] for c in cm],
+                                       [c.get('P_raw', c['P']) for c in cm]))
+                   if cm else None,
         })
         found_best = probe_move == best_uci
         found_equiv = probe_cpl <= BRP_EQUIV_CPL
@@ -1358,6 +1359,9 @@ class Rescorer(object):
             if found_equiv:
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
+                if ply is not None:
+                    self.add_blunder_replay_training_example(
+                        ply, epoch, best_uci, best_cp, probe_cpl)
             # not equiv -- found_equiv took everything at or under
             # BRP_EQUIV_CPL, so anything reaching here is still wrong
             elif ply is not None:
@@ -1700,12 +1704,10 @@ class Rescorer(object):
     def add_blunder_replay_training_example(self, ply, epoch, best_uci,
                                              best_cp, probe_cpl):
         """
-        Still-live, still-bad replay probes never earn a normal training
-        example on their own -- this is the only path that turns one into a
-        live_buffer sample. Policy blends the model's own visits with an SF
-        target (sf_move_target on SF's best), alpha
-        ramping 0.10 at probe_cpl=25 to 0.85 at 150. Value is the search's
-        own WDL, unblended.
+        Turns a passed (found_equiv) replay probe into a live_buffer sample.
+        Policy blends the model's own visits with an SF target
+        (sf_move_target on SF's best), alpha ramping 0.10 at probe_cpl=25 to
+        0.85 at 150. Value is the search's own WDL, unblended.
         """
         board = ply['board']
         tr = ply.get('tr') or {}
@@ -1989,7 +1991,9 @@ class Rescorer(object):
                     pwht *= self.config.kl_boost_median_mult
                 # value-KL boost on the value weight, mirroring the policy boost.
                 # max(0.01, .) floors the quantile so a zeroed tracker doesn't make
-                # every ply eligible.
+                # every ply eligible. Keyed on raw search vs net, not the blended
+                # target: the outcome half would skew weight toward the opening
+                # and early game.
                 if klv is not None:
                     if klv >= max(0.03, self.kl_value_q80):
                         vwht *= self.config.kl_boost_p80_mult
@@ -2176,16 +2180,21 @@ class Rescorer(object):
     def record_report_game(self, game_data, game_plies, out_df, ply_states):
         """One finished game into its scenario row and, for selfplay, the
         quality trends. Quality is the game's mean over its scored xc0
-        plies; CE only exists where plies trained, KL is search KL."""
+        plies. KLp is KL(visits || priors) and KLv KL(value target || NN
+        WDL), each the gap between the net and what it trains toward; the
+        value target is final here (cliff-walker cut applied)."""
         n = len(out_df)
         tsl = 1000 * out_df['esl'] if n else None
-        kls = [p['tr'].get('kl') for p in ply_states if p.get('tr')]
-        kls = [k for k in kls if k is not None]
+        trs = [p['tr'] for p in ply_states if p.get('tr')]
+        klps = [t['kl'] for t in trs if t.get('kl') is not None]
+        klvs = [kl_divergence(t['wdl_target'], t['root_wdl_nn']) for t in trs
+                if t.get('wdl_target') is not None
+                and t.get('root_wdl_nn') is not None]
         quality = {
             'cpl': out_df['delta'].mean() if n else None,
             'tsl': tsl.mean() if n else None,
-            'ce': out_df['ce'].mean() if n else None,
-            'kl': float(np.mean(kls)) if kls else None,
+            'klv': float(np.mean(klvs)) if klvs else None,
+            'klp': float(np.mean(klps)) if klps else None,
         }
         scenario = game_data.get('scenario', 'unknown')
         name = report_row_name(scenario, game_data.get('stockfish_color'))
@@ -2488,7 +2497,7 @@ class Rescorer(object):
 
         print()
         out("-" * W)
-        out(f"{'trend (game EMA)':<16}{'CPL':>7}{'TSL':>7}{'CE':>6}{'KL':>6}"
+        out(f"{'trend (game EMA)':<16}{'CPL':>7}{'TSL':>7}{'KLv':>7}{'KLp':>6}"
             f"{f'TSL>{TSL_MISTAKE}':>9}{f'TSL>{TSL_BLUNDER}':>9}")
         t = self.trends
         for i, span in enumerate(TREND_SPANS):
@@ -2497,10 +2506,11 @@ class Rescorer(object):
             mistake = t['tsl_mistake'].value(i)
             blunder = t['tsl_blunder'].value(i)
             out(f"{f'ema {span}':<16}" + cell(t['cpl'].value(i), 7, ".2f")
-                + cell(t['tsl'].value(i), 7, ".2f") + cell(t['ce'].value(i), 6, ".2f")
-                + cell(t['kl'].value(i), 6, ".2f")
+                + cell(t['tsl'].value(i), 7, ".2f") + cell(t['klv'].value(i), 7, ".3f")
+                + cell(t['klp'].value(i), 6, ".2f")
                 + cell(None if mistake is None else 100 * mistake, 8, ".1f") + "%"
                 + cell(None if blunder is None else 100 * blunder, 8, ".1f") + "%")
+        print()
         out("-" * W)
 
         if self.start_time is not None:

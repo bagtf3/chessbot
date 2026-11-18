@@ -91,6 +91,6 @@ When a move is played, `advance_root(move_uci)` promotes the chosen child to be 
 
 - **Simulation scheduling** — sim budget is set per-ply from a dict schedule (e.g., ramp from 1000 at ply 0 to 2800 at ply 45).
 - **Effort scaling** — on top of the ply schedule, each move's sims floor and ceiling are multiplied by a scale from an **effort table**. The table was built offline from ~200k training games by measuring how often an outcome-changing mistake happens in each bin of game phase × |parent Q| × parent draw probability. Bins where Xerces plays worse get more sims; quiet, low-stakes bins get fewer. Scales are clamped to `[0.5×, 2×]`, so the budget moves to where mistakes actually happen rather than growing overall. `effort_alpha` sets how strongly the measured mistake rates are turned into scales (0 = flat).
-- **Early stopping** — checks every `es_check_every` sims using two criteria: robust selection confidence (RSC) and Jensen-Shannon divergence stability of the visit distribution. When either is met, the search stops before the ceiling.
+- **Early stopping**: the [search controller](../experimental_features/search_controller.md), a small temporal model, checks in every 100 root visits and decides when to stop or extend the search.
 - **Move sampling** — after search completes, the move to play is sampled from the top-5 candidates using temperature that decays linearly from ply 0 to ply 30.
 - **Dirichlet noise** — added to root priors once per move to encourage exploration.

@@ -1,11 +1,22 @@
 import gc
 import os
+import re
 import time
 
 import numpy as np
 
 
 ENC_SHAPE = {"xc0": "64", "lc0": "112x8x8", "xc0h": "393"}
+
+
+def remove_stale_engines(trt_dir, model_name, tag):
+    """Delete model_name's own engines (<model_name>_<hash>_...), leaving
+    other models that share the prefix, e.g. <model_name>_web_..., alone."""
+    own = re.compile(re.escape(model_name) + r"_[0-9a-f]{12}_.*\.engine")
+    for f in os.listdir(trt_dir):
+        if own.fullmatch(f):
+            os.remove(os.path.join(trt_dir, f))
+            print(f'[{tag}] removed stale engine: {f}', flush=True)
 
 
 def enc_dummy(max_bs, encoding_type):
@@ -107,10 +118,7 @@ def build_trt(src_path, onnx_path, trt_dir, model_name, macro_batch,
           f'{os.path.basename(onnx_path)}', flush=True)
     export_ts_to_onnx(src_path, onnx_path, encoding_type=encoding_type)
 
-    for f in os.listdir(trt_dir):
-        if f.startswith(model_name) and f.endswith('.engine'):
-            os.remove(os.path.join(trt_dir, f))
-            print(f'[trt] removed stale engine: {f}', flush=True)
+    remove_stale_engines(trt_dir, model_name, 'trt')
 
     print('[trt] compiling TRT engine...', flush=True)
     t0 = time.time()
@@ -196,10 +204,7 @@ def recompile_selfplay_trt(cfg):
     print('[retrain] exporting ONNX for TRT recompile...')
     export_ts_to_onnx(cfg.model_path, onnx_path, encoding_type=cfg.encoding_type)
 
-    for f in os.listdir(trt_dir):
-        if f.startswith(model_name) and f.endswith('.engine'):
-            os.remove(os.path.join(trt_dir, f))
-            print(f'[retrain] removed stale engine: {f}')
+    remove_stale_engines(trt_dir, model_name, 'retrain')
 
     print('[retrain] compiling TRT engine...')
     sess = make_trt_session(onnx_path, model_name, trt_dir, cfg.macro_batch,

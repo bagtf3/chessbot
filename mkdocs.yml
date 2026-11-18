@@ -30,7 +30,7 @@ nav:
     - SmartGate: experimental_features/smartgate.md
     - MateLock: experimental_features/matelock.md
     - VScale: experimental_features/vscale.md
-    - Robust Selection Criteria: experimental_features/rsc.md
+    - Search Controller: experimental_features/search_controller.md
     - Prior Temperature Scaling: experimental_features/tempscale.md
   - FAQ: faq.md
   - Setup:

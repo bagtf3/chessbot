@@ -110,12 +110,14 @@ DEFAULTS = {
     "server_threads": 2,
     "seed": 1,
     # search params set over the run config's
-    "vscale": 1.0,
+    "vscale": 0.9,
+    "vscale_gate_q": 0.9,
     "fpu_reduction": 0.2,
     "qema_span": 160,
     "qdelta_span": 160,
 }
-SEARCH_OVERRIDES = ("vscale", "fpu_reduction", "qema_span", "qdelta_span")
+SEARCH_OVERRIDES = (
+    "vscale", "vscale_gate_q", "fpu_reduction", "qema_span", "qdelta_span")
 
 
 def dominance(visits, root_n, ceiling, min_decision):

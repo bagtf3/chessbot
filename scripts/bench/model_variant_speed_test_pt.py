@@ -5,6 +5,10 @@ PT eager and ORT+TensorRT fp16 speed tests for xc0h policy+value models.
 
 Models (CONV_MODELS, built from model.VARIANTS):
   m13-7-8c8t-d256   -- prod: build_pt_expandy_swiglu
+  m137sm_8c8t_d256  -- prod with the 4 FF blocks as FFN_SM (grouped softmax
+                       activation, 64 groups of 16)
+  m137smg_8c8t_d256 -- m137sm with the 4 SwiGLU blocks as SwiGLU_SM (grouped
+                       softmax gate x up, scaled by the group width)
   m137f_8c8t_d256_d512 -- build_pt_m137_franken: 64 tokens only, 6 smolgen tx
                        blocks at 256 then 2 at 512, split from / to policy,
                        gated spatial WDL, no smartgate
@@ -55,6 +59,10 @@ XC0H_IN_LEN = 6 * 64 + 6 + 3
 CONV_MODELS = [
     ("m13-7-8c8t-d256",  build_pt_expandy_swiglu, VARIANTS["m13-7-8c8t-d256"],
      "m137_8c8t_d256"),
+    ("m137sm_8c8t_d256", build_pt_expandy_swiglu, VARIANTS["m137sm_8c8t_d256"],
+     "m137sm_8c8t_d256"),
+    ("m137smg_8c8t_d256", build_pt_expandy_swiglu, VARIANTS["m137smg_8c8t_d256"],
+     "m137smg_8c8t_d256"),
     ("m137f_8c8t_d256_d512", build_pt_m137_franken,
      VARIANTS["m137f_8c8t_d256_d512"], "m137f_8c8t_d256_d512"),
     ("m137f_8c8t_4d256_4d512", build_pt_m137_franken,

@@ -5,10 +5,9 @@ scan of 18m_10c6t_d256_selfplay1, 14 distinct positions carried 10.4% of every
 record at ply <= 15, and startpos alone appeared 18,842 times. Training on that
 distribution spends capacity relearning the same first four moves.
 
-The fix is a weight, not a filter. Every record is kept; records whose position
-has been seen often carry proportionally less sample weight. Mass is restored
-per shard by apply_repeat_weights, so the total training signal is unchanged --
-it moves off the hot openings and onto everything else.
+The counts drive sampling: rescore's admit draws a record with a probability
+scaled by its position's band weight, so often-seen openings are thinned out of
+the buffer rather than reweighted inside it.
 
 Counts live in one flat float32 table indexed by a hash of the encoded board's
 current-position frame, x[:64]: a single-row count-min sketch. At 1 << 25 slots
@@ -17,10 +16,7 @@ current-position frame, x[:64]: a single-row count-min sketch. At 1 << 25 slots
 colliding into a 0.95 weight. Not worth mitigating.
 
 Keying on x rather than the zobrist hash is deliberate: it makes the slot
-recoverable from a bare record. Records that reach a shard without a key --
-remaining_untrained reloaded after a restart, seeder output -- are hashed on the
-fly at write time and weighted correctly, instead of silently escaping at 1.0.
-crc32 and not hash(): the builtin is salted per process, so it would hand out
+recoverable from a bare record. crc32 and not hash(): the builtin is salted per process, so it would hand out
 different slots after every restart and quietly invalidate the saved table.
 
 Only positions at absolute_ply <= MAX_TRACKED_PLY are bumped. That is a true
@@ -31,11 +27,9 @@ bump time, where a board exists; lookups need no gate, because a position that
 was never bumped reads back count 0 and weight 1.0 on its own.
 
 Only xerces-played positions bump the table. lc0 records -- distilled main
-positions and PV children alike -- neither bump it nor get reweighted by it:
-they are appended REWEIGHT_INELIGIBLE at every append site. An lc0 record is a
-second, independent observation of a position, so counting it would penalise
-the position for being studied, and reweighting it would compound the
-suppression already applied to the xc0 record it accompanies.
+positions and PV children alike -- neither bump it nor are sampled by it. An
+lc0 record is a second, independent observation of a position, so counting it
+would penalise the position for being studied.
 
 Counts decay by COUNTS_DECAY_FACTOR on every shard write: half-life 138 shards
 (~10,800 games), steady state 200x the per-shard arrival rate. WEIGHT_BANDS is

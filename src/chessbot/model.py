@@ -86,6 +86,14 @@ VARIANTS: dict[str, dict] = {
         conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
         n_plain=2, n_gated=6, n_ff=4, n_swiglu=4, attn_gate=True, prelu=True,
     ),
+    "m137sm_8c8t_d256": dict(
+        conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ffnsm=4, n_swiglu=4, attn_gate=True, prelu=True,
+    ),
+    "m137smg_8c8t_d256": dict(
+        conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
+        n_plain=2, n_gated=6, n_ffnsm=4, n_swiglusm=4, attn_gate=True, prelu=True,
+    ),
     "m137s_8c8t_d256_smolgen": dict(
         conv_filters=256, num_heads=8, ff_dim=1024, xc0h_K=6,
         n_plain=2, n_gated=6, n_ff=4, n_swiglu=4, attn_gate=True, prelu=True,
@@ -2164,6 +2172,9 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
     n_gated   = cfg.get("n_gated", 0)
     n_ff      = cfg.get("n_ff", 0)
     n_swiglu  = cfg.get("n_swiglu", 0)
+    n_ffnsm   = cfg.get("n_ffnsm", 0)
+    n_swiglusm = cfg.get("n_swiglusm", 0)
+    SM_GROUP  = 16           # FFN_SM / SwiGLU_SM softmax group width
     groups    = cfg.get("expandy_groups", 4)
     dr        = cfg.get("dropout", 0.05)
     norm      = cfg.get("norm", "layernorm")
@@ -2433,6 +2444,32 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.down_mon(down_out)
             return x + self.ff_drop(down_out)
 
+    class TxBlockFFNSM(nn.Module):
+        """FF block whose activation is a softmax over each token's ff_dim
+        hidden units in groups of SM_GROUP."""
+
+        def __init__(self, down_mon):
+            super().__init__()
+            self.n1 = make_norm(D)
+            self.attn = Attention(D, nh)
+            self.n2 = make_norm(D)
+            self.ff1 = nn.Linear(D, ff_dim)
+            self.ff2 = nn.Linear(ff_dim, D, bias=False)
+            self.smol = Smolgen() if smolgen else None
+            self.down_mon = down_mon
+            self.attn_drop = nn.Dropout(dr)
+            self.ff_drop = nn.Dropout(dr)
+
+        def forward(self, x, smol_gen=None):
+            n = self.n1(x)
+            bias = self.smol(n, smol_gen) if self.smol is not None else None
+            x = x + self.attn_drop(self.attn(n, n, bias))
+            B, T, _ = x.shape
+            h = self.ff1(self.n2(x)).view(B, T, ff_dim // SM_GROUP, SM_GROUP)
+            down_out = self.ff2(h.softmax(dim=-1).reshape(B, T, ff_dim))
+            self.down_mon(down_out)
+            return x + self.ff_drop(down_out)
+
     class TxBlockSwiGLU(nn.Module):
         def __init__(self, down_mon):
             super().__init__()
@@ -2456,6 +2493,36 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.down_mon(down_out)
             return x + self.ff_drop(down_out)
 
+    class TxBlockSwiGLUSM(nn.Module):
+        """SwiGLU block with a grouped softmax on the gate: per token, each of
+        the SM_GROUP-wide groups softly picks among its up values. Scaled by
+        SM_GROUP so a uniform gate passes up through unchanged."""
+
+        def __init__(self, down_mon):
+            super().__init__()
+            self.n1 = make_norm(D)
+            self.attn = Attention(D, nh, gate=attn_gate)
+            self.n2 = make_norm(D)
+            self.gate = nn.Linear(D, 4 * D)
+            self.up = nn.Linear(D, 4 * D)
+            self.down = nn.Linear(4 * D, D, bias=False)
+            self.smol = Smolgen() if smolgen else None
+            self.down_mon = down_mon
+            self.attn_drop = nn.Dropout(dr)
+            self.ff_drop = nn.Dropout(dr)
+
+        def forward(self, x, smol_gen=None):
+            n = self.n1(x)
+            bias = self.smol(n, smol_gen) if self.smol is not None else None
+            x = x + self.attn_drop(self.attn(n, n, bias))
+            B, T, _ = x.shape
+            n = self.n2(x)
+            g = self.gate(n).view(B, T, -1, SM_GROUP).softmax(dim=-1)
+            v = self.up(n).view(B, T, -1, SM_GROUP)
+            down_out = self.down((SM_GROUP * g * v).reshape(B, T, 4 * D))
+            self.down_mon(down_out)
+            return x + self.ff_drop(down_out)
+
     class M(nn.Module):
         def __init__(self):
             super().__init__()
@@ -2473,7 +2540,10 @@ def build_pt_expandy_swiglu(cfg: dict, log_params: bool = False):
             self.res_mon = MaxMonitor()
             self.blocks = nn.ModuleList(
                 [TxBlockFF(self.ff_down_mon) for _ in range(n_ff)]
-                + [TxBlockSwiGLU(self.swiglu_down_mon) for _ in range(n_swiglu)])
+                + [TxBlockFFNSM(self.ff_down_mon) for _ in range(n_ffnsm)]
+                + [TxBlockSwiGLU(self.swiglu_down_mon) for _ in range(n_swiglu)]
+                + [TxBlockSwiGLUSM(self.swiglu_down_mon)
+                   for _ in range(n_swiglusm)])
             # one 256 -> 64x64 generator shared by every block; zero-init so the
             # bias is exactly 0 at init (identity graft onto a no-smolgen checkpoint)
             self.smol_gen = None
@@ -2922,6 +2992,8 @@ PT_BUILDERS: dict[str, object] = {
     "conv-shallow-mha":                      build_pt_conv_shallow_mha,
     "full-mha-smartgate":                   build_pt_full_mha_smartgate,
     "m13-7-8c8t-d256":                      build_pt_expandy_swiglu,
+    "m137sm_8c8t_d256":                     build_pt_expandy_swiglu,
+    "m137smg_8c8t_d256":                    build_pt_expandy_swiglu,
     "m137s_8c8t_d256_smolgen":              build_pt_expandy_swiglu,
     "m137f_8c8t_d256_d512":                 build_pt_m137_franken,
     "m137f_8c8t_4d256_4d512":               build_pt_m137_franken,

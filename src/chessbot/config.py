@@ -151,8 +151,7 @@ class Config(object):
 
     train_on_stockfish = True
 
-    kl_boost_median_mult = 1.5   # pwht multiplier when KL > running EMA median
-    kl_boost_p80_mult    = 3.0   # pwht multiplier when KL > running EMA 80th pctile
+    kl_boost_p80_mult    = 1.5   # pwht/vwht multiplier when KL > running EMA 80th pctile
     kl_quantile_lr       = 0.0005 # step size for the online trackers (~1/lr, ~2000)
 
     game_probs = {
@@ -204,7 +203,6 @@ class Config(object):
     learning_rate = 1e-4          # optimizer LR; applied fresh at every retrain
     retrain_weight_decay = 0.005  # AdamW decoupled, 2D+ weights only
     adam_beta2 = 0.9917           # Adam v-window: 1/(1-beta2) steps; 0.9917~=120, 0.999~=1000
-    draw_value_scale = 1.0        # per-sample value weight for drawn games (decisive = 1.0)
     vscale = 0.9
     # vscale applies only while raw |root Q| > vscale_gate_q (0 = always)
     vscale_gate_q = 0.9

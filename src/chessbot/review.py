@@ -2049,6 +2049,7 @@ class RecordKeeper(object):
 
         # pull stats
         summed, avged = self.get_agg_metrics(print_span)
+        avg_moves = (self.total_plies / max(1, self.games_finished))
         gph =  3600 * self.games_finished / (now - self._run_start)
         
         print()
@@ -2057,6 +2058,12 @@ class RecordKeeper(object):
         mps, lps = summed.get("mps", 0), summed.get("lps", 0)
         print(f"[speed stats] mps={mps:.1f}  lps={lps:.1f}  gph={gph:.2f}  "
               f"uptime={compact_span(now - self._run_start)}")
+
+        print(
+            f"[game stats]  finished={self.games_finished}  "
+            f"W/D/L={self.white_wins}/{self.draws}/{self.black_wins}  "
+            f"draw={100 * self.draws / max(1, self.games_finished):.2f}%  "
+            f"avg plies={avg_moves:.1f}")
         print("-" * LOG_WIDTH)
 
         if not self.games_finished:

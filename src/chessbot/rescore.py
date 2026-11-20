@@ -28,7 +28,7 @@ from chessbot.replay_buffer import (
     new_shard_path, write_pkl_gz_shard, flush_lc0_shards, is_lc0_record,
 )
 from chessbot.opening_counts import (
-    COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts,
+    COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts, band_weights,
 )
 
 from chessbot.blunder_replay import (
@@ -67,6 +67,17 @@ BRP_ROUND_WAIT_S = 180
 # still trains, at LC0_SENT_XC0_WEIGHT.
 # weight multiplier on an xc0 sample whose position also went to lc0
 LC0_SENT_XC0_WEIGHT = 0.5
+# admit: every live_buffer sample is accepted on these rules. A move SF played
+# counts as TSL 0. KLm = max(KLv / KLv_p80, KLp / KLp_p80), clipped to
+# [ACCEPT_KL_FLOOR, 1]; a right move (TSL <= ACCEPT_TSL_GOOD) that was extended,
+# had a lock rejected or has KLm 1 is always taken, the rest are drawn at
+# max(ACCEPT_FLOOR, draw * opening band weight * KLm)
+ACCEPT_TSL_GOOD = 50
+ACCEPT_KL_FLOOR = 0.4
+ACCEPT_FLOOR = 0.05
+ACCEPT_DRAW_P = 0.8
+# a forced move teaches nothing; a few stay so the model keeps seeing them
+ACCEPT_ONE_LEGAL_P = 0.2
 LC0_TEACHER_TOP_K = 5
 LC0_TEACHER_PV_K = 2
 BRP_STAT_KEYS = (
@@ -97,6 +108,8 @@ TREND_SPANS = (100, 500, 2000)
 # per-ply TSL thresholds for the mistake / blunder rates in the trend lines
 TSL_MISTAKE = 50
 TSL_BLUNDER = 120
+# per-ply EMA span for the trend table's acc row (admitted xc0 plies)
+ACC_EMA_SPAN = 20000
 # stop/blunder stat blocks print every N analyzed games; their window
 # accumulators reset on print, so this is the cadence and the window both
 STATS_WINDOW_GAMES = 200
@@ -127,6 +140,12 @@ BUSY_EXTRA_MS = 20
 PAIR_TIME_MULT = 2.25
 PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5,
                 chess.QUEEN: 9}
+
+
+def ctrl_shaky(tr):
+    """The controller extended this move or rejected one of its locks."""
+    cs = tr.get('ctrl_sum') or {}
+    return bool(cs.get('ext') or cs.get('rejections'))
 
 
 def material(board):
@@ -499,6 +518,9 @@ class Rescorer(object):
         self.report_rows = defaultdict(ReportRow)
         self.brp_row = ReportRow()
         self.trends = {m: Trend() for m in (*QUALITY, "tsl_mistake", "tsl_blunder")}
+        # seeded at observed admitted-ply levels
+        self.acc_ema = {'cpl': 4.81, 'tsl': 6.03, 'klv': 0.115, 'klp': 0.47,
+                        'tsl_mistake': 0.045, 'tsl_blunder': 0.002}
 
         self.n_sf_submitted = 0
         self.sf_compute_time = 0.0
@@ -527,7 +549,7 @@ class Rescorer(object):
         self.window_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
 
         zero_sc = lambda: {
-            'total': 0, 'accepted': 0, 'blended': 0,
+            'offered': 0, 'accepted': 0,
             'lc0_queued': 0, 'lc0_samples': 0}
 
         self.sample_counts = zero_sc()
@@ -546,14 +568,14 @@ class Rescorer(object):
         # ply0 lc0 and xc0 only ever step together, so uplift always reconciles.
         # seeded at the observed teacher/xerces loss so one lucky first
         # probe does not own the number for thousands of samples
-        self.lc0_audit_ema = {'lc0': 13.2, 'xc0': 174.2}
+        self.lc0_audit_ema = {'lc0': 9.4, 'xc0': 97.6}
         self.brp_admit_n = 0
         self.brp_admit_ok = 0
 
-        self.kl_q50 = 0.345  # online-tracked EMA median of eligible-ply KL
-        self.kl_q80 = 0.657  # online-tracked EMA 80th percentile of eligible-ply KL
-        self.kl_value_q50 = 0.0  # EMA median of eligible-ply best_wdl||root_wdl_nn KL
-        self.kl_value_q80 = 0.0  # EMA 80th percentile of the same
+        self.kl_q50 = 0.21  # online-tracked EMA median of eligible-ply KL
+        self.kl_q80 = 0.55  # online-tracked EMA 80th percentile of eligible-ply KL
+        self.kl_value_q50 = 0.024  # EMA median of eligible-ply KL(target, root_wdl_nn)
+        self.kl_value_q80 = 0.124  # EMA 80th percentile of the same
 
         self.intake = deque()
         self.blunder_replay_intake = deque()
@@ -833,6 +855,37 @@ class Rescorer(object):
             return board.history_tokens(XC0H_K)
         return board.encode_64_tokens()
 
+    def track_accepted(self, cpl, tsl, klv, klp):
+        a = 2.0 / (ACC_EMA_SPAN + 1.0)
+        for k, v in (('cpl', cpl), ('tsl', tsl), ('klv', klv), ('klp', klp),
+                     ('tsl_mistake', tsl > TSL_MISTAKE),
+                     ('tsl_blunder', tsl > TSL_BLUNDER)):
+            self.acc_ema[k] += a * (float(v) - self.acc_ema[k])
+
+    @staticmethod
+    def target_kl(Y, node):
+        nn = node.get('root_wdl_nn')
+        return float(kl_divergence(Y, nn)) if nn is not None else 0.0
+
+    def admit(self, entry, okey, tsl, klv, klp, shaky, is_draw, n_legal):
+        """The one way into live_buffer. Returns True if the sample was taken."""
+        if n_legal <= 1:
+            ok = random.random() < ACCEPT_ONE_LEGAL_P
+        else:
+            klm = max(klv / max(self.kl_value_q80, 1e-6),
+                      klp / max(self.kl_q80, 1e-6))
+            klm = min(max(klm, ACCEPT_KL_FLOOR), 1.0)
+            if tsl <= ACCEPT_TSL_GOOD and (shaky or klm >= 1.0):
+                ok = True
+            else:
+                freq = (1.0 if okey in (None, REWEIGHT_INELIGIBLE)
+                        else float(band_weights(self.opening_counts.counts[okey])))
+                p = (ACCEPT_DRAW_P if is_draw else 1.0) * freq * klm
+                ok = random.random() < max(ACCEPT_FLOOR, p)
+        if ok:
+            self.live_buffer.append(entry, okey)
+        return ok
+
     def make_policy_example(self, board, ucis, visits):
         indices = board.moves_to_indices(ucis)
         policy = np.zeros(1858, dtype=np.float32)
@@ -853,13 +906,13 @@ class Rescorer(object):
             (x, None, sparsify_policy(policy), Y, vwht, pwht, source), okey)
         return policy
 
-    def training_data_from_sf(self, board, mv, tr, is_draw, sf_won):
+    def training_data_from_sf(self, board, mv, tr, sf_won):
         """One SF ply. Policy: Xerces's search when SF played the search's
         top move; otherwise sf_move_target on SF's move blended with the
         search, SF weight SF_POLICY_W_WON if SF won the game
-        else SF_POLICY_W_OTHER. The clip is applied after the blend. KL and
-        value-KL boosts match a Xerces ply. Returns (x, dense policy, okey,
-        vwht, pwht); finalize_game attaches the value target and appends."""
+        else SF_POLICY_W_OTHER. The clip is applied after the blend. The KL
+        boost matches a Xerces ply. Returns (x, dense policy, okey, pwht, kl,
+        n_legal); finalize_game attaches the value target and admits it."""
         cfg = self.config
         cm = tr['candidate_moves']
         lms = board.legal_moves()
@@ -877,24 +930,15 @@ class Rescorer(object):
             w = SF_POLICY_W_WON if sf_won else SF_POLICY_W_OTHER
             pi = w * sf_move_target(ucis, mv) + (1 - w) * pi
 
-        vwht = value_weight_for_game(cfg, is_draw)
-        pwht = value_weight_for_game(cfg, is_draw)
+        pwht = 1.0
         priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
         kl = kl_divergence(list(xc0), [priors_map.get(u, 0.0) for u in ucis])
         if kl >= self.kl_q80:
             pwht *= cfg.kl_boost_p80_mult
-        elif kl >= self.kl_q50:
-            pwht *= cfg.kl_boost_median_mult
-        # raw search vs net, not the blended target (see the selfplay path)
-        klv = tr.get('kl_value')
-        if klv is not None:
-            if klv >= max(0.03, self.kl_value_q80):
-                vwht *= cfg.kl_boost_p80_mult
-            elif klv >= max(0.01, self.kl_value_q50):
-                vwht *= cfg.kl_boost_median_mult
 
         x, policy = self.make_policy_example(board, ucis, list(pi))
-        return x, policy, self.opening_counts.key(board, x), vwht, pwht
+        return (x, policy, self.opening_counts.key(board, x), pwht, kl,
+                len(lms))
 
     def start_game(self, pkl_file, pool):
         path = str(pkl_file)
@@ -921,7 +965,6 @@ class Rescorer(object):
         vs_stockfish = header.get('vs_stockfish', False)
         sf_color = header.get('stockfish_color')
         result = header['result']
-        is_draw = (result == 0) or (result == 0.0)
 
         is_validation_game = 'validation' in header.get('scenario', '').lower()
         skip_all_training = is_validation_game
@@ -936,7 +979,6 @@ class Rescorer(object):
             rescore_esl_inaccuracy=cfg.rescore_esl_inaccuracy,
             rescore_esl_blunder=cfg.rescore_esl_blunder,
             rescore_analyze_batch=cfg.rescore_analyze_batch,
-            draw_value_scale=cfg.draw_value_scale,
             vscale=cfg.vscale,
         )
 
@@ -1005,7 +1047,7 @@ class Rescorer(object):
                 # value target waits for finalize_game, which knows the
                 # blunder cuts
                 sf_won = result != 0 and (result > 0) == bool(sf_color)
-                ex = self.training_data_from_sf(b_fast, mv, tr, is_draw, sf_won)
+                ex = self.training_data_from_sf(b_fast, mv, tr, sf_won)
                 tr['policy'] = [(int(j), float(ex[1][j]))
                                 for j in np.flatnonzero(ex[1])]
                 game_state['sf_examples'].append((i, turn, outcome, ex))
@@ -1317,17 +1359,22 @@ class Rescorer(object):
 
         ms = self.brp_scorer.score(best_uci, best_cp, probe_move, played_cp)
         probe_cpl = ms.loss
-        cm = ((ply or {}).get('tr') or {}).get('candidate_moves') or []
+        tr = (ply or {}).get('tr') or {}
+        cm = tr.get('candidate_moves') or []
+        wdl, nn_wdl = tr.get('best_wdl'), tr.get('root_wdl_nn')
+        tsl = 1000 * expected_score_loss(ms.best_cp, ms.best_cp - probe_cpl)
         self.brp_row.N += 1
         self.brp_row.add_quality({
             'cpl': probe_cpl,
-            'tsl': 1000 * expected_score_loss(ms.best_cp, ms.best_cp - probe_cpl),
+            'tsl': tsl,
+            'klv': float(kl_divergence(wdl, nn_wdl))
+                   if wdl is not None and nn_wdl is not None else None,
             'klp': float(kl_divergence([c['visits'] for c in cm],
                                        [c.get('P_raw', c['P']) for c in cm]))
                    if cm else None,
         })
         found_best = probe_move == best_uci
-        found_equiv = probe_cpl <= BRP_EQUIV_CPL
+        found_equiv = tsl <= ACCEPT_TSL_GOOD
         same_move = probe_move == orig_move
         evicted = found_equiv
         added_epoch = None
@@ -1360,10 +1407,9 @@ class Rescorer(object):
                 evict_position(pool, short_fen_key, "found_equiv", epoch,
                                evicted_path(self.blunder_pool_path))
                 if ply is not None:
-                    self.add_blunder_replay_training_example(
-                        ply, epoch, best_uci, best_cp, probe_cpl)
+                    self.add_blunder_replay_training_example(ply, tsl)
             # not equiv -- found_equiv took everything at or under
-            # BRP_EQUIV_CPL, so anything reaching here is still wrong
+            # ACCEPT_TSL_GOOD, so anything reaching here is still wrong
             elif ply is not None:
                 src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
                 if src['n_fails'] == BRP_LC0_REQUEUE_FAILS:
@@ -1683,8 +1729,12 @@ class Rescorer(object):
         if not cm or wdl is None:
             return False
 
+        legal = board.legal_moves()
+        if len(legal) <= 1 and random.random() >= ACCEPT_ONE_LEGAL_P:
+            return False
+
         vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
-        for u in board.legal_moves():
+        for u in legal:
             vmap.setdefault(u, 1)
 
         ucis = list(vmap)
@@ -1701,66 +1751,44 @@ class Rescorer(object):
         self.lc0_buffer.append(record, REWEIGHT_INELIGIBLE)
         return record
 
-    def add_blunder_replay_training_example(self, ply, epoch, best_uci,
-                                             best_cp, probe_cpl):
+    def add_blunder_replay_training_example(self, ply, tsl):
         """
-        Turns a passed (found_equiv) replay probe into a live_buffer sample.
-        Policy blends the model's own visits with an SF target
-        (sf_move_target on SF's best), alpha ramping 0.10 at probe_cpl=25 to
-        0.85 at 150. Value is the search's own WDL, unblended.
+        Offers a passed (found_equiv) replay probe to admit as a live_buffer
+        sample. Policy is the search's own visits with a 1-visit floor on every
+        legal move; value is the search's own WDL.
         """
         board = ply['board']
         tr = ply.get('tr') or {}
 
         cm = tr.get('candidate_moves', [])
-        xc0_pairs = [(c['uci'], max(1, c['visits'])) for c in cm]
-        if not xc0_pairs:
+        if not cm:
             return False
 
         legal_ucis = board.legal_moves()
-        if best_uci not in legal_ucis:
-            return False
+        vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
+        for u in legal_ucis:
+            vmap.setdefault(u, 1)
+        ucis, vis = list(vmap), list(vmap.values())
+        x, policy = self.make_policy_example(board, ucis, vis)
 
-        total_visits = sum(v for _, v in xc0_pairs)
-        legal_ucis = list(legal_ucis)
-        xc0_probs = {u: v / total_visits for u, v in xc0_pairs}
-        sf_probs = dict(zip(legal_ucis, sf_move_target(legal_ucis, best_uci)))
+        wdl = tr.get('best_wdl')
+        Y = (np.array(wdl, dtype=np.float32) if wdl is not None
+             else scalar_to_wdl(tr.get('Q_stm', 0.0)))
 
-        alpha = 0.10 + (min(max(probe_cpl, 25), 150) - 25) / 125.0 * 0.75
-
-        ucis = sorted(set(xc0_probs) | set(sf_probs))
-        blended = np.array([
-            alpha * sf_probs.get(u, 0.0) + (1 - alpha) * xc0_probs.get(u, 0.0)
-            for u in ucis
-        ], dtype=np.float32)
-        blended = blended / blended.sum()
-        blended = blend_to_uniform(blended, 1e-6, self.config.prior_clip_max)
-
-        indices = board.moves_to_indices(ucis)
-        policy = np.zeros(1858, dtype=np.float32)
-        for idx, p in zip(indices, blended):
-            policy[idx] += p
-
-        # Only the policy takes an SF blend; the value stays the search's own.
-        wdl_xc0 = tr.get('best_wdl')
-        if wdl_xc0 is not None:
-            wdl_xc0 = np.array(wdl_xc0, dtype=np.float32)
-        else:
-            wdl_xc0 = scalar_to_wdl(tr.get('Q_stm', 0.0))
-        Y = wdl_xc0
-
-        x = self.encode_board(board)
         okey = self.opening_counts.key(board, x)
         self.opening_counts.bump(okey)
+        priors = {c['uci']: c.get('P_raw', c['P']) for c in cm}
+        klp = float(kl_divergence(vis, [priors.get(u, 0.0) for u in ucis]))
         for c in (self.sample_counts, self.sample_counts_window):
-            c['accepted'] += 1
-            c['blended'] += 1
-        # distinct source tag so retrain_worker.py can exclude these blended
-        # synthetic-target samples from the validation draw
-        self.live_buffer.append(
-            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0_replay_blend'),
-            okey)
-        return True
+            c['offered'] += 1
+        ok = self.admit(
+            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0'),
+            okey, tsl, self.target_kl(Y, tr), klp, ctrl_shaky(tr), False,
+            len(legal_ucis))
+        if ok:
+            for c in (self.sample_counts, self.sample_counts_window):
+                c['accepted'] += 1
+        return ok
 
     def analyse_brp_file(self):
         """
@@ -1972,33 +2000,13 @@ class Rescorer(object):
             priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
             priors = [priors_map.get(u, 0.0) for u in mvs]
 
-            vwht = value_weight_for_game(cfg, is_draw)
-            pwht = value_weight_for_game(cfg, is_draw)
+            vwht = pwht = 1.0
             kl = kl_divergence(vis, priors)
             rows[-1][-2] = kl
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, self.config.kl_quantile_lr)
             self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, self.config.kl_quantile_lr)
-            klv = tr.get('kl_value')
-            if klv is not None:
-                self.kl_value_q50 = update_ema_quantile(
-                    self.kl_value_q50, klv, 0.5, self.config.kl_quantile_lr)
-                self.kl_value_q80 = update_ema_quantile(
-                    self.kl_value_q80, klv, 0.8, self.config.kl_quantile_lr)
-            if kl_eligible:
-                if kl >= self.kl_q80:
-                    pwht *= self.config.kl_boost_p80_mult
-                elif kl >= self.kl_q50:
-                    pwht *= self.config.kl_boost_median_mult
-                # value-KL boost on the value weight, mirroring the policy boost.
-                # max(0.01, .) floors the quantile so a zeroed tracker doesn't make
-                # every ply eligible. Keyed on raw search vs net, not the blended
-                # target: the outcome half would skew weight toward the opening
-                # and early game.
-                if klv is not None:
-                    if klv >= max(0.03, self.kl_value_q80):
-                        vwht *= self.config.kl_boost_p80_mult
-                    elif klv >= max(0.01, self.kl_value_q50):
-                        vwht *= self.config.kl_boost_median_mult
+            if kl_eligible and kl >= self.kl_q80:
+                pwht *= self.config.kl_boost_p80_mult
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']
@@ -2024,6 +2032,9 @@ class Rescorer(object):
                 'idx_map':         idx_map,
                 'is_blunder':      is_blunder,
                 'stat_keys':       stat_keys,
+                'esl':             esl,
+                'kl':              kl,
+                'kl_eligible':     kl_eligible,
                 'ply_i':           i,
                 'best_wdl':        tr.get('best_wdl'),
             })
@@ -2036,8 +2047,8 @@ class Rescorer(object):
             game_state['plies'], cut_white, self.config.value_bootstrap_at_sample)
 
         # SF plies: cliff-walker-corrected outcome, half SF's own tanh(cp)
-        for ply_i, stm, outcome, (x, policy, okey, vwht, pwht) in game_state.get(
-                'sf_examples', ()):
+        for ply_i, stm, outcome, (x, policy, okey, pwht, kl, n_legal) in (
+                game_state.get('sf_examples', ())):
             cut = cut_outcome.get(ply_i)
             if cut is not None:
                 outcome = scalar_to_wdl(cut if stm else -cut)
@@ -2046,9 +2057,12 @@ class Rescorer(object):
             Y = outcome if sf_v is None else (
                 0.5 * outcome + 0.5 * scalar_to_wdl(sf_v)).astype(np.float32)
             node['wdl_target'] = Y
+            klv = self.target_kl(Y, node)
+            vwht = (self.config.kl_boost_p80_mult
+                    if klv >= max(0.03, self.kl_value_q80) else 1.0)
             self.opening_counts.bump(okey)
-            self.live_buffer.append(
-                (x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE), okey)
+            self.admit((x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE),
+                       okey, 0.0, klv, kl, ctrl_shaky(node), is_draw, n_legal)
 
         # loop 2: compute WDL targets and add to training
         for tup, aux in zip(pending, pending_aux):
@@ -2064,6 +2078,15 @@ class Rescorer(object):
                 Y = blend_wdl_stm(outcome, node.get('best_wdl'))
                 node['wdl_target'] = Y
 
+            klv = self.target_kl(Y, node)
+            self.kl_value_q50 = update_ema_quantile(
+                self.kl_value_q50, klv, 0.5, self.config.kl_quantile_lr)
+            self.kl_value_q80 = update_ema_quantile(
+                self.kl_value_q80, klv, 0.8, self.config.kl_quantile_lr)
+            # floored so a zeroed tracker doesn't boost every ply
+            if aux['kl_eligible'] and klv >= max(0.03, self.kl_value_q80):
+                vwht *= self.config.kl_boost_p80_mult
+
             wdl_node = aux.get('best_wdl')
             if wdl_node is not None:
                 model_wdl = np.array(wdl_node, dtype=np.float32)
@@ -2074,8 +2097,6 @@ class Rescorer(object):
                     # self-referential and barely moves. Y itself is unchanged.
                     row[-1] = cross_entropy(z_to_wdl(z), model_wdl)
 
-            sc['total'] += 1
-            scw['total'] += 1
 
             # the position was played either way, so the opening table is
             # bumped even when the sample itself goes to the teacher
@@ -2094,6 +2115,8 @@ class Rescorer(object):
                     scw['lc0_queued'] += 1
                     self.count_lc0_send(aux['stat_keys'])
                     continue
+                print(f"{RS} lc0 queue refused blunder {gid} ply {ply_i}, "
+                      f"left to the training path")
 
             sent = aux['sent_to_lc0']
             if aux['to_teacher']:
@@ -2111,9 +2134,13 @@ class Rescorer(object):
                 pwht *= LC0_SENT_XC0_WEIGHT
 
             entry = (x, None, sparsify_policy(policy), Y, vwht, pwht, 'xc0')
-            self.live_buffer.append(entry, okey)
-            sc['accepted'] += 1
-            scw['accepted'] += 1
+            sc['offered'] += 1
+            scw['offered'] += 1
+            if self.admit(entry, okey, 1000 * aux['esl'], klv, aux['kl'],
+                          ctrl_shaky(node), is_draw, len(aux['lms'])):
+                sc['accepted'] += 1
+                scw['accepted'] += 1
+                self.track_accepted(aux['loss'], 1000 * aux['esl'], klv, aux['kl'])
 
         cols = [
             'move_num', 'played_move', 'most_visited_move', 'best_move',
@@ -2180,13 +2207,13 @@ class Rescorer(object):
     def record_report_game(self, game_data, game_plies, out_df, ply_states):
         """One finished game into its scenario row and, for selfplay, the
         quality trends. Quality is the game's mean over its scored xc0
-        plies. KLp is KL(visits || priors) and KLv KL(value target || NN
-        WDL), each the gap between the net and what it trains toward; the
-        value target is final here (cliff-walker cut applied)."""
+        plies. KLp and KLv are the ones admit samples on: KL(visits with a
+        1-visit floor on every legal move || priors) and KL(value target || NN
+        WDL); the value target is final here (cliff-walker cut applied)."""
         n = len(out_df)
         tsl = 1000 * out_df['esl'] if n else None
         trs = [p['tr'] for p in ply_states if p.get('tr')]
-        klps = [t['kl'] for t in trs if t.get('kl') is not None]
+        klps = out_df['kl'].dropna().tolist() if n else []
         klvs = [kl_divergence(t['wdl_target'], t['root_wdl_nn']) for t in trs
                 if t.get('wdl_target') is not None
                 and t.get('root_wdl_nn') is not None]
@@ -2392,14 +2419,16 @@ class Rescorer(object):
             return (f"{RS}  {label:<9}{share:7.1%}{sims / k:7.0f}{tsl / k:7.2f}"
                     f"{cpl / k:7.2f}{bl / k:8.2%}")
 
+        old_n = f" / {a.old[0]} old xc0" if a.old[0] else ""
         print(f"{RS} controller, all {self.ctrl_games} games since start "
-              f"({n} ctrl / {a.old[0]} old xc0 moves)")
+              f"({n} ctrl{old_n} moves)")
         print(f"{RS}  {'stop':<9}{'share':>7}{'sims':>7}{'TSL':>7}{'CPL':>7}{'blund':>8}")
         for g in CtrlStats.GROUPS[:-1]:
             print(line(g, a.groups[g], a.groups[g][0] / n))
         print(line("all", a.all, 1.0))
-        # old rules: share is of all xc0 moves
-        print(line("old", a.old, a.old[0] / (n + a.old[0])))
+        if a.old[0]:
+            # old rules: share is of all xc0 moves
+            print(line("old", a.old, a.old[0] / (n + a.old[0])))
 
         saved = 1 - a.sims / a.sched if a.sched else float("nan")
         old_txt = (f"   old {a.old_sims / 1e6:.2f}M/{a.old_sched / 1e6:.2f}M "
@@ -2460,8 +2489,7 @@ class Rescorer(object):
         wh, ws, wc, wb = rows(f"last {STATS_WINDOW_GAMES}", self.window_stop)
         th, _,  tc, tb = rows("overall",  self.total_stop)
         if self.config.ctrl_enable:
-            print(f"{RS} KL        q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
-            print(f"{RS} KL_value  q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
+            print()
             return
         print(wh)
         print(ws)
@@ -2471,8 +2499,7 @@ class Rescorer(object):
         print(th)
         print(tc)
         print(tb)
-        print(f"{RS} KL        q50={self.kl_q50:.3f}  q80={self.kl_q80:.3f}")
-        print(f"{RS} KL_value  q50={self.kl_value_q50:.3f}  q80={self.kl_value_q80:.3f}")
+        print()
 
         for st in stops:
             self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
@@ -2510,6 +2537,17 @@ class Rescorer(object):
                 + cell(t['klp'].value(i), 6, ".2f")
                 + cell(None if mistake is None else 100 * mistake, 8, ".1f") + "%"
                 + cell(None if blunder is None else 100 * blunder, 8, ".1f") + "%")
+        for label, klv, klp in (("p50", self.kl_value_q50, self.kl_q50),
+                                ("p80", self.kl_value_q80, self.kl_q80)):
+            out(f"{label:<16}" + cell(None, 7, "") + cell(None, 7, "")
+                + cell(klv, 7, ".3f") + cell(klp, 6, ".2f")
+                + cell(None, 9, "") + cell(None, 9, ""))
+        a = self.acc_ema
+        if a:
+            out(f"{'acc':<16}" + cell(a['cpl'], 7, ".2f") + cell(a['tsl'], 7, ".2f")
+                + cell(a['klv'], 7, ".3f") + cell(a['klp'], 6, ".2f")
+                + cell(100 * a['tsl_mistake'], 8, ".1f") + "%"
+                + cell(100 * a['tsl_blunder'], 8, ".1f") + "%")
         print()
         out("-" * W)
 
@@ -2540,10 +2578,12 @@ class Rescorer(object):
             # answered a few seconds after it is sent, often after this print
             total = sc['accepted'] + sc['lc0_samples']
             pct = f"{sc['lc0_samples'] / total * 100:.1f}%" if total else "-"
-            return [sc['accepted'], sc['blended'], sc['lc0_queued'],
+            kept = (f"{sc['accepted'] / sc['offered'] * 100:.1f}%"
+                    if sc['offered'] else "-")
+            return [sc['accepted'], kept, sc['lc0_queued'],
                     sc['lc0_samples'], pct]
 
-        out(cols("targets", ["xc0", "blended", "lc0-sent", "lc0-back", "lc0-%"]))
+        out(cols("targets", ["xc0", "xc0-%", "lc0-sent", "lc0-back", "lc0-%"]))
         out(cols(f"last {REPORT_EVERY}", target_cells(self.sample_counts_window)))
         out(cols("total", target_cells(self.sample_counts)))
         out("-" * W)
@@ -2559,15 +2599,11 @@ class Rescorer(object):
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
         self.sample_counts_window = {
-            'total': 0, 'accepted': 0, 'blended': 0,
+            'offered': 0, 'accepted': 0,
             'lc0_queued': 0, 'lc0_samples': 0,
         }
 
 # helpers
-def value_weight_for_game(cfg, is_draw):
-    return cfg.draw_value_scale if is_draw else 1.0
-
-
 def update_ema_quantile(estimate, x, target_q, lr):
     """Online stochastic-approximation quantile tracker (Robbins-Monro).
     Self-corrects toward the point where P(X < estimate) == target_q."""

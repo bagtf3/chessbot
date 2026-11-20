@@ -41,15 +41,17 @@ import uuid
 
 import numpy as np
 
-from chessbot.opening_counts import apply_repeat_weights
 
 LIVE_BUFFER_SIZE = 204_800
 SHARD_SIZE = 10_240
 # lc0 shards are named apart so a retrain can draw one ahead of the rest
 LC0_SHARD_PREFIX = "lc0-"
 PRIMARY_TRIGGER_SHARDS = 144
-RETRAIN_PRIMARY_SHARDS = 14
-RETRAIN_REPLAY_SHARDS = 14
+RETRAIN_PRIMARY_SHARDS = 12
+RETRAIN_REPLAY_SHARDS = 12
+# non-lc0 primary shards read for the held-out fit check only, never trained,
+# never rewritten, left in primary for a later retrain
+RETRAIN_HOLDOUT_SHARDS = 1
 # 0 turns the historic draw off; its validation slice is then empty and skipped
 RETRAIN_HISTORIC_SHARDS = 0
 REPLAY_SEED_SHARDS = 144
@@ -277,6 +279,13 @@ def sample_retrain_primary(primary, n):
     return random.sample(lc0, k) + random.sample(rest, n - k)
 
 
+def sample_holdout_primary(primary, taken, n):
+    """n non-lc0 primary shards outside taken."""
+    taken = set(taken)
+    rest = [p for p in primary if not is_lc0_shard(p) and p not in taken]
+    return random.sample(rest, min(n, len(rest)))
+
+
 def rotate_to_replay(paths, replay_dir):
     """Move trained primary shards into replay. The lc0 prefix is dropped:
     the retrain already shuffled its records in with the others."""
@@ -379,11 +388,9 @@ class LiveBuffer:
         return chunk, chunk_keys
 
     def write_shard(self, chunk, chunk_keys, prefix=""):
-        """This is the only place opening reweighting happens. It must not
-        move into write_pkl_gz_shard -- shuffle_rewrite_primary calls that
-        too, and would compound the weighting every retrain cycle."""
+        """Opening counts decay once per shard written; repeated openings are
+        thinned by rescore's admit sampling, not reweighted here."""
         if self.counts is not None:
-            chunk = apply_repeat_weights(chunk, chunk_keys, self.counts)
             self.counts.decay()
 
         os.makedirs(self.primary_dir, exist_ok=True)

@@ -94,6 +94,67 @@ across the loopers (vs_stockfish moves, validation) and rescore (the
 - Lead: scale the movetime with material instead of only the decided /
   busy tiers.
 
+## Retrain
+
+### Multi-epoch retraining with patience
+- Lead from a side experiment: get more out of each retrain's data when
+  the holdout shard says it is still paying off.
+- Use the holdout shard (already read only, never trained, left in
+  primary) as the patience set: score it every S steps.
+- No improvement within the patience window -> LR / sqrt(10), at most
+  twice.
+- Always run at least 1 epoch; stop when patience runs out after that,
+  hard cap 3 epochs.
+- The before/after fit check stays on the same shard.
+
+### Robust worker -> runner messaging
+- Today the worker reports once, in `retrain_done`; a hard death (OOM
+  kill, CUDA segfault, terminate) skips the crash wrapper and the runner
+  learns nothing about what got done.
+- Send incremental messages as each step lands (`saved` once the model
+  is written, `rotated` once the shards are moved, then `done`) so the
+  runner always knows the true state: new weights or not, data spent or
+  not.
+- The runner acts on the last message received: reload TRT and release
+  with new weights after `saved`; warn when shards were not rotated
+  (they will be trained again) or when the csv rows are missing.
+- Save the model via `.tmp` + `os.replace` so a crash mid-save cannot
+  leave a half-written model.
+
+## Resumable games (soft shutdown)
+
+- A soft shutdown mode: each looper worker records, for every game in
+  progress, everything needed to resume it exactly where it stopped.
+- On the next start the games pick up mid-game. Downstream consumers
+  (`rescore.py`, `review.py`, game logs, index) cannot tell a resumed game
+  from one played straight through.
+- Main win: no lost mid-game progress on a restart when there is no time
+  to wait out `no new games`.
+- Also enables moving games between workers, e.g. gathering every
+  remaining validation game onto one worker, or rebalancing a lopsided
+  fleet.
+- The snag: the pyfastchess board, `MCTSTree` and the forest are not
+  picklable. The saved state has to rebuild the game move by move: the
+  start position and pre-moved opening moves, every played move, and the
+  per-ply search data already logged (policy, visits, values, stop
+  reasons, sampled params, scenario meta).
+- Each game finishes its current search before it is saved, so every
+  saved ply is complete. The tree is not saved: at most one search tree
+  of progress per game is lost, and the next move searches from a fresh
+  tree.
+- Hard requirement: a resumed game's training data must be identical to
+  what an uninterrupted game would have produced. If that cannot be
+  guaranteed 100% of the time, the feature is not worth building.
+
+## Runner command audit
+
+- Review the operator commands in `selfplay_runner.py` (stdin parser and
+  `handle_commands`): stop modes, pause / unpause kinds, respawn, end
+  validation, full clear, status, help.
+- Clean up the logic where it has grown by accretion, check the commands
+  interact sanely (e.g. holds during a drain or a retrain), and fill
+  gaps or extend where useful.
+
 ## Housekeeping
 
 ### RAM hygiene
@@ -118,6 +179,27 @@ across the loopers (vs_stockfish moves, validation) and rescore (the
   `analysis_staging/` first: slow, hard on RAM, won't scale.
 - First find what still reads the combined pickle; then read only the
   columns and games needed, incrementally.
+- Plan: parquet under `chessbot_data/scored_games/<run_tag>/<scenario>/`,
+  plain folder names (no hive `=`), `scenario` also stored as a column.
+  - `per_ply`: per-ply SF analysis only (CPL, TSL, KL, ...). No policy or
+    visits; those stay in `game_logs` for the rare review.
+  - `per_game_summary`: one row per game, index fields plus the per-game
+    stats `explore.py` uses. Small; this is what most analysis reads.
+  - Each game writes its own file to staging; every N games an async merge
+    writes one part (`.tmp` + `os.replace`, then deletes the singles).
+    Readers read parts plus staging and dedupe on `game_id`.
+  - No combined file. Readers glob many parts and pyarrow builds one df.
+  - No shard-membership pointers. Find a game by scenario folder plus a
+    `game_id` filter.
+  - One reader helper that unifies schemas across runs (missing columns ->
+    NaN).
+  - Run deletion (val_test script) must also remove the run's
+    `scored_games` folder.
+  - Migrate frozen runs one at a time: split `df_all` by scenario, one
+    merged file per scenario.
+- Training shards stay pkl.gz: reads are async during training, so a
+  columnar format (npz / parquet, fp16) would only save disk. Revisit for
+  the ~100M pretraining corpus.
 
 ## Decided against (for now)
 

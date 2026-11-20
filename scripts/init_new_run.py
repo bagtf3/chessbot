@@ -24,6 +24,7 @@ from pathlib import Path
 
 from chessbot.config import Config
 from chessbot.eval_metrics import LC0_PROGRESS_CSV, SF_PROGRESS_CSV
+from chessbot.retrain_worker import FIT_CSV
 
 
 def write_yaml(path, obj):
@@ -227,6 +228,14 @@ def main():
             write_yaml(val_yaml_dst, {"is_validation":True})
             print("[init] wrote minimal validation_config.yaml (no src found)")
 
+        # run-dir probe configs win over the shared .env ones, which can lag
+        # the live stop rules
+        for name in ("blunder_replay_config.yaml", "lc0_replay_config.yaml"):
+            src_path = os.path.join(src_dir, name)
+            if os.path.exists(src_path):
+                shutil.copy2(src_path, os.path.join(dest_dir, name))
+                print(f"[clone] copied {name} from {clone_tag}")
+
         # copy replay_buffer/ and primary_buffer/ dirs if present
         for buf_name in ("replay_buffer", "primary_buffer"):
             src_buf = os.path.join(src_dir, buf_name)
@@ -280,11 +289,12 @@ def main():
         # file missing" as "eval_progress.csv still holds pretraining rows" and
         # moves the whole file across, so cloning only the first one would
         # relabel this run's selfplay rows as pretraining on the new tag's
-        # first startup. The lc0 and SF slice csvs carry their history along.
+        # first startup. The lc0 and SF slice csvs and the fit-tracking csv
+        # carry their history along.
         if not args.ignore_eval_progress:
             for fname in ("eval_progress.csv",
                           "eval_progress_pretrain_continued.csv",
-                          LC0_PROGRESS_CSV, SF_PROGRESS_CSV):
+                          LC0_PROGRESS_CSV, SF_PROGRESS_CSV, FIT_CSV):
                 src_eval = os.path.join(src_dir, fname)
                 if os.path.exists(src_eval):
                     shutil.copy2(src_eval, os.path.join(dest_dir, fname))

@@ -31,6 +31,9 @@ RATE_EMA_SPAN = 8
 # lc0 runs in short demand-driven bursts, so its rates track a shorter window
 LC0_RATE_EMA_SPAN = 3
 SPM_EMA_SPAN = 3
+# observed xc0 fleet totals; each worker seeds its rate EMAs with its share
+RATE_SEED_MPS = 31.0
+RATE_SEED_LPS = 37962.5
 
 # priors-cache fields that accumulate in C++ rather than reading as a gauge
 CACHE_COUNTERS = ("queries", "hits", "evictions")
@@ -122,8 +125,11 @@ class GameLooper(object):
         self.run_start = now()
         self.mps = RateMeter("moves")
         self.lps = RateMeter("leafs")
-        self.mps_ema = None
-        self.lps_ema = None
+        self.mps_ema = self.lps_ema = None
+        if self.config.telemetry_kind == "xc0":
+            share = max(1, self.config.n_workers)
+            self.mps_ema = RATE_SEED_MPS / share
+            self.lps_ema = RATE_SEED_LPS / share
         self.spm_ema = None
         self.rate_pushes = 0
         self.cache_hit_ema = None

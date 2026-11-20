@@ -4,12 +4,14 @@ artifact of the old subprocess-script approach it replaces. See
 replay_buffer_redesign.md for the full design and message protocol.
 
 Message protocol (msg_q, main -> worker):
-  {"cmd": "preload", "replay": [paths], "historic": [paths]}
-  {"cmd": "start", "primary": [paths]}
+  {"cmd": "preload"}
+  {"cmd": "start"}
       Both sent back to back the moment the worker is spawned, which only
-      happens once primary_buffer is full at PRIMARY_TRIGGER_SHARDS. They
-      stayed two messages because the worker consumes them in order and the
-      split costs nothing.
+      happens once primary_buffer is full at PRIMARY_TRIGGER_SHARDS. The
+      worker draws the replay and historic shards on preload and the primary
+      and holdout shards on start. Once training has saved the model, the
+      worker moves the trained primary shards to replay and deletes the drawn
+      replay shards.
   {"cmd": "go"}
       Every selfplay worker has dropped its GPU sessions (or main gave up
       waiting). Training allocates only after this, or after GO_TIMEOUT_S.
@@ -37,9 +39,12 @@ import numpy as np
 from chessbot.config import Config
 from chessbot.opening_counts import apply_historic_dup_weights
 from chessbot.replay_buffer import (
-    read_shard, sample_records, stack_policies, write_pkl_gz_shard, POLICY_DIM,
-    SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS, VAL_PRIMARY_RECORDS,
-    VAL_SF_RECORDS, SF_SOURCE,
+    discard_files, list_shard_files, read_shard, rotate_to_replay,
+    sample_files, sample_holdout_primary, sample_records,
+    sample_retrain_primary, stack_policies, write_pkl_gz_shard, POLICY_DIM,
+    RETRAIN_HISTORIC_SHARDS, RETRAIN_HOLDOUT_SHARDS, RETRAIN_PRIMARY_SHARDS,
+    RETRAIN_REPLAY_SHARDS, SHARD_SIZE, VAL_HISTORIC_RECORDS, VAL_LC0_RECORDS,
+    VAL_PRIMARY_RECORDS, VAL_SF_RECORDS, SF_SOURCE,
 )
 from chessbot.eval_metrics import report_validation
 from chessbot.utils import policy_metric_rows
@@ -49,12 +54,11 @@ GO_TIMEOUT_S = 120.0
 # validation rows predicted and scored per pass; the only dense
 # (rows, POLICY_DIM) arrays ever held are this tall
 VAL_CHUNK = 2048
-# fit tracking: TRACK_RECORDS trained xc0 records and HOLDOUT_RECORDS xc0
-# records held out (dropped from the round, never trained), each predicted
-# with the starting and the trained weights. The worst row is the top
-# WORST_FRAC of the trained slice by its starting loss.
+# fit tracking: TRACK_RECORDS trained xc0 records and every record of the
+# holdout shards (read only, never trained), each predicted with the starting
+# and the trained weights. The worst row is the top WORST_FRAC of the trained
+# slice by its starting loss.
 TRACK_RECORDS = 2048
-HOLDOUT_RECORDS = 1024
 WORST_FRAC = 0.1
 FIT_CSV = "fit_tracking.csv"
 
@@ -68,9 +72,7 @@ def load_records(paths):
 
 def shuffle_rewrite_primary(paths, records):
     """Shuffle already-loaded primary records across file boundaries and
-    rewrite them, split evenly, back into the same filenames (the held-out
-    records are already gone, so shards run a little under SHARD_SIZE).
-    Takes the records the caller already read rather than re-reading from
+    rewrite them, split evenly, back into the same filenames. Takes the records the caller already read rather than re-reading from
     disk. Returns the shuffled record list -- already the exact primary
     portion of the retrain set."""
     all_records = list(records)
@@ -254,22 +256,20 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     cfg = Config.from_yaml(os.path.join(run_dir, "config.yaml"))
 
-    preload_msg = msg_q.get()
-    replay_records = load_records(preload_msg["replay"])
-    historic_records = apply_historic_dup_weights(
-        load_records(preload_msg["historic"]))
+    msg_q.get()
+    replay_paths = sample_files(cfg.replay_buffer_dir, RETRAIN_REPLAY_SHARDS)
+    replay_records = load_records(replay_paths)
+    historic_records = apply_historic_dup_weights(load_records(
+        sample_files(cfg.historic_dir, RETRAIN_HISTORIC_SHARDS)))
 
-    start_msg = msg_q.get()
-    primary_paths = start_msg["primary"]
+    msg_q.get()
+    primary = list_shard_files(cfg.primary_buffer_dir)
+    primary_paths = sample_retrain_primary(primary, RETRAIN_PRIMARY_SHARDS)
 
     model, arch = load_pt_model(cfg.model_path)
     primary_records_raw = load_records(primary_paths)
-
-    # held out: xc0 records sacrificed from this round, never trained
-    held_out = sample_records([r for r in primary_records_raw if r[6] == 'xc0'],
-                              HOLDOUT_RECORDS)
-    held_ids = {id(r) for r in held_out}
-    primary_records_raw = [r for r in primary_records_raw if id(r) not in held_ids]
+    held_out = load_records(sample_holdout_primary(
+        primary, primary_paths, RETRAIN_HOLDOUT_SHARDS))
 
     # primary validation is pure xc0 only; replay, lc0, and blend records
     # still train via all_records below, just aren't validated on
@@ -316,6 +316,10 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
 
     train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
                              model=model, arch=arch)
+    # the model is saved, so its training shards are spent
+    rotate_to_replay(primary_paths, cfg.replay_buffer_dir)
+    discard_files(replay_paths)
+    print("[retrain] primary -> replay rotated", flush=True)
 
     dt = time.monotonic() - t0
     n = len(X)

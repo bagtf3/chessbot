@@ -1367,13 +1367,6 @@ class SelfPlayRunner:
         if len(primary) < rb.PRIMARY_TRIGGER_SHARDS:
             return
 
-        replay_files = rb.sample_files(
-            self.cfg.replay_buffer_dir, rb.RETRAIN_REPLAY_SHARDS)
-        historic_files = rb.sample_files(
-            self.cfg.historic_dir, rb.RETRAIN_HISTORIC_SHARDS)
-        primary_sample = rb.sample_retrain_primary(
-            primary, rb.RETRAIN_PRIMARY_SHARDS)
-
         msg_q = self.ctx.Queue()
         result_q = self.ctx.Queue()
         p = self.ctx.Process(
@@ -1383,13 +1376,11 @@ class SelfPlayRunner:
         )
         p.start()
         # both up front; the worker consumes them in order
-        msg_q.put({"cmd": "preload", "replay": replay_files,
-                   "historic": historic_files})
-        msg_q.put({"cmd": "start", "primary": primary_sample})
+        msg_q.put({"cmd": "preload"})
+        msg_q.put({"cmd": "start"})
         self.retrain_worker = {
             "p": p, "msg_q": msg_q, "result_q": result_q,
-            "replay_files": replay_files, "primary_files": primary_sample,
-            "historic_files": historic_files, "go_wait_since": None,
+            "go_wait_since": None,
         }
         print(f"[retrain] launched at {len(primary)}/"
               f"{rb.PRIMARY_TRIGGER_SHARDS}", flush=True)
@@ -1528,12 +1519,7 @@ class SelfPlayRunner:
         # after reload_config, so playxerces restarts on the rebuilt engine
         self.unpause_playxerces()
 
-        if ok:
-            rb.rotate_to_replay(self.retrain_worker["primary_files"],
-                                self.cfg.replay_buffer_dir)
-            rb.discard_files(self.retrain_worker["replay_files"])
-            print("[retrain] primary -> replay rotated", flush=True)
-        else:
+        if not ok:
             print(f"[retrain] failed: {result.get('error')} -- epoch stays "
                   f"{self.current_epoch}, no csv rows written", flush=True)
 

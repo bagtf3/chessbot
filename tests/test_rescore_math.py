@@ -1,7 +1,6 @@
-"""Blend invariants and STM-POV correctness for the training targets.
+"""BRP target invariants and STM-POV correctness for the training targets.
 
-The blend tests pin structure (sums, coverage, monotonicity), not the alpha
-endpoints -- those are being tuned. The POV tests exercise all four
+The BRP tests pin structure (sums, coverage). The POV tests exercise all four
 combinations of side-to-move and who is winning, by mirroring: a position and
 its colour-mirror are the same position to a STM-relative encoder, so every
 target the rescorer builds for one must come out bit-identical to the other.
@@ -63,6 +62,7 @@ def make_rescorer():
     r.live_buffer = FakeBuffer()
     r.kl_q50 = 0.0
     r.kl_q80 = 0.0
+    r.kl_value_q80 = 0.0
     r.sample_counts = defaultdict(int)
     r.sample_counts_window = defaultdict(int)
     return r
@@ -103,32 +103,19 @@ def sole_entry(r):
     return x, densify_policy(policy), np.asarray(Y, dtype=np.float32), source
 
 
-def run_blend(fen, best_uci, best_cp, probe_cpl, best_wdl, ucis=None):
+def run_blend(fen, best_wdl, ucis=None):
     r = make_rescorer()
     ply = make_ply(fen, ucis=ucis, best_wdl=best_wdl)
-    ok = r.add_blunder_replay_training_example(
-        ply, epoch=1, best_uci=best_uci, best_cp=best_cp, probe_cpl=probe_cpl)
+    ok = r.add_blunder_replay_training_example(ply, tsl=0.0)
     assert ok
     return ply['board'], sole_entry(r)
 
 
-def sf_best_of(fen, avoid_first=True):
-    """A legal move that is not the top-visited candidate, so SF and xc0
-    disagree and the blend has something to move."""
-    board = fastboard(fen)
-    ucis = sorted(board.legal_moves())
-    return ucis[-1] if avoid_first else ucis[0]
-
-
-CPLS = [26, 50, 80, 110, 140, 150]
-
-
 def test_blend_policy_and_wdl_are_distributions():
     board, (x, policy, Y, source) = run_blend(
-        BLEND_FEN, sf_best_of(BLEND_FEN), best_cp=120, probe_cpl=90,
-        best_wdl=[0.4, 0.4, 0.2])
+        BLEND_FEN, best_wdl=[0.4, 0.4, 0.2])
 
-    assert source == 'xc0_replay_blend'
+    assert source == 'xc0'
     assert policy.sum() == pytest.approx(1.0, abs=1e-5)
     assert Y.sum() == pytest.approx(1.0, abs=1e-5)
     assert (policy >= 0).all()
@@ -136,12 +123,9 @@ def test_blend_policy_and_wdl_are_distributions():
 
 
 def test_every_legal_move_carries_mass():
-    """The SF pointmass puts 1 visit on every legal move before piling the
-    remainder on SF's best, so no legal move may end at zero."""
+    """Every legal move gets a 1-visit floor, so none may end at zero."""
     fen = BLEND_FEN
-    board, (x, policy, Y, source) = run_blend(
-        fen, sf_best_of(fen), best_cp=120, probe_cpl=140,
-        best_wdl=[0.4, 0.4, 0.2])
+    board, (x, policy, Y, source) = run_blend(fen, best_wdl=[0.4, 0.4, 0.2])
 
     legal = sorted(fastboard(fen).legal_moves())
     idx = fastboard(fen).moves_to_indices(legal)
@@ -150,42 +134,13 @@ def test_every_legal_move_carries_mass():
     assert np.count_nonzero(policy) == len(legal)
 
 
-def test_blend_weight_is_monotone_in_cpl():
-    """alpha is the only thing cpl drives, and it now moves the policy alone:
-    the worse xc0's move, the more mass SF's best carries. The value target
-    must not shift with cpl at all."""
-    fen = BLEND_FEN
-    best_uci = sf_best_of(fen)
-    best_cp = 400
-    best_wdl = [0.1, 0.3, 0.6]
-
-    sf_mass, values = [], []
-    for cpl in CPLS:
-        board, (x, policy, Y, source) = run_blend(
-            fen, best_uci, best_cp, cpl, best_wdl)
-        idx = board.moves_to_indices([best_uci])[0]
-        sf_mass.append(float(policy[idx]))
-        values.append(Y)
-
-    assert sf_mass == sorted(sf_mass)
-    for Y in values[1:]:
-        np.testing.assert_allclose(Y, values[0], atol=1e-6)
-
-
 def test_value_target_is_the_search_wdl_unblended():
-    """SF's cp scores its own best move, not the position the played move
-    reaches, so it must never touch the value target -- at any cpl, however
-    hard alpha pulls the policy."""
-    fen = BLEND_FEN
+    """The value target is the search's own WDL."""
     best_wdl = [0.1, 0.3, 0.6]
     # BLEND_FEN is white to move, so this white-POV wdl is already STM-POV
     expected = np.array(best_wdl, dtype=np.float32)
-
-    for cpl in CPLS:
-        board, (x, policy, Y, source) = run_blend(
-            fen, sf_best_of(fen), best_cp=400, probe_cpl=cpl,
-            best_wdl=best_wdl)
-        np.testing.assert_allclose(Y, expected, atol=1e-6)
+    board, (x, policy, Y, source) = run_blend(BLEND_FEN, best_wdl=best_wdl)
+    np.testing.assert_allclose(Y, expected, atol=1e-6)
 
 
 POV_CASES = [(STM_WINNING_FEN, True), (STM_LOSING_FEN, False)]
@@ -227,8 +182,7 @@ def test_blend_targets_are_stm_pov(fen, stm_winning):
     for pos_fen, wdl_white_pov, best_cp, cands, best_uci in \
             mirrored_case(fen, stm_winning):
         board, (x, policy, Y, source) = run_blend(
-            pos_fen, best_uci, best_cp, probe_cpl=100,
-            best_wdl=wdl_white_pov, ucis=cands)
+            pos_fen, best_wdl=wdl_white_pov, ucis=cands)
         results.append((np.asarray(x), policy, Y))
 
     (x_w, pol_w, Y_w), (x_b, pol_b, Y_b) = results

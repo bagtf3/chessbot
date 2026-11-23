@@ -48,6 +48,23 @@ GATE_LEGAL_POS_W = 5.0
 GATE_SHARE       = 0.05
 GATE_W_FLOOR     = 5.0
 
+# Patience on the held-out shard's training loss, scored every EVAL_EVERY
+# batches (skipped batches included). The first eval sets the baseline. Fails
+# count only over the last PATIENCE evals of epoch 1 and after, so the first LR
+# drop can come at the end of epoch 1 and no sooner: PATIENCE fails drop the LR,
+# at most LR_DROPS times; once the drops are spent, PATIENCE fails stop training.
+# A loss counts as better only when the paired z of the per-position gain over
+# the best eval exceeds PAIRED_Z; the IMPROVE_REL gate is logged beside it. The
+# pick is the latest best past epoch 1, else the end of epoch 1.
+PATIENCE             = 2
+LR_DROPS             = 2
+LR_DROP_FACTOR       = 10 ** -0.5
+MAX_EPOCHS           = 2
+IMPROVE_REL          = 0.0005
+PAIRED_Z             = 2.0
+EVAL_EVERY           = 120
+PATIENCE_CSV         = "patience_tracking.csv"
+
 
 def retrain_lw_state_path(model_path: str, run_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(model_path))[0]
@@ -364,9 +381,39 @@ def print_pt_sample_weight_stats(vwht, pwht, epoch, label=""):
         )
 
 
+def epoch_batch_count(n, batch_size):
+    """Batches in one pass: VRAM_CHUNK chunks, each split into batches."""
+    return sum(-(-min(VRAM_CHUNK, n - s) // batch_size)
+               for s in range(0, n, VRAM_CHUNK))
+
+
+def patience_eval_batches(epoch_batches):
+    """Batch counts at which the held-out shard is scored: every EVAL_EVERY,
+    plus the end of epoch 1."""
+    total = epoch_batches * MAX_EPOCHS
+    return sorted(set(range(EVAL_EVERY, total + 1, EVAL_EVERY)) | {epoch_batches})
+
+
+def write_patience_row(cfg, row):
+    import csv
+    path = os.path.join(cfg.run_dir, PATIENCE_CSV)
+    new = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def cpu_state(model):
+    return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+
+
 def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
-               label="", timings=None, model=None, arch=None):
-    """Load, train one epoch, save."""
+               label="", timings=None, model=None, arch=None, holdout=None):
+    """Load, train, save. Without holdout: one epoch. With holdout
+    (X, P, Y, vwht, pwht of the held-out shard): up to MAX_EPOCHS under
+    patience, saving the picked weights."""
     if timings is None:
         timings = {}
     tag = f"[retrain{(' ' + label) if label else ''}]"
@@ -452,11 +499,102 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
     has_proj = hasattr(model, "project_params")
     g_losses = []
 
+    def x_to_device(arr):
+        if cfg.encoding_type == "lc0":
+            x = torch.from_numpy(arr).float().to(device)
+            x[:, 109] /= 99.0
+            return x
+        return torch.from_numpy(arr).long().to(device)
+
+    def set_train_mode():
+        model.train()
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.eval()
+
+    epoch_batches = epoch_batch_count(n, args.batch_size)
+    pat = None
+    if holdout is not None:
+        hX, hP, hY, hv, hp = holdout
+        hP = stack_policies(hP, index=None).astype(np.float16)
+        hv = normalize_bounded_mean(hv).astype(np.float32)
+        hp = normalize_bounded_mean(hp).astype(np.float32)
+
+        def holdout_losses():
+            """Per-position weighted training loss on the held-out shard."""
+            model.eval()
+            out = np.empty(len(hX), dtype=np.float64)
+            with torch.no_grad(), autocast("cuda"):
+                for i in range(0, len(hX), args.batch_size):
+                    j = min(i + args.batch_size, len(hX))
+                    pol, val = model(x_to_device(hX[i:j]))
+                    pb = torch.from_numpy(hP[i:j]).float().to(device)
+                    yb = torch.from_numpy(hY[i:j]).float().to(device)
+                    lp = -(pb * F.log_softmax(pol.float(), dim=-1)).sum(dim=-1)
+                    lv = -(yb * F.log_softmax(val.float(), dim=-1)).sum(dim=-1)
+                    lp = lp * torch.from_numpy(hp[i:j]).to(device)
+                    lv = lv * torch.from_numpy(hv[i:j]).to(device)
+                    out[i:j] = (policy_lw * lp + value_lw * lv).double().cpu().numpy()
+            set_train_mode()
+            return out
+
+        pat = {"eval_at": set(patience_eval_batches(epoch_batches)),
+               "best": None, "best_vec": None, "best_batch": 0,
+               "fails": 0, "drops": 0, "lr": lr, "stop": False,
+               "best_state": None, "epoch1_state": None}
+        print(f"{tag} patience start: "
+              f"{len(pat['eval_at'])} evals over {MAX_EPOCHS} x {epoch_batches} batches")
+
+    def patience_eval(nb):
+        vec = holdout_losses()
+        loss_now = vec.mean()
+        first = pat["best"] is None
+        prev = loss_now if first else pat["best"]
+        d = (vec if first else pat["best_vec"]) - vec
+        z = 0.0 if first else d.mean() / (d.std(ddof=1) / np.sqrt(len(d)) + 1e-12)
+        gate_a = loss_now < prev * (1.0 - IMPROVE_REL)
+        gate_b = first or z > PAIRED_Z
+        if nb == epoch_batches:
+            pat["epoch1_state"] = cpu_state(model)
+        if gate_b:
+            pat.update(best=loss_now, best_vec=vec, best_batch=nb, fails=0)
+            if nb > epoch_batches:
+                pat["best_state"] = cpu_state(model)
+            action = "best"
+        else:
+            action = "fail"
+            if nb > epoch_batches - PATIENCE * EVAL_EVERY:
+                pat["fails"] += 1
+            if pat["fails"] >= PATIENCE:
+                if pat["drops"] < LR_DROPS:
+                    pat["drops"] += 1
+                    pat["fails"] = 0
+                    pat["lr"] *= LR_DROP_FACTOR
+                    for g in opt.param_groups:
+                        g["lr"] = pat["lr"]
+                    action = "drop"
+                else:
+                    pat["stop"] = True
+                    action = "stop"
+        print(f"{tag} patience b={nb} ({nb / epoch_batches:.2f})  "
+              f"loss {loss_now:.4f}  gain {100 * (1 - loss_now / prev):+.3f}%  "
+              f"z {z:+.2f}  -> {action}  lr {pat['lr']:.2e}")
+        write_patience_row(cfg, {
+            "epoch": epoch, "batch": nb, "epoch_frac": round(nb / epoch_batches, 4),
+            "lr": pat["lr"], "loss": round(loss_now, 6), "best_loss": round(prev, 6),
+            "rel_gain": round(1 - loss_now / prev, 6), "gate_a": int(gate_a),
+            "z": round(z, 3), "gate_b": int(gate_b), "fails": pat["fails"],
+            "drops": pat["drops"], "action": action})
+
     epoch_losses     = []
     epoch_grad_stats = []
     nan_skips        = 0
+    nb               = 0
+    seen             = 0
     t0 = time.time()
-    for ep_idx in range(1):
+    for ep_idx in range(MAX_EPOCHS if pat else 1):
+        if pat and pat["stop"]:
+            break
         # TEMPORARY: chunk the dataset into <=VRAM_CHUNK-record groups so a
         # single retrain never pushes more than that onto the GPU at once --
         # loading the whole array upfront was blowing past VRAM on large
@@ -529,20 +667,28 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     scaler.step(opt)
                     scaler.update()
                     opt.zero_grad()
-                    continue
+                else:
+                    grad_norms.append(raw_norm)
+                    if raw_norm > clip_norm:
+                        clip_count += 1
+                    scaler.step(opt)
+                    scaler.update()
+                    if has_proj:
+                        model.project_params()
 
-                grad_norms.append(raw_norm)
-                if raw_norm > clip_norm:
-                    clip_count += 1
-                scaler.step(opt)
-                scaler.update()
-                if has_proj:
-                    model.project_params()
+                    total        += loss.item()
+                    policy_total += policy_loss.item()
+                    value_total  += value_loss.item()
+                    steps        += 1
 
-                total        += loss.item()
-                policy_total += policy_loss.item()
-                value_total  += value_loss.item()
-                steps        += 1
+                nb += 1
+                seen += len(xb)
+                if pat and nb in pat["eval_at"]:
+                    patience_eval(nb)
+                    if pat["stop"]:
+                        break
+            if pat and pat["stop"]:
+                break
 
         if nan_skips:
             print(f"{tag} {nan_skips} batch(es) skipped this epoch due to non-finite grad norm")
@@ -565,7 +711,24 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
         })
 
     timings['fit'] = timings.get('fit', 0.0) + (time.time() - t0)
+    timings['samples'] = timings.get('samples', 0) + seen
     print_pt_fit_history(epoch_losses, epoch, label=label)
+
+    if pat:
+        if pat["best_batch"] > epoch_batches:
+            picked = pat["best_batch"]
+            model.load_state_dict(pat["best_state"])
+        else:
+            picked = epoch_batches
+            if nb > epoch_batches:
+                model.load_state_dict(pat["epoch1_state"])
+        print(f"{tag} patience: trained {nb} batches, picked b={picked} "
+              f"({picked / epoch_batches:.2f} epochs)")
+        write_patience_row(cfg, {
+            "epoch": epoch, "batch": picked, "epoch_frac": round(picked / epoch_batches, 4),
+            "lr": pat["lr"], "loss": "", "best_loss": round(pat["best"], 6),
+            "rel_gain": "", "gate_a": "", "z": "", "gate_b": "",
+            "fails": pat["fails"], "drops": pat["drops"], "action": "pick"})
 
     os.makedirs(os.path.dirname(opt_state_path), exist_ok=True)
     torch.save(flat_opt_state(model, opt), opt_state_path)

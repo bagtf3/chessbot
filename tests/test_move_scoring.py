@@ -53,18 +53,6 @@ def test_rescore_scorer_matches_the_old_inline_block(best_cp, played_cp, z_stm):
     assert ms.best_uci == ('d2d4' if want_swap else 'e2e4')
 
 
-def test_brp_scorer_is_a_raw_delta():
-    """probe_cpl drives eviction, the ratchet and escalation, so it must stay
-    exactly best_cp - played_cp with no band and no cap."""
-    s = make_scorer('brp')
-    for best_cp, played_cp in ((300, 290), (1500, 600), (0, 200), (50, 50)):
-        ms = s.score('e2e4', best_cp, 'd2d4', played_cp, z_stm=1.0)
-        assert ms.loss == best_cp - played_cp
-        assert not ms.swapped
-        assert not ms.missed_mate
-        assert ms.equiv == 0.0
-
-
 def test_lc0_matches_rescore_wherever_the_outcome_is_not_consulted():
     """Same rules by construction; the only divergence is the missed-mate
     test, which lc0 evaluates without a game result."""

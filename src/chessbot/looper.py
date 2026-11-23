@@ -77,7 +77,7 @@ class GameLooper(object):
     Orchestrates N games concurrently, central batching, caches, and training.
     """
     def __init__(self, model, cfg, recent_q, telem_q, msg_q, game_queue=None, sf_queue=None,
-                 remote=None):
+                 remote=None, lc0_link=None):
         self.id = cfg.id
         self.config = cfg
         self.recent_games_q = recent_q
@@ -91,7 +91,8 @@ class GameLooper(object):
         self.stop_at_empty = False
         self.games_finished = 0
         self.active_games = []
-        self.sf_games = {}
+        # games waiting on an expert's move, by game_id
+        self.expert_games = {}
         self.sf_thread = None  # lazy-initialized on first vs_stockfish game
         self.sf_teardown_pending = False
         # set while paused with GPU sessions dropped; the runner waits on it
@@ -99,6 +100,8 @@ class GameLooper(object):
         self.release_ev = None
         # xc0 inference-server slot; set, the worker holds no GPU session
         self.remote = remote
+        # (client id, router in_q, reply queue) to the lc0 server, or None
+        self.lc0_link = lc0_link
         self.forest = MCTSForest()
 
         # the search controller lives in C++ (one model per process); trees
@@ -136,6 +139,8 @@ class GameLooper(object):
         self.cache_prev = {}
         self.last_stats_log = now()
         self.prediction_times = []
+        # seconds from a vs_leela request going out to lc0's move being played
+        self.lc0_move_times = []
         self.infer_gaps = []
         self.last_infer_end = None
 
@@ -297,14 +302,14 @@ class GameLooper(object):
         self.tear_down_sf()
         self.sf_teardown_pending = False
         for g in self.active_games:
-            if g.sf_pending and not g.sf_ready:
-                g.sf_pending = False
+            if g.expert == "sf" and g.expert_pending and not g.expert_ready:
+                g.expert_pending = False
 
         # ort_trt and lc0_trt manage their own device memory, so there is
         # nothing to reclaim here beyond the python side
         gc.collect()
 
-        priors_cache_clear()
+        self.drop_caches()
 
         if self.release_ev is not None:
             self.release_ev.set()
@@ -329,6 +334,10 @@ class GameLooper(object):
 
         if self.unpause_epoch is not None:
             self.n_retrains = self.unpause_epoch
+
+    def drop_caches(self):
+        """NN caches go on a pause: the next model is a new net."""
+        priors_cache_clear()
 
     def pull_from_queue(self):
         games_at_once = self.config.games_at_once
@@ -380,6 +389,44 @@ class GameLooper(object):
         else:
             self.active_games.insert(at, cg)
         self.forest.add_tree(cg.tree)
+
+    def submit_expert(self, game):
+        """Ask the game's expert for its move; the reply lands through
+        set_expert_result."""
+        self.expert_games[game.game_id] = game
+        game.expert_pending = True
+        if game.expert == "lc0":
+            game.expert_asked_at = now()
+            cid, in_q, _ = self.lc0_link
+            in_q.put({"client": cid, "req": {
+                "fen": game.init_fen,
+                "moves": list(game.preopen_moves_uci) + list(game.moves_played),
+                "mode": "vs_leela", "priority": True,
+                "meta": {"game_id": game.game_id}}})
+            return
+        # vs_stockfish openings sample SF's move; validation and later
+        # plies never do
+        explore = (game.meta.get("scenario") == "vs_stockfish"
+                   and game.python_chess_board.ply() < SF_EXPLORE_PLIES)
+        self.ensure_sf_thread(game.config)
+        self.sf_thread.submit(game.game_id, game.python_chess_board,
+                              depth=game.meta.get("sf_depth"), explore=explore)
+
+    def drain_lc0_replies(self):
+        """lc0 moves for this worker's vs_leela games. A reply for a game this
+        worker no longer has (a predecessor's, or one already finished) is
+        dropped."""
+        if self.lc0_link is None:
+            return
+        reply_q = self.lc0_link[2]
+        while True:
+            try:
+                rep = reply_q.get_nowait()
+            except Empty:
+                return
+            g = self.expert_games.get((rep.get("meta") or {}).get("game_id"))
+            if g is not None and g.expert == "lc0" and rep.get("record"):
+                g.set_expert_result(rep)
 
     def ensure_sf_thread(self, cfg):
         if self.sf_thread is None:
@@ -453,8 +500,9 @@ class GameLooper(object):
                             raise tup[1]
 
                         game_id, res_tup = tup
-                        g = self.sf_games[game_id]
-                        g.set_stockfish_result(res_tup)
+                        self.expert_games[game_id].set_expert_result(res_tup)
+
+            self.drain_lc0_replies()
 
             # every pass fills from the top of the list until the batch is full
             # or the list runs out, so the oldest games finish first
@@ -463,30 +511,22 @@ class GameLooper(object):
             self.forest.resolve_all_inflight()
             for game in self.active_games:
                 g_mbs = micro_batch_for(game.tree, game.config)
-                sf_terminal, mcts_terminal = False, False
+                expert_terminal, mcts_terminal = False, False
 
-                # if its stockfish turn, check if the move is ready
-                # otherwise do not block and move on
-                if game.is_stockfish_turn():
-                    if not game.sf_pending:
-                        # submit move to sf queue here. vs_stockfish openings
-                        # sample SF's move; validation and later plies never do
-                        explore = (game.meta.get("scenario") == "vs_stockfish"
-                                   and game.python_chess_board.ply() < SF_EXPLORE_PLIES)
-                        self.ensure_sf_thread(game.config)
-                        self.sf_thread.submit(game.game_id, game.python_chess_board,
-                                              depth=game.meta.get("sf_depth"),
-                                              explore=explore)
-
-                        # stash the game here for easy reference later
-                        self.sf_games[game.game_id] = game
-                        game.sf_pending = True
+                # on an expert's turn, play its move once it is back and
+                # xc0 has searched to expert_move_sims; never block
+                if game.is_expert_turn():
+                    if not game.expert_pending:
+                        self.submit_expert(game)
 
                     if (game.tree.sims_completed_this_move
-                            >= game.config.sf_move_sims):
-                        if game.sf_pending and game.sf_ready:
-                            # sets pending, ready, res_tup to False, False, None
-                            sf_terminal = game.apply_stockfish_result(game.sf_res_tup)
+                            >= game.config.expert_move_sims):
+                        if game.expert_pending and game.expert_ready:
+                            if game.expert == "lc0":
+                                self.lc0_move_times.append(
+                                    now() - game.expert_asked_at)
+                            expert_terminal = game.apply_expert_result(
+                                game.expert_result, game.expert)
                             mps.tick(1)
                         else:
                             continue
@@ -498,12 +538,11 @@ class GameLooper(object):
                     mps.tick(1)
 
                 # terminal check. do not sim on a finished game
-                if sf_terminal or mcts_terminal:
+                if expert_terminal or mcts_terminal:
                     self.forest.pop_tree(game.tree)
                     self.finalize_game_data(game)
                     finished.append(game.game_id)
-                    if game.game_id in self.sf_games:
-                        del self.sf_games[game.game_id]
+                    self.expert_games.pop(game.game_id, None)
                     continue
 
                 # count_new never exceeds the ask, so the batch can't overfill
@@ -529,6 +568,7 @@ class GameLooper(object):
 
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
+                self.lc0_move_times.clear()
                 self.infer_gaps.clear()
                 counts.reset(); pred_fill.clear(); mbs_used.clear()
             
@@ -601,29 +641,9 @@ class GameLooper(object):
         Outcome is already white-POV (-1/0/+1) and does not need flipping.
         """
 
-        scenario = game.meta.get("scenario", "")
-
         # mem_summary = light index/telemetry essentials; rest = seed/config/
         # replay fields. merged they are the on-disk header.
         mem_summary, rest = game.emit_header(self.n_retrains)
-
-        # replay probes are a handful of moves per position: accumulate in
-        # memory and let the driver route them, instead of a pkl per position.
-        # they sit outside the LEAN/FATTY convention -- fat tree_search_data, no pkl.
-        if scenario in ("blunder_replay_probe", "lc0_replay_probe"):
-            meta = {
-                **mem_summary, **rest,
-                "moves_played": game.moves_played,
-                "xerces_uci": game.moves_played[0] if game.moves_played else None,
-                "tree_search_data": game.tree_data,
-            }
-
-            meta.update(game.meta)
-            self.recent_games_q.put({"looper_id": self.id, "meta": meta})
-
-            game.examples = []
-            game.recents.clear()
-            return
 
         # game.config, not self.config: validation pins min_game_length to 1 so
         # an adjudicated game still reports and the batch can complete
@@ -727,6 +747,9 @@ class GameLooper(object):
             "apl": np.mean(lpb) if lpb else 0.0,
             "n_preds": len(lpb),
             "infer_gap": np.mean(self.infer_gaps) if self.infer_gaps else 0.0,
+            "lc0_move_s": (float(np.mean(self.lc0_move_times))
+                           if self.lc0_move_times else 0.0),
+            "lc0_move_n": len(self.lc0_move_times),
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
             "batch_target": target,
@@ -820,10 +843,10 @@ class GameLooper(object):
 LOOPER_QUEUES = ("recent", "telemetry", "msg", "game")
 
 
-def init_selfplay(config, queues, remote=None):
+def init_selfplay(config, queues, remote=None, lc0_link=None):
     """queues: dict with every LOOPER_QUEUES name, plus "sf" for the SF
     worker. remote: an xc0 inference-server slot, or None for a local
-    session."""
+    session. lc0_link: the worker's route to the lc0 server, or None."""
     missing = [k for k in LOOPER_QUEUES if queues.get(k) is None]
     if missing:
         raise ValueError(f"init_selfplay missing queues: {missing}")
@@ -833,7 +856,7 @@ def init_selfplay(config, queues, remote=None):
         model=model, cfg=config.copy(),
         recent_q=queues["recent"], telem_q=queues["telemetry"],
         msg_q=queues["msg"], game_queue=queues["game"],
-        sf_queue=queues.get("sf"), remote=remote
+        sf_queue=queues.get("sf"), remote=remote, lc0_link=lc0_link
     )
 
     # infer the current epoch from the progress csv. Row count is wrong once the

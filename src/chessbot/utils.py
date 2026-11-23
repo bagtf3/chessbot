@@ -1069,16 +1069,19 @@ def accumulate_game_stats(g, stats, sf_overall, result_is_bot_pov=True):
     else:
         s["D"] += 1
 
-    if not g.get("vs_stockfish", False):
+    # one W/D/L line per match scenario (vs SF or lc0): validation,
+    # vs_stockfish and vs_leela never pool
+    if g.get("vs_stockfish", False):
+        opp_is_white = bool(g.get("stockfish_color"))
+    elif g.get("vs_leela", False):
+        opp_is_white = bool(g.get("lc0_color"))
+    else:
         return
-
-    # one W/D/L line per SF scenario: validation and vs_stockfish never pool
     o = sf_overall[scenario]
     o["N"] += 1
     o["plies_sum"] += plies
-    # result is WHITE-POV: the bot won iff Stockfish lost
-    sf_is_white = bool(g.get("stockfish_color"))
-    bot_won = r != 0 and ((r < 0) if sf_is_white else (r > 0))
+    # result is WHITE-POV: the bot won iff the opponent lost
+    bot_won = r != 0 and ((r < 0) if opp_is_white else (r > 0))
     s = 0.5 if r == 0 else float(bot_won)
     ema = o.get("ema", score_ema_start(scenario))
     o["ema"] = ema + (s - ema) * 2.0 / (SCORE_EMA_SPAN + 1)
@@ -1151,7 +1154,7 @@ def cell(v, w, spec):
 
 
 
-def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
+def print_summary_from_stats(stats, sf_overall, quality=None):
     """
     Pretty-print the scenario table and one bot-vs-Stockfish W/D/L line per
     SF scenario.
@@ -1159,8 +1162,8 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
     Takes counters rather than a games list, so a caller accumulating them
     incrementally can report on every game ever played without retaining any.
     W/D/L are white won / draw / white lost. quality maps a row name to
-    rescore's ReportRow (per-game CPL/TSL/KLv/KLp means) and brp is its probe
-    row; both lag finished games by the rescore backlog.
+    rescore's ReportRow (per-game CPL/TSL/KLv/KLp means); it lags finished
+    games by the rescore backlog.
     """
     quality = quality or {}
     counts = defaultdict(lambda: {"N": 0, "W": 0, "D": 0, "L": 0, "plies_sum": 0})
@@ -1170,15 +1173,15 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
             c[k] += s[k]
 
     def line(name, c, q):
-        n = c["N"] if c else q.N
-        wdl = [c[k] for k in "WDL"] if c else [None] * 3
-        d_pct = 100 * c["D"] / n if c and n else None
-        plies = c["plies_sum"] / n if c and n else None
+        n = c["N"]
+        wdl = [c[k] for k in "WDL"]
+        d_pct = 100 * c["D"] / n if n else None
+        plies = c["plies_sum"] / n if n else None
         mean = q.mean if q else (lambda m: None)
-        print(f"{name:<16}{n:>5}" + "".join(cell(v, 5, "d") for v in wdl)
-              + cell(d_pct, 6, ".1f") + cell(mean('cpl'), 8, ".2f")
-              + cell(mean('tsl'), 7, ".2f") + cell(mean('klv'), 7, ".3f")
-              + cell(mean('klp'), 6, ".2f") + cell(plies, 7, ".1f"))
+        print(f"{name:<17}{n:>6}" + "".join(cell(v, 6, "d") for v in wdl)
+              + cell(d_pct, 6, ".1f") + cell(mean('cpl'), 7, ".2f")
+              + cell(mean('tsl'), 7, ".2f") + cell(mean('klv'), 6, ".3f")
+              + cell(mean('klp'), 6, ".2f") + cell(plies, 6, ".1f"))
 
     def section(names):
         total_c = {"N": 0, "W": 0, "D": 0, "L": 0, "plies_sum": 0}
@@ -1191,8 +1194,8 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
                 total_q.merge(quality[name])
         return total_c, total_q
 
-    print(f"{'scenario':<16}{'N':>5}{'W':>5}{'D':>5}{'L':>5}{'D%':>6}"
-          f"{'CPL':>8}{'TSL':>7}{'KLv':>7}{'KLp':>6}{'plies':>7}")
+    print(f"{'scenario':<17}{'N':>6}{'W':>6}{'D':>6}{'L':>6}{'D%':>6}"
+          f"{'CPL':>7}{'TSL':>7}{'KLv':>6}{'KLp':>6}{'plies':>6}")
     print("-" * LOG_WIDTH)
     names = sorted(counts)
     total_c, total_q = section([n for n in names if not n.startswith("val(")])
@@ -1203,14 +1206,11 @@ def print_summary_from_stats(stats, sf_overall, quality=None, brp=None):
         print("-" * LOG_WIDTH)
         total_c, total_q = section(vals)
         line("validation total", total_c, total_q)
-    if brp is not None and brp.N:
-        print("-" * LOG_WIDTH)
-        line("BRP", None, brp)
     print("-" * LOG_WIDTH)
 
     # bot vs Stockfish summary per SF scenario (score: W=1, D=0.5, L=0)
     if sf_overall:
-        print("=== SF Games ===")
+        print("=== Match Scoring ===")
     sf_rows = sorted(sf_overall.items())
     wdl_w = max((len(f"{o['W']}/{o['D']}/{o['L']}") for _, o in sf_rows),
                 default=0)

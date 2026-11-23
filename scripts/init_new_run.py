@@ -25,6 +25,7 @@ from pathlib import Path
 from chessbot.config import Config
 from chessbot.eval_metrics import LC0_PROGRESS_CSV, SF_PROGRESS_CSV
 from chessbot.retrain_worker import FIT_CSV
+from chessbot.train_pytorch import PATIENCE_CSV
 
 
 def write_yaml(path, obj):
@@ -228,13 +229,13 @@ def main():
             write_yaml(val_yaml_dst, {"is_validation":True})
             print("[init] wrote minimal validation_config.yaml (no src found)")
 
-        # run-dir probe configs win over the shared .env ones, which can lag
+        # a run-dir lc0 config wins over the shared .env one, which can lag
         # the live stop rules
-        for name in ("blunder_replay_config.yaml", "lc0_replay_config.yaml"):
-            src_path = os.path.join(src_dir, name)
-            if os.path.exists(src_path):
-                shutil.copy2(src_path, os.path.join(dest_dir, name))
-                print(f"[clone] copied {name} from {clone_tag}")
+        name = "lc0_replay_config.yaml"
+        src_path = os.path.join(src_dir, name)
+        if os.path.exists(src_path):
+            shutil.copy2(src_path, os.path.join(dest_dir, name))
+            print(f"[clone] copied {name} from {clone_tag}")
 
         # copy replay_buffer/ and primary_buffer/ dirs if present
         for buf_name in ("replay_buffer", "primary_buffer"):
@@ -278,7 +279,8 @@ def main():
             print(f"[clone] {carry_verb} {name} from {clone_tag}")
 
         from chessbot.selfplay_runner import LC0_BACKLOG_FILE
-        for name in ("sf_cache.pkl.gz", "opening_counts.npz", LC0_BACKLOG_FILE):
+        for name in ("sf_cache.pkl.gz", "opening_counts.npz", LC0_BACKLOG_FILE,
+                     rb.CORRECTION_BUFFER_PKL):
             src_path = os.path.join(src_dir, name)
             if os.path.exists(src_path):
                 carry(src_path, os.path.join(dest_dir, name))
@@ -294,7 +296,8 @@ def main():
         if not args.ignore_eval_progress:
             for fname in ("eval_progress.csv",
                           "eval_progress_pretrain_continued.csv",
-                          LC0_PROGRESS_CSV, SF_PROGRESS_CSV, FIT_CSV):
+                          LC0_PROGRESS_CSV, SF_PROGRESS_CSV, FIT_CSV,
+                          PATIENCE_CSV):
                 src_eval = os.path.join(src_dir, fname)
                 if os.path.exists(src_eval):
                     shutil.copy2(src_eval, os.path.join(dest_dir, fname))

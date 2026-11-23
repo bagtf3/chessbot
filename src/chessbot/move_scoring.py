@@ -73,17 +73,12 @@ class MoveScorer:
 
 
 def make_scorer(kind, cfg=None):
-    """kind: 'rescore' | 'lc0' | 'brp'.
+    """kind: 'rescore' | 'lc0'.
 
-    'rescore' and 'lc0' share one rule set so their CPLs stay comparable; they
-    differ only in the missed-mate test, which needs a game outcome the
-    teacher's probe positions do not have.
+    Both share one rule set so their CPLs stay comparable; they differ only
+    in the missed-mate test, which needs a game outcome the teacher's probe
+    positions do not have.
     """
-    if kind == 'brp':
-        # raw delta: probe_cpl drives eviction, the sf_ms ratchet and the
-        # escalation bar, and those must stay continuous with pool history
-        return MoveScorer(ScoringRules())
-
     if kind not in ('rescore', 'lc0'):
         raise ValueError(f"unknown scorer kind {kind!r}")
 

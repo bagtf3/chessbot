@@ -23,14 +23,16 @@ import time
 from collections import deque
 
 from chessbot import PX_DIR, SP_DIR
-from chessbot.blunder_replay import load_probe_pool
 from chessbot.config import Config
 from chessbot.infer_ort_trt import prepare_trt, selfplay_trt_paths
 from chessbot.game_utils import GameGenerator
 from chessbot.infer_server import server_main
 from chessbot.looper import init_selfplay
 
-from chessbot.lc0_replay import LC0_BRP_SCENARIO, create_lc0_replay_config
+from chessbot.lc0_confirm import Lc0Confirmer
+from chessbot.lc0_replay import create_lc0_replay_config
+from chessbot.lc0_server import lc0_mode_configs, lc0_server_main
+from chessbot.request_router import RequestRouter
 
 from chessbot.eval_metrics import migrate_pretrain_progress
 from chessbot.rescore import Rescorer, SFRescoreThread
@@ -83,39 +85,28 @@ PAUSE_ALIASES = {"retraining": "retrain", "playxerces": "px"}
 EXTERNAL, RETRAIN, RESPAWN = "external", "retrain", "respawn"
 # longest the runner waits on the xc0 inference server to load or release
 SERVER_WAIT_S = 300.0
-# teacher probes are held and released in bundles this size so the lc0 worker
-# runs full batches instead of a trickle of near-empty ones
-LC0_BUNDLE_SIZE = 128
-# a bundle that has not filled after this long is sent as-is
-LC0_BUNDLE_MAX_WAIT_S = 600.0
-# unsent teacher probes saved at shutdown, reloaded on the next start
+# unsent and unfinished teacher probes saved at shutdown, reloaded and
+# started over on the next start
 LC0_BACKLOG_FILE = "lc0_backlog.pkl"
-
-# xc0 blunder-replay probes are held off the worker queue until this epoch;
-# credits and the blunder pool keep accruing, and lc0 BRP runs unaffected.
-BRP_WORKER_START_EPOCH = 5
-# probes go out in one bulk round every BRP_BULK_EVERY epochs (shifted by
-# BRP_BULK_OFFSET), up to BRP_BULK_FRAC of the pool drawn from the positions
-# that are due. A round that lands on a validation epoch is skipped.
-BRP_BULK_EVERY = 3
-BRP_BULK_OFFSET = 0
-BRP_BULK_FRAC = 0.10
+# an lc0 request unanswered this long is sent again; crash recovery resends
+# at once, so this only catches one lost without a server death
+LC0_REQUEST_TIMEOUT_S = 1800.0
+# the router client id for requests the runner itself makes
+LC0_RUNNER_CLIENT = "runner"
 
 
 def child_looper(cfg, stop_ev, recent_games_q, telemetry_q, msg_q, game_queue,
-                 release_ev=None, sf_queue=None, remote=None):
-    """mp.Process target. Selfplay, validation and blunder replays share
-    game_queue and are told apart by spec.meta. Only the SF worker also gets
+                 release_ev=None, sf_queue=None, remote=None, lc0_link=None):
+    """mp.Process target. Selfplay and validation share game_queue and are
+    told apart by spec.meta. Only the SF worker also gets
     sf_queue, which carries the vs_stockfish games and is drained first.
     remote is an xc0 inference-server slot; without one the worker builds its
-    own TRT session."""
+    own TRT session. lc0_link is (client id, router in_q, reply queue)."""
     queues = {"recent": recent_games_q, "telemetry": telemetry_q,
               "msg": msg_q, "game": game_queue, "sf": sf_queue}
-    with init_selfplay(cfg, queues, remote=remote) as looper:
+    with init_selfplay(cfg, queues, remote=remote, lc0_link=lc0_link) as looper:
         looper.release_ev = release_ev
-        # lc0 is demand-driven and idles between bundles; its idle window
-        # must outlast LC0_BUNDLE_MAX_WAIT_S or it exits waiting on one
-        looper.run(stop_ev, wait_time=2400 if cfg.id.startswith("lc0") else 600)
+        looper.run(stop_ev, wait_time=600)
 
 
 def drain_queue(q):
@@ -384,27 +375,29 @@ class SelfPlayRunner:
         self.rescorer = None
         self.recorder = None
         self.game_gen = None
-        self.blunder_pool = None
         self.sf_rescore_threads = []
 
         self.ctx = mp.get_context()
         self.game_q = None
         self.sf_q = None
-        self.lc0_q = None
+        # teacher probes from the rescorer, held while validation is out or
+        # lc0 is paused by the operator, then chained through the server
         self.lc0_hold = []
-        self.lc0_hold_since = None
+        self.lc0_confirmer = None
         self.recent_q = None
         self.telemetry_q = None
         self.procs = []
         self.worker_procs = []
         self.lc0_cfg = None
+        # search config per lc0 request mode, and the router to the lc0 server
+        self.lc0_modes = None
+        self.lc0_router = None
 
         self.current_epoch = 0
         self.games_at_start = 0
         self.total_games = 0
         self.total_queued = 0
         self.finished_games = deque()
-        self.finished_brp = deque()
 
         # validation batch state. val_pending counts paired_validation metas
         # still owed; the deadline is the backstop for one that never lands.
@@ -424,7 +417,10 @@ class SelfPlayRunner:
         self.xc0_server = None
         self.xc0_slots = []
         self.last_server_start = 0.0
+        # drain_and_stop goes to the xc0 fleet first; the lc0 server keeps
+        # answering their vs_leela moves and gets its own once they are gone
         self.stop_signal_sent = False
+        self.lc0_stop_sent = False
         self.started_at = None
         self.next_worker_id = 0
         self.last_respawn_at = 0.0
@@ -444,15 +440,8 @@ class SelfPlayRunner:
         for _ in range(max(1, cfg.rescore_n_sf_workers)):
             self.add_sf_thread()
 
-        # one live in-RAM copy; the Rescorer mutates it and the replay
-        # sampler reads it. Never crosses the process boundary. None when no
-        # pool is configured, which every replay path already handles.
-        self.blunder_pool = load_probe_pool()
-
         self.rescorer = Rescorer(cfg, sf_game_q, sf_res_q)
-        finished, finished_brp = self.rescorer.get_unprocessed()
-        self.finished_games = finished
-        self.finished_brp = finished_brp
+        self.finished_games = self.rescorer.get_unprocessed()
 
         # three unrelated startup chores: adopt the previous process's
         # untrained samples, top the replay buffer up from historic, and split
@@ -472,7 +461,6 @@ class SelfPlayRunner:
         self.recorder.primary_buffer_dir = cfg.primary_buffer_dir
         self.recorder.primary_buffer_trigger = rb.PRIMARY_TRIGGER_SHARDS
         self.recorder.quality_rows = self.rescorer.report_rows
-        self.recorder.brp_row = self.rescorer.brp_row
 
         self.reload_config()
         self.val_cfg = create_validation_config(
@@ -499,9 +487,7 @@ class SelfPlayRunner:
         """Games this run has already finished, counted off the on-disk index.
 
         The budget is a property of the run, not of one process, so a restart
-        resumes against it instead of starting the count over. Blunder-replay
-        probes never reach the index -- they return before update_game_index
-        -- so they correctly do not consume budget.
+        resumes against it instead of starting the count over.
         """
         path = self.base_cfg.game_index_staging_file
         if not os.path.exists(path):
@@ -517,16 +503,23 @@ class SelfPlayRunner:
             return
 
         rs = self.rescorer
-        flushed = rs.load_buffered_records(rb.read_live_buffer(path))
+        flushed = rs.load_buffered_records(
+            rb.read_live_buffer(path), rb.read_correction_buffer(cfg.run_dir))
         print(f"[runner] loaded from {os.path.basename(path)}: "
-              f"{len(rs.live_buffer)} xc0, {len(rs.lc0_buffer)} lc0 samples "
-              f"after flushing {len(flushed)} shards", flush=True)
+              f"{len(rs.live_buffer)} live, {len(rs.correction_buffer)} "
+              f"correction samples after flushing {len(flushed)} shards",
+              flush=True)
         # re-sync to canonical names immediately, so there is never a window
         # with no valid on-disk copy
-        rb.sync_live_buffer(cfg.run_dir, rs.buffered_records())
+        self.save_buffers()
         canonical = os.path.join(cfg.run_dir, rb.LIVE_BUFFER_PKL)
         if os.path.abspath(path) != os.path.abspath(canonical):
             os.remove(path)
+
+    def save_buffers(self):
+        rs = self.rescorer
+        return rb.sync_live_buffer(self.base_cfg.run_dir, rs.buffered_records(),
+                                   rs.correction_records())
 
     def reload_config(self):
         """Re-read the run yaml and rebuild the TRT engine for it.
@@ -545,11 +538,11 @@ class SelfPlayRunner:
         # re-pointing it here is what makes a yaml edit take effect
         if self.game_gen is not None:
             self.game_gen.config = self.cfg
-        # search params ride each spec's own cfg, so rebuilding this is enough
-        # for a live lc0 worker to pick them up. Batch sizes, encoding and the
-        # net are read at spawn and still need a restart.
+        # the lc0 server takes its mode configs at spawn, so a yaml edit
+        # reaches it on the next respawn ("respawn lc0")
         if self.lc0_cfg is not None:
             self.lc0_cfg = create_lc0_replay_config(self.cfg)
+            self.lc0_modes = lc0_mode_configs(self.cfg)
             self.rescorer.lc0_cfg = self.lc0_cfg
 
     def spawn_worker(self):
@@ -573,11 +566,15 @@ class SelfPlayRunner:
         msg_q = self.ctx.Queue()
         # the first worker spawned while nobody holds sf_q becomes the SF worker
         sf_owner = self.sf_q is not None and self.sf_owner() is None
+        lc0_link = None
+        if self.lc0_router is not None:
+            lc0_link = (c.id, self.lc0_router.in_q,
+                        self.lc0_router.add_client(c.id))
         p = self.ctx.Process(
             target=child_looper,
             args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
                   self.game_q, release_ev, self.sf_q if sf_owner else None,
-                  remote),
+                  remote, lc0_link),
             daemon=True,
         )
         p.start()
@@ -616,39 +613,47 @@ class SelfPlayRunner:
                   f"(score ema {ema:.3f})", flush=True)
         self.game_gen.sf_depth = depth
 
-    def spawn_lc0_worker(self):
-        """Start one lc0 teacher probe worker.
+    def spawn_lc0_server(self):
+        """Start the lc0 server on the router's queues, then hand it every
+        request still outstanding.
 
         Lives in self.procs so it inherits pause, reap and respawn, but never
         reads game_q: the two fleets would steal each other's specs.
         """
-        c = self.lc0_cfg.copy()
-        c.id = f"lc0w{self.next_worker_id}"
+        modes = {k: v.copy() for k, v in self.lc0_modes.items()}
+        wid = f"lc0s{self.next_worker_id}"
+        for c in modes.values():
+            c.id = wid
         self.next_worker_id += 1
         stop_ev = self.ctx.Event()
         release_ev = self.ctx.Event()
         msg_q = self.ctx.Queue()
+        r = self.lc0_router
         p = self.ctx.Process(
-            target=child_looper,
-            args=(c, stop_ev, self.recent_q, self.telemetry_q, msg_q,
-                  self.lc0_q, release_ev),
+            target=lc0_server_main,
+            args=(modes, stop_ev, self.telemetry_q, msg_q, r.priority_q,
+                  r.normal_q, r.reply_in, release_ev),
             daemon=True,
         )
         p.start()
         self.worker_procs.append(p)
         self.procs.append({
-            "id": c.id, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
+            "id": wid, "p": p, "stop_ev": stop_ev, "msg_q": msg_q,
             "release_ev": release_ev,
             "kind": "lc0", "stop_sent_at": None, "term_sent_at": None,
             "kill_sent_at": None,
         })
-        return c.id
+        n = r.resend_outstanding()
+        if n:
+            print(f"[runner] {wid} took over {n} outstanding lc0 requests",
+                  flush=True)
+        return wid
 
     def procs_of(self, kind):
         return [w for w in self.procs if w["kind"] == kind]
 
     def lc0_wanted(self):
-        return self.cfg.n_lc0_workers if self.lc0_cfg is not None else 0
+        return 1 if self.lc0_router is not None else 0
 
     def spawn_workers(self):
         """One queue to every selfplay worker. There is no designated
@@ -660,21 +665,28 @@ class SelfPlayRunner:
         self.game_q = self.ctx.Queue()
         self.sf_q = self.ctx.Queue()
 
+        # the router comes first: every xc0 worker is spawned as its client
+        if self.cfg.lc0_server:
+            self.lc0_router = RequestRouter(self.ctx, "lc0", LC0_REQUEST_TIMEOUT_S)
+            self.lc0_router.start()
+            self.lc0_confirmer = Lc0Confirmer(self.lc0_router, LC0_RUNNER_CLIENT)
+            self.lc0_confirmer.start()
+            self.game_gen.vs_leela_on = True
+            self.lc0_cfg = create_lc0_replay_config(self.cfg)
+            self.lc0_modes = lc0_mode_configs(self.cfg)
+            # handing the rescorer the config is what turns on the teacher path
+            self.rescorer.lc0_cfg = self.lc0_cfg
+
         if self.server_enabled():
             self.start_xc0_server()
         for _ in range(max(1, self.cfg.n_workers)):
             self.spawn_worker()
         print(f"[runner] spawned {len(self.procs)} workers", flush=True)
 
-        if self.cfg.n_lc0_workers:
-            self.lc0_q = self.ctx.Queue()
-            self.lc0_cfg = create_lc0_replay_config(self.cfg)
-            # handing the rescorer the config is what turns on the teacher path
-            self.rescorer.lc0_cfg = self.lc0_cfg
+        if self.lc0_router is not None:
             self.load_lc0_backlog()
-            for _ in range(self.cfg.n_lc0_workers):
-                self.spawn_lc0_worker()
-            print(f"[runner] spawned {self.cfg.n_lc0_workers} lc0 workers "
+            self.spawn_lc0_server()
+            print(f"[runner] spawned lc0 server "
                   f"({self.lc0_cfg.lc0_distill_model_name})", flush=True)
 
     def lc0_backlog_path(self):
@@ -687,15 +699,14 @@ class SelfPlayRunner:
         with open(path, "rb") as f:
             specs = pickle.load(f)
         os.remove(path)
-        if specs:
-            self.lc0_hold.extend(specs)
-            self.lc0_hold_since = time.monotonic()
+        self.lc0_hold.extend(specs)
         print(f"[runner] reloaded {len(specs)} lc0 probes from "
               f"{LC0_BACKLOG_FILE}", flush=True)
 
     def save_lc0_backlog(self):
-        """Held and queued teacher probes, after the lc0 worker has exited."""
-        specs = self.lc0_hold + drain_queue(self.lc0_q)
+        """Held probes and unfinished chains, after the lc0 server has
+        exited. A chain cut short starts over from ply 0 next time."""
+        specs = self.lc0_hold + self.lc0_confirmer.unfinished_specs()
         if not specs:
             return
         with open(self.lc0_backlog_path(), "wb") as f:
@@ -705,33 +716,31 @@ class SelfPlayRunner:
               f"{LC0_BACKLOG_FILE}", flush=True)
 
     def drain_lc0_specs(self):
-        """Hold staged teacher probes until LC0_BUNDLE_SIZE, then release the
-        whole bundle onto the lc0 queue. A bundle older than
-        LC0_BUNDLE_MAX_WAIT_S goes out short, and a draining run flushes
-        whatever is held so no probe is stranded. Nothing is released while
-        a validation batch is out."""
-        if self.lc0_q is None:
+        """Start a confirmation chain for each staged teacher probe. Nothing
+        starts while a validation batch is out or the operator holds lc0; a
+        draining run sends whatever is held so no probe is stranded."""
+        if self.lc0_confirmer is None:
             return 0
-        specs = self.rescorer.take_lc0_specs()
-        if specs and not self.lc0_hold:
-            self.lc0_hold_since = time.monotonic()
-        self.lc0_hold.extend(specs)
+        self.lc0_hold.extend(self.rescorer.take_lc0_specs())
 
-        sent = 0
         held_for_val = self.val_pending and not self.stop_signal_sent
-        # an operator lc0 hold keeps everything here until unpause
         held = held_for_val or EXTERNAL in self.holds["lc0"]
-        if self.lc0_hold and not held and (
-                len(self.lc0_hold) >= LC0_BUNDLE_SIZE
-                or time.monotonic() - self.lc0_hold_since >= LC0_BUNDLE_MAX_WAIT_S
-                or self.stop_signal_sent):
+        sent = 0
+        if not held:
             for spec in self.lc0_hold:
-                self.lc0_q.put(spec)
+                self.lc0_confirmer.submit(spec)
             sent = len(self.lc0_hold)
             self.lc0_hold = []
-            self.lc0_hold_since = None
-        self.recorder.lc0_backlog = self.lc0_q.qsize() + len(self.lc0_hold)
+        self.recorder.lc0_lanes = self.lc0_router.lane_counts()
+        self.recorder.lc0_held = len(self.lc0_hold)
         return sent
+
+    def ingest_lc0_chains(self):
+        if self.lc0_confirmer is None:
+            return
+        for meta in self.lc0_confirmer.take_done():
+            self.rescorer.ingest_lc0_replay(meta)
+            self.recorder.lc0_probes_done += 1
 
     def fleet_wanted(self):
         """True while the run still wants workers running.
@@ -764,7 +773,7 @@ class SelfPlayRunner:
         # several cooldowns rather than storming the GPU at once
         for kind, target, spawn in (
             ("xc0", max(1, self.cfg.n_workers), self.spawn_worker),
-            ("lc0", self.lc0_wanted(), self.spawn_lc0_worker),
+            ("lc0", self.lc0_wanted(), self.spawn_lc0_server),
         ):
             # a fresh worker starts unpaused and would contend for the GPU
             # with whatever the pause was protecting; wait for the unpause
@@ -860,16 +869,18 @@ class SelfPlayRunner:
         self.procs = [w for w in self.procs if w["kind"] != kind]
 
     def respawn_lc0_workers(self, why="operator"):
-        """Pause, tear down and rebuild the lc0 fleet from a fresh read of
-        lc0_replay_config.yaml -- the only way spawn-time params like
-        games_at_once take effect without a full run restart. Any other hold
-        on lc0 survives: the rebuilt fleet comes up when that clears."""
-        if self.lc0_cfg is None:
-            print("[runner] respawn lc0: no lc0 fleet configured", flush=True)
+        """Pause, tear down and rebuild the lc0 server from a fresh read of
+        lc0_replay_config.yaml -- the only way its search params take effect
+        without a full run restart. Outstanding requests go to the new
+        server. Any other hold on lc0 survives: the rebuilt server comes up
+        when that clears."""
+        if self.lc0_router is None:
+            print("[runner] respawn lc0: no lc0 server configured", flush=True)
             return
         self.hold({"lc0"}, RESPAWN)
         self.tear_down_fleet("lc0")
         self.lc0_cfg = create_lc0_replay_config(self.cfg)
+        self.lc0_modes = lc0_mode_configs(self.cfg)
         self.rescorer.lc0_cfg = self.lc0_cfg
         self.holds["lc0"].discard(RESPAWN)
         if self.holds["lc0"]:
@@ -879,9 +890,8 @@ class SelfPlayRunner:
             return
         # torn down, so there is nothing to unpause: the fleet starts fresh
         self.paused_kinds.discard("lc0")
-        for _ in range(self.cfg.n_lc0_workers):
-            self.spawn_lc0_worker()
-        print(f"[runner] respawned lc0 fleet ({why})", flush=True)
+        self.spawn_lc0_server()
+        print(f"[runner] respawned lc0 server ({why})", flush=True)
 
     def respawn_xc0_workers(self, why="operator"):
         """Pause, tear down and rebuild the xc0 fleet and its inference server
@@ -1087,49 +1097,9 @@ class SelfPlayRunner:
         if self.total_queued >= self.cfg.n_games:
             print(f"[runner] games budget {self.cfg.n_games} queued, draining",
                   flush=True)
-            self.broadcast("drain_and_stop")
+            self.broadcast("drain_and_stop", {"xc0"})
             self.stop_signal_sent = True
         return added
-
-    def maybe_bulk_blunder_replays(self):
-        """On a bulk epoch, queue up to BRP_BULK_FRAC of the pool. Positions
-        already probed this epoch count against the quota, so a restart
-        mid-round tops it up instead of sending a second round."""
-        epoch = self.current_epoch
-        if not self.cfg.use_blunder_replay:
-            return 0
-        if not self.blunder_pool or epoch % BRP_BULK_EVERY != BRP_BULK_OFFSET:
-            return 0
-        val_every = self.cfg.validate_every_n_retrains
-        if val_every and epoch % val_every == 0:
-            return 0
-        n_retired = self.rescorer.retire_failed(self.blunder_pool, epoch)
-        if n_retired:
-            print(f"[runner] BRP retired {n_retired} positions past max fails, "
-                  f"{len(self.blunder_pool)} live", flush=True)
-        quota = int(len(self.blunder_pool) * BRP_BULK_FRAC)
-        done = sum(1 for r in self.blunder_pool.values()
-                   if r.get('last_seen') == epoch)
-        n = self.enqueue_blunder_replays(quota - done)
-        self.rescorer.start_brp_round(n)
-        print(f"[runner] BRP bulk epoch {epoch}: queued {n} probes "
-              f"(quota {quota}, already probed {done})", flush=True)
-        return n
-
-    def enqueue_blunder_replays(self, n):
-        """Queue n replay probes, drawn from the positions that are due.
-        They ride the game queue but do not count against the games budget.
-        Progress shows up in the rescore table's replays column."""
-        if self.blunder_pool is None or n <= 0:
-            return 0
-        if self.current_epoch < BRP_WORKER_START_EPOCH:
-            return 0
-        specs = self.game_gen.next_blunder_replays(
-            self.blunder_pool, n, current_epoch=self.current_epoch,
-        )
-        for spec in specs:
-            self.game_q.put(spec)
-        return len(specs)
 
     def maybe_start_validation(self):
         """Fire on the retrain cadence. A batch is a discrete, non-overlapping
@@ -1228,15 +1198,6 @@ class SelfPlayRunner:
             meta = game["meta"]
             scenario = meta.get("scenario")
 
-            if scenario == "blunder_replay_probe":
-                self.finished_brp.append(game)
-                continue
-
-            if scenario == LC0_BRP_SCENARIO:
-                self.rescorer.ingest_lc0_replay(meta)
-                self.recorder.lc0_probes_done += 1
-                continue
-
             self.recorder.ingest_recents(game)
             self.update_game_index(meta)
             self.finished_games.append(game)
@@ -1254,8 +1215,8 @@ class SelfPlayRunner:
 
         self.recorder.lc0_audit_ema = self.rescorer.lc0_audit_ema
         self.recorder.lc0_audit_n = self.rescorer.lc0_audit_n
-        self.recorder.brp_admit_n = self.rescorer.brp_admit_n
-        self.recorder.brp_admit_ok = self.rescorer.brp_admit_ok
+        self.recorder.lc0_confirm_n = self.rescorer.lc0_confirm_n
+        self.recorder.lc0_confirm_ok = self.rescorer.lc0_confirm_ok
         self.recorder.maybe_log_results()
 
     def update_game_index(self, game):
@@ -1275,10 +1236,7 @@ class SelfPlayRunner:
     def tick_rescorer(self):
         while self.finished_games:
             self.rescorer.submit(pull_pkl(self.finished_games.popleft()))
-        while self.finished_brp:
-            self.rescorer.submit_blunder_replay(
-                self.finished_brp.popleft()["meta"])
-        self.rescorer.tick(self.blunder_pool)
+        self.rescorer.tick()
         self.scale_sf()
         self.recorder.training_queue = self.rescorer.training_data_size
 
@@ -1356,8 +1314,7 @@ class SelfPlayRunner:
         if self.retrain_worker is not None:
             return
         # an operator retrain or xc0 hold blocks retraining, and with it
-        # validation and the bulk BRP enqueue, both of which hang off
-        # poll_retrain. An lc0 hold does not.
+        # validation, which hangs off poll_retrain. An lc0 hold does not.
         if EXTERNAL in self.holds["retrain"] | self.holds["xc0"]:
             return
         # the validation batch finishes on the model it started on
@@ -1382,6 +1339,7 @@ class SelfPlayRunner:
             "p": p, "msg_q": msg_q, "result_q": result_q,
             "go_wait_since": None,
         }
+        self.recorder.hold_logs = True
         print(f"[retrain] launched at {len(primary)}/"
               f"{rb.PRIMARY_TRIGGER_SHARDS}", flush=True)
         self.rescorer.reset_writer()
@@ -1527,12 +1485,9 @@ class SelfPlayRunner:
         self.current_epoch = next_model_epoch(self.cfg.progress_csv_path)
         self.recorder.n_retrains = self.current_epoch
         self.retrain_worker = None
+        self.recorder.hold_logs = False
 
-        if not self.stop_signal_sent:
-            self.maybe_bulk_blunder_replays()
-
-        rb.sync_live_buffer(self.base_cfg.run_dir,
-                            self.rescorer.buffered_records())
+        self.save_buffers()
         self.maybe_start_validation()
 
     def handle_commands(self):
@@ -1540,7 +1495,7 @@ class SelfPlayRunner:
         if c.no_new_games.is_set():
             c.no_new_games.clear()
             if not self.stop_signal_sent:
-                self.broadcast("drain_and_stop")
+                self.broadcast("drain_and_stop", {"xc0"})
                 self.stop_signal_sent = True
                 dropped = len(drain_queue(self.game_q))
                 print(f"[cmd] no new games -- dropped {dropped} queued, "
@@ -1640,7 +1595,8 @@ class SelfPlayRunner:
             self.add_sf_thread("full clear")
 
     def save_training_snapshot(self):
-        data = self.rescorer.buffered_records()
+        data = (self.rescorer.buffered_records()
+                + self.rescorer.correction_records())
         n = self.controls.save_training_data_n
         if n and n < len(data):
             data = random.sample(data, n)
@@ -1672,12 +1628,14 @@ class SelfPlayRunner:
                 self.procs = check_and_reap_procs(
                     self.procs, self.worker_procs,
                     crash_log_path=self.crash_log_path)
+                self.tend_lc0_router()
                 self.check_xc0_server()
                 self.sync_xc0_server()
                 self.maybe_respawn_workers()
 
                 self.top_up_queue()
                 self.drain_lc0_specs()
+                self.ingest_lc0_chains()
                 self.drain_results()
                 self.maybe_expire_validation()
                 self.tick_rescorer()
@@ -1688,6 +1646,23 @@ class SelfPlayRunner:
             return 0 if not self.controls.stop.is_set() else 1
         finally:
             self.shutdown()
+
+    def tend_lc0_router(self):
+        """Drop reply queues of workers that have exited, and resend any
+        request past LC0_REQUEST_TIMEOUT_S. On a draining run, the lc0 server
+        is told to drain once the last xc0 worker has exited."""
+        r = self.lc0_router
+        if r is None:
+            return
+        if (self.stop_signal_sent and not self.lc0_stop_sent
+                and not self.procs_of("xc0")):
+            self.broadcast("drain_and_stop", {"lc0"})
+            self.lc0_stop_sent = True
+        live = {w["id"] for w in self.procs_of("xc0")} | {LC0_RUNNER_CLIENT}
+        r.prune_clients(live)
+        n = r.resend_stale()
+        if n:
+            print(f"[runner] resent {n} stale lc0 requests", flush=True)
 
     def initial_fill(self):
         """Seed the queue in priority order: probes, validation, selfplay.
@@ -1704,7 +1679,6 @@ class SelfPlayRunner:
         is empty right now, so the shallow target would take several loop
         passes to bring the fleet up to capacity.
         """
-        self.maybe_bulk_blunder_replays()
         self.maybe_start_validation()
         self.top_up_queue(
             target=self.cfg.n_workers * self.cfg.games_at_once
@@ -1767,26 +1741,26 @@ class SelfPlayRunner:
         if self.controls.stop.is_set():
             self.drain_rescorer(STOP_DRAIN_S)
 
+        self.ingest_lc0_chains()
         self.rescorer.push_analyzed()
         # after the drain, never before: pending only empties as these threads
         # return results
         for t in self.sf_rescore_threads + self.sf_retiring:
             t.close()
         self.sf_retiring = []
-        records = self.rescorer.buffered_records()
-        if records:
-            path = rb.sync_live_buffer(self.base_cfg.run_dir, records)
-            print(f"[runner] saved {len(records)} "
-                  f"samples to {os.path.basename(path)}", flush=True)
-        self.rescorer.close(self.blunder_pool)
+        n = self.rescorer.training_data_size
+        if n:
+            path = self.save_buffers()
+            print(f"[runner] saved {n} samples to "
+                  f"{os.path.basename(path)} and {rb.CORRECTION_BUFFER_PKL}",
+                  flush=True)
+        self.rescorer.close()
         self.stop_workers()
         self.report()
 
     def rescore_outstanding(self):
         """Games still owed a Stockfish pass, anywhere in the pipeline."""
-        return (len(self.finished_games) + len(self.finished_brp)
-                + len(self.rescorer.intake)
-                + len(self.rescorer.blunder_replay_intake)
+        return (len(self.finished_games) + len(self.rescorer.intake)
                 + len(self.rescorer.pending))
 
     def drain_rescorer(self, timeout_s=STOP_DRAIN_S):
@@ -1828,10 +1802,9 @@ class SelfPlayRunner:
         self.procs = [w for w in self.procs if w["p"].is_alive()]
         self.stop_xc0_server()
 
-        if self.lc0_q is not None:
+        if self.lc0_confirmer is not None:
             self.save_lc0_backlog()
-        for q in (self.recent_q, self.telemetry_q, self.game_q,
-                  self.sf_q, self.lc0_q):
+        for q in (self.recent_q, self.telemetry_q, self.game_q, self.sf_q):
             if q is not None:
                 q.cancel_join_thread()
                 q.close()

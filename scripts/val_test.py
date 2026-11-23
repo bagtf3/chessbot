@@ -151,7 +151,8 @@ def create(src_tag, name):
     n_backlog = fix_lc0_backlog(dst)
 
     cfg = Config.from_yaml(os.path.join(dst, "config.yaml"))
-    if cfg.run_tag != name or os.path.dirname(cfg.model_path) != dst:
+    model_dir = os.path.normcase(os.path.normpath(os.path.dirname(cfg.model_path)))
+    if cfg.run_tag != name or model_dir != os.path.normcase(os.path.normpath(dst)):
         sys.exit(f"[val_test] config check failed: run_tag {cfg.run_tag}, "
                  f"model_path {cfg.model_path}")
     if snapshot(src) != before:

@@ -104,19 +104,13 @@ class GameViewer:
 
     @classmethod
     def from_record(cls, row, sf_df=None):
-        """Viewer over an already-loaded log dict, e.g. one brp_reviewables
-        row. No file behind it, so self.path is None."""
+        """Viewer over an already-loaded log dict. No file behind it, so
+        self.path is None."""
         v = cls.__new__(cls)
         v.path = None
         v.log = row
         v.init_from_log(row, sf_df)
         return v
-
-    @classmethod
-    def from_batch(cls, jsonl_path, sf_df=None):
-        """Every row of a brp_reviewables jsonl, steppable one probe at a
-        time. See BrpReviewBatch."""
-        return BrpReviewBatch(jsonl_path, sf_df=sf_df)
 
     def init_from_log(self, log, sf_df=None):
         self.start_fen = log.get("start_fen")
@@ -976,7 +970,7 @@ class GameViewer:
                 parts.append(f"CPL={int(loss)}")
 
             if played_san != "?":
-                if xc0_uci and xc0_san != "?":
+                if xc0_uci and xc0_uci != played_uci and xc0_san != "?":
                     parts.append(f"played={played_san}")
                     xc0_cp = f" ({played_cp_pov})" if played_cp_pov is not None else ""
                     parts.append(f"Xc0={xc0_san}{xc0_cp}")
@@ -1696,221 +1690,12 @@ def make_training_sample(b, v, visits):
     return tup
 
 
-
-class BrpReviewBatch:
-    """Step through brp_reviewables.jsonl. Every row is a single probe move,
-    so next/prev walk between positions, not plies."""
-
-    def __init__(self, jsonl_path, sf_df=None):
-        self.path = pathlib.Path(jsonl_path)
-        if not self.path.exists():
-            raise FileNotFoundError(f"reviewables not found: {self.path}")
-        with open(self.path, "r", encoding="utf-8") as f:
-            self.rows = [json.loads(ln) for ln in f if ln.strip()]
-        if not self.rows:
-            raise ValueError(f"no rows in {self.path}")
-        self.sf_df = sf_df
-        self.i = 0
-        self.viewer = GameViewer.from_record(self.rows[0], sf_df)
-
-    def __len__(self):
-        return len(self.rows)
-
-    def __getitem__(self, i):
-        return GameViewer.from_record(self.rows[i], self.sf_df)
-
-    def seek(self, i):
-        """Move to row i without printing anything."""
-        self.i = max(0, min(i, len(self.rows) - 1))
-        self.viewer = GameViewer.from_record(self.rows[self.i], self.sf_df)
-        return self.viewer
-
-    def goto(self, i):
-        self.seek(i)
-        return self.show()
-
-    def next(self):
-        return self.goto(self.i + 1)
-
-    def prev(self):
-        return self.goto(self.i - 1)
-
-    def row(self):
-        return self.rows[self.i]
-
-    def summary(self):
-        """Every row minus the tree, for scanning/filtering in pandas."""
-        drop = {"tree_search_data", "moves_played", "history_uci"}
-        return pd.DataFrame([
-            {k: v for k, v in r.items() if k not in drop} for r in self.rows
-        ])
-
-    def fails_index(self, min_fails):
-        """Index of the next row at or past min_fails, wrapping once."""
-        n = len(self.rows)
-        for step in range(1, n + 1):
-            j = (self.i + step) % n
-            if (self.rows[j].get("n_fails") or 0) >= min_fails:
-                return j
-        return None
-
-    def seek_fails(self, min_fails):
-        j = self.fails_index(min_fails)
-        if j is None:
-            print(f"[brp] no row with n_fails >= {min_fails}")
-            return self.viewer
-        return self.goto(j)
-
-    def cpl_index(self, min_cpl):
-        """Index of the next row at or past min_cpl probe_cpl, wrapping once."""
-        n = len(self.rows)
-        for step in range(1, n + 1):
-            j = (self.i + step) % n
-            cpl = self.rows[j].get("probe_cpl")
-            if cpl is not None and cpl >= min_cpl:
-                return j
-        return None
-
-    def seek_cpl(self, min_cpl):
-        j = self.cpl_index(min_cpl)
-        if j is None:
-            print(f"[brp] no row with probe_cpl >= {min_cpl}")
-            return self.viewer
-        return self.goto(j)
-
-    def show(self, top_n=5):
-        self.viewer.show_board()
-        self.show_header()
-        self.viewer.show_moves(top_n=top_n)
-        return self.viewer
-
-    def san(self, uci):
-        """SAN from the probe position; all header moves are legal there."""
-        return self.viewer.board.san(uci) if uci else "?"
-
-    def show_header(self):
-        r = self.row()
-        print(f"[{self.i + 1}/{len(self.rows)}] {r.get('short_fen')}  "
-              f"epoch {r.get('model_epoch')}  fails {r.get('n_fails')}")
-        print(f"  orig  {self.san(r.get('orig_move'))} "
-              f"(cpl {r.get('orig_cpl')})  "
-              f"orig_best {self.san(r.get('orig_best'))}")
-        print(f"  probe {self.san(r.get('probe_move'))} "
-              f"(cpl {r.get('probe_cpl')})  "
-              f"sf_best {self.san(r.get('sf_best'))} "
-              f"@d{r.get('sf_best_depth')} cp {r.get('sf_best_cp')}")
-        print(f"  from  {r.get('src_run_tag')} / {r.get('src_game_id')} "
-              f"move {r.get('src_move_num')}")
-
-    def show_options(self):
-        print("Commands:")
-        print("  [Enter] / n          next probe")
-        print("  b, b<N>              back N probes, e.g. b5")
-        print("  g<N>                 go to probe N, e.g. g120")
-        print("  f<N>                 seek next probe with n_fails >= N")
-        print("  c<N>                 seek next probe with probe_cpl >= N")
-        print("  q, quit, exit        quit review")
-        print("  o, options, help     show this help text")
-        print("  fen                  print FEN for this position")
-        print("  hdr                  reprint the probe header")
-        print("  sf                   stockfish overlay (default depth)")
-        print("  sf<D>                stockfish eval to depth D, e.g. sf20")
-        print("  lc0                  lc0 overlay (default 4000 nodes)")
-        print("  lc0 <N>              lc0 eval with N nodes, e.g. lc0 8000")
-        print("  pv                   xc0 principal variation (min_vis=1)")
-        print("  pv<N>                xc0 pv filtered by min visits, e.g. pv8")
-        print("  visits <move>        show MCTS visits for a specific move")
-        print("  visits <N>           show visit info for N top moves")
-        print("  temp <T>             show priors temperature-scaled by T")
-
-    def replay(self, top_n=5):
-        print(f"Reviewing {len(self.rows)} probes from {self.path.name}")
-        print("Controls: Enter=next, b=back, g<N>=goto, f<N>=fails, o=options")
-        shown = False
-        while True:
-            if not shown:
-                self.show(top_n=top_n)
-                shown = True
-            v = self.viewer
-            cmd = input("[Enter]=next, b=back, q=quit, lc0/sf/pv, o=options > ")
-            cmd = cmd.strip()
-            cmd_cased = cmd
-            cmd = cmd.lower()
-            if cmd in ("q", "quit", "exit"):
-                break
-            elif cmd in ("o", "options", "help", "h", "?"):
-                self.show_options()
-            elif cmd == "fen":
-                print(v.board.fen())
-            elif cmd == "hdr":
-                self.show_header()
-            elif cmd.startswith("pv"):
-                s = cmd[2:].strip()
-                v.show_pv(min_vis=int(s) if s.isdigit() else 1)
-            elif cmd.startswith("sf"):
-                v.show_sf_overlay(cmd_cased)
-            elif cmd.startswith("lc0"):
-                v.show_lc0_overlay(cmd)
-            elif cmd.startswith("visits"):
-                split = [c.strip() for c in cmd.split(" ") if c.strip()]
-                if split[-1].isdigit():
-                    v.show_moves(top_n=int(split[-1]))
-                else:
-                    move_str = cmd_cased.replace(" ", "").replace("visits", "")
-                    v.show_visits(move_str)
-            elif cmd.startswith("temp"):
-                parts = cmd.split()
-                try:
-                    arg = parts[1]
-                    if arg.startswith("e="):
-                        v.show_temp(None, target_entropy=float(arg[2:]))
-                    else:
-                        v.show_temp(float(arg))
-                except (IndexError, ValueError):
-                    print("Usage: temp <T>  or  temp e=<0-1>")
-            elif cmd.startswith("g"):
-                s = cmd[1:].strip()
-                if s.isdigit():
-                    shown = False
-                    self.seek(int(s))
-                else:
-                    print("Usage: g<N>, e.g. g120")
-            elif cmd.startswith("f"):
-                s = cmd[1:].strip()
-                if s.isdigit():
-                    j = self.fails_index(int(s))
-                    if j is None:
-                        print(f"[brp] no row with n_fails >= {s}")
-                    else:
-                        shown = False
-                        self.seek(j)
-                else:
-                    print("Usage: f<N>, e.g. f3")
-            elif cmd.startswith("c"):
-                s = cmd[1:].strip()
-                if s.isdigit():
-                    j = self.cpl_index(int(s))
-                    if j is None:
-                        print(f"[brp] no row with probe_cpl >= {s}")
-                    else:
-                        shown = False
-                        self.seek(j)
-                else:
-                    print("Usage: c<N>, e.g. c200")
-            elif cmd.startswith("b"):
-                s = cmd[1:].strip()
-                n = int(s) if s.isdigit() else 1
-                shown = False
-                self.seek(self.i - n)
-            else:
-                shown = False
-                self.seek(self.i + 1)
-
-
 class RecordKeeper(object):    
     def __init__(self, n_retrains, every_sec=60):
         self.n_retrains = n_retrains
         self.every_sec = every_sec
+        # set while a retrain runs so its lines print as one unbroken stream
+        self.hold_logs = False
         self._last_stats_log = time.time()
         self._run_start = time.time()
 
@@ -1937,17 +1722,19 @@ class RecordKeeper(object):
         self.telemetry = {}
         self.lc0_telemetry = {}
         # set by the runner: it owns the queue and sees the replies
-        self.lc0_backlog = 0
+        # {priority: (outstanding, done)} from the lc0 router; True is the
+        # vs_leela lane, False the confirmation lane
+        self.lc0_lanes = {True: (0, 0), False: (0, 0)}
+        self.lc0_held = 0
         self.lc0_probes_done = 0
         # set by the runner from the rescorer's own audit state each pass
         self.lc0_audit_ema = {}
         self.lc0_audit_n = 0
-        self.brp_admit_n = 0
-        self.brp_admit_ok = 0
-        # set by the runner to the rescorer's live per-scenario quality rows
-        # and BRP probe row, so the scenario table can show CPL/TSL/CE/KL
+        self.lc0_confirm_n = 0
+        self.lc0_confirm_ok = 0
+        # set by the runner to the rescorer's live per-scenario quality rows,
+        # so the scenario table can show CPL/TSL/CE/KL
         self.quality_rows = {}
-        self.brp_row = None
 
     def ingest_recents(self, recent):
         meta = recent['meta']
@@ -2040,7 +1827,8 @@ class RecordKeeper(object):
 
     def maybe_log_results(self, window=1500, force=False):
         now = time.time()
-        if not force and (now - self._last_stats_log < self.every_sec):
+        if not force and (self.hold_logs
+                          or now - self._last_stats_log < self.every_sec):
             return
 
         # span this print covers, read before the stamp moves
@@ -2075,7 +1863,7 @@ class RecordKeeper(object):
 
         # counters cover the whole run, not the last `window` games
         print_summary_from_stats(self.scenario_stats, self.sf_overall,
-                                 self.quality_rows, self.brp_row)
+                                 self.quality_rows)
         primary_count = (len(os.listdir(self.primary_buffer_dir))
                          if self.primary_buffer_dir else 0)
         print(
@@ -2089,9 +1877,11 @@ class RecordKeeper(object):
         return
 
     def log_lc0_stats(self):
-        """Throughput of the lc0 teacher fleet, kept out of [speed stats] so
-        the selfplay numbers stay comparable across runs that do and do not
-        have an lc0 worker."""
+        """Throughput of the lc0 server, kept out of [speed stats] so the
+        selfplay numbers stay comparable across runs that do and do not have
+        one. The queue line splits the router's two lanes: wait (sent, not
+        yet answered) and done count positions; chains counts finished
+        confirmation chains."""
         fresh = [i for i in self.lc0_telemetry.values()
                  if i.get("ts", 0) >= time.time() - 180]
         if not fresh:
@@ -2102,7 +1892,7 @@ class RecordKeeper(object):
         pps = sum(i.get("preds_per_second", 0.0) for i in fresh)
         active = sum(i.get("n_active", 0) for i in fresh)
 
-        print(f"[lc0 stats] mps={mps:.2f}  lps={lps:.1f}  "
+        print(f"[lc0 stats ] mps={mps:.2f}  lps={lps:.1f}  "
               f"preds/s={pps:.1f}  moves/hr={mps * 3600:.0f}  "
               f"active={active}")
 
@@ -2111,20 +1901,35 @@ class RecordKeeper(object):
         rates = [i["cache_hit_ema"] for i in fresh if "cache_hit_ema" in i]
         hit = f"{100.0 * np.mean(rates):.1f}%" if rates else "--"
 
-        print(f"[lc0 queue] backlog={self.lc0_backlog}  "
-              f"done={self.lc0_probes_done}  sims/move={spm:.0f}  "
-              f"batch={batch:.0f}  cache_hit={hit}")
+        (v_out, v_done), (c_out, c_done) = self.lc0_lanes[True], self.lc0_lanes[False]
+        # request out to move played, over the xc0 workers' last windows
+        xc0 = [i for i in self.telemetry.values()
+               if i.get("ts", 0) >= time.time() - 180 and i.get("lc0_move_n")]
+        n_mv = sum(i["lc0_move_n"] for i in xc0)
+        move_s = (f"{sum(i['lc0_move_s'] * i['lc0_move_n'] for i in xc0) / n_mv:.2f}s"
+                  if n_mv else "--")
+        # plies per finished chain; chains still in flight skew it slightly
+        chains = self.lc0_probes_done
+        avg = f"{c_done / chains:.2f}" if chains else "--"
+        print(f"[lc0 queue ] vs_leela wait={v_out} done={v_done} move={move_s}")
+        print(f"[lc0 queue ] confirm  held={self.lc0_held} wait={c_out} "
+              f"done={c_done} chains={chains} ({avg} plies/chain)")
+        print(f"[lc0 search] sims/move={spm:.0f}  batch={batch:.0f}  "
+              f"cache_hit={hit}")
 
         E = self.lc0_audit_ema
         if 'lc0' in E:
-            if self.brp_admit_n:
-                pct = 100.0 * self.brp_admit_ok / self.brp_admit_n
-                print(f"[lc0 audit] candidates={self.brp_admit_n}  "
-                      f"confirmed blunders={self.brp_admit_ok} ({pct:.1f}%)")
-            lc0, xc0 = E['lc0'], E['xc0']
-            print(f"[lc0 audit] ply0 ema2k  n={self.lc0_audit_n:<5}"
-                  f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
-                  f"uplift={xc0 - lc0:+.1f}")
+            if self.lc0_confirm_n:
+                pct = 100.0 * self.lc0_confirm_ok / self.lc0_confirm_n
+                print(f"[lc0 audit ] candidates={self.lc0_confirm_n}  "
+                      f"confirmed blunders={self.lc0_confirm_ok} ({pct:.1f}%)")
+            for name, lk, xk in (("CPL", 'lc0', 'xc0'), ("TSL", 'lc0_tsl', 'xc0_tsl')):
+                if lk not in E:
+                    continue
+                lc0, xc0 = E[lk], E[xk]
+                print(f"[lc0 audit ] {name}: ema2k  n={self.lc0_audit_n:<5}"
+                      f" lc0={lc0:<6.1f}vs  xc0={xc0:<7.1f}"
+                      f"uplift={xc0 - lc0:+.1f}")
 
     def log_loop_stats(self, summed, avged):
         n_groups = summed.get("n_groups", 0)

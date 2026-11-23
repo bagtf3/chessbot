@@ -314,15 +314,17 @@ def retrain_worker_body(run_dir, msg_q, result_q, epoch):
     model, arch = load_pt_model(cfg.model_path)
     args = SimpleNamespace(batch_size=cfg.retrain_batch_size)
 
+    timings = {}
     train_stats = retrain_pt(cfg.model_path, X, P, Y, vwht, pwht, cfg, epoch, args,
-                             model=model, arch=arch)
+                             timings=timings, model=model, arch=arch,
+                             holdout=records_to_arrays(held_out))
     # the model is saved, so its training shards are spent
     rotate_to_replay(primary_paths, cfg.replay_buffer_dir)
     discard_files(replay_paths)
     print("[retrain] primary -> replay rotated", flush=True)
 
     dt = time.monotonic() - t0
-    n = len(X)
+    n = timings["samples"]
     print(f"[retrain] timing for epoch {epoch}: {dt:.1f}s  "
           f"{n / dt:.0f} samples/s  {dt * SHARD_SIZE / n:.2f}s per {SHARD_SIZE}",
           flush=True)

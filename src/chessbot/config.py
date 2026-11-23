@@ -32,12 +32,10 @@ class Config(object):
     validation_warmup_games = 1000
     n_workers = 2
 
-    # lc0 teacher probe fleet. 0 disables it; the worker runs its own net on
-    # its own queue and is counted separately from the selfplay workers.
-    n_lc0_workers = 0
+    # the lc0 server: one process running the lc0 net for teacher searches
+    # and vs_leela moves. False disables both.
+    lc0_server = False
     telemetry_kind = "xc0"
-    # xc0 blunder replay bulk rounds; False skips them entirely
-    use_blunder_replay = True
 
     # per-game parameter sampling; resolved once per game in the main process.
     # each entry: param_name: [list of options to pick from]; None = nothing.
@@ -56,7 +54,8 @@ class Config(object):
     # Simulation schedule. Each move the tree gets sims_min = sims_floor and
     # sims_max = sims_schedule at the current ply (the entry with the largest
     # start ply at or below it), else sims_ceiling; both times the effort scale.
-    sf_move_sims = 400
+    # xc0's search on an expert's (SF or lc0) turn, before the expert's move
+    expert_move_sims = 400
     sims_floor = 400
     sims_ceiling = 800
     sims_schedule = None   # {start_ply: ceiling}
@@ -146,7 +145,7 @@ class Config(object):
     rescore_equiv_max = 60
     # expected-score-loss bars for an inaccuracy and a blunder
     rescore_esl_inaccuracy = 0.05
-    rescore_esl_blunder = 0.12
+    rescore_esl_blunder = 0.10
     rescore_n_sf_workers = 1
 
     train_on_stockfish = True

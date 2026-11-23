@@ -1,13 +1,11 @@
 """
 lc0 replay probe primitives: config, candidate filter, spec construction.
-
-Deliberately shares nothing with blunder_replay.py. xc0_BRP is a testing and
-validation-tracking feature with its own pool, ratchet and history; lc0_BRP is
-an oracle/teacher training feature. A position reaching lc0_BRP after failing
-an xc0_BRP is an escalation to a better teacher, not a promotion, and must
-not be tracked as one.
+lc0 is the teacher: blunders and teacher-stream positions are searched by it
+and its searches become training samples.
 """
 import os
+
+import yaml
 
 from pyfastchess import Board as fastboard
 
@@ -17,30 +15,38 @@ LC0 = "[lc0_brp]"
 
 LC0_BRP_SCENARIO = "lc0_replay_probe"
 LC0_BRP_CONFIG_ENV = "LC0_REPLAY_CONFIG"
+# overrides on top of the teacher search for vs_leela moves
+VS_LEELA_SECTION = "vs_leela"
 
-# plies the probe plays from the blunder position. check_for_terminal tests
-# plies > max_game_length, so the config value is one less than this.
+# longest confirmation chain from the blunder position (lc0_confirm.py)
 LC0_BRP_PLIES = 3
 
 
-def create_lc0_replay_config(cfg, yaml_file=None):
-    """
-    Config for the lc0 replay probe worker.
-
-    Unlike the xc0 probe, encoding and backend are pinned to lc0 rather than
-    inherited: this worker exists to run the teacher net, not the model under
-    test.
-    """
-    pcfg = cfg.copy()
-    # a copy in the run dir (val_test forks) wins over the shared one
+def lc0_config_yaml(cfg, yaml_file=None):
+    """The lc0 yaml as a dict. A copy in the run dir (val_test forks) wins
+    over the shared one."""
     run_yaml = os.path.join(getattr(cfg, "run_dir", "") or "", "lc0_replay_config.yaml")
     if not yaml_file and os.path.exists(run_yaml):
         yaml_file = run_yaml
     p_yaml = yaml_file or os.environ.get(LC0_BRP_CONFIG_ENV, "")
     if not p_yaml or not os.path.exists(p_yaml):
         raise RuntimeError(f"{LC0} no lc0 probe config at {p_yaml!r}")
+    with open(p_yaml, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
 
-    pcfg.update_via(p_yaml)
+
+def create_lc0_replay_config(cfg, yaml_file=None):
+    """
+    Config for lc0 teacher searches; the yaml's vs_leela section is left out.
+
+    Unlike the xc0 probe, encoding and backend are pinned to lc0 rather than
+    inherited: this worker exists to run the teacher net, not the model under
+    test.
+    """
+    pcfg = cfg.copy()
+    data = lc0_config_yaml(cfg, yaml_file)
+    data.pop(VS_LEELA_SECTION, None)
+    pcfg.update(data)
     pcfg.init_paths()
 
     # set after init_paths, which derives model_path back from run_tag and
@@ -53,11 +59,9 @@ def create_lc0_replay_config(cfg, yaml_file=None):
     if not pcfg.lc0_distill_model_name:
         raise RuntimeError(f"{LC0} no lc0 model: set lc0_distill_model_name")
 
-    pcfg.max_game_length = LC0_BRP_PLIES - 1
     pcfg.telemetry_kind = "lc0"
 
-    # a 3-ply window is never adjudicated. syzygy still fires on the
-    # max_game_length branch in check_for_terminal, so probes can end short.
+    # the lc0 server searches single positions and never adjudicates
     pcfg.use_syzygy = False
     pcfg.allow_resignation = False
     pcfg.use_eval_draw = False

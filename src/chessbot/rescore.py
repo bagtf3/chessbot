@@ -1,4 +1,4 @@
-import os, json, gzip, glob, time
+import os, json, gzip, time
 from types import SimpleNamespace
 from pathlib import Path
 import uuid
@@ -25,28 +25,17 @@ from chessbot.utils import (
 )
 from chessbot.replay_buffer import (
     LiveBuffer, SF_SOURCE, sparsify_policy,
-    new_shard_path, write_pkl_gz_shard, flush_lc0_shards, is_lc0_record,
+    new_shard_path, write_pkl_gz_shard, flush_correction_shards, is_lc0_record,
 )
 from chessbot.opening_counts import (
     COUNTS_FILE, REWEIGHT_INELIGIBLE, OpeningCounts, band_weights,
-)
-
-from chessbot.blunder_replay import (
-    BRP_POOL_ENV, BRP_SCENARIOS, is_esl_candidate, ESL_ANY_MIN,
-    save_probe_pool, evicted_path, evict_position,
-    BRP_EQUIV_CPL, BRP_HISTORY_FILENAME,
-    blunder_replay_dir, BRP_POOL_MAX_SIZE,
-    BRP_MIN_CACHE_DEPTH, BRP_MAX_FAILS, ratchet_store, cached_deep_score,
-    BRP_START_MS, BRP_MS_STEP, BRP_MS_MAX_MULT,
-    BRP_REVIEWABLES_FILENAME, probe_fails,
-    BRP_LC0_REQUEUE_FAILS, retire_failed_positions,
 )
 
 from chessbot.lc0_replay import (
     lc0_replay_spec,
 )
 
-from chessbot.game_utils import reconcile_game_boards, short_fen
+from chessbot.game_utils import reconcile_game_boards
 
 from chessbot.move_scoring import make_scorer
 
@@ -56,12 +45,12 @@ RS = "[rescore]"
 LC0_BRP_SHARD_DIR = os.environ.get("LC0_BRP_SHARD_PATH", "")
 # lc0 audit smoothing, counted in scored positions
 AUDIT_EMA_SPAN = 2000
-BRP_MERGE_EVERY = 512
-# a bulk round is analysed once every probe is back, or once this share is
-# back and the stragglers have had BRP_ROUND_WAIT_S to arrive
-BRP_ROUND_DONE_FRAC = 0.999
-BRP_ROUND_WAIT_S = 180
-# teacher stream: plies neither pool confirmation nor the blunder path took,
+# blunder rule: a rescore_esl_blunder slip in a game the mover lost or drew,
+# an ESL_ANY_MIN slip in any game, or F (a won position thrown away)
+ESL_ANY_MIN = 0.20
+F_MIN_V = 1200
+F_MAX_P = 1000
+# teacher stream: plies the blunder path did not take,
 # sent to lc0 for one ply when ESL clears rescore_esl_inaccuracy and xc0's
 # search disagrees with SF's move (see policy_value_miss). The xc0 sample
 # still trains, at LC0_SENT_XC0_WEIGHT.
@@ -80,10 +69,20 @@ ACCEPT_DRAW_P = 0.8
 ACCEPT_ONE_LEGAL_P = 0.2
 LC0_TEACHER_TOP_K = 5
 LC0_TEACHER_PV_K = 2
-BRP_STAT_KEYS = (
+BLUNDER_STAT_KEYS = (
     "total", "missed_mate", "inaccuracy", "blunder", "blunder_lost",
     "blunder_any", "F",
 )
+
+
+def is_esl_candidate(v, p, esl, z_stm, esl_blunder):
+    """Scalar ESL rule: E for the ESL thresholds, F for a thrown-away won
+    position, F first. Returns (is_candidate, label)."""
+    if z_stm <= 0 and v >= F_MIN_V and p < F_MAX_P:
+        return True, "F"
+    if esl >= ESL_ANY_MIN or (z_stm <= 0 and esl >= esl_blunder):
+        return True, "E"
+    return False, None
 
 
 def policy_value_miss(cm, sf_uci):
@@ -152,13 +151,6 @@ def material(board):
     """Both sides' material in pawns."""
     return sum(v * len(board.pieces(pt, c))
                for pt, v in PIECE_VALUES.items() for c in chess.COLORS)
-
-
-def count_jsonl_lines(path):
-    if not os.path.exists(path):
-        return 0
-    with open(path, "r", encoding="utf-8") as f:
-        return sum([1 for _ in f])
 
 
 class CtrlStats:
@@ -447,26 +439,19 @@ class SFRescoreThread:
             results = []
 
             movetime_ms = info.get("movetime_ms", self.movetime_ms)
-            fixed_depth = info.get("depth")
 
             def timed(ms):
                 # longer search for pass2 because Xc0 move may be better
                 return (chess.engine.Limit(time=ms / 1000.0, depth=self.max_depth),
                         chess.engine.Limit(time=(ms + 20) / 1000.0, depth=self.max_depth))
 
-            if fixed_depth:
-                # replay probes run to a flat depth with no time cap
-                flat = chess.engine.Limit(depth=fixed_depth)
-                limits = (flat, flat)
-            else:
-                limits = timed(movetime_ms)
-            tiers = {None: limits,
+            tiers = {None: timed(movetime_ms),
                      "decided": timed(movetime_ms * DECIDED_TIME_FRAC),
                      "busy": timed(movetime_ms + BUSY_EXTRA_MS)}
 
             try:
                 if info.get("moves") is None:
-                    results = [self.search(pos[0], pos[1], pos[2], limits)
+                    results = [self.search(pos[0], pos[1], pos[2], tiers[None])
                                for pos in positions]
                 else:
                     results = self.rescore_game(positions, info["moves"], tiers)
@@ -492,20 +477,11 @@ class Rescorer(object):
               f"{n} slots occupied")
 
         self.live_buffer = LiveBuffer(cfg.primary_buffer_dir, counts=self.opening_counts)
-        # never flushed on its own; flush_lc0_shards drains it
-        self.lc0_buffer = LiveBuffer(cfg.primary_buffer_dir)
+        # the fast track: lc0 blunder corrections, written as their own
+        # shards. Never flushed on its own; flush_correction_shards drains it.
+        self.correction_buffer = LiveBuffer(cfg.primary_buffer_dir)
         self.analyzed_results = []
         self.closed = False
-
-        # pool itself is never cached here -- it's passed into tick() each
-        # call from the one copy SelfPlayRunner holds, since
-        # this class only ever mutates it (new candidates, replay evictions),
-        # never samples from it. blunder_pool_path is just a string, and
-        # n_pool_changes is this class's own save-cadence counter, so both
-        # are safe to hold as real instance state.
-        self.blunder_pool_path = os.environ.get(BRP_POOL_ENV) or None
-        self.n_pool_changes = 0
-        self.pool_save_times = []
 
         self.start_time = None  # set on first game to exclude idle startup time
         self.games_seen = set()
@@ -513,10 +489,9 @@ class Rescorer(object):
         self.written_total = 0
         self.written_this_round = 0
         self.total_plies = 0
-        # since start: rows by scenario, the BRP probe row, and selfplay
-        # quality trends (validation games stay out of the trends)
+        # since start: rows by scenario and selfplay quality trends
+        # (validation games stay out of the trends)
         self.report_rows = defaultdict(ReportRow)
-        self.brp_row = ReportRow()
         self.trends = {m: Trend() for m in (*QUALITY, "tsl_mistake", "tsl_blunder")}
         # seeded at observed admitted-ply levels
         self.acc_ema = {'cpl': 4.81, 'tsl': 6.03, 'klv': 0.115, 'klp': 0.47,
@@ -545,21 +520,16 @@ class Rescorer(object):
         self.ctrl_games = 0
 
         zero_blunder = lambda: {'n': 0, 'cpl': 0.0, 'lc0': 0}
-        self.total_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
-        self.window_blunder = {st: zero_blunder() for st in BRP_STAT_KEYS}
+        self.total_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
+        self.window_blunder = {st: zero_blunder() for st in BLUNDER_STAT_KEYS}
 
-        zero_sc = lambda: {
-            'offered': 0, 'accepted': 0,
-            'lc0_queued': 0, 'lc0_samples': 0}
-
-        self.sample_counts = zero_sc()
-        self.sample_counts_window = zero_sc()
+        self.sample_counts = zero_sample_counts()
+        self.sample_counts_window = zero_sample_counts()
 
         self.scorer = make_scorer('rescore', cfg)
-        self.brp_scorer = make_scorer('brp')
         self.lc0_scorer = make_scorer('lc0', cfg)
 
-        # TEMPORARY lc0_BRP audit: teacher output sent through SF to score it.
+        # TEMPORARY lc0 audit: teacher output sent through SF to score it.
         # Remove this and its call sites once lc0 quality is trusted.
         self.lc0_audit = {}
         self.lc0_audit_n = 0
@@ -568,9 +538,10 @@ class Rescorer(object):
         # ply0 lc0 and xc0 only ever step together, so uplift always reconciles.
         # seeded at the observed teacher/xerces loss so one lucky first
         # probe does not own the number for thousands of samples
-        self.lc0_audit_ema = {'lc0': 9.4, 'xc0': 97.6}
-        self.brp_admit_n = 0
-        self.brp_admit_ok = 0
+        self.lc0_audit_ema = {'lc0': 9.4, 'xc0': 97.6, 'lc0_tsl': 15.0, 'xc0_tsl': 120.0}
+        # ply0 audits, and those lc0 answered within ACCEPT_TSL_GOOD
+        self.lc0_confirm_n = 0
+        self.lc0_confirm_ok = 0
 
         self.kl_q50 = 0.21  # online-tracked EMA median of eligible-ply KL
         self.kl_q80 = 0.55  # online-tracked EMA 80th percentile of eligible-ply KL
@@ -578,21 +549,11 @@ class Rescorer(object):
         self.kl_value_q80 = 0.124  # EMA 80th percentile of the same
 
         self.intake = deque()
-        self.blunder_replay_intake = deque()
         self.pending = {}
 
-        self.blunder_replay_jsonl = os.path.join(
-            blunder_replay_dir(cfg), "blunder_replay_probe.jsonl")
-        self.brp_reviewables_jsonl = os.path.join(
-            blunder_replay_dir(cfg), BRP_REVIEWABLES_FILENAME)
-        self.n_replay_rows = count_jsonl_lines(self.blunder_replay_jsonl)
-        self.n_replay_finalized = 0
-        self.brp_expected = 0
-        self.brp_wait_start = None
-
-        # teacher probes staged here; the runner drains them onto lc0_q.
-        # lc0_cfg stays None when the run has no lc0 fleet, which turns
-        # queue_lc0_replay into a no-op.
+        # teacher probes staged here; the runner chains them through the lc0
+        # server. lc0_cfg stays None when the run has no lc0 server, which
+        # turns queue_lc0_replay into a no-op.
         self.lc0_pending = []
         self.lc0_cfg = None
 
@@ -602,120 +563,12 @@ class Rescorer(object):
 
         self.init_analyzer()
 
-    def maybe_add_blunder_candidate(self, pool, game_data, gid, ply_idx,
-                                    played_uci, best_uci, best_cp,
-                                    played_cp, cpl, z_stm, is_blunder,
-                                    best_depth=None, played_depth=None):
-        """
-        Admits a ply finalize_game flagged as a blunder. Mutates pool
-        directly (dedup by short_fen);
-        maybe_save_pool decides when that hits disk. Only STARTPOS-traceable
-        scenarios qualify: piece_odds, piece_training and random_init seed a
-        custom FEN directly, so history_uci for those never traces back to
-        STARTPOS. If the discovering game's own SF pass already reached
-        BRP_MIN_CACHE_DEPTH+, seed the deep cache immediately so
-        the first replay probe can potentially skip SF entirely.
-        """
-        scenario = game_data.get('scenario')
-        if scenario not in BRP_SCENARIOS or not is_blunder:
-            return
-
-        history = game_data.get('history_uci')
-        played = game_data.get('moves_played') or []
-        if not history:
-            return
-
-        offset = len(history) - len(played)
-        uci_path = list(history[:offset + ply_idx])
-        board = chess.Board()
-        for uci in uci_path:
-            board.push_uci(uci)
-
-        fen = board.fen()
-        key = short_fen(fen)
-
-        if key in pool:
-            pool[key]["times_seen"] = pool[key].get("times_seen", 1) + 1
-        elif len(pool) >= BRP_POOL_MAX_SIZE:
-            # pool is full -- drop the candidate, no eviction pressure yet
-            return
-        else:
-            rec = {
-                "fen": fen,
-                "uci_path": uci_path,
-                "start_ply": offset + ply_idx,
-                "run_tag": self.config.run_tag,
-                "game_id": gid,
-                "move_num": ply_idx,
-                "model_epoch": game_data.get("model_epoch"),
-                "scenario": scenario,
-                "z_stm": z_stm,
-                "played_move": played_uci,
-                "sf_best_move": best_uci,
-                "best_cp": best_cp,
-                "played_cp": played_cp,
-                "cpl": cpl,
-                "times_seen": 1,
-            }
-            if (best_depth or 0) >= BRP_MIN_CACHE_DEPTH:
-                ratchet_store(rec, best_uci, best_cp, best_depth)
-            if (played_depth or 0) >= BRP_MIN_CACHE_DEPTH:
-                ratchet_store(rec, played_uci, played_cp, played_depth)
-            if rec.get("deep_evals", {}).get(best_uci) is not None:
-                rec["deep_best_move"] = best_uci
-                rec["deep_best_cp"] = best_cp
-            # admission waits on the teacher; with no lc0 fleet a position
-            # goes straight in
-            if self.queue_candidate_lc0_replay(rec, key) is not None:
-                return True
-            rec["last_seen"] = rec["model_epoch"]
-            rec["n_fails"] = 0
-            pool[key] = rec
-
-        self.n_pool_changes += 1
-        self.maybe_save_pool(pool)
-
-    def maybe_save_pool(self, pool):
-        """
-        Atomic tmp-write + swap every BRP_MERGE_EVERY mutations, rate
-        limited on top to at most 2 saves per minute -- at high replay
-        throughput the count trigger alone could fire many times a second.
-        Changes just stay pending (nothing is lost) until the window opens
-        back up.
-        """
-        if pool is None or self.n_pool_changes < BRP_MERGE_EVERY:
-            return
-        now = time.time()
-        self.pool_save_times = [
-            t for t in self.pool_save_times if now - t < 60.0]
-        if len(self.pool_save_times) >= 2:
-            return
-        save_probe_pool(pool, self.blunder_pool_path)
-        self.pool_save_times.append(now)
-        self.n_pool_changes = 0
-        print(f"{RS} blunder pool saved: {len(pool)} live")
-
-    def retire_failed(self, pool, epoch):
-        if pool is None:
-            return 0
-        n = retire_failed_positions(
-            pool, epoch, evicted_path(self.blunder_pool_path))
-        if n:
-            save_probe_pool(pool, self.blunder_pool_path)
-            self.n_pool_changes = 0
-        return n
-
-    def close(self, pool=None):
+    def close(self):
         """Idempotent -- the runner closes on the normal path and again in
         cleanup, and the counts are unchanged between the two."""
         if self.closed:
             return
         self.closed = True
-        if self.n_replay_rows:
-            self.analyse_brp_file()
-        if pool is not None and self.n_pool_changes > 0:
-            save_probe_pool(pool, self.blunder_pool_path)
-            self.n_pool_changes = 0
         path = self.opening_counts.save()
         print(f"{RS} opening counts saved to {os.path.basename(path)} "
               f"({self.opening_counts.occupancy()} slots)")
@@ -729,32 +582,35 @@ class Rescorer(object):
 
     @property
     def training_data_size(self):
-        return len(self.live_buffer) + len(self.lc0_buffer)
+        return len(self.live_buffer) + len(self.correction_buffer)
 
     def buffered_records(self):
-        """Both buffers as one list, the on-disk live_buffer.pkl form."""
-        return self.live_buffer.records + self.lc0_buffer.records
+        """The live buffer, the on-disk live_buffer.pkl form."""
+        return self.live_buffer.records
 
-    def load_buffered_records(self, records):
-        """Split a saved live_buffer.pkl back into the two buffers and write
-        any shards it already fills."""
-        lc0 = [r for r in records if is_lc0_record(r)]
-        xc0 = [r for r in records if not is_lc0_record(r)]
-        self.live_buffer.load_records(xc0)
-        self.lc0_buffer.load_records(lc0, REWEIGHT_INELIGIBLE)
+    def correction_records(self):
+        """The correction buffer, the on-disk correction_buffer.pkl form."""
+        return self.correction_buffer.records
+
+    def load_buffered_records(self, records, correction=None):
+        """Load saved buffers back and write any shards they already fill.
+        With no correction file the run predates it, and its live buffer
+        file holds both, told apart by source (lc0 then meant correction)."""
+        if correction is None:
+            correction = [r for r in records if is_lc0_record(r)]
+            records = [r for r in records if not is_lc0_record(r)]
+        self.live_buffer.load_records(records)
+        self.correction_buffer.load_records(correction, REWEIGHT_INELIGIBLE)
         return self.flush_buffers()
 
     def flush_buffers(self):
         return (self.live_buffer.flush_all_ready()
-                + flush_lc0_shards(self.lc0_buffer))
+                + flush_correction_shards(self.correction_buffer))
 
     def submit(self, pkl_file):
         self.intake.append(pkl_file)
 
-    def submit_blunder_replay(self, brp_data):
-        self.blunder_replay_intake.append(brp_data)
-
-    def tick(self, pool=None):
+    def tick(self):
         # drain completed game batches from SF threads
         while True:
             try:
@@ -763,8 +619,7 @@ class Rescorer(object):
                 break
             if gid == '__error__':
                 raise results
-            self.handle_game_results(gid, results, pool)
-        self.maybe_analyse_brp_round()
+            self.handle_game_results(gid, results)
 
         flushed = self.flush_buffers()
         if flushed:
@@ -772,19 +627,13 @@ class Rescorer(object):
             self.written_this_round += n
             self.written_total += n
 
-        # prefer blunder_replays to clear those
-        # larger pending for these because theyre just single moves
-        while self.blunder_replay_intake and len(self.pending) < 40:
-            brp_data = self.blunder_replay_intake.popleft()
-            self.start_blunder_replay(brp_data=brp_data, pool=pool)
-
         if len(self.intake) > len(self.pending):
             intake_list = list(self.intake)
             random.shuffle(intake_list)
             self.intake = deque(intake_list)
-        
+
         while self.intake and len(self.pending) < 40:
-            self.start_game(self.intake.popleft(), pool)
+            self.start_game(self.intake.popleft())
 
     def init_analyzer(self):
         run_dir = self.config.run_dir
@@ -804,8 +653,7 @@ class Rescorer(object):
                 self.games_seen = set(df_all["game_id"].astype(str).unique())
 
     def get_unprocessed(self):
-        """Returns (unprocessed_games, unprocessed_blunder_replays). Replays never
-        reach an index, so the second is always empty.
+        """Staged games not yet processed.
 
         write_lean_record writes <gid>.pkl.gz, appends the final game_index.json
         row, then deletes the looper .pkl, in that order. So a game is done once
@@ -840,7 +688,7 @@ class Rescorer(object):
         if len(unprocessed_games):
             print(f"[rescore] {len(unprocessed_games)} unprocessed game(s) currently in queue")
 
-        return unprocessed_games, deque()
+        return unprocessed_games
 
     def reset_writer(self):
         self.written_this_round = 0
@@ -885,6 +733,12 @@ class Rescorer(object):
         if ok:
             self.live_buffer.append(entry, okey)
         return ok
+
+    def count_offer(self, kind, ok):
+        """Offered / accepted counts for an expert's plies (sf or vsl)."""
+        for c in (self.sample_counts, self.sample_counts_window):
+            c[f'{kind}_offered'] += 1
+            c[f'{kind}_accepted'] += int(ok)
 
     def make_policy_example(self, board, ucis, visits):
         indices = board.moves_to_indices(ucis)
@@ -940,7 +794,28 @@ class Rescorer(object):
         return (x, policy, self.opening_counts.key(board, x), pwht, kl,
                 len(lms))
 
-    def start_game(self, pkl_file, pool):
+    def training_data_from_lc0(self, board, tr):
+        """One lc0 ply of a vs_leela game, built as an xc0 ply is: lc0's
+        visits are the policy target and the ply's NN fields are xc0's, so the
+        KL is lc0's target against xc0's priors. Returns (x, dense policy,
+        okey, pwht, kl, n_legal); finalize_game attaches the value target and
+        admits it."""
+        cm = tr['candidate_moves']
+        lms = board.legal_moves()
+        vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
+        for u in lms:
+            vmap.setdefault(u, 1)
+        priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
+        kl = kl_divergence(list(vmap.values()),
+                           [priors_map.get(u, 0.0) for u in vmap])
+        pwht = self.config.kl_boost_p80_mult if kl >= self.kl_q80 else 1.0
+        x = tr['xc0h']
+        policy = np.zeros(1858, dtype=np.float32)
+        for idx, prob in tr['policy']:
+            policy[idx] = prob
+        return (x, policy, self.opening_counts.key(board, x), pwht, kl, len(lms))
+
+    def start_game(self, pkl_file):
         path = str(pkl_file)
         opener = gzip.open if path.lower().endswith('.gz') else open
         with opener(path, 'rb') as f:
@@ -959,7 +834,7 @@ class Rescorer(object):
         )
 
         # working game object: the FATTY header carried forward plus the
-        # derived move list the blunder-pool and lc0-replay helpers consume
+        # derived move list the lc0-replay helpers consume
         game_data = {**header, 'moves_played': moves_played}
         tree_data = {i: p for i, p in enumerate(plies)}
         vs_stockfish = header.get('vs_stockfish', False)
@@ -993,6 +868,7 @@ class Rescorer(object):
             'ply_states': [],
             # (ply_i, stm, outcome wdl, example parts) per trained SF ply
             'sf_examples': [],
+            'lc0_examples': [],
             'waiting': False,  # True once a batch has been submitted to a SF thread
         }
 
@@ -1031,6 +907,16 @@ class Rescorer(object):
                 continue
 
             if not cm:
+                board_ch.push(move_ch)
+                b_fast.push_uci(mv)
+                continue
+
+            # an lc0 ply (vs_leela) trains on lc0's search but is never scored:
+            # it stays out of SF analysis, blunder routing and every stat
+            if tr.get('sel_method') == 'lc0':
+                if not skip_all_training:
+                    game_state['lc0_examples'].append(
+                        (i, turn, self.training_data_from_lc0(b_fast, tr)))
                 board_ch.push(move_ch)
                 b_fast.push_uci(mv)
                 continue
@@ -1140,130 +1026,19 @@ class Rescorer(object):
             game_state['waiting'] = True
             # validation games are the cleanest quality signal there is --
             # high sims, no training use -- so they buy a deeper SF pass than
-            # selfplay. Blunder replays never come through here; they submit
-            # a flat depth instead of any movetime.
+            # selfplay.
             # the moves let the SF thread follow PVs across plies
             info = {"moves": list(game_data.get('moves_played', []))}
             if is_validation_game and cfg.rescore_movetime_validation_ms:
                 info["movetime_ms"] = cfg.rescore_movetime_validation_ms
             self.game_q.put((gid, to_sf_positions, info))
         else:
-            self.finalize_game(self.pending.pop(gid), pool)
+            self.finalize_game(self.pending.pop(gid))
 
-    def start_blunder_replay(self, brp_data, pool):
-        gid = str(brp_data.get('game_id'))
-        if gid in self.games_seen:
-            return
-
-        short_fen_key = brp_data.get('short_fen')
-        xerces_uci = brp_data.get('xerces_uci')
-
-        board_ch, b_fast = reconcile_game_boards(
-            brp_data['start_fen'], brp_data.get('history_uci'),
-            brp_data.get('moves_played'),
-        )
-        tree_data = brp_data.get('tree_search_data', {})
-
-        game_state = {
-            'gid': gid,
-            'brp_data': brp_data,
-            'ply_states': [],
-            'waiting': False,  # True once a batch has been submitted to a SF thread
-        }
-
-        to_sf_positions = []
-        for i, mv in enumerate(brp_data.get('moves_played', [])):
-            move_ch = chess.Move.from_uci(mv)
-            turn = board_ch.turn
-
-            tr = tree_data.get(i, tree_data.get(str(i), {}))
-            xerces_uci = brp_data.get('xerces_uci')
-
-            # cloned pre-move so a qualifying probe can build a training
-            # example at finalize time without backtracking from history_uci
-            ply = {
-                'ply_idx': i, 'mv': mv,
-                'turn': bool(turn),
-                'tr': tr,
-                'xerces_uci': xerces_uci,
-                'board': b_fast.clone(),
-                'resolved': False,
-            }
-
-            to_sf_positions.append((i, board_ch.copy(), xerces_uci))
-
-            game_state['ply_states'].append(ply)
-            board_ch.push(move_ch)
-            b_fast.push_uci(mv)
-
-        # both the best move and the move actually played here already cached
-        # at BRP_MIN_CACHE_DEPTH+ from an earlier probe or from initial
-        # pool-add seeding -- skip SF entirely. The ply states are built above
-        # this check rather than after it so a cache hit still carries its
-        # search (the hit skips Stockfish, not the probe's own MCTS) and can
-        # bank a training example like any other outcome.
-        if pool is not None and short_fen_key in pool:
-            src = pool[short_fen_key]
-            states = game_state['ply_states']
-            tr0 = (states[0].get('tr') or {}) if states else {}
-            # lc0's move was SF-confirmed at entry, so playing it completes
-            # the challenge outright -- no depth to compare, nothing to score
-            if xerces_uci and xerces_uci == src.get('lc0_move'):
-                cp = src.get('deep_best_cp') or src.get('best_cp') or 0
-                self.games_seen.add(gid)
-                ply_states = game_state['ply_states']
-                self.finalize_replay_result(
-                    brp_data, pool,
-                    probe_move=xerces_uci,
-                    best_uci=xerces_uci,
-                    best_cp=cp, played_cp=cp,
-                    best_depth=None, played_depth=None,
-                    sims=tr0.get('sims'), stop_reason=tr0.get('stop_reason'),
-                    from_cache=True,
-                    ply=ply_states[0] if ply_states else None,
-                )
-                return
-            hit = cached_deep_score(src, xerces_uci)
-            if hit is not None:
-                self.games_seen.add(gid)
-                ply_states = game_state['ply_states']
-                self.finalize_replay_result(
-                    brp_data, pool,
-                    probe_move=xerces_uci,
-                    best_uci=hit['deep_best_move'],
-                    best_cp=hit['deep_best_cp'],
-                    played_cp=hit['deep_played_cp'],
-                    best_depth=hit['deep_best_depth'],
-                    played_depth=hit['deep_depth'],
-                    sims=tr0.get('sims'), stop_reason=tr0.get('stop_reason'),
-                    from_cache=True,
-                    ply=ply_states[0] if ply_states else None,
-                )
-                return
-
-        self.pending[gid] = game_state
-        # submit to SF thread, or finalize immediately if every move was SF's own
-        if to_sf_positions:
-            self.n_sf_submitted += len(to_sf_positions)
-            game_state['waiting'] = True
-            sf_ms = BRP_START_MS
-            if pool is not None and short_fen_key in pool:
-                src = pool[short_fen_key]
-                if not src.get('sf_ms'):
-                    src['sf_ms'] = BRP_START_MS
-                    self.n_pool_changes += 1
-                    self.maybe_save_pool(pool)
-                sf_ms = src['sf_ms']
-            self.game_q.put((gid, to_sf_positions, {"movetime_ms": sf_ms}))
-        else:
-            # should never get here (every replay has exactly one move), but
-            # if it does, pop instead of leaking a permanent pending slot
-            self.pending.pop(gid, None)
-
-    def handle_game_results(self, gid, results, pool):
-        # TEMPORARY lc0_BRP audit, never enters self.pending
+    def handle_game_results(self, gid, results):
+        # TEMPORARY lc0 audit, never enters self.pending
         if gid in self.lc0_audit:
-            self.record_lc0_audit(gid, results, pool)
+            self.record_lc0_audit(gid, results)
             return
 
         if gid not in self.pending:
@@ -1309,202 +1084,7 @@ class Rescorer(object):
             ply['resolved']   = True
 
         game['waiting'] = False
-        game_state = self.pending.pop(gid)
-        if 'brp_data' in game_state:
-            self.finalize_blunder_replay(game_state, pool)
-        else:
-            self.finalize_game(game_state, pool)
-
-    def finalize_blunder_replay(self, game_state, pool):
-        """One SF result per replay. Evicts on the first found_equiv, full
-        stop -- with replays this frequent a streak requirement is
-        pointless."""
-        gid = game_state['gid']
-        brp_data = game_state['brp_data']
-        ply_states = game_state['ply_states']
-        if not ply_states or not ply_states[0].get('resolved'):
-            self.games_seen.add(gid)
-            return
-        ply = ply_states[0]
-        tr = ply.get('tr') or {}
-
-        self.games_seen.add(gid)
-        self.finalize_replay_result(
-            brp_data, pool,
-            probe_move=ply.get('xerces_uci'),
-            best_uci=ply.get('best_uci'),
-            best_cp=ply.get('best_cp'),
-            played_cp=ply.get('played_cp'),
-            best_depth=ply.get('best_depth'),
-            played_depth=ply.get('depth'),
-            sims=tr.get('sims'), stop_reason=tr.get('stop_reason'),
-            from_cache=False,
-            ply=ply,
-        )
-
-    def finalize_replay_result(self, brp_data, pool, probe_move, best_uci,
-                                best_cp, played_cp, best_depth, played_depth,
-                                sims, stop_reason, from_cache, ply=None):
-        """
-        Shared by the normal SF-completion path (finalize_blunder_replay)
-        and start_blunder_replay's cache-hit shortcut. Ratchet-stores the
-        best/played move eval+depth onto the pool record on every outcome,
-        not just eviction, so a later probe of the same still-live position
-        can skip SF via cached_deep_score.
-        """
-        short_fen_key = brp_data.get('short_fen')
-        orig_move = brp_data.get('orig_move')
-        orig_cpl = brp_data.get('orig_cpl')
-        epoch = brp_data.get('model_epoch')
-
-        ms = self.brp_scorer.score(best_uci, best_cp, probe_move, played_cp)
-        probe_cpl = ms.loss
-        tr = (ply or {}).get('tr') or {}
-        cm = tr.get('candidate_moves') or []
-        wdl, nn_wdl = tr.get('best_wdl'), tr.get('root_wdl_nn')
-        tsl = 1000 * expected_score_loss(ms.best_cp, ms.best_cp - probe_cpl)
-        self.brp_row.N += 1
-        self.brp_row.add_quality({
-            'cpl': probe_cpl,
-            'tsl': tsl,
-            'klv': float(kl_divergence(wdl, nn_wdl))
-                   if wdl is not None and nn_wdl is not None else None,
-            'klp': float(kl_divergence([c['visits'] for c in cm],
-                                       [c.get('P_raw', c['P']) for c in cm]))
-                   if cm else None,
-        })
-        found_best = probe_move == best_uci
-        found_equiv = tsl <= ACCEPT_TSL_GOOD
-        same_move = probe_move == orig_move
-        evicted = found_equiv
-        added_epoch = None
-
-        if short_fen_key and pool is not None and short_fen_key in pool:
-            src = pool[short_fen_key]
-            added_epoch = src.get('model_epoch')
-            src['last_seen'] = epoch
-            if not from_cache:
-                if (best_depth or 0) >= BRP_MIN_CACHE_DEPTH:
-                    ratchet_store(src, best_uci, best_cp, best_depth)
-                if (played_depth or 0) >= BRP_MIN_CACHE_DEPTH:
-                    ratchet_store(src, probe_move, played_cp, played_depth)
-                depths_map = src.get('deep_depths') or {}
-                prev_depth = depths_map.get(src.get('deep_best_move')) or 0
-                if (best_depth or 0) >= prev_depth:
-                    src['deep_best_move'] = best_uci
-                    src['deep_best_cp'] = best_cp
-
-                # neither resolved (found_equiv) nor locked a deep-enough
-                # best move this probe -- buy more depth next time
-                if not found_equiv and (best_depth or 0) < BRP_MIN_CACHE_DEPTH:
-                    current_ms = src.get('sf_ms') or BRP_START_MS
-                    src['sf_ms'] = min(
-                        current_ms + BRP_MS_STEP,
-                        BRP_START_MS * BRP_MS_MAX_MULT,
-                    )
-
-            if found_equiv:
-                evict_position(pool, short_fen_key, "found_equiv", epoch,
-                               evicted_path(self.blunder_pool_path))
-                if ply is not None:
-                    self.add_blunder_replay_training_example(ply, tsl)
-            # not equiv -- found_equiv took everything at or under
-            # ACCEPT_TSL_GOOD, so anything reaching here is still wrong
-            elif ply is not None:
-                src['n_fails'] = src.get('n_fails', probe_fails(src)) + 1
-                if src['n_fails'] == BRP_LC0_REQUEUE_FAILS:
-                    self.queue_brp_lc0_replay(src, short_fen_key, probe_cpl)
-                if src['n_fails'] > BRP_MAX_FAILS:
-                    evict_position(pool, short_fen_key, "max_fails", epoch,
-                                   evicted_path(self.blunder_pool_path))
-                    evicted = True
-
-            self.n_pool_changes += 1
-            self.maybe_save_pool(pool)
-
-        row = {
-            "short_fen": short_fen_key,
-            "src_run_tag": brp_data.get('src_run_tag'),
-            "model_epoch": epoch,
-            "added_epoch": added_epoch,
-            "orig_move": orig_move,
-            "orig_cpl": orig_cpl,
-            "probe_move": probe_move,
-            "probe_cpl": probe_cpl,
-            "deep_best": best_uci,
-            "best_depth": best_depth,
-            "same_move": same_move,
-            "found_best": found_best,
-            "found_equiv": found_equiv,
-            "evicted": evicted,
-            "sims": sims,
-            "stop_reason": stop_reason,
-            "from_cache": from_cache,
-        }
-        # .item() writes numpy scalars as their python value, so a numpy
-        # bool lands as true like a plain one instead of 1.0
-        with open(self.blunder_replay_jsonl, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=lambda o: o.item()) + "\n")
-
-        self.n_replay_rows += 1
-        self.n_replay_finalized += 1
-
-    def start_brp_round(self, n):
-        """Rows left from an unfinished earlier round are analysed first so
-        each round's summary covers only its own probes."""
-        if self.n_replay_rows:
-            self.analyse_brp_file()
-        self.brp_expected = n
-        self.brp_wait_start = None
-
-    def maybe_analyse_brp_round(self):
-        if not self.brp_expected:
-            return
-        n = self.n_replay_rows
-        if n < self.brp_expected:
-            if n < BRP_ROUND_DONE_FRAC * self.brp_expected:
-                return
-            now = time.time()
-            if self.brp_wait_start is None:
-                self.brp_wait_start = now
-            if now - self.brp_wait_start < BRP_ROUND_WAIT_S:
-                return
-        self.analyse_brp_file()
-        self.brp_expected = 0
-        self.brp_wait_start = None
-
-    def write_brp_reviewable(self, brp_data, src, ply, best_uci, best_cp,
-                             played_cp, probe_cpl, best_depth):
-        """Game-log shaped so GameViewer.from_record opens it directly.
-        history_uci is the path to the position plus the probe move, which is
-        the full line from STARTPOS -- reconcile_game_boards needs it whole."""
-        moves = list(brp_data.get('moves_played') or [])
-        row = {
-            "game_id": brp_data.get('game_id'),
-            "start_fen": brp_data.get('start_fen'),
-            "moves_played": moves,
-            "history_uci": list(src.get('uci_path') or []) + moves,
-            "tree_search_data": brp_data.get('tree_search_data') or {},
-            "result": None,
-            "scenario": "blunder_replay_probe",
-            "short_fen": brp_data.get('short_fen'),
-            "model_epoch": brp_data.get('model_epoch'),
-            "n_fails": src.get('n_fails'),
-            "probe_move": ply.get('xerces_uci'),
-            "probe_cpl": probe_cpl,
-            "played_cp": played_cp,
-            "sf_best": best_uci,
-            "sf_best_cp": best_cp,
-            "sf_best_depth": best_depth,
-            "orig_move": brp_data.get('orig_move'),
-            "orig_best": brp_data.get('orig_best'),
-            "orig_cpl": brp_data.get('orig_cpl'),
-            "src_run_tag": brp_data.get('src_run_tag'),
-            "src_game_id": brp_data.get('src_game_id'),
-            "src_move_num": brp_data.get('src_move_num'),
-        }
-        with open(self.brp_reviewables_jsonl, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=float) + "\n")
+        self.finalize_game(self.pending.pop(gid))
 
     def queue_lc0_replay(self, game_data, aux, meta_extra=None):
         """Hand one blunder position to the teacher fleet.
@@ -1516,70 +1096,18 @@ class Rescorer(object):
         if self.lc0_cfg is None:
             return None
 
+        # xc0_move is xc0's answer at the position; lc0 matching it ends the
+        # confirmation chain after one ply
         meta = {
             'src_game_id': game_data.get('game_id'),
             'orig_cpl': aux.get('orig_cpl'),
+            'xc0_move': aux.get('xerces_uci'),
         }
         meta.update(meta_extra or {})
-        cfg = self.lc0_cfg
-        if meta.get('stream') == 'teacher':
-            cfg = cfg.copy()
-            cfg.max_game_length = 0
         spec = lc0_replay_spec(
-            cfg, game_data, aux['ply_i'], aux['sfen'], meta)
+            self.lc0_cfg, game_data, aux['ply_i'], aux['sfen'], meta)
         if spec is not None:
             self.lc0_pending.append(spec)
-        return spec
-
-    def queue_brp_lc0_replay(self, src, sfen, probe_cpl=None):
-        """Send a still-failing probe position to the teacher.
-
-        Writes nothing back to the pool record on purpose: xc0_BRP tracking
-        must stay unaware that lc0_BRP exists.
-        """
-        if self.lc0_cfg is None:
-            return None
-
-        # start_fen is where the path lands, not where it starts: uci_path is
-        # the whole prefix and there are no scored moves after it
-        game_data = {
-            'start_fen': src['fen'],
-            'moves_played': [],
-            'history_uci': list(src.get('uci_path') or []),
-            'game_id': src.get('game_id'),
-        }
-        aux = {'ply_i': 0, 'sfen': sfen, 'orig_cpl': src.get('cpl')}
-        # the failing probe's own loss, not the pool's orig_cpl: uplift
-        # compares the teacher against what xc0 just answered here
-        spec = self.queue_lc0_replay(
-            game_data, aux, {'from_brp': True, 'xc0_cpl': probe_cpl})
-        if spec is not None:
-            self.sample_counts['lc0_queued'] += 1
-            self.sample_counts_window['lc0_queued'] += 1
-        return spec
-
-    def queue_candidate_lc0_replay(self, rec, sfen):
-        """Send a fresh blunder to the teacher before it is admitted.
-
-        The record rides in the meta and is only inserted if lc0 confirms the
-        position is correctable, so an unconfirmed blunder never joins the pool.
-        """
-        if self.lc0_cfg is None:
-            return None
-
-        game_data = {
-            'start_fen': rec['fen'],
-            'moves_played': [],
-            'history_uci': list(rec.get('uci_path') or []),
-            'game_id': rec.get('game_id'),
-        }
-        aux = {'ply_i': 0, 'sfen': sfen, 'orig_cpl': rec.get('cpl')}
-        spec = self.queue_lc0_replay(
-            game_data, aux,
-            {'pending_rec': rec, 'xc0_cpl': rec.get('cpl')})
-        if spec is not None:
-            self.sample_counts['lc0_queued'] += 1
-            self.sample_counts_window['lc0_queued'] += 1
         return spec
 
     def take_lc0_specs(self):
@@ -1589,7 +1117,7 @@ class Rescorer(object):
         return out
 
     def ingest_lc0_replay(self, meta):
-        """Turn a returned teacher probe into lc0_buffer samples.
+        """Turn a returned teacher probe into correction_buffer samples.
 
         One per ply actually played -- syzygy or a terminal can end the probe
         short of LC0_BRP_PLIES. Straight visits and WDL, weight 1.0, no
@@ -1622,15 +1150,15 @@ class Rescorer(object):
             board.push_uci(mv)
 
         self.submit_lc0_audit(
-            meta.get('game_id'), audit, meta.get('xc0_cpl'),
-            meta.get('pending_rec'), meta.get('sfen'), records)
+            meta.get('game_id'), audit, meta.get('xc0_cpl'), records,
+            meta.get('xc0_tsl'), meta.get('stream') != 'teacher')
 
         self.sample_counts['lc0_samples'] += n
         self.sample_counts_window['lc0_samples'] += n
         return n
 
-    def submit_lc0_audit(self, game_id, positions, xc0_cpl=None,
-                         pending=None, sfen=None, records=None):
+    def submit_lc0_audit(self, game_id, positions, xc0_cpl=None, records=None,
+                         xc0_tsl=None, blunder=False):
         """TEMPORARY. Score the teacher's own moves with SF, same budget and
         throttle as normal rescoring. Prefixed gid so it cannot collide with
         a real game in self.pending."""
@@ -1639,75 +1167,44 @@ class Rescorer(object):
         gid = f"lc0aud_{game_id}"
         self.lc0_audit[gid] = {
             'xc0_cpl': xc0_cpl,
+            'xc0_tsl': xc0_tsl,
             'ucis': {k: uci for k, _, uci in positions},
-            'pending': pending,
-            'sfen': sfen,
             'records': records or [],
+            'blunder': blunder,
         }
         self.game_q.put((gid, positions, {}))
 
-    def record_lc0_audit(self, gid, results, pool=None):
+    def record_lc0_audit(self, gid, results):
         """TEMPORARY. Only ply 0 is submitted: it is the escalated blunder and
         the only ply xc0 also answered. Scored under normal rescoring rules."""
         info = self.lc0_audit.pop(gid, None) or {}
         ucis = info.get('ucis') or {}
         xc0_cpl = info.get('xc0_cpl')
+        xc0_tsl = info.get('xc0_tsl')
 
         for r in results:
             k = r['ply_idx']
             ms = self.lc0_scorer.score(
                 r['best_uci'], r['best_cp'], ucis.get(k, ''), r['played_cp'])
+            lc0_tsl = 1000 * expected_score_loss(ms.best_cp, ms.best_cp - ms.loss)
 
-            # stepped as a pair, so the printed subtraction is one population
+            # each pair steps together, so the printed subtraction is one population
+            E = self.lc0_audit_ema
             if xc0_cpl is not None:
-                E = self.lc0_audit_ema
                 self.lc0_audit_n += 1
                 E['lc0'] = ema_step(E.get('lc0'), ms.loss, AUDIT_EMA_SPAN)
                 E['xc0'] = ema_step(E.get('xc0'), xc0_cpl, AUDIT_EMA_SPAN)
+            if xc0_tsl is not None:
+                E['lc0_tsl'] = ema_step(E.get('lc0_tsl'), lc0_tsl, AUDIT_EMA_SPAN)
+                E['xc0_tsl'] = ema_step(E.get('xc0_tsl'), xc0_tsl, AUDIT_EMA_SPAN)
 
             if k == 0:
-                self.resolve_lc0_candidate(
-                    info, ms.loss, ucis.get(0), pool)
-                if ms.loss <= BRP_EQUIV_CPL:
+                ok = lc0_tsl <= ACCEPT_TSL_GOOD
+                if info.get('blunder'):
+                    self.lc0_confirm_n += 1
+                    self.lc0_confirm_ok += ok
+                if ok:
                     self.add_to_lc0_pretrain_buffer(info.get('records'))
-
-    def resolve_lc0_candidate(self, info, lc0_loss, lc0_move, pool):
-        """Admit a deferred blunder, or cache lc0's move on a live record.
-
-        The bar is the agreement test: lc0 answering the position cleanly is
-        what makes the blunder correctable rather than an eval-horizon artifact.
-        """
-        sfen = info.get('sfen')
-        if pool is None or not sfen or not lc0_move:
-            return
-
-        pending = info.get('pending')
-        orig_cpl = (pending or {}).get('cpl')
-        bar = BRP_EQUIV_CPL
-        if orig_cpl is not None:
-            bar = min(BRP_EQUIV_CPL, int(orig_cpl) // 2)
-        ok = lc0_loss < bar
-
-        if pending is None:
-            # escalation: the record is already live, just bank the target
-            src = pool.get(sfen)
-            if src is not None and ok:
-                src['lc0_move'] = lc0_move
-                self.n_pool_changes += 1
-                self.maybe_save_pool(pool)
-            return
-
-        self.brp_admit_n += 1
-        if not ok or sfen in pool or len(pool) >= BRP_POOL_MAX_SIZE:
-            return
-
-        pending['lc0_move'] = lc0_move
-        pending['last_seen'] = pending.get('model_epoch')
-        pending['n_fails'] = 0
-        pool[sfen] = pending
-        self.brp_admit_ok += 1
-        self.n_pool_changes += 1
-        self.maybe_save_pool(pool)
 
     def add_to_lc0_pretrain_buffer(self, records):
         """Ply0-confirmed lc0 replays, set aside for the next deep pretrain --
@@ -1748,133 +1245,10 @@ class Rescorer(object):
         Y = np.array(wdl, dtype=np.float32)
         record = (self.encode_board(board), None, sparsify_policy(policy),
                   Y, 1.0, 1.0, 'lc0')
-        self.lc0_buffer.append(record, REWEIGHT_INELIGIBLE)
+        self.correction_buffer.append(record, REWEIGHT_INELIGIBLE)
         return record
 
-    def add_blunder_replay_training_example(self, ply, tsl):
-        """
-        Offers a passed (found_equiv) replay probe to admit as a live_buffer
-        sample. Policy is the search's own visits with a 1-visit floor on every
-        legal move; value is the search's own WDL.
-        """
-        board = ply['board']
-        tr = ply.get('tr') or {}
-
-        cm = tr.get('candidate_moves', [])
-        if not cm:
-            return False
-
-        legal_ucis = board.legal_moves()
-        vmap = {c['uci']: max(1, int(c['visits'])) for c in cm}
-        for u in legal_ucis:
-            vmap.setdefault(u, 1)
-        ucis, vis = list(vmap), list(vmap.values())
-        x, policy = self.make_policy_example(board, ucis, vis)
-
-        wdl = tr.get('best_wdl')
-        Y = (np.array(wdl, dtype=np.float32) if wdl is not None
-             else scalar_to_wdl(tr.get('Q_stm', 0.0)))
-
-        okey = self.opening_counts.key(board, x)
-        self.opening_counts.bump(okey)
-        priors = {c['uci']: c.get('P_raw', c['P']) for c in cm}
-        klp = float(kl_divergence(vis, [priors.get(u, 0.0) for u in ucis]))
-        for c in (self.sample_counts, self.sample_counts_window):
-            c['offered'] += 1
-        ok = self.admit(
-            (x, None, sparsify_policy(policy), Y, 1.0, 1.0, 'xc0'),
-            okey, tsl, self.target_kl(Y, tr), klp, ctrl_shaky(tr), False,
-            len(legal_ucis))
-        if ok:
-            for c in (self.sample_counts, self.sample_counts_window):
-                c['accepted'] += 1
-        return ok
-
-    def analyse_brp_file(self):
-        """
-        Replaces the old analyse_probe_file: no SF pass here, that already
-        happened per-replay in finalize_blunder_replay, which also evicts
-        immediately on found_equiv. This just summarizes the collected jsonl
-        into a CSV + history line, stamped with the newest epoch among the
-        rows. Fires once per bulk round, see maybe_analyse_brp_round.
-        """
-        rows = []
-        with open(self.blunder_replay_jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-
-        if not rows:
-            self.n_replay_rows = 0
-            return
-
-        new_df = pd.DataFrame(rows)
-        # max, not rows[-1] -- a backlogged batch of stale-epoch rows can get
-        # processed well after the run has moved on, and rows[-1] would then
-        # silently attribute the whole window to that old epoch. TODO: use
-        # the live current epoch directly instead of inferring it from the
-        # window's own rows.
-        epoch = max([r.get("model_epoch") for r in rows])
-
-        # a round split by a restart lands twice on the same epoch -- append
-        # onto that epoch's existing CSV instead of splitting across files.
-        # probe_e*.csv naming matches the old convention -- probe_table.py,
-        # pairwise.py, and backfill_probe_csv_keys.py all glob for it.
-        existing = glob.glob(os.path.join(
-            blunder_replay_dir(self.config), f"probe_e{epoch}_*.csv"))
-        if existing:
-            csv_path = existing[0]
-            df = pd.concat([pd.read_csv(csv_path), new_df], ignore_index=True)
-        else:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            csv_path = os.path.join(
-                blunder_replay_dir(self.config), f"probe_e{epoch}_{stamp}.csv")
-            df = new_df
-        df.to_csv(csv_path, index=False)
-
-        # signed per-position move, so each rate carries the size of its own
-        # effect rather than only how often it happened
-        delta = df["probe_cpl"] - df["orig_cpl"]
-        imp, wor = delta < 0, delta > 0
-
-        summary = {
-            "ts": int(time.time()),
-            "n_retrains": epoch,
-            "n_positions": len(df),
-            "orig_cpl": df["orig_cpl"].mean(),
-            "probe_cpl": df["probe_cpl"].mean(),
-            "improved": imp.mean(),
-            "improved_cpl": delta[imp].mean() if imp.any() else 0.0,
-            "worsened": wor.mean(),
-            "worsened_cpl": delta[wor].mean() if wor.any() else 0.0,
-            "same_move": df["same_move"].mean(),
-            "found_best": df["found_best"].mean(),
-            "found_equiv": df["found_equiv"].mean(),
-            "n_evicted": int(df["evicted"].sum()),
-            "cache_hit": df["from_cache"].mean(),
-            "file": os.path.basename(csv_path),
-        }
-        hist_path = os.path.join(
-            self.config.run_dir, BRP_HISTORY_FILENAME)
-        with open(hist_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(summary, default=float) + "\n")
-
-        print(f"{RS} blunder replay analysis @ epoch {epoch}: "
-              f"n={summary['n_positions']} "
-              f"cpl {summary['orig_cpl']:.1f} -> {summary['probe_cpl']:.1f}  "
-              f"same_move {summary['same_move']:.1%}  "
-              f"found_equiv {summary['found_equiv']:.1%}", flush=True)
-        print(f"{RS} improved {summary['improved']:.1%} "
-              f"({summary['improved_cpl']:+.1f} CPL)  "
-              f"worsened {summary['worsened']:.1%} "
-              f"({summary['worsened_cpl']:+.1f} CPL)  "
-              f"evicted {summary['n_evicted']}", flush=True)
-
-        open(self.blunder_replay_jsonl, "w", encoding="utf-8").close()
-        self.n_replay_rows = 0
-
-    def finalize_game(self, game_state, pool):
+    def finalize_game(self, game_state):
         if self.start_time is None:
             self.start_time = time.time()
         cfg = game_state['cfg']
@@ -1928,15 +1302,6 @@ class Rescorer(object):
             is_blunder = not missed_mate and is_esl_candidate(
                 best_cp, played_cp, esl, Z_stm, cfg.rescore_esl_blunder)[0]
 
-            # consider adding this position to the blunder replay pool
-            sent_to_lc0 = False
-            if pool is not None:
-                sent_to_lc0 = self.maybe_add_blunder_candidate(
-                    pool, game_data, gid, i, xerces_uci, best_uci, best_cp,
-                    played_cp, loss_this, Z_stm, is_blunder,
-                    best_depth=ply.get('best_depth'), played_depth=ply.get('depth'),
-                )
-
             if is_blunder:
                 v = cp_to_value_tanh(best_cp)
                 cut_white[i] = v if turn else -v
@@ -1964,11 +1329,8 @@ class Rescorer(object):
                 tr.get('stop_reason', ''), tr.get('sims', 0),
                 ply.get('parentQ_white', np.nan), ply.get('parent_p_draw', np.nan),
                 esl,
-                np.nan, np.nan,  # kl, ce -- filled in below if this ply trains
+                np.nan, np.nan,  # kl, ce -- filled in below; ce only if this ply trains
             ])
-
-            if ply['skip_training']:
-                continue
 
             lms = ply['lms']
             # ensure all legal moves have at least 1 visit
@@ -1976,8 +1338,21 @@ class Rescorer(object):
             for m in lms:
                 if m not in vmap:
                     vmap[m] = 1
-            
+
             visits = sorted(vmap.items(), key=lambda x: x[1], reverse=True)
+            mvs = [v[0] for v in visits]
+            vis = [v[1] for v in visits]
+
+            priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
+            priors = [priors_map.get(u, 0.0) for u in mvs]
+
+            # KLp is logged for every scored ply, validation included; only
+            # training plies move the quantile trackers below
+            kl = kl_divergence(vis, priors)
+            rows[-1][-2] = kl
+
+            if ply['skip_training']:
+                continue
 
             kl_eligible = loss_this <= EQUIV
 
@@ -1988,21 +1363,11 @@ class Rescorer(object):
             # directly; everything else trains on its raw visit policy
             to_lc0 = is_blunder
 
-            to_teacher = (not to_lc0 and not sent_to_lc0 and not missed_mate
+            to_teacher = (not to_lc0 and not missed_mate
                           and esl >= cfg.rescore_esl_inaccuracy
                           and policy_value_miss(cm, best_uci))
 
-            # just FYI if we do any adjustments we need to re-sort.
-
-            mvs = [v[0] for v in visits]
-            vis = [v[1] for v in visits]
-
-            priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
-            priors = [priors_map.get(u, 0.0) for u in mvs]
-
             vwht = pwht = 1.0
-            kl = kl_divergence(vis, priors)
-            rows[-1][-2] = kl
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, self.config.kl_quantile_lr)
             self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, self.config.kl_quantile_lr)
             if kl_eligible and kl >= self.kl_q80:
@@ -2018,10 +1383,8 @@ class Rescorer(object):
 
             pending_aux.append({
                 'sfen':            ply['sfen'],
+                'xerces_uci':      ply['xerces_uci'],
                 'to_lc0':          to_lc0,
-                # the candidate path already sent this one, with the pending
-                # record attached -- queueing again would duplicate the probe
-                'sent_to_lc0':     bool(sent_to_lc0),
                 'to_teacher':      to_teacher,
                 'loss':            loss_this,
                 'orig_cpl':        loss_this,
@@ -2061,8 +1424,28 @@ class Rescorer(object):
             vwht = (self.config.kl_boost_p80_mult
                     if klv >= max(0.03, self.kl_value_q80) else 1.0)
             self.opening_counts.bump(okey)
-            self.admit((x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE),
-                       okey, 0.0, klv, kl, ctrl_shaky(node), is_draw, n_legal)
+            self.count_offer('sf', self.admit(
+                (x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE),
+                okey, 0.0, klv, kl, ctrl_shaky(node), is_draw, n_legal))
+
+        # lc0 plies: valued as an xc0 ply is, cliff-walker cut included, and
+        # offered to admit with TSL taken as 0
+        for ply_i, stm, (x, policy, okey, pwht, kl, n_legal) in (
+                game_state.get('lc0_examples', ())):
+            node = game_state['plies'][ply_i]
+            Y = node['wdl_target']
+            cut = cut_outcome.get(ply_i)
+            if cut is not None:
+                Y = blend_wdl_stm(scalar_to_wdl(cut if stm else -cut),
+                                  node.get('best_wdl'))
+                node['wdl_target'] = Y
+            klv = self.target_kl(Y, node)
+            vwht = (self.config.kl_boost_p80_mult
+                    if klv >= max(0.03, self.kl_value_q80) else 1.0)
+            self.opening_counts.bump(okey)
+            self.count_offer('vsl', self.admit(
+                (x, None, sparsify_policy(policy), Y, vwht, pwht, 'lc0'),
+                okey, 0.0, klv, kl, ctrl_shaky(node), is_draw, n_legal))
 
         # loop 2: compute WDL targets and add to training
         for tup, aux in zip(pending, pending_aux):
@@ -2103,13 +1486,9 @@ class Rescorer(object):
             self.opening_counts.bump(okey)
 
             if aux['to_lc0']:
-                # already queued as a pool candidate, counted there, and
-                # carrying the pending record this path could not supply
-                if aux['sent_to_lc0']:
-                    self.count_lc0_send(aux['stat_keys'])
-                    continue
                 spec = self.queue_lc0_replay(
-                    game_data, aux, {'xc0_cpl': aux['loss']})
+                    game_data, aux,
+                    {'xc0_cpl': aux['loss'], 'xc0_tsl': 1000 * aux['esl']})
                 if spec is not None:
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
@@ -2118,10 +1497,11 @@ class Rescorer(object):
                 print(f"{RS} lc0 queue refused blunder {gid} ply {ply_i}, "
                       f"left to the training path")
 
-            sent = aux['sent_to_lc0']
+            sent = False
             if aux['to_teacher']:
                 spec = self.queue_lc0_replay(
-                    game_data, aux, {'xc0_cpl': aux['loss'], 'stream': 'teacher'})
+                    game_data, aux, {'xc0_cpl': aux['loss'], 'xc0_tsl': 1000 * aux['esl'],
+                                     'stream': 'teacher'})
                 if spec is not None:
                     sc['lc0_queued'] += 1
                     scw['lc0_queued'] += 1
@@ -2389,7 +1769,7 @@ class Rescorer(object):
         row(f"ESL >= {ESL_ANY_MIN:.2f}", "blunder_any")
         row("F", "F")
 
-        for k in BRP_STAT_KEYS:
+        for k in BLUNDER_STAT_KEYS:
             self.window_blunder[k] = {'n': 0, 'cpl': 0.0, 'lc0': 0}
 
     def accumulate_stop_stats(self, stop_stats):
@@ -2555,11 +1935,11 @@ class Rescorer(object):
             elapsed = time.time() - self.start_time
             avg_depth = (self.sf_depth_sum / self.sf_depth_count
                          if self.sf_depth_count else 0.0)
-            out(cols("throughput", ["games", "games/hr", "moves/s", "replays", "depth"]))
+            out(cols("throughput", ["games", "games/hr", "moves/s", "depth"]))
             out(cols("", [self.games_processed,
                           f"{self.games_processed / elapsed * 3600:.1f}",
                           f"{self.total_plies / elapsed:.2f}",
-                          self.n_replay_finalized, f"{avg_depth:.1f}"]))
+                          f"{avg_depth:.1f}"]))
 
         ms_pos = (1000 * self.sf_compute_time / self.sf_call_count
                   if self.sf_call_count else 0.0)
@@ -2573,19 +1953,28 @@ class Rescorer(object):
         out(cols("", [self.n_sf_submitted, f"{ms_pos:.0f}ms", f"{ms_ply:.0f}ms",
                       f"{first_run:.1f}%", len(self.intake) + len(self.pending)]))
 
-        def target_cells(sc):
-            # queued and samples do not balance within a window: a probe is
-            # answered a few seconds after it is sent, often after this print
-            total = sc['accepted'] + sc['lc0_samples']
-            pct = f"{sc['lc0_samples'] / total * 100:.1f}%" if total else "-"
-            kept = (f"{sc['accepted'] / sc['offered'] * 100:.1f}%"
-                    if sc['offered'] else "-")
-            return [sc['accepted'], kept, sc['lc0_queued'],
-                    sc['lc0_samples'], pct]
+        def kept(sc, kind):
+            off = sc[f'{kind}offered']
+            return f"{sc[f'{kind}accepted'] / off * 100:.1f}%" if off else "-"
 
-        out(cols("targets", ["xc0", "xc0-%", "lc0-sent", "lc0-back", "lc0-%"]))
-        out(cols(f"last {REPORT_EVERY}", target_cells(self.sample_counts_window)))
-        out(cols("total", target_cells(self.sample_counts)))
+        def admitted_cells(sc):
+            return [sc['accepted'], kept(sc, ''), sc['sf_accepted'], kept(sc, 'sf_'),
+                    sc['vsl_accepted'], kept(sc, 'vsl_')]
+
+        def correction_cells(sc):
+            # sent and back do not balance within a window: a chain is
+            # answered a few seconds after it is sent, often after this print
+            total = (sc['accepted'] + sc['sf_accepted'] + sc['vsl_accepted']
+                     + sc['lc0_samples'])
+            pct = f"{sc['lc0_samples'] / total * 100:.1f}%" if total else "-"
+            return [sc['lc0_queued'], sc['lc0_samples'], pct]
+
+        out(cols("admitted", ["xc0", "xc0-%", "sf", "sf-%", "lc0", "lc0-%"]))
+        out(cols(f"last {REPORT_EVERY}", admitted_cells(self.sample_counts_window)))
+        out(cols("total", admitted_cells(self.sample_counts)))
+        out(cols("corrections", ["sent", "back", "share"]))
+        out(cols(f"last {REPORT_EVERY}", correction_cells(self.sample_counts_window)))
+        out(cols("total", correction_cells(self.sample_counts)))
         out("-" * W)
         out(f"training samples this round: {self.written_this_round} | "
             f"total: {self.written_total}")
@@ -2598,12 +1987,17 @@ class Rescorer(object):
         self.sf_skipped = 0
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
-        self.sample_counts_window = {
-            'offered': 0, 'accepted': 0,
-            'lc0_queued': 0, 'lc0_samples': 0,
-        }
+        self.sample_counts_window = zero_sample_counts()
 
 # helpers
+def zero_sample_counts():
+    """xc0 offered / accepted (no prefix), the same for SF's and lc0's plies
+    in their match games, and the correction chains sent and samples back."""
+    return {'offered': 0, 'accepted': 0, 'sf_offered': 0, 'sf_accepted': 0,
+            'vsl_offered': 0, 'vsl_accepted': 0,
+            'lc0_queued': 0, 'lc0_samples': 0}
+
+
 def update_ema_quantile(estimate, x, target_q, lr):
     """Online stochastic-approximation quantile tracker (Robbins-Monro).
     Self-corrects toward the point where P(X < estimate) == target_q."""
@@ -2627,6 +2021,14 @@ def blend_wdl_stm(outcome_wdl_stm, best_wdl_stm):
     return (0.5 * outcome_wdl_stm + 0.5 * np.asarray(best_wdl_stm, dtype=np.float32))
 
 
+def sampled_off_pick(p):
+    """A sampled move that differs from xc0's own pick. Older logs leave
+    xc0_move None when the two match."""
+    xc0 = p.get('xc0_move')
+    return (p.get('sel_method') == 'sampled' and bool(xc0)
+            and xc0 != p.get('move_played'))
+
+
 def deviation_outcomes(plies, white_first, result, bootstrap):
     """White-POV outcome WDL per ply. With bootstrap, a sampled move that
     differed from Xerces's choice ends a segment: that ply and every ply
@@ -2637,8 +2039,7 @@ def deviation_outcomes(plies, white_first, result, bootstrap):
     for i in range(len(plies) - 1, -1, -1):
         p = plies[i] or {}
         bw = p.get('best_wdl')
-        if (bootstrap and bw is not None and p.get('xc0_move')
-                and p.get('sel_method') == 'sampled'):
+        if (bootstrap and bw is not None and sampled_off_pick(p)):
             bw = np.asarray(bw, dtype=np.float32)
             white = white_first if i % 2 == 0 else not white_first
             carry = bw if white else bw[::-1].copy()
@@ -2656,8 +2057,8 @@ def blunder_cut_outcomes(plies, cut_white, bootstrap):
         p = plies[i] or {}
         if i in cut_white:
             carry = cut_white[i]
-        elif (bootstrap and p.get('best_wdl') is not None and p.get('xc0_move')
-                and p.get('sel_method') == 'sampled'):
+        elif (bootstrap and p.get('best_wdl') is not None
+                and sampled_off_pick(p)):
             carry = None
         if carry is not None:
             out[i] = carry

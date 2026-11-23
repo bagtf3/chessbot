@@ -29,6 +29,12 @@ MAX_LENGTH_ADJ_THRESH = 0.5
 TABLEBASE = None
 PV_MAX = 64
 
+# (sel_method, stop_reason) recorded on a move an expert played
+EXPERT_CODES = {"sf": ("stockfish", "sf"), "lc0": ("lc0", "lc0")}
+EXPERT_METHODS = {m for m, _ in EXPERT_CODES.values()}
+# lc0 record fields left off an lc0 ply: the controller stats are xc0's own
+LC0_DROP_FIELDS = ("ctrl", "ctrl_sum")
+
 
 def build_raw_visits_sparse(board, ucis, visits):
     """Every legal move as sparse (int16 idx, int16 count), index-sorted. Legal
@@ -100,8 +106,8 @@ class MCTSTree(fasttree):
         params.update(self.move_params())
         super().__init__(board, params)
 
-        # sim_stop_reason stays Python-owned: apply_stockfish_result writes
-        # "sf" into it directly, which C++ has no way to produce.
+        # sim_stop_reason stays Python-owned: apply_expert_result writes the
+        # expert's stop code into it directly, which C++ has no way to produce.
         self.sim_stop_reason = ""
 
         self.effort_lut = {}
@@ -133,10 +139,10 @@ class MCTSTree(fasttree):
     def best(self):
         """
         Returns a 3-tuple:
-        (move_uci_to_play, selection_method, xerces_top_move_if_diff_else_none)
+        (move_uci_to_play, selection_method, xerces_top_move)
 
-        xerces_top_move_if_diff_else_none is set only when we sampled a different
-        move than Xerces would have played deterministically.
+        xerces_top_move is the move Xerces would have played deterministically,
+        whether or not sampling picked a different one.
         """
         xerces_move, xerces_method = self.select_xerces_top_move()
 
@@ -153,12 +159,12 @@ class MCTSTree(fasttree):
             sample = True
 
         if not sample:
-            return xerces_move, xerces_method, None
+            return xerces_move, xerces_method, xerces_move
 
         # if here we are sampling
         details = self.root_child_details()
         if not details:
-            return xerces_move, xerces_method, None
+            return xerces_move, xerces_method, xerces_move
 
         sign = 1.0 if self.board.white_to_move() else -1.0
         lead = details[0]
@@ -170,9 +176,7 @@ class MCTSTree(fasttree):
 
         # trivial cases
         if len(cands) == 1 or lead.N <= 0:
-            move = lead.uci
-            other = xerces_move if move != xerces_move else None
-            return move, "most_visited", other
+            return lead.uci, "most_visited", xerces_move
 
         top_ucis = [cd.uci for cd in cands]
         top_visits = np.array([cd.N for cd in cands], dtype=np.float64)
@@ -191,9 +195,7 @@ class MCTSTree(fasttree):
         probs = exps / exps.sum()
 
         idx = np.random.choice(len(top_ucis), p=probs)
-        move = top_ucis[idx]
-        other = xerces_move if move != xerces_move else None
-        return move, "sampled", other
+        return top_ucis[idx], "sampled", xerces_move
 
     def select_xerces_top_move(self):
         """
@@ -353,6 +355,13 @@ class ChessGame(object):
         self.meta = meta
         
         self.vs_stockfish = meta['vs_stockfish']
+        # the engine playing one side (sf or lc0), or None in selfplay
+        if self.vs_stockfish:
+            self.expert, self.expert_is_white = "sf", meta['stockfish_is_white']
+        elif meta.get('vs_leela'):
+            self.expert, self.expert_is_white = "lc0", meta['lc0_is_white']
+        else:
+            self.expert, self.expert_is_white = None, False
 
         # if vs stockfish, we need to maintain a python-chess board as well
         self.python_chess_board = None
@@ -381,9 +390,9 @@ class ChessGame(object):
         self.sf_eval = None
         self.sf_wdl = None
 
-        self.sf_pending = False
-        self.sf_ready = False
-        self.sf_res_tup = None
+        self.expert_pending = False
+        self.expert_ready = False
+        self.expert_result = None
         self.tf_last_resolved = 0
 
         # set when to start checking for draw by agreement
@@ -413,6 +422,8 @@ class ChessGame(object):
             "end_reason": self.end_reason,
             "vs_stockfish": self.vs_stockfish,
             "stockfish_color": self.stockfish_is_white,
+            "vs_leela": self.expert == "lc0",
+            "lc0_color": self.expert_is_white if self.expert == "lc0" else None,
             "sf_depth": self.meta.get("sf_depth"),
             "start_type": self.meta.get("start_type"),
             "mcts_sims_total": self.mcts_sims_total,
@@ -446,25 +457,30 @@ class ChessGame(object):
             return self.board.white_to_move()
         return self.board.side_to_move()
     
+    def is_expert_turn(self):
+        return self.expert is not None and (self.expert_is_white == self.turn())
+
     def is_stockfish_turn(self):
-        return self.vs_stockfish and (self.stockfish_is_white == self.turn())
-    
+        return self.expert == "sf" and self.is_expert_turn()
+
     def sync_controller(self, next_mover=False):
-        """The search controller runs on xc0's own moves only; Stockfish's
-        turns search to sf_move_sims with it off, and record nothing.
+        """The search controller runs on xc0's own moves only; an expert's
+        turns search to expert_move_sims with it off, and record nothing.
         next_mover: set it for the side about to move, before the tree
         advances, so the advance (no subtree reuse) and the move's sims
         budget follow that side's setting."""
-        sf = self.is_stockfish_turn() != (next_mover and self.vs_stockfish)
-        on = self.config.ctrl_enable and not sf
+        expert = self.is_expert_turn() != (next_mover and self.expert is not None)
+        on = self.config.ctrl_enable and not expert
         if self.tree.get_params("ctrl_enable")["ctrl_enable"] != on:
             self.tree.set_params(ctrl_enable=on, ctrl_record=on and self.config.ctrl_record)
 
     def push_move(self, mv, method, xc0_move):
         # collect search data then push and update
         self.collect_tree_search_data(mv, method, xc0_move)
+        return self.advance_move(mv, method)
 
-        if method != "stockfish":
+    def advance_move(self, mv, method):
+        if method not in EXPERT_METHODS:
             self.mcts_sims_total += self.tree.sims_completed_this_move
             self.mcts_plies += 1
 
@@ -590,12 +606,9 @@ class ChessGame(object):
             candidate_moves.append(cm)
         data["candidate_moves"] = candidate_moves
 
-        # pv traces Xerces's choice (most-visited on SF turns); pv_played traces
-        # the move actually played when it differs (sampled or SF)
-        if method == "stockfish":
-            pv_start, xerces_pick = "", (details[0].uci if details else None)
-        else:
-            pv_start = xerces_pick = xc0_move or mv
+        # pv traces Xerces's choice; pv_played traces the move actually played
+        # when it differs (sampled or an expert's)
+        pv_start = xerces_pick = xc0_move or mv
         pv = self.pv_dicts(pv_start)
         pv_played = self.pv_dicts(mv) if mv != xerces_pick else None
         data["pv"] = pv
@@ -610,20 +623,62 @@ class ChessGame(object):
                  "Q": rnd(x.Q, 4)}
                 for x in self.tree.principal_variation(PV_MAX, start)]
 
-    def set_stockfish_result(self, res_tup):
-        self.sf_res_tup = res_tup
-        self.sf_ready = True
+    def set_expert_result(self, result):
+        self.expert_result = result
+        self.expert_ready = True
 
-    def apply_stockfish_result(self, res_tup):
-        sf_v, best_move = res_tup[0], res_tup[1]
-        self.sf_wdl = res_tup[2] if len(res_tup) > 2 else None
+    def apply_expert_result(self, result, expert="sf"):
+        """Play the expert's move. xc0_move is xc0's most-visited pick, read
+        once the stop code is set so the robust selector stays out of it."""
+        method, stop = EXPERT_CODES[expert]
+        self.expert_result = None
+        self.expert_ready = False
+        self.expert_pending = False
+        self.tree.sim_stop_reason = stop
+        xc0_move, _ = self.tree.select_xerces_top_move()
+        if expert == "lc0":
+            return self.play_lc0_reply(result["record"], method, xc0_move)
 
+        sf_v, best_move = result[0], result[1]
+        self.sf_wdl = result[2] if len(result) > 2 else None
         self.sf_eval = sf_v
-        self.sf_res_tup = None
-        self.sf_ready = False
-        self.sf_pending = False
-        self.tree.sim_stop_reason = "sf"
-        return self.push_move(best_move, "stockfish", None)
+        return self.push_move(best_move, method, xc0_move)
+
+    def play_lc0_reply(self, lc0, method, xc0_move):
+        """lc0's search becomes the ply's record. The NN fields (P_raw, P,
+        root_wdl_nn, xc0h) stay xc0's, read from its own search of the same
+        position, so rescore scores lc0's target against xc0's net with the
+        code it runs on every xc0 ply."""
+        mv = lc0["move_played"]
+        self.collect_tree_search_data(mv, method, xc0_move)
+        own = self.tree_data.get(self.plies)
+
+        rec = {k: v for k, v in lc0.items() if k not in LC0_DROP_FIELDS}
+        rec.update(move_played=mv, xc0_move=xc0_move, sel_method=method,
+                   stop_reason=self.tree.sim_stop_reason)
+        if own is not None:
+            rec["root_wdl_nn"] = own["root_wdl_nn"]
+            rec["xc0h"] = own["xc0h"]
+            priors = {c["uci"]: (c["P_raw"], c["P"]) for c in own["candidate_moves"]}
+            rec["candidate_moves"] = [
+                {**c, "P_raw": priors.get(c["uci"], (0.0, 0.0))[0],
+                 "P": priors.get(c["uci"], (0.0, 0.0))[1]}
+                for c in lc0["candidate_moves"]]
+        else:
+            print(f"[game {self.game_id[:8]}] ply {self.plies}: xc0 never "
+                  f"searched the lc0 turn, its NN fields are lc0's", flush=True)
+        self.tree_data[self.plies] = rec
+
+        # resign and draw checks read the expert's value, as on SF turns
+        turn = self.turn()
+        q = rec["best_wdl"][0] - rec["best_wdl"][2]
+        q_white = q if turn else -q
+        entry = (mv, q, q_white, q_white, turn, q)
+        if own is not None:
+            self.recents[-1] = entry
+        else:
+            self.recents.append(entry)
+        return self.advance_move(mv, method)
 
     def make_move_from_tree(self):
         """ Play best-by-visits  """

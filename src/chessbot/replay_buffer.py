@@ -44,8 +44,10 @@ import numpy as np
 
 LIVE_BUFFER_SIZE = 204_800
 SHARD_SIZE = 10_240
-# lc0 shards are named apart so a retrain can draw one ahead of the rest
-LC0_SHARD_PREFIX = "lc0-"
+# correction shards (the fast track) are named apart so a retrain can draw
+# one ahead of the rest. The prefix predates the name: shards already
+# waiting in primary keep their fast track.
+CORRECTION_SHARD_PREFIX = "lc0-"
 PRIMARY_TRIGGER_SHARDS = 144
 RETRAIN_PRIMARY_SHARDS = 12
 RETRAIN_REPLAY_SHARDS = 12
@@ -83,8 +85,8 @@ def new_shard_path(out_dir, suffix=".pkl.gz", prefix=""):
     return os.path.join(out_dir, name)
 
 
-def is_lc0_shard(path):
-    return os.path.basename(path).startswith(LC0_SHARD_PREFIX)
+def is_correction_shard(path):
+    return os.path.basename(path).startswith(CORRECTION_SHARD_PREFIX)
 
 
 def is_lc0_record(record):
@@ -196,6 +198,9 @@ def read_shard(path):
 
 LIVE_BUFFER_PKL = "live_buffer.pkl"
 LIVE_BUFFER_BACKUP_GZ = "live_buffer_backup.pkl.gz"
+# the correction buffer's untrained samples, saved beside the live buffer's
+CORRECTION_BUFFER_PKL = "correction_buffer.pkl"
+CORRECTION_BUFFER_BACKUP_GZ = "correction_buffer_backup.pkl.gz"
 # old names -- still recognized on load so a run mid-migration to the new
 # names never loses a carryover it already has on disk
 REMAINING_GZ = "remaining_untrained.pkl.gz"
@@ -231,18 +236,33 @@ def write_pkl_shard_plain(records, path):
     os.replace(tmp_path, path)
 
 
-def sync_live_buffer(run_dir, records):
+def sync_live_buffer(run_dir, records, correction=None):
     """
-    Writes both the primary (plain pkl) and backup (gz) copies. Called at
-    load, every retrain, and every round end -- not just on shutdown -- so a
-    crash mid-run loses at most one retrain/round's worth of accumulation
-    instead of the whole run's.
+    Writes both the primary (plain pkl) and backup (gz) copies, and the same
+    pair for the correction buffer when given. Called at load, every retrain,
+    and every round end -- not just on shutdown -- so a crash mid-run loses at
+    most one retrain/round's worth of accumulation instead of the whole run's.
     """
     pkl_path = os.path.join(run_dir, LIVE_BUFFER_PKL)
     gz_path = os.path.join(run_dir, LIVE_BUFFER_BACKUP_GZ)
     write_pkl_shard_plain(records, pkl_path)
     write_pkl_gz_shard(records, gz_path)
+    if correction is not None:
+        write_pkl_shard_plain(correction,
+                              os.path.join(run_dir, CORRECTION_BUFFER_PKL))
+        write_pkl_gz_shard(correction,
+                           os.path.join(run_dir, CORRECTION_BUFFER_BACKUP_GZ))
     return pkl_path
+
+
+def read_correction_buffer(run_dir):
+    """The saved correction buffer, or None when the run has never written
+    one (its live buffer file then still holds both, told apart by source)."""
+    for name in (CORRECTION_BUFFER_PKL, CORRECTION_BUFFER_BACKUP_GZ):
+        p = os.path.join(run_dir, name)
+        if os.path.exists(p):
+            return read_live_buffer(p)
+    return None
 
 
 def list_shard_files(dir_path):
@@ -271,29 +291,30 @@ def sample_records(records, n):
 
 
 def sample_retrain_primary(primary, n):
-    """Two random lc0 shards when 3+ are waiting, one when 1-2 are, the rest
-    from the other shards. Further lc0 shards wait for a later retrain."""
-    lc0 = [p for p in primary if is_lc0_shard(p)]
-    rest = [p for p in primary if not is_lc0_shard(p)]
-    k = 2 if len(lc0) >= 3 else min(1, len(lc0))
-    return random.sample(lc0, k) + random.sample(rest, n - k)
+    """Two random correction shards when 3+ are waiting, one when 1-2 are,
+    the rest from the other shards. Further correction shards wait for a
+    later retrain."""
+    corr = [p for p in primary if is_correction_shard(p)]
+    rest = [p for p in primary if not is_correction_shard(p)]
+    k = 2 if len(corr) >= 3 else min(1, len(corr))
+    return random.sample(corr, k) + random.sample(rest, n - k)
 
 
 def sample_holdout_primary(primary, taken, n):
-    """n non-lc0 primary shards outside taken."""
+    """n non-correction primary shards outside taken."""
     taken = set(taken)
-    rest = [p for p in primary if not is_lc0_shard(p) and p not in taken]
+    rest = [p for p in primary if not is_correction_shard(p) and p not in taken]
     return random.sample(rest, min(n, len(rest)))
 
 
 def rotate_to_replay(paths, replay_dir):
-    """Move trained primary shards into replay. The lc0 prefix is dropped:
-    the retrain already shuffled its records in with the others."""
+    """Move trained primary shards into replay. The correction prefix is
+    dropped: the retrain already shuffled its records in with the others."""
     os.makedirs(replay_dir, exist_ok=True)
     for p in paths:
         name = os.path.basename(p)
-        if name.startswith(LC0_SHARD_PREFIX):
-            name = name[len(LC0_SHARD_PREFIX):]
+        if name.startswith(CORRECTION_SHARD_PREFIX):
+            name = name[len(CORRECTION_SHARD_PREFIX):]
         os.replace(p, os.path.join(replay_dir, name))
 
 
@@ -418,11 +439,11 @@ class LiveBuffer:
         return written
 
 
-def flush_lc0_shards(lc0_buffer, n=SHARD_SIZE):
-    """Every n lc0 records go out as one pure lc0 shard. Returns written
-    paths."""
+def flush_correction_shards(buffer, n=SHARD_SIZE):
+    """Every n correction records go out as one pure correction shard.
+    Returns written paths."""
     written = []
-    while len(lc0_buffer) >= n:
-        written.append(lc0_buffer.write_shard(
-            *lc0_buffer.take(n), prefix=LC0_SHARD_PREFIX))
+    while len(buffer) >= n:
+        written.append(buffer.write_shard(
+            *buffer.take(n), prefix=CORRECTION_SHARD_PREFIX))
     return written

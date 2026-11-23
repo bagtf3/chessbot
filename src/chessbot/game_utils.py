@@ -518,7 +518,10 @@ STOP_RULE_ARMS = {
     "old": {"ctrl_enable": False, "es_check_every": 100, "use_robust": True,
             "qmm_gap_block": 0.05},
 }
+# no UHO against SF: paired validation plays UHO starts vs SF
 VS_SF_STARTS = {"startpos": 0.5, "pre_opened": 0.25, "pre_opened_mini": 0.25}
+VS_LEELA_STARTS = {"startpos": 0.25, "UHO": 0.25, "pre_opened": 0.25,
+                   "pre_opened_mini": 0.25}
 
 
 def scenario_cfg(cfg, scenario):
@@ -536,9 +539,18 @@ def scenario_cfg(cfg, scenario):
     return c
 
 
+# vs_leela plays xc0's side exactly as vs_stockfish does
+SCENARIO_OVERRIDES["vs_leela"] = SCENARIO_OVERRIDES["vs_stockfish"]
+# game types that need an expert engine to be up before they can be drawn
+EXPERT_GAME_TYPES = ("vs_leela",)
+
+
 class GameGenerator:
     def __init__(self, cfg):
         self.config = cfg
+        # set by the runner once the lc0 server is up; vs_leela is skipped
+        # in the draw until then
+        self.vs_leela_on = False
         # bounded: the source corpora (UHO pgn, pre_opened pkl path lists)
         # are finite, so over a long run this set saturates and the 20-attempt
         # retry below burns 20 board rebuilds per game only to return a
@@ -620,10 +632,10 @@ class GameGenerator:
     def new_board(self, game_type=None):
         """Returns (board, meta) — compatibility API for misc scripts."""
         if game_type is None:
-            types, probs = zip(*self.config.game_probs.items())
-            game_type = random.choices(types, weights=probs, k=1)[0]
-        if game_type == "vs_stockfish":
-            types, probs = zip(*VS_SF_STARTS.items())
+            game_type = self.draw_game_type(self.config)
+        if game_type in ("vs_stockfish", "vs_leela"):
+            starts = VS_SF_STARTS if game_type == "vs_stockfish" else VS_LEELA_STARTS
+            types, probs = zip(*starts.items())
             game_type = random.choices(types, weights=probs, k=1)[0]
         fen, moves, meta = self.generate(game_type)
         b = fastboard(fen)
@@ -635,8 +647,7 @@ class GameGenerator:
         if cfg is None:
             cfg = self.config
         if game_type is None:
-            types, probs = zip(*cfg.game_probs.items())
-            game_type = random.choices(types, weights=probs, k=1)[0]
+            game_type = self.draw_game_type(cfg)
         elif game_type not in self.game_types:
             raise ValueError(
                 f"Unknown game type {game_type}. Pick one of {self.game_types}"
@@ -644,6 +655,8 @@ class GameGenerator:
 
         if game_type == "vs_stockfish":
             return self.vs_stockfish_game(cfg)
+        if game_type == "vs_leela":
+            return self.vs_leela_game(cfg)
 
         fen, moves, meta = self.generate_dedup(game_type)
 
@@ -688,6 +701,29 @@ class GameGenerator:
         return GameSpec(fen=fen, moves=moves, meta=meta,
                         cfg=scenario_cfg(cfg, "vs_stockfish"))
 
+    def vs_leela_game(self, cfg):
+        """A training game against lc0 from one of VS_LEELA_STARTS, random
+        colour. lc0's moves come from the lc0 server's vs_leela search."""
+        types, probs = zip(*VS_LEELA_STARTS.items())
+        start_type = random.choices(types, weights=probs, k=1)[0]
+        fen, moves, meta = self.generate_dedup(start_type)
+        meta.update({
+            "scenario": "vs_leela", "start_type": start_type,
+            "vs_stockfish": False, "stockfish_is_white": False,
+            "vs_leela": True, "lc0_is_white": random.random() < 0.5,
+        })
+        self.games_queued += 1
+        return GameSpec(fen=fen, moves=moves, meta=meta,
+                        cfg=scenario_cfg(cfg, "vs_leela"))
+
+    def draw_game_type(self, cfg):
+        """A game type by game_probs, leaving out expert games whose engine
+        is not up."""
+        off = () if self.vs_leela_on else EXPERT_GAME_TYPES
+        types, probs = zip(*((t, p) for t, p in cfg.game_probs.items()
+                             if t not in off))
+        return random.choices(types, weights=probs, k=1)[0]
+
     def remember_fen(self, key):
         """FIFO-bounded dedup memory."""
         if key in self.used_fens:
@@ -696,26 +732,6 @@ class GameGenerator:
         self.used_fens_order.append(key)
         while len(self.used_fens_order) > USED_FENS_CAP:
             self.used_fens.discard(self.used_fens_order.popleft())
-
-    def next_blunder_replays(self, pool, n_to_queue, current_epoch=None):
-        """Sample n_to_queue probes from the live pool. Metering and logging
-        live at the selfplay_runner callsites. current_epoch gates
-        the last_seen cooldown and the max-fails age-out."""
-        from chessbot.blunder_replay import (
-            create_blunder_replay_config, blunder_replay_specs,
-        )
-
-        if pool is None or n_to_queue <= 0:
-            return []
-
-        replay_cfg = create_blunder_replay_config(self.config)
-
-        specs = blunder_replay_specs(
-            replay_cfg, pool, n_to_queue,
-            current_epoch=current_epoch
-        )
-
-        return specs
 
     def validation_games(self, cfg=None, n_pairs=None):
         """n_pairs positions, each played from both sides -- 2*n_pairs specs.

@@ -64,32 +64,12 @@ class Config(object):
     effort_scale_table = ""
     effort_alpha = 0.0
 
-    # early stop -- tiered rule (C++, pyfastchess mcts.cpp evaluate_early_stop)
-    es_check_every = 100
-    use_robust = True       # fallback selector when a search hits "full" (ceiling)
-
-    es_tier1_consec = 3         # "runaway": consecutive checkins with the same leader
-    es_tier1_jsd_thresh = 0.005
-    es_tier2_consec = 5         # "two-horse race": consecutive checkins, top-2 stable in top-3
-    es_tier2_jsd_thresh = 0.0003
-    es_tier1_dq12_floor = -0.25
-    es_tier1_qema_veto = 0.2
-    es_observe_only = False     # experiments: record would-stop, never stop
-    es_record_all = False       # experiments: full check-in rows from the first
-    rsc_top_n = 5
-    rsc_min_visits = 60
-    rsc_visit_share_floor = 0.15
-    rsc_margin = 0.05
-
     # search controller (C++, pyfastchess controller.cpp; the rules are
     # documented at the ctrl params in mcts.hpp). ctrl_model: an exported
     # two-head <checkpoint>.ctrl dir, loaded once per worker; ctrl_enable needs
-    # it and es_check_every 0. Off on Stockfish's turns in vs-SF games.
+    # it. Off on Stockfish's turns in vs-SF games. Without it a search runs to
+    # sims_ceiling.
     ctrl_model = ""
-    # "ctrl" or "old": switches every stop-rule setting together
-    # (game_utils.STOP_RULE_ARMS) so the two can be sampled per game. None
-    # leaves the config's own settings alone.
-    stop_rules = None
     ctrl_enable = False
     ctrl_min_stop = 300         # earliest stop; sims_max is held at least this
     ctrl_s_thresh = 0.95
@@ -178,11 +158,9 @@ class Config(object):
     qdelta_span = 100
     recent_visits_span = 400    # visit_share EMA span
     # qmm_force sends a visit to each new Qmm leader; qmm_gate is the completed
-    # backups a child needs to join Qmm (0 = 1); qmm_gap_block vetoes
-    # tier1/tier2 stops while the leader's STM Qmm - Q < -qmm_gap_block (0 = off)
+    # backups a child needs to join Qmm (0 = 1)
     qmm_force = False
     qmm_gate = 0
-    qmm_gap_block = 0.0
     qmm_min_visits = 3
     # tree mechanics
     tree_reuse = True

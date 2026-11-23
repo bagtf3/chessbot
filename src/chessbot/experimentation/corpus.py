@@ -78,8 +78,7 @@ PLY_COLS = ["game_id", "move_num", "stm", "played_move", "most_visited_move",
 # exist on reviewable games
 LOG_FIELDS = ["abs_ply", "sel_method", "xc0_move", "cpl", "cpl_depth",
               "best_wdl", "root_wdl_nn", "wdl_target", "z_wdl", "kl_value",
-              "sf_value", "pv_len", "gap_block_sims", "gap_block_leader",
-              "time", "sims_floor", "sims_ceiling", "sims_min", "sims_max",
+              "sf_value", "pv_len", "time", "sims_floor", "sims_ceiling", "sims_min", "sims_max",
               "avg_depth", "max_depth",
               "children_visited", "total_children", "candidate_moves", "pv",
               "pv_played"]

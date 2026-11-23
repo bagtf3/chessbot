@@ -1003,7 +1003,7 @@ def collection_meta(coll, cfg, n_specs, excluded):
         "code": {"chessbot": git_rev(here),
                  "pyfastchess": git_rev(os.path.dirname(os.path.dirname(
                      os.path.dirname(pyfastchess.__file__))))},
-        "search_overrides": {"dirichlet_eps": 0.0, "es_check_every": 0,
+        "search_overrides": {"dirichlet_eps": 0.0,
                              **{k: coll[k] for k in SEARCH_OVERRIDES}},
     }
 
@@ -1018,9 +1018,8 @@ def run_collection(path):
         coll["max_trees"] = 2 * coll["max_live"]
     cfg = Config.from_yaml(raw["run_config"])
     cfg.sampleable = None
-    # no root noise; the old tier/RSC/gap-block stop rules and their snapshots off
-    cfg.update({"dirichlet_eps": 0.0, "es_check_every": 0, "es_record_all": False,
-                **{k: coll[k] for k in SEARCH_OVERRIDES}})
+    # no root noise
+    cfg.update({"dirichlet_eps": 0.0, **{k: coll[k] for k in SEARCH_OVERRIDES}})
 
     if raw.get("resume"):
         out_dir = os.path.join(COLLECTIONS_DIR, raw["resume"])

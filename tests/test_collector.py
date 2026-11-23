@@ -222,7 +222,7 @@ def cfg():
     pyfastchess.raw_cache_clear()
     pyfastchess.priors_cache_clear()
     c = Config()
-    c.update({"dirichlet_eps": 0.0, "es_check_every": 0})
+    c.update({"dirichlet_eps": 0.0})
     return c
 
 

@@ -68,8 +68,8 @@ m137_8c8t: `build_pt_expandy_swiglu` (registry key `m13-7-8c8t-d256`):
 - `best()` returns 3-tuple: `(move_uci, method, xerces_top_if_sampled_diff)`
 - Stopping: the search controller (C++, two-head ONNX model, check-ins every 100
   root visits). Stops are `ctrl` (heads agree) or `lock` (visit dominance); a
-  low-quality lock is extended up to `ctrl_ext_max` times. RSC is off with it on.
-  Design: `SEARCH_CONTROLLER.md`. The old tiered early stop is the `stop_rules: old` arm.
+  low-quality lock is extended up to `ctrl_ext_max` times. It is the only stop
+  rule; without it a search runs to `sims_max`. Design: `SEARCH_CONTROLLER.md`.
 - Sims: `sims_floor` / `sims_ceiling`, `sims_schedule` by ply, scaled per move by
   the effort table
 - c_puct scalar or `{ply: value}`; dirichlet noise per move

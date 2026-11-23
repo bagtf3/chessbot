@@ -854,6 +854,7 @@ class GameViewer:
             xc0_move = raw_xc0
 
         sampled = bool((not is_sf_turn) and raw_xc0 and (raw_xc0 != chosen))
+        lc0_turn = node.get("sel_method") == "lc0"
 
         xc0_idx = None
         if xc0_move:
@@ -889,12 +890,16 @@ class GameViewer:
             if xc0_move and uci == xc0_move:
                 extra.append("<-Xc0, SF" if sf_best_uci and uci == sf_best_uci
                              else "<-Xc0")
-            is_samp = sampled and uci == chosen and chosen != xc0_move
-            if is_samp:
-                extra.append("<-SF,samp" if sf_best_uci and uci == sf_best_uci
-                             else "<-sampled")
-            mark = bool(sf_best_uci and uci == sf_best_uci
-                        and uci != xc0_move and not is_samp)
+            is_sf = bool(sf_best_uci and uci == sf_best_uci)
+            if lc0_turn:
+                is_samp = uci == chosen
+                if is_samp:
+                    extra.append("<-lc0, SF" if is_sf else "<-lc0")
+            else:
+                is_samp = sampled and uci == chosen and chosen != xc0_move
+                if is_samp:
+                    extra.append("<-SF,samp" if is_sf else "<-sampled")
+            mark = bool(is_sf and uci != xc0_move and not is_samp)
             return extra, mark
 
         self.print_header(show_rank=need_rank)
@@ -1035,7 +1040,13 @@ class GameViewer:
                 else:
                     extra.append("<-Xc0")
 
-            if sampled and (uci == chosen) and (chosen != xc0_move):
+            if node.get("sel_method") == "lc0":
+                if uci == chosen:
+                    if sf_best_uci and (chosen == sf_best_uci):
+                        extra.append("<-lc0, SF")
+                    else:
+                        extra.append("<-lc0")
+            elif sampled and (uci == chosen) and (chosen != xc0_move):
                 if sf_best_uci and (chosen == sf_best_uci):
                     extra.append("<-SF,samp")
                 else:

@@ -20,6 +20,7 @@ import sys
 import threading
 import json
 import time
+import traceback
 from collections import deque
 
 from chessbot import PX_DIR, SP_DIR
@@ -1830,7 +1831,23 @@ def parse_paths(run_tag):
 
 
 def run_roundless(run_tag):
-    """Entry point. scripts/run_selfplay.py is a shim over this."""
+    """Entry point. scripts/run_selfplay.py is a shim over this.
+
+    Exits with os._exit once shutdown has saved everything: a normal
+    interpreter exit joins queue feeder threads and child processes, and
+    one that never finishes keeps the process alive after a stop."""
+    code = 1
+    try:
+        code = run_runner(run_tag)
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+
+
+def run_runner(run_tag):
     base_cfg, yaml_path, val_yaml_path = parse_paths(run_tag)
     controls = Controls()
     runner = SelfPlayRunner(

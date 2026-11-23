@@ -200,46 +200,11 @@ class MCTSTree(fasttree):
     def select_xerces_top_move(self):
         """
         Deterministic Xerces choice (no sampling), returning:
-        (uci, method) where method is "robust" or "most_visited".
+        (uci, method) where method is "most_visited".
         """
-        # the search controller always plays the most visited move
-        ctrl_on = self.get_params("ctrl_enable")["ctrl_enable"]
-        if self.sim_stop_reason == "full" and self.config.use_robust and not ctrl_on:
-            uci = self.select_using_robust()
-            return uci, "robust"
-
         uci, _ = super().best()
         return uci, "most_visited"
 
-    def select_using_robust(self):
-        """
-        Deterministic robust selector.
-        Returns just the uci (so callers can label it however they want).
-        """
-        rsc, details = self.robust_selection_criteria()
-        if (not rsc) or (not details) or (len(details) == 1):
-            uci, _ = super().best()
-            return uci
-
-        most_visits = details[0].N
-        # anything > 2k visits is well-searched
-        visit_threshold = min(most_visits * 0.7, 2000) 
-
-        best_rsc = -np.inf
-        best_uci = None
-        for d in details:
-            if (d.uci in rsc) and (d.N >= visit_threshold):
-                this_rsc = rsc[d.uci]
-                if this_rsc > best_rsc:
-                    best_rsc = this_rsc
-                    best_uci = d.uci
-
-        if best_uci is None:
-            uci, _ = super().best()
-            return uci
-
-        return best_uci
-        
     def advance(self, board, move_uci):
         """
         Safe root advance: mutate the C++ tree, then sync Python-side bookeeping.
@@ -515,11 +480,8 @@ class ChessGame(object):
     
         # C++ summaries
         avg_depth, max_depth = self.tree.depth_stats()
-        rsc, details = self.tree.robust_selection_criteria()
-        rsc = {} if not rsc else rsc
-        if details is None:
-            return
-        
+        details = self.tree.root_child_details()
+
         sims = int(self.tree.sims_completed_this_move)
         total_children = len(details)
         visited_children = sum([1 for cd in details if cd.N > 0])
@@ -552,7 +514,6 @@ class ChessGame(object):
         # boost- and Qmm-force-decided visits are left out of the policy target
         ucis = [cd.uci for cd in details]
         visits = [cd.N - cd.boosted_N - cd.forced_N for cd in details]
-        gb = self.tree.gap_block()
 
         data = {
             "abs_ply": self.board.history_size(),
@@ -571,8 +532,6 @@ class ChessGame(object):
             "raw_visits": build_raw_visits_sparse(self.board, ucis, visits),
             "avg_depth": rnd(avg_depth, 2), "max_depth": max_depth,
             "sharp_by_depth": list(self.tree.sharp_by_depth()),
-            "gap_block_sims": gb.sims,
-            "gap_block_leader": gb.leader or None,
             "children_visited": visited_children,
             "total_children": total_children,
         }
@@ -600,7 +559,7 @@ class ChessGame(object):
                 "boosted": cd.boosted_N,
                 "Qmm": rnd(cd.Qmm, 4),
                 "Q_draw": rnd(cd.draw, 4) if cd.n_done > 0 else float("nan"),
-                "is_terminal": cd.is_terminal, "rcs": rnd(rsc.get(cd.uci, 0.0), 4)
+                "is_terminal": cd.is_terminal,
             }
             
             candidate_moves.append(cm)
@@ -628,8 +587,7 @@ class ChessGame(object):
         self.expert_ready = True
 
     def apply_expert_result(self, result, expert="sf"):
-        """Play the expert's move. xc0_move is xc0's most-visited pick, read
-        once the stop code is set so the robust selector stays out of it."""
+        """Play the expert's move. xc0_move is xc0's most-visited pick."""
         method, stop = EXPERT_CODES[expert]
         self.expert_result = None
         self.expert_ready = False

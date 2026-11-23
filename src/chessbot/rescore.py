@@ -508,10 +508,6 @@ class Rescorer(object):
         self.sf_depth_count = 0
         self.current_movetime_ms = 0
 
-        zero_stop = lambda: {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
-        self.total_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
-        self.window_stop = {st: zero_stop() for st in ("full", "tier1", "tier2")}
-
         # search controller, xc0's own moves only; printed and dropped every
         # CTRL_WINDOW_GAMES games
         # running sums since this process started; printed every
@@ -1317,7 +1313,7 @@ class Rescorer(object):
                                        tr.get('sims', 0), loss_this, esl, xerces_uci,
                                        self.config.rescore_esl_blunder, pair_esl)
             elif tr.get('sel_method') != 'stockfish':
-                # xc0 moves searched without the controller (stop_rules old)
+                # xc0 moves searched without the controller
                 self.ctrl_acc.add_old(tr.get('sims', 0), loss_this, esl,
                                       tr.get('sims_max', 0),
                                       self.config.rescore_esl_blunder)
@@ -1549,18 +1545,6 @@ class Rescorer(object):
             out[key] = val
             out_df[key] = val
 
-        stop_stats = {}
-        for st in ('full', 'tier1', 'tier2'):
-            mask_st = out_df['stop_reason'] == st
-            n_st = mask_st.sum()
-            stop_stats[st] = {
-                'n': int(n_st),
-                'cpl': rnd(out_df.loc[mask_st, 'delta'].mean(), 3) if n_st else np.nan,
-                'bmr': out_df.loc[mask_st, 'played_best_move'].mean() if n_st else np.nan,
-                'sims': out_df.loc[mask_st, 'sims'].mean() if n_st else np.nan
-            }
-
-        out['stop_stats'] = stop_stats
         out['df'] = out_df
 
         self.analyzed_results.append(out)
@@ -1570,14 +1554,13 @@ class Rescorer(object):
                                 game_state['ply_states'])
         self.write_lean_record(game_state, cpl_by_ply)
         self.games_seen.add(gid)
-        self.accumulate_stop_stats(stop_stats)
         # cfg here is the per-game snapshot; the controller flag is run-wide
         if self.config.ctrl_enable:
             self.ctrl_games += 1
             if self.ctrl_games % CTRL_WINDOW_GAMES == 0:
                 self.print_ctrl_stats()
         if self.games_processed % STATS_WINDOW_GAMES == 0:
-            self.print_stop_stats()
+            print()
             self.print_blunder_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
             self.push_analyzed()
@@ -1634,8 +1617,7 @@ class Rescorer(object):
                 'stm', 'move_played', 'z_wdl', 'wdl_target', 'policy',
                 'kl', 'kl_value')}
             for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
-                      'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits',
-                      'gap_block_sims', 'gap_block_leader', 'pv_len',
+                      'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits', 'pv_len',
                       'pv_played_len', 'sf_value'):
                 entry[k] = node.get(k)
             # search-controller check-ins, only on games run with ctrl_record
@@ -1772,18 +1754,6 @@ class Rescorer(object):
         for k in BLUNDER_STAT_KEYS:
             self.window_blunder[k] = {'n': 0, 'cpl': 0.0, 'lc0': 0}
 
-    def accumulate_stop_stats(self, stop_stats):
-        for st, s in stop_stats.items():
-            n = s['n']
-            if not n:
-                continue
-            for acc in (self.total_stop, self.window_stop):
-                acc[st]['n'] += n
-                acc[st]['cpl'] += s['cpl'] * n
-                acc[st]['bmr'] += s['bmr'] * n
-                if not np.isnan(s.get('sims', float('nan'))):
-                    acc[st]['sims'] += s['sims'] * n
-
     def print_ctrl_stats(self):
         """Search controller since this process started: how each search
         ended and the quality of the move it played."""
@@ -1830,59 +1800,6 @@ class Rescorer(object):
         print(f"{RS}  ctrl     {a.ms / n:.1f} ms/mv   {a.checkins / n:.1f} ci/mv"
               f"   stab {a.stab / n:.3f}   qual {a.qual / n:.3f}"
               f"   ties {a.ties / max(1, a.checkins):.2%}")
-
-    def print_stop_stats(self):
-        stops = ("tier1", "tier2", "full")
-        W = 12
-
-        def col(val):
-            return f"  {val:>{W}}  |"
-
-        def pct(acc, st):
-            total_n = sum(acc[s]['n'] for s in stops)
-            return acc[st]['n'] / total_n if total_n else 0.0
-
-        def cpl(acc, st):
-            n = acc[st]['n']
-            return acc[st]['cpl'] / n if n else float('nan')
-
-        def bmr(acc, st):
-            n = acc[st]['n']
-            return acc[st]['bmr'] / n if n else float('nan')
-
-        def avg_sims(acc, st):
-            n = acc[st]['n']
-            return round(acc[st]['sims'] / n) if n else 0
-
-        def rows(label, acc):
-            hdr  = f"{RS}  {'':<12} |"
-            crow = f"{RS}  {label:<12} |"
-            brow = f"{RS}  {label:<12} |"
-            srow = f"{RS}  {'avg sims':<12} |"
-            for st in stops:
-                hdr  += col(f"{st} ({pct(acc, st):.0%})")
-                crow += col(f"CPL {cpl(acc, st):5.2f}")
-                brow += col(f"BMR {bmr(acc, st):.3f}")
-                srow += col(avg_sims(acc, st))
-            return hdr, srow, crow, brow
-
-        wh, ws, wc, wb = rows(f"last {STATS_WINDOW_GAMES}", self.window_stop)
-        th, _,  tc, tb = rows("overall",  self.total_stop)
-        if self.config.ctrl_enable:
-            print()
-            return
-        print(wh)
-        print(ws)
-        print(wc)
-        print(wb)
-        print()
-        print(th)
-        print(tc)
-        print(tb)
-        print()
-
-        for st in stops:
-            self.window_stop[st] = {'n': 0, 'cpl': 0.0, 'bmr': 0.0, 'sims': 0.0}
 
     def push_analyzed(self):
         """Write the analyzed games out as one staging chunk."""

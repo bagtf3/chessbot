@@ -27,11 +27,26 @@ Check-ins run every 100 root visits. No stop below `ctrl_min_stop`;
 - Leader everywhere (`best()`, details, PV, check-in slots, lock): visits,
   then STM Q, then the visit-share EMA, then prior, then list order.
 - Off on Stockfish's turns in vs-SF games. No tree reuse while it is on.
-- `ctrl_enable` needs `es_check_every: 0` (one stop system at a time) and a
-  loaded model. RSC selection is off; every stop plays the leader.
-- `stop_rules` (`ctrl` / `old`, `game_utils.STOP_RULE_ARMS`) switches every
-  stop setting together, so the old tiered early stop can be sampled per
-  game.
+- `ctrl_enable` needs a loaded model. Every stop plays the leader. With it
+  off, a search runs to `sims_max` ("full").
+
+## Recovering the old stop rules
+
+The controller is the only stop rule. The old tiered early stop (tier1
+"runaway" / tier2 "two-horse race" on JSD check-ins), RSC robust selection
+and the `qmm_gap_block` veto were removed after the controller took
+validation to SF d16. Recover them only for an A/B backtest:
+
+1. Check out pyfastchess `68562d3` and chessbot `93b142a` (the last commits
+   with the old rules), each on its own branch.
+2. Rebuild pyfastchess: `pip install -e .` in the pyfastchess repo.
+3. Run with `stop_rules: old` (or put `stop_rules: [ctrl, old]` in
+   `sampleable` for a per-game A/B). That arm sets `ctrl_enable: false`,
+   `es_check_every: 100`, `use_robust: true`, `qmm_gap_block: 0.05`.
+4. Run configs need the `es_*` and `use_robust` keys back for that version
+   to load them.
+
+Switch back to the current commits and rebuild afterwards.
 
 ## Telemetry
 

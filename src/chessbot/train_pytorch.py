@@ -49,14 +49,13 @@ GATE_SHARE       = 0.05
 GATE_W_FLOOR     = 5.0
 
 # Patience on the held-out shard's training loss, scored every EVAL_EVERY
-# batches (skipped batches included). The first eval sets the baseline. Fails
-# count only over the last PATIENCE evals of epoch 1 and after, so the first LR
-# drop can come at the end of epoch 1 and no sooner: PATIENCE fails drop the LR,
-# at most LR_DROPS times; once the drops are spent, PATIENCE fails stop training.
-# A loss counts as better only when the paired z of the per-position gain over
-# the best eval exceeds PAIRED_Z; the IMPROVE_REL gate is logged beside it. The
-# pick is the latest best past epoch 1, else the end of epoch 1.
-PATIENCE             = 2
+# batches (skipped batches included). The first eval sets the baseline.
+# PATIENCE fails drop the LR, at most LR_DROPS times; once the drops are spent,
+# PATIENCE fails stop training, but never before the end of epoch 1. A loss
+# counts as better only when the paired z of the per-position gain over the best
+# eval exceeds PAIRED_Z; the IMPROVE_REL gate is logged beside it. The pick is
+# the best eval past epoch 1, else the end of epoch 1.
+PATIENCE             = 3
 LR_DROPS             = 2
 LR_DROP_FACTOR       = 10 ** -0.5
 MAX_EPOCHS           = 2
@@ -562,9 +561,8 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                 pat["best_state"] = cpu_state(model)
             action = "best"
         else:
+            pat["fails"] += 1
             action = "fail"
-            if nb > epoch_batches - PATIENCE * EVAL_EVERY:
-                pat["fails"] += 1
             if pat["fails"] >= PATIENCE:
                 if pat["drops"] < LR_DROPS:
                     pat["drops"] += 1
@@ -573,7 +571,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
                     for g in opt.param_groups:
                         g["lr"] = pat["lr"]
                     action = "drop"
-                else:
+                elif nb >= epoch_batches:
                     pat["stop"] = True
                     action = "stop"
         print(f"{tag} patience b={nb} ({nb / epoch_batches:.2f})  "

@@ -93,6 +93,7 @@ class GameViewer:
                 'pv':                p.get('pv', []),
                 'pv_played':         p.get('pv_played'),
                 'sf_value':          p.get('sf_value'),
+                'sf_wdl':            p.get('sf_wdl'),
             }
             for i, p in enumerate(plies)
         }
@@ -766,6 +767,7 @@ class GameViewer:
         nn_value  = node.get('nn_value')
         best_wdl  = node.get('best_wdl')
         sf_value  = node.get('sf_value')
+        sf_wdl    = node.get('sf_wdl')
         is_white  = self.turn()
         sign      = 1 if is_white else -1
 
@@ -777,7 +779,8 @@ class GameViewer:
             nn_wdl_stm = nw / nw.sum() if nw.sum() > 0 else nw
 
         # reconstruct Y matching rescore.py formulas exactly:
-        #   SF move:     0.5*z + 0.5*scalar_to_wdl(sf_value)  (fallback: pure z)
+        #   SF move:     0.5*z + 0.5*sf_wdl, else scalar_to_wdl(sf_value)
+        #                (fallback: pure z)
         #   Xerces move: 0.5*z + 0.5*best_wdl   (fallback: pure z)
         Y = None
         if nn_value is not None:
@@ -790,15 +793,15 @@ class GameViewer:
                 z_wdl = np.array([0.0, 1.0, 0.0])
 
             if is_sf_turn:
-                if sf_value is not None:
+                if sf_wdl is not None:
+                    Y = 0.5 * z_wdl + 0.5 * np.asarray(sf_wdl, dtype=np.float64)
+                elif sf_value is not None:
                     Y = 0.5 * z_wdl + 0.5 * scalar_to_wdl(sf_value)
                 else:
                     Y = z_wdl.copy()
             else:
                 if best_wdl is not None:
-                    bw = np.array(best_wdl, dtype=np.float64)
-                    if not is_white:
-                        bw = bw[[2, 1, 0]]
+                    bw = np.array(best_wdl, dtype=np.float64)  # STM-POV
                     Y = 0.5 * z_wdl + 0.5 * bw
                 else:
                     Y = z_wdl.copy()

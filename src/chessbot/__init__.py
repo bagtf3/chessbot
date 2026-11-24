@@ -32,6 +32,9 @@ PX_DIR = os.getenv("PX_DIR", os.path.join(os.path.dirname(os.path.normpath(SP_DI
                                           "playxerces"))
 MODEL_DIR = os.getenv("MODEL_DIR", "")
 CUTECHESS_CLI_LOC = os.getenv("CUTECHESS_CLI_LOC", "")
+# run-independent shard, never trained, scored once per retrain on the
+# picked weights
+FIT_CHECKIN_SHARD = os.getenv("FIT_CHECKIN_SHARD", "")
 
 import chess
 WHITE_WINNING_WHITE_MOVE = chess.Board("rn5N/p2p3p/b2k3n/5p2/1p2P3/8/PPPP1PPP/RNBQKB1R w KQ - 1 12")

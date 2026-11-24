@@ -128,29 +128,6 @@ def report_validation(epoch, progress_csv_path, slices, train_stats=None):
     pb, hb, lb, sb = (metrics_block(slices[k])
                       for k in ('primary', 'historic', 'lc0', 'sf'))
 
-    pfx = f"[epoch {epoch:4d}] [metrics]"
-    LBL_W = 60
-
-    def wdl_line(b):
-        return (f"CE={b['ce']:.3f}  MSE={b['mse']:.3f}  "
-                f"corr={b['corr']:.2f}  CE_gain={b['ce_gain']:.2f}  n={b['n']}")
-
-    def pol_line(b):
-        return (f"top1_exact={b['top1_exact']:.2f}  mass: "
-                f"top1={b['top1_mass']:.2f}  "
-                f"top3={b['top3_mass']:.2f}")
-
-    def print_slice(b, label, line_fn):
-        if not b:
-            return
-        print(f"{pfx} {line_fn(b):<{LBL_W}}({label})")
-
-    blocks = [(pb, 'primary'), (hb, 'historic'), (lb, 'lc0'), (sb, 'sf')]
-    for b, label in blocks:
-        print_slice(b, label, wdl_line)
-    for b, label in blocks:
-        print_slice(b, label, pol_line)
-
     # internal key -> csv column. Names match the pretraining schema
     # (bootstrap's UNIFIED_COLS) so both files stack on the same axes.
     col_map = {
@@ -208,8 +185,7 @@ def report_validation(epoch, progress_csv_path, slices, train_stats=None):
     ]
     for path, b, row_epoch in writes:
         save_csv(path, b, row_epoch)
-    saved = [os.path.basename(path) for path, b, _ in writes if b]
-    print(f"{pfx} saved to {' + '.join(saved)}")
+    print("[retrain] all CSVs saved")
 
     parts = [g for g in slices.values() if len(g['wdl_pred'])]
     combined = {

@@ -536,8 +536,10 @@ class ChessGame(object):
             "total_children": total_children,
         }
         if self.is_stockfish_turn():
-            # SF's tanh(cp) value at play time, STM-POV
+            # SF's tanh(cp) value and WDL head at play time, STM-POV
             data["sf_value"] = rnd(self.sf_eval, 4)
+            if self.sf_wdl is not None:
+                data["sf_wdl"] = tuple(rnd(x, 4) for x in self.sf_wdl)
         if sp["ctrl_record"]:
             data["ctrl"] = self.tree.get_ctrl_record()
         # rescore's controller stats; the lean log keeps the heads and rejections

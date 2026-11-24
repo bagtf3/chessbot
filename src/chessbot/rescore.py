@@ -263,7 +263,7 @@ class SFRescoreThread:
         # rerun) that would otherwise run away.
         self.max_depth = 24
         self.movetime_ms = cfg.rescore_movetime_ms
-        self.sf_config = {'Threads': 1, 'Hash': 256}
+        self.sf_config = {'Threads': 1, 'Hash': 256, 'UCI_ShowWDL': True}
         self.stop_ev = threading.Event()
         self.t = None
         self.eng = None
@@ -305,6 +305,7 @@ class SFRescoreThread:
         best_uci = pv[0]
         best_cp = score_cp_stm_pov(info['score'])
         best_abs = score_cp_white_pov(info['score'])
+        best_wdl = sf_wdl_stm(info)
 
         # pass 2: score xerces's move only if it differs from best
         rerun = xerces_uci != best_uci
@@ -316,8 +317,9 @@ class SFRescoreThread:
             depths.append(info2.get('depth', 0))
             played_cp = score_cp_stm_pov(info2['score'])
             played_abs = score_cp_white_pov(info2['score'])
+            played_wdl = sf_wdl_stm(info2)
         else:
-            played_cp, played_abs = best_cp, best_abs
+            played_cp, played_abs, played_wdl = best_cp, best_abs, best_wdl
             depths.append(depth)
 
         pair_cp = None
@@ -344,6 +346,8 @@ class SFRescoreThread:
             'best_abs':   best_abs,
             'played_cp':  played_cp,
             'played_abs': played_abs,
+            'best_wdl':   best_wdl,   # SF WDL head, STM-POV
+            'played_wdl': played_wdl,
             'elapsed':    elapsed,
             'best_depth': depth,      # pass 1, the free search
             'depth':      depths[0],  # pass 2, the played move
@@ -1077,6 +1081,8 @@ class Rescorer(object):
             ply['best_depth'] = r.get('best_depth')
             ply['depth']      = r.get('depth')
             ply['pair_cp']    = r.get('pair_cp')
+            ply['sf_best_wdl']   = r.get('best_wdl')
+            ply['sf_played_wdl'] = r.get('played_wdl')
             ply['resolved']   = True
 
         game['waiting'] = False
@@ -1259,7 +1265,7 @@ class Rescorer(object):
         rows = []
         eval_trace = []
         turn_at = {}
-        # white-POV SF value of the position at each blunder ply
+        # white-POV SF WDL of the position at each blunder ply
         cut_white = {}
         pending = []
         pending_aux = []
@@ -1299,8 +1305,10 @@ class Rescorer(object):
                 best_cp, played_cp, esl, Z_stm, cfg.rescore_esl_blunder)[0]
 
             if is_blunder:
-                v = cp_to_value_tanh(best_cp)
-                cut_white[i] = v if turn else -v
+                w = ply.get('sf_played_wdl' if ms.swapped else 'sf_best_wdl')
+                if w is None:
+                    w = scalar_to_wdl(cp_to_value_tanh(best_cp))
+                cut_white[i] = stm_to_white_wdl(w, turn)
 
             eval_trace.append((i, best_abs))
             if 'ctrl_sum' in tr:
@@ -1405,16 +1413,20 @@ class Rescorer(object):
         cut_outcome = blunder_cut_outcomes(
             game_state['plies'], cut_white, self.config.value_bootstrap_at_sample)
 
-        # SF plies: cliff-walker-corrected outcome, half SF's own tanh(cp)
+        # SF plies: cliff-walker-corrected outcome, half SF's WDL head
+        # (tanh(cp) for logs without it)
         for ply_i, stm, outcome, (x, policy, okey, pwht, kl, n_legal) in (
                 game_state.get('sf_examples', ())):
             cut = cut_outcome.get(ply_i)
             if cut is not None:
-                outcome = scalar_to_wdl(cut if stm else -cut)
+                outcome = stm_to_white_wdl(cut, stm)
             node = game_state['plies'][ply_i]
-            sf_v = node.get('sf_value')
-            Y = outcome if sf_v is None else (
-                0.5 * outcome + 0.5 * scalar_to_wdl(sf_v)).astype(np.float32)
+            sf_w, sf_v = node.get('sf_wdl'), node.get('sf_value')
+            if sf_w is None and sf_v is not None:
+                sf_w = scalar_to_wdl(sf_v)
+            Y = outcome if sf_w is None else (
+                0.5 * outcome + 0.5 * np.asarray(sf_w, dtype=np.float32)
+            ).astype(np.float32)
             node['wdl_target'] = Y
             klv = self.target_kl(Y, node)
             vwht = (self.config.kl_boost_p80_mult
@@ -1432,8 +1444,7 @@ class Rescorer(object):
             Y = node['wdl_target']
             cut = cut_outcome.get(ply_i)
             if cut is not None:
-                Y = blend_wdl_stm(scalar_to_wdl(cut if stm else -cut),
-                                  node.get('best_wdl'))
+                Y = blend_wdl_stm(stm_to_white_wdl(cut, stm), node.get('best_wdl'))
                 node['wdl_target'] = Y
             klv = self.target_kl(Y, node)
             vwht = (self.config.kl_boost_p80_mult
@@ -1453,7 +1464,7 @@ class Rescorer(object):
             # target is SF's value before that blunder instead
             cut = cut_outcome.get(ply_i)
             if cut is not None:
-                outcome = scalar_to_wdl(cut if is_white else -cut)
+                outcome = stm_to_white_wdl(cut, is_white)
                 Y = blend_wdl_stm(outcome, node.get('best_wdl'))
                 node['wdl_target'] = Y
 
@@ -1618,7 +1629,7 @@ class Rescorer(object):
                 'kl', 'kl_value')}
             for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
                       'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits', 'pv_len',
-                      'pv_played_len', 'sf_value'):
+                      'pv_played_len', 'sf_value', 'sf_wdl'):
                 entry[k] = node.get(k)
             # search-controller check-ins, only on games run with ctrl_record
             if 'ctrl' in node:
@@ -1964,8 +1975,23 @@ def deviation_outcomes(plies, white_first, result, bootstrap):
     return out
 
 
+def sf_wdl_stm(info):
+    """SF's WDL head from an analyse() info, STM-POV, or None."""
+    w = info.get('wdl')
+    if w is None:
+        return None
+    r = w.relative
+    return (r.wins / 1000.0, r.draws / 1000.0, r.losses / 1000.0)
+
+
+def stm_to_white_wdl(w, white):
+    """Flip a WDL between STM and white POV (the flip is its own inverse)."""
+    w = np.asarray(w, dtype=np.float32)
+    return w if white else w[::-1].copy()
+
+
 def blunder_cut_outcomes(plies, cut_white, bootstrap):
-    """White-POV value per ply from the nearest SF-flagged blunder at or after
+    """White-POV WDL per ply from the nearest SF-flagged blunder at or after
     it. A sampled deviation that deviation_outcomes already cuts at wins when
     it is nearer; plies with neither ahead of them are left out."""
     out = {}

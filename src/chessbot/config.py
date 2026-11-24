@@ -81,7 +81,7 @@ class Config(object):
     ctrl_ext_q0 = 0.7
     ctrl_ext_absq0 = 0.6
     ctrl_ext_slope = 0.6666667
-    ctrl_ext_pruning = 0.5      # pruning_factor while extended; restored next move
+    ctrl_ext_pruning = 1.0      # pruning_factor while extended; restored next move
     ctrl_record = False         # keep every check-in in the game log (ply["ctrl"])
     checkin_break = False       # collect_many_leaves returns at each check-in
 

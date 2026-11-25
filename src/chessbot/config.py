@@ -130,7 +130,6 @@ class Config(object):
 
     train_on_stockfish = True
 
-    kl_boost_p80_mult    = 1.5   # pwht/vwht multiplier when KL > running EMA 80th pctile
     kl_quantile_lr       = 0.0005 # step size for the online trackers (~1/lr, ~2000)
 
     game_probs = {

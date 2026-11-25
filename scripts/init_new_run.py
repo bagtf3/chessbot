@@ -25,7 +25,7 @@ from pathlib import Path
 from chessbot.config import Config
 from chessbot.eval_metrics import LC0_PROGRESS_CSV, SF_PROGRESS_CSV
 from chessbot.retrain_worker import FIT_CSV
-from chessbot.train_pytorch import CHECKIN_CSV, PATIENCE_CSV
+from chessbot.train_pytorch import CHECKIN_CSV, PATIENCE_CSV, TIER_CSV
 
 
 def write_yaml(path, obj):
@@ -297,7 +297,7 @@ def main():
             for fname in ("eval_progress.csv",
                           "eval_progress_pretrain_continued.csv",
                           LC0_PROGRESS_CSV, SF_PROGRESS_CSV, FIT_CSV,
-                          PATIENCE_CSV, CHECKIN_CSV):
+                          PATIENCE_CSV, CHECKIN_CSV, TIER_CSV):
                 src_eval = os.path.join(src_dir, fname)
                 if os.path.exists(src_eval):
                     shutil.copy2(src_eval, os.path.join(dest_dir, fname))

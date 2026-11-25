@@ -764,10 +764,9 @@ class Rescorer(object):
         """One SF ply. Policy: Xerces's search when SF played the search's
         top move; otherwise sf_move_target on SF's move blended with the
         search, SF weight SF_POLICY_W_WON if SF won the game
-        else SF_POLICY_W_OTHER. The clip is applied after the blend. The KL
-        boost matches a Xerces ply. Returns (x, dense policy, okey, pwht, kl,
-        n_legal); finalize_game attaches the value target and admits it."""
-        cfg = self.config
+        else SF_POLICY_W_OTHER. The clip is applied after the blend. Returns
+        (x, dense policy, okey, pwht, kl, n_legal); finalize_game attaches the
+        value target and admits it."""
         cm = tr['candidate_moves']
         lms = board.legal_moves()
         idx_uci = dict(zip(board.moves_to_indices(lms), lms))
@@ -787,8 +786,6 @@ class Rescorer(object):
         pwht = 1.0
         priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
         kl = kl_divergence(list(xc0), [priors_map.get(u, 0.0) for u in ucis])
-        if kl >= self.kl_q80:
-            pwht *= cfg.kl_boost_p80_mult
 
         x, policy = self.make_policy_example(board, ucis, list(pi))
         return (x, policy, self.opening_counts.key(board, x), pwht, kl,
@@ -808,7 +805,7 @@ class Rescorer(object):
         priors_map = {c['uci']: c.get('P_raw', c['P']) for c in cm}
         kl = kl_divergence(list(vmap.values()),
                            [priors_map.get(u, 0.0) for u in vmap])
-        pwht = self.config.kl_boost_p80_mult if kl >= self.kl_q80 else 1.0
+        pwht = 1.0
         x = tr['xc0h']
         policy = np.zeros(1858, dtype=np.float32)
         for idx, prob in tr['policy']:
@@ -1358,8 +1355,6 @@ class Rescorer(object):
             if ply['skip_training']:
                 continue
 
-            kl_eligible = loss_this <= EQUIV
-
             stat_keys = self.accumulate_blunder_stats(
                 missed_mate, best_cp, played_cp, loss_this, Z_stm, esl, cfg)
 
@@ -1374,8 +1369,6 @@ class Rescorer(object):
             vwht = pwht = 1.0
             self.kl_q50 = update_ema_quantile(self.kl_q50, kl, 0.5, self.config.kl_quantile_lr)
             self.kl_q80 = update_ema_quantile(self.kl_q80, kl, 0.8, self.config.kl_quantile_lr)
-            if kl_eligible and kl >= self.kl_q80:
-                pwht *= self.config.kl_boost_p80_mult
 
             # build policy from precomputed board state
             idx_map = ply['idx_map']
@@ -1401,7 +1394,6 @@ class Rescorer(object):
                 'stat_keys':       stat_keys,
                 'esl':             esl,
                 'kl':              kl,
-                'kl_eligible':     kl_eligible,
                 'ply_i':           i,
                 'best_wdl':        tr.get('best_wdl'),
             })
@@ -1429,8 +1421,7 @@ class Rescorer(object):
             ).astype(np.float32)
             node['wdl_target'] = Y
             klv = self.target_kl(Y, node)
-            vwht = (self.config.kl_boost_p80_mult
-                    if klv >= max(0.03, self.kl_value_q80) else 1.0)
+            vwht = 1.0
             self.opening_counts.bump(okey)
             self.count_offer('sf', self.admit(
                 (x, None, sparsify_policy(policy), Y, vwht, pwht, SF_SOURCE),
@@ -1447,8 +1438,7 @@ class Rescorer(object):
                 Y = blend_wdl_stm(stm_to_white_wdl(cut, stm), node.get('best_wdl'))
                 node['wdl_target'] = Y
             klv = self.target_kl(Y, node)
-            vwht = (self.config.kl_boost_p80_mult
-                    if klv >= max(0.03, self.kl_value_q80) else 1.0)
+            vwht = 1.0
             self.opening_counts.bump(okey)
             self.count_offer('vsl', self.admit(
                 (x, None, sparsify_policy(policy), Y, vwht, pwht, 'lc0'),
@@ -1473,9 +1463,6 @@ class Rescorer(object):
                 self.kl_value_q50, klv, 0.5, self.config.kl_quantile_lr)
             self.kl_value_q80 = update_ema_quantile(
                 self.kl_value_q80, klv, 0.8, self.config.kl_quantile_lr)
-            # floored so a zeroed tracker doesn't boost every ply
-            if aux['kl_eligible'] and klv >= max(0.03, self.kl_value_q80):
-                vwht *= self.config.kl_boost_p80_mult
 
             wdl_node = aux.get('best_wdl')
             if wdl_node is not None:
@@ -1570,7 +1557,8 @@ class Rescorer(object):
             self.ctrl_games += 1
             if self.ctrl_games % CTRL_WINDOW_GAMES == 0:
                 self.print_ctrl_stats()
-        if self.games_processed % STATS_WINDOW_GAMES == 0:
+        if (self.games_processed % STATS_WINDOW_GAMES == 0
+                and self.games_processed % REPORT_EVERY != 0):
             print()
             self.print_blunder_stats()
         if len(self.analyzed_results) >= cfg.rescore_analyze_batch:
@@ -1654,7 +1642,7 @@ class Rescorer(object):
                 entry['esl'] = 0.0
 
             if reviewable:
-                for k in ('sims', 'time', 'avg_depth', 'max_depth',
+                for k in ('sims', 'time', 'expert_move_time', 'avg_depth', 'max_depth',
                           'children_visited', 'total_children', 'pv',
                           'pv_played', 'sharp_by_depth'):
                     if k in node:
@@ -1856,8 +1844,14 @@ class Rescorer(object):
                 + cell(a['klv'], 7, ".3f") + cell(a['klp'], 6, ".2f")
                 + cell(100 * a['tsl_mistake'], 8, ".1f") + "%"
                 + cell(100 * a['tsl_blunder'], 8, ".1f") + "%")
-        print()
         out("-" * W)
+        # the blunder table sits between the trends and throughput when both
+        # are due
+        if self.games_processed % STATS_WINDOW_GAMES == 0:
+            print()
+            self.print_blunder_stats()
+            print()
+            out("-" * W)
 
         if self.start_time is not None:
             elapsed = time.time() - self.start_time
@@ -2085,13 +2079,13 @@ def combine_analysis_staging(run_dir):
 
     # nothing to do if staging doesn't exist
     if not os.path.isdir(staging):
-        print(f"[combine] no /analysis_staging dir")
+        print("[combine] no /analysis_staging dir")
         return None
 
     # list chunk files
     fns = sorted([fn for fn in os.listdir(staging) if fn.endswith(".pkl")])
     if not fns:
-        print(f"[combine] no chunk files in /analysis_staging dir")
+        print("[combine] no chunk files in /analysis_staging dir")
         return None
 
     # load existing combined (if any)

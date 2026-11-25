@@ -8,7 +8,7 @@ from queue import Queue, Empty
 import chess
 import chess.engine
 
-from chessbot.review import score_to_value_stm_pov_tanh
+from chessbot.utils import score_to_value_stm_pov_tanh
 
 now = time.time
 
@@ -141,6 +141,8 @@ class GameLooper(object):
         self.prediction_times = []
         # seconds from a vs_leela request going out to lc0's move being played
         self.lc0_move_times = []
+        # the lc0 server's own search time for those moves
+        self.lc0_srv_times = []
         self.infer_gaps = []
         self.last_infer_end = None
 
@@ -415,7 +417,7 @@ class GameLooper(object):
     def drain_lc0_replies(self):
         """lc0 moves for this worker's vs_leela games. A reply for a game this
         worker no longer has (a predecessor's, or one already finished) is
-        dropped."""
+        dropped. A reply with no record is logged and xc0 plays that turn."""
         if self.lc0_link is None:
             return
         reply_q = self.lc0_link[2]
@@ -425,8 +427,12 @@ class GameLooper(object):
             except Empty:
                 return
             g = self.expert_games.get((rep.get("meta") or {}).get("game_id"))
-            if g is not None and g.expert == "lc0" and rep.get("record"):
-                g.set_expert_result(rep)
+            if g is None or g.expert != "lc0":
+                continue
+            if not rep.get("record"):
+                print(f"[lc0] no record for game {g.game_id[:8]} ply {g.plies} "
+                      f"(rid {rep.get('rid')}), xc0 plays the turn", flush=True)
+            g.set_expert_result(rep)
 
     def ensure_sf_thread(self, cfg):
         if self.sf_thread is None:
@@ -499,8 +505,8 @@ class GameLooper(object):
                         if tup[0] == "__error__":
                             raise tup[1]
 
-                        game_id, res_tup = tup
-                        self.expert_games[game_id].set_expert_result(res_tup)
+                        game_id, res_tup, sf_s = tup
+                        self.expert_games[game_id].set_expert_result(res_tup, sf_s)
 
             self.drain_lc0_replies()
 
@@ -525,6 +531,10 @@ class GameLooper(object):
                             if game.expert == "lc0":
                                 self.lc0_move_times.append(
                                     now() - game.expert_asked_at)
+                                srv = (game.expert_result.get("record")
+                                       or {}).get("time")
+                                if srv is not None:
+                                    self.lc0_srv_times.append(srv)
                             expert_terminal = game.apply_expert_result(
                                 game.expert_result, game.expert)
                             mps.tick(1)
@@ -569,6 +579,7 @@ class GameLooper(object):
             if self.maybe_push_telemetry(counts, pred_fill, mbs_used, force=False):
                 self.prediction_times.clear()
                 self.lc0_move_times.clear()
+                self.lc0_srv_times.clear()
                 self.infer_gaps.clear()
                 counts.reset(); pred_fill.clear(); mbs_used.clear()
             
@@ -750,6 +761,9 @@ class GameLooper(object):
             "lc0_move_s": (float(np.mean(self.lc0_move_times))
                            if self.lc0_move_times else 0.0),
             "lc0_move_n": len(self.lc0_move_times),
+            "lc0_srv_s": (float(np.mean(self.lc0_srv_times))
+                          if self.lc0_srv_times else 0.0),
+            "lc0_srv_n": len(self.lc0_srv_times),
             "pred_wait": 0.0,
             "preds_per_second": 0.0,
             "batch_target": target,
@@ -942,6 +956,7 @@ class StockfishThread(object):
                 continue
 
             try:
+                t0 = time.monotonic()
                 res_tup = None
                 if explore:
                     res_tup = self.explore_eval(board, depth or self.depth)
@@ -951,7 +966,7 @@ class StockfishThread(object):
                         depth=depth or self.depth, engine=self.eng
                     )
 
-                self.res_q.put((game_id, res_tup))
+                self.res_q.put((game_id, res_tup, time.monotonic() - t0))
             except Exception as e:
                 self.err = e
                 self.res_q.put(("__error__", e))

@@ -59,6 +59,8 @@ REWEIGHT_INELIGIBLE = -1
 POS_FRAME = 64
 
 COUNTS_DECAY_FACTOR = 0.995
+# the table is saved to disk every COUNTS_SAVE_EVERY decays (shard writes)
+COUNTS_SAVE_EVERY = 5
 MAX_TRACKED_PLY = 15
 
 # (inclusive upper bound on floor(count), weight). Anything above the last
@@ -157,6 +159,8 @@ class OpeningCounts:
         is 4.5x slower -- the gather costs more than the multiply saves."""
         self.counts *= factor
         self.n_decays += 1
+        if self.path is not None and self.n_decays % COUNTS_SAVE_EVERY == 0:
+            self.save()
 
     def occupancy(self):
         return int(np.count_nonzero(self.counts))

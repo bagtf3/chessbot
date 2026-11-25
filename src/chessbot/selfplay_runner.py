@@ -733,6 +733,8 @@ class SelfPlayRunner:
             sent = len(self.lc0_hold)
             self.lc0_hold = []
         self.recorder.lc0_lanes = self.lc0_router.lane_counts()
+        self.recorder.lc0_ages = self.lc0_router.ages()
+        self.recorder.lc0_resends = self.lc0_router.resends
         self.recorder.lc0_held = len(self.lc0_hold)
         return sent
 

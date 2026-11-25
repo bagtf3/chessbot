@@ -28,12 +28,15 @@ class RequestRouter(object):
         self.reply_in = ctx.Queue()
         self.ctx = ctx
         self.client_qs = {}
-        # rid -> [client, req, sent_at]
+        # rid -> [client, req, sent_at, submitted_at]; sent_at moves on a
+        # resend, submitted_at never does
         self.outstanding = {}
         self.lock = threading.Lock()
         self.rids = count()
         # replies delivered per lane (True = priority)
         self.done = {True: 0, False: 0}
+        # requests sent again by resend_stale
+        self.resends = 0
 
     @property
     def priority_q(self):
@@ -69,7 +72,8 @@ class RequestRouter(object):
     def submit(self, client, req):
         with self.lock:
             req["rid"] = next(self.rids)
-            self.outstanding[req["rid"]] = [client, req, time.monotonic()]
+            t = time.monotonic()
+            self.outstanding[req["rid"]] = [client, req, t, t]
         self.server_qs[bool(req.get("priority"))].put(req)
 
     def forward_requests(self):
@@ -98,7 +102,7 @@ class RequestRouter(object):
             now = time.monotonic()
             for _, e in entries:
                 e[2] = now
-        for _, (_, req, _) in entries:
+        for _, (_, req, *_) in entries:
             self.server_qs[bool(req.get("priority"))].put(req)
         return len(entries)
 
@@ -110,7 +114,8 @@ class RequestRouter(object):
                      if now - e[2] > self.timeout_s]
             for e in stale:
                 e[2] = now
-        for _, req, _ in stale:
+            self.resends += len(stale)
+        for _, req, *_ in stale:
             self.server_qs[bool(req.get("priority"))].put(req)
         return len(stale)
 
@@ -118,9 +123,17 @@ class RequestRouter(object):
         """{priority: (outstanding, done)} for both lanes."""
         with self.lock:
             out = {True: 0, False: 0}
-            for _, req, _ in self.outstanding.values():
+            for _, req, *_ in self.outstanding.values():
                 out[bool(req.get("priority"))] += 1
             return {k: (out[k], self.done[k]) for k in (True, False)}
+
+    def ages(self):
+        """(max, mean) seconds since submit over every outstanding request,
+        (0, 0) when none are out."""
+        now = time.monotonic()
+        with self.lock:
+            a = [now - e[3] for e in self.outstanding.values()]
+        return (max(a), sum(a) / len(a)) if a else (0.0, 0.0)
 
 
 def drain(q):

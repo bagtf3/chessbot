@@ -358,6 +358,9 @@ class ChessGame(object):
         self.expert_pending = False
         self.expert_ready = False
         self.expert_result = None
+        # the expert's own search time for its pending move (SF's, from the
+        # SF thread)
+        self.expert_s = None
         self.tf_last_resolved = 0
 
         # set when to start checking for draw by agreement
@@ -523,6 +526,9 @@ class ChessGame(object):
             "sel_method": method,
             "stop_reason": self.tree.sim_stop_reason,
             "time": rnd(elapsed, 3),
+            # the expert's own search time; time is the looper's, request to
+            # move played. None on xc0 plies
+            "expert_move_time": None,
             "sims": sims,
             "sims_min": int(sp["sims_min"]),
             "sims_max": int(sp["sims_max"]),
@@ -538,6 +544,8 @@ class ChessGame(object):
         if self.is_stockfish_turn():
             # SF's tanh(cp) value and WDL head at play time, STM-POV
             data["sf_value"] = rnd(self.sf_eval, 4)
+            if self.expert_s is not None:
+                data["expert_move_time"] = rnd(self.expert_s, 3)
             if self.sf_wdl is not None:
                 data["sf_wdl"] = tuple(rnd(x, 4) for x in self.sf_wdl)
         if sp["ctrl_record"]:
@@ -584,16 +592,21 @@ class ChessGame(object):
                  "Q": rnd(x.Q, 4)}
                 for x in self.tree.principal_variation(PV_MAX, start)]
 
-    def set_expert_result(self, result):
+    def set_expert_result(self, result, expert_s=None):
         self.expert_result = result
+        self.expert_s = expert_s
         self.expert_ready = True
 
     def apply_expert_result(self, result, expert="sf"):
-        """Play the expert's move. xc0_move is xc0's most-visited pick."""
+        """Play the expert's move. xc0_move is xc0's most-visited pick. An lc0
+        reply with no record is played by xc0 from its own search, as an xc0
+        ply."""
         method, stop = EXPERT_CODES[expert]
         self.expert_result = None
         self.expert_ready = False
         self.expert_pending = False
+        if expert == "lc0" and not result.get("record"):
+            return self.make_move_from_tree()
         self.tree.sim_stop_reason = stop
         xc0_move, _ = self.tree.select_xerces_top_move()
         if expert == "lc0":
@@ -610,12 +623,18 @@ class ChessGame(object):
         position, so rescore scores lc0's target against xc0's net with the
         code it runs on every xc0 ply."""
         mv = lc0["move_played"]
+        start = self.tree._move_started_at
         self.collect_tree_search_data(mv, method, xc0_move)
         own = self.tree_data.get(self.plies)
 
         rec = {k: v for k, v in lc0.items() if k not in LC0_DROP_FIELDS}
+        # time is the looper's, the server's search time goes to
+        # expert_move_time
         rec.update(move_played=mv, xc0_move=xc0_move, sel_method=method,
-                   stop_reason=self.tree.sim_stop_reason)
+                   stop_reason=self.tree.sim_stop_reason,
+                   time=(own["time"] if own is not None
+                         else rnd(_now() - start, 3) if start is not None else None),
+                   expert_move_time=lc0.get("time"))
         if own is not None:
             rec["root_wdl_nn"] = own["root_wdl_nn"]
             rec["xc0h"] = own["xc0h"]

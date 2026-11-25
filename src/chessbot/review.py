@@ -1,9 +1,14 @@
-import os, json, gzip, pathlib, time, random, asyncio, concurrent.futures
+import os, json, gzip, pathlib, time, asyncio, concurrent.futures
 import pickle
 
 # the retained list would otherwise grow for the life of the process; the
 # counters carry the whole-run view, this is only for the last-50 line
 RECENT_GAMES_CAP = 20000
+# lc0 log smoothing: EMA span and max window, in lc0 logs, and the vs_leela
+# move-time EMAs' starting values (s), looper side and lc0 server side
+LC0_LOG_SPAN = 5
+LC0_MOVE_EMA_SEED = 1.5
+LC0_SRV_EMA_SEED = 1.0
 
 # per-window counts, as opposed to the rates and gauges alongside them in the
 # telemetry dict. Only these get scaled onto the print's span.
@@ -32,8 +37,7 @@ from chessbot.utils import (
     compact_count, compact_span, LOG_WIDTH,
 )
 from chessbot.utils import (
-    score_cp_stm_pov, score_cp_white_pov, score_clipped, score_to_value_stm_pov,
-    score_to_value_stm_pov_tanh, rnd, scalar_to_wdl,
+    score_cp_stm_pov, score_cp_white_pov, score_clipped, rnd, scalar_to_wdl,
     calc_entropy, kl_divergence, load_json, save_pickle_atomic,
 )
 
@@ -85,6 +89,7 @@ class GameViewer:
                 'stop_reason':       p.get('stop_reason'),
                 'sims':              p.get('sims'),
                 'time':              p.get('time'),
+                'expert_move_time':  p.get('expert_move_time'),
                 'avg_depth':         p.get('avg_depth'),
                 'max_depth':         p.get('max_depth'),
                 'children_visited':  p.get('children_visited'),
@@ -1582,13 +1587,13 @@ def combine_analysis_staging(run_dir):
 
     # nothing to do if staging doesn't exist
     if not os.path.isdir(staging):
-        print(f"[combine] no /analysis_staging dir")
+        print("[combine] no /analysis_staging dir")
         return None
 
     # list chunk files
     fns = sorted([fn for fn in os.listdir(staging) if fn.endswith(".pkl")])
     if not fns:
-        print(f"[combine] no chunk files in /analysis_staging dir")
+        print("[combine] no chunk files in /analysis_staging dir")
         return None
 
     # load existing combined (if any)
@@ -1739,6 +1744,16 @@ class RecordKeeper(object):
         # {priority: (outstanding, done)} from the lc0 router; True is the
         # vs_leela lane, False the confirmation lane
         self.lc0_lanes = {True: (0, 0), False: (0, 0)}
+        # (max, mean) seconds outstanding and the stale-resend count
+        self.lc0_ages = (0.0, 0.0)
+        self.lc0_resends = 0
+        # per lc0 log: vs_leela move times (looper, server) and mean age as
+        # EMAs over LC0_LOG_SPAN logs, max age as the max over the last
+        # LC0_LOG_SPAN
+        self.lc0_move_ema = LC0_MOVE_EMA_SEED
+        self.lc0_srv_ema = LC0_SRV_EMA_SEED
+        self.lc0_age_ema = None
+        self.lc0_age_maxes = deque(maxlen=LC0_LOG_SPAN)
         self.lc0_held = 0
         self.lc0_probes_done = 0
         # set by the runner from the rescorer's own audit state each pass
@@ -1906,30 +1921,47 @@ class RecordKeeper(object):
         pps = sum(i.get("preds_per_second", 0.0) for i in fresh)
         active = sum(i.get("n_active", 0) for i in fresh)
 
-        print(f"[lc0 stats ] mps={mps:.2f}  lps={lps:.1f}  "
-              f"preds/s={pps:.1f}  moves/hr={mps * 3600:.0f}  "
-              f"active={active}")
-
         spm = np.mean([i.get("spm", 0.0) for i in fresh])
         batch = np.mean([i.get("apl", 0.0) for i in fresh])
         rates = [i["cache_hit_ema"] for i in fresh if "cache_hit_ema" in i]
         hit = f"{100.0 * np.mean(rates):.1f}%" if rates else "--"
 
+        def cells(*items):
+            return "".join(s.ljust(w) if len(s) < w - 1 else s + "  "
+                           for s, w in zip(items, (11, 12, 17))) + items[-1]
+
+        print("[lc0 stats ] " + cells(
+            f"mps={mps:.2f}", f"lps={lps:.1f}", f"preds/s={pps:.1f}",
+            f"moves/hr={mps * 3600:.0f}"))
+        print("[lc0 search] " + cells(
+            f"sims={spm:.0f}", f"batch={batch:.0f}", f"cache_hit={hit}",
+            f"active={active}"))
+
         (v_out, v_done), (c_out, c_done) = self.lc0_lanes[True], self.lc0_lanes[False]
-        # request out to move played, over the xc0 workers' last windows
+        a = 2.0 / (LC0_LOG_SPAN + 1)
+        # request out to move played, and the server's search time, over the
+        # xc0 workers' last windows
         xc0 = [i for i in self.telemetry.values()
-               if i.get("ts", 0) >= time.time() - 180 and i.get("lc0_move_n")]
-        n_mv = sum(i["lc0_move_n"] for i in xc0)
-        move_s = (f"{sum(i['lc0_move_s'] * i['lc0_move_n'] for i in xc0) / n_mv:.2f}s"
-                  if n_mv else "--")
+               if i.get("ts", 0) >= time.time() - 180]
+        for key, attr in (("lc0_move", "lc0_move_ema"), ("lc0_srv", "lc0_srv_ema")):
+            n = sum(i.get(f"{key}_n", 0) for i in xc0)
+            if n:
+                mv = sum(i[f"{key}_s"] * i[f"{key}_n"] for i in xc0
+                         if i.get(f"{key}_n")) / n
+                setattr(self, attr, getattr(self, attr) + a * (mv - getattr(self, attr)))
+        age_max, age_mean = self.lc0_ages
+        self.lc0_age_maxes.append(age_max)
+        self.lc0_age_ema = (age_mean if self.lc0_age_ema is None
+                            else self.lc0_age_ema + a * (age_mean - self.lc0_age_ema))
         # plies per finished chain; chains still in flight skew it slightly
         chains = self.lc0_probes_done
         avg = f"{c_done / chains:.2f}" if chains else "--"
-        print(f"[lc0 queue ] vs_leela wait={v_out} done={v_done} move={move_s}")
-        print(f"[lc0 queue ] confirm  held={self.lc0_held} wait={c_out} "
-              f"done={c_done} chains={chains} ({avg} plies/chain)")
-        print(f"[lc0 search] sims/move={spm:.0f}  batch={batch:.0f}  "
-              f"cache_hit={hit}")
+        print(f"[lc0 queue ] done: {'vs=' + compact_count(v_done):<8}"
+              f"bl={compact_count(c_done)} ({avg} avg)   "
+              f"move={self.lc0_move_ema:.2f}s / {self.lc0_srv_ema:.2f}s")
+        print(f"[lc0 queue ] wait: {f'vs={v_out}':<8}bl={c_out}  "
+              f"held: {self.lc0_held}  age: max={max(self.lc0_age_maxes):.0f}s "
+              f"avg={self.lc0_age_ema:.0f}s  resends={self.lc0_resends}")
 
         E = self.lc0_audit_ema
         if 'lc0' in E:

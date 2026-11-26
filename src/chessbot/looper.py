@@ -975,8 +975,9 @@ class StockfishThread(object):
 
     def explore_eval(self, board, depth):
         """Opening exploration: sample SF's move from its top MultiPV lines.
-        Returns the same (value, move, wdl) as sf_eval, with value and wdl
-        taken from the best line, or None to fall back to the plain search:
+        Returns the same (value, move, wdl, mate) as sf_eval, with value and
+        wdl taken from the best line and mate 0, or None to fall back to the
+        plain search:
         few legal moves, any mate score, fewer than two usable lines, or any
         error here."""
         try:
@@ -1010,7 +1011,7 @@ class StockfishThread(object):
                     wdl_info.relative.draws / 1000.0,
                     wdl_info.relative.losses / 1000.0)
                    if wdl_info is not None else None)
-            return val, str(move), wdl
+            return val, str(move), wdl, 0
         except Exception as e:
             print(f"[sf explore] falling back to plain search: {e!r}", flush=True)
             return None

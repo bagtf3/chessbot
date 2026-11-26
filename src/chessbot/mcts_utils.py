@@ -354,6 +354,7 @@ class ChessGame(object):
         self.mcts_plies = 0
         self.sf_eval = None
         self.sf_wdl = None
+        self.sf_mate = None
 
         self.expert_pending = False
         self.expert_ready = False
@@ -548,6 +549,9 @@ class ChessGame(object):
                 data["expert_move_time"] = rnd(self.expert_s, 3)
             if self.sf_wdl is not None:
                 data["sf_wdl"] = tuple(rnd(x, 4) for x in self.sf_wdl)
+            # SF plays its own best move, so the move's mate is the position's
+            data["mate_distance"] = data["played_mate_distance"] = self.sf_mate
+            data["mate_distance_source"] = "sf"
         if sp["ctrl_record"]:
             data["ctrl"] = self.tree.get_ctrl_record()
         # rescore's controller stats; the lean log keeps the heads and rejections
@@ -612,8 +616,7 @@ class ChessGame(object):
         if expert == "lc0":
             return self.play_lc0_reply(result["record"], method, xc0_move)
 
-        sf_v, best_move = result[0], result[1]
-        self.sf_wdl = result[2] if len(result) > 2 else None
+        sf_v, best_move, self.sf_wdl, self.sf_mate = result
         self.sf_eval = sf_v
         return self.push_move(best_move, method, xc0_move)
 

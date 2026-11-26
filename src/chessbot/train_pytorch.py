@@ -363,10 +363,14 @@ def print_patience_row(tag, nb, ep, means, best, z, thresh, action, lr, marks=No
     def loss(k, spec):
         v = means.get(k)
         return ("-" if v is None else format(v, spec)).rjust(6) + marks.get(k, " ")
+    # an eval that also forced the LR drop prints its action with ** after
+    # the LR
+    drop = action.endswith("+drop")
+    action = action.removesuffix("+drop")
     print(f"{tag} {nb:>4}  {ep:>4.2f}  {loss('replay_loss', '.3f')}  "
           f"{loss('primary_loss', '.3f')}  {loss('loss', '.4f')}  "
           f"{cell(thresh, 6, '.4f')}  {cell(best, 6, '.3f')}  {cell(z, 5, '+.2f')}  "
-          f"{action:<6}  {lr:.1e}")
+          f"{action:<6}  {lr:.1e}{'**' if drop else ''}")
 
 
 def print_pt_grad_stats(epoch_grad_stats, gate, skips, label=""):
@@ -524,8 +528,9 @@ def eval_set_ce(model, s, batch_size, encoding_type):
 
 def score_checkin_shard(cfg, epoch, model, arrays, batch_size, policy_lw, value_lw,
                         tag="[retrain]"):
-    """Score the check-in shard, print it beside the means of the last
-    CHECKIN_MEANS rows that exist, and append its row to CHECKIN_CSV: the
+    """Score the check-in shard, print its change from the first row and
+    from the means of the last CHECKIN_MEANS rows that exist, and append its
+    row to CHECKIN_CSV: the
     record-weighted losses and the unweighted (unw_*) ones."""
     import csv
     s = prep_eval_set(arrays)
@@ -537,10 +542,14 @@ def score_checkin_shard(cfg, epoch, model, arrays, batch_size, policy_lw, value_
     if os.path.exists(path):
         with open(path, newline="", encoding="utf-8") as f:
             prior = [float(r["loss"]) for r in csv.DictReader(f)]
-    lasts = "".join(f"  last{k} {np.mean(prior[-k:]):.4f}"
-                    for k in CHECKIN_MEANS if len(prior) >= k)
-    print(f"{tag} checkin shard {vec.mean():.4f}  "
-          f"(policy {lp:.4f}  value {lv:.4f}){lasts}")
+    print(f"{tag} checkin shard {vec.mean():.4f}  (policy {lp:.4f}  value {lv:.4f})")
+    if prior:
+        refs = [("1st", prior[0])] + [(f"last{k}", np.mean(prior[-k:]))
+                                      for k in sorted(CHECKIN_MEANS, reverse=True)
+                                      if len(prior) >= k]
+        print(f"{tag} vs: " + "  ".join(
+            f"{name} ({ref:.3f}) = {(vec.mean() / ref - 1) * 100:+.3f}%"
+            for name, ref in refs))
     write_csv_row(cfg, CHECKIN_CSV, {
         "run_tag": cfg.run_tag, "epoch": epoch, "loss": round(vec.mean(), 6),
         "policy": round(lp, 6), "value": round(lv, 6),
@@ -633,9 +642,10 @@ def score_tiers(cfg, epoch, model, ts, batch_size, tag="[retrain]"):
     def val_str(r):
         return (f"gap {r['gap_before']:.3f}->{r['gap_after']:.3f}  "
                 f"toward {r['toward']:.0%}")
-    for head, fmt in (("policy", pol_str), ("value", val_str)):
-        print(f"{tag} tier {head:<6} {top} {fmt(out[head, top])}  |  "
-              f"{mid} {fmt(out[head, mid])}")
+    for name in (top, mid):
+        print(f"{tag} policy {name:<4} {pol_str(out['policy', name])}")
+    print(f"{tag} value  {top:<4} {val_str(out['value', top])}  |  "
+          f"{mid} {val_str(out['value', mid])}")
 
 
 def cpu_state(model):
@@ -1024,6 +1034,7 @@ def retrain_pt(model_path, X, P, Y_wdl, vwht, pwht, cfg, epoch, args,
               f"repl {pm.get('replay_loss', float('nan')):.4f}  "
               f"prim {pm.get('primary_loss', float('nan')):.4f}  "
               f"held {pm['loss']:.4f}  trained {nb} batches")
+        print()
         write_csv_row(cfg, PATIENCE_CSV, {
             "epoch": epoch, "batch": picked, "epoch_frac": round(picked / epoch_batches, 4),
             "lr": pat["lr"], **pat["means"][picked], "best_loss": round(pat["best"], 6),

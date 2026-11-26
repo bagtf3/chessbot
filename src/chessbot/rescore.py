@@ -19,8 +19,8 @@ from chessbot import SF_LOC
 from chessbot.config import XC0H_K
 from chessbot.utils import (
     score_cp_stm_pov, score_cp_white_pov, rnd, kl_divergence, cross_entropy,
-    scalar_to_wdl, cp_to_value_tanh, expected_score_loss,
-    ema_step, load_json, save_pickle_atomic, blend_to_uniform,
+    scalar_to_wdl, cp_to_value_tanh, expected_score_loss, pov_mate, mate_key,
+    mate_before, ema_step, load_json, save_pickle_atomic, blend_to_uniform,
     QUALITY, ReportRow, report_row_name, cell,
 )
 from chessbot.replay_buffer import (
@@ -119,17 +119,20 @@ CTRL_WINDOW_GAMES = 100
 C = 0.9699
 D = d = np.arctanh(0.5)
 
-# Rescore shortcuts. A move that follows an earlier search's PV is not
-# searched: CPL 0, scored at the bookend's eval, once the bookend (the
-# position where the game leaves the PV, searched anyway) confirms the PV's
-# eval within PV_CONFIRM_ES expected score; otherwise every skipped move is
-# searched. Positions with search |Q| or D above DECIDED_QD get
+# Rescore shortcuts. A position reached along an earlier search's PV, where
+# xc0's move and the move played are both the PV's, is not searched, at most
+# PV_SKIP_MAX in a row: CPL 0, scored at the bookend's eval (cp and WDL).
+# The bookend is the next position searched on the line; it confirms the
+# skips when SF's expected score there is within PV_CONFIRM_ES of the
+# origin's, else every skipped position is searched. A move off the PV is
+# always searched. Positions with search |Q| or D above DECIDED_QD get
 # DECIDED_TIME_FRAC of the movetime; other positions from BUSY_MIN_PLY on
 # (game ply from startpos, by the FEN's move counters) with more than
 # BUSY_LEGAL legal moves or BUSY_MATERIAL material get BUSY_EXTRA_MS more.
 # An extended controller search that changed its leader has both moves
 # scored in one multipv search at PAIR_TIME_MULT of the movetime.
 PV_CONFIRM_ES = 0.02
+PV_SKIP_MAX = 3
 DECIDED_QD = 0.9
 DECIDED_TIME_FRAC = 0.8
 BUSY_MIN_PLY = 10
@@ -243,6 +246,94 @@ class Trend:
         return self.vals[i] if self.n >= TREND_SPANS[i] else None
 
 
+def set_mate_distance(node, mate, played_mate, source):
+    """STM-POV mate distances on a game-log ply: the position's and the
+    played move's, with their source; None when unknown."""
+    node['mate_distance'] = mate
+    node['played_mate_distance'] = played_mate
+    node['mate_distance_source'] = None if mate is None else source
+
+
+def merge_mate(own, proof):
+    """own tightened by proof, both STM-POV mate distances (None or 0 for
+    none). A proof beats no mate; of two the shorter holds, as each bounds
+    the distance; opposite signs keep own."""
+    if not proof:
+        return own
+    if not own or ((own > 0) == (proof > 0) and abs(proof) < abs(own)):
+        return proof
+    return own
+
+
+def mate_after(p):
+    """Mate distance of the position a move of mate distance p leads to."""
+    return -(p - 1) if p > 0 else -p
+
+
+def consolidate_mates(game_state):
+    """Tighten every ply's mate distances with the proofs its neighbors along
+    the game line hold, then rewrite the SF evals of a ply whose position or
+    played move turned from no mate to mate.
+
+    Only what follows from the moves actually played is used: a played move
+    of mate p puts its child at mate_after(p); a child mated in K makes the
+    played move a mate in K + 1; a child mating in K makes the played move a
+    mate against in K. A position is at least as good as its played move,
+    every move of a mated position is mated as soon, and a forced move is the
+    position. Repeats until nothing moves."""
+    plies, n_legal = game_state['plies'], game_state['n_legal']
+    n = len(plies)
+    md = [p.get('mate_distance') for p in plies]
+    pmd = [p.get('played_mate_distance') for p in plies]
+    before = list(zip(md, pmd))
+    if n and game_state.get('mated'):
+        pmd[-1] = merge_mate(pmd[-1], 1)
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            m, p = md[i], pmd[i]
+            if m and m < 0:
+                p = merge_mate(p, m)
+            if i + 1 < n and md[i + 1]:
+                p = merge_mate(p, mate_before(md[i + 1]))
+            if p and (p > 0 or n_legal[i] == 1):
+                m = merge_mate(m, p)
+            if i > 0 and pmd[i - 1]:
+                m = merge_mate(m, mate_after(pmd[i - 1]))
+            if (m, p) != (md[i], pmd[i]):
+                md[i], pmd[i], changed = m, p, True
+
+    states = {s['ply_idx']: s for s in game_state['ply_states']}
+    for i, node in enumerate(plies):
+        if (md[i], pmd[i]) == before[i]:
+            continue
+        set_mate_distance(node, md[i], pmd[i], 'derived')
+        turn = node.get('stm')
+        st = states.get(i)
+        if st is not None:
+            turn = st['turn']
+            if md[i] and not before[i][0]:
+                st['best_cp'], st['best_abs'], st['sf_best_wdl'] = mate_evals(md[i], turn)
+            # the played evals score xc0's pick, so only when it was played
+            if pmd[i] and not before[i][1] and st['xerces_uci'] == st['mv']:
+                st['played_cp'], st['played_abs'], st['sf_played_wdl'] = mate_evals(
+                    pmd[i], turn)
+        elif md[i] and not before[i][0] and node.get('sel_method') == 'stockfish':
+            # SF's own move: a mate is a won or lost value and WDL
+            node['sf_value'] = 1.0 if md[i] > 0 else -1.0
+            node['sf_wdl'] = mate_evals(md[i], turn)[2]
+
+
+def mate_evals(m, turn):
+    """(STM cp, white cp, STM WDL) of a mate in m for the side to move, on
+    the same clip and mate-score conventions as a searched mate."""
+    pov = chess.engine.PovScore(chess.engine.Mate(m), turn)
+    wdl = (1.0, 0.0, 0.0) if m > 0 else (0.0, 0.0, 1.0)
+    return score_cp_stm_pov(pov), score_cp_white_pov(pov), wdl
+
+
 class SFRescoreThread:
     """
     SF worker that processes one game at a time for TT locality.
@@ -306,6 +397,7 @@ class SFRescoreThread:
         best_cp = score_cp_stm_pov(info['score'])
         best_abs = score_cp_white_pov(info['score'])
         best_wdl = sf_wdl_stm(info)
+        best_mate = pov_mate(info['score'])
 
         # pass 2: score xerces's move only if it differs from best
         rerun = xerces_uci != best_uci
@@ -318,8 +410,10 @@ class SFRescoreThread:
             played_cp = score_cp_stm_pov(info2['score'])
             played_abs = score_cp_white_pov(info2['score'])
             played_wdl = sf_wdl_stm(info2)
+            played_mate = pov_mate(info2['score'])
         else:
             played_cp, played_abs, played_wdl = best_cp, best_abs, best_wdl
+            played_mate = best_mate
             depths.append(depth)
 
         pair_cp = None
@@ -339,6 +433,7 @@ class SFRescoreThread:
         return {
             'pair_cp':    pair_cp,    # (xc0's move, rejected leader)
             'ply_idx':    ply_idx,
+            'white':      board.turn == chess.WHITE,
             'best_uci':   best_uci,
             'pv_ucis':    pv[:3],
             'pv':         pv,
@@ -348,6 +443,12 @@ class SFRescoreThread:
             'played_abs': played_abs,
             'best_wdl':   best_wdl,   # SF WDL head, STM-POV
             'played_wdl': played_wdl,
+            # STM-POV mate distances: SF's best line, the move played, and the
+            # position (the better of the two, as when xc0's move beats the
+            # pass-1 pick)
+            'best_mate':  best_mate,
+            'played_mate': played_mate,
+            'mate':       max(best_mate, played_mate, key=mate_key),
             'elapsed':    elapsed,
             'best_depth': depth,      # pass 1, the free search
             'depth':      depths[0],  # pass 2, the played move
@@ -356,30 +457,43 @@ class SFRescoreThread:
         }
 
     @staticmethod
-    def unsearched(ply_idx, board, xerces_uci, abs_cp, depth, pv, why):
+    def unsearched(ply_idx, board, xerces_uci, src, pv, why):
         """A result scored without a search: xc0's move is the best move, at
-        a white-POV eval taken from elsewhere."""
-        cp = abs_cp if board.turn == chess.WHITE else -abs_cp
+        the eval (white-POV cp and WDL) and depth of src, the searched result
+        it is taken from. Its mate distances are unknown."""
+        white = board.turn == chess.WHITE
+        abs_cp = src['best_abs']
+        cp = abs_cp if white else -abs_cp
+        wdl = src.get('best_wdl')
+        if wdl is not None:
+            wdl = tuple(float(x) for x in
+                        stm_to_white_wdl(stm_to_white_wdl(wdl, src['white']), white))
         return {
-            'ply_idx': ply_idx, 'best_uci': xerces_uci, 'pv_ucis': pv[:3], 'pv': pv,
+            'ply_idx': ply_idx, 'white': white, 'best_uci': xerces_uci,
+            'pv_ucis': pv[:3], 'pv': pv,
             'best_cp': cp, 'best_abs': abs_cp, 'played_cp': cp, 'played_abs': abs_cp,
-            'elapsed': 0.0, 'best_depth': depth, 'depth': depth, 'depths': [],
-            'rerun': False, 'skipped': why,
+            'best_wdl': wdl, 'played_wdl': wdl,
+            'best_mate': None, 'played_mate': None, 'mate': None,
+            'elapsed': 0.0, 'best_depth': src['best_depth'], 'depth': src['best_depth'],
+            'depths': [], 'rerun': False, 'skipped': why,
         }
 
     def rescore_game(self, positions, moves, tiers):
-        """One game's positions in ply order. Forced moves are not searched.
-        A move on the PV of the last searched position is not searched
-        either. The bookend is the next searched position still on the PV's
-        line (where xc0 left it: SF's best and the move played, as for any
-        position); if its eval matches the PV's, the skipped moves get CPL 0
-        at the bookend's eval, else they are searched. With no such position
-        (the game ends, or a move off the PV came first) the last skipped
-        move is searched as the bookend."""
+        """One game's positions in ply order. Forced moves are not searched;
+        they take the last searched eval. A position the game reaches along
+        the PV of the last searched position, where xc0's move and the move
+        played are both the PV's, is not searched either, up to PV_SKIP_MAX
+        in a row. The bookend is the next searched position still on the
+        PV's line; if its SF expected score is within PV_CONFIRM_ES of the
+        origin's, the skipped positions get CPL 0 at the bookend's eval, else
+        they are searched. With no such position (the game ends) the last
+        skipped position is searched as the bookend. The ends must also
+        agree on which side, if either, has a mate, and the bookend's mate
+        may be no slower than the origin's counted forward to it."""
         out = {}
         origin = None   # (ply, result) whose PV the game is following
         chain = []      # positions on origin's PV, not searched yet
-        last_abs = 0.0
+        last = None     # the last searched result
 
         def on_line(k):
             # the game reached k along origin's PV
@@ -390,40 +504,53 @@ class SFRescoreThread:
         def on_pv(k, xerces_uci):
             off = k - origin[0]
             pv = origin[1]['pv']
-            return on_line(k) and off < len(pv) and xerces_uci == pv[off]
+            return (on_line(k) and off < len(pv)
+                    and xerces_uci == pv[off] == moves[k])
 
         def settle(k=None, book=None):
             if not chain:
                 return
             if book is None or not on_line(k):
-                last = chain.pop()
-                book = self.search(last[0], last[1], last[2], tiers[last[3]])
-                out[last[0]] = book
+                end = chain.pop()
+                book = self.search(end[0], end[1], end[2], tiers[end[3]])
+                out[end[0]] = book
             o_res = origin[1]
-            # expected-score gap either way, white POV
-            gap = max(expected_score_loss(o_res['best_abs'], book['best_abs']),
-                      expected_score_loss(book['best_abs'], o_res['best_abs']))
+            # the ends agree on SF's expected score, on who, if anyone, has a
+            # mate, and the bookend's mate is no slower than the origin's
+            # counted forward to it (shorter only means the origin's bound
+            # was loose); skipped positions get no mate distance of their own
+            agree = (abs(white_score(o_res) - white_score(book)) <= PV_CONFIRM_ES
+                     and white_mate_sign(o_res, 'best_mate')
+                     == white_mate_sign(book, 'mate'))
+            if agree and book['mate']:
+                expect = o_res['best_mate']
+                for _ in range(book['ply_idx'] - origin[0]):
+                    expect = mate_after(expect)
+                agree = expect != 0 and abs(book['mate']) <= abs(expect)
             for c, board, xerces_uci, tier, _ in chain:
                 off = c - origin[0]
-                out[c] = (self.unsearched(c, board, xerces_uci, book['best_abs'],
-                                          book['best_depth'], o_res['pv'][off:], "pv")
-                          if gap <= PV_CONFIRM_ES
+                out[c] = (self.unsearched(c, board, xerces_uci, book,
+                                          o_res['pv'][off:], "pv")
+                          if agree
                           else self.search(c, board, xerces_uci, tiers[tier]))
             chain.clear()
 
         for pos in positions:
             k, board, xerces_uci, tier, rejected = pos
             if board.legal_moves.count() == 1:
-                out[k] = self.unsearched(k, board, xerces_uci, last_abs, 0, [], "forced")
+                out[k] = (self.unsearched(k, board, xerces_uci, last, [], "forced")
+                          if last is not None else
+                          self.search(k, board, xerces_uci, tiers[tier]))
                 continue
             # a rejected leader needs its own score, so it is never skipped
-            if origin is not None and not rejected and on_pv(k, xerces_uci):
+            if (origin is not None and not rejected and len(chain) < PV_SKIP_MAX
+                    and on_pv(k, xerces_uci)):
                 chain.append(pos)
                 continue
             r = self.search(k, board, xerces_uci, tiers[tier], rejected)
             settle(k, r)
             out[k] = r
-            last_abs = r['best_abs']
+            last = r
             origin = (k, r) if r['pv'] else None
         settle()
         return [out[k] for k in sorted(out)]
@@ -507,6 +634,10 @@ class Rescorer(object):
         self.sf_call_count = 0
         self.sf_rerun_count = 0
         self.sf_skipped = 0
+        # positions skipped along a PV, of all positions rescored: run total
+        # and the REPORT_EVERY window
+        self.pv_skips = self.pv_skips_window = 0
+        self.sf_positions = self.sf_positions_window = 0
         self.n_sf_workers = cfg.rescore_n_sf_workers
         self.sf_depth_sum = 0
         self.sf_depth_count = 0
@@ -875,8 +1006,11 @@ class Rescorer(object):
         # (ply_idx, board_copy, xerces_uci) queued for SF analysis
         to_sf_positions = []
         # walk each move: route SF moves, build ply state
+        # legal moves per ply, for the mate consistency pass
+        game_state['n_legal'] = n_legal = []
         for i, mv in enumerate(game_data.get('moves_played', [])):
             move_ch = chess.Move.from_uci(mv)
+            n_legal.append(board_ch.legal_moves.count())
             is_sf_move = vs_stockfish and (board_ch.turn == sf_color)
             turn = board_ch.turn
             tr = plies[i]
@@ -1016,6 +1150,8 @@ class Rescorer(object):
             board_ch.push(move_ch)
             b_fast.push_uci(mv)
 
+        # the last move mated: its mate distance is 1
+        game_state['mated'] = board_ch.is_checkmate()
         self.pending[gid] = game_state
         # submit to SF thread, or finalize immediately if every move was SF's own
         if to_sf_positions:
@@ -1043,6 +1179,12 @@ class Rescorer(object):
 
         game = self.pending[gid]
         ply_map = {p['ply_idx']: p for p in game['ply_states']}
+
+        n_pv = sum(r.get('skipped') == 'pv' for r in results)
+        for k in ('', '_window'):
+            setattr(self, f'pv_skips{k}', getattr(self, f'pv_skips{k}') + n_pv)
+            setattr(self, f'sf_positions{k}',
+                    getattr(self, f'sf_positions{k}') + len(results))
 
         for r in results:
             ply_idx    = r['ply_idx']
@@ -1081,6 +1223,14 @@ class Rescorer(object):
             ply['sf_best_wdl']   = r.get('best_wdl')
             ply['sf_played_wdl'] = r.get('played_wdl')
             ply['resolved']   = True
+            # rescore scores xc0's pick; on a sampled ply that is not the
+            # move played, so its mate is kept apart and the played move's
+            # is left to consolidate_mates
+            sampled = ply['xerces_uci'] != ply['mv']
+            set_mate_distance(ply['tr'], r['mate'],
+                              None if sampled else r['played_mate'],
+                              'derived' if r.get('skipped') else 'sf')
+            ply['tr']['xc0_mate_distance'] = r['played_mate'] if sampled else None
 
         game['waiting'] = False
         self.finalize_game(self.pending.pop(gid))
@@ -1250,6 +1400,8 @@ class Rescorer(object):
     def finalize_game(self, game_state):
         if self.start_time is None:
             self.start_time = time.time()
+        # before any CPL, TSL, blunder or target is read off the SF evals
+        consolidate_mates(game_state)
         cfg = game_state['cfg']
         game_data = game_state['game_data']
         gid = game_state['gid']
@@ -1617,7 +1769,9 @@ class Rescorer(object):
                 'kl', 'kl_value')}
             for k in ('abs_ply', 'sel_method', 'xc0_move', 'stop_reason',
                       'best_wdl', 'root_wdl_nn', 'xc0h', 'raw_visits', 'pv_len',
-                      'pv_played_len', 'sf_value', 'sf_wdl'):
+                      'pv_played_len', 'sf_value', 'sf_wdl', 'mate_distance',
+                      'played_mate_distance', 'mate_distance_source',
+                      'xc0_mate_distance'):
                 entry[k] = node.get(k)
             # search-controller check-ins, only on games run with ctrl_record
             if 'ctrl' in node:
@@ -1844,14 +1998,16 @@ class Rescorer(object):
                 + cell(a['klv'], 7, ".3f") + cell(a['klp'], 6, ".2f")
                 + cell(100 * a['tsl_mistake'], 8, ".1f") + "%"
                 + cell(100 * a['tsl_blunder'], 8, ".1f") + "%")
-        out("-" * W)
         # the blunder table sits between the trends and throughput when both
         # are due
         if self.games_processed % STATS_WINDOW_GAMES == 0:
+            out("-" * W)
             print()
             self.print_blunder_stats()
             print()
-            out("-" * W)
+        else:
+            print()
+        out("-" * W)
 
         if self.start_time is not None:
             elapsed = time.time() - self.start_time
@@ -1874,6 +2030,15 @@ class Rescorer(object):
         out(cols("SF", ["positions", "ms/pos", "ms/ply", "1st run", "backlog"]))
         out(cols("", [self.n_sf_submitted, f"{ms_pos:.0f}ms", f"{ms_ply:.0f}ms",
                       f"{first_run:.1f}%", len(self.intake) + len(self.pending)]))
+
+        def share(n, d):
+            return f"{n} ({n / d:.1%})" if d else f"{n}"
+        # positions skipped along a PV, of all positions rescored
+        out(f"{'PV skips':<16}last {REPORT_EVERY} "
+            f"{share(self.pv_skips_window, self.sf_positions_window)}   "
+            f"total {share(self.pv_skips, self.sf_positions)}")
+        self.pv_skips_window = self.sf_positions_window = 0
+        out()
 
         def kept(sc, kind):
             off = sc[f'{kind}offered']
@@ -1976,6 +2141,23 @@ def sf_wdl_stm(info):
         return None
     r = w.relative
     return (r.wins / 1000.0, r.draws / 1000.0, r.losses / 1000.0)
+
+
+def white_score(res):
+    """White's expected score at a searched result: SF's WDL as W + D/2,
+    or the cp eval's when SF gave no WDL."""
+    w = res.get('best_wdl')
+    if w is None:
+        return 0.5 * (1.0 + float(cp_to_value_tanh(res['best_abs'])))
+    w = stm_to_white_wdl(w, res['white'])
+    return float(w[0] + 0.5 * w[1])
+
+
+def white_mate_sign(res, key):
+    """+1 white has a mate, -1 black has, 0 neither, at a searched result's
+    STM-POV mate distance under key."""
+    m = res[key]
+    return 0 if not m else (1 if (m > 0) == res['white'] else -1)
 
 
 def stm_to_white_wdl(w, white):

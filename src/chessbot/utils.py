@@ -79,6 +79,26 @@ def score_to_value_stm_pov_tanh(board_score, mid_cp=TANH_MID_CP):
         raw = rel_score.score(mate_score=MATE_CP)
     return cp_to_value_tanh(raw, mid_cp=mid_cp)
 
+def pov_mate(pov_score):
+    """Mate distance in moves, STM-POV: +N the side to move mates in N, -N it
+    is mated in N, 0 no mate in the search."""
+    return pov_score.relative.mate() or 0
+
+
+def mate_key(m):
+    """Sort key for STM-POV mate distances, best for the side to move last:
+    being mated (sooner is worse), then no mate, then mating (sooner is
+    better)."""
+    return (0, -m) if m < 0 else (1, 0) if m == 0 else (2, -m)
+
+
+def mate_before(m):
+    """Mate distance one ply earlier along the line that reached a position
+    of mate distance m: a mated side's -N came from the mating side's N+1, a
+    mating side's +N from the mated side's -N, and no mate from no mate."""
+    return 1 - m if m < 0 else -m
+
+
 # another method of converting scores
 def score_clipped(x, clip_max=CLIP_MAX):
     return np.clip(x.score(mate_score=MATE_CP), -clip_max, clip_max)
@@ -92,52 +112,29 @@ def score_cp_stm_pov(pov_score):
     return score_clipped(pov_score.relative)
 
 
-def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, time_lim=None, engine=None):
+def sf_eval(b, score_fn=score_to_value_stm_pov, depth=12, engine=None):
+    """SF at depth: (value, best move, STM WDL or None, mate distance)."""
     if not isinstance(b, chess.Board):
         b = chess.Board(b.fen())
-        
-    if engine is None:
-        new_eng = True
+
+    new_eng = engine is None
+    if new_eng:
         engine = chess.engine.SimpleEngine.popen_uci(SF_LOC)
         engine.configure({"Threads": 1, "Hash": 128})
-    else:
-        new_eng = False
-
-    # dynamic limit for depth, time limit or both
-    if depth is None:
-        limit = chess.engine.Limit(time=time_lim)
-    
-    elif time_lim is None:
-        limit = chess.engine.Limit(depth=depth)
-
-    else:
-        limit = chess.engine.Limit(depth=depth, time=time_lim)
-
     try:
-        info = engine.analyse(b, limit=limit, info=chess.engine.INFO_ALL)
-
-        val = score_fn(info['score'])
-        best_move = info.get("pv", [""])[0]
-        search_depth = info['depth']
-        wdl_info = info.get('wdl')
-        wdl = (
-            (wdl_info.relative.wins / 1000.0,
-             wdl_info.relative.draws / 1000.0,
-             wdl_info.relative.losses / 1000.0)
-            if wdl_info is not None else None
-        )
-    except Exception as e:
-        print(e)
-
+        info = engine.analyse(b, limit=chess.engine.Limit(depth=depth),
+                              info=chess.engine.INFO_ALL)
     finally:
         if new_eng:
             engine.quit()
 
-    # if time given, return search depth
-    if time_lim is None:
-        return val, str(best_move), wdl
-    else:
-        return val, str(best_move), search_depth
+    wdl_info = info.get('wdl')
+    wdl = ((wdl_info.relative.wins / 1000.0,
+            wdl_info.relative.draws / 1000.0,
+            wdl_info.relative.losses / 1000.0)
+           if wdl_info is not None else None)
+    best_move = info.get("pv", [""])[0]
+    return score_fn(info['score']), str(best_move), wdl, pov_mate(info['score'])
 
 
 
@@ -152,7 +149,7 @@ def load_json(path):
         # Fallback: parse line-by-line (JSONL / concatenated objects)
         items = []
         for line in text.splitlines():
-            line = line.strip()
+            line = line.strip().strip("\x00")
             if line:
                 items.append(json.loads(line))
         return items

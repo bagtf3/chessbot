@@ -99,6 +99,10 @@ class GameViewer:
                 'pv_played':         p.get('pv_played'),
                 'sf_value':          p.get('sf_value'),
                 'sf_wdl':            p.get('sf_wdl'),
+                'mate_distance':     p.get('mate_distance'),
+                'played_mate_distance': p.get('played_mate_distance'),
+                'mate_distance_source': p.get('mate_distance_source'),
+                'xc0_mate_distance': p.get('xc0_mate_distance'),
             }
             for i, p in enumerate(plies)
         }
